@@ -1,0 +1,227 @@
+---
+title: Downloads
+---
+
+<Questions>
+- How do I download Antfly?
+- How do I install Antfly on macOS?
+- How do I install Antfly on Linux?
+- How do I run Antfly with Docker?
+</Questions>
+
+## Download Antfly
+
+### Early-Access Release
+
+Antfly is currently in pre-alpha development.
+We are actively working on features and improvements, and we welcome your feedback.
+
+Antfly ships with bundled [ONNX Runtime](https://onnxruntime.ai/) and [XLA](https://openxla.org/) backends for fast local ML inference. This allows Antfly to generate embeddings, rerank results, and chunk text directly without requiring an external service like Ollama.
+
+<DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} variant="omni" />
+
+### Installation Instructions
+
+<PlatformTabs defaultValue="brew" macos="brew" linux="linux" windows="windows">
+  <TabsList>
+    <TabsTrigger value="brew">macOS (brew)</TabsTrigger>
+    <TabsTrigger value="macos-manual">macOS (manual)</TabsTrigger>
+    <TabsTrigger value="linux">Linux</TabsTrigger>
+    <TabsTrigger value="windows">Windows</TabsTrigger>
+    <TabsTrigger value="docker">Docker Compose</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="brew">
+```bash
+brew install --cask antflydb/antfly/antfly
+```
+
+or tap homebrew-antfly and install separately:
+
+```bash
+brew tap antflydb/antfly
+brew install --cask antfly
+```
+
+This installs `antfly` with bundled ONNX Runtime and XLA libraries for local ML inference. CLI commands are available directly as `antfly <command>` (e.g., `antfly query`, `antfly table create`).
+  </TabsContent>
+
+  <TabsContent value="macos-manual">
+<Steps>
+### Install using the install script (recommended)
+
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni
+```
+
+Or install a specific version:
+
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni {ANTFLY_VERSION}
+```
+
+### Or manually extract the binaries
+
+```bash
+tar -xzf antfly-omni_{ANTFLY_VERSION}_Darwin_arm64.tar.gz
+```
+
+### Make the binaries executable
+
+```bash
+chmod +x antfly
+```
+
+### Remove the quarantine attribute
+
+```bash
+xattr -dr com.apple.quarantine antfly lib/
+```
+
+### Ensure the binaries and libraries are accessible
+
+The `lib/` directory contains the bundled ONNX Runtime and XLA libraries. Keep it alongside the `antfly` binary, or set `DYLD_LIBRARY_PATH`:
+
+```bash
+export DYLD_LIBRARY_PATH=$(pwd)/lib:$DYLD_LIBRARY_PATH
+export PATH=$PATH:$(pwd)
+```
+</Steps>
+  </TabsContent>
+
+  <TabsContent value="linux">
+<Steps>
+### Install using the install script (recommended)
+
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni
+```
+
+Or install a specific version:
+
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni {ANTFLY_VERSION}
+```
+
+### Or manually extract the binaries
+
+```bash
+tar -xzf antfly-omni_{ANTFLY_VERSION}_Linux_x86_64.tar.gz
+```
+
+For ARM64, use `Linux_arm64` instead.
+
+### Make the binaries executable
+
+```bash
+chmod +x antfly
+```
+
+### Ensure the binaries and libraries are accessible
+
+The `lib/` directory contains the bundled ONNX Runtime and XLA libraries. Keep it alongside the `antfly` binary, or set `LD_LIBRARY_PATH`:
+
+```bash
+export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
+export PATH=$PATH:$(pwd)
+```
+</Steps>
+  </TabsContent>
+
+  <TabsContent value="windows">
+<Callout type="info">
+The Windows build is a pure Go binary without bundled ML backends. Use an external embedding provider like Ollama for ML inference on Windows.
+</Callout>
+
+<DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
+
+<Steps>
+### Extract the ZIP file
+
+### Add the extracted folder to your system PATH
+</Steps>
+  </TabsContent>
+
+  <TabsContent value="docker">
+<Steps>
+### Create an `entrypoint.sh`
+
+```bash
+#!/bin/bash
+
+# Start Ollama in the background.
+/bin/ollama serve &
+# Record Process ID.
+pid=$!
+
+# Pause for Ollama to start.
+sleep 5
+
+echo "🔴 Retrieve ALL-MINILM model..."
+ollama pull all-minilm
+echo "🟢 Done!"
+
+# Wait for Ollama process to finish.
+wait $pid
+```
+
+### Create a `config.json`
+
+```json
+{
+  "metadata": {
+    "orchestration_urls": { "1": "http://127.0.0.1:12377" }
+  },
+  "replication_factor": 1,
+  "max_shards_per_table": 4
+}
+```
+
+### Create a `docker-compose.yml`
+
+```yaml
+services:
+  antfly:
+    image: ghcr.io/antflydb/antfly:latest
+    command: ["swarm"]
+    ports:
+      - "8080:8080" # Public API port
+      - "9090:9090" # MCP port
+    volumes:
+      - ./antfly-data:/antflydb
+      - ./config.json:/config.json
+    container_name: antfly-swarm
+    environment:
+      - ANTFLY_LOG_LEVEL=info
+    restart: always
+    networks:
+      - antfly-network
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama-data:/root/.ollama
+      - ./entrypoint.sh:/entrypoint.sh
+    container_name: ollama
+    pull_policy: always
+    tty: true
+    restart: always
+    entrypoint: ["/usr/bin/bash", "/entrypoint.sh"]
+    networks:
+      - antfly-network
+
+networks:
+  antfly-network:
+    driver: bridge
+
+volumes:
+  antfly-data:
+  ollama-data:
+```
+
+### Run `docker-compose up -d`
+</Steps>
+  </TabsContent>
+</PlatformTabs>

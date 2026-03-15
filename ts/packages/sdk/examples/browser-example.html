@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Antfly SDK Browser Example</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        input, button {
+            padding: 8px 12px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        #results {
+            background: #f8f9fa;
+            border-radius: 4px;
+            padding: 15px;
+            margin-top: 20px;
+            white-space: pre-wrap;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+        }
+        .search-box {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .search-box input {
+            flex: 1;
+        }
+    </style>
+</head>
+<body>
+    <h1>Antfly SDK Browser Example</h1>
+    
+    <div class="container">
+        <h2>Configuration</h2>
+        <div>
+            <input type="text" id="baseUrl" placeholder="Base URL" value="http://localhost:8080">
+            <input type="text" id="username" placeholder="Username" value="admin">
+            <input type="password" id="password" placeholder="Password" value="password">
+            <button type="button" onclick="initClient()">Initialize Client</button>
+        </div>
+        <div id="status"></div>
+    </div>
+
+    <div class="container">
+        <h2>Search Products</h2>
+        <div class="search-box">
+            <input type="text" id="searchQuery" placeholder="Enter search query...">
+            <button type="button" onclick="searchProducts()">Search</button>
+        </div>
+        <div id="results"></div>
+    </div>
+
+    <div class="container">
+        <h2>Quick Actions</h2>
+        <button type="button" onclick="listTables()">List Tables</button>
+        <button type="button" onclick="createSampleTable()">Create Sample Table</button>
+        <button type="button" onclick="insertSampleData()">Insert Sample Data</button>
+    </div>
+
+    <script type="module">
+        // In a real application, you would import from the built bundle
+        // For this example, we'll use a mock implementation
+        
+        class AntflyClient {
+            constructor(config) {
+                this.config = config;
+                this.baseUrl = config.baseUrl;
+                this.headers = {
+                    'Content-Type': 'application/json',
+                    ...config.headers
+                };
+                
+                if (config.auth) {
+                    const auth = btoa(`${config.auth.username}:${config.auth.password}`);
+                    this.headers.Authorization = `Basic ${auth}`;
+                }
+            }
+            
+            async request(path, options = {}) {
+                const response = await fetch(`${this.baseUrl}${path}`, {
+                    ...options,
+                    headers: this.headers
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Request failed');
+                }
+                
+                return response.status === 204 ? null : await response.json();
+            }
+            
+            query = async (request) => {
+                const data = await this.request('/query', {
+                    method: 'POST',
+                    body: JSON.stringify(request)
+                });
+                return data?.responses?.[0];
+            }
+            
+            tables = {
+                list: async () => {
+                    return this.request('/table');
+                },
+                
+                create: async (tableName, config) => {
+                    return this.request(`/table/${tableName}`, {
+                        method: 'POST',
+                        body: JSON.stringify(config)
+                    });
+                },
+                
+                query: async (tableName, request) => {
+                    return this.request(`/table/${tableName}/query`, {
+                        method: 'POST',
+                        body: JSON.stringify(request)
+                    });
+                },
+                
+                batch: async (tableName, request) => {
+                    return this.request(`/table/${tableName}/batch`, {
+                        method: 'POST',
+                        body: JSON.stringify(request)
+                    });
+                }
+            }
+        }
+        
+        // Make client available globally
+        window.AntflyClient = AntflyClient;
+        window.client = null;
+        
+        window.initClient = () => {
+            const baseUrl = document.getElementById('baseUrl').value;
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            window.client = new AntflyClient({
+                baseUrl,
+                auth: { username, password }
+            });
+            
+            document.getElementById('status').textContent = '✅ Client initialized';
+        }
+        
+        window.searchProducts = async () => {
+            if (!window.client) {
+                alert('Please initialize the client first');
+                return;
+            }
+            
+            const query = document.getElementById('searchQuery').value;
+            const results = document.getElementById('results');
+            
+            try {
+                results.textContent = 'Searching...';
+                
+                const response = await window.client.tables.query('products', {
+                    full_text_search: { query },
+                    limit: 10
+                });
+                
+                results.textContent = JSON.stringify(response, null, 2);
+            } catch (error) {
+                results.textContent = `Error: ${error.message}`;
+            }
+        }
+        
+        window.listTables = async () => {
+            if (!window.client) {
+                alert('Please initialize the client first');
+                return;
+            }
+            
+            const results = document.getElementById('results');
+            
+            try {
+                results.textContent = 'Loading tables...';
+                const tables = await window.client.tables.list();
+                results.textContent = JSON.stringify(tables, null, 2);
+            } catch (error) {
+                results.textContent = `Error: ${error.message}`;
+            }
+        }
+        
+        window.createSampleTable = async () => {
+            if (!window.client) {
+                alert('Please initialize the client first');
+                return;
+            }
+            
+            const results = document.getElementById('results');
+            
+            try {
+                results.textContent = 'Creating table...';
+                const table = await window.client.tables.create('products', {
+                    num_shards: 2,
+                    schema: {
+                        key: 'id',
+                        default_type: 'product'
+                    }
+                });
+                results.textContent = `Table created:\n${JSON.stringify(table, null, 2)}`;
+            } catch (error) {
+                results.textContent = `Error: ${error.message}`;
+            }
+        }
+        
+        window.insertSampleData = async () => {
+            if (!window.client) {
+                alert('Please initialize the client first');
+                return;
+            }
+            
+            const results = document.getElementById('results');
+            
+            try {
+                results.textContent = 'Inserting data...';
+                await window.client.tables.batch('products', {
+                    inserts: {
+                        'prod:001': {
+                            name: 'Laptop',
+                            price: 999.99,
+                            category: 'Electronics'
+                        },
+                        'prod:002': {
+                            name: 'Mouse',
+                            price: 29.99,
+                            category: 'Accessories'
+                        }
+                    }
+                });
+                results.textContent = 'Data inserted successfully';
+            } catch (error) {
+                results.textContent = `Error: ${error.message}`;
+            }
+        }
+        
+        // Auto-initialize on load
+        window.addEventListener('DOMContentLoaded', () => {
+            window.initClient();
+        });
+    </script>
+</body>
+</html>

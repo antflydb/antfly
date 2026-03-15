@@ -1,0 +1,107 @@
+openapi: 3.0.3
+info:
+  title: Chunking Types
+  description: "Shared types for text and media chunking."
+  version: "0.0.2"
+components:
+  schemas:
+    TextContent:
+      type: object
+      description: "Text content with character offsets."
+      required:
+        - text
+        - start_char
+        - end_char
+      properties:
+        text:
+          type: string
+          description: "The chunk text content"
+        start_char:
+          type: integer
+          description: "Character position in original text where chunk starts"
+        end_char:
+          type: integer
+          description: "Character position in original text where chunk ends (exclusive)"
+
+    BinaryContent:
+      type: object
+      description: "Binary media content with format-specific metadata."
+      properties:
+        data:
+          type: string
+          format: byte
+          description: "Base64-encoded binary data (valid WAV, PNG, etc.)"
+        start_time_ms:
+          type: number
+          format: float
+          description: "Audio: window start time in milliseconds"
+        end_time_ms:
+          type: number
+          format: float
+          description: "Audio: window end time in milliseconds"
+        frame_index:
+          type: integer
+          description: "Animation: frame number"
+        frame_delay_ms:
+          type: integer
+          description: "Animation: display delay in milliseconds"
+
+    Chunk:
+      description: "A chunk of content. Text chunks have mime_type text/plain."
+      allOf:
+        - oneOf:
+            - $ref: "#/components/schemas/TextContent"
+            - $ref: "#/components/schemas/BinaryContent"
+        - type: object
+          required:
+            - id
+            - mime_type
+          properties:
+            id:
+              type: integer
+              x-go-type: uint32
+              description: "Sequence number of the chunk (0, 1, 2, ...)"
+            mime_type:
+              type: string
+              description: "MIME type: text/plain, audio/wav, image/png, etc."
+
+    TextChunkOptions:
+      type: object
+      description: "Options specific to text chunking."
+      properties:
+        target_tokens:
+          type: integer
+          description: "Target number of tokens per chunk."
+        overlap_tokens:
+          type: integer
+          description: "Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers."
+        separator:
+          type: string
+          description: "Separator string for splitting (e.g., '\\n\\n' for paragraphs). Only used by fixed-size chunkers."
+
+    AudioChunkOptions:
+      type: object
+      description: "Options specific to audio chunking."
+      properties:
+        window_duration_ms:
+          type: integer
+          description: "Window duration in milliseconds for fixed-window audio chunking (default: 30000)."
+        overlap_duration_ms:
+          type: integer
+          description: "Overlap duration in milliseconds between audio chunks (default: 0)."
+
+    ChunkOptions:
+      type: object
+      description: "Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults."
+      properties:
+        max_chunks:
+          type: integer
+          description: "Maximum number of chunks to generate per document."
+        threshold:
+          type: number
+          format: float
+          description: "Confidence threshold for model-based chunking (0.0-1.0)."
+        text:
+          $ref: "#/components/schemas/TextChunkOptions"
+        audio:
+          $ref: "#/components/schemas/AudioChunkOptions"

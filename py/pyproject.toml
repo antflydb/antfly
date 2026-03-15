@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "antfly-sdk"
+version = "0.0.2-dev2"
+description = "Python SDK for Antfly distributed key-value store and search engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Antfly, Inc.", email = "ajroetker@antfly.io"},
+]
+keywords = ["antfly", "database", "key-value", "search", "distributed"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "httpx>=0.23.0,<0.29.0",
+    "attrs>=22.2.0",
+    "python-dateutil>=2.8.0,<3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/antflydb/antfly-py"
+Documentation = "https://antfly-sdk-python.readthedocs.io"
+Repository = "https://github.com/antflydb/antfly-py"
+Issues = "https://github.com/antflydb/antfly-py/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "pytest-asyncio>=1.2.0",
+    "requests>=2.32.5",
+    "ruff>=0.13.0",
+    "openapi-python-client>=0.26.1",
+    "pyright>=1.1.405",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/antfly"]
+
+[tool.ruff]
+line-length = 120
+target-version =  "py313"
+
+[tool.ruff.lint]
+select = ["F", "I", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pyright]
+include = ["src"]
+exclude = ["src/antfly/client_generated"]
+pythonVersion = "3.13"
+reportMissingImports = "warning"
+reportUndefinedVariable = "warning"
+reportGeneralTypeIssues = "warning"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

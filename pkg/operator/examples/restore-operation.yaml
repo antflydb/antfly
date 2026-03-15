@@ -1,0 +1,113 @@
+# AntflyRestore Example - On-Demand Restore Operations
+#
+# This example shows how to restore data from a backup to an Antfly cluster.
+# The operator creates a Job that runs antfly restore to perform the restore.
+#
+# Note: AntflyRestore is a one-shot operation. Once completed or failed,
+# the resource should be deleted and recreated if another restore is needed.
+
+---
+# Basic restore - restore all tables from a backup
+apiVersion: antfly.io/v1
+kind: AntflyRestore
+metadata:
+  name: restore-from-daily
+  namespace: antfly-staging
+spec:
+  # Target cluster for restore
+  clusterRef:
+    name: staging-cluster
+    # namespace: antfly-staging  # Optional, defaults to same namespace
+
+  # Source backup to restore from
+  source:
+    backupId: daily-backup-20250118020000
+    location: s3://antfly-backups/prod
+    credentialsSecret:
+      name: s3-backup-credentials
+
+  # Restore mode (default: fail_if_exists)
+  # Options:
+  #   fail_if_exists  - Abort if any table already exists
+  #   skip_if_exists  - Skip existing tables, restore others
+  #   overwrite       - Drop and recreate existing tables
+  restoreMode: fail_if_exists
+
+---
+# Restore specific tables only
+apiVersion: antfly.io/v1
+kind: AntflyRestore
+metadata:
+  name: restore-user-tables
+  namespace: antfly-staging
+spec:
+  clusterRef:
+    name: staging-cluster
+  source:
+    backupId: daily-backup-20250118020000
+    location: s3://antfly-backups/prod
+    credentialsSecret:
+      name: s3-backup-credentials
+  # Only restore these tables
+  tables:
+    - users
+    - user_preferences
+  # Skip tables that already exist
+  restoreMode: skip_if_exists
+
+---
+# Restore with overwrite (destructive - use with caution!)
+apiVersion: antfly.io/v1
+kind: AntflyRestore
+metadata:
+  name: restore-overwrite
+  namespace: antfly-staging
+spec:
+  clusterRef:
+    name: staging-cluster
+  source:
+    backupId: weekly-full-backup-20250112000000
+    location: s3://antfly-backups/prod/weekly
+    credentialsSecret:
+      name: s3-backup-credentials
+  # WARNING: This will drop and recreate existing tables!
+  restoreMode: overwrite
+  # Longer timeout for large datasets
+  restoreTimeout: 4h
+
+---
+# Restore from local filesystem backup
+apiVersion: antfly.io/v1
+kind: AntflyRestore
+metadata:
+  name: restore-from-local
+  namespace: antfly-dev
+spec:
+  clusterRef:
+    name: dev-cluster
+  source:
+    backupId: hourly-dev-backup-20250118100000
+    location: file:///mnt/backups/dev
+  restoreMode: overwrite
+  # Fewer retries for dev
+  backoffLimit: 1
+
+---
+# Cross-namespace restore (restore prod backup to staging)
+apiVersion: antfly.io/v1
+kind: AntflyRestore
+metadata:
+  name: restore-prod-to-staging
+  namespace: antfly-staging
+spec:
+  clusterRef:
+    name: staging-cluster
+  source:
+    backupId: daily-backup-20250118020000
+    location: s3://antfly-backups/prod
+    credentialsSecret:
+      name: s3-backup-credentials  # Must exist in antfly-staging namespace
+  tables:
+    - products
+    - categories
+  restoreMode: skip_if_exists

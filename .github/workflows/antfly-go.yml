@@ -1,0 +1,215 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Go
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  antfly:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Install ollama
+        run: curl -fsSL https://ollama.com/install.sh | bash
+
+      - name: Run Ollama Server
+        run: |
+          ollama serve &
+          pid=$!
+          sleep 5 # Give server time to start
+          # Pull model with retry on digest mismatch (clears corrupted cache)
+          for i in 1 2 3; do
+            if ollama pull gemma3:4b 2>&1 | tee /tmp/ollama-pull.log; then
+              echo "Model pulled successfully"
+              break
+            fi
+
+            if grep -q "digest mismatch" /tmp/ollama-pull.log; then
+              echo "Digest mismatch detected, clearing Ollama cache and retrying ($i/3)..."
+              rm -rf ~/.ollama/models
+              sleep 2
+            else
+              echo "Pull failed with non-digest error, retrying ($i/3)..."
+              sleep 5
+            fi
+
+            if [ $i -eq 3 ]; then
+              echo "Failed to pull model after 3 attempts"
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set Go experiment
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Configure Go for private modules
+        # git config --global url."https://oauth2:${{ secrets.GH_TOKEN }}@github.com".insteadOf "https://github.com"
+        run: |
+          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
+          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
+
+      - name: Clean Go module cache
+        run: go clean -modcache
+
+      - name: Verify Go modules
+        run: go mod download
+
+      - name: Build Antfly
+        run: go build -v -o antfly ./cmd/antfly
+
+      - name: Clean Go module cache before swarm test
+        run: go clean -modcache
+
+      - name: Test swarm startup
+        run: |
+          # Start swarm mode in background
+          ./antfly swarm &
+          SWARM_PID=$!
+
+          echo "Waiting for swarm to start (PID: $SWARM_PID)..."
+
+          # Wait for healthz endpoint (liveness)
+          HEALTHZ_OK=false
+          for i in {1..30}; do
+            if curl -sf http://localhost:4200/healthz > /dev/null 2>&1; then
+              echo "healthz endpoint ready after ${i}s"
+              HEALTHZ_OK=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$HEALTHZ_OK" != "true" ]; then
+            echo "ERROR: healthz endpoint did not respond within 30 seconds"
+            kill $SWARM_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Wait for readyz endpoint (readiness)
+          READYZ_OK=false
+          for i in {1..30}; do
+            if curl -sf http://localhost:4200/readyz > /dev/null 2>&1; then
+              echo "readyz endpoint ready after ${i}s"
+              READYZ_OK=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READYZ_OK" != "true" ]; then
+            echo "ERROR: readyz endpoint did not respond within 30 seconds"
+            kill $SWARM_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Swarm startup test passed!"
+          kill $SWARM_PID 2>/dev/null || true
+
+          # Wait for process to exit and clean up
+          wait $SWARM_PID 2>/dev/null || true
+
+      - name: Test
+        run: go test -v ./...
+
+      - name: Start PostgreSQL
+        run: |
+          # Clean up any existing postgres-test container from previous runs
+          docker rm -f postgres-test 2>/dev/null || true
+
+          RUNNER_CONTAINER=$(docker ps --filter "label=com.amazonaws.ecs.container-name" --format "{{.ID}}" | head -1)
+
+          if [ -n "$RUNNER_CONTAINER" ]; then
+            echo "Found runner container: $RUNNER_CONTAINER"
+            RUNNER_NETWORK=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$RUNNER_CONTAINER" | head -1)
+            echo "Runner network: $RUNNER_NETWORK"
+          fi
+
+          if [ -n "$RUNNER_NETWORK" ]; then
+            echo "Starting postgres on runner network: $RUNNER_NETWORK"
+            docker run -d --name postgres-test \
+              --network "$RUNNER_NETWORK" \
+              -e POSTGRES_USER=antfly \
+              -e POSTGRES_PASSWORD=antfly_dev \
+              -e POSTGRES_DB=antfly_test \
+              postgres:18-alpine
+
+            sleep 5
+            POSTGRES_IP=$(docker inspect -f "{{.NetworkSettings.Networks.${RUNNER_NETWORK}.IPAddress}}" postgres-test)
+            echo "PostgreSQL IP: $POSTGRES_IP"
+            echo "POSTGRES_HOST=$POSTGRES_IP" >> $GITHUB_ENV
+          else
+            echo "No runner container found, using host network"
+            docker run -d --name postgres-test \
+              --network host \
+              -e POSTGRES_USER=antfly \
+              -e POSTGRES_PASSWORD=antfly_dev \
+              -e POSTGRES_DB=antfly_test \
+              postgres:18-alpine
+            echo "POSTGRES_HOST=127.0.0.1" >> $GITHUB_ENV
+          fi
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec postgres-test pg_isready -U antfly -d antfly_test 2>/dev/null; then
+              echo "PostgreSQL is ready"
+              break
+            fi
+            echo "Waiting for PostgreSQL... ($i/30)"
+            sleep 2
+          done
+
+          docker exec postgres-test psql -U antfly -d antfly_test -c "SELECT 1" || exit 1
+          echo "PostgreSQL connection verified"
+
+      - name: Stop Ollama before E2E tests
+        run: pkill ollama || true
+
+      - name: E2E Quickstart Test
+        run: |
+          make e2e E2E_TEST=TestE2E_Quickstart E2E_TIMEOUT=10m
+
+      - name: E2E Builtin Providers Test
+        run: |
+          cd e2e && go test -v ./... -run TestE2E_BuiltinProviders -timeout 10m
+
+      - name: E2E Distributed Transaction Tests
+        run: |
+          cd e2e && RUN_TXN_TESTS=true go test -v ./... -run DistributedTransaction -timeout 5m
+
+      - name: E2E Autoscaling Tests
+        run: |
+          cd e2e && RUN_AUTOSCALING_TESTS=true go test -v ./... -run Autoscaling -timeout 20m
+
+      - name: E2E Online Shard Split Tests
+        run: |
+          cd e2e && RUN_SHARD_SPLIT_TESTS=true go test -v ./... -run OnlineSplit -timeout 30m
+
+      - name: E2E Foreign Table Tests
+        env:
+          ANTFLY_E2E_PG_DSN: postgres://antfly:antfly_dev@${{ env.POSTGRES_HOST }}:5432/antfly_test?sslmode=disable
+        run: |
+          cd e2e && RUN_FOREIGN_TABLE_TESTS=true go test -v ./... -run TestE2E_ForeignTable -timeout 10m

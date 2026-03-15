@@ -1,0 +1,29 @@
+{
+  "indexes": {
+    "title_body": {
+      "type": "embeddings",
+      "template": "{{title}} {{body}}",
+      "embedder": {
+        "provider": "termite",
+        "model": "BAAI/bge-small-en-v1.5"
+      },
+      "chunker": {
+        "provider": "antfly",
+        "text": {
+          "target_tokens": 200,
+          "overlap_tokens": 25
+        }
+      }
+    },
+    "thumbnail": {
+      "type": "embeddings",
+      "template": "{{media url=thumbnail_url}}",
+      "embedder": {
+        "provider": "termite",
+        "model": "openai/clip-vit-base-patch32"
+      },
+      "dimension": 512,
+      "distance_metric": "cosine"
+    }
+  }
+}

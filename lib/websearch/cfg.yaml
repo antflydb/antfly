@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: websearch
+generate:
+  models: true
+  embedded-spec: true
+compatibility:
+  always-prefix-enum-values: true
+output: openapi.gen.go
+output-options:
+  skip-prune: true
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true
+import-mapping:
+  ../../pkg/libaf/s3/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/s3

@@ -1,0 +1,80 @@
+/antfly
+/antfly-*
+!www/components/layout/antfly-*
+/antfly_*
+/antfly.*
+main
+
+lib/vector/testdata/random-4096d-10k.gob
+lib/vector/testdata/random-2048d-10k.gob
+
+# go workspace (developer-specific paths and replace directives)
+go.work
+go.work.sum
+
+models/*
+
+# main db dirs for antfly
+antflydb
+termitedb
+onnxruntime
+
+# ai
+.aider*
+*aider*
+.claude/
+!.claude/settings.json
+!.claude/hooks/
+
+*.gif
+*.log
+gosec_output.txt
+
+.DS_Store
+
+# Added by goreleaser init:
+dist/
+
+# Runtime libraries
+onnxruntime/
+pjrt/
+
+# releasing
+.github_token
+.aws_credentials
+completions
+
+# testdata files
+testfile*
+wiki-articles*
+src/metadata/testdata/query_generation_*_results.json
+
+# e2e test results
+e2e/test_results/*.md
+e2e/models/
+
+# prometheus data
+/data/
+
+# backups
+*-metadata.json
+*.tar.gz
+*.tar.sz
+*.tar.zst
+
+!antfly.json
+!antfly.go
+!antfly_test.go
+!antfly-genkit
+!evalaf/plugins/antfly
+!antfly-operator
+!src/metadata/antfarm/antfly-logo_icon-*.png
+!pkg/operator/manifests/crd/antfly.io_*.yaml
+!termite/pkg/operator/manifests/crd/antfly.io_*.yaml
+!.github/workflows/antfly-operator-container.yml
+
+.specify/
+scripts/__pycache__/
+
+
+/datasets/

@@ -1,0 +1,214 @@
+// Copyright 2025 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+edition = "2023";
+
+package db;
+import "google/protobuf/go_features.proto";
+
+option go_package = "github.com/antflydb/antfly/src/store/db";
+option features.(pb.go).api_level = API_OPAQUE;
+
+message Op {
+  enum OpType {
+    OpBatch = 0;
+    OpSplit = 1;
+    OpSetRange = 2;
+    OpUpdateSchema = 3;
+    OpAddIndex = 4;
+    OpDeleteIndex = 5;
+    OpBackup = 6;
+    OpInitTransaction = 7;
+    OpCommitTransaction = 8;
+    OpAbortTransaction = 9;
+    OpWriteIntent = 10;
+    OpResolveIntents = 11;
+    OpFinalizeSplit = 12;  // Complete a split by deleting split-off data
+    OpSetSplitState = 13;  // Update split state (replaces local pendingSplitKey)
+  }
+
+  enum SyncLevel {
+    SyncLevelPropose = 0;      // Wait for Raft proposal acceptance (default)
+    SyncLevelWrite = 1;        // Wait for Pebble KV write
+    SyncLevelFullText = 2;     // Wait for full-text index WAL write
+    SyncLevelEnrichments = 3;  // Pre-compute enrichments before Raft proposal
+    SyncLevelEmbeddings = 4;   // Wait for embeddings index write (dense + sparse + full-text)
+  }
+
+  OpType op = 1 [ features.field_presence = IMPLICIT ];
+  string uuid = 2; // [default = "N/A"]
+
+  // Operation-specific data
+  oneof operation {
+    BatchOp batch = 3 [ lazy = true ];
+    SplitOp split = 4 [ lazy = true ];
+    SetRangeOp set_range = 5 [ lazy = true ];
+    UpdateSchemaOp update_schema = 6 [ lazy = true ];
+    AddIndexOp add_index = 7 [ lazy = true ];
+    DeleteIndexOp delete_index = 8 [ lazy = true ];
+    BackupOp backup = 9 [ lazy = true ];
+    InitTransactionOp init_transaction = 10 [ lazy = true ];
+    CommitTransactionOp commit_transaction = 11 [ lazy = true ];
+    AbortTransactionOp abort_transaction = 12 [ lazy = true ];
+    WriteIntentOp write_intent = 13 [ lazy = true ];
+    ResolveIntentsOp resolve_intents = 14 [ lazy = true ];
+    FinalizeSplitOp finalize_split = 15 [ lazy = true ];
+    SetSplitStateOp set_split_state = 16 [ lazy = true ];
+  }
+}
+
+message Write {
+  bytes key = 1 [ features.field_presence = IMPLICIT ];
+  bytes value = 2 [ features.field_presence = IMPLICIT ];
+}
+
+message TransformOp {
+  enum OpType {
+    SET = 0;            // $set - Set value at path
+    UNSET = 1;          // $unset - Remove field
+    INC = 2;            // $inc - Increment/decrement numeric value
+    PUSH = 3;           // $push - Append to array
+    PULL = 4;           // $pull - Remove array elements matching value
+    ADD_TO_SET = 5;     // $addToSet - Add to array if not exists
+    POP = 6;            // $pop - Remove first (-1) or last (1) array element
+    MUL = 7;            // $mul - Multiply numeric value
+    MIN = 8;            // $min - Set to minimum of current and value
+    MAX = 9;            // $max - Set to maximum of current and value
+    CURRENT_DATE = 10;  // $currentDate - Set to current timestamp
+    RENAME = 11;        // $rename - Rename field
+  }
+
+  string path = 1 [ features.field_presence = IMPLICIT ];     // JSONPath expression (e.g., "$.tags", "$.user.name")
+  OpType op = 2 [ features.field_presence = IMPLICIT ];
+  bytes value = 3;     // JSON-encoded value (optional for UNSET, CURRENT_DATE)
+}
+
+message Transform {
+  bytes key = 1 [ features.field_presence = IMPLICIT ];
+  repeated TransformOp operations = 2;
+  bool upsert = 3;  // If true, create document if it doesn't exist
+}
+
+message BatchOp {
+  repeated Write writes = 1;
+  repeated bytes deletes = 2;
+  repeated Transform transforms = 3;
+  Op.SyncLevel sync_level = 4;
+  uint64 timestamp = 5 [ features.field_presence = IMPLICIT ];
+}
+
+message SplitDeltaEntry {
+  uint64 sequence = 1 [ features.field_presence = IMPLICIT ];
+  uint64 timestamp = 2 [ features.field_presence = IMPLICIT ];
+  repeated Write writes = 3;
+  repeated bytes deletes = 4;
+}
+
+message SplitOp {
+  uint64 new_shard_id = 1 [ features.field_presence = IMPLICIT ];
+  bytes split_key = 2 [ features.field_presence = IMPLICIT ];
+}
+
+// FinalizeSplitOp completes a split by deleting split-off data and updating the byte range.
+// This is the second phase of a two-phase split that ensures continuous data availability.
+// The first phase (SplitOp) creates the archive but preserves data on the parent shard.
+// FinalizeSplit is triggered when the new shard is ready (has HasSnapshot=true).
+message FinalizeSplitOp {
+  // The new end of the byte range after the split (the split key)
+  bytes new_range_end = 1 [ features.field_presence = IMPLICIT ];
+}
+
+message SetRangeOp {
+  bytes start_key = 1 [ features.field_presence = IMPLICIT ];
+  bytes end_key = 2 [ features.field_presence = IMPLICIT ];
+}
+
+message UpdateSchemaOp {
+  bytes schema = 1 [ features.field_presence = IMPLICIT ];
+}
+
+message AddIndexOp {
+  string name = 1 [ features.field_presence = IMPLICIT ];
+  string type = 2 [ features.field_presence = IMPLICIT ];
+  bytes config = 3 [ features.field_presence = IMPLICIT ];
+}
+
+message DeleteIndexOp {
+  string name = 1 [ features.field_presence = IMPLICIT ];
+}
+
+message BackupOp {
+  string backup_id = 1 [ features.field_presence = IMPLICIT ];
+  string location = 2 [ features.field_presence = IMPLICIT ];
+}
+
+message InitTransactionOp {
+  bytes txn_id = 1 [ features.field_presence = IMPLICIT ];
+  uint64 timestamp = 2 [ features.field_presence = IMPLICIT ];
+  repeated bytes participants = 3; // Shard IDs
+}
+
+message CommitTransactionOp {
+  bytes txn_id = 1 [ features.field_presence = IMPLICIT ];
+}
+
+message AbortTransactionOp {
+  bytes txn_id = 1 [ features.field_presence = IMPLICIT ];
+}
+
+message VersionPredicate {
+  bytes key = 1 [ features.field_presence = IMPLICIT ];
+  uint64 expected_version = 2 [ features.field_presence = IMPLICIT ];  // 0 means "key must not exist"
+}
+
+message WriteIntentOp {
+  bytes txn_id = 1 [ features.field_presence = IMPLICIT ];
+  uint64 timestamp = 2 [ features.field_presence = IMPLICIT ];
+  bytes coordinator_shard = 3 [ features.field_presence = IMPLICIT ];
+  BatchOp batch = 4; // Reuse existing BatchOp for writes/deletes
+  repeated VersionPredicate predicates = 5;  // Checked during intent write for OCC
+}
+
+message ResolveIntentsOp {
+  bytes txn_id = 1 [ features.field_presence = IMPLICIT ];
+  int32 status = 2 [ features.field_presence = IMPLICIT ]; // TxnStatus from common.transaction
+}
+
+// SplitState represents the current phase of a shard split operation.
+// This state is persisted in Pebble and replicated via Raft to ensure
+// consistency across leadership changes. Unlike the old pendingSplitKey
+// which was local-only, SplitState survives leadership transitions.
+message SplitState {
+  // Phase represents the current stage of the split operation.
+  enum Phase {
+    PHASE_NONE = 0;         // No split in progress
+    PHASE_PREPARE = 1;      // Shadow index created, dual-write active
+    PHASE_SPLITTING = 2;    // Archive created, new shard starting
+    PHASE_FINALIZING = 3;   // New shard ready, cleaning up parent
+    PHASE_ROLLING_BACK = 4; // Timeout reached, reverting to pre-split
+  }
+
+  Phase phase = 1 [ features.field_presence = IMPLICIT ];
+  bytes split_key = 2 [ features.field_presence = IMPLICIT ];
+  uint64 new_shard_id = 3 [ features.field_presence = IMPLICIT ];
+  int64 started_at_unix_nanos = 4 [ features.field_presence = IMPLICIT ];
+  bytes original_range_end = 5 [ features.field_presence = IMPLICIT ];
+}
+
+// SetSplitStateOp is used to atomically update the split state during a split operation.
+// This replaces the old local-only pendingSplitKey with a Raft-replicated state machine.
+message SetSplitStateOp {
+  // The new split state, or nil to clear the state (after finalize/rollback).
+  SplitState state = 1;
+}

@@ -1,0 +1,112 @@
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-linkerd
+  namespace: default
+spec:
+  # Container image for Antfly
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Service Mesh Configuration - Linkerd
+  serviceMesh:
+    enabled: true
+    annotations:
+      # Enable Linkerd sidecar injection
+      linkerd.io/inject: enabled
+
+      # Skip Raft ports to reduce latency for consensus traffic
+      # Leader Raft: 9017, Data Raft: 9021
+      config.linkerd.io/skip-outbound-ports: "9017,9021"
+      config.linkerd.io/skip-inbound-ports: "9017,9021"
+
+      # Proxy resource configuration (optional)
+      config.linkerd.io/proxy-cpu-limit: "500m"
+      config.linkerd.io/proxy-cpu-request: "100m"
+      config.linkerd.io/proxy-memory-limit: "512Mi"
+      config.linkerd.io/proxy-memory-request: "128Mi"
+
+      # Proxy log level (optional)
+      # Values: trace, debug, info, warn, error
+      config.linkerd.io/proxy-log-level: "warn,linkerd=info"
+
+      # Timeout configuration (optional)
+      config.linkerd.io/proxy-outbound-connect-timeout: "1000ms"
+
+  # Metadata Nodes Configuration
+  metadataNodes:
+    replicas: 3
+    resources:
+      cpu: "500m"
+      memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+    # Port configuration (uses operator defaults)
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+
+  # Data Nodes Configuration
+  dataNodes:
+    replicas: 3
+    resources:
+      cpu: "1000m"
+      memory: "2Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"
+
+    # Port configuration (uses operator defaults)
+    api:
+      port: 12380
+    raft:
+      port: 9021
+
+  # Storage Configuration
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "10Gi"
+
+  # Antfly Database Configuration
+  config: |
+    {
+      "max_shard_size_bytes": 67108864,
+      "replication_factor": 3,
+      "enable_auth": false,
+      "disable_shard_alloc": true
+    }
+
+---
+# Optional: Linkerd Server for specific traffic policies
+apiVersion: policy.linkerd.io/v1beta1
+kind: Server
+metadata:
+  name: antfly-linkerd-leader
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: antfly-database
+      app.kubernetes.io/component: leader
+  port: 12377
+  proxyProtocol: HTTP/1
+
+---
+# Optional: Linkerd ServerAuthorization for access control
+apiVersion: policy.linkerd.io/v1beta1
+kind: ServerAuthorization
+metadata:
+  name: antfly-linkerd-leader-authz
+  namespace: default
+spec:
+  server:
+    name: antfly-linkerd-leader
+  client:
+    meshTLS:
+      serviceAccounts:
+        - name: default
+          namespace: default

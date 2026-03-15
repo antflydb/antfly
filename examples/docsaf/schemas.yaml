@@ -1,0 +1,298 @@
+# Example schemas for repository document types
+# These schemas can be used when creating tables in Antfly
+
+# Schema for markdown sections
+markdown_section:
+  type: object
+  x-antfly-include-in-all:
+    - title
+    - content
+  properties:
+    id:
+      type: string
+      description: Unique identifier for the section
+      x-antfly-index: true
+    file_path:
+      type: string
+      description: Relative path to the source file
+      x-antfly-types:
+        - keyword
+    title:
+      type: string
+      description: Section heading or title
+      x-antfly-types:
+        - text
+        - keyword
+    content:
+      type: string
+      description: Full markdown content of the section
+      x-antfly-types:
+        - text
+        - search_as_you_type
+    _type:
+      type: string
+      description: Document type (markdown_section)
+      x-antfly-types:
+        - keyword
+    metadata:
+      type: object
+      description: Additional metadata
+      properties:
+        heading_level:
+          type: integer
+          description: Heading level (1-6)
+        is_mdx:
+          type: boolean
+          description: Whether this is an MDX file
+        no_headings:
+          type: boolean
+          description: True if the file had no headings
+  required:
+    - id
+    - file_path
+    - title
+    - content
+    - _type
+
+# Schema for MDX sections (same as markdown but with MDX flag)
+mdx_section:
+  type: object
+  x-antfly-include-in-all:
+    - title
+    - content
+  properties:
+    id:
+      type: string
+      description: Unique identifier for the section
+      x-antfly-index: true
+    file_path:
+      type: string
+      description: Relative path to the source file
+      x-antfly-types:
+        - keyword
+    title:
+      type: string
+      description: Section heading or title
+      x-antfly-types:
+        - text
+        - keyword
+    content:
+      type: string
+      description: Full MDX content of the section
+      x-antfly-types:
+        - text
+        - search_as_you_type
+    _type:
+      type: string
+      description: Document type (mdx_section)
+      x-antfly-types:
+        - keyword
+    metadata:
+      type: object
+      description: Additional metadata
+      properties:
+        heading_level:
+          type: integer
+          description: Heading level (1-6)
+        is_mdx:
+          type: boolean
+          description: Always true for MDX files
+        no_headings:
+          type: boolean
+          description: True if the file had no headings
+  required:
+    - id
+    - file_path
+    - title
+    - content
+    - _type
+
+# Schema for OpenAPI info sections
+openapi_info:
+  type: object
+  x-antfly-include-in-all:
+    - title
+    - content
+  properties:
+    id:
+      type: string
+      description: Unique identifier for the info section
+      x-antfly-index: true
+    file_path:
+      type: string
+      description: Relative path to the OpenAPI spec file
+      x-antfly-types:
+        - keyword
+    title:
+      type: string
+      description: API title from the info object
+      x-antfly-types:
+        - text
+        - keyword
+    content:
+      type: string
+      description: JSON representation of the info object
+      x-antfly-types:
+        - text
+    _type:
+      type: string
+      description: Document type (openapi_info)
+      x-antfly-types:
+        - keyword
+    metadata:
+      type: object
+      description: API metadata
+      properties:
+        openapi_version:
+          type: string
+          description: OpenAPI specification version
+        api_version:
+          type: string
+          description: API version
+        api_title:
+          type: string
+          description: API title
+          x-antfly-types:
+            - text
+            - keyword
+  required:
+    - id
+    - file_path
+    - title
+    - content
+    - _type
+
+# Schema for OpenAPI path operations
+openapi_path:
+  type: object
+  x-antfly-include-in-all:
+    - title
+    - content
+  properties:
+    id:
+      type: string
+      description: Unique identifier for the path operation
+      x-antfly-index: true
+    file_path:
+      type: string
+      description: Relative path to the OpenAPI spec file
+      x-antfly-types:
+        - keyword
+    title:
+      type: string
+      description: HTTP method and path (e.g., "GET /api/users")
+      x-antfly-types:
+        - text
+        - keyword
+    content:
+      type: string
+      description: JSON representation of the operation
+      x-antfly-types:
+        - text
+    _type:
+      type: string
+      description: Document type (openapi_path)
+      x-antfly-types:
+        - keyword
+    metadata:
+      type: object
+      description: Path operation metadata
+      properties:
+        http_method:
+          type: string
+          description: HTTP method (get, post, put, delete, etc.)
+          x-antfly-types:
+            - keyword
+        path:
+          type: string
+          description: API path (e.g., /api/users)
+          x-antfly-types:
+            - keyword
+        operation_id:
+          type: string
+          description: Operation ID from the spec
+          x-antfly-types:
+            - keyword
+        summary:
+          type: string
+          description: Operation summary
+          x-antfly-types:
+            - text
+        description:
+          type: string
+          description: Operation description
+          x-antfly-types:
+            - text
+        tags:
+          type: array
+          description: Operation tags
+          items:
+            type: string
+          x-antfly-types:
+            - keyword
+  required:
+    - id
+    - file_path
+    - title
+    - content
+    - _type
+
+# Schema for OpenAPI component schemas
+openapi_schema:
+  type: object
+  x-antfly-include-in-all:
+    - title
+    - content
+  properties:
+    id:
+      type: string
+      description: Unique identifier for the schema
+      x-antfly-index: true
+    file_path:
+      type: string
+      description: Relative path to the OpenAPI spec file
+      x-antfly-types:
+        - keyword
+    title:
+      type: string
+      description: 'Schema name with prefix (e.g., "Schema: User")'
+      x-antfly-types:
+        - text
+        - keyword
+    content:
+      type: string
+      description: JSON representation of the schema
+      x-antfly-types:
+        - text
+    _type:
+      type: string
+      description: Document type (openapi_schema)
+      x-antfly-types:
+        - keyword
+    metadata:
+      type: object
+      description: Schema metadata
+      properties:
+        schema_name:
+          type: string
+          description: Name of the schema
+          x-antfly-types:
+            - keyword
+        schema_type:
+          type: array
+          description: JSON schema type(s)
+          items:
+            type: string
+          x-antfly-types:
+            - keyword
+        description:
+          type: string
+          description: Schema description
+          x-antfly-types:
+            - text
+  required:
+    - id
+    - file_path
+    - title
+    - content
+    - _type

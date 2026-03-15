@@ -1,0 +1,415 @@
+openapi: 3.0.3
+info:
+  title: Web Search Provider Configuration
+  description: |
+    OpenAPI specification for web search provider configuration.
+
+    Web search providers allow the chat agent to search external sources
+    when internal documents don't have the answer.
+  version: "1.0.0"
+
+components:
+  schemas:
+    WebSearchProvider:
+      type: string
+      enum:
+        - google
+        - bing
+        - serper
+        - tavily
+        - brave
+        - duckduckgo
+      description: |
+        The web search provider to use.
+
+        - **google**: Google Custom Search API (requires CSE setup)
+        - **bing**: Microsoft Bing Web Search API
+        - **serper**: Serper.dev Google Search API (simpler setup)
+        - **tavily**: Tavily AI Search API (optimized for RAG)
+        - **brave**: Brave Search API
+        - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+
+    WebSearchConfig:
+      description: |
+        A unified configuration for web search providers.
+
+        Each provider has specific configuration requirements. Use the appropriate
+        provider-specific config or set common options at the top level.
+
+        **Environment Variables (fallbacks):**
+        - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID
+        - BING_SEARCH_API_KEY
+        - SERPER_API_KEY
+        - TAVILY_API_KEY
+        - BRAVE_API_KEY
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: "#/components/schemas/WebSearchProvider"
+        max_results:
+          type: integer
+          default: 5
+          minimum: 1
+          maximum: 20
+          description: "Maximum number of search results to return"
+        timeout_ms:
+          type: integer
+          default: 10000
+          description: "Request timeout in milliseconds"
+        safe_search:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          default: true
+          description: "Enable safe search filtering"
+        language:
+          type: string
+          description: "Preferred language for results (e.g., 'en', 'es', 'fr')"
+          example: "en"
+        region:
+          type: string
+          description: "Preferred region for results (e.g., 'us', 'uk', 'de')"
+          example: "us"
+      discriminator:
+        propertyName: provider
+        mapping:
+          google: "#/components/schemas/GoogleSearchConfig"
+          bing: "#/components/schemas/BingSearchConfig"
+          serper: "#/components/schemas/SerperSearchConfig"
+          tavily: "#/components/schemas/TavilySearchConfig"
+          brave: "#/components/schemas/BraveSearchConfig"
+          duckduckgo: "#/components/schemas/DuckDuckGoSearchConfig"
+
+    GoogleSearchConfig:
+      type: object
+      description: |
+        Configuration for Google Custom Search API.
+
+        Requires a Custom Search Engine (CSE) to be configured in Google Cloud Console.
+
+        **Setup:**
+        1. Create a project at https://console.cloud.google.com
+        2. Enable Custom Search API
+        3. Create a Custom Search Engine at https://cse.google.com
+        4. Get API key and CSE ID
+
+        **Docs:** https://developers.google.com/custom-search/v1/overview
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: "Google API key (or set GOOGLE_CSE_API_KEY env var)"
+            cse_id:
+              type: string
+              description: "Custom Search Engine ID (or set GOOGLE_CSE_ID env var)"
+            search_type:
+              type: string
+              enum: ["web", "image"]
+              default: "web"
+              description: "Type of search to perform"
+            date_restrict:
+              type: string
+              description: "Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)"
+              example: "m1"
+
+    BingSearchConfig:
+      type: object
+      description: |
+        Configuration for Microsoft Bing Web Search API.
+
+        **Setup:**
+        1. Create Azure account at https://portal.azure.com
+        2. Create a Bing Search resource
+        3. Get API key from resource keys
+
+        **Docs:** https://docs.microsoft.com/en-us/bing/search-apis/bing-web-search/overview
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: "Bing Search API key (or set BING_SEARCH_API_KEY env var)"
+            endpoint:
+              type: string
+              format: uri
+              default: "https://api.bing.microsoft.com/v7.0/search"
+              description: "Bing API endpoint URL"
+            freshness:
+              type: string
+              enum: ["Day", "Week", "Month"]
+              description: "Filter results by freshness"
+
+    SerperSearchConfig:
+      type: object
+      description: |
+        Configuration for Serper.dev Google Search API.
+
+        Serper provides a simpler alternative to Google Custom Search with
+        competitive pricing and easy setup.
+
+        **Setup:**
+        1. Sign up at https://serper.dev
+        2. Get API key from dashboard
+
+        **Docs:** https://serper.dev/docs
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: "Serper API key (or set SERPER_API_KEY env var)"
+            search_type:
+              type: string
+              enum: ["search", "news", "images", "places", "shopping"]
+              default: "search"
+              description: "Type of search to perform"
+            time_period:
+              type: string
+              enum: ["d", "w", "m", "y"]
+              description: "Time period filter: d=day, w=week, m=month, y=year"
+
+    TavilySearchConfig:
+      type: object
+      description: |
+        Configuration for Tavily AI Search API.
+
+        Tavily is optimized for RAG and AI applications, providing
+        pre-processed results with summaries and relevance scoring.
+
+        **Setup:**
+        1. Sign up at https://tavily.com
+        2. Get API key from dashboard
+
+        **Docs:** https://docs.tavily.com
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: "Tavily API key (or set TAVILY_API_KEY env var)"
+            search_depth:
+              type: string
+              enum: ["basic", "advanced"]
+              default: "basic"
+              description: |
+                Search depth:
+                - basic: Fast search with standard results
+                - advanced: Deeper search with more comprehensive results
+            include_answer:
+              type: boolean
+              default: true
+              description: "Include AI-generated answer summary"
+            include_raw_content:
+              type: boolean
+              default: false
+              description: "Include raw HTML content of pages"
+            include_domains:
+              type: array
+              items:
+                type: string
+              description: "Only include results from these domains"
+            exclude_domains:
+              type: array
+              items:
+                type: string
+              description: "Exclude results from these domains"
+
+    BraveSearchConfig:
+      type: object
+      description: |
+        Configuration for Brave Search API.
+
+        Brave Search provides privacy-focused search with its own independent index.
+
+        **Setup:**
+        1. Sign up at https://brave.com/search/api/
+        2. Get API key from dashboard
+
+        **Docs:** https://api.search.brave.com/app/documentation
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: "Brave Search API key (or set BRAVE_API_KEY env var)"
+            freshness:
+              type: string
+              enum: ["pd", "pw", "pm", "py"]
+              description: "Freshness filter: pd=day, pw=week, pm=month, py=year"
+            text_decorations:
+              type: boolean
+              default: false
+              description: "Include text decorations (bold, italic markers)"
+            spellcheck:
+              type: boolean
+              default: true
+              description: "Enable spellcheck suggestions"
+
+    DuckDuckGoSearchConfig:
+      type: object
+      description: |
+        Configuration for DuckDuckGo Instant Answer API.
+
+        DuckDuckGo provides limited free search without requiring an API key.
+        Best for simple queries; may not return results for all searches.
+
+        **Note:** This uses the Instant Answer API which has limitations.
+        For production use, consider other providers.
+
+        **Docs:** https://duckduckgo.com/api
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            no_redirect:
+              type: boolean
+              default: true
+              description: "Skip HTTP redirect for bang queries"
+            no_html:
+              type: boolean
+              default: true
+              description: "Remove HTML from results"
+
+    WebSearchResult:
+      type: object
+      description: "A single web search result"
+      required:
+        - title
+        - url
+      properties:
+        title:
+          type: string
+          description: "Title of the search result"
+        url:
+          type: string
+          format: uri
+          description: "URL of the search result"
+        snippet:
+          type: string
+          description: "Text snippet/description from the result"
+        source:
+          type: string
+          description: "Domain name of the source"
+        published_date:
+          type: string
+          format: date-time
+          description: "Publication date if available"
+        score:
+          type: number
+          format: float
+          description: "Relevance score (provider-specific)"
+
+    WebSearchResponse:
+      type: object
+      description: "Response from a web search query"
+      required:
+        - results
+      properties:
+        query:
+          type: string
+          description: "The search query that was executed"
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebSearchResult"
+          description: "List of search results"
+        answer:
+          type: string
+          description: "AI-generated answer summary (if supported by provider)"
+        total_results:
+          type: integer
+          description: "Total number of results available"
+        search_time_ms:
+          type: integer
+          description: "Time taken to perform the search in milliseconds"
+
+    FetchConfig:
+      type: object
+      description: |
+        Configuration for URL content fetching.
+
+        Uses lib/scraping for downloading and processing. Supports:
+        - HTTP/HTTPS URLs with security validation
+        - HTML pages (extracts readable text via go-readability)
+        - PDF files (extracts text)
+        - Images (returns as data URIs)
+        - Plain text files
+        - S3 URLs (requires s3_credentials)
+
+        Security features (from lib/scraping.ContentSecurityConfig):
+        - Allowed host whitelist
+        - Private IP blocking (SSRF prevention)
+        - Download size limits
+        - Timeout controls
+      properties:
+        s3_credentials:
+          description: "S3 credentials for fetching S3 URLs. If not set, uses package-level defaults."
+          $ref: "../../pkg/libaf/s3/openapi.yaml#/components/schemas/Credentials"
+        max_content_length:
+          type: integer
+          default: 50000
+          description: "Maximum content length in characters (truncated if exceeded)"
+        allowed_hosts:
+          type: array
+          items:
+            type: string
+          description: |
+            Whitelist of allowed hostnames for fetching.
+            If empty, all hosts are allowed (except private IPs).
+            Example: ["docs.example.com", "api.example.com"]
+        block_private_ips:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          default: true
+          description: |
+            Block requests to private IP ranges (SSRF prevention).
+            Blocked: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        max_download_size_bytes:
+          type: integer
+          default: 104857600
+          description: "Maximum download size in bytes (default: 100MB)"
+        timeout_seconds:
+          type: integer
+          default: 30
+          description: "Download timeout in seconds"
+
+    FetchResult:
+      type: object
+      description: |
+        Result from fetching a URL via lib/scraping.
+
+        Content is automatically processed based on MIME type:
+        - HTML: Readable text extracted via go-readability
+        - PDF: Text extracted from all pages
+        - Images: Returned as base64 data URIs
+        - Text: Returned as-is
+      required:
+        - url
+        - content
+      properties:
+        url:
+          type: string
+          format: uri
+          description: "The URL that was fetched"
+        title:
+          type: string
+          description: "Page title (extracted from HTML)"
+        content:
+          type: string
+          description: "Extracted/processed content"
+        content_type:
+          type: string
+          description: "MIME type of the original content"
+        truncated:
+          type: boolean
+          description: "Whether content was truncated due to max_content_length"
+        fetch_time_ms:
+          type: integer
+          description: "Time taken to fetch and process in milliseconds"

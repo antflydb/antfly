@@ -1,0 +1,73 @@
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: production-antfly-cluster
+  namespace: production
+  labels:
+    app.kubernetes.io/name: antfly-cluster
+    app.kubernetes.io/instance: production-antfly-cluster
+    app.kubernetes.io/part-of: antfly
+    app.kubernetes.io/version: "latest"
+    environment: production
+spec:
+  # Production-ready container image
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Metadata nodes configuration (Raft consensus layer)
+  metadataNodes:
+    replicas: 3  # Required for Raft consensus
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+    resources:
+      cpu: "1000m"      # 1 CPU core
+      memory: "2Gi"     # 2GB RAM
+      limits:
+        cpu: "2000m"    # 2 CPU cores max
+        memory: "4Gi"   # 4GB RAM max
+  
+  # Data nodes configuration (Storage layer)
+  dataNodes:
+    replicas: 3  # Required for Raft consensus
+    api:
+      port: 12380
+    raft:
+      port: 9021
+    resources:
+      cpu: "2000m"      # 2 CPU cores
+      memory: "4Gi"     # 4GB RAM
+      limits:
+        cpu: "4000m"    # 4 CPU cores max
+        memory: "8Gi"   # 8GB RAM max
+  
+  # Storage configuration for production
+  storage:
+    storageClass: "fast-ssd"  # Use high-performance storage
+    metadataStorage: "10Gi"     # 10GB for metadata nodes
+    dataStorage: "100Gi"      # 100GB for data nodes
+  
+  # Production Antfly database configuration
+  config: |
+    {
+      "log": {
+        "level": "warn",
+        "style": "json"
+      },
+      "max_shard_size_bytes": 268435456,
+      "raft_snapshot_threshold": 50000,
+      "raft_heartbeat_timeout": "100ms",
+      "raft_election_timeout": "1000ms",
+      "cache_size": 10000,
+      "batch_size": 1000,
+      "enable_metrics": true,
+      "compression": "snappy",
+      "encryption_at_rest": true,
+      "backup_enabled": true,
+      "backup_interval": "6h",
+      "max_connections": 1000,
+      "connection_timeout": "30s",
+      "query_timeout": "60s"
+    }
+    

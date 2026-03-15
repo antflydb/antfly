@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Epstein Documents Search</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            text-align: center;
+            padding: 40px 20px;
+            background: #1a1a2e;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        header h1 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+
+        header p {
+            color: #aaa;
+            font-size: 0.95rem;
+        }
+
+        .search-box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        .search-form {
+            display: flex;
+            gap: 10px;
+        }
+
+        .search-input {
+            flex: 1;
+            padding: 12px 16px;
+            font-size: 16px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .search-input:focus {
+            border-color: #4a90d9;
+        }
+
+        .search-button {
+            padding: 12px 24px;
+            background: #4a90d9;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .search-button:hover {
+            background: #357abd;
+        }
+
+        .results-info {
+            color: #666;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+        }
+
+        .error {
+            background: #fee;
+            border: 1px solid #fcc;
+            color: #c00;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+
+        .result-card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 15px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.08);
+            transition: box-shadow 0.2s;
+        }
+
+        .result-card:hover {
+            box-shadow: 0 3px 15px rgba(0,0,0,0.12);
+        }
+
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 10px;
+        }
+
+        .result-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #1a1a2e;
+            flex: 1;
+        }
+
+        .result-link {
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        .result-link:hover {
+            color: #4a90d9;
+            text-decoration: underline;
+        }
+
+        .view-pdf-link {
+            color: #4a90d9;
+            text-decoration: none;
+            font-size: 0.85rem;
+            padding: 2px 8px;
+            border: 1px solid #4a90d9;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+
+        .view-pdf-link:hover {
+            background: #4a90d9;
+            color: white;
+        }
+
+        .result-score {
+            background: #e8f4e8;
+            color: #2d6a2d;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .result-meta {
+            font-size: 0.85rem;
+            color: #888;
+            margin-bottom: 10px;
+        }
+
+        .result-meta span {
+            margin-right: 15px;
+        }
+
+        .result-content {
+            color: #555;
+            font-size: 0.9rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: 'Georgia', 'Times New Roman', serif;
+            background: #fafafa;
+            padding: 12px 15px;
+            border-radius: 4px;
+            border-left: 3px solid #ddd;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .result-content mark {
+            background: #fff3cd;
+            padding: 0 2px;
+        }
+
+        .result-content::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .result-content::-webkit-scrollbar-track {
+            background: #f0f0f0;
+        }
+
+        .result-content::-webkit-scrollbar-thumb {
+            background: #ccc;
+            border-radius: 3px;
+        }
+
+        .no-results {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
+
+        .examples {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f0f0f0;
+            border-radius: 6px;
+        }
+
+        .examples h3 {
+            font-size: 0.9rem;
+            color: #666;
+            margin-bottom: 10px;
+        }
+
+        .example-queries {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .example-query {
+            background: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            color: #4a90d9;
+            text-decoration: none;
+            border: 1px solid #ddd;
+            transition: all 0.2s;
+        }
+
+        .example-query:hover {
+            background: #4a90d9;
+            color: white;
+            border-color: #4a90d9;
+        }
+
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: #888;
+            font-size: 0.85rem;
+        }
+
+        footer a {
+            color: #4a90d9;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Epstein Documents Search</h1>
+        <p>Search through publicly released court documents and DOJ files</p>
+    </header>
+
+    <div class="container">
+        <div class="search-box">
+            <form class="search-form" action="/search" method="GET">
+                <input
+                    type="text"
+                    name="q"
+                    class="search-input"
+                    placeholder="Search documents..."
+                    value="{{.Query}}"
+                    autofocus
+                >
+                <button type="submit" class="search-button">Search</button>
+            </form>
+
+            {{if not .Query}}
+            <div class="examples">
+                <h3>Example searches:</h3>
+                <div class="example-queries">
+                    <a href="/search?q=flight+logs" class="example-query">flight logs</a>
+                    <a href="/search?q=Virginia+Giuffre" class="example-query">Virginia Giuffre</a>
+                    <a href="/search?q=Little+St+James" class="example-query">Little St James</a>
+                    <a href="/search?q=massage" class="example-query">massage</a>
+                    <a href="/search?q=recruitment" class="example-query">recruitment</a>
+                    <a href="/search?q=Maxwell" class="example-query">Maxwell</a>
+                </div>
+            </div>
+            {{end}}
+        </div>
+
+        {{if .Error}}
+        <div class="error">
+            Error: {{.Error}}
+        </div>
+        {{end}}
+
+        {{if .Query}}
+        <div class="results-info">
+            Found {{.Total}} results for "{{.Query}}" ({{.Took}})
+        </div>
+
+        {{if .Results}}
+            {{range .Results}}
+            <div class="result-card">
+                <div class="result-header">
+                    {{if .URL}}
+                    <a href="{{.URL}}" target="_blank" class="result-title result-link">{{.Title}} 📄</a>
+                    {{else}}
+                    <div class="result-title">{{.Title}}</div>
+                    {{end}}
+                    <div class="result-score">Score: {{printf "%.2f" .Score}}</div>
+                </div>
+                <div class="result-meta">
+                    {{if .FilePath}}<span>File: {{.FilePath}}</span>{{end}}
+                    {{if .PageNum}}<span>Page: {{.PageNum}}</span>{{end}}
+                    {{if .URL}}<a href="{{.URL}}" target="_blank" class="view-pdf-link">View PDF</a>{{end}}
+                </div>
+                <div class="result-content">
+                    {{.Content}}
+                </div>
+            </div>
+            {{end}}
+        {{else}}
+            <div class="no-results">
+                No results found for "{{.Query}}"
+            </div>
+        {{end}}
+        {{end}}
+    </div>
+
+    <footer>
+        <p>
+            Powered by <a href="https://github.com/antflydb/antfly">Antfly</a> |
+            Documents sourced from <a href="https://archive.org/details/combined-all-epstein-files">Internet Archive</a> and <a href="https://www.justice.gov/epstein">DOJ</a>
+        </p>
+    </footer>
+</body>
+</html>

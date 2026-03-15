@@ -1,0 +1,35 @@
+[
+  {
+    "input": "What is 2+2?",
+    "reference": "4",
+    "metadata": {
+      "domain": "math",
+      "difficulty": "easy"
+    }
+  },
+  {
+    "input": "What is the capital of France?",
+    "reference": "Paris",
+    "metadata": {
+      "domain": "geography",
+      "difficulty": "easy"
+    }
+  },
+  {
+    "input": "What color is the sky?",
+    "reference": "(?i)blue",
+    "metadata": {
+      "domain": "general",
+      "difficulty": "easy",
+      "note": "Case-insensitive regex pattern"
+    }
+  },
+  {
+    "input": "Who wrote Romeo and Juliet?",
+    "reference": "(?i)william\\s+shakespeare|shakespeare",
+    "metadata": {
+      "domain": "literature",
+      "difficulty": "medium"
+    }
+  }
+]

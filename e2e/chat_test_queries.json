@@ -1,0 +1,68 @@
+[
+  {
+    "messages": [
+      {"role": "user", "content": "What is Antfly?"}
+    ],
+    "expected_keywords": ["database", "search", "vector", "distributed"],
+    "description": "Single-turn baseline: basic product description"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "How do I create a table in Antfly?"},
+      {"role": "assistant", "content": "To create a table in Antfly, you use the CreateTable API endpoint. You specify the table name, number of shards, and index configurations including full-text (BM25) and embedding (vector) indexes."},
+      {"role": "user", "content": "What index types can I add to it?"}
+    ],
+    "expected_keywords": ["full_text", "aknn", "embedding", "index"],
+    "description": "Multi-turn follow-up: ask about tables then follow up about indexes"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "I want to build a search feature for my app. What does Antfly offer?"},
+      {"role": "assistant", "content": "Antfly offers hybrid search combining BM25 full-text search with vector semantic search using reciprocal rank fusion (RRF). It also supports reranking, filtering, and RAG for AI-generated answers."},
+      {"role": "user", "content": "Tell me more about the reranking part specifically."}
+    ],
+    "expected_keywords": ["reranker", "cross-encoder", "relevance", "termite"],
+    "description": "Conversational refinement: broad question then narrow to reranking"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "How does Antfly handle data consistency across nodes?"}
+    ],
+    "expected_keywords": ["raft", "consensus", "leader", "replication"],
+    "description": "Single-turn technical: distributed systems question"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "Can I use Antfly for RAG?"},
+      {"role": "assistant", "content": "Yes, Antfly has built-in RAG support. You can use the RAG endpoint or the Answer Agent to retrieve relevant documents and generate AI-powered answers with citations."},
+      {"role": "user", "content": "What about a multi-turn chat experience with RAG?"}
+    ],
+    "expected_keywords": ["chat", "agent", "conversation", "messages"],
+    "description": "Multi-turn about chat capabilities: ask about RAG then about chat agent"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "What embedding providers does Antfly support?"},
+      {"role": "assistant", "content": "Antfly supports multiple embedding providers including OpenAI, Google/Gemini, Ollama, Bedrock, Vertex AI, and Termite for local ONNX inference."},
+      {"role": "user", "content": "Which one should I use for local development?"}
+    ],
+    "expected_keywords": ["ollama", "termite", "local", "onnx"],
+    "description": "Multi-turn recommendation: ask about providers then ask for local recommendation"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "Explain how semantic search works in Antfly."}
+    ],
+    "expected_keywords": ["embedding", "vector", "similarity", "aknn"],
+    "description": "Single-turn explanation: semantic search mechanics"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "How do I sync data from an external database to Antfly?"},
+      {"role": "assistant", "content": "Antfly provides the Linear Merge API for syncing external data sources. It performs a stateless, sorted merge of records - upserting new/changed records and deleting records that no longer exist in the source."},
+      {"role": "user", "content": "Does it support pagination for large datasets?"}
+    ],
+    "expected_keywords": ["linear merge", "pagination", "cursor", "batch"],
+    "description": "Multi-turn about data sync: ask about sync then about pagination"
+  }
+]

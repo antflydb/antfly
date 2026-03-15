@@ -1,0 +1,82 @@
+name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
+
+# Trigger on py-prefixed version tags only:
+# - py-v1.2.3       → publishes to PyPI
+# - py-v1.2.3-test1 → publishes to TestPyPI
+on:
+  push:
+    tags:
+      - 'py-v*'
+
+jobs:
+  build:
+    name: Build distribution 📦
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build a binary wheel and a source tarball
+        working-directory: py
+        run: uv build
+      - name: Store the distribution packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: py/dist/
+
+  publish-to-pypi:
+    name: >-
+      Publish Python 🐍 distribution 📦 to PyPI
+    # Only publish release tags (no -test suffix)
+    if: startsWith(github.ref, 'refs/tags/py-v') && !contains(github.ref, '-test')
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/antfly-sdk
+    permissions:
+      id-token: write # IMPORTANT: mandatory for trusted publishing
+
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish distribution 📦 to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-to-testpypi:
+    name: Publish Python 🐍 distribution 📦 to TestPyPI
+    # Only publish test tags (with -test suffix)
+    if: contains(github.ref, '-test')
+    needs:
+      - build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/antfly-sdk
+
+    permissions:
+      id-token: write # IMPORTANT: mandatory for trusted publishing
+
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish distribution 📦 to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/

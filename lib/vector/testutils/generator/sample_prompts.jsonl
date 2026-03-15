@@ -1,0 +1,10 @@
+{"id": 1, "title": "Neural Networks", "description": "Deep learning architectures that mimic the human brain", "category": "AI", "tags": ["machine learning", "deep learning"]}
+{"id": 2, "title": "Natural Language Processing", "description": "Teaching computers to understand and generate human language", "category": "AI", "tags": ["NLP", "linguistics"]}
+{"id": 3, "title": "Computer Vision", "description": "Enabling machines to interpret and understand visual information", "category": "AI", "tags": ["image processing", "object detection"]}
+{"id": 4, "title": "Reinforcement Learning", "description": "Training agents through rewards and penalties", "category": "AI", "tags": ["RL", "game AI"]}
+{"id": 5, "title": "Transformers", "description": "Attention-based models that revolutionized NLP", "category": "AI", "tags": ["BERT", "GPT"]}
+{"id": 6, "title": "Convolutional Networks", "description": "Specialized neural networks for processing grid-like data", "category": "AI", "tags": ["CNN", "image recognition"]}
+{"id": 7, "title": "Generative AI", "description": "Creating new content using machine learning models", "category": "AI", "tags": ["GANs", "diffusion models"]}
+{"id": 8, "title": "Knowledge Graphs", "description": "Representing information as interconnected entities and relationships", "category": "Data", "tags": ["graph database", "semantic web"]}
+{"id": 9, "title": "Vector Databases", "description": "Specialized databases for storing and querying high-dimensional vectors", "category": "Data", "tags": ["embeddings", "similarity search"]}
+{"id": 10, "title": "Edge Computing", "description": "Processing data closer to where it's generated", "category": "Infrastructure", "tags": ["IoT", "distributed computing"]}

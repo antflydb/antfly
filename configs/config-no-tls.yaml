@@ -1,0 +1,31 @@
+metadata:
+  orchestration_urls:
+    b: "http://127.0.0.1:12277"
+    c: "http://127.0.0.1:12278"
+    d: "http://127.0.0.1:12279"
+storage:
+  local:
+    base_dir: "antflydb"
+  keyvalue: "local"
+  metadatakv: "local"
+termite:
+  api_url: "http://127.0.0.1:11433"
+max_shard_size_bytes: 64000000
+replication_factor: 3
+disable_shard_alloc: true
+log_level: "debug"
+logging_style: "terminal"
+
+# CORS configuration for API server
+# Enables Cross-Origin Resource Sharing for remote dashboard access
+cors:
+  enabled: true
+  # Allow all origins (development mode) - use ["*"] for permissive access
+  allowed_origins: ["*"]
+  # For production, specify exact origins:
+  # allowed_origins: ["https://yourdomain.com", "https://app.yourdomain.com"]
+  allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
+  allowed_headers: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"]
+  # exposed_headers: []  # Add any custom headers your API returns that the frontend needs to read
+  # allow_credentials: false  # Set to true if using cookies/auth (requires specific origins, not "*")
+  max_age: 3600  # Cache preflight requests for 1 hour

@@ -1,0 +1,1025 @@
+openapi: 3.0.3
+info:
+  title: Index Configuration
+  description: "An OpenAPI specification for configuring different indexes in AntflyDB."
+  version: "0.0.1"
+components:
+  schemas:
+    SortDirection:
+      type: boolean
+      description: "Sort direction for a single field. true = descending, false = ascending."
+    SortField:
+      type: object
+      description: "A single sort field with direction."
+      required:
+        - field
+      properties:
+        field:
+          type: string
+          description: "The field name to sort by."
+        desc:
+          type: boolean
+          default: false
+          description: "Sort direction. true = descending, false = ascending."
+    IndexType:
+      # FIXME (ajr) Looks like a bug in oapi-codegen where it doesn't respect
+      # the x-go-type-skip-optional-pointer when the schema is referenced from
+      # another schema in the MarshalJSON.
+      #
+      # x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - full_text
+        - embeddings
+        - graph
+      description: "The type of the index."
+    IndexConfig:
+      type: object
+      description: "Configuration for an index"
+      oneOf:
+        - $ref: "#/components/schemas/FullTextIndexConfig"
+        - $ref: "#/components/schemas/EmbeddingsIndexConfig"
+        - $ref: "#/components/schemas/GraphIndexConfig"
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          description: "Name of the index"
+        description:
+          type: string
+          description: "Optional description of the index and its purpose"
+        type:
+          $ref: "#/components/schemas/IndexType"
+          x-go-name: "type"
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: "Version of the index implementation. Defaults to 0."
+        enrichments:
+          type: array
+          items:
+            type: string
+          x-go-type-skip-optional-pointer: true
+          description: "List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level."
+          example: ["semantic_chunks", "summary"]
+    FullTextIndexConfig:
+      type: object
+      properties:
+        mem_only:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether to use memory-only storage"
+    FullTextIndexStats:
+      type: object
+      properties:
+        error:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Error message if stats could not be retrieved"
+        total_indexed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents in the index"
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Size of the index in bytes"
+        rebuilding:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index is currently rebuilding"
+        backfill_progress:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Progress of ongoing rebuild as fraction [0.0, 1.0]"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents indexed during current rebuild"
+    EmbeddingsIndexConfig:
+      type: object
+      description: >-
+        Unified configuration for embeddings indexes.
+        When sparse is true, creates a sparse vector index (SPLADE inverted index).
+        When sparse is false (default), creates a dense vector index (HNSW).
+        For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+      properties:
+        sparse:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: "When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index."
+        dimension:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: "Vector dimension for dense indexes. Can be omitted when an embedder is configured (auto-detected via probe). Ignored for sparse indexes."
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Field to extract embeddings from"
+        template:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: >-
+            Handlebars template for generating prompts.
+            See https://handlebarsjs.com/guide/ for more information.
+          example: 'Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.'
+        distance_metric:
+          $ref: "#/components/schemas/DistanceMetric"
+        mem_only:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether to use in-memory only storage (dense only)"
+        embedder:
+          description: "Configuration for the embeddings plugin"
+          $ref: "../../../../lib/embeddings/openapi.yaml#/components/schemas/EmbedderConfig"
+        summarizer:
+          description: "Configuration for the summarizer plugin (dense only)"
+          $ref: "../../../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+        chunker:
+          description: "Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense only)"
+          $ref: "../../../../lib/chunking/openapi.yaml#/components/schemas/ChunkerConfig"
+        top_k:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          default: 10
+          description: "Default number of results to return from search (sparse only)"
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          default: 0.0
+          description: "Minimum weight threshold for sparse vector entries (sparse only)"
+        chunk_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 64
+          default: 1024
+          description: "Number of documents per posting list chunk (sparse only)"
+    EmbeddingsIndexStats:
+      type: object
+      description: "Statistics for an embeddings index (dense or sparse)"
+      properties:
+        error:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Error message if stats could not be retrieved"
+        total_indexed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of vectors/documents in the index"
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Size of the index in bytes"
+        total_nodes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Total number of nodes in the index (dense only)"
+        total_terms:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of unique terms in the inverted index (sparse only)"
+        rebuilding:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index enricher is currently backfilling"
+        wal_backlog:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents pending enrichment in the WAL"
+        backfill_progress:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Backfill progress as a ratio from 0.0 to 1.0"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Total items processed during backfill"
+    IndexStats:
+      type: object
+      description: "Statistics for an index"
+      oneOf:
+        - $ref: "#/components/schemas/FullTextIndexStats"
+        - $ref: "#/components/schemas/EmbeddingsIndexStats"
+        - $ref: "#/components/schemas/GraphIndexStats"
+    MergeStrategy:
+      type: string
+      enum:
+        - rrf
+        - rsf
+        - failover
+      default: rrf
+      description: |
+        Merge strategy for combining results from the semantic_search and full_text_search.
+        rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
+        rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
+        failover: Use full_text_search if embedding generation fails
+    MergeConfig:
+      type: object
+      description: Configuration for result fusion when combining multiple search indexes.
+      properties:
+        strategy:
+          $ref: "#/components/schemas/MergeStrategy"
+        weights:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: |
+            Named weights keyed by index name. `full_text` for the full-text search index;
+            embedding index names for vector indexes.
+            Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+          example:
+            full_text: 0.3
+            title_embedding: 1.0
+        window_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: RSF normalization window size. Defaults to `limit`.
+        rank_constant:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: RRF k constant (1/(k+rank)). Defaults to 60.0.
+    Pruner:
+      type: object
+      description: |
+        Configuration for pruning search results based on score quality.
+        Helps filter out low-relevance results in RAG pipelines by detecting
+        score gaps or deviations from top results.
+      properties:
+        min_score_ratio:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: |
+            Keep only results with score >= max_score * min_score_ratio.
+            For example, 0.5 keeps results scoring at least half of the top result.
+            Applied after fusion scoring.
+          example: 0.5
+        max_score_gap_percent:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: |
+            Stop returning results when the gap between consecutive scores
+            exceeds this percentage of the total score range (max - min).
+            Detects "elbows" in score distributions regardless of score scale.
+            For example, 30.0 stops when a gap spans 30% of the score range.
+          example: 30.0
+        min_absolute_score:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: |
+            Hard minimum score threshold. Results with scores below this value
+            are excluded regardless of other pruning settings.
+          example: 0.01
+        require_multi_index:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: |
+            Only keep results that appear in multiple indexes (both full-text
+            and vector search). Useful for increasing precision by requiring
+            agreement between different retrieval methods.
+          default: false
+        std_dev_threshold:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: |
+            Keep results within N standard deviations below the mean score.
+            For example, 1.0 keeps results with score >= mean - 1*stddev.
+            Useful for statistical outlier detection in result sets.
+          example: 1.5
+    DistanceMetric:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum: [l2_squared, inner_product, cosine]
+      default: l2_squared
+      description: >-
+        Distance metric for the vector index (dense only).
+        Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI).
+        Use "inner_product" for models trained with dot product similarity.
+        Use "l2_squared" (default) for models trained with Euclidean distance.
+    AntflyType:
+      type: string
+      enum:
+        - search_as_you_type
+        - keyword
+        - text
+        - html
+        - numeric
+        - datetime
+        - boolean
+        - link
+        - geopoint
+        - geoshape
+        - embedding
+        - blob
+    GraphIndexConfig:
+      type: object
+      description: "Configuration for graph index type"
+      properties:
+        summarizer:
+          description: "Configuration for generating node summaries (enables tree navigation in AnswerAgent)"
+          $ref: "../../../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+        template:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: |
+            Handlebars template for generating summarizer input text.
+            Uses document fields as template variables.
+            Same pattern as EmbeddingsConfig template.
+          example: "{{title}}\n{{content}}"
+        edge_types:
+          type: array
+          description: "List of edge types with their configurations"
+          items:
+            $ref: "#/components/schemas/EdgeTypeConfig"
+        max_edges_per_document:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Maximum number of edges per document (0 = unlimited)"
+    EdgeTypeConfig:
+      type: object
+      description: "Configuration for a specific edge type"
+      properties:
+        name:
+          type: string
+          description: "Edge type name (e.g., 'cites', 'similar_to')"
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: |
+            Document field containing target node key(s) for automatic edge creation.
+            Supports string (single target) or array of strings (multiple targets).
+            When omitted, edges must be provided explicitly via _edges.
+        topology:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - tree
+            - graph
+          default: graph
+          description: |
+            Topology constraint for this edge type:
+            - tree: Single parent per node, no cycles
+            - graph: No constraints (default)
+        max_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          default: 1.0
+          description: "Maximum allowed edge weight"
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          default: 0.0
+          description: "Minimum allowed edge weight"
+        allow_self_loops:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: true
+          description: "Whether to allow edges from a node to itself"
+        required_metadata:
+          type: array
+          description: "Required metadata fields for this edge type"
+          items:
+            type: string
+      required:
+        - name
+    GraphIndexStats:
+      type: object
+      description: "Statistics for graph index"
+      properties:
+        error:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Error message if stats could not be retrieved"
+        total_edges:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Total number of edges in the graph"
+        edge_types:
+          type: object
+          additionalProperties:
+            type: integer
+            format: uint64
+          description: "Count of edges per edge type"
+        rebuilding:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index is currently rebuilding"
+        backfill_progress:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Rebuild progress as a ratio from 0.0 to 1.0"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of edges indexed during current rebuild"
+    Edge:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "A typed, weighted connection between documents"
+      required:
+        - source
+        - target
+        - type
+        - weight
+      properties:
+        source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: byte
+          description: Base64-encoded source document key
+        target:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: byte
+          description: Base64-encoded target document key
+        type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Edge type (e.g., "cites", "similar_to", "authored_by")
+        weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: Edge weight/confidence (0.0 to 1.0)
+        created_at:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: date-time
+          description: When the edge was created
+        updated_at:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: date-time
+          description: When the edge was last updated
+        metadata:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Optional edge metadata
+    EdgeDirection:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - out
+        - in
+        - both
+      default: out
+      description: |
+        Direction of edges to query:
+        - out: Outgoing edges from the node
+        - in: Incoming edges to the node
+        - both: Both outgoing and incoming edges
+    GraphQueryType:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - traverse
+        - neighbors
+        - shortest_path
+        - k_shortest_paths
+        - pattern
+      description: "Type of graph query to execute"
+    PathWeightMode:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - min_hops
+        - min_weight
+        - max_weight
+      description: |
+        Path weighting algorithm for pathfinding:
+        - min_hops: Minimize number of edges
+        - min_weight: Minimize sum of edge weights
+        - max_weight: Maximize product of edge weights
+    TraversalRules:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "Rules for graph traversal"
+      properties:
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: Filter edges by type (empty = all types)
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          default: 0.0
+          description: Minimum edge weight filter
+        max_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          default: 1.0
+          description: Maximum edge weight filter
+        direction:
+          $ref: "#/components/schemas/EdgeDirection"
+        max_depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 3
+          description: Maximum traversal depth (0 = unlimited)
+        max_results:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 100
+          description: Maximum results to return (0 = unlimited)
+        include_paths:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: Include path information in results
+        deduplicate_nodes:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: true
+          description: Visit each node only once
+    TraversalResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "A single result from graph traversal"
+      required:
+        - key
+        - depth
+      properties:
+        key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: byte
+          description: Base64-encoded document key
+        document:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Document data (if loaded)
+        depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: Distance from start node (0 = start node)
+        path:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+            format: byte
+          description: Sequence of keys from start to this node (if include_paths=true)
+        path_edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: "#/components/schemas/Edge"
+          description: Sequence of edges from start to this node (if include_paths=true)
+        total_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: Product of edge weights along the path
+    PathFindWeightMode:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - min_hops
+        - max_weight
+        - min_weight
+      default: min_hops
+      description: |-
+        Algorithm for path finding:
+        - min_hops: Shortest path by hop count (breadth-first search, ignores weights)
+        - max_weight: Path with maximum product of edge weights (strongest connection chain)
+        - min_weight: Path with minimum sum of edge weights (lowest cost route)
+    PathFindRequest:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      required:
+        - source
+        - target
+      properties:
+        source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Source node key (base64-encoded)
+        target:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Target node key (base64-encoded)
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: Filter by specific edge types
+        max_depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 50
+        weight_mode:
+          $ref: "#/components/schemas/PathFindWeightMode"
+        k:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 1
+          minimum: 1
+          maximum: 100
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+        max_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+        direction:
+          $ref: "#/components/schemas/EdgeDirection"
+    PathFindResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      properties:
+        paths:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: "#/components/schemas/Path"
+        source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        target:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        weight_mode:
+          $ref: "#/components/schemas/PathFindWeightMode"
+        paths_found:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+        search_time_ms:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+    Path:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      properties:
+        nodes:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: Ordered list of node keys (base64-encoded)
+        edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: "#/components/schemas/PathEdge"
+        total_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+        length:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+    PathEdge:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      properties:
+        source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        target:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+        metadata:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+    NodeFilter:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "Filter nodes during graph traversal using existing query primitives"
+      properties:
+        filter_query:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Bleve query to filter nodes (same syntax as search filter_query)"
+        filter_prefix:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Filter by key prefix"
+    GraphNodeSelector:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "Defines how to select start/target nodes for graph queries"
+      properties:
+        keys:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Explicit list of node keys"
+        result_ref:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: |
+            Reference to search results to use as nodes:
+            - "$full_text_results" - use full-text search results
+            - "$embeddings_results.index_name" - use vector search results from specific index
+        limit:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Maximum number of nodes to select from the referenced results"
+        node_filter:
+          $ref: "#/components/schemas/NodeFilter"
+          description: "Filter which nodes to use as start/target"
+    GraphQueryParams:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "Parameters for graph traversal and pathfinding"
+      properties:
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Filter by edge types"
+        direction:
+          $ref: "#/components/schemas/EdgeDirection"
+        max_depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Maximum traversal depth"
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Minimum edge weight"
+        max_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Maximum edge weight"
+        max_results:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Maximum number of results (traversal)"
+        deduplicate_nodes:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Remove duplicate nodes (traversal)"
+        include_paths:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Include path information (traversal)"
+        weight_mode:
+          $ref: "#/components/schemas/PathWeightMode"
+        k:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Number of paths to find (k-shortest-paths)"
+        node_filter:
+          $ref: "#/components/schemas/NodeFilter"
+          description: "Filter which nodes to visit during traversal"
+        algorithm:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Graph algorithm to run (e.g., 'pagerank', 'betweenness')"
+        algorithm_params:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Parameters for the graph algorithm"
+    GraphResultNode:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "A node in graph query results"
+      required:
+        - key
+      properties:
+        key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Document key"
+        depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Distance from start node"
+        distance:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Weighted distance"
+        document:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Full document (if include_documents=true)"
+        path:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Keys in path from start to this node"
+        path_edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PathEdge'
+          description: "Edges in path from start to this node"
+        edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/Edge'
+          description: "Connected edges (when include_edges=true)"
+    PatternEdgeStep:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "Edge constraints in a pattern step"
+      properties:
+        types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Edge types to traverse (empty = any)"
+        direction:
+          $ref: "#/components/schemas/EdgeDirection"
+        min_hops:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 1
+          minimum: 1
+          description: "Minimum number of hops (1 = direct edge)"
+        max_hops:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 1
+          minimum: 1
+          description: "Maximum number of hops (>1 = variable-length path)"
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Minimum edge weight filter"
+        max_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Maximum edge weight filter"
+    PatternStep:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "A step in a graph pattern query"
+      properties:
+        alias:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Name for this node (reuse alias for cycle detection)"
+        node_filter:
+          $ref: "#/components/schemas/NodeFilter"
+          description: "Filter constraints for nodes at this step"
+        edge:
+          $ref: "#/components/schemas/PatternEdgeStep"
+          description: "Edge to traverse to reach this step (null for first step)"
+    GraphQuery:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "Declarative graph query to execute after full-text/vector searches"
+      required:
+        - type
+        - index_name
+      properties:
+        type:
+          $ref: "#/components/schemas/GraphQueryType"
+        index_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Graph index name (must be graph type)"
+        start_nodes:
+          $ref: '#/components/schemas/GraphNodeSelector'
+          description: "Starting node(s) for the query"
+        target_nodes:
+          $ref: '#/components/schemas/GraphNodeSelector'
+          description: "Target nodes (for pathfinding only)"
+        params:
+          $ref: '#/components/schemas/GraphQueryParams'
+          description: "Traversal/pathfinding parameters"
+        pattern:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternStep'
+          description: "Pattern steps for pattern query type"
+        return_aliases:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Which aliases to return from pattern query (empty = all)"
+        include_documents:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Fetch full documents for graph results"
+        include_edges:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Include edge details for each node"
+        fields:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Which fields to return from documents"
+    PatternMatch:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "A single match from a pattern query"
+      properties:
+        bindings:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphResultNode'
+          description: "Map of alias to matched node"
+        path:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PathEdge'
+          description: "Edges traversed in this match"
+    GraphQueryResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: "Results of a graph query"
+      required:
+        - type
+        - total
+      properties:
+        type:
+          $ref: "#/components/schemas/GraphQueryType"
+        nodes:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResultNode'
+          description: "Result nodes"
+        paths:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/Path'
+          description: "Result paths (for pathfinding queries)"
+        matches:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternMatch'
+          description: "Pattern matches (for pattern queries)"
+        total:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Total number of results"
+        took:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: int64
+          x-go-type: time.Duration
+          description: "Query execution time"

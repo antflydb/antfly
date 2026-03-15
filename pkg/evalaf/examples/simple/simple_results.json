@@ -1,0 +1,187 @@
+{
+  "summary": {
+    "total_examples": 3,
+    "passed_examples": 2,
+    "failed_examples": 1,
+    "average_score": 0.78125,
+    "pass_rate": 0.6666666666666666,
+    "total_duration": 151834,
+    "evaluator_stats": {
+      "contains": {
+        "name": "contains",
+        "total_evaluations": 3,
+        "passed": 2,
+        "failed": 1,
+        "errors": 0,
+        "average_score": 0.6666666666666666,
+        "pass_rate": 0.6666666666666666,
+        "average_duration": 6319
+      },
+      "exact_match": {
+        "name": "exact_match",
+        "total_evaluations": 3,
+        "passed": 2,
+        "failed": 1,
+        "errors": 0,
+        "average_score": 0.6666666666666666,
+        "pass_rate": 0.6666666666666666,
+        "average_duration": 15471
+      },
+      "fuzzy_match": {
+        "name": "fuzzy_match",
+        "total_evaluations": 3,
+        "passed": 2,
+        "failed": 1,
+        "errors": 0,
+        "average_score": 0.7916666666666666,
+        "pass_rate": 0.6666666666666666,
+        "average_duration": 26999
+      },
+      "regex_match": {
+        "name": "regex_match",
+        "total_evaluations": 3,
+        "passed": 3,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 15124
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is 2+2?",
+        "reference": "4",
+        "metadata": {
+          "domain": "math"
+        }
+      },
+      "output": "4",
+      "results": {
+        "contains": {
+          "pass": true,
+          "score": 1,
+          "reason": "Output contains \"4\""
+        },
+        "exact_match": {
+          "pass": true,
+          "score": 1,
+          "reason": "Output matches reference exactly"
+        },
+        "fuzzy_match": {
+          "pass": true,
+          "score": 1,
+          "reason": "Similarity: 100.00% (threshold: 80.00%)",
+          "metadata": {
+            "levenshtein_distance": 0,
+            "similarity": 1,
+            "threshold": 0.8
+          }
+        },
+        "regex_match": {
+          "pass": true,
+          "score": 1,
+          "reason": "Output matches pattern \"4\""
+        }
+      },
+      "duration": 36208,
+      "timestamp": "2025-11-11T14:38:56.23409-08:00"
+    },
+    {
+      "example": {
+        "input": "What is the capital of France?",
+        "reference": "Paris",
+        "metadata": {
+          "domain": "geography"
+        }
+      },
+      "output": "Paris",
+      "results": {
+        "contains": {
+          "pass": true,
+          "score": 1,
+          "reason": "Output contains \"Paris\""
+        },
+        "exact_match": {
+          "pass": true,
+          "score": 1,
+          "reason": "Output matches reference exactly"
+        },
+        "fuzzy_match": {
+          "pass": true,
+          "score": 1,
+          "reason": "Similarity: 100.00% (threshold: 80.00%)",
+          "metadata": {
+            "levenshtein_distance": 0,
+            "similarity": 1,
+            "threshold": 0.8
+          }
+        },
+        "regex_match": {
+          "pass": true,
+          "score": 1,
+          "reason": "Output matches pattern \"Paris\""
+        }
+      },
+      "duration": 39250,
+      "timestamp": "2025-11-11T14:38:56.234123-08:00"
+    },
+    {
+      "example": {
+        "input": "What color is the sky?",
+        "reference": "(?i)blue",
+        "metadata": {
+          "domain": "general"
+        }
+      },
+      "output": "Blue",
+      "results": {
+        "contains": {
+          "pass": false,
+          "score": 0,
+          "reason": "Output does not contain \"(?i)blue\""
+        },
+        "exact_match": {
+          "pass": false,
+          "score": 0,
+          "reason": "Output does not match reference (got \"Blue\", expected \"(?i)blue\")"
+        },
+        "fuzzy_match": {
+          "pass": false,
+          "score": 0.375,
+          "reason": "Similarity: 37.50% (threshold: 80.00%)",
+          "metadata": {
+            "levenshtein_distance": 5,
+            "similarity": 0.375,
+            "threshold": 0.8
+          }
+        },
+        "regex_match": {
+          "pass": true,
+          "score": 1,
+          "reason": "Output matches pattern \"(?i)blue\""
+        }
+      },
+      "duration": 67500,
+      "timestamp": "2025-11-11T14:38:56.234035-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": true,
+      "max_concurrency": 5,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-11T14:38:56.234011-08:00"
+}

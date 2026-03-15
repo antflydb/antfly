@@ -1,0 +1,522 @@
+{
+  "summary": {
+    "total_examples": 5,
+    "passed_examples": 5,
+    "failed_examples": 0,
+    "average_score": 1,
+    "pass_rate": 1,
+    "total_duration": 30401399000,
+    "evaluator_stats": {
+      "citations": {
+        "name": "citations",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 13873
+      },
+      "completeness": {
+        "name": "completeness",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 1310623116
+      },
+      "coverage": {
+        "name": "coverage",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 5616
+      },
+      "faithfulness": {
+        "name": "faithfulness",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 1124151774
+      },
+      "relevance": {
+        "name": "relevance",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 1075179799
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is machine learning?",
+        "reference": "Machine learning is a subset of artificial intelligence that learns from data to make predictions and decisions.",
+        "context": [
+          "Machine learning is a subset of artificial intelligence that focuses on developing systems that can learn from and make decisions based on data.",
+          "It involves training algorithms on large datasets to recognize patterns and make predictions.",
+          "Common applications include image recognition, natural language processing, and recommendation systems."
+        ],
+        "metadata": {
+          "difficulty": "easy",
+          "domain": "ai",
+          "expected_citation_count": 2
+        }
+      },
+      "output": {
+        "generation": "Machine learning is a subset of artificial intelligence that focuses on developing systems that can learn from and make decisions based on data [doc0]. It involves training algorithms on large datasets to recognize patterns and make predictions [doc1]. Common applications include image recognition, natural language processing, and recommendation systems [doc2].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What is machine learning?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 3 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 3,
+            "cited_doc_ids": [
+              1,
+              2,
+              0
+            ],
+            "context_doc_count": 3,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer effectively defines machine learning as a subset of AI and accurately describes the core process of learning from data and making predictions. It also provides relevant examples of applications. It’s a concise and well-written explanation suitable for a general audience. No significant aspects are missing.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer effectively defines machine learning as a subset of AI and accurately describes the core process of learning from data and making predictions. It also provides relevant examples of applications. It’s a concise and well-written explanation suitable for a general audience. No significant aspects are missing.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 3/3 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 3,
+            "cited_ids": [
+              1,
+              2,
+              0
+            ],
+            "context_count": 3,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately reflects the definitions and applications of machine learning as presented in the provided context documents. It successfully synthesizes the information from all three documents.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately reflects the definitions and applications of machine learning as presented in the provided context documents. It successfully synthesizes the information from all three documents.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly defines machine learning as a subset of AI, explains its core process of learning from data and making predictions, and provides relevant examples of applications. It comprehensively addresses the question's core elements.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly defines machine learning as a subset of AI, explains its core process of learning from data and making predictions, and provides relevant examples of applications. It comprehensively addresses the question's core elements.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        }
+      },
+      "duration": 5641495958,
+      "timestamp": "2025-11-11T22:49:34.240216-08:00"
+    },
+    {
+      "example": {
+        "input": "How does neural network training work?",
+        "reference": "Neural networks are trained using backpropagation and gradient descent to minimize loss by adjusting weights.",
+        "context": [
+          "Neural network training involves adjusting weights and biases through backpropagation.",
+          "The process uses gradient descent to minimize the loss function.",
+          "Training requires labeled data and multiple epochs to converge.",
+          "Regularization techniques like dropout help prevent overfitting."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "ai",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Neural network training works through a process of adjusting weights and biases to minimize errors [doc0]. This is achieved using gradient descent, which iteratively updates these parameters to reduce the loss function [doc1]. The training process requires labeled data and typically involves multiple epochs to allow the network to converge [doc2]. Furthermore, techniques like dropout are utilized to prevent overfitting during the training process [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "How does neural network training work?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer effectively explains the core concepts of neural network training: weight/bias adjustment via gradient descent, the role of labeled data and epochs, and the use of regularization techniques like dropout. It’s concise and provides a good overview.  A slightly higher score could be given if it briefly explained the concept of a loss function.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer effectively explains the core concepts of neural network training: weight/bias adjustment via gradient descent, the role of labeled data and epochs, and the use of regularization techniques like dropout. It’s concise and provides a good overview.  A slightly higher score could be given if it briefly explained the concept of a loss function.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the key steps of neural network training as described in all three provided context documents (doc0, doc1, and doc2). It correctly identifies the use of weight/bias adjustment, gradient descent, labeled data, epochs, and regularization (dropout).\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the key steps of neural network training as described in all three provided context documents (doc0, doc1, and doc2). It correctly identifies the use of weight/bias adjustment, gradient descent, labeled data, epochs, and regularization (dropout).\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by explaining the core components of neural network training: weight and bias adjustment via gradient descent, the use of labeled data and epochs, and the concept of regularization (dropout). It provides a good overview of the process.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by explaining the core components of neural network training: weight and bias adjustment via gradient descent, the use of labeled data and epochs, and the concept of regularization (dropout). It provides a good overview of the process.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 6368997791,
+      "timestamp": "2025-11-11T22:49:39.881573-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the benefits of distributed databases?",
+        "reference": "Distributed databases offer scalability, high availability, and improved performance through data distribution.",
+        "context": [
+          "Distributed databases provide horizontal scalability by spreading data across multiple nodes.",
+          "They offer high availability through replication and fault tolerance.",
+          "Distributed systems can handle larger workloads than single-node databases.",
+          "Geographic distribution reduces latency for users in different regions."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "databases",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Distributed databases offer several key benefits. Primarily, they provide horizontal scalability by spreading data across multiple nodes [doc0]. This allows them to handle larger workloads than traditional, single-node databases [doc2]. Furthermore, distributed databases offer high availability through replication and fault tolerance [doc1]. Finally, geographic distribution reduces latency for users in different regions [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What are the benefits of distributed databases?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              2,
+              1,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively addresses the question by outlining key benefits of distributed databases: horizontal scalability, high availability, and reduced latency through geographic distribution. It correctly links these benefits to the architecture of distributed databases. The inclusion of 'doc0', 'doc1', 'doc2', and 'doc3' suggests further supporting details are available, which strengthens the response.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively addresses the question by outlining key benefits of distributed databases: horizontal scalability, high availability, and reduced latency through geographic distribution. It correctly links these benefits to the architecture of distributed databases. The inclusion of 'doc0', 'doc1', 'doc2', and 'doc3' suggests further supporting details are available, which strengthens the response.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              2,
+              1,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the benefits of distributed databases as outlined in the provided context documents. It correctly identifies scalability, high availability, and geographic distribution as key advantages.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the benefits of distributed databases as outlined in the provided context documents. It correctly identifies scalability, high availability, and geographic distribution as key advantages.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer directly addresses the question by outlining key benefits of distributed databases: horizontal scalability, high availability, and reduced latency due to geographic distribution. It also references supporting documentation.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer directly addresses the question by outlining key benefits of distributed databases: horizontal scalability, high availability, and reduced latency due to geographic distribution. It also references supporting documentation.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        }
+      },
+      "duration": 5953722584,
+      "timestamp": "2025-11-11T22:49:46.250413-08:00"
+    },
+    {
+      "example": {
+        "input": "Explain the CAP theorem",
+        "reference": "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+        "context": [
+          "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+          "Consistency means all nodes see the same data at the same time.",
+          "Availability ensures every request receives a response, without guarantee of the most recent data.",
+          "Partition tolerance allows the system to continue operating despite network partitions."
+        ],
+        "metadata": {
+          "difficulty": "hard",
+          "domain": "databases",
+          "expected_citation_count": 4
+        }
+      },
+      "output": {
+        "generation": "The CAP theorem states that distributed systems can only guarantee two out of three properties: Consistency, Availability, and Partition tolerance [doc0].\n\n*   **Consistency** means that all nodes in the system see the same data at the same time [doc1].\n*   **Availability** ensures that every request receives a response, without any guarantee that the response is the most recent data [doc2].\n*   **Partition tolerance** allows the system to continue operating despite network partitions [doc3].\n\nEssentially, a distributed system must choose between consistency and availability when a network partition occurs [doc0].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "Explain the CAP theorem",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 5 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 5,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer clearly and accurately explains the CAP theorem, defining each of its components (Consistency, Availability, and Partition tolerance) and highlights the fundamental trade-off. The explanation is concise and easy to understand. The inclusion of the citation to the source documents further strengthens the response. It fully addresses the question.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer clearly and accurately explains the CAP theorem, defining each of its components (Consistency, Availability, and Partition tolerance) and highlights the fundamental trade-off. The explanation is concise and easy to understand. The inclusion of the citation to the source documents further strengthens the response. It fully addresses the question.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately and completely reflects the information provided in the context documents. It correctly defines each of the CAP theorem properties and highlights the trade-off between consistency and availability during a partition.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately and completely reflects the information provided in the context documents. It correctly defines each of the CAP theorem properties and highlights the trade-off between consistency and availability during a partition.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer directly and accurately explains the CAP theorem, defining its three properties (Consistency, Availability, Partition tolerance) and the fundamental trade-off between them. It's a concise and correct explanation of the core concept.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer directly and accurately explains the CAP theorem, defining its three properties (Consistency, Availability, Partition tolerance) and the fundamental trade-off between them. It's a concise and correct explanation of the core concept.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        }
+      },
+      "duration": 6507751709,
+      "timestamp": "2025-11-11T22:49:52.203988-08:00"
+    },
+    {
+      "example": {
+        "input": "What is vector search?",
+        "reference": "Vector search uses embeddings and approximate nearest neighbor algorithms to find semantically similar content.",
+        "context": [
+          "Vector search uses embeddings to find semantically similar content.",
+          "It converts text, images, or other data into high-dimensional vectors.",
+          "Approximate nearest neighbor algorithms like HNSW enable fast retrieval.",
+          "Vector search powers modern semantic search and recommendation systems."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "search",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Vector search is a technique that utilizes embeddings to find content with semantic similarity [doc0]. It works by first converting text, images, or other data into high-dimensional vectors [doc1]. These algorithms, often using approximate nearest neighbor algorithms like HNSW [doc2], enable fast retrieval of similar items. Ultimately, vector search powers modern semantic search and recommendation systems [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What is vector search?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              1,
+              2,
+              3,
+              0
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively explains vector search, covering its core functionality (using embeddings and approximate nearest neighbor algorithms), its purpose (semantic similarity and powering search/recommendation systems), and includes relevant terminology (embeddings, HNSW). It doesn't leave any major gaps in understanding.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively explains vector search, covering its core functionality (using embeddings and approximate nearest neighbor algorithms), its purpose (semantic similarity and powering search/recommendation systems), and includes relevant terminology (embeddings, HNSW). It doesn't leave any major gaps in understanding.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the key aspects of vector search as described in the context documents. It correctly identifies the use of embeddings, the conversion to vectors, the role of approximate nearest neighbor algorithms, and its application in semantic search and recommendation systems.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the key aspects of vector search as described in the context documents. It correctly identifies the use of embeddings, the conversion to vectors, the role of approximate nearest neighbor algorithms, and its application in semantic search and recommendation systems.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer directly defines vector search, explaining its core function (using embeddings and approximate nearest neighbor algorithms for similarity retrieval) and its applications (semantic search and recommendation).\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer directly defines vector search, explaining its core function (using embeddings and approximate nearest neighbor algorithms for similarity retrieval) and its applications (semantic search and recommendation).\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        }
+      },
+      "duration": 5929426792,
+      "timestamp": "2025-11-11T22:49:58.711578-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": false,
+      "max_concurrency": 1,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-11T22:49:34.240215-08:00"
+}

@@ -1,0 +1,124 @@
+services:
+  # MinIO - S3-compatible object storage
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"  # MinIO API
+      - "9001:9001"  # MinIO Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - antfly-network
+    restart: always
+
+  # MinIO Client - Create bucket on startup
+  minio-setup:
+    image: minio/mc:latest
+    container_name: minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb myminio/antfly-data --ignore-existing;
+      mc anonymous set download myminio/antfly-data;
+      echo 'MinIO bucket setup complete';
+      exit 0;
+      "
+    networks:
+      - antfly-network
+
+  # Antfly with S3 storage enabled
+  antfly:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["swarm", "--config", "/config.yaml"]
+    ports:
+      - "8080:8080"  # Public API port
+      - "4200:4200"  # Metrics port
+    volumes:
+      - ./antfly-data:/antflydb
+      - ./config.yaml:/config.yaml
+    container_name: antfly-swarm-s3
+    environment:
+      - ANTFLY_LOG_LEVEL=debug
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    restart: always
+    networks:
+      - antfly-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:4200/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Ollama for embeddings (optional)
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+      - ./entrypoint.sh:/entrypoint.sh
+    container_name: ollama
+    pull_policy: always
+    tty: true
+    restart: always
+    entrypoint: ["/usr/bin/bash", "/entrypoint.sh"]
+    networks:
+      - antfly-network
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ../prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    restart: always
+    networks:
+      - antfly-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    restart: always
+    networks:
+      - antfly-network
+
+networks:
+  antfly-network:
+    driver: bridge
+
+volumes:
+  antfly-data:
+  minio-data:
+  ollama-data:
+  grafana-data:

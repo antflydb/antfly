@@ -1,0 +1,355 @@
+/* -----------------------------------------------------------
+   SearchAF Design Tokens - Source of Truth
+   Sync with Figma/Storybook
+   ----------------------------------------------------------- */
+
+:root {
+  /* ===== Brand Colors (Light Mode) - Monochrome ===== */
+  --searchaf-1: #ffffff;
+  --searchaf-2: #fafafa;
+  --searchaf-3: #f5f5f5;
+  --searchaf-4: #e5e5e5;
+  --searchaf-5: #d4d4d4;
+  --searchaf-6: #a3a3a3;
+  --searchaf-7: #737373;
+  --searchaf-8: #525252;
+  --searchaf-9: #1c2024; /* primary brand color - dark monochrome */
+  --searchaf-10: #18181b;
+  --searchaf-11: #09090b;
+  --searchaf-12: #000000;
+
+  /* ===== Neutral Scale (Light) ===== */
+  --gray-1: #fcfcfc;
+  --gray-2: #f9f9f9;
+  --gray-3: #f0f0f0;
+  --gray-4: #e4e4e7;
+  --gray-5: #d4d4d8;
+  --gray-6: #a1a1aa;
+  --gray-7: #71717a;
+  --gray-8: #52525b;
+  --gray-9: #3f3f46;
+  --gray-10: #27272a;
+  --gray-11: #18181b;
+  --gray-12: #09090b;
+
+  /* ===== Semantic Colors (Light Mode) ===== */
+  --background: #ffffff;
+  --background-secondary: #fafafa;
+  --foreground: #1c2024;
+  --card: #ffffff;
+  --card-foreground: #1c2024;
+  --popover: #ffffff;
+  --popover-foreground: #1c2024;
+  --primary: #1c2024;
+  --primary-foreground: #ffffff;
+  --secondary: var(--searchaf-3);
+  --secondary-foreground: var(--gray-9);
+  --muted: var(--searchaf-3);
+  --muted-foreground: var(--gray-7);
+  --accent: var(--searchaf-4);
+  --accent-foreground: var(--searchaf-9);
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: var(--gray-4);
+  --input: var(--gray-3);
+  --ring: var(--searchaf-8);
+
+  /* Danger */
+  --danger-50: #fef2f2;
+  --danger-100: #fee2e2;
+  --danger-200: #fecaca;
+  --danger-300: #fca5a5;
+  --danger-400: #f87171;
+  --danger-500: #ef4444;
+  --danger-600: #dc2626;
+  --danger-700: #b91c1c;
+  --danger-800: #991b1b;
+  --danger-900: #7f1d1d;
+  --danger-fg: #ffffff;
+
+  /* Success */
+  --success-50: #f0fdf4;
+  --success-100: #dcfce7;
+  --success-200: #bbf7d0;
+  --success-300: #86efac;
+  --success-400: #4ade80;
+  --success-500: #22c55e;
+  --success-600: #16a34a;
+  --success-700: #15803d;
+  --success-800: #166534;
+  --success-900: #14532d;
+  --success-fg: #0a0a0b;
+
+  /* Info */
+  --info-50: #eff6ff;
+  --info-100: #dbeafe;
+  --info-200: #bfdbfe;
+  --info-300: #93c5fd;
+  --info-400: #60a5fa;
+  --info-500: #3b82f6;
+  --info-600: #2563eb;
+  --info-700: #1d4ed8;
+  --info-800: #1e40af;
+  --info-900: #1e3a8a;
+  --info-fg: #ffffff;
+
+  /* Warning */
+  --warning-50: #fffbeb;
+  --warning-100: #fef3c7;
+  --warning-200: #fde68a;
+  --warning-300: #fcd34d;
+  --warning-400: #fbbf24;
+  --warning-500: #f59e0b;
+  --warning-600: #d97706;
+  --warning-700: #b45309;
+  --warning-800: #92400e;
+  --warning-900: #78350f;
+  --warning-fg: #0a0a0b;
+
+  /* Badge Colors - Purple (for semantic/branded badges) */
+  --badge-purple-50: #faf5ff;
+  --badge-purple-100: #f3e8ff;
+  --badge-purple-200: #e9d5ff;
+  --badge-purple-300: #d8b4fe;
+  --badge-purple-400: #c084fc;
+  --badge-purple-500: #a855f7;
+  --badge-purple-600: #9333ea;
+  --badge-purple-700: #7e22ce;
+  --badge-purple-800: #6b21a8;
+  --badge-purple-900: #581c87;
+  --badge-purple-fg: #ffffff;
+
+  /* Badge Colors - Blue (for info/processing badges) */
+  --badge-blue-50: #eff6ff;
+  --badge-blue-100: #dbeafe;
+  --badge-blue-200: #bfdbfe;
+  --badge-blue-300: #93c5fd;
+  --badge-blue-400: #60a5fa;
+  --badge-blue-500: #3b82f6;
+  --badge-blue-600: #2563eb;
+  --badge-blue-700: #1d4ed8;
+  --badge-blue-800: #1e40af;
+  --badge-blue-900: #1e3a8a;
+  --badge-blue-fg: #ffffff;
+
+  /* Badge Colors - Green (for success/filtered badges) */
+  --badge-green-50: #f0fdf4;
+  --badge-green-100: #dcfce7;
+  --badge-green-200: #bbf7d0;
+  --badge-green-300: #86efac;
+  --badge-green-400: #4ade80;
+  --badge-green-500: #22c55e;
+  --badge-green-600: #16a34a;
+  --badge-green-700: #15803d;
+  --badge-green-800: #166534;
+  --badge-green-900: #14532d;
+  --badge-green-fg: #0a0a0b;
+
+  /* Badge Colors - Orange (for warning/aggregation badges) */
+  --badge-orange-50: #fff7ed;
+  --badge-orange-100: #ffedd5;
+  --badge-orange-200: #fed7aa;
+  --badge-orange-300: #fdba74;
+  --badge-orange-400: #fb923c;
+  --badge-orange-500: #f97316;
+  --badge-orange-600: #ea580c;
+  --badge-orange-700: #c2410c;
+  --badge-orange-800: #9a3412;
+  --badge-orange-900: #7c2d12;
+  --badge-orange-fg: #0a0a0b;
+
+  /* ===== Showcase Background Colors (Light Mode) ===== */
+  --showcase-bg-rose: #e85a8f;
+  --showcase-bg-red: #e85a5a;
+  --showcase-bg-orange: #e88a5a;
+  --showcase-bg-amber: #e8b05a;
+  --showcase-bg-yellow: #e8d85a;
+  --showcase-bg-lime: #b0e85a;
+  --showcase-bg-green: #5ae85a;
+  --showcase-bg-emerald: #5ae8a0;
+  --showcase-bg-teal: #5ae8c8;
+  --showcase-bg-cyan: #5ac8e8;
+  --showcase-bg-sky: #5a9ae8;
+  --showcase-bg-blue: #5a5ae8;
+  --showcase-bg-indigo: #8a5ae8;
+  --showcase-bg-violet: #b05ae8;
+  --showcase-bg-purple: #d85ae8;
+  --showcase-bg-slate: #27272a; /* Blackish gray */
+  --showcase-bg-gray: #e4e4e7; /* Light gray */
+}
+
+/* Dark Mode */
+.dark {
+  /* ===== Brand Colors (Dark Mode) - Monochrome ===== */
+  --searchaf-1: #0a0a0a;
+  --searchaf-2: #0f0f0f;
+  --searchaf-3: #131313;
+  --searchaf-4: #262626;
+  --searchaf-5: #3a3a3a;
+  --searchaf-6: #525252;
+  --searchaf-7: #737373;
+  --searchaf-8: #a1a1a1;
+  --searchaf-9: #e5e5e5; /* primary brand color in dark - light monochrome */
+  --searchaf-10: #f5f5f5;
+  --searchaf-11: #fafafa;
+  --searchaf-12: #ffffff;
+
+  /* ===== Neutral Scale (Dark) ===== */
+  --gray-1: #0a0a0a;
+  --gray-2: #0f0f0f;
+  --gray-3: #131313;
+  --gray-4: #262626;
+  --gray-5: #3a3a3a;
+  --gray-6: #525252;
+  --gray-7: #737373;
+  --gray-8: #a1a1a1;
+  --gray-9: #d4d4d4;
+  --gray-10: #e5e5e5;
+  --gray-11: #f5f5f5;
+  --gray-12: #ffffff;
+
+  /* ===== Semantic Colors (Dark Mode) ===== */
+  --background: #131313;
+  --background-secondary: #0f0f0f;
+  --foreground: #edeef0;
+  --card: #0f0f0f;
+  --card-foreground: #edeef0;
+  --popover: #0f0f0f;
+  --popover-foreground: #edeef0;
+  --primary: #e5e5e5; /* Light color for dark mode buttons */
+  --primary-foreground: #0f0f0f; /* Dark text on light buttons */
+  --secondary: var(--searchaf-3);
+  --secondary-foreground: var(--gray-10);
+  --muted: var(--searchaf-3);
+  --muted-foreground: var(--gray-8);
+  --accent: var(--searchaf-4);
+  --accent-foreground: var(--searchaf-11);
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: var(--gray-4);
+  --input: var(--gray-3);
+  --ring: var(--searchaf-9);
+
+  /* Danger (Dark Mode) */
+  --danger-50: #1a0808;
+  --danger-100: #2a0f0f;
+  --danger-200: #3d1515;
+  --danger-300: #5c1e1e;
+  --danger-400: #7c2626;
+  --danger-500: #ef4444;
+  --danger-600: #f87171;
+  --danger-700: #fca5a5;
+  --danger-800: #fecaca;
+  --danger-900: #fee2e2;
+  --danger-fg: #ffffff;
+
+  /* Success (Dark Mode) */
+  --success-50: #0a1a0c;
+  --success-100: #0f2a12;
+  --success-200: #153d19;
+  --success-300: #1e5c24;
+  --success-400: #267c32;
+  --success-500: #22c55e;
+  --success-600: #4ade80;
+  --success-700: #86efac;
+  --success-800: #bbf7d0;
+  --success-900: #dcfce7;
+  --success-fg: #ffffff;
+
+  /* Info (Dark Mode) */
+  --info-50: #081a2a;
+  --info-100: #0f2544;
+  --info-200: #1e3a5f;
+  --info-300: #2c5282;
+  --info-400: #3c6cb4;
+  --info-500: #3b82f6;
+  --info-600: #60a5fa;
+  --info-700: #93c5fd;
+  --info-800: #bfdbfe;
+  --info-900: #dbeafe;
+  --info-fg: #ffffff;
+
+  /* Warning (Dark Mode) */
+  --warning-50: #1a1508;
+  --warning-100: #2a220f;
+  --warning-200: #3d3015;
+  --warning-300: #5c4a1e;
+  --warning-400: #7c6426;
+  --warning-500: #f59e0b;
+  --warning-600: #fbbf24;
+  --warning-700: #fcd34d;
+  --warning-800: #fde68a;
+  --warning-900: #fef3c7;
+  --warning-fg: #ffffff;
+
+  /* Badge Colors - Purple (Dark Mode) */
+  --badge-purple-50: #1a0b2e;
+  --badge-purple-100: #2e1a47;
+  --badge-purple-200: #4a2766;
+  --badge-purple-300: #6b3398;
+  --badge-purple-400: #8b4cc9;
+  --badge-purple-500: #a855f7;
+  --badge-purple-600: #c084fc;
+  --badge-purple-700: #d8b4fe;
+  --badge-purple-800: #e9d5ff;
+  --badge-purple-900: #f3e8ff;
+  --badge-purple-fg: #ffffff;
+
+  /* Badge Colors - Blue (Dark Mode) */
+  --badge-blue-50: #0a1929;
+  --badge-blue-100: #1e2a3f;
+  --badge-blue-200: #2d3e5f;
+  --badge-blue-300: #3d5687;
+  --badge-blue-400: #5577b5;
+  --badge-blue-500: #3b82f6;
+  --badge-blue-600: #60a5fa;
+  --badge-blue-700: #93c5fd;
+  --badge-blue-800: #bfdbfe;
+  --badge-blue-900: #dbeafe;
+  --badge-blue-fg: #ffffff;
+
+  /* Badge Colors - Green (Dark Mode) */
+  --badge-green-50: #0a1f0f;
+  --badge-green-100: #1a332a;
+  --badge-green-200: #2a4d3f;
+  --badge-green-300: #3d7059;
+  --badge-green-400: #559373;
+  --badge-green-500: #22c55e;
+  --badge-green-600: #4ade80;
+  --badge-green-700: #86efac;
+  --badge-green-800: #bbf7d0;
+  --badge-green-900: #dcfce7;
+  --badge-green-fg: #ffffff;
+
+  /* Badge Colors - Orange (Dark Mode) */
+  --badge-orange-50: #1a0f08;
+  --badge-orange-100: #2e1f15;
+  --badge-orange-200: #4d3322;
+  --badge-orange-300: #734a2f;
+  --badge-orange-400: #99653f;
+  --badge-orange-500: #f97316;
+  --badge-orange-600: #fb923c;
+  --badge-orange-700: #fdba74;
+  --badge-orange-800: #fed7aa;
+  --badge-orange-900: #ffedd5;
+  --badge-orange-fg: #ffffff;
+
+  /* ===== Showcase Background Colors (Dark Mode) ===== */
+  --showcase-bg-rose: #c45a8f;
+  --showcase-bg-red: #c45a5a;
+  --showcase-bg-orange: #c48a5a;
+  --showcase-bg-amber: #c4a05a;
+  --showcase-bg-yellow: #c4c05a;
+  --showcase-bg-lime: #a0c45a;
+  --showcase-bg-green: #5ac45a;
+  --showcase-bg-emerald: #5ac490;
+  --showcase-bg-teal: #5ac4b0;
+  --showcase-bg-cyan: #5ab0c4;
+  --showcase-bg-sky: #5a8ac4;
+  --showcase-bg-blue: #5a5ac4;
+  --showcase-bg-indigo: #805ac4;
+  --showcase-bg-violet: #a05ac4;
+  --showcase-bg-purple: #c45ac4;
+  --showcase-bg-slate: #f0f0f0; /* Light gray in dark mode */
+  --showcase-bg-gray: #3f3f46; /* Dark gray in dark mode */
+}

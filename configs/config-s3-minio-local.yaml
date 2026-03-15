@@ -1,0 +1,40 @@
+# Example configuration for local development with MinIO
+# This demonstrates how to test S3 storage locally using MinIO
+
+metadata:
+  orchestration_urls:
+    b: "http://127.0.0.1:12277"
+    c: "http://127.0.0.1:12278"
+    d: "http://127.0.0.1:12279"
+
+# Storage configuration
+storage:
+  local:
+    base_dir: "antflydb"
+  keyvalue: "s3"
+  metadatakv: "local"
+  s3:
+    endpoint: "localhost:9000"
+    bucket: "antfly-test"
+    prefix: "local-dev"
+    use_ssl: false  # MinIO local typically doesn't use SSL
+
+# To start local MinIO:
+# docker run -p 9000:9000 -p 9001:9001 \
+#   -e MINIO_ROOT_USER=minioadmin \
+#   -e MINIO_ROOT_PASSWORD=minioadmin \
+#   minio/minio server /data --console-address ":9001"
+#
+# Then set environment variables:
+# export AWS_ACCESS_KEY_ID="minioadmin"
+# export AWS_SECRET_ACCESS_KEY="minioadmin"
+#
+# Create bucket:
+# mc alias set local http://localhost:9000 minioadmin minioadmin
+# mc mb local/antfly-test
+
+max_shard_size_bytes: 64000000
+replication_factor: 1  # Single node for local testing
+disable_shard_alloc: true
+log_level: "debug"
+logging_style: "terminal"

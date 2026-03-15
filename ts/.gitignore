@@ -1,0 +1,26 @@
+# Node modules
+node_modules/
+
+# Build output
+dist/
+# Generated declaration files at package root (not src/types/)
+packages/*/types/
+
+# Turbo
+.turbo/
+
+# AI
+.aider*
+
+# TS
+!antfly.ts
+!antfly-api.d.ts
+
+# OS
+.DS_Store
+
+# Storybook
+storybook-static/
+
+# Lock files (use workspace root only)
+packages/*/package-lock.json

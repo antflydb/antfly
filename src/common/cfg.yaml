@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: common
+generate:
+  models: true
+  embedded-spec: true
+compatibility:
+  always-prefix-enum-values: true
+output: config.gen.go
+output-options:
+  skip-prune: true
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true
+import-mapping:
+  ../../lib/middleware/openapi.yaml: github.com/antflydb/antfly/lib/middleware
+  ../../lib/embeddings/openapi.yaml: github.com/antflydb/antfly/lib/embeddings
+  ../../lib/ai/openapi.yaml: github.com/antflydb/antfly/lib/ai
+  ../../lib/audio/openapi.yaml: github.com/antflydb/antfly/lib/audio
+  ../../lib/reranking/openapi.yaml: github.com/antflydb/antfly/lib/reranking
+  ../../lib/chunking/openapi.yaml: github.com/antflydb/antfly/lib/chunking
+  ../../pkg/libaf/logging/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/logging
+  ../../pkg/libaf/scraping/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/scraping
+  ../../termite/pkg/termite/openapi.yaml: github.com/antflydb/termite/pkg/termite

@@ -1,0 +1,146 @@
+# Example: AntflyCluster on AWS EKS with IRSA for S3 Backups
+#
+# This example shows how to use IAM Roles for Service Accounts (IRSA)
+# to grant pods access to AWS services (like S3) without static credentials.
+#
+# Prerequisites:
+# 1. EKS cluster with OIDC provider configured:
+#    eksctl utils associate-iam-oidc-provider --cluster=<cluster-name> --approve
+#
+# 2. Create IAM role with S3 permissions and trust policy for the service account:
+#    aws iam create-role --role-name antfly-backup-role \
+#      --assume-role-policy-document file://trust-policy.json
+#
+#    trust-policy.json example:
+#    {
+#      "Version": "2012-10-17",
+#      "Statement": [{
+#        "Effect": "Allow",
+#        "Principal": {
+#          "Federated": "arn:aws:iam::<account-id>:oidc-provider/oidc.eks.<region>.amazonaws.com/id/<oidc-id>"
+#        },
+#        "Action": "sts:AssumeRoleWithWebIdentity",
+#        "Condition": {
+#          "StringEquals": {
+#            "oidc.eks.<region>.amazonaws.com/id/<oidc-id>:sub": "system:serviceaccount:antfly-eks-irsa:antfly-backup-sa"
+#          }
+#        }
+#      }]
+#    }
+#
+# 3. Attach S3 policy to the role:
+#    aws iam put-role-policy --role-name antfly-backup-role \
+#      --policy-name antfly-s3-backup \
+#      --policy-document file://s3-policy.json
+#
+#    s3-policy.json example:
+#    {
+#      "Version": "2012-10-17",
+#      "Statement": [{
+#        "Effect": "Allow",
+#        "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+#        "Resource": [
+#          "arn:aws:s3:::my-antfly-backups",
+#          "arn:aws:s3:::my-antfly-backups/*"
+#        ]
+#      }]
+#    }
+#
+# 4. Create ServiceAccount with IRSA annotation:
+#    (This is included in this manifest below)
+#
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: antfly-eks-irsa
+---
+# ServiceAccount with IRSA annotation
+# The eks.amazonaws.com/role-arn annotation tells EKS to inject AWS credentials
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: antfly-backup-sa
+  namespace: antfly-eks-irsa
+  annotations:
+    # IMPORTANT: Replace with your actual IAM role ARN
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/antfly-backup-role"
+---
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-eks-irsa-cluster
+  namespace: antfly-eks-irsa
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Use the IRSA-enabled ServiceAccount
+  serviceAccountName: antfly-backup-sa
+
+  # AWS EKS configuration
+  eks:
+    enabled: true
+    # IRSA role ARN - also specified on ServiceAccount but useful for validation
+    irsaRoleARN: "arn:aws:iam::123456789012:role/antfly-backup-role"
+    # EBS configuration
+    ebsVolumeType: "gp3"
+    ebsEncrypted: true
+    # Optionally specify KMS key for volume encryption
+    # ebsKmsKeyId: "arn:aws:kms:us-east-2:123456789012:key/12345678-1234-1234-1234-123456789012"
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+
+  metadataNodes:
+    replicas: 3
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+    resources:
+      cpu: "500m"
+      memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+    # No envFrom needed - IRSA provides credentials automatically
+
+  dataNodes:
+    replicas: 3
+    api:
+      port: 12380
+    raft:
+      port: 9021
+    resources:
+      cpu: "1000m"
+      memory: "2Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"
+    # No envFrom needed - IRSA provides credentials automatically
+
+  storage:
+    storageClass: "gp3"
+    metadataStorage: "1Gi"
+    dataStorage: "10Gi"
+
+  # S3 backup configuration - credentials come from IRSA
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      },
+      "storage": {
+        "s3": {
+          "region": "us-east-2",
+          "bucket": "my-antfly-backups",
+          "prefix": "eks-cluster/"
+        }
+      },
+      "cache_size": 1000,
+      "enable_metrics": true,
+      "max_shard_size_bytes": 134217728,
+      "raft_snapshot_threshold": 10000
+    }

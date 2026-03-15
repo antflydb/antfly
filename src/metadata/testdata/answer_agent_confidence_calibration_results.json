@@ -1,0 +1,475 @@
+{
+  "summary": {
+    "total_examples": 15,
+    "passed_examples": 15,
+    "failed_examples": 0,
+    "average_score": 0.9526666561762492,
+    "pass_rate": 1,
+    "total_duration": 14269326291,
+    "evaluator_stats": {
+      "confidence": {
+        "name": "confidence",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 0.9526666561762492,
+        "pass_rate": 1,
+        "average_duration": 4771
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is the weather today?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "weather forecast today",
+        "route_type": "question",
+        "semantic_query": "current weather conditions, temperature, humidity, wind speed, precipitation, location-specific weather data"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 9127588167,
+      "timestamp": "2025-11-16T13:06:16.236773-08:00"
+    },
+    {
+      "example": {
+        "input": "How does photosynthesis work?",
+        "reference": "question",
+        "metadata": {
+          "category": "explanation_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Explain the process of photosynthesis, including the roles of chlorophyll, sunlight, carbon dioxide, and water.",
+        "route_type": "question",
+        "semantic_query": "photosynthesis process, chlorophyll, sunlight absorption, carbon dioxide fixation, water utilization, plant energy conversion, light-dependent reactions, light-independent reactions (Calvin cycle)"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 4333940792,
+      "timestamp": "2025-11-16T13:06:11.095305-08:00"
+    },
+    {
+      "example": {
+        "input": "papers about neural networks",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "neural network research papers",
+        "route_type": "search",
+        "semantic_query": "neural networks, artificial intelligence, deep learning, machine learning algorithms, convolutional neural networks, recurrent neural networks, long short-term memory, generative adversarial networks, training methods, optimization techniques"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 1354049375,
+      "timestamp": "2025-11-16T13:06:11.095125-08:00"
+    },
+    {
+      "example": {
+        "input": "documents on distributed systems",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "distributed systems architecture and design",
+        "route_type": "search",
+        "semantic_query": "distributed systems, cloud computing, microservices, consensus algorithms, fault tolerance, consistency models, distributed databases, system design patterns, scalability, high availability"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 3248631459,
+      "timestamp": "2025-11-16T13:06:11.09527-08:00"
+    },
+    {
+      "example": {
+        "input": "research about quantum computing",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "quantum computing concepts, applications, and technologies",
+        "route_type": "search",
+        "semantic_query": "quantum computing, qubits, superposition, entanglement, quantum algorithms, quantum hardware, quantum software, quantum information science, quantum error correction, Shor's algorithm, Grover's algorithm"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2352592334,
+      "timestamp": "2025-11-16T13:06:11.095151-08:00"
+    },
+    {
+      "example": {
+        "input": "Why is the sky blue?",
+        "reference": "question",
+        "metadata": {
+          "category": "explanation_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Why is the sky blue?",
+        "route_type": "question",
+        "semantic_query": "atmospheric scattering of sunlight, Rayleigh scattering, blue light wavelength, color perception, electromagnetic radiation in the atmosphere"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 5141717125,
+      "timestamp": "2025-11-16T13:06:11.095028-08:00"
+    },
+    {
+      "example": {
+        "input": "articles on climate change",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "climate change articles",
+        "route_type": "search",
+        "semantic_query": "climate change impacts, global warming, greenhouse effect, climate science, environmental policy, climate solutions, mitigation strategies, adaptation measures"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 6907262083,
+      "timestamp": "2025-11-16T13:06:11.095111-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the symptoms of diabetes?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "symptoms of type 1 and type 2 diabetes",
+        "route_type": "question",
+        "semantic_query": "diabetes symptoms, type 1 diabetes symptoms, type 2 diabetes symptoms, hyperglycemia, hypoglycemia, diabetic neuropathy, diabetic retinopathy, diabetic nephropathy, blood glucose levels, fasting blood sugar, A1C test"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 8985866209,
+      "timestamp": "2025-11-16T13:06:11.095081-08:00"
+    },
+    {
+      "example": {
+        "input": "best practices for code review",
+        "reference": "question",
+        "metadata": {
+          "category": "guidance_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "best practices for code review guidelines and standards",
+        "route_type": "question",
+        "semantic_query": "code review process, software development best practices, code review standards, code quality, defect prevention, collaborative code review, pull request guidelines"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 9900136125,
+      "timestamp": "2025-11-16T13:06:11.095113-08:00"
+    },
+    {
+      "example": {
+        "input": "How do I install Docker?",
+        "reference": "question",
+        "metadata": {
+          "category": "how_to_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "How to install Docker Desktop for Windows or Docker Engine on Linux",
+        "route_type": "question",
+        "semantic_query": "Docker installation guide, Docker setup, Docker installation process, Docker engine installation, Docker desktop installation, containerization tutorial, setting up Docker environment, Docker commands for installation"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 7905877042,
+      "timestamp": "2025-11-16T13:06:11.095059-08:00"
+    },
+    {
+      "example": {
+        "input": "examples of microservices architecture",
+        "reference": "question",
+        "metadata": {
+          "category": "example_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "examples of microservices architectural patterns and implementation strategies",
+        "route_type": "question",
+        "semantic_query": "microservices architecture patterns, architectural styles, design patterns, service decomposition, bounded contexts, API gateway, service mesh, event-driven architecture, communication protocols (REST, gRPC, message queues), deployment strategies"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 9493212167,
+      "timestamp": "2025-11-16T13:06:13.447759-08:00"
+    },
+    {
+      "example": {
+        "input": "When was the French Revolution?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Dates of the French Revolution",
+        "route_type": "question",
+        "semantic_query": "French Revolution timeline, causes of the French Revolution, events of the French Revolution, revolutionary period France, dates of the Reign of Terror"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 9419058291,
+      "timestamp": "2025-11-16T13:06:12.449185-08:00"
+    },
+    {
+      "example": {
+        "input": "tutorials on machine learning",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "machine learning tutorials",
+        "route_type": "search",
+        "semantic_query": "machine learning tutorial resources, machine learning learning paths, deep learning tutorials, scikit-learn tutorials, TensorFlow tutorials, PyTorch tutorials, machine learning courses"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 9487068458,
+      "timestamp": "2025-11-16T13:06:14.343921-08:00"
+    },
+    {
+      "example": {
+        "input": "What is the capital of France?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.99,
+        "improved_query": "What is the capital city of France?",
+        "route_type": "question",
+        "semantic_query": "capital city France, Paris, French government, administrative center France"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.9900000095367432,
+          "reason": "Confidence: 0.99 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.9900000095367432,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 9160773625,
+      "timestamp": "2025-11-16T13:06:15.429269-08:00"
+    },
+    {
+      "example": {
+        "input": "compare React vs Vue",
+        "reference": "question",
+        "metadata": {
+          "category": "comparison_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "compare React and Vue.js frameworks",
+        "route_type": "question",
+        "semantic_query": "React framework comparison, Vue.js framework comparison, JavaScript front-end development frameworks, differences between React and Vue.js, front-end development frameworks comparison"
+      },
+      "results": {
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 6081168875,
+      "timestamp": "2025-11-16T13:06:11.095026-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": true,
+      "max_concurrency": 10,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-16T13:06:11.095017-08:00"
+}

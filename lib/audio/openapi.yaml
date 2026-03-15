@@ -1,0 +1,471 @@
+openapi: 3.0.3
+info:
+  title: Audio Provider Configuration
+  description: "Configuration schemas for TTS (Text-to-Speech) and STT (Speech-to-Text) providers in Antfly."
+  version: "0.0.1"
+components:
+  schemas:
+    # TTS Provider Types
+    TTSProvider:
+      type: string
+      enum:
+        - openai
+        - vertex
+        - elevenlabs
+      description: "The TTS provider to use."
+
+    # STT Provider Types
+    STTProvider:
+      type: string
+      enum:
+        - openai
+        - vertex
+        - termite
+      description: "The STT provider to use."
+
+    # Audio Formats
+    AudioFormat:
+      type: string
+      enum:
+        - mp3
+        - wav
+        - ogg
+        - opus
+        - flac
+        - pcm
+        - aac
+        - webm
+      description: "Audio encoding format."
+
+    # OpenAI TTS Configuration
+    OpenAITTSConfig:
+      type: object
+      description: |-
+        Configuration for OpenAI TTS provider.
+
+        API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+
+        **Models:** tts-1 (faster, lower quality), tts-1-hd (higher quality)
+
+        **Voices:** alloy, echo, fable, onyx, nova, shimmer
+
+        **Docs:** https://platform.openai.com/docs/guides/text-to-speech
+      properties:
+        model:
+          type: string
+          enum: [tts-1, tts-1-hd]
+          default: tts-1
+          description: "TTS model to use. tts-1 is faster, tts-1-hd has higher quality."
+        api_key:
+          type: string
+          description: "OpenAI API key. Falls back to OPENAI_API_KEY environment variable."
+        voice:
+          type: string
+          enum: [alloy, echo, fable, onyx, nova, shimmer]
+          default: alloy
+          description: "Default voice to use."
+        base_url:
+          type: string
+          format: uri
+          description: "API base URL. Falls back to OPENAI_BASE_URL environment variable."
+      example:
+        model: tts-1-hd
+        voice: nova
+
+    # Vertex TTS Configuration (Google Cloud)
+    VertexTTSConfig:
+      type: object
+      description: |-
+        Configuration for Google Cloud Text-to-Speech provider (Vertex AI).
+
+        Uses Application Default Credentials (ADC) for authentication.
+
+        **Voice Types:** Neural2 (best), WaveNet (high quality), Standard
+
+        **Docs:** https://cloud.google.com/text-to-speech/docs
+      properties:
+        project_id:
+          type: string
+          description: "Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable."
+        location:
+          type: string
+          default: us-central1
+          description: "Google Cloud location."
+        credentials_path:
+          type: string
+          description: "Path to service account JSON key file."
+        language_code:
+          type: string
+          default: en-US
+          description: "Default language code (e.g., 'en-US', 'es-ES')."
+        voice_name:
+          type: string
+          description: "Default voice name (e.g., 'en-US-Neural2-A')."
+      example:
+        project_id: my-gcp-project
+        language_code: en-US
+        voice_name: en-US-Neural2-A
+
+    # ElevenLabs TTS Configuration
+    ElevenLabsTTSConfig:
+      type: object
+      description: |-
+        Configuration for ElevenLabs TTS provider.
+
+        API key via `api_key` field or `ELEVENLABS_API_KEY` environment variable.
+
+        **Models:** eleven_monolingual_v1, eleven_multilingual_v2, eleven_turbo_v2_5 (fastest)
+
+        **Docs:** https://elevenlabs.io/docs/api-reference
+      properties:
+        api_key:
+          type: string
+          description: "ElevenLabs API key. Falls back to ELEVENLABS_API_KEY environment variable."
+        voice_id:
+          type: string
+          description: "Default ElevenLabs voice ID."
+        model_id:
+          type: string
+          enum: [eleven_monolingual_v1, eleven_multilingual_v2, eleven_turbo_v2_5]
+          default: eleven_turbo_v2_5
+          description: "TTS model to use."
+        stability:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.5
+          description: "Voice stability (0.0-1.0). Higher = more consistent."
+        similarity_boost:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.75
+          description: "Similarity boost (0.0-1.0). Higher = more similar to original voice."
+        style:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: "Speaking style exaggeration (0.0-1.0). Only for v2 models."
+      required:
+        - voice_id
+      example:
+        voice_id: "21m00Tcm4TlvDq8ikWAM"
+        model_id: eleven_turbo_v2_5
+        stability: 0.5
+        similarity_boost: 0.75
+
+    # OpenAI STT Configuration
+    OpenAISTTConfig:
+      type: object
+      description: |-
+        Configuration for OpenAI STT (Whisper) provider.
+
+        API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+
+        **Model:** whisper-1
+
+        **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB)
+
+        **Docs:** https://platform.openai.com/docs/guides/speech-to-text
+      properties:
+        model:
+          type: string
+          default: whisper-1
+          description: "Whisper model to use."
+        api_key:
+          type: string
+          description: "OpenAI API key. Falls back to OPENAI_API_KEY environment variable."
+        base_url:
+          type: string
+          format: uri
+          description: "API base URL. Falls back to OPENAI_BASE_URL environment variable."
+      example:
+        model: whisper-1
+
+    # Vertex STT Configuration (Google Cloud)
+    VertexSTTConfig:
+      type: object
+      description: |-
+        Configuration for Google Cloud Speech-to-Text provider (Vertex AI).
+
+        Uses Application Default Credentials (ADC) for authentication.
+
+        **Features:** Streaming, speaker diarization, automatic punctuation
+
+        **Docs:** https://cloud.google.com/speech-to-text/docs
+      properties:
+        project_id:
+          type: string
+          description: "Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable."
+        location:
+          type: string
+          default: us-central1
+          description: "Google Cloud location."
+        credentials_path:
+          type: string
+          description: "Path to service account JSON key file."
+        language_code:
+          type: string
+          default: en-US
+          description: "Default language code (e.g., 'en-US', 'es-ES')."
+        enable_automatic_punctuation:
+          type: boolean
+          default: true
+          description: "Enable automatic punctuation."
+        use_enhanced:
+          type: boolean
+          default: false
+          description: "Use enhanced models for better accuracy (costs more)."
+        model:
+          type: string
+          description: "Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation')."
+      example:
+        project_id: my-gcp-project
+        language_code: en-US
+        enable_automatic_punctuation: true
+
+    # Termite STT Configuration
+    TermiteSTTConfig:
+      type: object
+      description: |-
+        Configuration for Termite STT (Whisper, Wav2Vec2, HuBERT) provider.
+
+        Uses local Termite service for speech-to-text inference.
+
+        **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base
+
+        **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
+
+        **Docs:** See Termite documentation
+      properties:
+        api_url:
+          type: string
+          format: uri
+          description: "Termite API URL. Falls back to ANTFLY_TERMITE_URL environment variable."
+        model:
+          type: string
+          description: "Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default."
+      example:
+        api_url: "http://localhost:8080"
+        model: openai/whisper-base
+
+    # TTS Configuration Union
+    TTSConfig:
+      description: |-
+        Unified configuration for a TTS provider.
+
+        Select the provider type and configure provider-specific settings.
+
+        **Supported Providers:**
+        - `openai` - OpenAI TTS (tts-1, tts-1-hd)
+        - `vertex` - Google Cloud Text-to-Speech (Vertex AI)
+        - `elevenlabs` - ElevenLabs premium voices
+
+        **Example:**
+        ```yaml
+        provider: openai
+        model: tts-1-hd
+        voice: nova
+        ```
+      allOf:
+        - oneOf:
+            - $ref: '#/components/schemas/OpenAITTSConfig'
+            - $ref: '#/components/schemas/VertexTTSConfig'
+            - $ref: '#/components/schemas/ElevenLabsTTSConfig'
+        - properties:
+            provider:
+              $ref: '#/components/schemas/TTSProvider'
+          required:
+            - provider
+      example:
+        provider: openai
+        model: tts-1-hd
+        voice: nova
+
+    # STT Configuration Union
+    STTConfig:
+      description: |-
+        Unified configuration for an STT provider.
+
+        Select the provider type and configure provider-specific settings.
+
+        **Supported Providers:**
+        - `openai` - OpenAI Whisper (whisper-1)
+        - `vertex` - Google Cloud Speech-to-Text (Vertex AI)
+        - `termite` - Local Termite service (Whisper, Wav2Vec2, HuBERT)
+
+        **Example:**
+        ```yaml
+        provider: termite
+        api_url: "http://localhost:8080"
+        model: openai/whisper-base
+        ```
+      allOf:
+        - oneOf:
+            - $ref: '#/components/schemas/OpenAISTTConfig'
+            - $ref: '#/components/schemas/VertexSTTConfig'
+            - $ref: '#/components/schemas/TermiteSTTConfig'
+        - properties:
+            provider:
+              $ref: '#/components/schemas/STTProvider'
+          required:
+            - provider
+      example:
+        provider: termite
+        api_url: "http://localhost:8080"
+        model: openai/whisper-base
+
+    # TTS Request/Response for API
+    TTSRequest:
+      type: object
+      description: "Request to synthesize speech from text."
+      properties:
+        text:
+          type: string
+          description: "Text to convert to speech."
+        voice:
+          type: string
+          description: "Voice ID to use."
+        format:
+          $ref: '#/components/schemas/AudioFormat'
+        speed:
+          type: number
+          minimum: 0.25
+          maximum: 4.0
+          default: 1.0
+          description: "Playback speed multiplier."
+        s3_output:
+          type: string
+          format: uri
+          description: "Optional S3 URI to write audio output (s3://bucket/key)."
+        s3_credentials:
+          $ref: '../../pkg/libaf/s3/openapi.yaml#/components/schemas/Credentials'
+          description: "Optional S3 credentials. Falls back to server-configured defaults."
+      required:
+        - text
+
+    TTSResponse:
+      type: object
+      description: "Response from speech synthesis."
+      properties:
+        format:
+          $ref: '#/components/schemas/AudioFormat'
+        duration_ms:
+          type: integer
+          description: "Duration of synthesized audio in milliseconds."
+        characters_used:
+          type: integer
+          description: "Number of characters processed."
+        s3_url:
+          type: string
+          format: uri
+          description: "S3 URI where audio was written (if s3_output was specified)."
+
+    # STT Request/Response for API
+    STTRequest:
+      type: object
+      description: "Request to transcribe audio to text."
+      properties:
+        url:
+          type: string
+          format: uri
+          description: "URL to audio file. Supports http://, https://, or s3:// URIs."
+        s3_credentials:
+          $ref: '../../pkg/libaf/s3/openapi.yaml#/components/schemas/Credentials'
+          description: "Optional S3 credentials for s3:// URLs. Falls back to server-configured defaults."
+        format:
+          $ref: '#/components/schemas/AudioFormat'
+        language:
+          type: string
+          description: "ISO 639-1 language code (e.g., 'en', 'es'). Leave empty for auto-detection."
+        timestamps:
+          type: boolean
+          default: false
+          description: "Include word-level timestamps."
+        diarization:
+          type: boolean
+          default: false
+          description: "Enable speaker diarization."
+      required:
+        - url
+
+    STTResponse:
+      type: object
+      description: "Response from speech transcription."
+      properties:
+        text:
+          type: string
+          description: "Full transcribed text."
+        language:
+          type: string
+          description: "Detected or specified language code."
+        duration_ms:
+          type: integer
+          description: "Duration of audio in milliseconds."
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/TranscriptSegment'
+        speakers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Speaker'
+
+    TranscriptSegment:
+      type: object
+      properties:
+        text:
+          type: string
+        start_ms:
+          type: integer
+        end_ms:
+          type: integer
+        speaker:
+          type: string
+        words:
+          type: array
+          items:
+            $ref: '#/components/schemas/WordTimestamp'
+
+    WordTimestamp:
+      type: object
+      properties:
+        word:
+          type: string
+        start_ms:
+          type: integer
+        end_ms:
+          type: integer
+
+    Speaker:
+      type: object
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+
+    # Voice listing
+    Voice:
+      type: object
+      description: "An available TTS voice."
+      properties:
+        id:
+          type: string
+          description: "Voice ID."
+        name:
+          type: string
+          description: "Human-readable voice name."
+        language:
+          type: string
+          description: "Primary language code."
+        gender:
+          type: string
+          enum: [male, female, neutral, unknown]
+        description:
+          type: string
+        preview_url:
+          type: string
+          format: uri
+          description: "URL to preview audio sample."

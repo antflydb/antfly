@@ -1,0 +1,328 @@
+# This is an example .goreleaser.yml file with some sensible defaults.
+# Make sure to check the documentation at https://goreleaser.com
+
+# The lines below are called `modelines`. See `:help modeline`
+# Feel free to remove those if you don't want/need to use them.
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+version: 2
+
+before:
+  hooks:
+    - ./scripts/completions.sh
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  # Default pure Go builds (no CGO required)
+  - env:
+      - CGO_ENABLED=0
+      - GOEXPERIMENT=simd
+    tags:
+      - afrelease
+    goos:
+      - linux
+      - windows
+      - darwin
+    id: "antfly"
+    main: ./cmd/antfly
+    binary: antfly
+    ignore:
+      - goarch: "386"
+      - goos: darwin
+        goarch: amd64
+  # ============================================
+  # OMNI builds (ONNX + XLA) for runtime backend selection
+  # ============================================
+
+  # Linux AMD64 Omni (ONNX + XLA)
+  - id: "antfly-omni-linux-amd64"
+    env:
+      - CGO_ENABLED=1
+      - GOEXPERIMENT=simd
+      - CGO_LDFLAGS=-L{{ .Env.ONNXRUNTIME_ROOT }}/linux-amd64/lib -lonnxruntime -ltokenizers -lstdc++
+      - CGO_CFLAGS=-I{{ .Env.ONNXRUNTIME_ROOT }}/linux-amd64/include
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    tags:
+      - afrelease
+      - onnx
+      - ORT
+      - xla
+      - XLA
+    goos:
+      - linux
+    goarch:
+      - amd64
+    main: ./cmd/antfly
+    binary: antfly
+
+  # Linux ARM64 Omni (ONNX + XLA) (cross-compile)
+  - id: "antfly-omni-linux-arm64"
+    env:
+      - CGO_ENABLED=1
+      - GOEXPERIMENT=simd
+      - CC=aarch64-linux-gnu-gcc
+      - CXX=aarch64-linux-gnu-g++
+      - CGO_LDFLAGS=-L{{ .Env.ONNXRUNTIME_ROOT }}/linux-arm64/lib -lonnxruntime -ltokenizers -lstdc++
+      - CGO_CFLAGS=-I{{ .Env.ONNXRUNTIME_ROOT }}/linux-arm64/include
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    tags:
+      - afrelease
+      - onnx
+      - ORT
+      - xla
+      - XLA
+    goos:
+      - linux
+    goarch:
+      - arm64
+    main: ./cmd/antfly
+    binary: antfly
+
+  # macOS ARM64 Omni (ONNX + XLA) (Zig cross-compilation)
+  - id: "antfly-omni-darwin-arm64"
+    env:
+      - CGO_ENABLED=1
+      - GOEXPERIMENT=simd
+      - CC=zig c++ -target aarch64-macos -isysroot {{ .Env.SDK_PATH }} -I{{ .Env.SDK_PATH }}/usr/include -I{{ .Env.SDK_PATH }}/System/Library/Frameworks/Kernel.framework/Versions/A/Headers -F{{ .Env.SDK_PATH }}/System/Library/Frameworks -Wno-nullability-completeness
+      - CXX=zig c++ -target aarch64-macos -isysroot {{ .Env.SDK_PATH }} -I{{ .Env.SDK_PATH }}/usr/include -I{{ .Env.SDK_PATH }}/System/Library/Frameworks/Kernel.framework/Versions/A/Headers -F{{ .Env.SDK_PATH }}/System/Library/Frameworks -Wno-nullability-completeness
+      - CGO_LDFLAGS=-L{{ .Env.ONNXRUNTIME_ROOT }}/darwin-arm64/lib -L{{ .Env.SDK_PATH }}/usr/lib -lonnxruntime -ltokenizers -F{{ .Env.SDK_PATH }}/System/Library/Frameworks -framework CoreFoundation -framework Security
+      - CGO_CFLAGS=-I{{ .Env.ONNXRUNTIME_ROOT }}/darwin-arm64/include -isysroot {{ .Env.SDK_PATH }} -I{{ .Env.SDK_PATH }}/usr/include -I{{ .Env.SDK_PATH }}/System/Library/Frameworks/Kernel.framework/Versions/A/Headers -Wno-nullability-completeness
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -extldflags "-Wl,-rpath,@executable_path/lib"
+    tags:
+      - afrelease
+      - onnx
+      - ORT
+      - xla
+      - XLA
+    goos:
+      - darwin
+    goarch:
+      - arm64
+    main: ./cmd/antfly
+    binary: antfly
+
+archives:
+  # Default pure Go builds
+  - id: default
+    formats: [tar.gz]
+    # this name template makes the OS and Arch compatible with the results of `uname`.
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    # use zip for windows archives
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    ids:
+      - antfly
+    files:
+      - README.md
+      - LICENSE
+      - completions/*
+
+  # OMNI builds (ONNX + XLA) with runtime backend selection
+  # Includes bundled ONNX Runtime and PJRT libraries
+  - id: omni
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}-omni_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    ids:
+      - antfly-omni-linux-amd64
+      - antfly-omni-linux-arm64
+      - antfly-omni-darwin-arm64
+    files:
+      - README.md
+      - LICENSE
+      - completions/*
+      # Bundle ONNX Runtime libraries for each platform
+      - src: "onnxruntime/{{ .Os }}-{{ .Arch }}/lib/libonnxruntime*"
+        dst: lib/
+        strip_parent: true
+      # Bundle ONNX Runtime GenAI libraries (for LLM generation)
+      # Note: Not available for linux-arm64, glob silently skips if no match
+      - src: "onnxruntime/{{ .Os }}-{{ .Arch }}/lib/libonnxruntime-genai*"
+        dst: lib/
+        strip_parent: true
+      # Bundle PJRT CPU plugin for XLA backend
+      - src: "pjrt/{{ .Os }}-{{ .Arch }}/lib/pjrt_c_api_cpu*"
+        dst: lib/
+        strip_parent: true
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - Merge pull request
+      - Merge branch
+      - go mod tidy
+
+release:
+  # https://goreleaser.com/customization/release/
+  github:
+    owner: antflydb
+    name: antfly
+  # Do not auto-publish the release.
+  draft: true
+  # Whether to remove existing draft releases with the same name before creating
+  # a new one. Only effective if `draft` is set to true.
+  replace_existing_draft: true
+  # Whether to use an existing draft release as the target release.
+  use_existing_draft: true
+  # Whether to remove an artifact that already exists.
+  replace_existing_artifacts: true
+  # If set to auto, will mark the release as not ready for production
+  # in case there is an indicator for this in the tag e.g. v1.0.0-rc1
+  # If set to true, will mark the release as not ready for production.
+  # Default: false.
+  prerelease: auto
+  footer: >-
+
+    ---
+
+    Released by [GoReleaser](https://github.com/goreleaser/goreleaser).
+  header: |
+    # Antfly version {{.Tag}}
+
+    ### Documentation ({{ .Date }})
+
+    The documentation for is available here :
+
+    https://docs.antfly.io
+  # What to do with the release notes in case there the release already exists.
+  #
+  # Valid options are:
+  # - `keep-existing`: keep the existing notes
+  # - `append`: append the current release notes to the existing notes
+  # - `prepend`: prepend the current release notes to the existing notes
+  # - `replace`: replace existing notes
+  #
+  # Default: `keep-existing`.
+  mode: replace
+  # You can add extra pre-existing files to the release.
+  # The filename on the release will be the last part of the path (base).
+  # If another file with the same name exists, the last one found will be used.
+  #
+  # Templates: allowed.
+  # extra_files:
+  #   - glob: ./path/to/file.txt
+  #   - glob: ./glob/**/to/**/file/**/*
+  #   - glob: ./glob/foo/to/bar/file/foobar/override_from_previous
+  #   - glob: ./single_file.txt
+  #     name_template: file.txt # note that this only works if glob matches 1 file only
+
+  # Upload metadata.json and artifacts.json to the release as well.
+  include_meta: true
+homebrew_casks:
+  - name: antfly
+    ids:
+      - omni
+    skip_upload: auto
+    repository:
+      owner: antflydb
+      name: homebrew-antfly
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://docs.antfly.io"
+    description: "antfly - AntflyDB with ONNX Runtime + XLA multi-backend ML inference"
+    url:
+      template: "https://releases.antfly.io/antfly/{{ .Tag }}/{{ .ArtifactName }}"
+    binary: antfly
+    completions:
+      bash: completions/antfly.bash
+      zsh: completions/antfly.zsh
+      fish: completions/antfly.fish
+    caveats: |
+      antfly includes both ONNX Runtime and XLA backends for ML inference.
+      Bundled libraries are auto-discovered from lib/ next to the binary.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/antfly", "#{staged_path}/lib"]
+          end
+nfpms:
+  - file_name_template: "{{ .ConventionalFileName }}"
+    # - file_name_template: >-
+    #     antfly-
+    #     {{- .Version}}_{{.Os}}-
+    #     {{- if eq .Arch "amd64" }}x86_64
+    #     {{- else if eq .Arch "386" }}i386
+    #     {{- else if eq .Arch "darwin" }}MacOS
+    #     {{- else if eq .Arch "linux" }}Linux
+    #     {{- else if eq .Arch "windows" }}Windows
+    #     {{- else }}{{ .Arch }}{{ end }}
+    homepage: https://antfly.io
+    description: A command line interface for running AntfyDB indexing
+    maintainer: Antfly Developers <contact@antfly.io>
+    license: Apache 2.0
+    vendor: Red Hat
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    ids:
+      - antfly
+    id: antfly
+blobs:
+  # https://goreleaser.com/customization/blob/
+  # You can have multiple blob configs
+  - provider: s3
+    endpoint: "{{ .Env.AWS_ENDPOINT_URL }}"
+    region: auto  # Required for Cloudflare R2 (doesn't accept AWS region names like us-east-2)
+    bucket: antfly-releases
+    # You can add extra pre-existing files to the bucket.
+    #
+    # The filename on the release will be the last part of the path (base).
+    # If another file with the same name exists, the last one found will be used.
+    # These globs can also include templates.
+    extra_files:
+      - glob: ./scripts/install.sh
+      - glob: ./openapi.yaml
+    #   - glob: ./path/to/file.txt
+    #   - glob: ./glob/**/to/**/file/**/*
+    #   - glob: ./glob/foo/to/bar/file/foobar/override_from_previous
+    #   - glob: ./single_file.txt
+    #     # Templates: allowed.
+    #     name_template: file.txt # note that this only works if glob matches 1 file only
+    # Upload metadata.json and artifacts.json to the release as well.
+    include_meta: true
+    # Upload only the files defined in extra_files.
+    # extra_files_only: true
+  # Upload to /latest/ path for easy installation (stable releases only)
+  - provider: s3
+    endpoint: "{{ .Env.AWS_ENDPOINT_URL }}"
+    region: auto  # Required for Cloudflare R2
+    bucket: antfly-releases
+    directory: "antfly/latest"
+    disable: "{{ if .Prerelease }}true{{ end }}"
+    extra_files:
+      - glob: ./scripts/install.sh
+      - glob: ./openapi.yaml
+    include_meta: true
+env_files:
+  # FIXME (ajr) this isn't working
+  # use GITHUB_TOKEN env var instead
+  github_token: ./github_token

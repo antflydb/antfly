@@ -1,0 +1,38 @@
+{
+  "default_type": "default",
+  "document_schemas": {
+    "default": {
+      "schema": {
+        "type": "object",
+        "x-antfly-include-in-all": ["TICO", "AUTR", "DESC"],
+        "properties": {
+          "_id": {
+            "type": "string"
+          },
+          "TICO": {
+            "type": "string",
+            "x-antfly-types": ["text", "keyword", "search_as_you_type"]
+          },
+          "AUTR": {
+            "type": "string",
+            "x-antfly-types": ["text", "keyword", "search_as_you_type"]
+          },
+          "DOMN": {
+            "type": "string"
+          },
+          "DESC": {
+            "type": "string"
+          },
+          "DMIS": {
+            "type": "string",
+            "format": "date"
+          },
+          "DMAJ": {
+            "type": "string",
+            "format": "date"
+          }
+        }
+      }
+    }
+  }
+}

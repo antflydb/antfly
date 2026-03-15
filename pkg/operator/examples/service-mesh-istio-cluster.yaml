@@ -1,0 +1,114 @@
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-istio
+  namespace: default
+spec:
+  # Container image for Antfly
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Service Mesh Configuration - Istio
+  serviceMesh:
+    enabled: true
+    annotations:
+      # Enable Istio sidecar injection
+      sidecar.istio.io/inject: "true"
+
+      # Exclude Raft ports from service mesh to reduce latency
+      # Leader Raft: 9017, Data Raft: 9021
+      traffic.sidecar.istio.io/excludeOutboundPorts: "9017,9021"
+      traffic.sidecar.istio.io/excludeInboundPorts: "9017,9021"
+
+      # Sidecar resource limits (optional but recommended)
+      sidecar.istio.io/proxyCPU: "100m"
+      sidecar.istio.io/proxyMemory: "128Mi"
+      sidecar.istio.io/proxyCPULimit: "500m"
+      sidecar.istio.io/proxyMemoryLimit: "512Mi"
+
+      # Concurrency for sidecar proxy (optional)
+      sidecar.istio.io/concurrency: "2"
+
+      # Logging level for Istio proxy (optional)
+      # Values: trace, debug, info, warning, error, critical, off
+      sidecar.istio.io/logLevel: "warning"
+
+  # Metadata Nodes Configuration
+  metadataNodes:
+    replicas: 3
+    resources:
+      cpu: "500m"
+      memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+    # Port configuration (uses operator defaults)
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+
+  # Data Nodes Configuration
+  dataNodes:
+    replicas: 3
+    resources:
+      cpu: "1000m"
+      memory: "2Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"
+
+    # Port configuration (uses operator defaults)
+    api:
+      port: 12380
+    raft:
+      port: 9021
+
+  # Storage Configuration
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "10Gi"
+
+  # Antfly Database Configuration
+  config: |
+    {
+      "max_shard_size_bytes": 67108864,
+      "replication_factor": 3,
+      "enable_auth": false,
+      "disable_shard_alloc": true
+    }
+
+---
+# Optional: Istio PeerAuthentication to enforce mTLS
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: antfly-istio-mtls
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: antfly-database
+  mtls:
+    mode: STRICT
+
+---
+# Optional: Istio DestinationRule for connection pooling
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: antfly-istio
+  namespace: default
+spec:
+  host: antfly-istio-leader.default.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 30s
+      http:
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 100
+        maxRequestsPerConnection: 2

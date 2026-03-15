@@ -1,0 +1,1115 @@
+{
+  "summary": {
+    "total_examples": 15,
+    "passed_examples": 15,
+    "failed_examples": 0,
+    "average_score": 0.9866666658719381,
+    "pass_rate": 1,
+    "total_duration": 131423157084,
+    "evaluator_stats": {
+      "classification": {
+        "name": "classification",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 2405
+      },
+      "coherence": {
+        "name": "coherence",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 1755593435
+      },
+      "confidence": {
+        "name": "confidence",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 0.9333333293596904,
+        "pass_rate": 1,
+        "average_duration": 2725
+      },
+      "helpfulness": {
+        "name": "helpfulness",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 2188774997
+      },
+      "relevance": {
+        "name": "relevance",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 3291882367
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is the weather today?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Current weather conditions for [user's location]",
+        "route_type": "question",
+        "semantic_query": "weather forecast, current weather, temperature, precipitation, humidity, wind speed, [user's location] weather"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer effectively summarizes the query's intent and the various aspects of weather information being sought. It includes relevant metadata (confidence, improved_query, route_type, semantic_query) which demonstrates an understanding of the query's underlying meaning and the system's processing steps. It’s a standard and appropriate response for this type of question.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer effectively summarizes the query's intent and the various aspects of weather information being sought. It includes relevant metadata (confidence, improved_query, route_type, semantic_query) which demonstrates an understanding of the query's underlying meaning and the system's processing steps. It’s a standard and appropriate response for this type of question.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive breakdown of what's needed to fulfill the user's request for the weather. The listed elements (confidence, improved query, semantic query) indicate a robust system designed to understand and respond to the user's intent. It’s a technically useful response for a system designed to answer this question.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive breakdown of what's needed to fulfill the user's request for the weather. The listed elements (confidence, improved query, semantic query) indicate a robust system designed to understand and respond to the user's intent. It’s a technically useful response for a system designed to answer this question.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of the elements needed to answer the question 'What is the weather today?' including relevant search terms and confidence levels, indicating it directly addresses the query.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of the elements needed to answer the question 'What is the weather today?' including relevant search terms and confidence levels, indicating it directly addresses the query.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 4932624958,
+      "timestamp": "2025-11-11T22:50:24.869469-08:00"
+    },
+    {
+      "example": {
+        "input": "How does photosynthesis work?",
+        "reference": "question",
+        "metadata": {
+          "category": "explanation_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Explain the process of photosynthesis, including the roles of chlorophyll, light energy, carbon dioxide, and water.",
+        "route_type": "question",
+        "semantic_query": "photosynthesis process, chlorophyll, light energy conversion, carbon fixation, water utilization, plant biology, energy production in plants"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The provided response isn't a direct answer but a detailed query breakdown used for a search engine or information retrieval system.  It effectively lists the key components and concepts related to photosynthesis, demonstrating a strong understanding of the topic. The 'improved_query' is highly relevant and well-structured, suggesting a thorough approach to understanding the process. The confidence score reflects the system's assuredness in its understanding of the topic.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The provided response isn't a direct answer but a detailed query breakdown used for a search engine or information retrieval system.  It effectively lists the key components and concepts related to photosynthesis, demonstrating a strong understanding of the topic. The 'improved_query' is highly relevant and well-structured, suggesting a thorough approach to understanding the process. The confidence score reflects the system's assuredness in its understanding of the topic.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a highly detailed and relevant response to the question about photosynthesis. It correctly identifies key components (chlorophyll, light energy, carbon dioxide, water) and suggests a comprehensive approach to explaining the process. The included semantic query further reinforces the scope of the response and indicates a good understanding of the question's underlying need.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a highly detailed and relevant response to the question about photosynthesis. It correctly identifies key components (chlorophyll, light energy, carbon dioxide, water) and suggests a comprehensive approach to explaining the process. The included semantic query further reinforces the scope of the response and indicates a good understanding of the question's underlying need.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of photosynthesis, explicitly mentioning key components like chlorophyll, light energy, carbon dioxide, and water – all essential elements for understanding the process. The improved query further reinforces the focus on the question's core elements.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of photosynthesis, explicitly mentioning key components like chlorophyll, light energy, carbon dioxide, and water – all essential elements for understanding the process. The improved query further reinforces the focus on the question's core elements.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 5314910250,
+      "timestamp": "2025-11-11T22:50:29.801975-08:00"
+    },
+    {
+      "example": {
+        "input": "papers about neural networks",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.85,
+        "improved_query": "neural networks research papers",
+        "route_type": "search",
+        "semantic_query": "neural networks, deep learning, artificial neural networks, machine learning, artificial intelligence, network architecture, training algorithms, backpropagation, convolutional neural networks, recurrent neural networks"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The response effectively translates the question 'papers about neural networks' into a structured data format. The `map` structure clearly outlines relevant search terms categorized by confidence, improved query, route type, and semantic query. The inclusion of diverse terms (deep learning, artificial neural networks, etc.) demonstrates a good understanding of the topic and relevant search strategies. The confidence score is high as it represents a reasonable approach to initially querying for information on this subject.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The response effectively translates the question 'papers about neural networks' into a structured data format. The `map` structure clearly outlines relevant search terms categorized by confidence, improved query, route type, and semantic query. The inclusion of diverse terms (deep learning, artificial neural networks, etc.) demonstrates a good understanding of the topic and relevant search strategies. The confidence score is high as it represents a reasonable approach to initially querying for information on this subject.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.8500000238418579,
+          "reason": "Confidence: 0.85 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.8500000238418579,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The response provides a highly relevant and useful starting point for someone asking about papers on neural networks. The `map` structure breaks down the query into key semantic components – neural networks, deep learning, related fields, and specific network types – which is exactly what someone researching this topic would need. The confidence score of 0.85 is reasonable, and the level of detail is appropriate for guiding a search.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The response provides a highly relevant and useful starting point for someone asking about papers on neural networks. The `map` structure breaks down the query into key semantic components – neural networks, deep learning, related fields, and specific network types – which is exactly what someone researching this topic would need. The confidence score of 0.85 is reasonable, and the level of detail is appropriate for guiding a search.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive breakdown of relevant search terms and concepts related to neural networks, directly addressing the question. The inclusion of various sub-areas like CNNs and RNNs demonstrates a good understanding of the topic.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive breakdown of relevant search terms and concepts related to neural networks, directly addressing the question. The inclusion of various sub-areas like CNNs and RNNs demonstrates a good understanding of the topic.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 5378377834,
+      "timestamp": "2025-11-11T22:50:35.116754-08:00"
+    },
+    {
+      "example": {
+        "input": "documents on distributed systems",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.85,
+        "improved_query": "distributed systems architecture design patterns",
+        "route_type": "search",
+        "semantic_query": "distributed computing systems, microservices architecture, cloud-native distributed systems, consensus algorithms, fault tolerance, high availability, distributed databases, service mesh"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a well-organized and relevant set of terms associated with distributed systems. The inclusion of concepts like 'consensus algorithms,' 'fault tolerance,' and 'high availability' demonstrates a good understanding of the topic. The 'map' structure, while unconventional, effectively presents a categorized list of related concepts. The confidence score is high due to the logical connection and relevant terms provided.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a well-organized and relevant set of terms associated with distributed systems. The inclusion of concepts like 'consensus algorithms,' 'fault tolerance,' and 'high availability' demonstrates a good understanding of the topic. The 'map' structure, while unconventional, effectively presents a categorized list of related concepts. The confidence score is high due to the logical connection and relevant terms provided.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.8500000238418579,
+          "reason": "Confidence: 0.85 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.8500000238418579,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer provides a highly relevant and useful starting point for someone asking about distributed systems. The `map` structure effectively lists key concepts and related search terms, which is precisely what someone researching the topic would need. It moves beyond a simple definition and suggests avenues for further investigation. The confidence score reflects the quality and relevance of the provided information.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer provides a highly relevant and useful starting point for someone asking about distributed systems. The `map` structure effectively lists key concepts and related search terms, which is precisely what someone researching the topic would need. It moves beyond a simple definition and suggests avenues for further investigation. The confidence score reflects the quality and relevance of the provided information.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a rich set of related terms directly relevant to distributed systems. It includes core concepts like architecture design patterns, specific technologies (microservices, cloud-native, service mesh, distributed databases), and important considerations (consensus algorithms, fault tolerance, high availability). This goes far beyond a simple acknowledgement of the question.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a rich set of related terms directly relevant to distributed systems. It includes core concepts like architecture design patterns, specific technologies (microservices, cloud-native, service mesh, distributed databases), and important considerations (consensus algorithms, fault tolerance, high availability). This goes far beyond a simple acknowledgement of the question.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 5271472417,
+      "timestamp": "2025-11-11T22:50:40.494998-08:00"
+    },
+    {
+      "example": {
+        "input": "research about quantum computing",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "quantum computing concepts, applications, and technologies",
+        "route_type": "search",
+        "semantic_query": "quantum computing, qubit, superposition, entanglement, quantum algorithms, quantum hardware, quantum information processing, quantum error correction, quantum cryptography"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a highly relevant and organized response to the question 'research about quantum computing.' It's structured as a 'map' outlining key concepts, applications, and technologies. The inclusion of specific terms like 'qubit,' 'superposition,' and 'entanglement' demonstrates a solid understanding of the subject. The suggested route type (search) is appropriate for further investigation. The confidence level is high as it directly addresses the prompt.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a highly relevant and organized response to the question 'research about quantum computing.' It's structured as a 'map' outlining key concepts, applications, and technologies. The inclusion of specific terms like 'qubit,' 'superposition,' and 'entanglement' demonstrates a solid understanding of the subject. The suggested route type (search) is appropriate for further investigation. The confidence level is high as it directly addresses the prompt.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The response provides a highly relevant and useful starting point for someone researching quantum computing. It offers a structured set of search queries covering core concepts, applications, and technologies. The confidence score reflects the quality and focus of the suggested search terms.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The response provides a highly relevant and useful starting point for someone researching quantum computing. It offers a structured set of search queries covering core concepts, applications, and technologies. The confidence score reflects the quality and focus of the suggested search terms.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive and relevant response to the question about quantum computing. It outlines key concepts, applications, and technologies, reflecting a good starting point for research. The structured output (map format) suggests a systematic approach to the research topic.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive and relevant response to the question about quantum computing. It outlines key concepts, applications, and technologies, reflecting a good starting point for research. The structured output (map format) suggests a systematic approach to the research topic.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 5029008958,
+      "timestamp": "2025-11-11T22:50:45.76634-08:00"
+    },
+    {
+      "example": {
+        "input": "Why is the sky blue?",
+        "reference": "question",
+        "metadata": {
+          "category": "explanation_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Why does the sky appear blue?",
+        "route_type": "question",
+        "semantic_query": "atmospheric scattering of sunlight, Rayleigh scattering, blue light wavelength, color perception, explanation of sky color"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The response effectively captures the core reason for the blue sky – Rayleigh scattering. The included semantic queries demonstrate a thorough understanding of the underlying physics (wavelength, color perception) and the relevant terminology. It's logically coherent and well-organized, presenting a clear and understandable explanation.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The response effectively captures the core reason for the blue sky – Rayleigh scattering. The included semantic queries demonstrate a thorough understanding of the underlying physics (wavelength, color perception) and the relevant terminology. It's logically coherent and well-organized, presenting a clear and understandable explanation.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a highly relevant and accurate response to the question about why the sky is blue. The included metadata (confidence, improved query, route type, semantic query) suggests a sophisticated system that understands the core concepts involved – Rayleigh scattering and the role of blue light wavelengths in color perception. It's appropriately detailed for a general audience seeking an explanation.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a highly relevant and accurate response to the question about why the sky is blue. The included metadata (confidence, improved query, route type, semantic query) suggests a sophisticated system that understands the core concepts involved – Rayleigh scattering and the role of blue light wavelengths in color perception. It's appropriately detailed for a general audience seeking an explanation.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of the scientific explanation for the blue color of the sky, referencing key concepts like Rayleigh scattering and wavelength. It directly addresses the question's core inquiry.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of the scientific explanation for the blue color of the sky, referencing key concepts like Rayleigh scattering and wavelength. It directly addresses the question's core inquiry.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        }
+      },
+      "duration": 12900919666,
+      "timestamp": "2025-11-11T22:50:50.795225-08:00"
+    },
+    {
+      "example": {
+        "input": "articles on climate change",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "climate change articles",
+        "route_type": "search",
+        "semantic_query": "climate change impact, global warming, greenhouse effect, climate science, environmental policy, effects of climate change, solutions to climate change"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a structured breakdown of search elements related to 'climate change articles'. It includes confidence, an improved query, and a breakdown of semantic queries, indicating a logical and organized approach to information retrieval. The inclusion of different facets (impact, global warming, etc.) demonstrates a comprehensive search strategy.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a structured breakdown of search elements related to 'climate change articles'. It includes confidence, an improved query, and a breakdown of semantic queries, indicating a logical and organized approach to information retrieval. The inclusion of different facets (impact, global warming, etc.) demonstrates a comprehensive search strategy.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a well-structured and detailed expansion of the initial query 'articles on climate change'. The `improved_query` suggests a broader range of relevant search terms, indicating an understanding of the user's potential need for diverse information related to climate change. The confidence score reflects a strong likelihood that these expanded search terms would lead to useful results. It effectively addresses the underlying need for a comprehensive search strategy.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a well-structured and detailed expansion of the initial query 'articles on climate change'. The `improved_query` suggests a broader range of relevant search terms, indicating an understanding of the user's potential need for diverse information related to climate change. The confidence score reflects a strong likelihood that these expanded search terms would lead to useful results. It effectively addresses the underlying need for a comprehensive search strategy.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of search terms related to 'climate change articles,' including various facets of the topic (impacts, global warming, scientific aspects, policy, and solutions). This demonstrates a clear understanding of the user's query and offers a useful starting point for finding relevant articles.\",\n  \"confidence\": 0.9\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of search terms related to 'climate change articles,' including various facets of the topic (impacts, global warming, scientific aspects, policy, and solutions). This demonstrates a clear understanding of the user's query and offers a useful starting point for finding relevant articles.\",\n  \"confidence\": 0.9\n}\n```"
+          }
+        }
+      },
+      "duration": 5205526708,
+      "timestamp": "2025-11-11T22:51:03.695825-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the symptoms of diabetes?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "symptoms of type 1 and type 2 diabetes",
+        "route_type": "question",
+        "semantic_query": "diabetes symptoms, hyperglycemia, hypoglycemia, diabetic neuropathy, diabetic retinopathy, diabetic nephropathy, blood glucose monitoring, diabetes complications, type 1 diabetes symptoms, type 2 diabetes symptoms"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive list of symptoms associated with diabetes, including hyperglycemia, hypoglycemia, neuropathy, retinopathy, nephropathy, and methods for monitoring (blood glucose monitoring). The inclusion of 'type 1 and type 2 diabetes' demonstrates an understanding of different forms of the disease. The semantic query details further support a thorough response to the question. It's logically coherent and well-structured.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive list of symptoms associated with diabetes, including hyperglycemia, hypoglycemia, neuropathy, retinopathy, nephropathy, and methods for monitoring (blood glucose monitoring). The inclusion of 'type 1 and type 2 diabetes' demonstrates an understanding of different forms of the disease. The semantic query details further support a thorough response to the question. It's logically coherent and well-structured.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a comprehensive list of symptoms associated with diabetes, including hyperglycemia, hypoglycemia, and various complications like neuropathy, retinopathy, and nephropathy. It also mentions blood glucose monitoring, which is crucial for managing the condition. This directly addresses the user's question and offers valuable information. The confidence score reflects the thoroughness of the response.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a comprehensive list of symptoms associated with diabetes, including hyperglycemia, hypoglycemia, and various complications like neuropathy, retinopathy, and nephropathy. It also mentions blood glucose monitoring, which is crucial for managing the condition. This directly addresses the user's question and offers valuable information. The confidence score reflects the thoroughness of the response.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.98,\n  \"reason\": \"The answer provides a comprehensive list of symptoms associated with diabetes, including hyperglycemia, hypoglycemia, and various complications like neuropathy, retinopathy, and nephropathy. It directly addresses the question's request for information about the symptoms of diabetes.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.98,\n  \"reason\": \"The answer provides a comprehensive list of symptoms associated with diabetes, including hyperglycemia, hypoglycemia, and various complications like neuropathy, retinopathy, and nephropathy. It directly addresses the question's request for information about the symptoms of diabetes.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 14073032500,
+      "timestamp": "2025-11-11T22:51:08.901222-08:00"
+    },
+    {
+      "example": {
+        "input": "best practices for code review",
+        "reference": "question",
+        "metadata": {
+          "category": "guidance_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "best practices for code review process and guidelines",
+        "route_type": "question",
+        "semantic_query": "code review best practices, software development review process, code quality guidelines, secure code review, code review checklists, code review standards"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The response is a mapping of keywords and concepts related to code review. While it identifies relevant terms, it doesn't provide any actual best practices or a structured explanation. It's a metadata mapping rather than a helpful answer to the question. It lacks coherence as a response to the prompt.\",\n  \"confidence\": 0.8\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The response is a mapping of keywords and concepts related to code review. While it identifies relevant terms, it doesn't provide any actual best practices or a structured explanation. It's a metadata mapping rather than a helpful answer to the question. It lacks coherence as a response to the prompt.\",\n  \"confidence\": 0.8\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The answer provides a list of keywords and concepts related to code review, which is a starting point. However, it doesn't actually *provide* best practices. It simply identifies terms someone could search for. It doesn't synthesize information or offer concrete advice.\",\n  \"confidence\": 0.8\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The answer provides a list of keywords and concepts related to code review, which is a starting point. However, it doesn't actually *provide* best practices. It simply identifies terms someone could search for. It doesn't synthesize information or offer concrete advice.\",\n  \"confidence\": 0.8\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive list of relevant keywords and concepts related to best practices for code review, directly addressing the question. The inclusion of terms like 'code review process,' 'software development review process,' and 'code quality guidelines' demonstrates a good understanding of the topic.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive list of relevant keywords and concepts related to best practices for code review, directly addressing the question. The inclusion of terms like 'code review process,' 'software development review process,' and 'code quality guidelines' demonstrates a good understanding of the topic.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 4823769542,
+      "timestamp": "2025-11-11T22:51:22.973905-08:00"
+    },
+    {
+      "example": {
+        "input": "How do I install Docker?",
+        "reference": "question",
+        "metadata": {
+          "category": "how_to_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "steps to install Docker on Windows, macOS, or Linux",
+        "route_type": "question",
+        "semantic_query": "Docker installation guide; Docker setup; containerization installation; Docker Desktop installation; Docker Engine installation; container runtime installation"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The answer primarily provides a list of search terms related to Docker installation, which isn't a coherent answer to the question 'How do I install Docker?' It lacks any actual installation instructions or a clear, step-by-step guide. While the semantic query and route type are relevant, they don't constitute a response.\",\n  \"confidence\": 0.8\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The answer primarily provides a list of search terms related to Docker installation, which isn't a coherent answer to the question 'How do I install Docker?' It lacks any actual installation instructions or a clear, step-by-step guide. While the semantic query and route type are relevant, they don't constitute a response.\",\n  \"confidence\": 0.8\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The answer is a metadata extraction and doesn't actually provide instructions on how to install Docker. It lists related search queries, which is helpful for someone *searching* for information, but not for someone who needs a step-by-step guide on how to install Docker. It doesn't address the user's underlying need for a functional installation.\",\n  \"confidence\": 0.8\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": false,\n  \"score\": 0.3,\n  \"reason\": \"The answer is a metadata extraction and doesn't actually provide instructions on how to install Docker. It lists related search queries, which is helpful for someone *searching* for information, but not for someone who needs a step-by-step guide on how to install Docker. It doesn't address the user's underlying need for a functional installation.\",\n  \"confidence\": 0.8\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive list of relevant search queries related to installing Docker, directly addressing the user's question of \\\"How do I install Docker?\\\" It includes different operating systems and installation methods (Docker Desktop, Docker Engine).\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive list of relevant search queries related to installing Docker, directly addressing the user's question of \\\"How do I install Docker?\\\" It includes different operating systems and installation methods (Docker Desktop, Docker Engine).\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 4980804958,
+      "timestamp": "2025-11-11T22:51:27.797555-08:00"
+    },
+    {
+      "example": {
+        "input": "examples of microservices architecture",
+        "reference": "question",
+        "metadata": {
+          "category": "example_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "examples of microservices architectural patterns and designs",
+        "route_type": "question",
+        "semantic_query": "microservices architecture patterns, microservices design, architectural styles for microservices, distributed systems design, service-oriented architecture"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a good starting point for addressing the question. The `map` structure is a reasonable approach for presenting related concepts. The included semantic queries are relevant and demonstrate an understanding of the broader context of microservices architecture. It’s not a fully detailed list, but it’s a solid, logically coherent response reflecting a search-derived approach.\",\n  \"confidence\": 0.9\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a good starting point for addressing the question. The `map` structure is a reasonable approach for presenting related concepts. The included semantic queries are relevant and demonstrate an understanding of the broader context of microservices architecture. It’s not a fully detailed list, but it’s a solid, logically coherent response reflecting a search-derived approach.\",\n  \"confidence\": 0.9\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer provides a good starting point by suggesting related queries (architectural patterns, designs, etc.). This demonstrates an understanding of the user's intent to go beyond a simple definition of microservices. However, it doesn't actually *provide* examples.  A stronger response would include specific patterns like API gateways, service meshes, or communication styles (e.g., REST, gRPC).\",\n  \"confidence\": 0.9\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer provides a good starting point by suggesting related queries (architectural patterns, designs, etc.). This demonstrates an understanding of the user's intent to go beyond a simple definition of microservices. However, it doesn't actually *provide* examples.  A stronger response would include specific patterns like API gateways, service meshes, or communication styles (e.g., REST, gRPC).\",\n  \"confidence\": 0.9\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a broadened search query that directly relates to the question 'examples of microservices architecture'. Expanding the search to include 'architectural patterns and designs' and 'distributed systems design' is highly relevant and helpful for someone seeking examples.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a broadened search query that directly relates to the question 'examples of microservices architecture'. Expanding the search to include 'architectural patterns and designs' and 'distributed systems design' is highly relevant and helpful for someone seeking examples.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 13707493542,
+      "timestamp": "2025-11-11T22:51:32.778237-08:00"
+    },
+    {
+      "example": {
+        "input": "When was the French Revolution?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "When did the French Revolution begin and end?",
+        "route_type": "question",
+        "semantic_query": "French Revolution timeline, causes of the French Revolution, dates of the French Revolution, revolutionary period France, 1789 French Revolution, 1799 French Revolution"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive and logical response to the question. It includes a confidence score, an improved query that refines the search, and a list of related semantic queries, all demonstrating a good understanding of the topic and a strategy for further investigation. It's well-structured and clearly explains the approach to answering the question.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive and logical response to the question. It includes a confidence score, an improved query that refines the search, and a list of related semantic queries, all demonstrating a good understanding of the topic and a strategy for further investigation. It's well-structured and clearly explains the approach to answering the question.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a very useful starting point for someone asking about the French Revolution. The suggested improved queries (timeline, causes, dates) directly address the user's likely need for a detailed timeline and key information. The confidence score reflects the high probability that these related queries will lead to a satisfactory answer.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a very useful starting point for someone asking about the French Revolution. The suggested improved queries (timeline, causes, dates) directly address the user's likely need for a detailed timeline and key information. The confidence score reflects the high probability that these related queries will lead to a satisfactory answer.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive response to the question of when the French Revolution occurred by suggesting related queries that delve into the timeline, causes, and dates of the revolution. This directly addresses the question's request for information about the timeframe of the event.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a comprehensive response to the question of when the French Revolution occurred by suggesting related queries that delve into the timeline, causes, and dates of the revolution. This directly addresses the question's request for information about the timeframe of the event.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 5056585042,
+      "timestamp": "2025-11-11T22:51:46.48539-08:00"
+    },
+    {
+      "example": {
+        "input": "tutorials on machine learning",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.85,
+        "improved_query": "machine learning tutorials for beginners",
+        "route_type": "search",
+        "semantic_query": "machine learning tutorials, introductory machine learning, beginner machine learning courses, machine learning learning resources, practical machine learning tutorials"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer effectively summarizes the user's query into a structured format. The `map` key clearly outlines the various aspects of the search – confidence score, improved query terms, and the route type (search).  It demonstrates a good understanding of the user’s intent and provides relevant metadata. The confidence score is a useful addition. Minor improvement could be a more descriptive route type.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer effectively summarizes the user's query into a structured format. The `map` key clearly outlines the various aspects of the search – confidence score, improved query terms, and the route type (search).  It demonstrates a good understanding of the user’s intent and provides relevant metadata. The confidence score is a useful addition. Minor improvement could be a more descriptive route type.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.8500000238418579,
+          "reason": "Confidence: 0.85 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.8500000238418579,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a well-structured mapping of a search query, indicating intent (tutorials), confidence level, and potentially relevant variations. This is a highly useful response for a user seeking machine learning tutorials, offering a starting point for more targeted searches. It addresses the need for a comprehensive list of relevant resources.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer provides a well-structured mapping of a search query, indicating intent (tutorials), confidence level, and potentially relevant variations. This is a highly useful response for a user seeking machine learning tutorials, offering a starting point for more targeted searches. It addresses the need for a comprehensive list of relevant resources.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of a search query related to 'machine learning tutorials'. It includes confidence scores, improved query suggestions, and the type of search (search). This directly addresses the question by outlining the kind of search terms and strategies someone might use when looking for tutorials on machine learning.\",\n  \"confidence\": 0.9\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer provides a detailed breakdown of a search query related to 'machine learning tutorials'. It includes confidence scores, improved query suggestions, and the type of search (search). This directly addresses the question by outlining the kind of search terms and strategies someone might use when looking for tutorials on machine learning.\",\n  \"confidence\": 0.9\n}\n```"
+          }
+        }
+      },
+      "duration": 5071847125,
+      "timestamp": "2025-11-11T22:51:51.541849-08:00"
+    },
+    {
+      "example": {
+        "input": "What is the capital of France?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 1,
+        "improved_query": "What is the capital city of France?",
+        "route_type": "question",
+        "semantic_query": "capital city France, Paris, French government, administrative center France"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer provides a structured representation of the query, including confidence, an improved query, a route type (question), and semantic queries.  It correctly identifies the core elements needed to answer the question and demonstrates a systematic approach to understanding and refining the query. The confidence score of 1 indicates complete certainty about the response.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer provides a structured representation of the query, including confidence, an improved query, a route type (question), and semantic queries.  It correctly identifies the core elements needed to answer the question and demonstrates a systematic approach to understanding and refining the query. The confidence score of 1 indicates complete certainty about the response.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 1,
+          "reason": "Confidence: 1.00 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 1,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer provides a structured response indicating it's designed to answer a question about the capital of France. The included metadata (confidence, improved query, route type, semantic query) suggests a system designed to understand and fulfill the user's need. It directly addresses the question, and the metadata highlights the system's capabilities.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer provides a structured response indicating it's designed to answer a question about the capital of France. The included metadata (confidence, improved query, route type, semantic query) suggests a system designed to understand and fulfill the user's need. It directly addresses the question, and the metadata highlights the system's capabilities.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer provides a structured representation of a query related to the question. While it doesn't directly state 'Paris' as the capital, the metadata clearly indicates the intent is to find the capital of France, making it highly relevant.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer provides a structured representation of a query related to the question. While it doesn't directly state 'Paris' as the capital, the metadata clearly indicates the intent is to find the capital of France, making it highly relevant.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 25529946541,
+      "timestamp": "2025-11-11T22:51:56.613571-08:00"
+    },
+    {
+      "example": {
+        "input": "compare React vs Vue",
+        "reference": "question",
+        "metadata": {
+          "category": "comparison_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "compare React and Vue frameworks: features, differences, and use cases",
+        "route_type": "question",
+        "semantic_query": "React framework comparison, Vue.js framework comparison, JavaScript front-end frameworks, single-page application frameworks, front-end development frameworks, React vs Vue.js, framework comparison, front-end development"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "coherence": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The response is a good semantic query reflecting the question. It effectively identifies key aspects to be compared (React and Vue), including features, differences, and use cases. The inclusion of relevant keywords demonstrates an understanding of the topic. While not a direct answer, it fulfills the prompt's requirement to identify relevant search terms for comparing the frameworks.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The response is a good semantic query reflecting the question. It effectively identifies key aspects to be compared (React and Vue), including features, differences, and use cases. The inclusion of relevant keywords demonstrates an understanding of the topic. While not a direct answer, it fulfills the prompt's requirement to identify relevant search terms for comparing the frameworks.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "helpfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer isn't a direct comparison, but the 'improved_query' suggests an understanding of the user's intent. It correctly identifies the core need (comparing React and Vue) and provides a structured way to explore that comparison. The semantic query terms are also relevant and helpful. While it doesn't offer a full comparison, it's a good starting point and outlines the key areas to investigate when researching the topic.\",\n  \"confidence\": 0.9\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer isn't a direct comparison, but the 'improved_query' suggests an understanding of the user's intent. It correctly identifies the core need (comparing React and Vue) and provides a structured way to explore that comparison. The semantic query terms are also relevant and helpful. While it doesn't offer a full comparison, it's a good starting point and outlines the key areas to investigate when researching the topic.\",\n  \"confidence\": 0.9\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer effectively summarizes the core of the question by identifying key aspects to compare (features, differences, use cases) and providing related semantic queries. It’s a very relevant and helpful response.\",\n  \"confidence\": 0.98\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer effectively summarizes the core of the question by identifying key aspects to compare (features, differences, use cases) and providing related semantic queries. It’s a very relevant and helpful response.\",\n  \"confidence\": 0.98\n}\n```"
+          }
+        }
+      },
+      "duration": 14146821542,
+      "timestamp": "2025-11-11T22:52:22.142883-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": false,
+      "max_concurrency": 1,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-11T22:50:24.869468-08:00"
+}

@@ -1,0 +1,680 @@
+{
+  "summary": {
+    "total_examples": 15,
+    "passed_examples": 15,
+    "failed_examples": 0,
+    "average_score": 0.9749999940395355,
+    "pass_rate": 1,
+    "total_duration": 16307213125,
+    "evaluator_stats": {
+      "classification": {
+        "name": "classification",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 5691
+      },
+      "confidence": {
+        "name": "confidence",
+        "total_evaluations": 15,
+        "passed": 15,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 0.949999988079071,
+        "pass_rate": 1,
+        "average_duration": 6340
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is the weather today?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "weather forecast today",
+        "route_type": "question",
+        "semantic_query": "current weather conditions, temperature, precipitation, wind speed, humidity, location-specific weather data"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 5106410917,
+      "timestamp": "2025-11-16T13:05:37.106362-08:00"
+    },
+    {
+      "example": {
+        "input": "How does photosynthesis work?",
+        "reference": "question",
+        "metadata": {
+          "category": "explanation_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Explain the process of photosynthesis, including the roles of chlorophyll, light energy, carbon dioxide, and water.",
+        "route_type": "question",
+        "semantic_query": "photosynthesis process, chlorophyll, light energy conversion, carbon fixation, water utilization, plant energy production, light-dependent reactions, light-independent reactions, Calvin cycle"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 3254868542,
+      "timestamp": "2025-11-16T13:05:40.072145-08:00"
+    },
+    {
+      "example": {
+        "input": "papers about neural networks",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "neural networks research papers",
+        "route_type": "search",
+        "semantic_query": "neural networks, deep learning, artificial neural networks, artificial intelligence, machine learning models, convolutional neural networks, recurrent neural networks, deep learning architectures"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2859296125,
+      "timestamp": "2025-11-16T13:05:41.37858-08:00"
+    },
+    {
+      "example": {
+        "input": "documents on distributed systems",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "distributed systems architecture design patterns and best practices",
+        "route_type": "search",
+        "semantic_query": "distributed computing systems, microservices architecture, cloud-native distributed systems, consensus algorithms, fault tolerance, scalability, high availability, system design patterns, distributed databases, service mesh"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 3001425584,
+      "timestamp": "2025-11-16T13:05:42.212802-08:00"
+    },
+    {
+      "example": {
+        "input": "research about quantum computing",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "quantum computing concepts, applications, and technologies",
+        "route_type": "search",
+        "semantic_query": "quantum computing, quantum information processing, qubits, superposition, entanglement, quantum algorithms, quantum hardware, quantum error correction, quantum computing research"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2815845958,
+      "timestamp": "2025-11-16T13:05:43.327033-08:00"
+    },
+    {
+      "example": {
+        "input": "Why is the sky blue?",
+        "reference": "question",
+        "metadata": {
+          "category": "explanation_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "Why does the sky appear blue?",
+        "route_type": "question",
+        "semantic_query": "atmospheric scattering of sunlight, Rayleigh scattering, blue light wavelength, light refraction, sky color phenomenon, electromagnetic radiation, solar spectrum"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2779749458,
+      "timestamp": "2025-11-16T13:05:44.237897-08:00"
+    },
+    {
+      "example": {
+        "input": "articles on climate change",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "climate change articles",
+        "route_type": "search",
+        "semantic_query": "climate change impacts, global warming, greenhouse effect, climate science, environmental policy, carbon emissions, climate solutions"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2965780958,
+      "timestamp": "2025-11-16T13:05:37.106346-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the symptoms of diabetes?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "symptoms of type 1 and type 2 diabetes",
+        "route_type": "question",
+        "semantic_query": "diabetes symptoms, type 1 diabetes symptoms, type 2 diabetes symptoms, hyperglycemia, hypoglycemia, diabetic neuropathy, diabetic retinopathy, diabetic nephropathy, blood glucose monitoring, diabetes complications"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2924177375,
+      "timestamp": "2025-11-16T13:05:46.142896-08:00"
+    },
+    {
+      "example": {
+        "input": "best practices for code review",
+        "reference": "question",
+        "metadata": {
+          "category": "guidance_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "best practices for code review guidelines and standards",
+        "route_type": "question",
+        "semantic_query": "code review best practices, software development review processes, code review standards, guidelines for effective code reviews, improving code quality through review"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2947319584,
+      "timestamp": "2025-11-16T13:05:47.017666-08:00"
+    },
+    {
+      "example": {
+        "input": "How do I install Docker?",
+        "reference": "question",
+        "metadata": {
+          "category": "how_to_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "How to install Docker on Windows, macOS, or Linux",
+        "route_type": "question",
+        "semantic_query": "Docker installation process, Docker Desktop, Docker Engine, containerization, container image installation, virtual environment creation, container runtime, Docker setup, Docker tutorial"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2881078500,
+      "timestamp": "2025-11-16T13:05:48.041182-08:00"
+    },
+    {
+      "example": {
+        "input": "examples of microservices architecture",
+        "reference": "question",
+        "metadata": {
+          "category": "example_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "examples of microservices architectural patterns and implementations",
+        "route_type": "question",
+        "semantic_query": "microservices architecture patterns, microservices design patterns, service-oriented architecture, distributed systems, API design, event-driven architecture, message queues, containerization (Docker, Kubernetes), service mesh"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2826910375,
+      "timestamp": "2025-11-16T13:05:45.214253-08:00"
+    },
+    {
+      "example": {
+        "input": "When was the French Revolution?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "When did the French Revolution begin and end?",
+        "route_type": "question",
+        "semantic_query": "French Revolution timeline, start date, end date, causes of the French Revolution, key events of the French Revolution"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2665189000,
+      "timestamp": "2025-11-16T13:05:49.965004-08:00"
+    },
+    {
+      "example": {
+        "input": "tutorials on machine learning",
+        "reference": "search",
+        "metadata": {
+          "category": "search_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "machine learning tutorials for beginners",
+        "route_type": "search",
+        "semantic_query": "machine learning tutorials, learning algorithms, supervised learning, unsupervised learning, deep learning, neural networks, introduction to machine learning"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"search\", Got: \"search\" ✓",
+          "metadata": {
+            "actual": "search",
+            "expected": "search",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2699404375,
+      "timestamp": "2025-11-16T13:05:49.067094-08:00"
+    },
+    {
+      "example": {
+        "input": "What is the capital of France?",
+        "reference": "question",
+        "metadata": {
+          "category": "factual_query",
+          "expected_confidence_min": 0.8
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "What is the capital city of France?",
+        "route_type": "question",
+        "semantic_query": "capital city France, Paris, France geography, French government, administrative center France"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 2491286500,
+      "timestamp": "2025-11-16T13:05:50.922287-08:00"
+    },
+    {
+      "example": {
+        "input": "compare React vs Vue",
+        "reference": "question",
+        "metadata": {
+          "category": "comparison_query",
+          "expected_confidence_min": 0.7
+        }
+      },
+      "output": {
+        "confidence": 0.95,
+        "improved_query": "compare React and Vue frameworks, including their key features, differences, and use cases.",
+        "route_type": "question",
+        "semantic_query": "React framework comparison, Vue.js framework comparison, JavaScript front-end frameworks, front-end development frameworks, single-page application frameworks, React vs Vue.js, front-end development technologies, component-based architecture, data binding, virtual DOM, reactivity"
+      },
+      "results": {
+        "classification": {
+          "pass": true,
+          "score": 1,
+          "reason": "Expected: \"question\", Got: \"question\" ✓",
+          "metadata": {
+            "actual": "question",
+            "expected": "question",
+            "valid_classes": [
+              "question",
+              "search"
+            ]
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 4272204458,
+      "timestamp": "2025-11-16T13:05:37.106345-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": true,
+      "max_concurrency": 3,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-16T13:05:37.106303-08:00"
+}

@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*" # Triggers on tags like v1.0.0, v0.0.0-dev10
+
+permissions:
+  contents: write # Required for creating releases
+  packages: write # Required if publishing Docker images
+  id-token: write # Required for keyless OIDC signing in container workflow
+
+jobs:
+  goreleaser:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    env:
+      GOEXPERIMENT: simd
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # Required for GoReleaser changelog generation
+          submodules: true # Your project uses submodules
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: ''
+
+      - name: Install protoc
+        run: |
+          # Install protoc 33.1 (supports Protobuf Editions)
+          # Ubuntu apt has old versions that don't support edition = "2023"
+          PROTOC_VERSION="33.1"
+          curl -fsSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
+          rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          protoc --version
+
+      - name: Install protoc-gen-go
+        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
+
+      - name: Install ARM64 cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.1"
+
+      # Cache ONNX Runtime libraries (versions from termite/scripts/download-onnxruntime.sh)
+      - name: Cache ONNX Runtime libraries
+        id: cache-onnx
+        uses: actions/cache@v5
+        with:
+          path: onnxruntime
+          key: onnxruntime-1.24.3-genai-0.12.1-tokenizers-1.26.0
+
+      - name: Download ONNX Runtime libraries
+        if: steps.cache-onnx.outputs.cache-hit != 'true'
+        run: ./termite/scripts/download-onnxruntime.sh
+
+      # Cache PJRT libraries (versions from termite/scripts/download-pjrt.sh)
+      - name: Cache PJRT libraries
+        id: cache-pjrt
+        uses: actions/cache@v5
+        with:
+          path: pjrt
+          key: pjrt-0.83.4-tokenizers-1.25.0
+
+      - name: Download PJRT libraries
+        if: steps.cache-pjrt.outputs.cache-hit != 'true'
+        run: ./termite/scripts/download-pjrt.sh
+
+      # Cache macOS SDK for cross-compilation
+      - name: Cache macOS SDK
+        id: cache-macos-sdk
+        uses: actions/cache@v5
+        with:
+          path: /tmp/macos-sdk
+          key: macos-sdk-15.5
+
+      - name: Download macOS SDK for cross-compilation
+        if: steps.cache-macos-sdk.outputs.cache-hit != 'true'
+        run: |
+          # Download macOS SDK for cross-compilation
+          # Using the osxcross SDK packages from joseluisq/macosx-sdks
+          mkdir -p /tmp/macos-sdk
+          curl -fsSL https://github.com/joseluisq/macosx-sdks/releases/download/15.5/MacOSX15.5.sdk.tar.xz | tar -xJf - -C /tmp/macos-sdk
+
+      - name: Set macOS SDK path
+        run: |
+          echo "SDK_PATH=/tmp/macos-sdk/MacOSX15.5.sdk" >> $GITHUB_ENV
+          # Verify required headers exist (mach headers are in Kernel.framework, not usr/include)
+          echo "Checking for mach headers in Kernel.framework..."
+          ls -la /tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach/ | head -20 || echo "WARNING: mach headers not found in Kernel.framework"
+          ls /tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach/mach_vm.h || echo "WARNING: mach_vm.h not found"
+
+      - name: Configure Go for private modules
+        run: |
+          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
+          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
+          echo "ONNXRUNTIME_ROOT=${{ github.workspace }}/onnxruntime" >> $GITHUB_ENV
+          echo "PJRT_ROOT=${{ github.workspace }}/pjrt" >> $GITHUB_ENV
+
+      - name: Extract version from tag
+        run: |
+          echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          echo "Release version: ${GITHUB_REF_NAME}"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "v2.12.0"
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  # Build and publish container images after release
+  publish-container:
+    needs: goreleaser
+    uses: ./.github/workflows/antfly-container.yml
+    with:
+      tag_name: ${{ github.ref_name }}
+    secrets: inherit

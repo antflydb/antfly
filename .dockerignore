@@ -1,0 +1,67 @@
+# Version control
+.git
+.gitmodules
+
+# Config and metadata
+.goreleaser.yaml
+.golangci.yaml
+.claude
+.aider*
+*aider*
+.dockerignore
+Procfile*
+README*
+
+# Test and example data
+wiki-articles.json
+wiki-articles-1000.json
+testfile*
+*.gob
+*_test.go
+lib/vector/testutils
+e2e/
+
+# Local databases
+antflydb
+termitedb
+metadatadb
+
+# ML models and native libraries (not needed for pure-Go build)
+models/
+onnxruntime/
+pjrt/
+examples/
+
+# Termite large artifacts (source is needed, but not models/binaries/native libs)
+termite/registry/
+termite/models/
+termite/onnxruntime/
+termite/pjrt/
+termite/bin/
+termite/e2e/
+
+# SDKs (not needed for server build)
+ts/
+py/
+
+# Frontend and docs
+www/
+node_modules/
+dist/
+design-system/
+
+# DevOps and infrastructure
+devops/
+work-log/
+
+# Specs, datasets, and build cache
+specs/
+datasets/
+.turbo/
+
+# Misc
+*.log
+*.jpg
+*.py
+laion-400m-images/
+data/

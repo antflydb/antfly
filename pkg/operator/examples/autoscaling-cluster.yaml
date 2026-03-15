@@ -1,0 +1,60 @@
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: autoscaling-cluster
+  namespace: default
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  metadataNodes:
+    replicas: 3
+    resources:
+      cpu: "100m"
+      memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+  
+  dataNodes:
+    replicas: 3  # Initial replicas
+    autoScaling:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+      targetMemoryUtilizationPercentage: 80
+      scaleUpCooldown: 60s
+      scaleDownCooldown: 300s
+    resources:
+      cpu: "200m"
+      memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+    api:
+      port: 12380
+    raft:
+      port: 9021
+  
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      },
+      "cluster_name": "autoscaling-cluster",
+      "enable_metrics": true,
+      "storage": {
+        "cache_size": 536870912
+      }
+    }
+  
+  storage:
+    storageClass: standard
+    metadataStorage: 1Gi
+    dataStorage: 2Gi

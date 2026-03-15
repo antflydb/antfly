@@ -1,0 +1,352 @@
+# ====================================================================================
+# Go Version Configuration
+# ====================================================================================
+# Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
+GO := GOEXPERIMENT=simd go
+
+# Go modules outside of root and termite (which has its own Makefile)
+GO_SUBMODULES := \
+	./e2e \
+	./pkg/client \
+	./pkg/operator \
+	./pkg/libaf \
+	./pkg/docsaf \
+	./pkg/evalaf \
+	./pkg/evalaf/plugins/antfly \
+	./pkg/genkit/antfly \
+	./pkg/genkit/openrouter
+
+# ====================================================================================
+# General Commands
+# ====================================================================================
+
+.PHONY: help
+help:
+	@echo "Usage: make <target>"
+	@echo ""
+	@echo "Targets:"
+	@echo "  build              Build the antfly binary"
+	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
+	@echo "  build-termite-dashboard  Build the termite dashboard (termite-only antfarm)"
+	@echo "  build-docs         Join and lint OpenAPI specifications"
+	@echo "  generate           Generate code, client SDKs, and all website documentation (API, config, changelog)"
+	@echo "  lint               Run golangci-lint with auto-fix"
+	@echo "  update-deps        Update Go dependencies"
+	@echo "  cleanup-goreman    Clean up goreman logs and data"
+	@echo ""
+	@echo "E2E Testing Commands:"
+	@echo "  e2e                Run e2e tests with ONNX+XLA (downloads deps on first run)"
+	@echo "                     Options: E2E_TEST=TestName E2E_TIMEOUT=30m"
+	@echo "  e2e-deps           Download ONNX Runtime and PJRT for e2e tests"
+	@echo ""
+	@echo "ML Backend Commands:"
+	@echo "  build-omni         Build antfly with ONNX + XLA backends (omni)"
+	@echo ""
+	@echo "Omni Cross-Compilation (for goreleaser):"
+	@echo "  download-omni-deps     Download ONNX Runtime and PJRT to antfly root"
+	@echo ""
+	@echo "Minikube Commands:"
+	@echo "  minikube-start     Start a Minikube instance"
+	@echo "  minikube-delete    Delete the Minikube instance"
+	@echo "  minikube-deploy    Deploy the application to Minikube"
+	@echo "  minikube-status    Get the status of the Minikube deployment"
+	@echo "  minikube-restart   Restart the Minikube instance"
+	@echo "  show-ingress       Show the Ingress IP and example commands"
+
+
+# ====================================================================================
+# Build and Generation Commands
+# ====================================================================================
+
+.PHONY: build build-docs generate lint license-headers license-check update-deps build-antfarm build-termite-dashboard
+
+build-antfarm: build-antfarm-main build-termite-dashboard
+
+build-antfarm-main:
+	@echo "Building antfarm frontend..."
+	cd ts && pnpm install && pnpm --filter antfarm build
+	@echo "Copying dist files to src/metadata/antfarm..."
+	rm -rf src/metadata/antfarm/*
+	cp -r ts/apps/antfarm/dist/* src/metadata/antfarm/
+
+build-termite-dashboard:
+	@echo "Building termite dashboard (antfarm with VITE_PRODUCTS=termite)..."
+	cd ts && pnpm install && VITE_PRODUCTS=termite pnpm --filter antfarm build
+	@echo "Copying dist files to termite/pkg/termite/dashboard..."
+	rm -rf termite/pkg/termite/dashboard/*
+	cp -r ts/apps/antfarm/dist/* termite/pkg/termite/dashboard/
+
+build: build-antfarm generate
+	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
+
+build-docs:
+	npx @redocly/cli@latest join src/metadata/api.yaml src/usermgr/api.yaml
+	npx @redocly/cli@latest lint openapi.yaml
+
+generate: build-docs build-termite-dashboard
+	$(GO) generate ./...
+	$(MAKE) -C ./termite generate
+	@for mod in $(GO_SUBMODULES); do \
+		echo "==> Generating in $$mod"; \
+		(cd $$mod && go generate ./...) || exit 1; \
+	done
+	cd ts && pnpm --filter @antfly/sdk generate
+	cd ts && pnpm --filter @antfly/termite-sdk generate
+	$(MAKE) -C ./py generate
+
+license-headers: ## Add ELv2 license headers to core files missing them
+	$(GO) run github.com/google/addlicense@latest \
+		-f .license-header.txt \
+		-ignore 'termite/**' \
+		-ignore 'lib/multirafthttp/**' \
+		-ignore 'lib/types/**' \
+		-ignore 'pkg/**' \
+		-ignore 'ts/**' \
+		-ignore 'py/**' \
+		-ignore 'rs/**' \
+		-ignore 'vendor/**' \
+		-ignore '.github/**' \
+		-ignore 'examples/**' \
+		-ignore 'configs/**' \
+		-ignore 'devops/**' \
+		-ignore 'scripts/**' \
+		-ignore '**/*.pb.go' \
+		-ignore '**/zz_generated*' \
+		-ignore '**/Dockerfile*' \
+		-ignore '**/*.yaml' \
+		-ignore '**/*.yml' \
+		.
+
+license-check: ## Check that all core files have license headers
+	$(GO) run github.com/google/addlicense@latest \
+		-check \
+		-f .license-header.txt \
+		-ignore 'termite/**' \
+		-ignore 'lib/multirafthttp/**' \
+		-ignore 'lib/types/**' \
+		-ignore 'pkg/**' \
+		-ignore 'ts/**' \
+		-ignore 'py/**' \
+		-ignore 'rs/**' \
+		-ignore 'vendor/**' \
+		-ignore '.github/**' \
+		-ignore 'examples/**' \
+		-ignore 'configs/**' \
+		-ignore 'devops/**' \
+		-ignore 'scripts/**' \
+		-ignore '**/*.pb.go' \
+		-ignore '**/zz_generated*' \
+		-ignore '**/Dockerfile*' \
+		-ignore '**/*.yaml' \
+		-ignore '**/*.yml' \
+		.
+
+lint:
+	$(GO) run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...
+	$(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...
+	$(GO) run github.com/Antonboom/testifylint@latest --fix ./...
+	@for mod in $(GO_SUBMODULES); do \
+		echo "==> Linting $$mod"; \
+		(cd $$mod && go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...) && \
+		(cd $$mod && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...) && \
+		(cd $$mod && go run github.com/Antonboom/testifylint@latest --fix ./...) || exit 1; \
+	done
+	$(MAKE) -C termite lint
+	cd ts && pnpm run lint
+
+
+# ====================================================================================
+# Omni Dependencies Download (for goreleaser CGO cross-compilation)
+# ====================================================================================
+#
+# Downloads ONNX Runtime and PJRT libraries needed for goreleaser omni builds.
+# Run this before: goreleaser release --snapshot --clean
+#
+# Downloads to termite/onnxruntime and termite/pjrt by default.
+# Uses stamp files to skip if already downloaded.
+
+.PHONY: download-omni-deps
+
+download-omni-deps:
+	$(MAKE) -C termite download-omni-deps
+
+update-deps:
+	$(GO) get -u ./... && $(GO) mod tidy
+	@for mod in $(GO_SUBMODULES); do \
+		echo "==> Updating deps in $$mod"; \
+		(cd $$mod && go get -u ./... && go mod tidy) || exit 1; \
+	done
+	$(MAKE) -C termite update-deps
+
+
+# ====================================================================================
+# ML Backend Build Targets
+# ====================================================================================
+# Build Antfly with various ML backend configurations
+
+.PHONY: build-omni
+
+build-omni: download-omni-deps
+	@echo "Building antfly with ONNX + XLA backends (omni)..."
+	@echo "Platform: $(E2E_PLATFORM)"
+	export ONNXRUNTIME_ROOT=$$(pwd)/termite/onnxruntime && \
+	export PJRT_ROOT=$$(pwd)/termite/pjrt && \
+	export CGO_ENABLED=1 && \
+	export LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
+	export LD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
+	export DYLD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
+	$(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o antfly ./cmd/antfly
+
+
+# ====================================================================================
+# E2E Testing Commands
+# ====================================================================================
+# End-to-end tests for docsaf that require ONNX/XLA backends and ML models
+
+# Detect OS and architecture for library paths
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Darwin)
+    ifeq ($(UNAME_M),arm64)
+        E2E_PLATFORM := darwin-arm64
+    else
+        E2E_PLATFORM := darwin-amd64
+    endif
+else
+    ifeq ($(UNAME_M),aarch64)
+        E2E_PLATFORM := linux-arm64
+    else
+        E2E_PLATFORM := linux-amd64
+    endif
+endif
+
+.PHONY: e2e e2e-deps
+
+# E2E test configuration
+E2E_TEST ?=
+E2E_TIMEOUT ?= 30m
+E2E_MEMLIMIT ?= 16GiB
+
+e2e-deps:
+	$(MAKE) -C termite download-omni-deps
+
+e2e: e2e-deps
+	@echo "Running E2E tests with ONNX+XLA build (Termite provider)..."
+	@echo "This will download models on first run (embedder, chunker, reranker, generator)."
+	@echo "Platform: $(E2E_PLATFORM)"
+ifdef E2E_TEST
+	@echo "Test: $(E2E_TEST)"
+endif
+	@echo "Timeout: $(E2E_TIMEOUT)"
+	@echo "Memory limit: $(E2E_MEMLIMIT)"
+	export ONNXRUNTIME_ROOT=$$(pwd)/termite/onnxruntime && \
+	export PJRT_ROOT=$$(pwd)/termite/pjrt && \
+	export CGO_ENABLED=1 && \
+	export GOMEMLIMIT=$(E2E_MEMLIMIT) && \
+	export LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
+	export LD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
+	export DYLD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
+	export RUN_EVAL_TESTS=true && \
+	export E2E_PROVIDER=termite && \
+	cd e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
+
+
+# ====================================================================================
+# Minikube Commands
+# ====================================================================================
+
+.PHONY: minikube-start minikube-delete minikube-deploy minikube-status minikube-restart build-minikube show-ingress
+
+minikube-start:
+	minikube start --driver=vfkit --container-runtime containerd --cpus 3 --memory "7G" --disk-size "20G" --profile=minikube
+	minikube addons enable metrics-server --profile=minikube
+	minikube addons enable ingress --profile=minikube
+	minikube addons enable ingress-dns --profile=minikube
+	minikube addons enable registry --profile=minikube
+	$(MAKE) minikube-deploy
+
+minikube-delete:
+	minikube delete --profile=minikube
+
+minikube-deploy: build-minikube
+	@echo "Waiting for Ingress controller deployment to be ready..."
+	@kubectl wait --namespace ingress-nginx \
+		--for=condition=available deployment \
+		--selector=app.kubernetes.io/component=controller \
+		--timeout=120s --context=minikube || \
+		(echo "Error: Ingress controller deployment did not become ready." && exit 1)
+	@echo "Applying Kubernetes manifests..."
+	@kubectl --context=minikube apply -R -f ./devops/minikube/
+	@echo "Waiting for ingress resource to be created and potentially assign IP..."
+	@sleep 10 # Give ingress resource time to be processed
+	$(MAKE) show-ingress
+
+minikube-status:
+	@echo "Pods:"
+	@kubectl --context=minikube get pods
+	@echo "\nServices:"
+	@kubectl --context=minikube get services
+	@echo "\nDeployments:"
+	@kubectl --context=minikube get deployments
+
+minikube-restart: minikube-delete minikube-start
+
+build-minikube:
+	minikube image build --profile=minikube -t localhost:5000/antfly:latest .
+
+show-ingress:
+	@echo "Fetching Ingress IP..."
+	@INGRESS_IP=$$(kubectl --context=minikube get ingress antfly-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}'); \
+	if [ -z "$$INGRESS_IP" ]; then \
+		echo "Ingress IP not available yet. Trying again after delay..."; \
+		sleep 10; \
+		INGRESS_IP=$$(kubectl --context=minikube get ingress antfly-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}'); \
+	fi; \
+	if [ -z "$$INGRESS_IP" ]; then \
+		echo "Error: Could not retrieve Ingress IP."; \
+		echo "Ensure Minikube tunnel is running if needed (e.g., 'minikube tunnel --profile=minikube' in another terminal)"; \
+		echo "and the ingress controller pod is running correctly ('kubectl --context=minikube get pods -n ingress-nginx')."; \
+		exit 1; \
+	fi; \
+	echo "Ingress Controller IP: $$INGRESS_IP"; \
+	echo ""; \
+	echo "Example Access Commands:"; \
+	echo "  # Access Leader API (replace /api/endpoint with actual path)"; \
+	echo "  curl http://$$INGRESS_IP/leader/api/endpoint"; \
+	echo ""; \
+	echo "  # Access Worker 1 API (replace /api/endpoint with actual path)"; \
+	echo "  curl http://$$INGRESS_IP/worker-1/api/endpoint"; \
+	echo ""; \
+	echo "  # Access Worker 2 API (replace /api/endpoint with actual path)"; \
+	echo "  curl http://$$INGRESS_IP/worker-2/api/endpoint"; \
+	echo ""; \
+	echo "Note: If using Minikube Docker/Podman driver without LoadBalancer support, you might need 'minikube tunnel --profile=minikube' in a separate terminal."
+
+
+# ====================================================================================
+# Operator Commands
+# ====================================================================================
+
+.PHONY: operator-build operator-test operator-docker-build operator-lint
+
+operator-build: ## Build the antfly-operator binary
+	(cd ./pkg/operator && $(MAKE) build)
+
+operator-test: ## Run antfly-operator tests
+	(cd ./pkg/operator && $(MAKE) test)
+
+operator-lint: ## Run linter on antfly-operator
+	(cd ./pkg/operator && $(MAKE) lint)
+
+operator-docker-build: ## Build antfly-operator Docker image
+	docker build -t antfly-operator:latest -f ./pkg/operator/Dockerfile ./pkg/operator
+
+
+# ====================================================================================
+# Cleanup Commands
+# ====================================================================================
+
+.PHONY: cleanup-goreman
+
+cleanup-goreman:
+	rm -rf goreman.log antflydb/metadata antflydb/store qlogdir; lsof -i udp:9021 -i udp:9022 -i udp:9023 -i udp:9024 -i udp:9025 -i udp:9026 -i udp:52380 -i udp:42380 -i udp:22380 -i udp:42380 -i udp:12380 -i udp:32380 -i udp:12277 -i udp:9018 -i udp:9019 -i tcp:8080 -i udp:9017 -i udp:4211 -i tcp:8080 -i tcp:9021 -i tcp:4201 -i tcp:4202 -i tcp:4203 -i tcp:4211 -i tcp:4212 -i tcp:4213 -i tcp:4201 -i tcp:9022 -i tcp:9025 -i tcp:9023 -i tcp:9024 -i tcp:11433 -i udp:11433 | awk '{print $2 }' | sed '1d' | xargs kill -9

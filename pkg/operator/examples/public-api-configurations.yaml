@@ -1,0 +1,305 @@
+# Example: Public API Service Configurations
+#
+# This file demonstrates various configurations for the public API service.
+# The public API service exposes the Antfly cluster API externally.
+#
+# IMPORTANT: This file contains multiple example configurations.
+# Apply only ONE section at a time (not the entire file).
+
+---
+# Example 1: LoadBalancer (Default, Recommended)
+# Creates a cloud provider LoadBalancer with external IP
+# Best for: Production deployments, GKE Autopilot, AWS, Azure
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-loadbalancer
+  namespace: default
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Public API with LoadBalancer (default behavior)
+  publicAPI:
+    enabled: true
+    serviceType: LoadBalancer
+    port: 80  # External port (maps to leader API port internally)
+
+  metadataNodes:
+    replicas: 3
+    metadataAPI: {}
+    metadataRaft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  dataNodes:
+    replicas: 3
+    api: {}
+    raft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "2Gi"
+
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "5Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      }
+    }
+
+---
+# Example 2: NodePort with Auto-Assigned Port
+# Exposes the service on each node's IP at a static port
+# Best for: On-premises, bare metal, development
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-nodeport-auto
+  namespace: default
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Public API with NodePort (auto-assigned in range 30000-32767)
+  publicAPI:
+    enabled: true
+    serviceType: NodePort
+    port: 8080
+    # nodePort not specified - Kubernetes will auto-assign
+
+  metadataNodes:
+    replicas: 3
+    metadataAPI: {}
+    metadataRaft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  dataNodes:
+    replicas: 3
+    api: {}
+    raft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "2Gi"
+
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "5Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "terminal"
+      }
+    }
+
+---
+# Example 3: NodePort with Specific Port
+# Exposes the service on each node's IP at a specific port
+# Best for: When you need a predictable port number
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-nodeport-specific
+  namespace: default
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Public API with NodePort at specific port
+  publicAPI:
+    enabled: true
+    serviceType: NodePort
+    port: 8080
+    nodePort: 30100  # Specific port in range 30000-32767
+
+  metadataNodes:
+    replicas: 3
+    metadataAPI: {}
+    metadataRaft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  dataNodes:
+    replicas: 3
+    api: {}
+    raft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "2Gi"
+
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "5Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "terminal"
+      }
+    }
+
+---
+# Example 4: ClusterIP (Internal Only)
+# No external access - internal cluster communication only
+# Best for: When using custom Ingress or service mesh
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-clusterip
+  namespace: default
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Public API with ClusterIP (internal only)
+  publicAPI:
+    enabled: true
+    serviceType: ClusterIP
+    port: 8080
+
+  metadataNodes:
+    replicas: 3
+    metadataAPI: {}
+    metadataRaft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  dataNodes:
+    replicas: 3
+    api: {}
+    raft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "2Gi"
+
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "5Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      }
+    }
+
+---
+# Example 5: Disabled Public API
+# No public API service created - you manage external access
+# Best for: Custom Ingress, advanced networking, service mesh
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-no-public-api
+  namespace: default
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Public API disabled - no service created
+  publicAPI:
+    enabled: false
+
+  metadataNodes:
+    replicas: 3
+    metadataAPI: {}
+    metadataRaft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  dataNodes:
+    replicas: 3
+    api: {}
+    raft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "2Gi"
+
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "5Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      }
+    }
+
+---
+# Example 6: Minimal Configuration (Uses Defaults)
+# When publicAPI is not specified, defaults are applied:
+#   - enabled: true
+#   - serviceType: LoadBalancer
+#   - port: 80
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-default
+  namespace: default
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # No publicAPI specified - uses defaults (LoadBalancer on port 80)
+
+  metadataNodes:
+    replicas: 3
+    metadataAPI: {}
+    metadataRaft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  dataNodes:
+    replicas: 3
+    api: {}
+    raft: {}
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "2Gi"
+
+  storage:
+    storageClass: "standard"
+    metadataStorage: "1Gi"
+    dataStorage: "5Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      }
+    }

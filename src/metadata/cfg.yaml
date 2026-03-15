@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: metadata
+generate:
+  std-http-server: true
+  embedded-spec: true
+  models: true
+compatibility:
+  always-prefix-enum-values: true
+output: api.gen.go
+output-options:
+  # to make sure that all types are generated
+  skip-prune: true
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true
+import-mapping:
+  ../usermgr/api.yaml: "github.com/antflydb/antfly/src/usermgr"
+  ../../lib/embeddings/openapi.yaml: github.com/antflydb/antfly/lib/embeddings
+  ../../lib/ai/openapi.yaml: github.com/antflydb/antfly/lib/ai
+  ../../lib/ai/eval/openapi.yaml: github.com/antflydb/antfly/lib/ai/eval
+  ../../lib/chunking/openapi.yaml: github.com/antflydb/antfly/lib/chunking
+  ../../lib/reranking/openapi.yaml: github.com/antflydb/antfly/lib/reranking
+  ../../lib/schema/openapi.yaml: github.com/antflydb/antfly/lib/schema
+  ../store/db/indexes/openapi.yaml: github.com/antflydb/antfly/src/store/db/indexes
+  ../../vendor/bleve-query-openapi.yaml: github.com/antflydb/antfly/src/store/db/indexes

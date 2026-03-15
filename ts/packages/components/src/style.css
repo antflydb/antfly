@@ -1,0 +1,382 @@
+.react-af-active-filters > ul > li,
+.react-af-facet {
+  background-color: #fafafa;
+  margin: 5px 7px 5px 0;
+  padding: 5px 7px;
+  border: 1px solid #ddd;
+  border-radius: 2px;
+  box-shadow: 1px 2px 2px 0 rgba(197, 197, 197, 0.5);
+}
+.react-af-active-filters > ul {
+  list-style: none;
+  padding: 0;
+}
+.react-af-active-filters > ul > li {
+  display: inline;
+}
+.react-af-active-filters > ul > li > button {
+  margin-left: 5px;
+}
+.react-af-facet {
+  max-width: 300px;
+}
+.react-af-facet input[type="text"] {
+  width: 100%;
+}
+.react-af-facet > label {
+  display: block;
+}
+
+/* SearchBox and AnswerBox container positioning for autosuggest dropdown */
+.react-af-searchbox,
+.react-af-answerbox {
+  position: relative;
+}
+
+/* Legacy autosuggest (without children) */
+.react-af-autosuggest {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  max-height: 400px;
+  overflow-y: auto;
+  margin-top: 4px;
+  list-style: none;
+  padding: 0;
+}
+
+.react-af-autosuggest-item {
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.react-af-autosuggest-item:hover {
+  background-color: #f5f5f5;
+}
+
+.react-af-autosuggest-term {
+  display: block;
+}
+
+/* Autosuggest composable components styles */
+
+/* Container for composable autosuggest */
+.react-af-autosuggest-container {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  max-height: 400px;
+  overflow-y: auto;
+  margin-top: 4px;
+  min-height: 50px;
+  /* Hide by default to prevent flash when typing starts */
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.15s ease-in-out,
+    visibility 0.15s ease-in-out;
+}
+
+/* Show autosuggest container when it has content - prevents empty container flash.
+   Uses data-attributes set by the component for robust visibility control that
+   can't be accidentally overridden by downstream CSS class styling. */
+.react-af-autosuggest-container[data-has-content="true"] {
+  opacity: 1;
+  visibility: visible;
+}
+
+.react-af-autosuggest-dropdown {
+  padding: 8px 0;
+}
+
+/* Layout variants */
+.react-af-autosuggest-layout-vertical {
+  display: flex;
+  flex-direction: column;
+}
+
+.react-af-autosuggest-layout-horizontal {
+  display: flex;
+  flex-direction: row;
+  gap: 16px;
+}
+
+.react-af-autosuggest-layout-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+/* AutosuggestResults styles */
+.react-af-autosuggest-results {
+  margin-bottom: 8px;
+}
+
+.react-af-autosuggest-results-header,
+.react-af-autosuggest-results-footer {
+  padding: 8px 12px;
+  font-weight: 600;
+  font-size: 14px;
+  color: #666;
+  border-bottom: 1px solid #eee;
+}
+
+.react-af-autosuggest-results-footer {
+  border-bottom: none;
+  border-top: 1px solid #eee;
+}
+
+.react-af-autosuggest-results-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.react-af-autosuggest-result-item {
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.react-af-autosuggest-result-item:hover {
+  background-color: #f5f5f5;
+}
+
+.react-af-autosuggest-results-empty {
+  padding: 12px;
+  color: #999;
+  font-style: italic;
+}
+
+/* AutosuggestFacets styles */
+.react-af-autosuggest-facets {
+  margin-bottom: 8px;
+}
+
+.react-af-autosuggest-facets-header,
+.react-af-autosuggest-facets-footer {
+  padding: 8px 12px;
+  font-weight: 600;
+  font-size: 14px;
+  color: #666;
+}
+
+.react-af-autosuggest-facet-section-label {
+  padding: 8px 12px;
+  font-weight: 600;
+  font-size: 13px;
+  color: #333;
+  background-color: #f9f9f9;
+  border-bottom: 1px solid #eee;
+}
+
+.react-af-autosuggest-facets-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.react-af-autosuggest-facet-item {
+  padding: 8px 12px;
+  transition: background-color 0.2s;
+}
+
+.react-af-autosuggest-facet-item-clickable {
+  cursor: pointer;
+}
+
+.react-af-autosuggest-facet-item-clickable:hover {
+  background-color: #f5f5f5;
+}
+
+.react-af-autosuggest-facet-term {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.react-af-autosuggest-facet-count {
+  color: #999;
+  font-size: 12px;
+  margin-left: 8px;
+}
+
+.react-af-autosuggest-facets-empty {
+  padding: 12px;
+  color: #999;
+  font-style: italic;
+}
+
+/* Shared selected state */
+.react-af-autosuggest-item-selected {
+  background-color: #e6f7ff;
+  border-left: 3px solid #1890ff;
+}
+
+/* ChatBar styles */
+.react-af-chat-bar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.react-af-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.react-af-chat-turn {
+  margin-bottom: 16px;
+  animation: react-af-chat-turn-enter 0.3s ease-out;
+}
+
+@keyframes react-af-chat-turn-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.react-af-chat-message-user {
+  padding: 8px 12px;
+  margin-bottom: 4px;
+  background-color: #f0f0f0;
+  border-radius: 8px;
+  max-width: 80%;
+  margin-left: auto;
+}
+
+.react-af-chat-message-assistant {
+  padding: 8px 12px;
+  margin-bottom: 4px;
+  max-width: 80%;
+}
+
+.react-af-chat-streaming-cursor::after {
+  content: "▊";
+  animation: react-af-chat-blink 1s step-end infinite;
+}
+
+@keyframes react-af-chat-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.react-af-chat-streaming-indicator {
+  padding: 8px 12px;
+  color: #999;
+  font-style: italic;
+}
+
+.react-af-chat-followups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.react-af-chat-followup-button {
+  padding: 6px 12px;
+  border: 1px solid #ddd;
+  border-radius: 16px;
+  background: white;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background-color 0.2s;
+}
+
+.react-af-chat-followup-button:hover {
+  background-color: #f5f5f5;
+}
+
+.react-af-chat-clarification {
+  padding: 8px 12px;
+  margin-top: 8px;
+  border: 1px solid #e6e6e6;
+  border-radius: 8px;
+  background-color: #fafafa;
+}
+
+.react-af-chat-clarification-option {
+  padding: 6px 12px;
+  margin: 4px 4px 0 0;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+}
+
+.react-af-chat-clarification-option:hover {
+  background-color: #f5f5f5;
+}
+
+.react-af-chat-confidence {
+  margin-top: 4px;
+  color: #999;
+}
+
+.react-af-chat-hits {
+  margin-top: 8px;
+}
+
+.react-af-chat-input {
+  padding: 8px;
+  border-top: 1px solid #eee;
+}
+
+.react-af-chat-input-form {
+  display: flex;
+  gap: 8px;
+}
+
+.react-af-chat-input-field {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.react-af-chat-input-field:disabled {
+  opacity: 0.6;
+}
+
+.react-af-chat-input-submit {
+  padding: 8px 16px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+}
+
+.react-af-chat-input-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.react-af-chat-error {
+  padding: 8px 12px;
+  color: #e00;
+  background-color: #fff0f0;
+  border-radius: 4px;
+  margin-bottom: 4px;
+}

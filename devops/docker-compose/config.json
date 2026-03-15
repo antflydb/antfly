@@ -1,0 +1,9 @@
+{
+  "metadata": {
+    "orchestration_urls": { "1": "http://127.0.0.1:12377" }
+  },
+  "replication_factor": 1,
+  "max_shards_per_table": 4,
+  "log_level": "info",
+  "logging_style": "json"
+}

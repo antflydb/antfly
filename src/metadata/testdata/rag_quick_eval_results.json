@@ -1,0 +1,263 @@
+{
+  "summary": {
+    "total_examples": 5,
+    "passed_examples": 5,
+    "failed_examples": 0,
+    "average_score": 1,
+    "pass_rate": 1,
+    "total_duration": 11615320709,
+    "evaluator_stats": {
+      "citations": {
+        "name": "citations",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 24075
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is machine learning?",
+        "reference": "Machine learning is a subset of artificial intelligence that learns from data to make predictions and decisions.",
+        "context": [
+          "Machine learning is a subset of artificial intelligence that focuses on developing systems that can learn from and make decisions based on data.",
+          "It involves training algorithms on large datasets to recognize patterns and make predictions.",
+          "Common applications include image recognition, natural language processing, and recommendation systems."
+        ],
+        "metadata": {
+          "difficulty": "easy",
+          "domain": "ai",
+          "expected_citation_count": 2
+        }
+      },
+      "output": {
+        "generation": "Machine learning is a subset of artificial intelligence that focuses on developing systems capable of learning from data and making decisions based on it [doc0]. This process involves training algorithms on large datasets to recognize patterns and make predictions [doc1]. Common applications of machine learning include image recognition, natural language processing, and recommendation systems [doc2].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What is machine learning?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 3 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 3,
+            "cited_doc_ids": [
+              2,
+              0,
+              1
+            ],
+            "context_doc_count": 3,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 5773543292,
+      "timestamp": "2025-11-16T13:06:35.451864-08:00"
+    },
+    {
+      "example": {
+        "input": "How does neural network training work?",
+        "reference": "Neural networks are trained using backpropagation and gradient descent to minimize loss by adjusting weights.",
+        "context": [
+          "Neural network training involves adjusting weights and biases through backpropagation.",
+          "The process uses gradient descent to minimize the loss function.",
+          "Training requires labeled data and multiple epochs to converge.",
+          "Regularization techniques like dropout help prevent overfitting."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "ai",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Neural network training works through a process of adjusting weights and biases to minimize errors. This is achieved using an algorithm that employs gradient descent [doc1]. Specifically, the training process utilizes labeled data and iterates through multiple epochs [doc2] to allow the network to converge. The core of the method is backpropagation [doc0], which calculates the gradient of the loss function and then updates the weights and biases accordingly. Additionally, regularization techniques, such as dropout [doc3], are often employed to prevent overfitting during training.",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "How does neural network training work?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              3,
+              1,
+              2
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 4722931500,
+      "timestamp": "2025-11-16T13:06:29.61008-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the benefits of distributed databases?",
+        "reference": "Distributed databases offer scalability, high availability, and improved performance through data distribution.",
+        "context": [
+          "Distributed databases provide horizontal scalability by spreading data across multiple nodes.",
+          "They offer high availability through replication and fault tolerance.",
+          "Distributed systems can handle larger workloads than single-node databases.",
+          "Geographic distribution reduces latency for users in different regions."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "databases",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive summary. Distributed databases offer several key benefits. Primarily, they provide horizontal scalability by spreading data across multiple nodes [doc0]. This allows distributed systems to handle larger workloads than single-node databases [doc2]. Furthermore, distributed databases offer high availability through replication and fault tolerance [doc1]. Finally, geographic distribution reduces latency for users in different regions [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What are the benefits of distributed databases?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              2,
+              1,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 5841752000,
+      "timestamp": "2025-11-16T13:06:29.610081-08:00"
+    },
+    {
+      "example": {
+        "input": "Explain the CAP theorem",
+        "reference": "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+        "context": [
+          "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+          "Consistency means all nodes see the same data at the same time.",
+          "Availability ensures every request receives a response, without guarantee of the most recent data.",
+          "Partition tolerance allows the system to continue operating despite network partitions."
+        ],
+        "metadata": {
+          "difficulty": "hard",
+          "domain": "databases",
+          "expected_citation_count": 4
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive summary. The CAP theorem states that distributed systems can only guarantee two out of three properties: Consistency, Availability, and Partition tolerance [doc0]. \n\n*   **Consistency:** This means all nodes see the same data at the same time [doc1].\n*   **Availability:** Availability ensures every request receives a response, without guarantee of the most recent data [doc2].\n*   **Partition tolerance:** This allows the system to continue operating despite network partitions [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "Explain the CAP theorem",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              2,
+              3,
+              0,
+              1
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 5879005208,
+      "timestamp": "2025-11-16T13:06:34.333034-08:00"
+    },
+    {
+      "example": {
+        "input": "What is vector search?",
+        "reference": "Vector search uses embeddings and approximate nearest neighbor algorithms to find semantically similar content.",
+        "context": [
+          "Vector search uses embeddings to find semantically similar content.",
+          "It converts text, images, or other data into high-dimensional vectors.",
+          "Approximate nearest neighbor algorithms like HNSW enable fast retrieval.",
+          "Vector search powers modern semantic search and recommendation systems."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "search",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive answer to the question “What is vector search?” Vector search uses embeddings to find semantically similar content [doc0]. It converts text, images, or other data into high-dimensional vectors [doc1]. These vectors are then used to find content with similar meaning, even if the exact words are different. Approximate nearest neighbor algorithms like HNSW enable fast retrieval [doc2]. Vector search powers modern semantic search and recommendation systems [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What is vector search?",
+        "route_type": "question"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 7115338792,
+      "timestamp": "2025-11-16T13:06:29.610073-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": true,
+      "max_concurrency": 3,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-16T13:06:29.610064-08:00"
+}

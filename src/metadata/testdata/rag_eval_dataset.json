@@ -1,0 +1,76 @@
+[
+  {
+    "input": "What is machine learning?",
+    "context": [
+      "Machine learning is a subset of artificial intelligence that focuses on developing systems that can learn from and make decisions based on data.",
+      "It involves training algorithms on large datasets to recognize patterns and make predictions.",
+      "Common applications include image recognition, natural language processing, and recommendation systems."
+    ],
+    "reference": "Machine learning is a subset of artificial intelligence that learns from data to make predictions and decisions.",
+    "metadata": {
+      "domain": "ai",
+      "difficulty": "easy",
+      "expected_citation_count": 2
+    }
+  },
+  {
+    "input": "How does neural network training work?",
+    "context": [
+      "Neural network training involves adjusting weights and biases through backpropagation.",
+      "The process uses gradient descent to minimize the loss function.",
+      "Training requires labeled data and multiple epochs to converge.",
+      "Regularization techniques like dropout help prevent overfitting."
+    ],
+    "reference": "Neural networks are trained using backpropagation and gradient descent to minimize loss by adjusting weights.",
+    "metadata": {
+      "domain": "ai",
+      "difficulty": "medium",
+      "expected_citation_count": 3
+    }
+  },
+  {
+    "input": "What are the benefits of distributed databases?",
+    "context": [
+      "Distributed databases provide horizontal scalability by spreading data across multiple nodes.",
+      "They offer high availability through replication and fault tolerance.",
+      "Distributed systems can handle larger workloads than single-node databases.",
+      "Geographic distribution reduces latency for users in different regions."
+    ],
+    "reference": "Distributed databases offer scalability, high availability, and improved performance through data distribution.",
+    "metadata": {
+      "domain": "databases",
+      "difficulty": "medium",
+      "expected_citation_count": 3
+    }
+  },
+  {
+    "input": "Explain the CAP theorem",
+    "context": [
+      "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+      "Consistency means all nodes see the same data at the same time.",
+      "Availability ensures every request receives a response, without guarantee of the most recent data.",
+      "Partition tolerance allows the system to continue operating despite network partitions."
+    ],
+    "reference": "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+    "metadata": {
+      "domain": "databases",
+      "difficulty": "hard",
+      "expected_citation_count": 4
+    }
+  },
+  {
+    "input": "What is vector search?",
+    "context": [
+      "Vector search uses embeddings to find semantically similar content.",
+      "It converts text, images, or other data into high-dimensional vectors.",
+      "Approximate nearest neighbor algorithms like HNSW enable fast retrieval.",
+      "Vector search powers modern semantic search and recommendation systems."
+    ],
+    "reference": "Vector search uses embeddings and approximate nearest neighbor algorithms to find semantically similar content.",
+    "metadata": {
+      "domain": "search",
+      "difficulty": "medium",
+      "expected_citation_count": 3
+    }
+  }
+]

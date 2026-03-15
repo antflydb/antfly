@@ -1,0 +1,1164 @@
+openapi: 3.0.3
+info:
+  title: Generator Provider Configuration
+  description: "An OpenAPI specification for configuring different generative AI providers in AntflyDB."
+  version: "0.0.1"
+components:
+  schemas:
+    GeneratorProvider:
+      type: string
+      enum:
+        - gemini
+        - vertex
+        - ollama
+        - openai
+        - openrouter
+        - bedrock
+        - anthropic
+        - cohere
+        - termite
+        - mock
+      description: "The generative AI provider to use."
+
+    GeneratorConfig:
+      description: |-
+        A unified configuration for a generative AI provider.
+
+        Generators can be configured with custom prompts using templates. Templates use
+        Handlebars syntax and support various built-in helpers for formatting and data manipulation.
+
+        **Template System:**
+        - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
+        - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
+        - **Context**: Templates receive the full context data passed to the generator
+
+        **Built-in Helpers:**
+
+        1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
+           ```handlebars
+           {{scrubHtml html_content}}
+           ```
+           - Removes `<script>` and `<style>` tags
+           - Adds newlines after block elements (p, div, h1-h6, li, etc.)
+           - Returns plain text with preserved readability
+           - Useful for cleaning web content before summarization
+
+        2. **eq** - Equality comparison for conditionals
+           ```handlebars
+           {{#if (eq status "active")}}Active{{/if}}
+           {{#if (eq @key "special")}}Special field{{/if}}
+           ```
+           - Use in `{{#if}}` blocks for conditional logic
+           - Compares any two values for equality
+
+        3. **media** - GenKit dotprompt media directive for multimodal content
+           ```handlebars
+           {{media url=imageDataURI}}
+           {{media url=this.image_url}}
+           {{media url="https://example.com/image.jpg"}}
+           {{media url="s3://endpoint/bucket/image.png"}}
+           {{media url="file:///path/to/image.jpg"}}
+           ```
+
+           **Supported URL Schemes:**
+           - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
+           - `http://` / `https://` - Web URLs with automatic content type detection
+           - `file://` - Local filesystem paths
+           - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
+
+           **Automatic Content Processing:**
+           - **Images**: Downloaded, resized (if needed), converted to data URIs
+           - **PDFs**: Text extracted or first page rendered as image
+           - **HTML**: Readable text extracted using Mozilla Readability
+
+           **Security Controls:**
+           Downloads are protected by content security settings (see Configuration Reference):
+           - Allowed host whitelist
+           - Private IP blocking (prevents SSRF attacks)
+           - Download size limits (default: 100MB)
+           - Download timeouts (default: 30s)
+           - Image dimension limits (default: 2048px, auto-resized)
+
+           See: https://antfly.io/docs/configuration#security--cors
+
+        4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
+           ```handlebars
+           {{encodeToon this.fields}}
+           {{encodeToon this.fields lengthMarker=false indent=4}}
+           {{encodeToon this.fields delimiter="\t"}}
+           ```
+
+           **What is TOON?**
+           TOON is a compact, human-readable format designed for passing structured data to LLMs.
+           It provides **30-60% token reduction** compared to JSON while maintaining high LLM
+           comprehension accuracy.
+
+           **Key Features:**
+           - Compact syntax using `:` for key-value pairs
+           - Array length markers: `tags[#3]: ai,search,ml`
+           - Tabular format for uniform data structures
+           - Optimized for LLM parsing and understanding
+           - Maintains human readability
+
+           **Benefits:**
+           - **Lower API costs** - Reduced token usage means lower LLM API costs
+           - **Faster responses** - Less tokens to process
+           - **More context** - Fit more documents within token limits
+
+           **Options:**
+           - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
+           - `indent` (int): Indentation spacing for nested objects (default: 2)
+           - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
+
+           **Example output:**
+           ```
+           title: Introduction to Vector Search
+           author: Jane Doe
+           tags[#3]: ai,search,ml
+           metadata:
+             edition: 2
+             pages: 450
+           ```
+
+           **Default in RAG:** TOON is the default format for document rendering in RAG queries.
+
+           **References:**
+           - TOON Specification: https://github.com/toon-format/toon
+           - Go Implementation: https://github.com/alpkeskin/gotoon
+
+        **Template Examples:**
+
+        RAG summarization with document references:
+        ```handlebars
+        Based on these documents, provide a comprehensive summary:
+
+        {{#each documents}}
+        Document {{this.id}}:
+        {{scrubHtml this.content}}
+
+        {{/each}}
+
+        Valid document IDs: {{#each documents}}{{this.id}}{{#unless @last}}, {{/unless}}{{/each}}
+        ```
+
+        Conditional formatting:
+        ```handlebars
+        {{#if system_prompt}}System: {{system_prompt}}{{/if}}
+
+        User Query: {{query}}
+
+        {{#if context}}
+        Context:
+        {{#each context}}
+        - {{this}}
+        {{/each}}
+        {{/if}}
+        ```
+
+        Multimodal prompt with images:
+        ```handlebars
+        Analyze this image:
+        {{media url=image_url}}
+
+        Focus on: {{focus_area}}
+        ```
+
+        Structured data encoding:
+        ```handlebars
+        User Profile:
+        {{encodeToon user_data indent=2 lengthMarker=true}}
+
+        Please analyze this profile.
+        ```
+
+        **Common Use Cases:**
+        - **RAG (Retrieval-Augmented Generation)**: Format retrieved documents with citations
+        - **Summarization**: Clean HTML content and structure summaries
+        - **Query Classification**: Format queries with metadata for better classification
+        - **Multimodal**: Include images/audio/video in prompts
+        - **Data Formatting**: Convert structured data to readable text
+
+        **Best Practices:**
+        - Keep templates simple - complex logic belongs in application code
+        - Use clear, descriptive field names in context
+        - Handle missing fields gracefully (templates use "missingkey=zero" by default)
+        - Test templates with representative data before production use
+      allOf:
+        - oneOf:
+            - $ref: "#/components/schemas/GoogleGeneratorConfig"
+            - $ref: "#/components/schemas/VertexGeneratorConfig"
+            - $ref: "#/components/schemas/OllamaGeneratorConfig"
+            - $ref: "#/components/schemas/TermiteGeneratorConfig"
+            - $ref: "#/components/schemas/OpenAIGeneratorConfig"
+            - $ref: "#/components/schemas/OpenRouterGeneratorConfig"
+            - $ref: "#/components/schemas/BedrockGeneratorConfig"
+            - $ref: "#/components/schemas/AnthropicGeneratorConfig"
+            - $ref: "#/components/schemas/CohereGeneratorConfig"
+        - properties:
+            provider:
+              $ref: "#/components/schemas/GeneratorProvider"
+          required:
+            - provider
+      example:
+        provider: "openai"
+        model: "gpt-4.1"
+        temperature: 0.7
+        max_tokens: 2048
+
+    GoogleGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Google generative AI provider (Gemini).
+
+        **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
+
+        **Docs:** https://ai.google.dev/gemini-api/docs/models
+      properties:
+        project_id:
+          type: string
+          description: "The Google Cloud project ID."
+        location:
+          type: string
+          description: "The Google Cloud location (e.g., 'us-central1')."
+        model:
+          type: string
+          description: "The name of the generative model to use (e.g., 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.0-pro')."
+          default: "gemini-2.5-flash"
+          example: "gemini-2.5-flash"
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+        api_key:
+          type: string
+          description: "The Google API key."
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Google API endpoint."
+      required:
+        - model
+
+    VertexGeneratorConfig:
+      type: object
+      description: |
+        Configuration for Google Cloud Vertex AI generative models (enterprise-grade).
+
+        Uses Application Default Credentials (ADC) for authentication. In GCP environments
+        (Cloud Run, GKE, Compute Engine) this is automatic. For local dev, run
+        `gcloud auth application-default login`. Requires IAM role `roles/aiplatform.user`.
+
+        **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
+
+        **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
+      properties:
+        model:
+          type: string
+          description: "The name of the Vertex AI model to use."
+          default: "gemini-2.5-flash"
+          example: "gemini-2.5-flash"
+        project_id:
+          type: string
+          description: "Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable."
+        location:
+          type: string
+          description: "Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'."
+          default: "us-central1"
+        credentials_path:
+          type: string
+          description: "Path to service account JSON key file. Sets GOOGLE_APPLICATION_CREDENTIALS environment variable. Alternative to ADC for non-GCP environments."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0). Higher values make output more random."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0). Alternative to temperature."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter. Only sample from the top K options for each subsequent token."
+      required:
+        - model
+      example:
+        provider: "vertex"
+        model: "gemini-2.5-flash"
+        project_id: "my-gcp-project"
+        location: "us-central1"
+        temperature: 0.7
+        max_tokens: 4096
+
+    OllamaGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Ollama generative AI provider.
+
+        Ollama provides local LLM inference for privacy and offline use.
+
+        **Example Models:** llama3.3:70b, qwen2.5:72b, deepseek-r1:70b, mistral:7b, llava:34b
+
+        **Docs:** https://ollama.com/library
+      properties:
+        model:
+          type: string
+          description: "The name of the Ollama model to use (e.g., 'llama3.3:70b', 'qwen2.5:72b', 'deepseek-coder:33b')."
+          example: "llama3.3:70b"
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Ollama API endpoint."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+        timeout:
+          type: integer
+          description: "HTTP response timeout in seconds for Ollama API calls. Defaults to 540 (9 minutes). Increase for large models on slow hardware."
+          minimum: 1
+      required:
+        - model
+
+    TermiteGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Termite generative AI provider.
+
+        Termite is Antfly's built-in ML service for local LLM inference using
+        ONNX Runtime GenAI models. It provides text generation with automatic
+        model discovery from the `models/generators/` directory.
+
+        **Example Models:** onnxruntime/Gemma-3-ONNX (from HuggingFace)
+
+        **Features:**
+        - Local inference with no external API dependencies
+        - ONNX Runtime GenAI for efficient CPU/GPU execution
+        - Auto-discovery of models from `models/generators/` directory
+        - OpenAI-compatible chat format
+      properties:
+        model:
+          type: string
+          description: "The name of the generator model (maps to models/generators/{name}/ directory)."
+          example: "onnxruntime/Gemma-3-ONNX"
+        api_url:
+          type: string
+          format: uri
+          description: "The URL of the Termite API endpoint."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+        timeout:
+          type: integer
+          description: "HTTP response timeout in seconds for Termite API calls. Defaults to 540 (9 minutes). Increase for large models on slow hardware."
+          minimum: 1
+      required:
+        - model
+
+    OpenAIGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the OpenAI generative AI provider.
+
+        **Example Models:** gpt-4.1 (default), gpt-4.1-mini, o3, o4-mini
+
+        **Docs:** https://platform.openai.com/docs/models
+      properties:
+        model:
+          type: string
+          description: "The name of the OpenAI model to use (e.g., 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini')."
+          default: "gpt-4.1"
+          example: "gpt-4.1"
+        url:
+          type: string
+          format: uri
+          description: "The URL of the OpenAI API endpoint."
+        api_key:
+          type: string
+          description: "The OpenAI API key."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: "Penalty for token frequency (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: "Penalty for token presence (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0
+      required:
+        - model
+
+    BedrockGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the AWS Bedrock generative AI provider.
+
+        Provides access to models from Anthropic, Meta, Amazon, Cohere, Mistral, and others.
+
+        **Example Models:** anthropic.claude-sonnet-4-5-20250929-v1:0, meta.llama3-3-70b-instruct-v1:0, amazon.nova-pro-v1:0
+
+        **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+      properties:
+        model:
+          type: string
+          example: "anthropic.claude-sonnet-4-5-20250929-v1:0"
+          description: "The Bedrock model ID to use (e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0')."
+        region:
+          type: string
+          description: "The AWS region for the Bedrock service."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+      required:
+        - model
+
+    AnthropicGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Anthropic generative AI provider (Claude models).
+
+        API key via `api_key` field or `ANTHROPIC_API_KEY` environment variable.
+
+        **Example Models:** claude-sonnet-4-5-20250929 (default), claude-opus-4-5-20251101, claude-3-5-haiku-20241022
+
+        **Docs:** https://docs.anthropic.com/en/docs/about-claude/models/overview
+      properties:
+        model:
+          type: string
+          description: "The full model ID of the Anthropic model to use (e.g., 'claude-sonnet-4-5-20250929', 'claude-opus-4-5-20251101')."
+          default: "claude-sonnet-4-5-20250929"
+          example: "claude-sonnet-4-5-20250929"
+        api_key:
+          type: string
+          description: "The Anthropic API key. If not provided, falls back to ANTHROPIC_API_KEY environment variable."
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Anthropic API endpoint (optional, uses default if not specified)."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-1.0). Higher values make output more random."
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0). Alternative to temperature."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter. Only sample from the top K options for each subsequent token."
+      required:
+        - model
+      example:
+        provider: "anthropic"
+        model: "claude-sonnet-4-5-20250929"
+        temperature: 0.7
+        max_tokens: 4096
+
+    CohereGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Cohere generative AI provider (Command models).
+
+        API key via `api_key` field or `COHERE_API_KEY` environment variable.
+
+        **Example Models:** command-r-plus (default), command-r, command-a-03-2025
+
+        **Docs:** https://docs.cohere.com/reference/chat
+      properties:
+        model:
+          type: string
+          description: "The name of the Cohere model to use."
+          default: "command-r-plus"
+          example: "command-r-plus"
+        api_key:
+          type: string
+          description: "The Cohere API key. If not provided, falls back to COHERE_API_KEY environment variable."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-1.0). Higher values make output more random."
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0). Alternative to temperature."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter. Only sample from the top K options for each subsequent token."
+        frequency_penalty:
+          type: number
+          format: float
+          description: "Penalty for token frequency (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        presence_penalty:
+          type: number
+          format: float
+          description: "Penalty for token presence (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+      required:
+        - model
+      example:
+        provider: "cohere"
+        model: "command-r-plus"
+        temperature: 0.7
+        max_tokens: 4096
+
+    OpenRouterGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the OpenRouter generative AI provider.
+
+        OpenRouter provides a unified API for multiple LLM providers with automatic fallback routing.
+        API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
+
+        **Model Selection:**
+        - Use `model` for a single model (e.g., "openai/gpt-4.1", "anthropic/claude-sonnet-4-5-20250929")
+        - Use `models` array for fallback routing - OpenRouter tries models in order until one succeeds
+
+        **Example Models:** openai/gpt-4.1, anthropic/claude-sonnet-4-5-20250929, google/gemini-2.5-flash,
+        meta-llama/llama-3.3-70b-instruct
+
+        **Docs:** https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request
+      properties:
+        model:
+          type: string
+          description: "Single model identifier (e.g., 'openai/gpt-4.1'). Either model or models must be provided."
+          example: "openai/gpt-4.1"
+        models:
+          type: array
+          items:
+            type: string
+          description: |
+            Array of model identifiers for fallback routing. OpenRouter tries each model in order
+            until one succeeds. Either model or models must be provided.
+          example:
+            [
+              "openai/gpt-4.1",
+              "anthropic/claude-sonnet-4-5-20250929",
+              "google/gemini-2.5-flash",
+            ]
+        api_key:
+          type: string
+          description: "The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0). Higher values make output more random."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0). Alternative to temperature."
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: "Penalty for token frequency (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: "Penalty for token presence (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0
+      example:
+        provider: "openrouter"
+        model: "openai/gpt-4.1"
+        temperature: 0.7
+        max_tokens: 4096
+
+    GenerateResult:
+      type: object
+      description: "Result of a generate operation. Formatted as markdown by default with inline resource references using [resource_id <id>] or [resource_id <id1>, <id2>] format."
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: "The generated text in markdown format with inline resource references like [resource_id res1] or [resource_id res1, res2]"
+
+    RouteType:
+      type: string
+      enum: ["question", "search"]
+      description: "Classification of query type: question (specific factual query) or search (exploratory query)"
+
+    QueryStrategy:
+      type: string
+      enum: ["simple", "decompose", "step_back", "hyde"]
+      description: |
+        Strategy for query transformation and retrieval:
+        - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
+        - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions.
+        - step_back: Generate broader background query first, then specific query. Best for questions needing context.
+        - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
+
+    SemanticQueryMode:
+      type: string
+      enum: ["rewrite", "hypothetical"]
+      description: |
+        Mode for semantic query generation:
+        - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization)
+        - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
+
+    ClassificationTransformationResult:
+      type: object
+      description: "Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization"
+      required:
+        - route_type
+        - improved_query
+        - semantic_query
+        - semantic_mode
+        - strategy
+        - confidence
+      properties:
+        route_type:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/RouteType"
+        strategy:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/QueryStrategy"
+        semantic_mode:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/SemanticQueryMode"
+        improved_query:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Clarified query with added context for answer generation (human-readable)"
+        semantic_query:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'"
+        step_back_query:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Broader background query for context (only present when strategy is 'step_back')"
+        sub_questions:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Decomposed sub-questions (only present when strategy is 'decompose')"
+        multi_phrases:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Alternative phrasings of the query for expanded retrieval coverage"
+        reasoning:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)"
+        confidence:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Classification confidence (0.0 to 1.0)"
+
+    GenerationConfidence:
+      type: object
+      description: "Confidence assessment for the generated response"
+      required:
+        - generation_confidence
+        - context_relevance
+      properties:
+        generation_confidence:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Overall confidence in the generation (0.0 to 1.0). Considers both ability to answer from provided resources and general knowledge."
+        context_relevance:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Relevance of the provided resources to the question (0.0 to 1.0)"
+
+    GenerationResult:
+      type: object
+      description: "Result from generation with optional confidence and follow-up questions"
+      required:
+        - generation
+      properties:
+        generation_confidence:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Overall confidence in the generation (0.0 to 1.0)"
+        context_relevance:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Relevance of the provided resources to the question (0.0 to 1.0)"
+        generation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Generated response in markdown format"
+        followup_questions:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Suggested follow-up questions"
+
+    # Step Configuration Schemas for Retrieval Agent Pipeline
+
+    RetryConfig:
+      type: object
+      description: "Retry configuration for generator calls"
+      properties:
+        max_attempts:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 10
+          description: "Maximum number of retry attempts"
+        initial_backoff_ms:
+          type: integer
+          default: 1000
+          minimum: 100
+          description: "Initial backoff delay in milliseconds"
+        backoff_multiplier:
+          type: number
+          format: float
+          default: 2.0
+          minimum: 1.0
+          maximum: 5.0
+          description: "Multiplier for exponential backoff"
+        max_backoff_ms:
+          type: integer
+          default: 30000
+          description: "Maximum backoff delay in milliseconds"
+
+    ChainCondition:
+      type: string
+      enum: ["always", "on_error", "on_timeout", "on_rate_limit"]
+      default: "on_error"
+      description: |
+        Condition for trying the next generator in chain:
+        - always: Always try next regardless of outcome
+        - on_error: Try next on any error (default)
+        - on_timeout: Try next only on timeout errors
+        - on_rate_limit: Try next only on rate limit errors
+
+    ChainLink:
+      type: object
+      description: "A single link in a generator chain with optional retry and condition"
+      required:
+        - generator
+      properties:
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+        retry:
+          $ref: "#/components/schemas/RetryConfig"
+          description: "Retry configuration for this generator"
+        condition:
+          $ref: "#/components/schemas/ChainCondition"
+          description: "When to try the next generator in chain"
+
+    ClassificationStepConfig:
+      type: object
+      description: |
+        Configuration for the classification step. This step analyzes the query,
+        selects the optimal retrieval strategy, and generates semantic transformations.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable query classification and strategy selection"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator to use for classification. If not specified, uses the default summarizer."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        with_reasoning:
+          type: boolean
+          default: false
+          description: "Include pre-retrieval reasoning explaining query analysis and strategy selection"
+        force_strategy:
+          $ref: "#/components/schemas/QueryStrategy"
+          description: "Override LLM strategy selection. If not set, the LLM chooses optimal strategy."
+        force_semantic_mode:
+          $ref: "#/components/schemas/SemanticQueryMode"
+          description: "Override semantic query mode selection."
+        multi_phrase_count:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 10
+          description: "Number of alternative query phrasings to generate"
+
+    GenerationStepConfig:
+      type: object
+      description: |
+        Configuration for the generation step. This step generates the final
+        response from retrieved documents using the reasoning as context.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable generation from retrieved documents"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator to use for generation. If not specified, uses the default summarizer."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        system_prompt:
+          type: string
+          description: "Custom system prompt for answer generation"
+        generation_context:
+          type: string
+          description: "Custom guidance for generation tone, detail level, and style"
+          example: "Be concise and technical. Include code examples where relevant."
+
+    FollowupStepConfig:
+      type: object
+      description: |
+        Configuration for generating follow-up questions. Uses a separate generator
+        call which can use a cheaper/faster model.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable follow-up question generation"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator for follow-up questions. If not specified, uses the answer step's generator."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        count:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 10
+          description: "Number of follow-up questions to generate"
+        context:
+          type: string
+          description: "Custom guidance for follow-up question focus and style"
+          example: "Focus on implementation details and edge cases"
+
+    ConfidenceStepConfig:
+      type: object
+      description: |
+        Configuration for confidence assessment. Evaluates answer quality and
+        resource relevance. Can use a model calibrated for scoring tasks.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable confidence scoring"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator for confidence assessment. If not specified, uses the answer step's generator."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        context:
+          type: string
+          description: "Custom guidance for confidence assessment approach"
+          example: "Be conservative - only give high confidence if resources directly address the question"
+
+    # Chat Agent Types - Conversational RAG with tool calling
+
+    ChatMessageRole:
+      type: string
+      enum: ["user", "assistant", "system", "tool"]
+      description: "Role of the message sender in the conversation"
+
+    ChatToolCall:
+      type: object
+      description: "A tool call made by the assistant"
+      required:
+        - id
+        - name
+        - arguments
+      properties:
+        id:
+          type: string
+          description: "Unique identifier for this tool call"
+        name:
+          type: string
+          description: "Name of the tool being called"
+        arguments:
+          type: object
+          additionalProperties: true
+          description: "Arguments passed to the tool as key-value pairs"
+
+    ChatToolResult:
+      type: object
+      description: "Result from executing a tool call"
+      required:
+        - tool_call_id
+        - result
+      properties:
+        tool_call_id:
+          type: string
+          description: "ID of the tool call this result corresponds to"
+        result:
+          type: object
+          additionalProperties: true
+          description: "Result data from the tool execution"
+        error:
+          type: string
+          description: "Error message if tool execution failed"
+
+    ChatMessage:
+      type: object
+      description: "A message in the conversation history"
+      required:
+        - role
+        - content
+      properties:
+        role:
+          $ref: "#/components/schemas/ChatMessageRole"
+        content:
+          type: string
+          description: "Text content of the message"
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatToolCall"
+          description: "Tool calls made by the assistant (only for assistant role)"
+        tool_results:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatToolResult"
+          description: "Results from tool executions (only for tool role)"
+
+    ChatToolName:
+      type: string
+      description: |
+        Available tool names for the chat and retrieval agents.
+        - add_filter: Add search filters (field constraints)
+        - ask_clarification: Ask user for clarification
+        - search: Execute semantic searches (legacy, use semantic_search for retrieval)
+        - websearch: Search the web (requires websearch_config)
+        - fetch: Fetch URL content (subject to security controls)
+        - semantic_search: Execute semantic/vector search against an index
+        - full_text_search: Execute full-text BM25 search against an index
+        - tree_search: Execute tree search with beam search navigation
+        - graph_search: Execute graph traversal search
+      enum:
+        - add_filter
+        - ask_clarification
+        - search
+        - websearch
+        - fetch
+        - semantic_search
+        - full_text_search
+        - tree_search
+        - graph_search
+
+    ChatToolsConfig:
+      type: object
+      description: |
+        Configuration for chat agent tools.
+
+        If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search.
+
+        For models that don't support native tool calling (e.g., Ollama),
+        a prompt-based fallback is used with structured output parsing.
+      properties:
+        enabled_tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatToolName"
+          description: |
+            List of tools to enable. If empty, defaults to filter, clarification, and search.
+          example: ["add_filter", "search", "websearch"]
+        websearch_config:
+          $ref: "../websearch/openapi.yaml#/components/schemas/WebSearchConfig"
+          description: |
+            Web search provider configuration. Required when websearch tool is enabled.
+            See lib/websearch/openapi.yaml for provider-specific options.
+        fetch_config:
+          $ref: "../websearch/openapi.yaml#/components/schemas/FetchConfig"
+          description: |
+            URL fetching configuration. See lib/websearch/openapi.yaml
+            for available options and security controls.
+        max_tool_iterations:
+          type: integer
+          default: 5
+          minimum: 1
+          maximum: 20
+          description: |
+            Maximum number of tool call iterations per turn.
+            Prevents infinite loops in tool execution.
+
+    ClarificationRequest:
+      type: object
+      description: "A request for clarification from the user"
+      required:
+        - question
+      properties:
+        question:
+          type: string
+          description: "The clarifying question to ask the user"
+        options:
+          type: array
+          items:
+            type: string
+          description: "Optional list of suggested answers for the user to choose from"
+        required:
+          type: boolean
+          default: false
+          description: "Whether the clarification is required before proceeding"
+
+    FilterSpec:
+      type: object
+      description: "A filter specification to apply to search queries"
+      required:
+        - field
+        - operator
+        - value
+      properties:
+        field:
+          type: string
+          description: "Field name to filter on"
+        operator:
+          type: string
+          enum:
+            [
+              "eq",
+              "ne",
+              "gt",
+              "gte",
+              "lt",
+              "lte",
+              "contains",
+              "prefix",
+              "range",
+              "in",
+            ]
+          description: |
+            Filter operator:
+            - eq: Equals
+            - ne: Not equals
+            - gt/gte: Greater than (or equal)
+            - lt/lte: Less than (or equal)
+            - contains: Contains substring
+            - prefix: Starts with
+            - range: Between two values (value should be array [min, max])
+            - in: Value in list (value should be array)
+        value:
+          description: "Filter value (string, number, boolean, or array for range/in operators)"
+

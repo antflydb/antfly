@@ -1,0 +1,101 @@
+# Example: AntflyCluster on AWS EKS with Spot Instances
+#
+# This example shows how to use EC2 Spot Instances for up to 90% cost savings.
+# Spot Instances can be interrupted with 2-minute warning, so:
+# - Metadata nodes do NOT use Spot (critical for Raft consensus)
+# - Data nodes use Spot (safe with 3+ replicas due to replication)
+#
+# Prerequisites:
+# 1. EKS cluster with mixed instance node group (on-demand + spot):
+#    - On-demand nodes for metadata (labeled: eks.amazonaws.com/capacityType=ON_DEMAND)
+#    - Spot nodes for data (labeled: eks.amazonaws.com/capacityType=SPOT)
+#
+# 2. Or use Karpenter with mixed provisioners
+#
+# 3. EBS CSI driver installed:
+#    kubectl get csidriver ebs.csi.aws.com
+#
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: antfly-eks-spot
+---
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-eks-spot-cluster
+  namespace: antfly-eks-spot
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # AWS EKS configuration with Spot Instances
+  eks:
+    enabled: true
+    # Enable Spot Instances for data nodes (metadata nodes never use Spot)
+    useSpotInstances: true
+    # Prefer specific instance types for consistent performance
+    instanceTypes:
+      - "m5.large"
+      - "m5.xlarge"
+      - "m6i.large"
+      - "m6i.xlarge"
+    # EBS configuration
+    ebsVolumeType: "gp3"
+    ebsEncrypted: true
+    # Pod Disruption Budget - critical for Spot interruption handling
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+
+  # Metadata nodes - DO NOT use Spot (critical for consensus)
+  # These will run on on-demand capacity
+  metadataNodes:
+    replicas: 3
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+    resources:
+      cpu: "500m"
+      memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+  # Data nodes - Safe to use Spot with 3+ replicas
+  # The operator will add:
+  # - nodeSelector: eks.amazonaws.com/capacityType=SPOT
+  # - toleration for spot taint
+  # - terminationGracePeriodSeconds: 25 (for graceful shutdown)
+  dataNodes:
+    replicas: 3  # Minimum 3 for Spot safety (data is replicated)
+    api:
+      port: 12380
+    raft:
+      port: 9021
+    resources:
+      cpu: "1000m"
+      memory: "2Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"
+
+  storage:
+    storageClass: "gp3"
+    metadataStorage: "1Gi"
+    dataStorage: "10Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      },
+      "cache_size": 1000,
+      "enable_metrics": true,
+      "max_shard_size_bytes": 134217728,
+      "raft_snapshot_threshold": 10000,
+      "replication_factor": 3
+    }

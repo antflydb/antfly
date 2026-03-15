@@ -1,0 +1,68 @@
+# Example configuration with S3 storage for SST files
+# This demonstrates how to configure Antfly to store Pebble SST files in S3-compatible object storage
+
+metadata:
+  orchestration_urls:
+    b: "http://127.0.0.1:12277"
+    c: "http://127.0.0.1:12278"
+    d: "http://127.0.0.1:12279"
+
+# Storage configuration
+storage:
+  # Local storage configuration (always required for some local data)
+  local:
+    base_dir: "antflydb"
+
+  # Storage backend for key-value data: "local" or "s3"
+  keyvalue: "s3"
+
+  # Storage backend for metadata: "local" or "s3"
+  metadatakv: "local"
+
+  # S3 configuration (required when keyvalue or metadatakv is "s3")
+  s3:
+    # S3-compatible endpoint
+    # For AWS S3: "s3.amazonaws.com" or "s3.us-west-2.amazonaws.com" (regional)
+    # For MinIO local: "localhost:9000"
+    # For DigitalOcean Spaces: "nyc3.digitaloceanspaces.com"
+    endpoint: "s3.amazonaws.com"
+
+    # AWS region (required for AWS S3, optional for MinIO)
+    region: "us-east-1"
+
+    # S3 bucket name (must be created beforehand)
+    # Must be 3-63 characters, lowercase, no underscores
+    bucket: "antfly-production-data"
+
+    # Optional path prefix within the bucket for organization
+    # Useful for multi-cluster deployments or staging/production separation
+    prefix: "production/cluster-1"
+
+    # Enable SSL/TLS for S3 connections
+    # Set to true for AWS S3, false for local MinIO without TLS
+    use_ssl: true
+
+    # Credentials can be provided via:
+    # 1. Config with keystore (recommended): Use ${secret:...} syntax for secure credential lookup
+    # 2. Environment variables: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (fallback)
+    # 3. IAM roles: When running on AWS EC2/ECS/EKS (no credentials needed in config)
+    #
+    # Example using keystore references (credentials resolved at startup):
+    access_key_id: "${secret:aws.access_key_id}"
+    secret_access_key: "${secret:aws.secret_access_key}"
+    # session_token: "${secret:aws.session_token}"  # Optional, for temporary credentials
+    #
+    # NEVER store raw credentials directly in config files for security reasons
+
+# Shard and replication settings
+max_shard_size_bytes: 64000000  # 64MB
+replication_factor: 3
+disable_shard_alloc: false
+
+# Logging configuration
+log_level: "info"
+logging_style: "json"  # Use structured logging for production
+
+# Optional: Termite embedding cache service
+# termite:
+#   api_url: "http://127.0.0.1:11433"

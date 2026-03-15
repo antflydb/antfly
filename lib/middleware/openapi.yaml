@@ -1,0 +1,71 @@
+openapi: 3.0.3
+info:
+  title: Middleware Configuration
+  description: "Configuration schema for Antfly HTTP middleware."
+  version: "0.0.1"
+
+components:
+  schemas:
+    CORSConfig:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          description: "Controls whether CORS is enabled"
+          default: true
+        allowed_origins:
+          type: array
+          description: "List of allowed origins for CORS requests. Use ['*'] to allow all origins. Defaults to ['*'] if empty and enabled is true."
+          items:
+            type: string
+          example:
+            - "https://example.com"
+            - "https://app.example.com"
+        allowed_methods:
+          type: array
+          description: "HTTP methods allowed for CORS requests"
+          items:
+            type: string
+          default:
+            - "GET"
+            - "POST"
+            - "PUT"
+            - "DELETE"
+            - "OPTIONS"
+            - "PATCH"
+          example:
+            - "GET"
+            - "POST"
+            - "PUT"
+            - "DELETE"
+        allowed_headers:
+          type: array
+          description: "Headers that can be used in CORS requests"
+          items:
+            type: string
+          default:
+            - "Content-Type"
+            - "Authorization"
+            - "X-Requested-With"
+            - "Accept"
+            - "Origin"
+          example:
+            - "Content-Type"
+            - "Authorization"
+        exposed_headers:
+          type: array
+          description: "Headers exposed to the client. Useful if your API returns custom headers that the frontend needs to read."
+          items:
+            type: string
+          example:
+            - "X-Total-Count"
+        allow_credentials:
+          type: boolean
+          description: "Indicates whether credentials (cookies, auth headers) are allowed. Note: If true, allowed_origins cannot be ['*']."
+          default: false
+        max_age:
+          type: integer
+          description: "How long (in seconds) the results of a preflight request can be cached"
+          default: 3600
+          minimum: 0
+          example: 3600

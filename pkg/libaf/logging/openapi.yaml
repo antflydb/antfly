@@ -1,0 +1,38 @@
+openapi: "3.0.3"
+info:
+  version: v1alpha1
+  title: Antfly Termite Logging Configuration
+  description: Logging configuration schema for Termite services.
+
+components:
+  schemas:
+    Level:
+      type: string
+      description: "Logging verbosity level"
+      enum:
+        - debug
+        - info
+        - warn
+        - error
+      default: "info"
+      example: "info"
+
+    Style:
+      type: string
+      description: "Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent."
+      enum:
+        - terminal
+        - json
+        - logfmt
+        - noop
+      default: "terminal"
+      example: "terminal"
+
+    Config:
+      type: object
+      description: Logging configuration for Termite services
+      properties:
+        level:
+          $ref: "#/components/schemas/Level"
+        style:
+          $ref: "#/components/schemas/Style"

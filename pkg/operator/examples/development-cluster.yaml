@@ -1,0 +1,63 @@
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-dev-cluster
+  namespace: antfly-dev
+  labels:
+    app.kubernetes.io/name: antfly-cluster
+    app.kubernetes.io/instance: antfly-dev-cluster
+    app.kubernetes.io/part-of: antfly
+    environment: development
+spec:
+  # Development image with latest features
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Minimal metadata nodes for development
+  metadataNodes:
+    replicas: 3 # Still need 3 for Raft, but minimal resources
+    metadataAPI: {}
+    metadataRaft: {}
+    resources:
+      cpu: "100m" # Minimal CPU
+      memory: "128Mi" # Minimal memory
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+
+  # Minimal data nodes for development
+  dataNodes:
+    replicas: 3 # Still need 3 for Raft
+    api: {}
+    raft: {}
+    resources:
+      cpu: "100m"
+      memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  # Minimal storage for development
+  storage:
+    storageClass: "standard"
+    metadataStorage: "500Mi"
+    dataStorage: "2Gi"
+
+  # Development-friendly configuration
+  config: |
+    {
+      "log": {
+        "level": "debug",
+        "style": "terminal"
+      },
+      "max_shard_size_bytes": 67108864,
+      "raft_snapshot_threshold": 1000,
+      "raft_heartbeat_timeout": "200ms",
+      "raft_election_timeout": "1000ms",
+      "cache_size": 100,
+      "batch_size": 10,
+      "enable_metrics": true,
+      "enable_debug_endpoints": true,
+      "slow_query_threshold": "100ms",
+      "enable_query_logging": true
+    }

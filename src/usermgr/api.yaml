@@ -1,0 +1,664 @@
+openapi: 3.0.3
+info:
+  version: v1alpha1
+  title: User Management API
+  description: API for managing users, their passwords, and permissions.
+  contact:
+    name: Antfly
+    url: https://github.com/antflydb/antfly
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+servers:
+  - url: /api/v1
+    description: Main API server
+security:
+  - BasicAuth: []
+  - ApiKeyAuth: []
+  - BearerAuth: []
+tags:
+  - name: User
+    x-displayName: User
+    description: Operations related to users
+  - name: Permission
+    x-displayName: Permission
+    description: Operations related to permissions
+  - name: ApiKey
+    x-displayName: API Key
+    description: Operations related to API key management
+
+components:
+  securitySchemes:
+    BasicAuth:
+      type: http
+      scheme: basic
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+    BearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    User:
+      type: object
+      properties:
+        username:
+          type: string
+          example: johndoe
+        password_hash:
+          type: string
+          format: byte # Typically base64 encoded
+          description: "Base64 encoded password hash. Exposing this is a security risk."
+          example: "JGFyZ29uMm..."
+      required:
+        - username
+        - password_hash
+
+    ResourceType:
+      type: string
+      enum: ["table", "user", "*"]
+      description: "Type of the resource, e.g., table, user, or global ('*')."
+      example: "table"
+
+    PermissionType:
+      type: string
+      enum: ["read", "write", "admin"]
+      description: "Type of permission."
+      example: "read"
+
+    Permission:
+      type: object
+      properties:
+        resource:
+          type: string
+          description: "Resource name (e.g., table name, target username, or '*' for global)."
+          example: "orders_table"
+        resource_type:
+          $ref: "#/components/schemas/ResourceType"
+        type:
+          $ref: "#/components/schemas/PermissionType"
+      required:
+        - resource
+        - resource_type
+        - type
+
+    CreateUserRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          description: "Username for the new user. If provided in the path, this field can be omitted or must match the path parameter."
+          example: "johndoe"
+        password:
+          type: string
+          format: password
+          example: "s3cr3tP@sswOrd"
+        initial_policies:
+          type: array
+          items:
+            $ref: "#/components/schemas/Permission"
+          nullable: true
+          description: "Optional list of initial permissions for the user."
+      required:
+        - password # Username can be taken from path, password must be in body.
+
+    UpdatePasswordRequest:
+      type: object
+      properties:
+        new_password:
+          type: string
+          format: password
+          example: "newS3cr3tP@sswOrd"
+      required:
+        - new_password
+
+    SuccessMessage:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Operation completed successfully"
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "An error message"
+      required:
+        - error
+
+    ApiKey:
+      type: object
+      description: "Public metadata for an API key (secrets are never returned after creation)."
+      properties:
+        key_id:
+          type: string
+          description: "Unique identifier for the API key."
+          example: "aBcDeFgHiJkLmNoPqRsT"
+        name:
+          type: string
+          description: "Human-readable name for the API key."
+          example: "CI pipeline key"
+        username:
+          type: string
+          description: "Owner of the API key."
+          example: "johndoe"
+        permissions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Permission"
+          nullable: true
+          description: "Optional permission scoping. If empty, inherits owner's full permissions."
+        created_at:
+          type: string
+          format: date-time
+          description: "When the API key was created."
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: "When the API key expires. Null means never."
+      required:
+        - key_id
+        - name
+        - username
+        - created_at
+
+    ApiKeyWithSecret:
+      description: "API key creation response including the cleartext secret (shown once)."
+      allOf:
+        - $ref: "#/components/schemas/ApiKey"
+        - type: object
+          properties:
+            key_secret:
+              type: string
+              description: "Cleartext secret for the API key. Store securely — it cannot be retrieved again."
+              example: "dGhpcyBpcyBhIHNlY3JldA"
+            encoded:
+              type: string
+              description: "Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret)."
+              example: "YUJjRGVGZ0hpSmtMbU5vUHFSc1Q6ZEdocGN5QnBjeUJoSUhObFkzSmxkQQ=="
+          required:
+            - key_secret
+            - encoded
+
+    CreateApiKeyRequest:
+      type: object
+      description: "Request to create a new API key."
+      properties:
+        name:
+          type: string
+          description: "Human-readable name for the API key."
+          example: "CI pipeline key"
+        expires_in:
+          type: string
+          description: "Duration until expiration (e.g., '720h' for 30 days). Empty means never."
+          example: "720h"
+        permissions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Permission"
+          nullable: true
+          description: "Optional permission scoping. Each permission must be a subset of the creator's permissions."
+      required:
+        - name
+
+  parameters:
+    UserNamePathParameter:
+      name: userName
+      in: path
+      required: true
+      description: The username.
+      schema:
+        type: string
+        example: "johndoe"
+    KeyIdPathParameter:
+      name: keyId
+      in: path
+      required: true
+      description: The API key ID.
+      schema:
+        type: string
+        example: "aBcDeFgHiJkLmNoPqRsT"
+
+paths:
+  /users/me:
+    get:
+      tags:
+        - User
+      summary: Get current authenticated user
+      description: Retrieves details for the currently authenticated user.
+      operationId: getCurrentUser
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  username:
+                    type: string
+                    example: johndoe
+                  permissions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Permission"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users:
+    get:
+      tags:
+        - User
+      summary: List all users
+      description: Retrieves a list of all users in the system. Requires admin permission.
+      operationId: listUsers
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    username:
+                      type: string
+                      example: johndoe
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Forbidden - requires admin permission
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users/{userName}:
+    parameters:
+      - $ref: "#/components/parameters/UserNamePathParameter"
+    post:
+      tags:
+        - User
+      summary: Create a new user
+      description: Creates a new user with the given username and password. Username in path takes precedence.
+      operationId: createUser
+      requestBody:
+        description: User creation details
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User" # Reflects current Go code behavior
+        "400":
+          description: Bad Request (e.g., invalid input, username/password mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Conflict (e.g., user already exists)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      tags:
+        - User
+      summary: Get user details
+      description: Retrieves details for a specific user.
+      operationId: getUserByName
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User" # Reflects current Go code behavior
+        "400":
+          description: Bad Request (e.g., username is required)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      tags:
+        - User
+      summary: Delete a user
+      description: Deletes a specific user.
+      operationId: deleteUser
+      responses:
+        "204":
+          description: User deleted successfully
+        "400":
+          description: Bad Request (e.g., username is required)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users/{userName}/password:
+    parameters:
+      - $ref: "#/components/parameters/UserNamePathParameter"
+    put:
+      tags:
+        - User
+      summary: Update user password
+      description: Updates the password for a specific user.
+      operationId: updateUserPassword
+      requestBody:
+        description: New password details
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePasswordRequest"
+      responses:
+        "200":
+          description: Password updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          description: Bad Request (e.g., new password empty, username required)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users/{userName}/permissions:
+    parameters:
+      - $ref: "#/components/parameters/UserNamePathParameter"
+    get:
+      tags:
+        - Permission
+      summary: Get user permissions
+      description: Retrieves all permissions for a specific user.
+      operationId: getUserPermissions
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Permission"
+        "400":
+          description: Bad Request (e.g., username is required)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      tags:
+        - Permission
+      summary: Add permission to user
+      description: Adds a new permission to a specific user.
+      operationId: addPermissionToUser
+      requestBody:
+        description: Permission details to add
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Permission"
+      responses:
+        "201":
+          description: Permission added successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          description: Bad Request (e.g., invalid input, username required)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      tags:
+        - Permission
+      summary: Remove permission from user
+      description: Removes a specific permission rule from a user based on resource name and type.
+      operationId: removePermissionFromUser
+      parameters:
+        - name: resource
+          in: query
+          required: true
+          description: The name of the resource for the permission to be removed.
+          schema:
+            type: string
+            example: "orders_table"
+        - name: resourceType
+          in: query
+          required: true
+          description: The type of the resource for the permission to be removed.
+          schema:
+            $ref: "#/components/schemas/ResourceType"
+      responses:
+        "204":
+          description: Permission removed successfully
+        "400":
+          description: Bad Request (e.g., missing query parameters, invalid resourceType, username required)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found or Role not found for the given resource
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users/{userName}/api-keys:
+    parameters:
+      - $ref: "#/components/parameters/UserNamePathParameter"
+    get:
+      tags:
+        - ApiKey
+      summary: List API keys for a user
+      description: Returns all API keys owned by the specified user. Secrets are never included.
+      operationId: listApiKeys
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ApiKey"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      tags:
+        - ApiKey
+      summary: Create a new API key
+      description: Creates a new API key for the specified user. The cleartext secret is returned only in this response.
+      operationId: createApiKey
+      requestBody:
+        description: API key creation details
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+      responses:
+        "201":
+          description: API key created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyWithSecret"
+        "400":
+          description: Bad Request (e.g., invalid input)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Forbidden (e.g., requested permissions exceed creator's permissions)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users/{userName}/api-keys/{keyId}:
+    parameters:
+      - $ref: "#/components/parameters/UserNamePathParameter"
+      - $ref: "#/components/parameters/KeyIdPathParameter"
+    delete:
+      tags:
+        - ApiKey
+      summary: Delete an API key
+      description: Permanently deletes the specified API key. Subsequent requests using this key will be rejected.
+      operationId: deleteApiKey
+      responses:
+        "204":
+          description: API key deleted successfully
+        "404":
+          description: API key not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"

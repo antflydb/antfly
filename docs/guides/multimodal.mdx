@@ -1,0 +1,514 @@
+---
+title: Multimodal Embeddings
+description: Learn how to work with images and multimedia content in AntflyDB
+prerequisites:
+  - Antfly installed and running
+  - Ollama with LLaVA (for vision) or Vertex AI / Gemini credentials
+difficulty: intermediate
+estimatedTime: "20 min"
+tags: [multimodal, images, pdf, embeddings]
+---
+
+<Questions>
+- How do I index images in Antfly?
+- How do I search images with Antfly?
+- What is the link annotation for remote content?
+- How do vision models work with Antfly?
+- Can I index PDFs with Antfly?
+</Questions>
+
+## Overview
+
+AntflyDB supports multimodal embeddings, allowing you to process and search not just text, but also images, PDFs, and other remote content. This is achieved through:
+
+1. **Schema annotations** that mark fields as links to remote content
+2. **Template-based processing** using Handlebars helpers to fetch and process remote content
+3. **Vision-language models** that can understand and describe visual content before generating embeddings
+
+## How It Works
+
+### 1. Schema-Based Link Annotations
+
+Mark fields in your table schema as links using the `x-antfly-types` extension:
+
+```json
+{
+  "properties": {
+    "title": {
+      "type": "string"
+    },
+    "image_url": {
+      "type": "string",
+      "x-antfly-types": ["link"]
+    },
+    "pdf_url": {
+      "type": "string",
+      "x-antfly-types": ["link"]
+    }
+  }
+}
+```
+
+Fields marked as `link` type will be automatically processed during indexing. Supported URL schemes:
+- HTTP/HTTPS URLs: `http://` or `https://`
+- S3 URLs: `s3://`
+- File URLs: `file://`
+
+### 2. Template Helpers for Remote Content
+
+AntflyDB provides Handlebars helpers to process remote content in index templates:
+
+- **`{{remoteMedia url="..."}}`** - Downloads and processes images, returns a Genkit media directive
+- **`{{remotePDF url="..."}}`** - Downloads and extracts text from PDFs
+- **`{{remoteText url="..."}}`** - Downloads and preserves text content (HTML, markdown, etc.)
+
+These helpers automatically:
+- Download the content with security limits (100MB max, 30s timeout)
+- Block private IPs for security
+- Process images (resize, convert to data URIs)
+- Extract text from PDFs
+- Handle errors gracefully
+
+## Creating Multimodal Indexes
+
+To create an index that processes images or other remote content, you need to:
+
+1. Define a schema with link-annotated fields
+2. Create an index with a template that uses remote helpers
+3. Configure a summarizer (for vision models) and embedder
+
+### Example: Image Search with Schema Annotations
+
+First, create a table with a schema that marks the image field as a link:
+
+```bash
+antfly table create --table product_catalog \
+  --schema '{
+    "document_schemas": {
+      "product": {
+        "schema": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "image_url": {
+              "type": "string",
+              "x-antfly-types": ["link"]
+            },
+            "description": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+
+Then create an index with a template that processes the image:
+
+```bash
+antfly index create --table product_catalog \
+  --index visual_search \
+  --template '{{name}} {{description}} {{remoteMedia url=image_url}}' \
+  --dimension 384 \
+  --embedder '{
+    "provider": "ollama",
+    "model": "all-minilm",
+    "url": "http://localhost:11434"
+  }' \
+  --summarizer '{
+    "provider": "ollama",
+    "model": "llava",
+    "url": "http://localhost:11434"
+  }'
+```
+
+In this configuration:
+- **Schema annotation**: `x-antfly-types: ["link"]` tells AntflyDB to process this field as a remote link
+- **Template**: `{{remoteMedia url=image_url}}` downloads the image and converts it to a format the vision model can process
+- **`--summarizer`**: LLaVA vision model analyzes the image and generates a description
+- **`--embedder`**: all-minilm creates searchable embeddings from the combined text and image description
+
+### Example: PDF Document Search
+
+For processing PDF documents:
+
+```bash
+antfly table create --table documents \
+  --schema '{
+    "document_schemas": {
+      "paper": {
+        "schema": {
+          "properties": {
+            "title": {"type": "string"},
+            "pdf_url": {
+              "type": "string",
+              "x-antfly-types": ["link"]
+            }
+          }
+        }
+      }
+    }
+  }'
+
+antfly index create --table documents \
+  --index pdf_content \
+  --template '{{title}} {{remotePDF url=pdf_url}}' \
+  --dimension 384 \
+  --embedder '{
+    "provider": "ollama",
+    "model": "all-minilm",
+    "url": "http://localhost:11434"
+  }'
+```
+
+### Using Native Multimodal Embedders
+
+Some models like Gemini support native multimodal embeddings. The template still uses the helpers, but the model processes both text and images directly:
+
+```bash
+antfly index create --table product_catalog \
+  --index gemini_visual \
+  --template '{{name}} {{remoteMedia url=image_url}}' \
+  --dimension 768 \
+  --embedder '{
+    "provider": "gemini",
+    "model": "text-embedding-004"
+  }'
+```
+
+## How It Works
+
+When you insert a document with link-annotated fields:
+
+1. **Schema Detection**: AntflyDB identifies fields marked with `x-antfly-types: ["link"]` in the schema
+2. **Link Processing**: During indexing, the template is rendered with document data
+3. **Remote Content Fetching**: Template helpers (like `{{remoteMedia}}`) download and process the remote content
+4. **Summarization** (if configured): Vision models analyze images and generate textual descriptions
+5. **Embedding Generation**: The processed content (text + image descriptions) is converted to vector embeddings
+6. **Indexing**: The embeddings are stored in the vector index for similarity search
+
+## Complete Example: Building an Image Search System
+
+### Step 1: Create the table with schema
+
+```bash
+antfly table create --table product_catalog \
+  --schema '{
+    "document_schemas": {
+      "product": {
+        "schema": {
+          "properties": {
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "image_url": {
+              "type": "string",
+              "x-antfly-types": ["link"]
+            },
+            "price": {"type": "number"},
+            "category": {"type": "string"}
+          },
+          "required": ["name", "image_url"]
+        }
+      }
+    }
+  }'
+```
+
+### Step 2: Create the multimodal index
+
+```bash
+antfly index create --table product_catalog \
+  --index visual_search \
+  --template '{{name}} {{description}} {{remoteMedia url=image_url}}' \
+  --dimension 384 \
+  --embedder '{
+    "provider": "ollama",
+    "model": "all-minilm",
+    "url": "http://localhost:11434"
+  }' \
+  --summarizer '{
+    "provider": "ollama",
+    "model": "llava",
+    "url": "http://localhost:11434"
+  }'
+```
+
+### Step 3: Insert products with images
+
+```bash
+antfly insert --table product_catalog \
+  --data '{
+    "_type": "product",
+    "id": "SKU-001",
+    "name": "Vintage Leather Jacket",
+    "description": "Classic style with modern comfort",
+    "image_url": "https://store.example.com/images/leather-jacket.jpg",
+    "price": 299.99,
+    "category": "clothing"
+  }'
+```
+
+### Step 4: Search for similar products
+
+```bash
+antfly query --table product_catalog \
+  --semantic-search "brown leather jacket with zipper" \
+  --indexes visual_search \
+  --limit 10
+```
+
+## Best Practices
+
+1. **Use Schema Annotations**:
+   - Always mark link fields with `x-antfly-types: ["link"]` for automatic processing
+   - Define document schemas for type safety and validation
+   - Use nested schemas for complex document structures (tested and supported)
+
+2. **Template Design**:
+   - Combine text fields and remote content in templates: `{{name}} {{remoteMedia url=image_url}}`
+   - Use `{{remotePDF}}` for PDF text extraction
+   - Use `{{remoteText}}` for HTML articles or other text content
+   - Templates work with or without schemas for backward compatibility
+
+3. **Model Selection**:
+   - Use vision-language models like LLaVA for detailed image understanding
+   - Use Gemini for native multimodal support
+   - Consider model size vs. accuracy tradeoffs
+   - Local models (Ollama) are better for high-volume processing
+
+4. **Security and Performance**:
+   - Remote content is automatically limited to 100MB max download size
+   - 30-second timeout prevents hanging on slow servers
+   - Private IPs are blocked for security
+   - Images are automatically resized (max 2048px dimension)
+   - Failed downloads are handled gracefully without blocking indexing
+
+5. **Error Handling**:
+   - Missing or broken links won't prevent document indexing
+   - Custom prompts can be used for specialized summarization tasks
+   - Use the `_type` field to identify document schemas
+
+## Supported Content Types
+
+**Images** (via `{{remoteMedia}}`):
+- JPEG/JPG
+- PNG
+- WebP
+- Returns Genkit dotprompt media directive for vision models
+
+**PDFs** (via `{{remotePDF}}`):
+- Extracts text content from PDF documents
+- Optional `output="markdown"` parameter for formatted output
+- Returns plain text (not a directive)
+
+**Text Content** (via `{{remoteText}}`):
+- HTML articles
+- Markdown files
+- Plain text
+- Preserves content as-is
+
+## Advanced Features
+
+### Custom Summarization Prompts
+
+You can customize how content is summarized using the `WithSummarizePrompt` option:
+
+```go
+customPrompt := `{{this}}
+
+Summarize the above in exactly 5 words.`
+
+summaries, err := summarizer.SummarizeRenderedDocs(ctx, rendered,
+    WithSummarizePrompt(customPrompt))
+```
+
+The `{{this}}` placeholder represents the rendered document content.
+
+### Nested Link Fields
+
+Link fields work with nested document structures:
+
+```json
+{
+  "metadata": {
+    "properties": {
+      "thumbnail": {
+        "type": "string",
+        "x-antfly-types": ["link"]
+      }
+    }
+  }
+}
+```
+
+### Supported URL Schemes
+
+- `http://` and `https://` - Web resources
+- `s3://` - AWS S3 objects
+- `file://` - Local filesystem (with security restrictions)
+
+## Future Enhancements
+
+AntflyDB's multimodal capabilities are continuously expanding. Planned features include:
+- Audio file support with speech-to-text
+- Video frame extraction and indexing
+- Support for additional embedding models like [ImageBind](https://github.com/facebookresearch/ImageBind)
+- Additional template helpers for specialized content types
+
+## Multimodal Search Queries
+
+In addition to indexing multimodal content, AntflyDB supports **multimodal search queries**. This allows you to search using images, PDFs, or other content types - not just text.
+
+### Using `embedding_template` for Query-Time Processing
+
+The `embedding_template` field in query requests lets you specify how the `semantic_search` value should be processed before embedding. The template has access to `this` which contains the `semantic_search` string.
+
+**Available helpers:**
+- `{{remoteMedia url=this}}` - Fetches and embeds remote images
+- `{{remotePDF url=this}}` - Fetches and extracts content from PDFs
+- `{{remoteText url=this}}` - Fetches remote text content
+- `{{media url=this}}` - Embeds inline data URIs (base64 images)
+
+### Example: Search by Image URL
+
+Search for similar products using an image URL:
+
+```bash
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "product_catalog",
+    "semantic_search": "https://example.com/my-image.jpg",
+    "embedding_template": "{{remoteMedia url=this}}",
+    "indexes": ["visual_search"],
+    "limit": 10
+  }'
+```
+
+### Example: Search by Base64 Image with Vertex AI
+
+For native multimodal embedding without summarization, use Google Vertex AI's multimodal embedding model with base64-encoded images:
+
+**1. Create an index with Vertex multimodal embedder:**
+
+```bash
+antfly index create --table product_catalog \
+  --index vertex_multimodal \
+  --template '{{name}} {{media url=image_url}}' \
+  --dimension 1408 \
+  --embedder '{
+    "provider": "vertex",
+    "model": "multimodalembedding@001",
+    "project": "your-gcp-project",
+    "location": "us-central1"
+  }'
+```
+
+**2. Search using a base64-encoded image:**
+
+```bash
+# Encode your search image to base64
+IMAGE_BASE64=$(base64 -w 0 search-image.jpg)
+
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "product_catalog",
+    "semantic_search": "data:image/jpeg;base64,'$IMAGE_BASE64'",
+    "embedding_template": "{{media url=this}}",
+    "indexes": ["vertex_multimodal"],
+    "limit": 10
+  }'
+```
+
+**Using the Go SDK:**
+
+```go
+import (
+    "encoding/base64"
+    "io"
+    "os"
+
+    "github.com/antflydb/antfly-go/antfly"
+)
+
+// Read and encode the image
+imageFile, _ := os.Open("search-image.jpg")
+imageData, _ := io.ReadAll(imageFile)
+base64Image := base64.StdEncoding.EncodeToString(imageData)
+dataURI := "data:image/jpeg;base64," + base64Image
+
+// Search using the image
+results, err := client.Query(ctx, antfly.QueryRequest{
+    Table:             "product_catalog",
+    SemanticSearch:    dataURI,
+    EmbeddingTemplate: "{{media url=this}}",
+    Indexes:           []string{"vertex_multimodal"},
+    Limit:             10,
+})
+```
+
+**Using the TypeScript SDK:**
+
+```typescript
+import { readFileSync } from 'fs';
+
+// Read and encode the image
+const imageData = readFileSync('search-image.jpg');
+const base64Image = imageData.toString('base64');
+const dataURI = `data:image/jpeg;base64,${base64Image}`;
+
+// Search using the image
+const results = await client.query({
+  table: 'product_catalog',
+  semantic_search: dataURI,
+  embedding_template: '{{media url=this}}',
+  indexes: ['vertex_multimodal'],
+  limit: 10,
+});
+```
+
+### Example: Search by PDF Content
+
+Find documents similar to a PDF:
+
+```bash
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "documents",
+    "semantic_search": "https://example.com/reference-paper.pdf",
+    "embedding_template": "{{remotePDF url=this}}",
+    "indexes": ["pdf_content"],
+    "limit": 10
+  }'
+```
+
+### Combining Text and Multimodal Content
+
+You can mix text with multimodal content in your search:
+
+```bash
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "product_catalog",
+    "semantic_search": "https://example.com/red-dress.jpg",
+    "embedding_template": "Find products similar to this image: {{remoteMedia url=this}}",
+    "indexes": ["visual_search"],
+    "limit": 10
+  }'
+```
+
+### Supported Multimodal Embedding Providers
+
+| Provider | Model | Supports Images | Supports Text+Image |
+|----------|-------|-----------------|---------------------|
+| Vertex AI | `multimodalembedding@001` | ✅ | ✅ |
+| Gemini | `text-embedding-004` | ✅ | ✅ |
+| Ollama + Vision | Any + LLaVA | Via summarizer | Via summarizer |
+
+For providers that don't natively support multimodal embeddings, use the `--summarizer` option to convert images to text descriptions before embedding.
+

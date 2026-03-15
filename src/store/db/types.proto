@@ -1,0 +1,38 @@
+// Copyright 2025 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+edition = "2023";
+
+package db;
+import "google/protobuf/go_features.proto";
+
+option go_package = "github.com/antflydb/antfly/src/store/db";
+option features.(pb.go).api_level = API_OPAQUE;
+
+// ShardState represents the state of a shard
+enum ShardState {
+  Default = 0;
+  // Shard is in the middle of being split off of a PreSplit shard
+  SplittingOff = 1;
+  // Shard has been split off and is waiting for the snapshot
+  SplitOffPreSnap = 2;
+  // Shard has been marked as being in the middle of a split
+  PreSplit = 3;
+  // Shard has been marked as being in the middle of a merge
+  PreMerge = 4;
+  // Shard has nodes that are initializing
+  Initializing = 5;
+  // Shard is splitting
+  Splitting = 6;
+}

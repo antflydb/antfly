@@ -1,0 +1,3 @@
+antfly-data/
+ollama-data/
+!grafana/dashboards/antfly.json

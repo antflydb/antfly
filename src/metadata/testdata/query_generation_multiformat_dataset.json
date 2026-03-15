@@ -1,0 +1,628 @@
+[
+  {
+    "input": "Search for documents about machine learning",
+    "reference": {
+      "simplified": {"match": "machine learning", "field": "content"},
+      "bleve": {"match": "machine learning", "field": "content"},
+      "mongodb": {"content": {"$text": {"$search": "machine learning"}}}
+    },
+    "metadata": {
+      "category": "simple_match",
+      "difficulty": "easy",
+      "schema_fields": ["title:text", "content:text", "tags:keyword"]
+    }
+  },
+  {
+    "input": "Find all published articles",
+    "reference": {
+      "simplified": {"term": "published", "field": "status"},
+      "bleve": {"term": "published", "field": "status"},
+      "mongodb": {"status": "published"}
+    },
+    "metadata": {
+      "category": "term_query",
+      "difficulty": "easy",
+      "schema_fields": ["status:keyword", "title:text", "content:text"]
+    }
+  },
+  {
+    "input": "Products priced between $50 and $100",
+    "reference": {
+      "simplified": {"field": "price", "gte": 50, "lte": 100},
+      "bleve": {"min": 50, "inclusive_min": true, "max": 100, "inclusive_max": true, "field": "price"},
+      "mongodb": {"price": {"$gte": 50, "$lte": 100}}
+    },
+    "metadata": {
+      "category": "range_query",
+      "difficulty": "easy",
+      "schema_fields": ["name:text", "price:numeric", "category:keyword"]
+    }
+  },
+  {
+    "input": "Articles about Python that are also about data science",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"match": "Python", "field": "content"},
+          {"match": "data science", "field": "content"}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"match": "Python", "field": "content"},
+          {"match": "data science", "field": "content"}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"content": {"$text": {"$search": "Python"}}},
+          {"content": {"$text": {"$search": "data science"}}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "and_query",
+      "difficulty": "easy",
+      "schema_fields": ["title:text", "content:text", "tags:keyword"]
+    }
+  },
+  {
+    "input": "Documents written in Python or JavaScript",
+    "reference": {
+      "simplified": {
+        "or": [
+          {"term": "python", "field": "language"},
+          {"term": "javascript", "field": "language"}
+        ]
+      },
+      "bleve": {
+        "disjuncts": [
+          {"term": "python", "field": "language"},
+          {"term": "javascript", "field": "language"}
+        ]
+      },
+      "mongodb": {
+        "$or": [
+          {"language": "python"},
+          {"language": "javascript"}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "or_query",
+      "difficulty": "easy",
+      "schema_fields": ["title:text", "language:keyword", "content:text"]
+    }
+  },
+  {
+    "input": "All items except those marked as deleted",
+    "reference": {
+      "simplified": {"not": {"term": "deleted", "field": "status"}},
+      "bleve": {"must_not": {"disjuncts": [{"term": "deleted", "field": "status"}]}},
+      "mongodb": {"status": {"$ne": "deleted"}}
+    },
+    "metadata": {
+      "category": "not_query",
+      "difficulty": "easy",
+      "schema_fields": ["name:text", "status:keyword"]
+    }
+  },
+  {
+    "input": "Senior engineers in remote or hybrid positions with salary over 100k",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"term": "senior", "field": "level"},
+          {"or": [
+            {"term": "remote", "field": "work_type"},
+            {"term": "hybrid", "field": "work_type"}
+          ]},
+          {"field": "salary", "gte": 100000}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"term": "senior", "field": "level"},
+          {"disjuncts": [
+            {"term": "remote", "field": "work_type"},
+            {"term": "hybrid", "field": "work_type"}
+          ]},
+          {"min": 100000, "inclusive_min": true, "field": "salary"}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"level": "senior"},
+          {"$or": [{"work_type": "remote"}, {"work_type": "hybrid"}]},
+          {"salary": {"$gte": 100000}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "nested_boolean",
+      "difficulty": "medium",
+      "schema_fields": ["title:text", "level:keyword", "work_type:keyword", "salary:numeric"]
+    }
+  },
+  {
+    "input": "Search for exact phrase 'machine learning engineer'",
+    "reference": {
+      "simplified": {"phrase": "machine learning engineer", "field": "title"},
+      "bleve": {"match_phrase": "machine learning engineer", "field": "title"},
+      "mongodb": {"title": {"$text": {"$search": "\"machine learning engineer\""}}}
+    },
+    "metadata": {
+      "category": "phrase_match",
+      "difficulty": "easy",
+      "schema_fields": ["title:text", "content:text"]
+    }
+  },
+  {
+    "input": "Products with status draft, pending, or published",
+    "reference": {
+      "simplified": {"in": ["draft", "pending", "published"], "field": "status"},
+      "bleve": {
+        "disjuncts": [
+          {"term": "draft", "field": "status"},
+          {"term": "pending", "field": "status"},
+          {"term": "published", "field": "status"}
+        ]
+      },
+      "mongodb": {"status": {"$in": ["draft", "pending", "published"]}}
+    },
+    "metadata": {
+      "category": "in_query",
+      "difficulty": "easy",
+      "schema_fields": ["name:text", "status:keyword", "price:numeric"]
+    }
+  },
+  {
+    "input": "Find users who have an email address",
+    "reference": {
+      "simplified": {"exists": "email"},
+      "bleve": {"field": "email", "min": "", "max": "~"},
+      "mongodb": {"email": {"$exists": true}}
+    },
+    "metadata": {
+      "category": "exists_query",
+      "difficulty": "easy",
+      "schema_fields": ["name:text", "email:keyword", "phone:keyword"]
+    }
+  },
+  {
+    "input": "Restaurants within 5 kilometers of downtown San Francisco",
+    "reference": {
+      "simplified": {"geo_distance": {"field": "location", "lat": 37.7749, "lon": -122.4194, "distance": "5km"}},
+      "bleve": {"field": "location", "lat": 37.7749, "lon": -122.4194, "distance": "5km"},
+      "mongodb": {"location": {"$near": {"$geometry": {"type": "Point", "coordinates": [-122.4194, 37.7749]}, "$maxDistance": 5000}}}
+    },
+    "metadata": {
+      "category": "geo_distance",
+      "difficulty": "medium",
+      "schema_fields": ["name:text", "location:geopoint", "cuisine:keyword"],
+      "geo_context": "downtown San Francisco coordinates: 37.7749, -122.4194"
+    }
+  },
+  {
+    "input": "Search for 'recieve' but allow for typos",
+    "reference": {
+      "simplified": {"fuzzy": "recieve", "field": "content", "fuzziness": 2},
+      "bleve": {"term": "recieve", "field": "content", "fuzziness": 2},
+      "mongodb": {"content": {"$regex": "rec[ei]{2}ve", "$options": "i"}}
+    },
+    "metadata": {
+      "category": "fuzzy_search",
+      "difficulty": "medium",
+      "schema_fields": ["title:text", "content:text"]
+    }
+  },
+  {
+    "input": "Find all files matching the pattern *.log",
+    "reference": {
+      "simplified": {"wildcard": "*.log", "field": "filename"},
+      "bleve": {"wildcard": "*.log", "field": "filename"},
+      "mongodb": {"filename": {"$regex": ".*\\.log$"}}
+    },
+    "metadata": {
+      "category": "wildcard",
+      "difficulty": "medium",
+      "schema_fields": ["filename:keyword", "path:text", "size:numeric"]
+    }
+  },
+  {
+    "input": "Products with SKU matching pattern ABC-[0-9]{3}",
+    "reference": {
+      "simplified": {"regexp": "ABC-[0-9]{3}", "field": "sku"},
+      "bleve": {"regexp": "ABC-[0-9]{3}", "field": "sku"},
+      "mongodb": {"sku": {"$regex": "ABC-[0-9]{3}"}}
+    },
+    "metadata": {
+      "category": "regex",
+      "difficulty": "medium",
+      "schema_fields": ["name:text", "sku:keyword", "price:numeric"]
+    }
+  },
+  {
+    "input": "Articles starting with 'Breaking'",
+    "reference": {
+      "simplified": {"prefix": "Breaking", "field": "title"},
+      "bleve": {"prefix": "Breaking", "field": "title"},
+      "mongodb": {"title": {"$regex": "^Breaking"}}
+    },
+    "metadata": {
+      "category": "prefix",
+      "difficulty": "easy",
+      "schema_fields": ["title:text", "content:text", "author:keyword"]
+    }
+  },
+  {
+    "input": "Events happening between January 1st 2024 and March 31st 2024",
+    "reference": {
+      "simplified": {"field": "event_date", "gte": "2024-01-01", "lte": "2024-03-31"},
+      "bleve": {"field": "event_date", "start": "2024-01-01", "end": "2024-03-31", "inclusive_start": true, "inclusive_end": true},
+      "mongodb": {"event_date": {"$gte": "2024-01-01", "$lte": "2024-03-31"}}
+    },
+    "metadata": {
+      "category": "date_range",
+      "difficulty": "easy",
+      "schema_fields": ["name:text", "event_date:datetime", "venue:keyword"]
+    }
+  },
+  {
+    "input": "I want to find cheap hotels near the beach that have a pool but not those noisy ones near the highway",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"field": "price", "lte": 100},
+          {"match": "beach", "field": "location_description"},
+          {"term": "true", "field": "has_pool"},
+          {"not": {"match": "highway", "field": "location_description"}}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"max": 100, "inclusive_max": true, "field": "price"},
+          {"match": "beach", "field": "location_description"},
+          {"term": "true", "field": "has_pool"},
+          {"must_not": {"disjuncts": [{"match": "highway", "field": "location_description"}]}}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"price": {"$lte": 100}},
+          {"location_description": {"$text": {"$search": "beach"}}},
+          {"has_pool": true},
+          {"location_description": {"$not": {"$regex": "highway", "$options": "i"}}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "complex_colloquial",
+      "difficulty": "hard",
+      "schema_fields": ["name:text", "price:numeric", "location_description:text", "has_pool:boolean", "rating:numeric"]
+    }
+  },
+  {
+    "input": "Show me everything that was updated recently but hasn't been reviewed yet",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"field": "updated_at", "gte": "now-7d"},
+          {"not": {"exists": "reviewed_at"}}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"field": "updated_at", "start": "now-7d", "inclusive_start": true},
+          {"must_not": {"disjuncts": [{"field": "reviewed_at", "min": "", "max": "~"}]}}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"updated_at": {"$gte": {"$date": {"$subtract": ["$$NOW", 604800000]}}}},
+          {"reviewed_at": {"$exists": false}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "relative_time_ambiguous",
+      "difficulty": "hard",
+      "schema_fields": ["title:text", "updated_at:datetime", "reviewed_at:datetime", "status:keyword"]
+    }
+  },
+  {
+    "input": "Premium members who bought something expensive last month but didn't leave a review",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"term": "premium", "field": "membership_tier"},
+          {"field": "last_purchase_amount", "gte": 500},
+          {"field": "last_purchase_date", "gte": "now-30d"},
+          {"not": {"exists": "last_review_date"}}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"term": "premium", "field": "membership_tier"},
+          {"min": 500, "inclusive_min": true, "field": "last_purchase_amount"},
+          {"field": "last_purchase_date", "start": "now-30d", "inclusive_start": true},
+          {"must_not": {"disjuncts": [{"field": "last_review_date", "min": "", "max": "~"}]}}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"membership_tier": "premium"},
+          {"last_purchase_amount": {"$gte": 500}},
+          {"last_purchase_date": {"$gte": {"$date": {"$subtract": ["$$NOW", 2592000000]}}}},
+          {"last_review_date": {"$exists": false}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "multi_constraint_implicit",
+      "difficulty": "hard",
+      "schema_fields": ["name:text", "membership_tier:keyword", "last_purchase_amount:numeric", "last_purchase_date:datetime", "last_review_date:datetime"]
+    }
+  },
+  {
+    "input": "Either high-priority bugs assigned to me, or any critical bugs regardless of assignee",
+    "reference": {
+      "simplified": {
+        "or": [
+          {"and": [
+            {"term": "high", "field": "priority"},
+            {"term": "bug", "field": "type"},
+            {"term": "me", "field": "assignee"}
+          ]},
+          {"and": [
+            {"term": "critical", "field": "severity"},
+            {"term": "bug", "field": "type"}
+          ]}
+        ]
+      },
+      "bleve": {
+        "disjuncts": [
+          {"conjuncts": [
+            {"term": "high", "field": "priority"},
+            {"term": "bug", "field": "type"},
+            {"term": "me", "field": "assignee"}
+          ]},
+          {"conjuncts": [
+            {"term": "critical", "field": "severity"},
+            {"term": "bug", "field": "type"}
+          ]}
+        ]
+      },
+      "mongodb": {
+        "$or": [
+          {"$and": [{"priority": "high"}, {"type": "bug"}, {"assignee": "me"}]},
+          {"$and": [{"severity": "critical"}, {"type": "bug"}]}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "complex_boolean_or",
+      "difficulty": "hard",
+      "schema_fields": ["title:text", "type:keyword", "priority:keyword", "severity:keyword", "assignee:keyword"]
+    }
+  },
+  {
+    "input": "Find apartments in Manhattan or Brooklyn, 2+ bedrooms, under $3000, that allow dogs",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"or": [
+            {"term": "manhattan", "field": "neighborhood"},
+            {"term": "brooklyn", "field": "neighborhood"}
+          ]},
+          {"field": "bedrooms", "gte": 2},
+          {"field": "rent", "lt": 3000},
+          {"term": "true", "field": "pets_allowed"}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"disjuncts": [
+            {"term": "manhattan", "field": "neighborhood"},
+            {"term": "brooklyn", "field": "neighborhood"}
+          ]},
+          {"min": 2, "inclusive_min": true, "field": "bedrooms"},
+          {"max": 3000, "inclusive_max": false, "field": "rent"},
+          {"term": "true", "field": "pets_allowed"}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"$or": [{"neighborhood": "manhattan"}, {"neighborhood": "brooklyn"}]},
+          {"bedrooms": {"$gte": 2}},
+          {"rent": {"$lt": 3000}},
+          {"pets_allowed": true}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "real_world_listing",
+      "difficulty": "hard",
+      "schema_fields": ["address:text", "neighborhood:keyword", "bedrooms:numeric", "rent:numeric", "pets_allowed:boolean"]
+    }
+  },
+  {
+    "input": "Active subscriptions expiring within the next week that haven't been renewed and cost more than $50/month",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"term": "active", "field": "status"},
+          {"field": "expires_at", "gte": "now", "lte": "now+7d"},
+          {"not": {"term": "true", "field": "auto_renew"}},
+          {"field": "monthly_cost", "gt": 50}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"term": "active", "field": "status"},
+          {"field": "expires_at", "start": "now", "end": "now+7d", "inclusive_start": true, "inclusive_end": true},
+          {"must_not": {"disjuncts": [{"term": "true", "field": "auto_renew"}]}},
+          {"min": 50, "inclusive_min": false, "field": "monthly_cost"}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"status": "active"},
+          {"expires_at": {"$gte": "$$NOW", "$lte": {"$add": ["$$NOW", 604800000]}}},
+          {"auto_renew": {"$ne": true}},
+          {"monthly_cost": {"$gt": 50}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "business_logic_complex",
+      "difficulty": "hard",
+      "schema_fields": ["user_id:keyword", "status:keyword", "expires_at:datetime", "auto_renew:boolean", "monthly_cost:numeric"]
+    }
+  },
+  {
+    "input": "Get everything",
+    "reference": {
+      "simplified": {"match_all": {}},
+      "bleve": {"match_all": {}},
+      "mongodb": {}
+    },
+    "metadata": {
+      "category": "match_all_ambiguous",
+      "difficulty": "easy",
+      "schema_fields": ["any"]
+    }
+  },
+  {
+    "input": "Nothing should match this impossible query - items that are both active and inactive",
+    "reference": {
+      "simplified": {"and": [{"term": "active", "field": "status"}, {"term": "inactive", "field": "status"}]},
+      "bleve": {"conjuncts": [{"term": "active", "field": "status"}, {"term": "inactive", "field": "status"}]},
+      "mongodb": {"$and": [{"status": "active"}, {"status": "inactive"}]}
+    },
+    "metadata": {
+      "category": "impossible_query",
+      "difficulty": "medium",
+      "schema_fields": ["name:text", "status:keyword"]
+    }
+  },
+  {
+    "input": "Sort of new-ish products that are kinda popular but not crazy expensive",
+    "reference": {
+      "simplified": {
+        "and": [
+          {"field": "created_at", "gte": "now-90d"},
+          {"field": "popularity_score", "gte": 50},
+          {"field": "price", "lte": 200}
+        ]
+      },
+      "bleve": {
+        "conjuncts": [
+          {"field": "created_at", "start": "now-90d", "inclusive_start": true},
+          {"min": 50, "inclusive_min": true, "field": "popularity_score"},
+          {"max": 200, "inclusive_max": true, "field": "price"}
+        ]
+      },
+      "mongodb": {
+        "$and": [
+          {"created_at": {"$gte": {"$date": {"$subtract": ["$$NOW", 7776000000]}}}},
+          {"popularity_score": {"$gte": 50}},
+          {"price": {"$lte": 200}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "vague_colloquial",
+      "difficulty": "hard",
+      "schema_fields": ["name:text", "created_at:datetime", "popularity_score:numeric", "price:numeric"]
+    }
+  },
+  {
+    "input": "Search for 'kubernetes' in the title, content, or tags fields",
+    "reference": {
+      "simplified": {
+        "or": [
+          {"match": "kubernetes", "field": "title"},
+          {"match": "kubernetes", "field": "content"},
+          {"match": "kubernetes", "field": "tags"}
+        ]
+      },
+      "bleve": {
+        "disjuncts": [
+          {"match": "kubernetes", "field": "title"},
+          {"match": "kubernetes", "field": "content"},
+          {"match": "kubernetes", "field": "tags"}
+        ]
+      },
+      "mongodb": {
+        "$or": [
+          {"title": {"$text": {"$search": "kubernetes"}}},
+          {"content": {"$text": {"$search": "kubernetes"}}},
+          {"tags": {"$text": {"$search": "kubernetes"}}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "multi_field_match",
+      "difficulty": "medium",
+      "schema_fields": ["title:text", "content:text", "tags:text", "author:keyword"]
+    }
+  },
+  {
+    "input": "Products with price strictly greater than $10 and strictly less than $50",
+    "reference": {
+      "simplified": {"field": "price", "gt": 10, "lt": 50},
+      "bleve": {"field": "price", "min": 10, "inclusive_min": false, "max": 50, "inclusive_max": false},
+      "mongodb": {"price": {"$gt": 10, "$lt": 50}}
+    },
+    "metadata": {
+      "category": "exclusive_range",
+      "difficulty": "easy",
+      "schema_fields": ["name:text", "price:numeric", "category:keyword"]
+    }
+  },
+  {
+    "input": "Find users who don't have a verified email address",
+    "reference": {
+      "simplified": {"not": {"exists": "verified_email"}},
+      "bleve": {"must_not": {"disjuncts": [{"field": "verified_email", "min": "", "max": "~"}]}},
+      "mongodb": {"verified_email": {"$exists": false}}
+    },
+    "metadata": {
+      "category": "not_exists",
+      "difficulty": "easy",
+      "schema_fields": ["name:text", "email:keyword", "verified_email:keyword", "phone:keyword"]
+    }
+  },
+  {
+    "input": "Search for 'error' anywhere in the document - check title, body, and comments",
+    "reference": {
+      "simplified": {
+        "or": [
+          {"match": "error", "field": "title"},
+          {"match": "error", "field": "body"},
+          {"match": "error", "field": "comments"}
+        ]
+      },
+      "bleve": {
+        "disjuncts": [
+          {"match": "error", "field": "title"},
+          {"match": "error", "field": "body"},
+          {"match": "error", "field": "comments"}
+        ]
+      },
+      "mongodb": {
+        "$or": [
+          {"title": {"$text": {"$search": "error"}}},
+          {"body": {"$text": {"$search": "error"}}},
+          {"comments": {"$text": {"$search": "error"}}}
+        ]
+      }
+    },
+    "metadata": {
+      "category": "multi_field_match",
+      "difficulty": "medium",
+      "schema_fields": ["title:text", "body:text", "comments:text", "author:keyword", "status:keyword"]
+    }
+  }
+]

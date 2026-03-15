@@ -1,0 +1,6 @@
+project_name_override: antfly
+package_name_override: client_generated
+package_version_override: 0.0.1
+post_hooks:
+  - "ruff check client_generated --fix"
+  - "ruff format client_generated"

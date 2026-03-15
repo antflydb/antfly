@@ -1,0 +1,69 @@
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: small-antfly-cluster
+  namespace: default
+  labels:
+    app.kubernetes.io/name: antfly-cluster
+    app.kubernetes.io/instance: small-antfly-cluster
+    app.kubernetes.io/part-of: antfly
+spec:
+  # Container image for Antfly database
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # Metadata nodes configuration (Raft consensus layer)
+  metadataNodes:
+    replicas: 3  # Required for Raft consensus
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+    resources:
+      cpu: "250m"
+      memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+  
+  # Data nodes configuration (Storage layer)
+  dataNodes:
+    replicas: 3  # Required for Raft consensus
+    api:
+      port: 12380
+    raft:
+      port: 9021
+    resources:
+      cpu: "250m"
+      memory: "512Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+  
+  # Storage configuration
+  storage:
+    # Choose the storage class for your platform:
+    #   EKS:      "gp2" (default) or create "gp3" (see AWS EKS guide)
+    #   GKE:      "standard-rwo"
+    #   minikube: "standard"
+    #   Other:    "" (uses cluster default)
+    storageClass: ""
+    metadataStorage: "1Gi"
+    dataStorage: "5Gi"
+  
+  # Antfly database configuration
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      },
+      "max_shard_size_bytes": 134217728,
+      "raft_snapshot_threshold": 10000,
+      "raft_heartbeat_timeout": "150ms",
+      "raft_election_timeout": "150ms",
+      "cache_size": 1000,
+      "batch_size": 100,
+      "enable_metrics": true
+    }
+    

@@ -1,0 +1,301 @@
+{
+  "summary": {
+    "total_examples": 5,
+    "passed_examples": 5,
+    "failed_examples": 0,
+    "average_score": 0.9749999940395355,
+    "pass_rate": 1,
+    "total_duration": 17677842250,
+    "evaluator_stats": {
+      "citations": {
+        "name": "citations",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 28274
+      },
+      "confidence": {
+        "name": "confidence",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 0.949999988079071,
+        "pass_rate": 1,
+        "average_duration": 9349
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is vector search and how does it work?",
+        "reference": "Vector search uses embeddings to convert data into high-dimensional vectors and find semantically similar content using approximate nearest neighbor algorithms like HNSW.",
+        "context": [
+          "Vector search is a technique that uses embeddings to find semantically similar content in a database.",
+          "It works by converting text, images, or other data into high-dimensional numerical vectors.",
+          "Approximate nearest neighbor algorithms like HNSW (Hierarchical Navigable Small World) enable fast retrieval of similar vectors.",
+          "Vector search powers modern semantic search engines and recommendation systems by understanding meaning rather than just matching keywords."
+        ],
+        "metadata": {
+          "domain": "search",
+          "expected_citation_count": 3,
+          "expected_route_type": "question"
+        }
+      },
+      "output": {
+        "generation": "Vector search is a technique that uses embeddings to find semantically similar content in a database [doc0]. It works by converting text, images, or other data into high-dimensional numerical vectors [doc1]. These vectors represent the meaning of the data, and the search process involves finding vectors that are closest to a query vector – effectively identifying content with similar meanings [doc1].  Approximate nearest neighbor algorithms like HNSW (Hierarchical Navigable Small World) enable fast retrieval of these similar vectors [doc2].  Vector search powers modern semantic search engines and recommendation systems by understanding meaning rather than just matching keywords [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "vector search technology and its underlying mechanisms",
+        "semantic_query": "vector search, similarity search, approximate nearest neighbor search, embedding search, vector databases, semantic search, vector embeddings, ANN algorithms"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 5 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 5,
+            "cited_doc_ids": [
+              3,
+              0,
+              1,
+              2
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 5899301250,
+      "timestamp": "2025-11-16T13:06:05.194594-08:00"
+    },
+    {
+      "example": {
+        "input": "papers about distributed consensus algorithms",
+        "reference": "Key distributed consensus algorithms include Raft (designed for understandability), Paxos (the classic approach), and Byzantine Fault Tolerance algorithms like PBFT.",
+        "context": [
+          "Raft is a consensus algorithm designed to be more understandable than Paxos while providing the same guarantees.",
+          "The Raft algorithm divides consensus into leader election, log replication, and safety components.",
+          "Paxos is a family of protocols for solving consensus in distributed systems, known for being difficult to understand.",
+          "Byzantine Fault Tolerance algorithms like PBFT handle malicious actors in distributed systems."
+        ],
+        "metadata": {
+          "domain": "distributed_systems",
+          "expected_citation_count": 3,
+          "expected_route_type": "search"
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive answer to the question “papers about distributed consensus algorithms”.\n\nDistributed consensus algorithms are a complex area of study.  Raft is one such algorithm, designed to be more understandable than Paxos while still providing the same guarantees [doc0]. The Raft algorithm specifically divides consensus into three components: leader election, log replication, and safety components [doc1]. Paxos, another family of protocols for solving consensus in distributed systems, is known for being difficult to understand [doc2]. Furthermore, algorithms like PBFT (Byzantine Fault Tolerance algorithms) are designed to handle malicious actors within distributed systems [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "distributed consensus algorithms research papers",
+        "semantic_query": "distributed consensus algorithms, blockchain, Byzantine fault tolerance, Paxos, Raft, BFT, fault tolerance, distributed systems, consensus protocols, algorithm design"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 3677585041,
+      "timestamp": "2025-11-16T13:05:53.416014-08:00"
+    },
+    {
+      "example": {
+        "input": "How does the CAP theorem affect database design?",
+        "reference": "The CAP theorem forces distributed databases to choose between AP (availability + partition tolerance) or CP (consistency + partition tolerance) trade-offs.",
+        "context": [
+          "The CAP theorem states that distributed databases can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+          "Most distributed databases choose to optimize for availability and partition tolerance (AP systems) or consistency and partition tolerance (CP systems).",
+          "AP systems like Cassandra prioritize availability, allowing eventual consistency.",
+          "CP systems like HBase prioritize strong consistency, potentially sacrificing availability during partitions."
+        ],
+        "metadata": {
+          "domain": "databases",
+          "expected_citation_count": 3,
+          "expected_route_type": "question"
+        }
+      },
+      "output": {
+        "generation": "The CAP theorem significantly impacts database design by forcing architects to make trade-offs between consistency, availability, and partition tolerance [doc0].  Essentially, a distributed database cannot simultaneously guarantee all three.  Most systems therefore choose to prioritize two of these properties, leading to distinct architectural approaches.\n\nHere's how the CAP theorem influences database design:\n\n*   **AP Systems (Availability and Partition Tolerance):** Systems like Cassandra prioritize availability and partition tolerance [doc2]. This means they accept eventual consistency, meaning data may not be immediately consistent across all nodes, but they continue to operate even during network partitions.\n\n*   **CP Systems (Consistency and Partition Tolerance):** Systems like HBase prioritize strong consistency and partition tolerance [doc3].  This approach guarantees that all data replicas will remain consistent, but the system may become unavailable during a network partition, as it waits for all nodes to synchronize.\n\nTherefore, the CAP theorem dictates that database designers must consciously choose which two of the three properties are most critical for their specific application [doc0].  The decision will determine the system's architecture and its behavior under various failure scenarios.",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "How does the CAP theorem impact database design considerations?",
+        "semantic_query": "CAP theorem, distributed database consistency, availability, partition tolerance, database design principles, distributed system architecture, data consistency models, fault tolerance in databases"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 8100938417,
+      "timestamp": "2025-11-16T13:05:57.093619-08:00"
+    },
+    {
+      "example": {
+        "input": "research on transformer architectures in NLP",
+        "reference": "Transformer architectures use attention mechanisms and have spawned models like BERT (bidirectional encoding), GPT (autoregressive generation), and ViT (vision tasks).",
+        "context": [
+          "The Transformer architecture introduced the attention mechanism, eliminating the need for recurrent connections.",
+          "BERT (Bidirectional Encoder Representations from Transformers) uses masked language modeling for pre-training.",
+          "GPT models use autoregressive language modeling to generate text token by token.",
+          "Vision Transformers (ViT) adapt the transformer architecture for image classification tasks."
+        ],
+        "metadata": {
+          "domain": "ai",
+          "expected_citation_count": 3,
+          "expected_route_type": "search"
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive answer to the question “research on transformer architectures in NLP”. \n\nTransformer architectures have significantly impacted Natural Language Processing (NLP) research. Here’s a breakdown of key aspects based on the provided information:\n\n*   **Core Architecture:** The Transformer architecture, introduced through [doc0 \u003cID\u003e], fundamentally changed NLP by removing the need for recurrent connections. This was achieved through the incorporation of the attention mechanism.\n\n*   **BERT:** BERT (Bidirectional Encoder Representations from Transformers) utilizes the transformer architecture for pre-training, employing masked language modeling [doc1 \u003cID\u003e]. This allows BERT to learn contextual representations of words within a sentence.\n\n*   **GPT Models:** GPT (Generative Pre-trained Transformer) models leverage the transformer architecture for text generation, utilizing autoregressive language modeling [doc2 \u003cID\u003e]. This approach generates text token by token, predicting the next word in a sequence.\n\n*   **Adaptations:** The transformer architecture has been adapted for different modalities. For example, Vision Transformers (ViT) [doc3 \u003cID\u003e] demonstrate the application of transformers to image classification tasks. \n\nThese different approaches represent ongoing research efforts utilizing the transformer architecture's strengths in sequence processing and attention mechanisms within NLP.",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "transformer architectures in natural language processing research",
+        "semantic_query": "transformer models, neural machine translation, natural language understanding, sequence-to-sequence learning, attention mechanisms, NLP research, deep learning architectures, BERT, GPT, transformer networks"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "No citations found in output",
+          "metadata": {
+            "citation_count": 0
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 7831219666,
+      "timestamp": "2025-11-16T13:06:00.357185-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the key principles of REST API design?",
+        "reference": "REST API design principles include using HTTP methods semantically, stateless resource identification via URIs, proper status codes, and hypermedia for discoverability.",
+        "context": [
+          "REST APIs should use HTTP methods semantically: GET for retrieval, POST for creation, PUT for updates, DELETE for removal.",
+          "Resources should be identified by URIs, and representations should be stateless.",
+          "Proper HTTP status codes (200, 201, 404, 500, etc.) communicate results clearly to clients.",
+          "RESTful APIs benefit from being self-descriptive and using hypermedia (HATEOAS) for discoverability."
+        ],
+        "metadata": {
+          "domain": "api_design",
+          "expected_citation_count": 3,
+          "expected_route_type": "question"
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive summary. Use markdown formatting (headings, bullets, bold/italic, code blocks) as appropriate. Cite sources using the format [resource_id \u003cID\u003e] where \u003cID\u003e is the actual resource ID from the list above.\n\nKey principles of REST API design, as outlined in the provided documents, include:\n\n*   **Semantic Use of HTTP Methods:** REST APIs should employ HTTP methods according to their semantic meanings. Specifically, `GET` is used for retrieval operations, `POST` for creating new resources, `PUT` for updating existing resources, and `DELETE` for removing resources [doc0 \u003cID\u003e].\n\n*   **Stateless Resources:** Resources should be identified by URIs, and representations should be stateless [doc1 \u003cID\u003e]. This means that the server does not retain any information about the client's previous requests.\n\n*   **Clear Communication via HTTP Status Codes:** Proper HTTP status codes (e.g., 200, 201, 404, 500) are crucial for communicating the results of operations to the client [doc2 \u003cID\u003e].\n\n*   **Hypermedia as the Engine of Application State (HATEOAS):** RESTful APIs benefit from being self-descriptive and using hypermedia (HATEOAS) for discoverability [doc3 \u003cID\u003e].",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "key principles of REST API design",
+        "semantic_query": "REST API design principles, architectural patterns, API design guidelines, HTTP methods, resources, statelessness, client-server architecture, API best practices"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "No citations found in output",
+          "metadata": {
+            "citation_count": 0
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        }
+      },
+      "duration": 6941138250,
+      "timestamp": "2025-11-16T13:05:53.416012-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": true,
+      "max_concurrency": 2,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-16T13:05:53.416005-08:00"
+}

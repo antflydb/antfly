@@ -1,0 +1,513 @@
+openapi: 3.0.3
+info:
+  title: Embeddings Provider Configuration
+  description: "An OpenAPI specification for configuring different embedding providers in AntflyDB."
+  version: "0.0.1"
+components:
+  schemas:
+    EmbedderProvider:
+      type: string
+      enum:
+        - gemini
+        - vertex
+        - ollama
+        - openai
+        - openrouter
+        - bedrock
+        - cohere
+        - mock
+        - termite
+        - antfly
+      description: "The embedding provider to use."
+
+    GoogleEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the Google AI (Gemini) embedding provider.
+
+        API key via `api_key` field or `GEMINI_API_KEY` environment variable.
+
+        **Example Models:** gemini-embedding-001 (default, 3072 dims)
+
+        **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
+      properties:
+        project_id:
+          type: string
+          description: "The Google Cloud project ID (optional for Gemini API, required for Vertex AI)."
+        location:
+          type: string
+          description: "The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API."
+        model:
+          type: string
+          description: "The name of the embedding model to use."
+          default: "gemini-embedding-001"
+          example: "gemini-embedding-001"
+        dimension:
+          type: integer
+          description: "The dimension of the embedding vector (768, 1536, or 3072 recommended)."
+          default: 3072
+        api_key:
+          type: string
+          description: "The Google API key. Can also be set via GEMINI_API_KEY environment variable."
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Google API endpoint (optional, uses default if not specified)."
+      required:
+        - model
+      example:
+        provider: "gemini"
+        model: "gemini-embedding-001"
+        dimension: 3072
+        api_key: "your-api-key"
+
+    VertexEmbedderConfig:
+      type: object
+      description: |
+        Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
+
+        Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
+
+        **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
+
+        **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+      properties:
+        model:
+          type: string
+          description: "The name of the Vertex AI embedding model to use."
+          default: "gemini-embedding-001"
+          example: "gemini-embedding-001"
+        project_id:
+          type: string
+          description: "Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable."
+        location:
+          type: string
+          description: "Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'."
+          default: "us-central1"
+        credentials_path:
+          type: string
+          description: "Path to service account JSON key file. Alternative to ADC for non-GCP environments."
+        dimension:
+          type: integer
+          description: "The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding)."
+          default: 3072
+      required:
+        - model
+      example:
+        provider: "vertex"
+        model: "gemini-embedding-001"
+        project_id: "my-gcp-project"
+        location: "us-central1"
+        dimension: 3072
+
+    OllamaEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the Ollama embedding provider.
+
+        Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var.
+
+        **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims)
+
+        **Docs:** https://ollama.com/search?c=embedding
+      properties:
+        model:
+          type: string
+          description: "The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large')."
+          example: "nomic-embed-text"
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable."
+          default: "http://localhost:11434"
+          example: "http://localhost:11434"
+      required:
+        - model
+      example:
+        provider: "ollama"
+        model: "nomic-embed-text"
+        url: "http://localhost:11434"
+
+    OpenAIEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the OpenAI embedding provider.
+
+        API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+        Supports OpenAI-compatible APIs via `url` field.
+
+        **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims)
+
+        **Docs:** https://platform.openai.com/docs/guides/embeddings
+      properties:
+        model:
+          type: string
+          description: "The name of the OpenAI model to use."
+          default: "text-embedding-3-small"
+          example: "text-embedding-3-small"
+        url:
+          type: string
+          format: uri
+          description: "The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL environment variable."
+          default: "https://api.openai.com"
+          example: "https://api.openai.com"
+        api_key:
+          type: string
+          description: "The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable."
+        dimensions:
+          type: integer
+          description: "Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072."
+      required:
+        - model
+      example:
+        provider: "openai"
+        model: "text-embedding-3-small"
+        api_key: "sk-..."
+
+    BedrockEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the AWS Bedrock embedding provider.
+
+        Uses AWS credentials from environment or IAM roles.
+
+        **Example Models:** cohere.embed-english-v4, amazon.titan-embed-text-v2:0
+
+        **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+      properties:
+        model:
+          type: string
+          description: "The Bedrock model ID to use (e.g., 'cohere.embed-english-v4', 'amazon.titan-embed-text-v2:0')."
+          example: "cohere.embed-english-v4"
+        region:
+          type: string
+          description: "The AWS region for the Bedrock service (e.g., 'us-east-1')."
+          example: "us-east-1"
+        strip_new_lines:
+          type: boolean
+          description: "Whether to strip new lines from the input text before embedding."
+          default: false
+        batch_size:
+          type: integer
+          description: "The batch size for embedding requests to optimize throughput."
+          default: 1
+      required:
+        - model
+      example:
+        provider: "bedrock"
+        model: "cohere.embed-english-v4"
+        region: "us-east-1"
+
+    CohereEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the Cohere embedding provider.
+
+        API key via `api_key` field or `COHERE_API_KEY` environment variable.
+
+        **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
+
+        **Docs:** https://docs.cohere.com/reference/embed
+      properties:
+        model:
+          type: string
+          description: "The name of the Cohere embedding model to use."
+          default: "embed-english-v3.0"
+          example: "embed-english-v3.0"
+        api_key:
+          type: string
+          description: "The Cohere API key. Can also be set via COHERE_API_KEY environment variable."
+        input_type:
+          type: string
+          description: "Specifies the type of input for optimized embeddings."
+          enum:
+            - search_document
+            - search_query
+            - classification
+            - clustering
+          default: "search_document"
+        truncate:
+          type: string
+          description: "How to handle inputs longer than the max token length."
+          enum:
+            - NONE
+            - START
+            - END
+          default: "END"
+      required:
+        - model
+      example:
+        provider: "cohere"
+        model: "embed-english-v3.0"
+        input_type: "search_document"
+
+    OpenRouterEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the OpenRouter embedding provider.
+
+        OpenRouter provides a unified API for multiple embedding models from different providers.
+        API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
+
+        **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
+        google/gemini-embedding-001, qwen/qwen3-embedding-8b
+
+        **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+      properties:
+        model:
+          type: string
+          description: "The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001')."
+          default: "openai/text-embedding-3-small"
+          example: "openai/text-embedding-3-small"
+        api_key:
+          type: string
+          description: "The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable."
+        dimensions:
+          type: integer
+          description: "Output dimension for the embedding (if supported by the model)."
+      required:
+        - model
+      example:
+        provider: "openrouter"
+        model: "openai/text-embedding-3-small"
+        api_key: "sk-or-..."
+
+    TermiteEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the Termite embedding provider.
+
+        Termite is Antfly's built-in ML service for local embeddings using ONNX models.
+        It provides embedding generation with multi-tier caching (memory + persistent).
+
+        **Features:**
+        - Local ONNX-based embedding generation
+        - L1 memory cache with configurable TTL
+        - L2 persistent Pebble database cache
+        - Singleflight deduplication for concurrent identical requests
+
+        **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
+
+        Models are loaded from the `models/embedders/{name}/` directory.
+      properties:
+        model:
+          type: string
+          description: "The embedding model name (maps to models/embedders/{name}/ directory)."
+          example: "bge-base-en-v1.5"
+        api_url:
+          type: string
+          format: uri
+          description: "The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable."
+          example: "http://localhost:8082"
+      required:
+        - model
+      example:
+        provider: "termite"
+        model: "bge-base-en-v1.5"
+        api_url: "http://localhost:8082"
+
+    AntflyEmbedderConfig:
+      type: object
+      description: |-
+        Configuration for the built-in Antfly embedding provider.
+
+        Uses an embedded INT8-quantized all-MiniLM-L6-v2 ONNX model bundled directly
+        in the binary. No external service, API key, or model download required.
+
+        **Model:** all-MiniLM-L6-v2 (384 dimensions, text-only)
+
+        **Features:**
+        - Zero configuration — works out of the box
+        - No network access required
+        - Pure Go inference via GoMLX
+      example:
+        provider: "antfly"
+
+    EmbedderConfig:
+      description: |-
+        A unified configuration for an embedding provider.
+
+        Embedders can be configured with templates to customize how documents are
+        converted to text before embedding. Templates use Handlebars syntax and
+        support various built-in helpers.
+
+        **Template System:**
+        - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
+        - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
+        - **Context**: Templates receive the full document as context
+
+        **Built-in Helpers:**
+
+        1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
+           ```handlebars
+           {{scrubHtml html_content}}
+           ```
+           - Removes `<script>` and `<style>` tags
+           - Adds newlines after block elements (p, div, h1-h6, li, etc.)
+           - Returns plain text with preserved readability
+
+        2. **eq** - Equality comparison for conditionals
+           ```handlebars
+           {{#if (eq status "active")}}Active user{{/if}}
+           {{#if (eq @key "special")}}Special field{{/if}}
+           ```
+
+        3. **media** - GenKit dotprompt media directive for multimodal content
+           ```handlebars
+           {{media url=imageDataURI}}
+           {{media url=this.image_url}}
+           {{media url="https://example.com/image.jpg"}}
+           {{media url="s3://endpoint/bucket/image.png"}}
+           {{media url="file:///path/to/image.jpg"}}
+           ```
+
+           **Supported URL Schemes:**
+           - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
+           - `http://` / `https://` - Web URLs with automatic content type detection
+           - `file://` - Local filesystem paths
+           - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
+
+           **Automatic Content Processing:**
+           - **Images**: Downloaded, resized (if needed), converted to data URIs
+           - **PDFs**: Text extracted or first page rendered as image
+           - **HTML**: Readable text extracted using Mozilla Readability
+
+           **Security Controls:**
+           Downloads are protected by content security settings (see Configuration Reference):
+           - Allowed host whitelist
+           - Private IP blocking (prevents SSRF attacks)
+           - Download size limits (default: 100MB)
+           - Download timeouts (default: 30s)
+           - Image dimension limits (default: 2048px, auto-resized)
+
+           See: https://antfly.io/docs/configuration#security--cors
+
+        4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
+           ```handlebars
+           {{encodeToon this.fields}}
+           {{encodeToon this.fields lengthMarker=false indent=4}}
+           {{encodeToon this.fields delimiter="\t"}}
+           ```
+
+           **What is TOON?**
+           TOON is a compact, human-readable format designed for passing structured data to LLMs.
+           It provides **30-60% token reduction** compared to JSON while maintaining high LLM
+           comprehension accuracy.
+
+           **Key Features:**
+           - Compact syntax using `:` for key-value pairs
+           - Array length markers: `tags[#3]: ai,search,ml`
+           - Tabular format for uniform data structures
+           - Optimized for LLM parsing and understanding
+           - Maintains human readability
+
+           **Benefits:**
+           - **Lower API costs** - Reduced token usage means lower LLM API costs
+           - **Faster responses** - Less tokens to process
+           - **More context** - Fit more documents within token limits
+
+           **Options:**
+           - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
+           - `indent` (int): Indentation spacing for nested objects (default: 2)
+           - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
+
+           **Example output:**
+           ```
+           title: Introduction to Vector Search
+           author: Jane Doe
+           tags[#3]: ai,search,ml
+           metadata:
+             edition: 2
+             pages: 450
+           ```
+
+           **Default in RAG:** TOON is the default format for document rendering in RAG queries.
+
+           **References:**
+           - TOON Specification: https://github.com/toon-format/toon
+           - Go Implementation: https://github.com/alpkeskin/gotoon
+
+        **Template Examples:**
+
+        Document with metadata:
+        ```handlebars
+        Title: {{metadata.title}}
+        Date: {{metadata.date}}
+        Tags: {{#each metadata.tags}}{{this}}, {{/each}}
+
+        {{content}}
+        ```
+
+        HTML content extraction:
+        ```handlebars
+        Product: {{name}}
+        Description: {{scrubHtml description_html}}
+        Price: ${{price}}
+        ```
+
+        Multimodal with image:
+        ```handlebars
+        Product: {{title}}
+        {{media url=image}}
+        Description: {{description}}
+        ```
+
+        Conditional formatting:
+        ```handlebars
+        {{title}}
+        {{#if author}}By: {{author}}{{/if}}
+        {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
+        {{body}}
+        ```
+
+        **Environment Variables:**
+        - `GEMINI_API_KEY` - API key for Google AI
+        - `OPENAI_API_KEY` - API key for OpenAI
+        - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
+        - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
+
+        **Importing Pre-computed Embeddings:**
+
+        You can import existing embeddings (from OpenAI, Cohere, or any provider) by including
+        them directly in your documents using the `_embeddings` field. This bypasses the
+        embedding generation step and writes vectors directly to the index.
+
+        **Steps:**
+        1. Create the index first with the appropriate dimension
+        2. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+
+        **Example:**
+        ```json
+        {
+          "title": "My Document",
+          "content": "Document text...",
+          "_embeddings": {
+            "my_vector_index": [0.1, 0.2, 0.3, ...]
+          }
+        }
+        ```
+
+        **Use Cases:**
+        - Migrating from another vector database with existing embeddings
+        - Using embeddings generated by external systems
+        - Importing pre-computed OpenAI, Cohere, or other provider embeddings
+        - Batch processing embeddings offline before ingestion
+      allOf:
+        - oneOf:
+            - $ref: "#/components/schemas/GoogleEmbedderConfig"
+            - $ref: "#/components/schemas/VertexEmbedderConfig"
+            - $ref: "#/components/schemas/OllamaEmbedderConfig"
+            - $ref: "#/components/schemas/OpenAIEmbedderConfig"
+            - $ref: "#/components/schemas/OpenRouterEmbedderConfig"
+            - $ref: "#/components/schemas/BedrockEmbedderConfig"
+            - $ref: "#/components/schemas/CohereEmbedderConfig"
+            - $ref: "#/components/schemas/TermiteEmbedderConfig"
+            - $ref: "#/components/schemas/AntflyEmbedderConfig"
+        - properties:
+            provider:
+              $ref: "#/components/schemas/EmbedderProvider"
+          required:
+            - provider
+      example:
+        provider: "openai"
+        model: "text-embedding-3-small"

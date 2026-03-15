@@ -1,0 +1,219 @@
+[
+  {
+    "input": "Find all published articles",
+    "reference": {"term": "published", "field": "status"},
+    "metadata": {
+      "category": "simple_term",
+      "schema_fields": ["status:keyword", "title:text", "content:text"]
+    }
+  },
+  {
+    "input": "Search for documents about machine learning",
+    "reference": {"match": "machine learning", "field": "content"},
+    "metadata": {
+      "category": "simple_match",
+      "schema_fields": ["title:text", "content:text", "tags:keyword"]
+    }
+  },
+  {
+    "input": "Products priced between $50 and $100",
+    "reference": {"field": "price", "gte": 50, "lte": 100},
+    "metadata": {
+      "category": "range_query",
+      "schema_fields": ["name:text", "price:numeric", "category:keyword"]
+    }
+  },
+  {
+    "input": "Articles about Python that are also about data science",
+    "reference": {
+      "and": [
+        {"match": "Python", "field": "content"},
+        {"match": "data science", "field": "content"}
+      ]
+    },
+    "metadata": {
+      "category": "conjunction",
+      "schema_fields": ["title:text", "content:text", "tags:keyword"]
+    }
+  },
+  {
+    "input": "Documents written in Python or JavaScript",
+    "reference": {
+      "or": [
+        {"term": "python", "field": "language"},
+        {"term": "javascript", "field": "language"}
+      ]
+    },
+    "metadata": {
+      "category": "disjunction",
+      "schema_fields": ["title:text", "language:keyword", "content:text"]
+    }
+  },
+  {
+    "input": "All active users except admins",
+    "reference": {
+      "and": [
+        {"bool": true, "field": "is_active"},
+        {"not": {"term": "admin", "field": "role"}}
+      ]
+    },
+    "metadata": {
+      "category": "negation",
+      "schema_fields": ["name:text", "role:keyword", "is_active:boolean"]
+    }
+  },
+  {
+    "input": "Find restaurants within 5km of downtown San Francisco",
+    "reference": {
+      "geo_distance": {
+        "field": "location",
+        "point": [-122.4194, 37.7749],
+        "distance": "5km"
+      }
+    },
+    "metadata": {
+      "category": "geo_distance",
+      "schema_fields": ["name:text", "location:geopoint", "cuisine:keyword"],
+      "geo_context": "downtown San Francisco coordinates: -122.4194, 37.7749"
+    }
+  },
+  {
+    "input": "Articles published after January 2024",
+    "reference": {"field": "published_at", "gte": "2024-01-01"},
+    "metadata": {
+      "category": "date_range",
+      "schema_fields": ["title:text", "published_at:datetime", "author:keyword"]
+    }
+  },
+  {
+    "input": "Products starting with 'Pro'",
+    "reference": {"prefix": "Pro", "field": "name"},
+    "metadata": {
+      "category": "prefix",
+      "schema_fields": ["name:text", "price:numeric", "sku:keyword"]
+    }
+  },
+  {
+    "input": "Find user IDs matching the pattern user-123-*",
+    "reference": {"wildcard": "user-123-*", "field": "user_id"},
+    "metadata": {
+      "category": "wildcard",
+      "schema_fields": ["user_id:keyword", "name:text", "email:keyword"]
+    }
+  },
+  {
+    "input": "Documents with version numbers like v1.0, v2.5, etc.",
+    "reference": {"regexp": "v[0-9]+\\.[0-9]+", "field": "version"},
+    "metadata": {
+      "category": "regexp",
+      "schema_fields": ["title:text", "version:keyword", "content:text"]
+    }
+  },
+  {
+    "input": "Senior Python developers in remote or hybrid positions",
+    "reference": {
+      "and": [
+        {"match": "python", "field": "skills"},
+        {"term": "senior", "field": "level"},
+        {
+          "or": [
+            {"term": "remote", "field": "work_type"},
+            {"term": "hybrid", "field": "work_type"}
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "category": "complex_nested",
+      "schema_fields": ["skills:text", "level:keyword", "work_type:keyword", "salary:numeric"]
+    }
+  },
+  {
+    "input": "High-rated products (4+ stars) under $50",
+    "reference": {
+      "and": [
+        {"field": "rating", "gte": 4},
+        {"field": "price", "lt": 50}
+      ]
+    },
+    "metadata": {
+      "category": "multiple_ranges",
+      "schema_fields": ["name:text", "price:numeric", "rating:numeric", "category:keyword"]
+    }
+  },
+  {
+    "input": "Search for 'recieve' with typo tolerance",
+    "reference": {"term": "recieve", "field": "content", "fuzziness": 1},
+    "metadata": {
+      "category": "fuzzy",
+      "schema_fields": ["title:text", "content:text"]
+    }
+  },
+  {
+    "input": "Match all documents in the database",
+    "reference": {"match_all": {}},
+    "metadata": {
+      "category": "match_all",
+      "schema_fields": ["any"]
+    }
+  },
+  {
+    "input": "Find documents with IDs doc-1, doc-2, and doc-3",
+    "reference": {"ids": ["doc-1", "doc-2", "doc-3"]},
+    "metadata": {
+      "category": "doc_ids",
+      "schema_fields": ["any"]
+    }
+  },
+  {
+    "input": "Show only active items",
+    "reference": {"bool": true, "field": "is_active"},
+    "metadata": {
+      "category": "bool_field",
+      "schema_fields": ["name:text", "is_active:boolean"]
+    }
+  },
+  {
+    "input": "Articles about AI that mention transformers but not about cars",
+    "reference": {
+      "and": [
+        {"match": "AI", "field": "content"},
+        {"match": "transformers", "field": "content"},
+        {"not": {"match": "cars", "field": "content"}}
+      ]
+    },
+    "metadata": {
+      "category": "complex_with_negation",
+      "schema_fields": ["title:text", "content:text", "category:keyword"]
+    }
+  },
+  {
+    "input": "Tech jobs paying at least $100k where all skills Python, SQL, and AWS are required",
+    "reference": {
+      "and": [
+        {"field": "salary", "gte": 100000},
+        {"term": "tech", "field": "industry"},
+        {"match": "Python SQL AWS", "field": "requirements", "operator": "and"}
+      ]
+    },
+    "metadata": {
+      "category": "match_with_operator",
+      "schema_fields": ["title:text", "salary:numeric", "industry:keyword", "requirements:text"]
+    }
+  },
+  {
+    "input": "Events in the Bay Area region (bounding box)",
+    "reference": {
+      "geo_bbox": {
+        "field": "location",
+        "top_left": [-122.75, 37.95],
+        "bottom_right": [-121.75, 37.25]
+      }
+    },
+    "metadata": {
+      "category": "geo_bbox",
+      "schema_fields": ["name:text", "location:geopoint", "date:datetime"],
+      "geo_context": "Bay Area bounding box: top_left [-122.75, 37.95], bottom_right [-121.75, 37.25]"
+    }
+  }
+]

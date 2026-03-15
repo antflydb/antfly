@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: antfly-workers-svc
+spec:
+  clusterIP: None # This makes it a headless service
+  selector:
+    app: antfly
+    role: worker
+  ports:
+    - name: api
+      port: 12380
+      targetPort: 12380
+    - name: raft
+      port: 9201
+      targetPort: 9021
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: antfly-workers
+spec:
+  serviceName: antfly-workers-svc
+  replicas: 3
+  selector:
+    matchLabels:
+      app: antfly
+      role: worker
+  volumeClaimTemplates:
+    - metadata:
+        name: worker-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "standard"
+        resources:
+          requests:
+            storage: 1Gi
+  template:
+    metadata:
+      labels:
+        app: antfly
+        role: worker
+    spec:
+      volumes:
+        - name: config
+          configMap:
+            name: antfly-config
+      containers:
+        - name: antfly
+          image: antfly:latest
+          imagePullPolicy: Never # Use the local minikube image
+          volumeMounts:
+            - name: worker-storage
+              mountPath: /antflydb
+            - name: config
+              mountPath: /config
+          # Use pod ordinal index for ID
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              ID=$((ORDINAL + 1))
+              exec /antfly store --id $ID --config /config/config.yaml \
+                --api http://0.0.0.0:12380 \
+                --raft http://0.0.0.0:9021 \
+                --service ${HOSTNAME}.antfly-workers-svc.default.svc.cluster.local
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 4200
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 4200
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2

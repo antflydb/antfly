@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: query
+output: query.gen.go
+generate:
+  embedded-spec: true
+  models: true
+  client: true
+compatibility:
+  always-prefix-enum-values: true
+output-options:
+  # to make sure that all types are generated
+  skip-prune: true
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true

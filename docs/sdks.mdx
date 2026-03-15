@@ -1,0 +1,155 @@
+---
+title: "SDKs"
+description: "Client libraries for Go, TypeScript, Python, and Rust — auto-generated from the Antfly OpenAPI spec."
+---
+
+# SDKs
+
+Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust. All SDKs are auto-generated from the [OpenAPI specification](/docs/api) and kept in sync with every release.
+
+| Language | Package | Registry | Source |
+|----------|---------|----------|--------|
+| Go | `github.com/antflydb/antfly-go/antfly` | [pkg.go.dev](https://pkg.go.dev/github.com/antflydb/antfly-go/antfly) | [GitHub](https://github.com/antflydb/antfly-go) |
+| TypeScript | `@antfly/sdk` | [npm](https://www.npmjs.com/package/@antfly/sdk) | [GitHub](https://github.com/antflydb/antfly-ts) |
+| Python | `antfly-sdk` | [PyPI](https://pypi.org/project/antfly-sdk/) | [GitHub](https://github.com/antflydb/antfly-py) |
+| Rust | `antfly-client` | [crates.io](https://crates.io/crates/antfly-client) | [GitHub](https://github.com/antflydb/antfly/tree/main/rs/antfly-client) |
+
+## Installation
+
+<CodeTabs persistKey="sdk-lang" samples={[
+  {
+    language: "Go",
+    code: `go get github.com/antflydb/antfly-go/antfly`
+  },
+  {
+    language: "TypeScript",
+    code: `npm install @antfly/sdk`
+  },
+  {
+    language: "Python",
+    code: `pip install antfly-sdk`
+  },
+  {
+    language: "Rust",
+    code: `# Cargo.toml\n[dependencies]\nantfly-client = "0.1"`
+  }
+]} />
+
+## Authentication
+
+All three authentication methods are supported across SDKs: basic auth, API key, and bearer token.
+
+### Basic Auth
+
+<CodeTabs persistKey="sdk-lang" samples={[
+  {
+    language: "Go",
+    code: `import "github.com/antflydb/antfly-go/antfly"\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)`
+  },
+  {
+    language: "TypeScript",
+    code: `import { AntflyClient } from '@antfly/sdk';\n\nconst client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: {\n    username: 'admin',\n    password: 'password',\n  },\n});`
+  },
+  {
+    language: "Python",
+    code: `from antfly import AntflyClient\n\nclient = AntflyClient(\n    base_url='http://localhost:8080',\n    username='admin',\n    password='password',\n)`
+  },
+  {
+    language: "Rust",
+    code: `use antfly_client::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert(\n                reqwest::header::AUTHORIZATION,\n                reqwest::header::HeaderValue::from_str(\n                    &format!("Basic {}", base64::encode("admin:password"))\n                ).unwrap(),\n            );\n            h\n        })\n        .build()\n        .unwrap(),\n);`
+  }
+]} />
+
+### API Key
+
+<CodeTabs persistKey="sdk-lang" samples={[
+  {
+    language: "Go",
+    code: `client, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithApiKey("key-id", "key-secret"),\n)`
+  },
+  {
+    language: "TypeScript",
+    code: `const client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: {\n    type: 'apiKey',\n    keyId: 'key-id',\n    keySecret: 'key-secret',\n  },\n});`
+  },
+  {
+    language: "Python",
+    code: `client = AntflyClient(\n    base_url='http://localhost:8080',\n    api_key=('key-id', 'key-secret'),\n)`
+  },
+  {
+    language: "Rust",
+    code: `use antfly_client::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert("X-Api-Key-Id", "key-id".parse().unwrap());\n            h.insert("X-Api-Key-Secret", "key-secret".parse().unwrap());\n            h\n        })\n        .build()\n        .unwrap(),\n);`
+  }
+]} />
+
+### Bearer Token
+
+<CodeTabs persistKey="sdk-lang" samples={[
+  {
+    language: "Go",
+    code: `client, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBearerToken("your-token"),\n)`
+  },
+  {
+    language: "TypeScript",
+    code: `const client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: {\n    type: 'bearer',\n    token: 'your-token',\n  },\n});`
+  },
+  {
+    language: "Python",
+    code: `client = AntflyClient(\n    base_url='http://localhost:8080',\n    bearer_token='your-token',\n)`
+  },
+  {
+    language: "Rust",
+    code: `use antfly_client::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert(\n                reqwest::header::AUTHORIZATION,\n                "Bearer your-token".parse().unwrap(),\n            );\n            h\n        })\n        .build()\n        .unwrap(),\n);`
+  }
+]} />
+
+## Quick Start
+
+### Insert Documents
+
+<CodeTabs persistKey="sdk-lang" samples={[
+  {
+    language: "Go",
+    code: `import (\n\t"context"\n\t"github.com/antflydb/antfly-go/antfly"\n)\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)\nif err != nil {\n\tlog.Fatal(err)\n}\n\n// Batch insert documents\nresp, err := client.BatchTableWithResponse(\n\tcontext.Background(),\n\t"products",\n\tantfly.BatchTableJSONRequestBody{\n\t\tInserts: &map[string]interface{}{\n\t\t\t"prod:001": map[string]interface{}{\n\t\t\t\t"name":  "Laptop",\n\t\t\t\t"price": 1299.99,\n\t\t\t},\n\t\t\t"prod:002": map[string]interface{}{\n\t\t\t\t"name":  "Mouse",\n\t\t\t\t"price": 29.99,\n\t\t\t},\n\t\t},\n\t},\n)`
+  },
+  {
+    language: "TypeScript",
+    code: `import { AntflyClient } from '@antfly/sdk';\n\nconst client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: { username: 'admin', password: 'password' },\n});\n\n// Batch insert documents\nawait client.tables.batch('products', {\n  inserts: {\n    'prod:001': { name: 'Laptop', price: 1299.99 },\n    'prod:002': { name: 'Mouse', price: 29.99 },\n  },\n});`
+  },
+  {
+    language: "Python",
+    code: `from antfly import AntflyClient\n\nclient = AntflyClient(\n    base_url='http://localhost:8080',\n    username='admin',\n    password='password',\n)\n\n# Batch insert documents\nclient.batch(\n    table='products',\n    inserts={\n        'prod:001': {'name': 'Laptop', 'price': 1299.99},\n        'prod:002': {'name': 'Mouse', 'price': 29.99},\n    },\n)`
+  },
+  {
+    language: "Rust",
+    code: `use antfly_client::Client;\nuse antfly_client::types::BatchTableBody;\nuse serde_json::json;\nuse std::collections::HashMap;\n\nlet client = Client::new("http://localhost:8080");\n\n// Batch insert documents\nlet mut inserts = HashMap::new();\ninserts.insert(\n    "prod:001".to_string(),\n    json!({"name": "Laptop", "price": 1299.99}),\n);\ninserts.insert(\n    "prod:002".to_string(),\n    json!({"name": "Mouse", "price": 29.99}),\n);\n\nclient\n    .batch_table(\n        "products",\n        &BatchTableBody {\n            inserts: Some(inserts),\n            ..Default::default()\n        },\n    )\n    .await?;`
+  }
+]} />
+
+### Query
+
+<CodeTabs persistKey="sdk-lang" samples={[
+  {
+    language: "Go",
+    code: `resp, err := client.QueryWithResponse(\n\tcontext.Background(),\n\tantfly.QueryJSONRequestBody{\n\t\tTable: strPtr("products"),\n\t\tFullTextSearch: &antfly.FullTextSearch{\n\t\t\tQuery: strPtr("laptop"),\n\t\t},\n\t\tLimit: intPtr(10),\n\t},\n)\nif err != nil {\n\tlog.Fatal(err)\n}\n\nfor _, hit := range resp.JSON200.Hits {\n\tfmt.Printf("%s: %v\\n", hit.Key, hit.Fields)\n}`
+  },
+  {
+    language: "TypeScript",
+    code: `const results = await client.query({\n  table: 'products',\n  full_text_search: { query: 'laptop' },\n  limit: 10,\n});\n\nfor (const hit of results.hits) {\n  console.log(hit.key, hit.fields);\n}`
+  },
+  {
+    language: "Python",
+    code: `results = client.query(\n    table='products',\n    full_text_search={'query': 'laptop'},\n    limit=10,\n)\n\nfor hit in results.hits:\n    print(hit.key, hit.fields)`
+  },
+  {
+    language: "Rust",
+    code: `use antfly_client::Client;\nuse antfly_client::types::{GlobalQueryBody, FullTextSearch};\n\nlet client = Client::new("http://localhost:8080");\n\nlet resp = client\n    .global_query(&GlobalQueryBody {\n        table: Some("products".to_string()),\n        full_text_search: Some(FullTextSearch {\n            query: Some("laptop".to_string()),\n            ..Default::default()\n        }),\n        limit: Some(10),\n        ..Default::default()\n    })\n    .await?;\n\nlet results = resp.into_inner();\nfor response in &results.responses {\n    if let Some(hits) = &response.hits {\n        for hit in &hits.hits {\n            println!("{}: {:?}", hit.id, hit.source);\n        }\n    }\n}`
+  }
+]} />
+
+## React Components
+
+For building search UIs, Antfly provides `@antfly/components` — a React component library with search boxes, facets, result lists, RAG answer boxes, and more. See the [React Antfly documentation](/docs/ui/react-antfly) for details.
+
+```bash
+npm install @antfly/components @antfly/sdk
+```

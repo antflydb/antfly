@@ -1,0 +1,36 @@
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+/antfly-operator
+
+# Test artifacts
+test/e2e/bin/
+testbin/
+
+# Coverage reports
+*.out
+*.test
+
+# Go build cache
+go.sum.tmp
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+.aider*

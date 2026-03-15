@@ -1,0 +1,11 @@
+# Use goreman to run `go install github.com/mattn/goreman@latest`
+antfly1:   ./antfly store --id 1 --config configs/config-tls.yaml --raft "https://127.0.0.1:9021" --api "https://127.0.0.1:12380" --health-port 4201
+antfly2:   ./antfly store --id 2 --config configs/config-tls.yaml --raft "https://127.0.0.1:9022" --api "https://127.0.0.1:22380" --health-port 4202
+antfly3:   ./antfly store --id 3 --config configs/config-tls.yaml --raft "https://127.0.0.1:9023" --api "https://127.0.0.1:32380" --health-port 4203
+antfly4:   ./antfly store --id 4 --config configs/config-tls.yaml --raft "https://127.0.0.1:9024" --api "https://127.0.0.1:42380" --health-port 4204
+antfly5:   ./antfly store --id 5 --config configs/config-tls.yaml --raft "https://127.0.0.1:9025" --api "https://127.0.0.1:52380" --health-port 4205
+metadata1: ./antfly metadata --id 11 --config configs/config-tls.yaml --raft "https://127.0.0.1:9017" --api "https://127.0.0.1:12377" --public-api "https://127.0.0.1:12277" --cluster "{ \"b\": \"https://127.0.0.1:9017\", \"c\": \"https://127.0.0.1:9018\", \"d\": \"https://127.0.0.1:9019\" }" --health-port 4211
+metadata2: ./antfly metadata --id 12 --config configs/config-tls.yaml --raft "https://127.0.0.1:9018" --api "https://127.0.0.1:12378" --public-api "https://127.0.0.1:12278" --cluster "{ \"b\": \"https://127.0.0.1:9017\", \"c\": \"https://127.0.0.1:9018\", \"d\": \"https://127.0.0.1:9019\" }" --health-port 4212
+metadata3: ./antfly metadata --id 13 --config configs/config-tls.yaml --raft "https://127.0.0.1:9019" --api "https://127.0.0.1:12379" --public-api "https://127.0.0.1:12279" --cluster "{ \"b\": \"https://127.0.0.1:9017\", \"c\": \"https://127.0.0.1:9018\", \"d\": \"https://127.0.0.1:9019\" }" --health-port 4213
+termite:   ./antfly termite --config configs/config-tls.yaml --health-port 4299
+loadbalancer: go run cmd/loadbalancer/main.go

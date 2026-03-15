@@ -1,0 +1,157 @@
+openapi: 3.0.3
+info:
+  title: Reranking Provider Configuration
+  description: "An OpenAPI specification for configuring different reranking providers in AntflyDB."
+  version: "0.0.1"
+components:
+  schemas:
+    RerankerProvider:
+      type: string
+      enum:
+        - antfly
+        - ollama
+        - termite
+        - cohere
+        - vertex
+      description: "The reranking provider to use."
+
+    OllamaRerankerConfig:
+      type: object
+      description: "Configuration for the Ollama reranking provider."
+      properties:
+        model:
+          type: string
+          description: "The name of the Ollama model to use for reranking."
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Ollama API endpoint."
+      required:
+        - model
+
+    TermiteRerankerConfig:
+      type: object
+      description: "Configuration for the Termite reranking provider."
+      properties:
+        model:
+          type: string
+          description: "The name of the reranking model (e.g., cross-encoder model name)."
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Termite API endpoint."
+      required:
+        - model
+
+    CohereRerankerConfig:
+      type: object
+      description: |-
+        Configuration for the Cohere reranking provider.
+
+        API key via `api_key` field or `COHERE_API_KEY` environment variable.
+
+        **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0
+
+        **Docs:** https://docs.cohere.com/reference/rerank
+      properties:
+        model:
+          type: string
+          description: "The name of the Cohere reranking model to use."
+          default: "rerank-english-v3.0"
+          example: "rerank-english-v3.0"
+        api_key:
+          type: string
+          description: "The Cohere API key. Can also be set via COHERE_API_KEY environment variable."
+        top_n:
+          type: integer
+          description: "Number of most relevant documents to return. If not specified, returns all documents with scores."
+        max_chunks_per_doc:
+          type: integer
+          description: "Maximum number of chunks per document for long document handling."
+      required:
+        - model
+      example:
+        provider: "cohere"
+        model: "rerank-english-v3.0"
+
+    VertexRerankerConfig:
+      type: object
+      description: |-
+        Configuration for the Google Vertex AI Ranking API.
+
+        Uses Application Default Credentials (ADC) or explicit credentials path.
+
+        **Prerequisites:**
+        - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com`
+        - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission)
+
+        **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004
+
+        **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking
+
+        **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
+      properties:
+        model:
+          type: string
+          description: "The ranking model to use."
+          default: "semantic-ranker-default@latest"
+          example: "semantic-ranker-default@latest"
+        project_id:
+          type: string
+          description: "Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable."
+        credentials_path:
+          type: string
+          description: "Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable."
+        top_n:
+          type: integer
+          description: "Maximum number of records to return. If not specified, returns all documents with scores."
+      required:
+        - model
+      example:
+        provider: "vertex"
+        model: "semantic-ranker-default@latest"
+        project_id: "my-gcp-project"
+
+    AntflyRerankerConfig:
+      type: object
+      description: |-
+        Configuration for the built-in Antfly reranking provider.
+
+        Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model
+        bundled directly in the binary. No external service, API key, or model download required.
+
+        **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder)
+
+        **Features:**
+        - Zero configuration — works out of the box
+        - No network access required
+        - Pure Go inference via GoMLX
+      example:
+        provider: "antfly"
+
+    RerankerConfig:
+      x-go-type-skip-optional-pointer: false
+      description: "A unified configuration for a reranking provider."
+      allOf:
+        - type: object
+          properties:
+            provider:
+              $ref: "#/components/schemas/RerankerProvider"
+            field:
+              type: string
+              description: "Field name to extract from documents for reranking."
+            template:
+              type: string
+              description: "Handlebars template to render document text for reranking."
+          required:
+            - provider
+        - oneOf:
+            - $ref: "#/components/schemas/AntflyRerankerConfig"
+            - $ref: "#/components/schemas/OllamaRerankerConfig"
+            - $ref: "#/components/schemas/TermiteRerankerConfig"
+            - $ref: "#/components/schemas/CohereRerankerConfig"
+            - $ref: "#/components/schemas/VertexRerankerConfig"
+      example:
+        provider: "ollama"
+        model: "dengcao/Qwen3-Reranker-0.6B:F16"
+        field: "content"

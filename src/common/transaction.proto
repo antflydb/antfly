@@ -1,0 +1,47 @@
+// Copyright 2025 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+edition = "2023";
+
+package common;
+import "google/protobuf/go_features.proto";
+
+option go_package = "github.com/antflydb/antfly/src/common";
+option features.(pb.go).api_level = API_OPAQUE;
+
+enum TxnStatus {
+  TxnStatusPending = 0;
+  TxnStatusCommitted = 1;
+  TxnStatusAborted = 2;
+}
+
+// Stored on coordinator shard at key: \x00\x00__txn_records__:<txnID>
+message TransactionRecord {
+  bytes txn_id = 1 [ features.field_presence = IMPLICIT ];
+  TxnStatus status = 2 [ features.field_presence = IMPLICIT ];
+  uint64 timestamp = 3 [ features.field_presence = IMPLICIT ];  // From metadata HLC
+  repeated bytes participants = 4;  // Shard IDs
+  int64 created_at = 5 [ features.field_presence = IMPLICIT ];  // Unix timestamp
+  int64 committed_at = 6 [ features.field_presence = IMPLICIT ]; // Unix timestamp (0 if pending)
+}
+
+// Stored on participant shards at key: \x00\x00__txn_intents__:<txnID>:<userKey>
+message WriteIntent {
+  bytes value = 1 [ features.field_presence = IMPLICIT ];  // The provisional write (compressed if needed)
+  bytes txn_id = 2 [ features.field_presence = IMPLICIT ]; // Transaction ID
+  uint64 timestamp = 3 [ features.field_presence = IMPLICIT ]; // From metadata HLC
+  TxnStatus status = 4 [ features.field_presence = IMPLICIT ]; // Always Pending when written
+  bytes coordinator_shard = 5 [ features.field_presence = IMPLICIT ]; // Shard ID of coordinator
+  bool is_delete = 6 [ features.field_presence = IMPLICIT ]; // True if this is a delete intent
+}

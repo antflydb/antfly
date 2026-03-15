@@ -1,0 +1,83 @@
+// Copyright 2025 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+edition = "2023";
+package antfly.lib.vector.quantize;
+option go_package = "github.com/antflydb/antfly/lib/vector/quantize";
+option features.(pb.go).api_level = API_OPAQUE;
+
+import "lib/vector/vector.proto";
+import "google/protobuf/go_features.proto";
+
+// RaBitQCodeSet is a set of RaBitQ quantization codes. Each code represents a
+// quantized vector.
+message RaBitQCodeSet {
+  // Count is the number of codes in the set.
+  int64 count = 1 [features.field_presence = IMPLICIT];
+  // Width is the number of uint64 values that store a single code.
+  int64 width = 2 [features.field_presence = IMPLICIT];
+  // Data is a uint64 slice that stores all the codes in the set. Codes are
+  // stored contiguously in row-wise order.
+  repeated uint64 data = 3;
+}
+
+// RaBitQuantizedVectorSet encodes a set of RaBitQ quantized vectors.
+// We store the information to estimate the distance from the original
+// vectors to a given query vector.
+message RaBitQuantizedVectorSet {
+  // Metric specifies the distance metric used to compute similarity between vectors.
+  antfly.lib.vector.DistanceMetric metric = 1 [features.field_presence = IMPLICIT];
+  // Centroid is the mean/average of the vector set.
+  //
+  // NOTE: The quantized set centroid is set when the set is created and
+  // is not updated when vectors are added or removed.
+  //
+  // NOTE: This is always the mean centroid, regardless of the distance metric.
+  // The caller is responsible for converting this to a spherical centroid when
+  // that's needed (e.g. for Cosine distance).
+  //
+  // NOTE: The centroid should be treated as immutable.
+  repeated float centroid = 2;
+  // Codes is a set of RaBitQ quantization codes, with one code per quantized
+  // vector in the set.
+  RaBitQCodeSet codes = 3;
+  // CodeCounts records the count of "1" bits in each of the quantization codes.
+  repeated uint32 code_counts = 4;
+  // CentroidDistances is a slice of the exact L2/Euclidean distances (non-squared)
+  // of the original full-size vectors from the centroid.
+  repeated float centroid_distances = 5;
+  // QuantizedDotProducts is a slice of the exact inner products between the
+  // original full-size vectors and their corresponding quantized vectors.
+  //
+  // NOTE: These values have been inverted (1/inner_product) to avoid expensive
+  // division during distance estimation.
+  repeated float quantized_dot_products = 6;
+  // CentroidDotProducts is a slice of the exact inner products between the
+  // original full-size vectors and the centroid.
+  //
+  // NOTE: This is not used when using L2Squared distance.
+  repeated float centroid_dot_products = 7;
+  // CentroidNorm is the L2 norm of the mean centroid.
+  //
+  // NOTE: This is not used when using the L2Squared distance.
+  float centroid_norm = 8 [features.field_presence = IMPLICIT];
+}
+
+// NonQuantizedVectorSet trivially implements the QuantizedVectorSet interface,
+// storing the original full-size vectors without quantization. This is used in
+// testing and for the root partition, which is never quantized.
+message NonQuantizedVectorSet {
+  // Vectors is the set of original full-size vectors.
+  antfly.lib.vector.Set vectors = 1;
+}

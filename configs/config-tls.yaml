@@ -1,0 +1,29 @@
+metadata:
+  orchestration_urls:
+    b: "https://127.0.0.1:12277"
+    c: "https://127.0.0.1:12278"
+    d: "https://127.0.0.1:12279"
+termite:
+  api_url: "http://127.0.0.1:11433"
+tls:
+  cert: "certificate.crt"
+  key: "private.key"
+max_shard_size_bytes: 64000000
+replication_factor: 3
+disable_shard_alloc: true
+log_level: "info"
+logging_style: "json"
+
+# CORS configuration for API server
+# For production, specify exact allowed origins instead of "*"
+cors:
+  enabled: true
+  # Production: specify exact origins for security
+  allowed_origins: ["https://yourdomain.com", "https://app.yourdomain.com"]
+  # Development: use ["*"] to allow all origins
+  # allowed_origins: ["*"]
+  allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
+  allowed_headers: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"]
+  # exposed_headers: []  # Add any custom headers your API returns
+  # allow_credentials: true  # Enable if using cookies/auth with specific origins
+  max_age: 3600

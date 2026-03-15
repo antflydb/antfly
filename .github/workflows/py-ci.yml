@@ -1,0 +1,54 @@
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "py/**"
+      - ".github/workflows/py-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "py/**"
+      - ".github/workflows/py-ci.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.13"]') || fromJSON('["3.9", "3.10", "3.11", "3.12", "3.13"]') }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        working-directory: py
+        run: uv sync
+
+      - name: Run linting
+        working-directory: py
+        run: |
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+
+      - name: Run type checking
+        working-directory: py
+        run: uv run pyright src tests
+
+      - name: Run tests
+        working-directory: py
+        run: uv run pytest tests --cov=antfly --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: py/coverage.xml

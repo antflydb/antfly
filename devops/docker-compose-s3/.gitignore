@@ -1,0 +1,9 @@
+# Data directories
+antfly-data/
+minio-data/
+ollama-data/
+grafana-data/
+
+# Docker volumes
+*.db
+*.log

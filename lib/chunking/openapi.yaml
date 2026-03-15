@@ -1,0 +1,122 @@
+openapi: 3.0.3
+info:
+  title: Chunker Provider Configuration
+  description: "An OpenAPI specification for configuring different chunking providers in AntflyDB."
+  version: "0.0.1"
+components:
+  schemas:
+    ChunkerProvider:
+      type: string
+      enum:
+        - mock
+        - termite
+        - antfly
+      description: "The chunking provider to use."
+
+    ChunkerConfig:
+      description: "A unified configuration for a chunking provider."
+      allOf:
+        - oneOf:
+            - $ref: "#/components/schemas/TermiteChunkerConfig"
+            - $ref: "#/components/schemas/AntflyChunkerConfig"
+        - properties:
+            provider:
+              $ref: "#/components/schemas/ChunkerProvider"
+            store_chunks:
+              x-go-type-skip-optional-pointer: true
+              type: boolean
+              description: >-
+                Controls whether chunk data is persisted to storage.
+                When false (default), chunks are generated in memory and only embeddings are stored.
+                When true, both chunks and embeddings are stored.
+              default: false
+            full_text_index:
+              x-go-type-skip-optional-pointer: true
+              type: object
+              description: |
+                Configuration for full-text indexing of chunks in Bleve.
+                When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
+                When absent, chunks use :c: suffix and are only used for vector embeddings.
+              additionalProperties: true
+          required:
+            - provider
+      example:
+        provider: "termite"
+        model: "fixed"
+        text:
+          target_tokens: 500
+          overlap_tokens: 50
+
+    TermiteChunkerConfig:
+      description: |
+        Configuration for the Termite chunking provider.
+
+        Termite is a centralized HTTP service that provides chunking with multi-tier caching.
+        The model name maps to ONNX model directory names (similar to how Ollama works).
+
+        **Chunking Models:**
+        - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
+        - Any other name will attempt to load from models/chunkers/{name}/ directory
+
+        **Caching:**
+        - L1: Memory cache with 2-minute TTL
+        - L2: Persistent Pebble database
+        - Singleflight deduplication for concurrent identical requests
+      allOf:
+        - $ref: "../../pkg/libaf/chunking/openapi.yaml#/components/schemas/ChunkOptions"
+        - type: object
+          properties:
+            api_url:
+              type: string
+              format: uri
+              description: "The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable."
+              example: "http://localhost:8080"
+            model:
+              type: string
+              description: "The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/."
+              default: "fixed"
+              example: "fixed"
+          required:
+            - model
+      example:
+        provider: "termite"
+        api_url: "http://localhost:8080"
+        model: "fixed"
+        max_chunks: 50
+        text:
+          target_tokens: 500
+          overlap_tokens: 50
+          separator: "\n\n"
+
+    AntflyChunkerConfig:
+      description: |
+        Configuration for the local Antfly chunking provider.
+
+        This provider runs chunking directly within the storage node process,
+        without requiring an external Termite service. It uses simple fixed-size
+        tokenizer-based chunking with no caching overhead.
+
+        **Use this when:**
+        - Running single-node deployments (swarm mode)
+        - You don't need embedding/chunk caching across nodes
+        - You want minimal setup complexity
+
+        **Use Termite instead when:**
+        - Running multi-node clusters where caching reduces costs
+        - You need ONNX-accelerated chunking models
+        - You want persistent chunk/embedding caches
+      allOf:
+        - $ref: "../../pkg/libaf/chunking/openapi.yaml#/components/schemas/ChunkOptions"
+      example:
+        provider: "antfly"
+        max_chunks: 50
+        text:
+          target_tokens: 500
+          overlap_tokens: 50
+          separator: "\n\n"
+
+    Chunk:
+      $ref: "../../pkg/libaf/chunking/openapi.yaml#/components/schemas/Chunk"
+
+    ChunkOptions:
+      $ref: "../../pkg/libaf/chunking/openapi.yaml#/components/schemas/ChunkOptions"

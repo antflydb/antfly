@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: public-api-svc
+spec:
+  selector:
+    app: antfly
+    role: metadata
+  ports:
+    - protocol: TCP
+      port: 80 # The port the service exposes internally
+      targetPort: 12277 # The port your app listens on inside the container
+      nodePort: 30002 # The external port Minikube will use (e.g., 30002)
+  type: NodePort
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: antfly-metadata-svc
+spec:
+  clusterIP: None # This makes it a headless service
+  selector:
+    app: antfly
+    role: metadata
+  ports:
+    - name: api
+      port: 12377
+    - name: raft
+      port: 9017
+    - name: public
+      port: 12277
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: antfly-metadata
+spec:
+  serviceName: antfly-metadata-svc
+  replicas: 3
+  selector:
+    matchLabels:
+      app: antfly
+      role: metadata
+  volumeClaimTemplates:
+    - metadata:
+        name: metadata-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "standard"
+        resources:
+          requests:
+            storage: 500Mi
+  template:
+    metadata:
+      labels:
+        app: antfly
+        role: metadata
+    spec:
+      volumes:
+        - name: config
+          configMap:
+            name: antfly-config
+      containers:
+        - name: antfly
+          image: antfly:latest
+          imagePullPolicy: Never # Use the local minikube image
+          volumeMounts:
+            - name: metadata-storage
+              mountPath: /antflydb
+            - name: config
+              mountPath: /config
+          # Use pod ordinal index for ID
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              ID=$((ORDINAL + 1))
+              exec /antfly metadata --id $ID --config /config/config.yaml \
+                --api http://0.0.0.0:12377 \
+                --raft http://0.0.0.0:9017 \
+                --public-api http://0.0.0.0:12277 \
+                --cluster '{ "1": "http://antfly-metadata-0.antfly-metadata-svc.default.svc.cluster.local:9017", "2": "http://antfly-metadata-1.antfly-metadata-svc.default.svc.cluster.local:9017", "3": "http://antfly-metadata-2.antfly-metadata-svc.default.svc.cluster.local:9017" }'
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 4200
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 4200
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2

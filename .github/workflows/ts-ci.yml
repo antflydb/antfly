@@ -1,0 +1,97 @@
+name: TypeScript CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ts/**"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/ts-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "ts/**"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/ts-ci.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: ${{ github.event_name == 'pull_request' && fromJSON('["22.x"]') || fromJSON('["20.x", "22.x"]') }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint and type check
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+      - name: Run tests
+        run: pnpm test
+
+  playwright:
+    needs: [test]
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Install Playwright Browsers
+        working-directory: ts/apps/antfarm
+        run: pnpm exec playwright install --with-deps
+
+      - name: Preview server
+        working-directory: ts/apps/antfarm
+        run: pnpm preview &
+
+      - name: Wait for Server
+        working-directory: ts/apps/antfarm
+        run: pnpm exec wait-on http://localhost:4173
+
+      - name: Run Playwright tests
+        working-directory: ts/apps/antfarm
+        run: pnpm exec playwright test
+        env:
+          BASE_URL: http://localhost:4173
+
+      - uses: actions/upload-artifact@v6
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: ts/apps/antfarm/playwright-report/
+          retention-days: 30

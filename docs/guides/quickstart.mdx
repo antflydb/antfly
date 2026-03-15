@@ -1,0 +1,435 @@
+---
+title: Getting Started
+description: Get up and running with Antfly in 5 minutes
+prerequisites:
+  - Go 1.26+ or a prebuilt binary from the Downloads page
+  - "curl and jq (for sample data)"
+difficulty: beginner
+estimatedTime: "15 min"
+tags: [getting-started, setup, swarm]
+---
+
+<Questions>
+- How do I install Antfly?
+- How do I start Antfly for local development?
+- How do I create my first table and index?
+- How do I load data into Antfly?
+- How do I run a search query?
+- How do I use RAG with Termite for AI-powered answers?
+</Questions>
+
+**_AntflyDB_** is a document database built on top of [Raft](https://github.com/etcd-io/raft) for distribution, [Pebble](https://github.com/cockroachdb/pebble) for persistance, [Bleve](https://github.com/blevesearch/bleve) for full text indexing, and [SPANN](https://www.microsoft.com/en-us/research/wp-content/uploads/2021/11/SPANN_finalversion1.pdf) for vector indexing. This guide will help you get started with setting up your **_AntflyDB_** instance!
+
+## Download Antfly and CLI
+
+Visit the [Downloads page](/docs/downloads) and follow the instructions for the your platform.
+
+## Download Models
+
+Pull the embedding models and generation model using Termite (Antfly's built-in ML inference service):
+
+```bash
+antfly termite pull --variants i8 BAAI/bge-small-en-v1.5 openai/clip-vit-base-patch32 mixedbread-ai/mxbai-rerank-base-v1
+antfly termite pull hf:onnx-community/gemma-3-270m-it-ONNX
+```
+
+- `BAAI/bge-small-en-v1.5` is a small, fast text embedding model (384 dimensions) for semantic search, INT8 quantized for fast CPU inference
+- `openai/clip-vit-base-patch32` is a multimodal embedding model (512 dimensions) for image search
+- `mixedbread-ai/mxbai-rerank-base-v1` is a cross-encoder reranker for improving search result relevance
+- `onnx-community/gemma-3-270m-it-ONNX` is a small (~270M parameter) Gemma 3 model for query classification
+
+<Callout type="warning">
+**Model size matters for generation.** The `onnx-community/gemma-3-270m-it-ONNX` model is small and fast to download, but only suitable for **query classification** (`--classify`). For generation features like `--generate`, `--reasoning`, and `--followup`, you'll need a larger model. See the [RAG section](#rag-retrieval-augmented-generation) below for examples using Gemini, Ollama, or a larger Termite model.
+</Callout>
+
+<Callout type="info">
+Termite runs ONNX-optimized models locally for fast CPU inference without external API dependencies. Models are stored in `~/.termite/models/` and auto-discovered when Antfly starts. For more options, see `antfly termite list --remote` or the [Termite guide](/docs/guides/termite).
+</Callout>
+
+## Start Antfly in Swarm Mode
+Open up a new terminal and run:
+
+```bash
+antfly swarm 2>&1 | tee "antfly.log"
+```
+
+You should see logs indicating the metadata server, storage nodes, and Termite are starting. The API will be available at `http://localhost:8080`.
+
+<Callout type="info">
+Swarm mode starts Antfly with metadata, data nodes, and Termite in a single process. Termite auto-discovers models from `~/.termite/models/` and serves them for embedding, chunking, reranking, and generation. For production deployments, consider running separate metadata and worker nodes.
+</Callout>
+
+You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
+
+## Download Sample Data
+In another terminal... We'll use a sample of 10,000 Wikipedia articles enriched with thumbnail images:
+```bash
+# Download the sample data
+curl -L -o wiki-articles.json https://cdn.antfly.io/datasets/wiki-articles-10k-v001.json
+# Preview the data structure
+head -n 1 wiki-articles.json | jq '.'
+```
+
+Each article has:
+- `url`: Wikipedia URL
+- `title`: Article title
+- `body`: Article content
+- `thumbnail_url`: Wikipedia thumbnail image (when available)
+
+## Create a Table
+<Steps>
+### Create a table and index
+
+Create a table with two indexes: a text embedding index for semantic search and a CLIP image index for searching by thumbnail. Both use Termite for local ONNX inference.
+
+```bash
+antfly table create --table wikipedia \
+  --index '{
+    "name": "title_body",
+    "type": "embeddings",
+    "template": "{{title}} {{body}}",
+    "embedder": {
+      "provider": "termite",
+      "model": "BAAI/bge-small-en-v1.5"
+    },
+    "chunker": {
+      "provider": "antfly",
+      "text": {
+        "target_tokens": 200,
+        "overlap_tokens": 25
+      }
+    }
+  }' \
+  --index '{
+    "name": "thumbnail",
+    "type": "embeddings",
+    "template": "{{media url=thumbnail_url}}",
+    "embedder": {
+      "provider": "termite",
+      "model": "openai/clip-vit-base-patch32"
+    },
+    "dimension": 512,
+    "distance_metric": "cosine"
+  }'
+```
+
+<Callout type="info">
+- `title_body` uses `BAAI/bge-small-en-v1.5` (384 dimensions) for text semantic search with chunking
+- `thumbnail` uses CLIP (512 dimensions) for image search with cosine similarity — Antfly automatically fetches and embeds each article's Wikipedia thumbnail. Articles without a `thumbnail_url` are skipped.
+
+For alternative models, run `antfly termite list --remote` or see the [Termite guide](/docs/guides/termite).
+</Callout>
+
+### Verify the table and indexes were created
+
+```bash
+antfly table list
+antfly index list --table wikipedia
+```
+</Steps>
+
+## Load the Sample Data
+
+```bash
+# Load the Wikipedia articles using the title as the document ID
+antfly load --table wikipedia \
+  --file wiki-articles.json \
+  --id-field title
+```
+
+This will load 10,000 articles in 10 batches of 1000 documents each.
+Generating embeddings can take some time, especially for larger datasets.
+You can monitor the progress in the logs or by checking `active_vectors` in the index:
+
+```bash
+antfly index list --table wikipedia
+```
+
+## Query the Data
+
+<Callout type="info">
+You can run these queries using the CLI (shown below) or the web dashboard at `http://localhost:8080`.
+</Callout>
+
+### Full-Text Search
+
+Search for articles containing specific terms (a full specification of the query syntax is available in the [Bleve Query String Query documentation](https://blevesearch.com/docs/Query-String-Query/)):
+
+```bash
+# Search for articles about Korea
+antfly query --table wikipedia \
+  --full-text-search 'body:"Korea"' \
+  --fields "title,url" \
+  --limit 5
+```
+
+### Semantic Similarity Search
+
+Find articles semantically similar to a query:
+
+```bash
+# Find articles about anatomy and physiology
+antfly query --table wikipedia \
+  --semantic-search "anatomy and physiology" \
+  --indexes "title_body" \
+  --fields "title,url" \
+  --limit 5
+```
+
+### Hybrid Search
+
+Combine full-text, vector search, reranking, and pruning for better relevance:
+
+```bash
+# Find articles about Einstein with semantic understanding
+antfly query --table wikipedia \
+  --full-text-search 'body:Einstein' \
+  --semantic-search "theory of relativity and physics" \
+  --indexes "title_body" \
+  --fields "title,url" \
+  --limit 10 \
+  --reranker '{
+      "provider": "termite",
+      "model": "mixedbread-ai/mxbai-rerank-base-v1",
+      "field": "body"
+    }' \
+  --pruner '{"min_score_ratio": 0.01}'
+```
+
+<Callout type="info">
+**Reranking vs Pruning:**
+- **Reranking** uses a cross-encoder model (like `mixedbread-ai/mxbai-rerank-base-v1`) to re-score results based on query-document relevance. It improves ordering but keeps the same number of results.
+- **Pruning** filters out low-relevance results based on score quality. Use `min_score_ratio` to keep only results scoring at least N% of the top result, or `max_score_gap_percent` to detect "elbows" in score distribution.
+</Callout>
+
+### Image Search
+
+Search for articles by visual content using the CLIP thumbnail index. CLIP understands visual concepts, so you can describe what you're looking for:
+
+```bash
+# Find articles with images of maps or geography
+antfly query --table wikipedia \
+  --semantic-search "map of a country" \
+  --indexes "thumbnail" \
+  --fields "title,url,thumbnail_url" \
+  --limit 5
+```
+
+<Callout type="info">
+CLIP responds best to concrete visual descriptions ("red sports car", "mountain landscape") rather than abstract concepts. Articles without a `thumbnail_url` are skipped by the CLIP index. For a deeper dive, see the [Image Search with CLIP](/docs/examples/image-search) example.
+</Callout>
+
+### Multi-Index Hybrid Search
+
+Combine text, image, and full-text search across multiple indexes:
+
+```bash
+# Search with both text and image indexes
+antfly query --table wikipedia \
+  --full-text-search 'title:History' \
+  --semantic-search "ancient civilizations and archaeology" \
+  --indexes "title_body,thumbnail" \
+  --fields "title,url,thumbnail_url" \
+  --limit 10
+```
+
+## RAG (Retrieval-Augmented Generation)
+
+Combine search with LLM-powered classification and generation using the retrieval agent.
+
+<Steps>
+### Classify a query
+
+Use the small `gemma-3-270m-it-ONNX` model you pulled earlier to classify whether a query needs retrieval:
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --semantic-search "What are the major events in Korean history?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 5 \
+  --reranker '{
+      "provider": "termite",
+      "model": "mixedbread-ai/mxbai-rerank-base-v1",
+      "field": "body"
+    }' \
+  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
+  --generator '{
+    "provider": "termite",
+    "model": "onnx-community/gemma-3-270m-it-ONNX"
+  }' \
+  --max-context-tokens 512 \
+  --classify
+```
+
+This command:
+1. Searches for semantically similar articles using the generated embeddings
+2. Reranks results using the built-in cross-encoder reranker for better relevance
+3. Prunes low-quality results (keeps only those scoring ≥60% of top result, stops at large score gaps)
+4. Fits the remaining documents into a 512-token context budget, dropping lowest-ranked documents that don't fit
+5. Classifies the query intent using the small Gemma 3 model
+
+<Callout type="tip">
+**Pruning for RAG:** Pruning is especially valuable for RAG pipelines. Score-based pruning (`--pruner`) filters out marginally relevant documents, while token-based pruning (`--max-context-tokens`) ensures the context fits within the model's limits.
+</Callout>
+
+### RAG with generation, reasoning, and followup
+
+For full generation features (`--generate`, `--reasoning`, `--followup`), you need a larger model. Choose a provider below:
+
+<Tabs defaultValue="termite">
+  <TabsList>
+    <TabsTrigger value="termite">Termite (large model)</TabsTrigger>
+    <TabsTrigger value="ollama">Ollama</TabsTrigger>
+    <TabsTrigger value="gemini">Gemini</TabsTrigger>
+    <TabsTrigger value="openai">OpenAI</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="termite">
+Pull the larger Gemma 3 ONNX model (~5.7 GB) first:
+
+```bash
+antfly termite pull hf:onnxruntime/Gemma-3-ONNX
+```
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --semantic-search "What are the major events in Korean history?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 5 \
+  --generator '{
+    "provider": "termite",
+    "model": "onnxruntime/Gemma-3-ONNX"
+  }' \
+  --max-context-tokens 512 \
+  --classify --reasoning --generate --followup
+```
+  </TabsContent>
+
+  <TabsContent value="ollama">
+Requires [Ollama](https://ollama.com) running locally. Pull the model first:
+
+```bash
+ollama pull gemma3:4b-it-qat
+```
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --semantic-search "What are the major events in Korean history?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 5 \
+  --generator '{
+    "provider": "ollama",
+    "model": "gemma3:4b-it-qat"
+  }' \
+  --max-context-tokens 2048 \
+  --classify --reasoning --generate --followup
+```
+  </TabsContent>
+
+  <TabsContent value="gemini">
+Requires a [Google AI API key](https://aistudio.google.com/apikey). Set the `GEMINI_API_KEY` environment variable — Antfly picks it up automatically:
+
+```bash
+export GEMINI_API_KEY="your-api-key-here"
+```
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --semantic-search "What are the major events in Korean history?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 5 \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
+  --max-context-tokens 2048 \
+  --classify --reasoning --generate --followup
+```
+  </TabsContent>
+
+  <TabsContent value="openai">
+Requires an [OpenAI API key](https://platform.openai.com/api-keys). Set the `OPENAI_API_KEY` environment variable — Antfly picks it up automatically:
+
+```bash
+export OPENAI_API_KEY="your-api-key-here"
+```
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --semantic-search "What are the major events in Korean history?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 5 \
+  --generator '{"provider": "openai", "model": "gpt-4.1-mini"}' \
+  --max-context-tokens 2048 \
+  --classify --reasoning --generate --followup
+```
+  </TabsContent>
+</Tabs>
+
+<Callout type="info">
+**Choosing a generator model:**
+- **`onnx-community/gemma-3-270m-it-ONNX`** (~270M params, 1.1 GB) — fast, runs anywhere, good for `--classify` only
+- **`onnxruntime/Gemma-3-ONNX`** (~4B params, 5.7 GB) — local ONNX inference via Termite, supports all RAG features
+- **Ollama `gemma3:4b-it-qat`** — local inference via Ollama, quantized for fast CPU/GPU performance
+- **Gemini `gemini-2.5-flash`** — cloud API, fast and high quality, requires API key
+- **OpenAI `gpt-4.1-mini`** — cloud API, fast and high quality, requires API key
+</Callout>
+
+### RAG with structured output
+
+Add `--streaming=false` to get structured JSON output with source references instead of streaming text. This works with any of the generator providers above:
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --semantic-search "Explain the theory of relativity" \
+  --indexes "title_body" \
+  --fields "title,body,url" \
+  --limit 5 \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
+  --streaming=false --generate
+```
+
+### RAG with evaluation
+
+Add `--eval` to run evaluators on the query results and include scores in the response. Evaluation requires a model capable of generation — use a larger model as the judge:
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --semantic-search "What are the major events in Korean history?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 5 \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
+  --generate \
+  --eval '{
+    "evaluators": ["faithfulness", "relevance"],
+    "judge": {"provider": "gemini", "model": "gemini-3.0-flash"}
+  }'
+```
+
+Available evaluators:
+- **Retrieval metrics** (require `ground_truth.relevant_ids`): `recall`, `precision`, `ndcg`, `mrr`, `map`
+- **LLM-as-judge metrics** (require `judge` config): `relevance`, `faithfulness`, `completeness`, `coherence`, `safety`, `helpfulness`, `correctness`, `citation_quality`
+</Steps>
+
+## Next Steps
+
+1. **Image Search Example**: Build a full image search app with CLIP — see the [Image Search with CLIP](/docs/examples/image-search) example
+2. **Explore Different Models**: Browse available Termite models with `antfly termite list --remote` — try `mixedbread-ai/mxbai-embed-large-v1` for higher quality text embeddings or `mixedbread-ai/mxbai-rerank-base-v1` for neural reranking
+3. **Backup and Restore**: Try backing up your data:
+```bash
+antfly backup --table wikipedia \
+  --backup-id wiki-backup-$(date +%Y%m%d) \
+  --location "file:///tmp/antfly_backups"
+```
+4. **Production Deployment**: For production, run metadata and storage nodes separately for better scalability
+
+## Additional Resources
+
+- [Antfly CLI Documentation](/docs/api)
+- [Main Antfly README](https://github.com/antflydb/antfly/README.md)
+- [REST API Documentation](/docs/api)
+- [Termite Models](/termite) - Browse available embedding, chunking, and reranking models
+- [Configuration Reference](/docs/configuration) - Configure Termite, embedding providers, and more

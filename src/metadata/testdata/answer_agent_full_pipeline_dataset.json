@@ -1,0 +1,77 @@
+[
+  {
+    "input": "What is vector search and how does it work?",
+    "context": [
+      "Vector search is a technique that uses embeddings to find semantically similar content in a database.",
+      "It works by converting text, images, or other data into high-dimensional numerical vectors.",
+      "Approximate nearest neighbor algorithms like HNSW (Hierarchical Navigable Small World) enable fast retrieval of similar vectors.",
+      "Vector search powers modern semantic search engines and recommendation systems by understanding meaning rather than just matching keywords."
+    ],
+    "reference": "Vector search uses embeddings to convert data into high-dimensional vectors and find semantically similar content using approximate nearest neighbor algorithms like HNSW.",
+    "metadata": {
+      "expected_route_type": "question",
+      "domain": "search",
+      "expected_citation_count": 3
+    }
+  },
+  {
+    "input": "papers about distributed consensus algorithms",
+    "context": [
+      "Raft is a consensus algorithm designed to be more understandable than Paxos while providing the same guarantees.",
+      "The Raft algorithm divides consensus into leader election, log replication, and safety components.",
+      "Paxos is a family of protocols for solving consensus in distributed systems, known for being difficult to understand.",
+      "Byzantine Fault Tolerance algorithms like PBFT handle malicious actors in distributed systems."
+    ],
+    "reference": "Key distributed consensus algorithms include Raft (designed for understandability), Paxos (the classic approach), and Byzantine Fault Tolerance algorithms like PBFT.",
+    "metadata": {
+      "expected_route_type": "search",
+      "domain": "distributed_systems",
+      "expected_citation_count": 3
+    }
+  },
+  {
+    "input": "How does the CAP theorem affect database design?",
+    "context": [
+      "The CAP theorem states that distributed databases can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+      "Most distributed databases choose to optimize for availability and partition tolerance (AP systems) or consistency and partition tolerance (CP systems).",
+      "AP systems like Cassandra prioritize availability, allowing eventual consistency.",
+      "CP systems like HBase prioritize strong consistency, potentially sacrificing availability during partitions."
+    ],
+    "reference": "The CAP theorem forces distributed databases to choose between AP (availability + partition tolerance) or CP (consistency + partition tolerance) trade-offs.",
+    "metadata": {
+      "expected_route_type": "question",
+      "domain": "databases",
+      "expected_citation_count": 3
+    }
+  },
+  {
+    "input": "research on transformer architectures in NLP",
+    "context": [
+      "The Transformer architecture introduced the attention mechanism, eliminating the need for recurrent connections.",
+      "BERT (Bidirectional Encoder Representations from Transformers) uses masked language modeling for pre-training.",
+      "GPT models use autoregressive language modeling to generate text token by token.",
+      "Vision Transformers (ViT) adapt the transformer architecture for image classification tasks."
+    ],
+    "reference": "Transformer architectures use attention mechanisms and have spawned models like BERT (bidirectional encoding), GPT (autoregressive generation), and ViT (vision tasks).",
+    "metadata": {
+      "expected_route_type": "search",
+      "domain": "ai",
+      "expected_citation_count": 3
+    }
+  },
+  {
+    "input": "What are the key principles of REST API design?",
+    "context": [
+      "REST APIs should use HTTP methods semantically: GET for retrieval, POST for creation, PUT for updates, DELETE for removal.",
+      "Resources should be identified by URIs, and representations should be stateless.",
+      "Proper HTTP status codes (200, 201, 404, 500, etc.) communicate results clearly to clients.",
+      "RESTful APIs benefit from being self-descriptive and using hypermedia (HATEOAS) for discoverability."
+    ],
+    "reference": "REST API design principles include using HTTP methods semantically, stateless resource identification via URIs, proper status codes, and hypermedia for discoverability.",
+    "metadata": {
+      "expected_route_type": "question",
+      "domain": "api_design",
+      "expected_citation_count": 3
+    }
+  }
+]

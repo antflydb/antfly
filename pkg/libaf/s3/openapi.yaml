@@ -1,0 +1,31 @@
+openapi: 3.0.3
+info:
+  title: S3 Credentials Schema
+  description: "S3 authentication and connection configuration."
+  version: "0.0.1"
+components:
+  schemas:
+    Credentials:
+      type: object
+      properties:
+        endpoint:
+          type: string
+          description: "S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)"
+          minLength: 1
+          example: "s3.amazonaws.com"
+        use_ssl:
+          type: boolean
+          description: "Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)"
+          default: true
+        access_key_id:
+          type: string
+          description: "AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set."
+          example: "your-access-key-id"
+        secret_access_key:
+          type: string
+          description: "AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set."
+          example: "your-secret-access-key"
+        session_token:
+          type: string
+          description: "Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup."
+          example: "your-session-token"

@@ -1,0 +1,73 @@
+services:
+  antfly:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["swarm"]
+    ports:
+      - "8080:8080" # Public API port
+      # - "9090:9090" # MCP port
+      - "4200:4200" # Metrics port
+    volumes:
+      - ./antfly-data:/antflydb
+      - ./config.json:/config.json
+    container_name: antfly-swarm
+    environment:
+      - ANTFLY_LOG_LEVEL=info
+    restart: always
+    networks:
+      - antfly-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:4200/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama-data:/root/.ollama
+      - ./entrypoint.sh:/entrypoint.sh
+    container_name: ollama
+    pull_policy: always
+    tty: true
+    restart: always
+    entrypoint: ["/usr/bin/bash", "/entrypoint.sh"]
+    networks:
+      - antfly-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ../prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090" # Prometheus UI
+    restart: always
+    networks:
+      - antfly-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    restart: always
+    networks:
+      - antfly-network
+
+networks:
+  antfly-network:
+    driver: bridge
+
+volumes:
+  antfly-data:
+  ollama-data:
+  grafana-data:

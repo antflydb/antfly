@@ -1,0 +1,106 @@
+{
+  "name": "@antfly/components",
+  "version": "0.0.12",
+  "description": "React components for Antfly search",
+  "type": "module",
+  "main": "dist/main.js",
+  "module": "dist/main.js",
+  "types": "types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./dist/main.js",
+      "require": "./dist/main.cjs"
+    },
+    "./adapters": {
+      "types": "./types/adapters/index.d.ts",
+      "import": "./dist/adapters.js",
+      "require": "./dist/adapters.cjs"
+    },
+    "./styles": "./dist/components.css"
+  },
+  "files": [
+    "dist",
+    "types",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check . --write --unsafe",
+
+    "storybook": "sb dev",
+    "build-storybook": "sb build",
+    "clean": "rm -rf dist types",
+    "prepare": "pnpm run build"
+  },
+  "keywords": [
+    "antfly",
+    "react",
+    "search",
+    "components",
+    "facets",
+    "rag"
+  ],
+  "author": "Antfly Contributors",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly-ts.git",
+    "directory": "packages/components"
+  },
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/components#readme",
+  "browserslist": [
+    ">0.03%"
+  ],
+  "peerDependencies": {
+    "@antfly/sdk": "workspace:*",
+    "react": "^16.0.0 || ^17.0 || ^18.0 || ^19.0",
+    "react-dom": "^16.0 || ^17.0 || ^18.0 || ^19.0"
+  },
+  "dependencies": {
+    "@babel/runtime": "^7.28.6",
+    "qs": "^6.15.0",
+    "react-autosuggest": "^10.1.0"
+  },
+  "devDependencies": {
+    "@antfly/sdk": "workspace:*",
+    "@babel/core": "^7.29.0",
+    "@babel/preset-env": "^7.29.0",
+    "@babel/preset-react": "^7.28.5",
+    "@babel/preset-typescript": "^7.28.5",
+    "@storybook/addon-docs": "10.2.12",
+    "@storybook/addon-links": "^10.2.13",
+    "@storybook/react": "^10.2.13",
+    "@storybook/react-vite": "^10.2.13",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^25.3.3",
+    "@types/qs": "^6.14.0",
+    "@types/react": "^19.2.14",
+    "@types/react-autosuggest": "^10.1.11",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "@vitest/ui": "^4.0.18",
+    "core-js": "^3.48.0",
+    "jsdom": "^28.1.0",
+    "lodash": "^4.17.23",
+    "msw": "^2.12.10",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "sb": "^10.2.13",
+    "storybook": "^10.2.13",
+    "streamdown": "^2.3.0",
+    "vite": "^7.3.1",
+    "vite-plugin-dts": "^4.5.4",
+    "vitest": "^4.0.18"
+  }
+}

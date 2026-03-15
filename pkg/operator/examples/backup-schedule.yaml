@@ -1,0 +1,129 @@
+# AntflyBackup Example - Scheduled Backups
+#
+# This example shows how to configure scheduled backups for an Antfly cluster.
+# The operator creates a CronJob that runs antfly backup to perform backups.
+
+---
+# Daily backup to S3
+apiVersion: antfly.io/v1
+kind: AntflyBackup
+metadata:
+  name: daily-backup
+  namespace: antfly-prod
+spec:
+  # Reference to the cluster to back up
+  clusterRef:
+    name: prod-cluster
+    # namespace: antfly-prod  # Optional, defaults to same namespace
+
+  # Cron schedule (daily at 2am UTC)
+  schedule: "0 2 * * *"
+
+  # Backup destination
+  destination:
+    location: s3://antfly-backups/prod
+    credentialsSecret:
+      name: s3-backup-credentials  # Must exist in same namespace
+
+  # Optional: Only back up specific tables
+  # tables:
+  #   - users
+  #   - products
+
+  # Optional: Suspend scheduled backups
+  # suspend: true
+
+  # Optional: Timeout for backup operations (default: 1h)
+  # backupTimeout: 2h
+
+  # Optional: Job history limits
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+
+---
+# Weekly full backup with all tables
+apiVersion: antfly.io/v1
+kind: AntflyBackup
+metadata:
+  name: weekly-full-backup
+  namespace: antfly-prod
+spec:
+  clusterRef:
+    name: prod-cluster
+  # Every Sunday at midnight
+  schedule: "0 0 * * 0"
+  destination:
+    location: s3://antfly-backups/prod/weekly
+    credentialsSecret:
+      name: s3-backup-credentials
+  # Keep more weekly backups
+  successfulJobsHistoryLimit: 4
+
+---
+# Hourly backup for development (local filesystem)
+apiVersion: antfly.io/v1
+kind: AntflyBackup
+metadata:
+  name: hourly-dev-backup
+  namespace: antfly-dev
+spec:
+  clusterRef:
+    name: dev-cluster
+  # Every hour
+  schedule: "0 * * * *"
+  destination:
+    # Local filesystem (requires persistent volume)
+    location: file:///mnt/backups/dev
+  # Only keep last 3 backups
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+
+---
+# Backup to Google Cloud Storage (via S3-compatible API)
+apiVersion: antfly.io/v1
+kind: AntflyBackup
+metadata:
+  name: gcs-daily-backup
+  namespace: antfly-prod
+spec:
+  clusterRef:
+    name: prod-cluster
+  schedule: "0 2 * * *"
+  destination:
+    # Use s3:// URL scheme - GCS provides S3-compatible API
+    location: s3://my-gcs-bucket/antfly-backups
+    credentialsSecret:
+      name: gcs-hmac-credentials
+
+---
+# Example Secret for S3 credentials (AWS)
+# Create this secret before applying the backup resources
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-backup-credentials
+  namespace: antfly-prod
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "AKIA..."
+  AWS_SECRET_ACCESS_KEY: "your-secret-key"
+  AWS_REGION: "us-east-2"
+
+---
+# Example Secret for GCS credentials (via S3-compatible API)
+# Generate HMAC keys in GCS Console → Settings → Interoperability
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gcs-hmac-credentials
+  namespace: antfly-prod
+type: Opaque
+stringData:
+  # HMAC access key from GCS (starts with GOOG)
+  AWS_ACCESS_KEY_ID: "GOOG..."
+  # HMAC secret key from GCS
+  AWS_SECRET_ACCESS_KEY: "your-gcs-hmac-secret"
+  # Point to GCS S3-compatible endpoint
+  AWS_ENDPOINT_URL: "https://storage.googleapis.com"
+  # Optional: specify region
+  AWS_REGION: "auto"

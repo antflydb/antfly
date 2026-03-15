@@ -1,0 +1,39 @@
+version: 1
+
+# Evaluators to run
+evaluators:
+  # Built-in simple evaluators
+  exact_match:
+    type: exact_match
+
+  regex_check:
+    type: regex
+    pattern: "(?i)expected_pattern"
+
+  contains_check:
+    type: contains
+    custom:
+      case_insensitive: true
+
+  fuzzy:
+    type: fuzzy_match
+    custom:
+      threshold: 0.8
+
+# Datasets to evaluate
+datasets:
+  - name: simple_qa
+    path: ../testdata/datasets/simple_qa.json
+    type: json
+
+# Output configuration
+output:
+  format: json    # json, yaml, markdown, html
+  path: results/evaluation_report.json
+  pretty: true
+
+# Execution settings
+execution:
+  parallel: true            # Run evaluations in parallel
+  max_concurrency: 10       # Max concurrent evaluations
+  timeout: 5m               # Overall timeout

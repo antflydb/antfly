@@ -1,0 +1,192 @@
+# Changelog
+
+All notable changes to Antfly will be documented in this file.
+
+## Roadmap
+
+### Upcoming Features
+
+- **Multimodal Search Enhancements**
+  - Support for [ImageBind](https://github.com/facebookresearch/ImageBind) as a multimodal embedder
+  - Image-to-image similarity search (search with images as queries)
+  - Extended audio file support (MP3, WAV, FLAC)
+  - Video file processing and frame extraction
+  - Automatic scene detection and indexing for video content
+
+- **Advanced AI Capabilities**
+  - Custom prompt templates for different content types
+  - Model performance comparison tools
+  - Automatic model selection based on content type
+  - Fine-tuning support for domain-specific embeddings
+
+## Releases
+
+### [0.0.17] - 2026-03-15
+
+#### Features
+
+- CLIPCLAP multimodal embedder capabilities (#421)
+- `search_after`/`search_before` cursor pagination (#413)
+- Enrichment pipeline error handling for broken remote resources
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.16...v0.0.17)
+
+---
+
+### [0.0.15] - 2026-03-10
+
+#### Highlights
+
+- **Foreign Table Joins** — query across foreign tables with automatic filter pushdown and SQL aggregations
+- **Routed PG Replication** — route PostgreSQL CDC streams to specific tables with a new evaluator package for custom replication logic
+- **Distance Metric Configuration** — choose between cosine, euclidean, and dot-product distance per embedding index
+- **Index & Enricher Observability** — new stats endpoints exposing document counts, enrichment progress, and per-index health
+
+#### Features
+
+- **pgaf** — PostgreSQL extension providing a custom index access method (`CREATE INDEX ... USING antfly`), `@@@` operator for full-text/semantic/hybrid search, query builder functions, sync triggers, and `antfly_search()` for native Postgres integration
+- Foreign table join support with filter pushdown and SQL aggregations (#400)
+- Routed PostgreSQL replication with evaluator package extraction (#403)
+- Configurable distance metrics for embedding indexes (#406)
+- Comprehensive index and enricher stats API (#405)
+- CLIP image search improvements for multi-image queries (#406)
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.14...v0.0.15)
+
+---
+
+### [0.0.13] - 2026-03-03
+
+#### Highlights
+
+- **Sparse Vector Search (SPLADE)** — hybrid search combining dense and sparse vectors with weighted fusion for better relevance
+- **PostgreSQL CDC Replication** — automatically sync data from PostgreSQL into Antfly via logical replication
+- **Operator Improvements** — PVC lifecycle management, availability zone topology, admission webhooks, and storage resilience
+- **Faster Sparse Indexing** — up to 3.6x faster sparse index inserts with multi-tier caching
+
+#### Features
+
+- **Sparse Vector (SPLADE) Search** — hybrid dense+sparse fusion with configurable per-index merge weights
+- **PostgreSQL CDC Replication** — logical replication with automatic change capture from PostgreSQL tables
+- **Chunking and Summarization** support in sparse embeddings index
+- **Operator: PVC Lifecycle** management, availability zone topology, and storage resilience
+- **Operator: Admission Webhooks** for AntflyCluster resource validation
+
+#### Performance
+
+- Up to 3.6x faster sparse index inserts
+- Multi-tier caching and batched writes for sparse indexes
+- Configurable sync level for embeddings indexes
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.12...v0.0.13)
+
+---
+
+### [0.0.9] - 2026-02-22
+
+#### Highlights
+
+- **Secrets Management** — new API and dashboard page for managing secrets
+- **API Key & Bearer Token Auth** — authenticate with API keys or bearer tokens
+- **AI Provider Timeouts** — configurable timeout for AI provider calls
+- **PDF Enrichment Pipeline** — zip-direct reading, parallel extraction, vision-based categorization, and Florence 2 re-OCR for low-quality pages
+- **Omni Edition** — renamed install edition with streamlined macOS support
+
+#### Features
+
+- **Secrets Management** API and Antfarm dashboard page
+- **API Key & Bearer Token Authentication**
+- **AI Provider Timeout** configuration
+- **PDF Enrichment** — direct zip reading, parallel page extraction, page-type categorization with vision support, and Florence 2 re-OCR for low-quality pages
+- **Dashboard** improvements with reverse proxy support and sidebar redesign
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.8...v0.0.9)
+
+---
+
+### [0.0.8] - 2026-02-18
+
+#### Highlights
+
+- **Cross-Table Transactions** — optimistic concurrency control (OCC) with read-modify-write support across tables
+- **Built-in Embedder & Reranker** — bundled INT8 quantized all-MiniLM-L6-v2 embedder and reranker, no external service required
+- **Shared Pebble Block Cache** — single block cache shared across all DB instances per process for better memory utilization
+- **Operator Scheduling Constraints** — tolerations, nodeSelector, affinity, and topologySpreadConstraints in AntflyCluster CRD
+- **Cluster Hibernation** — scale operator replicas to zero while retaining PVCs for cost savings
+
+#### Features
+
+- **Cross-Table Transactions** with OCC read-modify-write support
+- **Built-in Embedder** — INT8 quantized all-MiniLM-L6-v2 bundled with Antfly
+- **Built-in Reranker** — INT8 quantized reranker model bundled with Antfly
+- **Shared Pebble Block Cache** across all DB instances per process
+- **Operator Scheduling Constraints** — tolerations, nodeSelector, affinity, and topologySpreadConstraints added to AntflyCluster CRD
+- **Cluster Hibernation** — allow scaling metadata and data node replicas to zero
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.7...v0.0.8)
+
+---
+
+### [0.0.7] - 2026-02-13
+
+#### Highlights
+
+- **Retrieval & Generation Agents** — new agentic architecture for retrieval-augmented generation
+- **MCP & A2A Protocol Support** — connect Antfly to AI agents via MCP (`/mcp/v1`) and Agent-to-Agent protocol
+- **Foreign Tables** — federated queries against external PostgreSQL databases
+- **Named Provider Registry** — configure embedders, generators, rerankers, and chunkers by name
+- **Audio Transcription** — speech-to-text support via Termite
+- **Ephemeral Chunks** — transient chunk storage with the `store_chunks` config option
+
+#### Features
+
+- **Retrieval Agents** — tool-use agentic loop for retrieval and generation, replacing the previous answer endpoint (deprecated `/agents/answer` still available for backward compatibility)
+- **MCP Server** at `/mcp/v1` for AI agent integration
+- **A2A Protocol** facade for retrieval and query-builder agents
+- **Foreign Tables** for federated PostgreSQL queries
+- **Named Provider Registry** for embedders, generators, chains, rerankers, and chunkers
+- **Audio/STT** with Termite as speech-to-text provider and media chunking support
+- **Ephemeral Chunks** mode (`store_chunks` config option) for transient chunk storage
+- **Graph Index** — field-based edges, topology constraints, and summarizer
+- **Remote Content** configuration system for web scraping
+- **CLAP & CLIPCLAP** model support for audio embeddings
+- **Antfly Operator** now included in the main repository with docs and install manifests
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.3...v0.0.7)
+
+---
+
+### [0.0.2] - 2026-01-10
+
+#### Highlights
+
+- **Cross-table join support** for queries spanning multiple tables
+- **Zero-downtime shard splitting** with two-phase split
+- **TTS/STT audio library** with OpenAI and Google Cloud providers
+- **CLIP model support** for multimodal image indexing
+
+#### Features
+
+- **Cross-Table Joins** — query across multiple tables with shard-aware routing
+- **Zero-Downtime Shard Splitting** — two-phase split for high availability
+- **Audio Library** — TTS and STT support with OpenAI and Google Cloud providers
+- **Dynamic Templates** — flexible field mapping with automatic schema inference
+- **Aggregations API** — range and term aggregations (renamed from Facets)
+- **Chat Agent** — tool execution, clarification handling, confidence scoring, and multi-turn query builder mode
+- **Indexes in Raft Snapshots** — faster recovery with pause/resume for index operations
+- **ONNX Runtime GenAI** bundled for local LLM generation
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.1...v0.0.2)
+
+---
+
+### [0.0.1] - 2025-12-20
+
+First official release of Antfly.
+
+#### Features
+
+- **Unified ONNX + XLA build** for cross-platform ML inference
+- **Termite** downloads page with Homebrew support
+- **antflycli** included in container images
+- **Document TTL** support

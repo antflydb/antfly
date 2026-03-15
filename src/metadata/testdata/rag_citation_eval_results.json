@@ -1,0 +1,357 @@
+{
+  "summary": {
+    "total_examples": 5,
+    "passed_examples": 5,
+    "failed_examples": 0,
+    "average_score": 1,
+    "pass_rate": 1,
+    "total_duration": 11087863625,
+    "evaluator_stats": {
+      "citation_coverage": {
+        "name": "citation_coverage",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 23916
+      },
+      "citations": {
+        "name": "citations",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 22090
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is machine learning?",
+        "reference": "Machine learning is a subset of artificial intelligence that learns from data to make predictions and decisions.",
+        "context": [
+          "Machine learning is a subset of artificial intelligence that focuses on developing systems that can learn from and make decisions based on data.",
+          "It involves training algorithms on large datasets to recognize patterns and make predictions.",
+          "Common applications include image recognition, natural language processing, and recommendation systems."
+        ],
+        "metadata": {
+          "difficulty": "easy",
+          "domain": "ai",
+          "expected_citation_count": 2
+        }
+      },
+      "output": {
+        "generation": "Machine learning is a subset of artificial intelligence that focuses on developing systems that can learn from and make decisions based on data [doc0]. It involves training algorithms on large datasets to recognize patterns and make predictions [doc1]. Common applications include image recognition, natural language processing, and recommendation systems [doc2].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What is machine learning?",
+        "route_type": "question"
+      },
+      "results": {
+        "citation_coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 3/3 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 3,
+            "cited_ids": [
+              1,
+              2,
+              0
+            ],
+            "context_count": 3,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 3 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 3,
+            "cited_doc_ids": [
+              0,
+              1,
+              2
+            ],
+            "context_doc_count": 3,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 8315105333,
+      "timestamp": "2025-11-16T13:06:41.225949-08:00"
+    },
+    {
+      "example": {
+        "input": "How does neural network training work?",
+        "reference": "Neural networks are trained using backpropagation and gradient descent to minimize loss by adjusting weights.",
+        "context": [
+          "Neural network training involves adjusting weights and biases through backpropagation.",
+          "The process uses gradient descent to minimize the loss function.",
+          "Training requires labeled data and multiple epochs to converge.",
+          "Regularization techniques like dropout help prevent overfitting."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "ai",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Neural network training works through a process of adjusting weights and biases to minimize errors [doc0]. This process utilizes gradient descent to iteratively refine the network's parameters [doc1]. Training requires labeled data and typically involves multiple epochs to allow the network to converge towards an optimal solution [doc2]. Furthermore, techniques like regularization (e.g., dropout) are often employed to prevent overfitting [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "How does neural network training work?",
+        "route_type": "question"
+      },
+      "results": {
+        "citation_coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              1,
+              2,
+              3,
+              0
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 11087849750,
+      "timestamp": "2025-11-16T13:06:41.225937-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the benefits of distributed databases?",
+        "reference": "Distributed databases offer scalability, high availability, and improved performance through data distribution.",
+        "context": [
+          "Distributed databases provide horizontal scalability by spreading data across multiple nodes.",
+          "They offer high availability through replication and fault tolerance.",
+          "Distributed systems can handle larger workloads than single-node databases.",
+          "Geographic distribution reduces latency for users in different regions."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "databases",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive summary. Distributed databases offer several key benefits. Primarily, they provide horizontal scalability by spreading data across multiple nodes [doc0]. Furthermore, they offer high availability through replication and fault tolerance [doc1]. Distributed systems, including distributed databases, can handle larger workloads than single-node databases [doc2]. Finally, geographic distribution reduces latency for users in different regions [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What are the benefits of distributed databases?",
+        "route_type": "question"
+      },
+      "results": {
+        "citation_coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              2,
+              3,
+              0,
+              1
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 6301939875,
+      "timestamp": "2025-11-16T13:06:41.225959-08:00"
+    },
+    {
+      "example": {
+        "input": "Explain the CAP theorem",
+        "reference": "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+        "context": [
+          "The CAP theorem states that distributed systems can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+          "Consistency means all nodes see the same data at the same time.",
+          "Availability ensures every request receives a response, without guarantee of the most recent data.",
+          "Partition tolerance allows the system to continue operating despite network partitions."
+        ],
+        "metadata": {
+          "difficulty": "hard",
+          "domain": "databases",
+          "expected_citation_count": 4
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive summary. The CAP theorem states that distributed systems can only guarantee two out of three properties: Consistency, Availability, and Partition tolerance [doc0]. \n\n*   **Consistency:** This means all nodes in the system see the same data at the same time [doc1].\n*   **Availability:** Ensures every request receives a response, without guaranteeing the most recent data [doc2].\n*   **Partition Tolerance:** Allows the system to continue operating despite network partitions [doc3].\n\nIt’s important to note that a system can’t fully optimize for all three simultaneously. [doc0]",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "Explain the CAP theorem",
+        "route_type": "question"
+      },
+      "results": {
+        "citation_coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              2,
+              3,
+              0,
+              1
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 5 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 5,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 9935320458,
+      "timestamp": "2025-11-16T13:06:41.225965-08:00"
+    },
+    {
+      "example": {
+        "input": "What is vector search?",
+        "reference": "Vector search uses embeddings and approximate nearest neighbor algorithms to find semantically similar content.",
+        "context": [
+          "Vector search uses embeddings to find semantically similar content.",
+          "It converts text, images, or other data into high-dimensional vectors.",
+          "Approximate nearest neighbor algorithms like HNSW enable fast retrieval.",
+          "Vector search powers modern semantic search and recommendation systems."
+        ],
+        "metadata": {
+          "difficulty": "medium",
+          "domain": "search",
+          "expected_citation_count": 3
+        }
+      },
+      "output": {
+        "generation": "Provide a comprehensive answer to the question \"What is vector search?\". Vector search uses embeddings to find semantically similar content [doc0]. It converts text, images, or other data into high-dimensional vectors [doc1]. Approximate nearest neighbor algorithms like HNSW enable fast retrieval [doc2]. Vector search powers modern semantic search and recommendation systems [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "query": "What is vector search?",
+        "route_type": "question"
+      },
+      "results": {
+        "citation_coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              3,
+              0,
+              1,
+              2
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        }
+      },
+      "duration": 7367394334,
+      "timestamp": "2025-11-16T13:06:41.225932-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": true,
+      "max_concurrency": 10,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-16T13:06:41.225926-08:00"
+}

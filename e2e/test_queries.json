@@ -1,0 +1,232 @@
+[
+  {
+    "query": "What can I use Antfly for?",
+    "expected_keywords": ["hybrid search", "vector", "rag", "semantic", "database", "use cases"],
+    "description": "Should explain main use cases like hybrid search, RAG, semantic search over databases"
+  },
+  {
+    "query": "How do I add semantic search to my application?",
+    "expected_keywords": ["aknn_v0", "embedder", "semantic_search", "vector", "similarity"],
+    "description": "Should explain creating vector indexes with embedders for semantic search"
+  },
+  {
+    "query": "Can I sync my Postgres database to Antfly for search?",
+    "expected_keywords": ["linear merge", "sync", "postgres", "sorted", "stateless"],
+    "description": "Should explain using Linear Merge to sync external databases"
+  },
+  {
+    "query": "How do I build a RAG chatbot with Antfly?",
+    "expected_keywords": ["rag", "retrieval", "generation", "chatbot", "streaming", "citations"],
+    "description": "Should explain RAG endpoint with retrieval and LLM generation"
+  },
+  {
+    "query": "Can Antfly search images and videos?",
+    "expected_keywords": ["multimodal", "vision", "images", "video", "llava", "gemini"],
+    "description": "Should explain multimodal indexing with vision models"
+  },
+  {
+    "query": "How do I implement autocomplete search?",
+    "expected_keywords": ["search_as_you_type", "autocomplete", "edge n-gram", "schema"],
+    "description": "Should explain using search_as_you_type field type for autocomplete"
+  },
+  {
+    "query": "What embedding models does Antfly support?",
+    "expected_keywords": ["ollama", "openai", "bedrock", "gemini", "embedder", "models"],
+    "description": "Should list embedding providers and popular models"
+  },
+  {
+    "query": "How do I combine keyword and semantic search?",
+    "expected_keywords": ["hybrid", "rrf", "full_text_search", "semantic_search", "reciprocal rank fusion"],
+    "description": "Should explain hybrid search using RRF to combine BM25 and vector results"
+  },
+  {
+    "query": "Can I search my documentation with Antfly?",
+    "expected_keywords": ["documentation", "markdown", "full_text", "semantic", "docsaf"],
+    "description": "Should explain indexing docs with full-text and semantic search"
+  },
+  {
+    "query": "How do I filter search results by category or date?",
+    "expected_keywords": ["filter_query", "filter_prefix", "date", "category", "bleve"],
+    "description": "Should explain using filter_query and filter_prefix for filtering"
+  },
+  {
+    "query": "What's the best way to search e-commerce products?",
+    "expected_keywords": ["hybrid search", "facets", "filters", "semantic", "product catalog"],
+    "description": "Should explain hybrid search with faceting for e-commerce"
+  },
+  {
+    "query": "How do I get AI-generated answers from my data?",
+    "expected_keywords": ["answer agent", "rag", "summarizer", "generation", "llm"],
+    "description": "Should explain Answer Agent and RAG for AI-generated answers"
+  },
+  {
+    "query": "Can I use Antfly with my existing OpenAI embeddings?",
+    "expected_keywords": ["openai", "embedder", "text-embedding-3", "api_key"],
+    "description": "Should explain configuring OpenAI embedder"
+  },
+  {
+    "query": "How do I structure my data in Antfly?",
+    "expected_keywords": ["table", "schema", "json schema", "x-antfly-types", "fields"],
+    "description": "Should explain tables, schemas, and field types"
+  },
+  {
+    "query": "What's the difference between full-text and semantic search?",
+    "expected_keywords": ["bm25", "keyword", "vector", "semantic", "meaning", "exact match"],
+    "description": "Should explain BM25 keyword matching vs vector semantic similarity"
+  },
+  {
+    "query": "How do I improve search relevance?",
+    "expected_keywords": ["reranker", "hybrid", "rrf", "relevance", "cross-encoder"],
+    "description": "Should explain reranking and hybrid search for better relevance"
+  },
+  {
+    "query": "Can I run Antfly locally for development?",
+    "expected_keywords": ["swarm", "development", "local", "ollama", "docker"],
+    "description": "Should explain swarm mode for local development"
+  },
+  {
+    "query": "How do I update document fields without overwriting everything?",
+    "expected_keywords": ["transform", "$inc", "$set", "$push", "partial update"],
+    "description": "Should explain MongoDB-style transforms for partial updates"
+  },
+  {
+    "query": "What happens if I need to reindex my data?",
+    "expected_keywords": ["backup", "restore", "index", "enrichment", "async"],
+    "description": "Should explain async enrichment and backup/restore process"
+  },
+  {
+    "query": "How do I scale Antfly for production?",
+    "expected_keywords": ["shards", "distributed", "raft", "replication", "horizontal"],
+    "description": "Should explain sharding, replication, and distributed architecture"
+  },
+  {
+    "query": "Can I search relationships between documents?",
+    "expected_keywords": ["graph", "edges", "traversal", "relationships", "graph_v0"],
+    "description": "Should explain graph indexes and traversal queries"
+  },
+  {
+    "query": "How much does it cost to run Antfly embeddings?",
+    "expected_keywords": ["ollama", "local", "openai", "cost", "self-hosted"],
+    "description": "Should explain local (Ollama) vs cloud embedding options"
+  },
+  {
+    "query": "How do I keep Antfly in sync with my Shopify store?",
+    "expected_keywords": ["linear merge", "sync", "shopify", "api", "pagination"],
+    "description": "Should explain syncing external APIs using Linear Merge"
+  },
+  {
+    "query": "Can I search across multiple languages?",
+    "expected_keywords": ["multilingual", "embeddings", "cohere", "language", "semantic"],
+    "description": "Should explain multilingual embedding models for cross-language search"
+  },
+  {
+    "query": "How does Antfly compare to Elasticsearch?",
+    "expected_keywords": ["elasticsearch", "bleve", "bm25", "vector", "hybrid", "comparison"],
+    "description": "Should compare Antfly to Elasticsearch including hybrid search advantages"
+  },
+  {
+    "query": "How does Antfly compare to Pinecone or Weaviate?",
+    "expected_keywords": ["pinecone", "weaviate", "vector", "hybrid", "full-text", "comparison"],
+    "description": "Should explain hybrid search advantage over vector-only databases"
+  },
+  {
+    "query": "Is Antfly better for RAG than pgvector?",
+    "expected_keywords": ["pgvector", "rag", "hybrid search", "bm25", "postgres"],
+    "description": "Should explain why hybrid search improves RAG over vector-only"
+  },
+  {
+    "query": "When should I NOT use Antfly?",
+    "expected_keywords": ["limitations", "use cases", "tradeoffs", "alternative"],
+    "description": "Should explain limitations and when other solutions are better"
+  },
+  {
+    "query": "Can I migrate from Elasticsearch to Antfly?",
+    "expected_keywords": ["migration", "elasticsearch", "import", "bleve", "mapping"],
+    "description": "Should explain migration path from Elasticsearch"
+  },
+  {
+    "query": "What hardware do I need to run Antfly in production?",
+    "expected_keywords": ["hardware", "cpu", "ram", "disk", "requirements", "capacity"],
+    "description": "Should provide hardware requirements and capacity planning guidance"
+  },
+  {
+    "query": "How do I monitor Antfly in production?",
+    "expected_keywords": ["monitoring", "prometheus", "metrics", "grafana", "health"],
+    "description": "Should explain monitoring setup with Prometheus and key metrics"
+  },
+  {
+    "query": "How do I upgrade Antfly without downtime?",
+    "expected_keywords": ["upgrade", "rolling", "zero downtime", "version", "compatibility"],
+    "description": "Should explain rolling upgrade procedures"
+  },
+  {
+    "query": "What happens during a node failure?",
+    "expected_keywords": ["failure", "raft", "recovery", "leader election", "availability"],
+    "description": "Should explain Raft failover and recovery behavior"
+  },
+  {
+    "query": "How do I secure Antfly?",
+    "expected_keywords": ["security", "authentication", "tls", "encryption", "auth"],
+    "description": "Should explain authentication, TLS, and security best practices"
+  },
+  {
+    "query": "How many queries per second can Antfly handle?",
+    "expected_keywords": ["performance", "throughput", "qps", "benchmark", "latency"],
+    "description": "Should provide performance benchmarks and throughput numbers"
+  },
+  {
+    "query": "When do I need to add more shards?",
+    "expected_keywords": ["sharding", "capacity", "scale", "performance", "guidelines"],
+    "description": "Should explain shard sizing and when to add more shards"
+  },
+  {
+    "query": "Does Antfly support geospatial search?",
+    "expected_keywords": ["geospatial", "geopoint", "geoshape", "location", "coordinates"],
+    "description": "Should explain geospatial field types and search capabilities"
+  },
+  {
+    "query": "How do I use Antfly with Kubernetes?",
+    "expected_keywords": ["kubernetes", "k8s", "helm", "statefulset", "deployment"],
+    "description": "Should explain Kubernetes deployment options"
+  },
+  {
+    "query": "Can I use Antfly as a vector store for LangChain?",
+    "expected_keywords": ["langchain", "vector store", "integration", "llm", "framework"],
+    "description": "Should explain LLM framework integrations"
+  },
+  {
+    "query": "What's the maximum document size in Antfly?",
+    "expected_keywords": ["limits", "document size", "maximum", "quotas"],
+    "description": "Should explain size limits and quotas"
+  },
+  {
+    "query": "How do atomic transactions work in Antfly?",
+    "expected_keywords": ["transaction", "atomic", "2pc", "distributed", "cross-shard"],
+    "description": "Should explain distributed transactions and 2-phase commit"
+  },
+  {
+    "query": "What client libraries does Antfly support?",
+    "expected_keywords": ["client", "sdk", "go", "typescript", "python", "library"],
+    "description": "Should list available client libraries and languages"
+  },
+  {
+    "query": "Can I run Antfly on a small VPS?",
+    "expected_keywords": ["vps", "minimum", "requirements", "small", "swarm"],
+    "description": "Should explain minimum deployment requirements and swarm mode for small setups"
+  },
+  {
+    "query": "How does Antfly handle backpressure?",
+    "expected_keywords": ["backpressure", "rate limiting", "queue", "performance", "throttle"],
+    "description": "Should explain how Antfly handles load and backpressure"
+  },
+  {
+    "query": "What happens if embedding generation fails?",
+    "expected_keywords": ["embedding", "failure", "retry", "async", "enrichment"],
+    "description": "Should explain error handling for async enrichment"
+  },
+  {
+    "query": "Does Antfly support TTL (time-to-live) for documents?",
+    "expected_keywords": ["ttl", "expiration", "automatic deletion", "ttl_duration", "ttl_field", "cleanup"],
+    "description": "Should explain document TTL and edge TTL configuration, use cases, and performance"
+  }
+]

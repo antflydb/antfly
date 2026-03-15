@@ -1,0 +1,576 @@
+{
+  "summary": {
+    "total_examples": 5,
+    "passed_examples": 4,
+    "failed_examples": 1,
+    "average_score": 0.9583333313465119,
+    "pass_rate": 0.8,
+    "total_duration": 85200445667,
+    "evaluator_stats": {
+      "citations": {
+        "name": "citations",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 20449
+      },
+      "completeness": {
+        "name": "completeness",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 2198078749
+      },
+      "confidence": {
+        "name": "confidence",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 0.949999988079071,
+        "pass_rate": 1,
+        "average_duration": 39032
+      },
+      "coverage": {
+        "name": "coverage",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 9066
+      },
+      "faithfulness": {
+        "name": "faithfulness",
+        "total_evaluations": 5,
+        "passed": 4,
+        "failed": 0,
+        "errors": 1,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 7470046866
+      },
+      "relevance": {
+        "name": "relevance",
+        "total_evaluations": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "average_score": 1,
+        "pass_rate": 1,
+        "average_duration": 1755013949
+      }
+    }
+  },
+  "results": [
+    {
+      "example": {
+        "input": "What is vector search and how does it work?",
+        "reference": "Vector search uses embeddings to convert data into high-dimensional vectors and find semantically similar content using approximate nearest neighbor algorithms like HNSW.",
+        "context": [
+          "Vector search is a technique that uses embeddings to find semantically similar content in a database.",
+          "It works by converting text, images, or other data into high-dimensional numerical vectors.",
+          "Approximate nearest neighbor algorithms like HNSW (Hierarchical Navigable Small World) enable fast retrieval of similar vectors.",
+          "Vector search powers modern semantic search engines and recommendation systems by understanding meaning rather than just matching keywords."
+        ],
+        "metadata": {
+          "domain": "search",
+          "expected_citation_count": 3,
+          "expected_route_type": "question"
+        }
+      },
+      "output": {
+        "generation": "Vector search is a technique that utilizes embeddings to find content that is semantically similar within a database [doc0]. It achieves this by converting text, images, or other data into high-dimensional numerical vectors [doc1]. These vectors represent the meaning of the data. To facilitate rapid retrieval, approximate nearest neighbor algorithms like HNSW (Hierarchical Navigable Small World) are often employed [doc2]. This allows for the fast identification of vectors most similar to a query vector, ultimately delivering results based on understanding the *meaning* of the data rather than just matching keywords [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "vector search technology explanation and working principles",
+        "semantic_query": "vector search, similarity search, approximate nearest neighbor search, embeddings, vector databases, dimensionality reduction, cosine similarity, Euclidean distance, indexing, search algorithms"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              3,
+              0,
+              1,
+              2
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively explains vector search, defining it and detailing the process of using embeddings and approximate nearest neighbor algorithms like HNSW. It correctly highlights the shift from keyword matching to semantic understanding. The inclusion of citations adds credibility. While slightly more detail regarding the types of data handled could be added, it’s a very solid explanation.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively explains vector search, defining it and detailing the process of using embeddings and approximate nearest neighbor algorithms like HNSW. It correctly highlights the shift from keyword matching to semantic understanding. The inclusion of citations adds credibility. While slightly more detail regarding the types of data handled could be added, it’s a very solid explanation.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              3,
+              0,
+              1,
+              2
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately and completely describes vector search as presented in the context documents, covering its core functionality, the use of embeddings and numerical vectors, and the role of approximate nearest neighbor algorithms.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately and completely describes vector search as presented in the context documents, covering its core functionality, the use of embeddings and numerical vectors, and the role of approximate nearest neighbor algorithms.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by defining vector search, explaining the use of embeddings and numerical vectors, and detailing the role of approximate nearest neighbor algorithms. It provides a comprehensive overview of the technique as requested.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by defining vector search, explaining the use of embeddings and numerical vectors, and detailing the role of approximate nearest neighbor algorithms. It provides a comprehensive overview of the technique as requested.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 19718608000,
+      "timestamp": "2025-11-11T23:04:35.618668-08:00"
+    },
+    {
+      "example": {
+        "input": "papers about distributed consensus algorithms",
+        "reference": "Key distributed consensus algorithms include Raft (designed for understandability), Paxos (the classic approach), and Byzantine Fault Tolerance algorithms like PBFT.",
+        "context": [
+          "Raft is a consensus algorithm designed to be more understandable than Paxos while providing the same guarantees.",
+          "The Raft algorithm divides consensus into leader election, log replication, and safety components.",
+          "Paxos is a family of protocols for solving consensus in distributed systems, known for being difficult to understand.",
+          "Byzantine Fault Tolerance algorithms like PBFT handle malicious actors in distributed systems."
+        ],
+        "metadata": {
+          "domain": "distributed_systems",
+          "expected_citation_count": 3,
+          "expected_route_type": "search"
+        }
+      },
+      "output": {
+        "generation": "Papers about distributed consensus algorithms include algorithms like Raft, which is designed to be more understandable than Paxos while still providing the same guarantees [doc0]. The Raft algorithm specifically divides consensus into leader election, log replication, and safety components [doc1]. Paxos is another family of protocols for solving consensus, but it is known for being difficult to understand [doc2]. Furthermore, for handling malicious actors, Byzantine Fault Tolerance algorithms like PBFT are relevant [doc3].",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "distributed consensus algorithms research papers",
+        "semantic_query": "distributed consensus algorithms, Byzantine fault tolerance, Paxos, Raft, BFT, fault tolerance, distributed systems, blockchain consensus, leader election, consistency models"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer effectively addresses the question by mentioning key distributed consensus algorithms (Raft, Paxos, and PBFT). It briefly describes the components of Raft and acknowledges the complexity of Paxos. It also introduces Byzantine Fault Tolerance as a relevant approach. While more detail on each algorithm could be added, the response provides a good overview and directly answers the question. It also references supporting documents which is crucial for a comprehensive response.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.9,\n  \"reason\": \"The answer effectively addresses the question by mentioning key distributed consensus algorithms (Raft, Paxos, and PBFT). It briefly describes the components of Raft and acknowledges the complexity of Paxos. It also introduces Byzantine Fault Tolerance as a relevant approach. While more detail on each algorithm could be added, the response provides a good overview and directly answers the question. It also references supporting documents which is crucial for a comprehensive response.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              2,
+              3,
+              0,
+              1
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": false,
+          "score": 0,
+          "error": "LLM generation failed: failed to send request: Post \"http://localhost:11434/api/chat\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by providing information about distributed consensus algorithms, specifically mentioning Raft, Paxos, and Byzantine Fault Tolerance (PBFT). It relates these algorithms to the core topic of the question and cites relevant documentation.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by providing information about distributed consensus algorithms, specifically mentioning Raft, Paxos, and Byzantine Fault Tolerance (PBFT). It relates these algorithms to the core topic of the question and cites relevant documentation.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 41486391791,
+      "timestamp": "2025-11-11T23:04:55.336785-08:00"
+    },
+    {
+      "example": {
+        "input": "How does the CAP theorem affect database design?",
+        "reference": "The CAP theorem forces distributed databases to choose between AP (availability + partition tolerance) or CP (consistency + partition tolerance) trade-offs.",
+        "context": [
+          "The CAP theorem states that distributed databases can only guarantee two of three properties: Consistency, Availability, and Partition tolerance.",
+          "Most distributed databases choose to optimize for availability and partition tolerance (AP systems) or consistency and partition tolerance (CP systems).",
+          "AP systems like Cassandra prioritize availability, allowing eventual consistency.",
+          "CP systems like HBase prioritize strong consistency, potentially sacrificing availability during partitions."
+        ],
+        "metadata": {
+          "domain": "databases",
+          "expected_citation_count": 3,
+          "expected_route_type": "question"
+        }
+      },
+      "output": {
+        "generation": "The CAP theorem fundamentally shapes database design by dictating that distributed databases can only achieve two out of the three following properties: Consistency, Availability, and Partition tolerance [doc0]. This forces database designers to make strategic choices, typically leading to the creation of either AP systems or CP systems [doc1].\n\nAP systems, exemplified by Cassandra, prioritize availability and partition tolerance, accepting eventual consistency [doc2]. In these systems, data may not be immediately consistent across all nodes, but the database remains available even during network partitions. Conversely, CP systems, like HBase, prioritize strong consistency and partition tolerance [doc3]. These systems might sacrifice availability during a partition to guarantee that all nodes have the same, up-to-date data. Therefore, the CAP theorem directly influences the architecture and design decisions for distributed databases, determining which trade-offs developers must accept.",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "How does the CAP theorem impact database design considerations?",
+        "semantic_query": "CAP theorem, distributed database consistency, availability, partition tolerance, database design, distributed systems architecture, data consistency models, fault tolerance in databases"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively addresses the question by explaining the CAP theorem's impact on database design. It clearly defines the three properties (Consistency, Availability, Partition Tolerance) and accurately describes the resulting AP (Availability and Partition Tolerance) and CP (Consistency and Partition Tolerance) system types. The explanation of eventual consistency in AP systems and the willingness to sacrifice availability in CP systems is well articulated. The reference to specific examples (Cassandra, HBase) strengthens the response. It’s a complete and well-explained answer.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively addresses the question by explaining the CAP theorem's impact on database design. It clearly defines the three properties (Consistency, Availability, Partition Tolerance) and accurately describes the resulting AP (Availability and Partition Tolerance) and CP (Consistency and Partition Tolerance) system types. The explanation of eventual consistency in AP systems and the willingness to sacrifice availability in CP systems is well articulated. The reference to specific examples (Cassandra, HBase) strengthens the response. It’s a complete and well-explained answer.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately reflects the information presented in all three provided context documents. It correctly explains the core tenets of the CAP theorem and how it leads to the design choices of AP and CP systems, including examples from Cassandra and HBase.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately reflects the information presented in all three provided context documents. It correctly explains the core tenets of the CAP theorem and how it leads to the design choices of AP and CP systems, including examples from Cassandra and HBase.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by explaining how the CAP theorem impacts database design. It clearly outlines the trade-offs between AP and CP systems, providing examples and referencing relevant documentation. It accurately reflects the core principles of the theorem and its influence on distributed database architecture.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by explaining how the CAP theorem impacts database design. It clearly outlines the trade-offs between AP and CP systems, providing examples and referencing relevant documentation. It accurately reflects the core principles of the theorem and its influence on distributed database architecture.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 8231941500,
+      "timestamp": "2025-11-12T10:13:30.159444-08:00"
+    },
+    {
+      "example": {
+        "input": "research on transformer architectures in NLP",
+        "reference": "Transformer architectures use attention mechanisms and have spawned models like BERT (bidirectional encoding), GPT (autoregressive generation), and ViT (vision tasks).",
+        "context": [
+          "The Transformer architecture introduced the attention mechanism, eliminating the need for recurrent connections.",
+          "BERT (Bidirectional Encoder Representations from Transformers) uses masked language modeling for pre-training.",
+          "GPT models use autoregressive language modeling to generate text token by token.",
+          "Vision Transformers (ViT) adapt the transformer architecture for image classification tasks."
+        ],
+        "metadata": {
+          "domain": "ai",
+          "expected_citation_count": 3,
+          "expected_route_type": "search"
+        }
+      },
+      "output": {
+        "generation": "Research on transformer architectures in NLP has led to significant advancements. The Transformer architecture, introduced in [doc0], eliminates the need for recurrent connections by utilizing the attention mechanism. This architecture has been adapted for various NLP tasks. For example, BERT [doc1] uses masked language modeling for pre-training, and GPT models [doc2] utilize autoregressive language modeling to generate text token by token. Furthermore, Vision Transformers (ViT) [doc3] demonstrate the application of transformer architectures to image classification.",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "transformer architectures in natural language processing research",
+        "semantic_query": "transformer models, neural networks, natural language processing, deep learning, attention mechanisms, sequence-to-sequence models, NLP research trends, model architectures, self-attention, encoder-decoder models"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              2,
+              3,
+              0,
+              1
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer effectively addresses the question by explaining the core concept of transformer architectures, providing specific examples like BERT and GPT, and extending the application to ViT. While it could benefit from a slightly deeper dive into the attention mechanism itself and perhaps a brief mention of key differences between BERT and GPT, it provides a solid overview for someone researching the topic. The inclusion of relevant documentation references ([doc0], [doc1], [doc2], [doc3]) is also a plus.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.85,\n  \"reason\": \"The answer effectively addresses the question by explaining the core concept of transformer architectures, providing specific examples like BERT and GPT, and extending the application to ViT. While it could benefit from a slightly deeper dive into the attention mechanism itself and perhaps a brief mention of key differences between BERT and GPT, it provides a solid overview for someone researching the topic. The inclusion of relevant documentation references ([doc0], [doc1], [doc2], [doc3]) is also a plus.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately reflects the information provided in all the context documents. It correctly describes the core concepts of the Transformer architecture, BERT, GPT, and ViT, and their respective applications.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately reflects the information provided in all the context documents. It correctly describes the core concepts of the Transformer architecture, BERT, GPT, and ViT, and their respective applications.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by discussing transformer architectures in NLP. It provides relevant examples like BERT, GPT, and ViT, outlining key adaptations and techniques related to the architecture. It's a highly relevant and informative response.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by discussing transformer architectures in NLP. It provides relevant examples like BERT, GPT, and ViT, outlining key adaptations and techniques related to the architecture. It's a highly relevant and informative response.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 6819800625,
+      "timestamp": "2025-11-12T10:13:39.552742-08:00"
+    },
+    {
+      "example": {
+        "input": "What are the key principles of REST API design?",
+        "reference": "REST API design principles include using HTTP methods semantically, stateless resource identification via URIs, proper status codes, and hypermedia for discoverability.",
+        "context": [
+          "REST APIs should use HTTP methods semantically: GET for retrieval, POST for creation, PUT for updates, DELETE for removal.",
+          "Resources should be identified by URIs, and representations should be stateless.",
+          "Proper HTTP status codes (200, 201, 404, 500, etc.) communicate results clearly to clients.",
+          "RESTful APIs benefit from being self-descriptive and using hypermedia (HATEOAS) for discoverability."
+        ],
+        "metadata": {
+          "domain": "api_design",
+          "expected_citation_count": 3,
+          "expected_route_type": "question"
+        }
+      },
+      "output": {
+        "generation": "The key principles of REST API design, as outlined in the provided resources, center around several core concepts:\n\n1.  **Semantic Use of HTTP Methods:** RESTful APIs rely on the semantic meaning of HTTP methods [doc0]. Specifically, GET is used for data retrieval, POST for creating new resources, PUT for updating existing resources, and DELETE for removing resources.\n\n2.  **Stateless Resources:** Resources should be identified by URIs, and representations should be stateless [doc1]. This means each request from a client to the server must contain all the information needed to understand and process the request, without relying on any prior context or session state.\n\n3.  **Clear Communication via HTTP Status Codes:** Proper HTTP status codes (e.g., 200, 201, 404, 500) are crucial for communicating the outcome of a request to the client [doc2]. These codes provide immediate feedback on the success or failure of an operation.\n\n4.  **Hypermedia as the Engine of Application State (HATEOAS):** RESTful APIs benefit from being self-descriptive and using hypermedia (HATEOAS) for discoverability [doc3]. This allows clients to discover related resources and actions through links within the responses, rather than relying on hardcoded URIs.",
+        "classification": "question",
+        "confidence": 0.95,
+        "improved_query": "key principles of REST API design",
+        "semantic_query": "REST API design principles, architectural patterns, API design best practices, HTTP methods, resource representation, statelessness, client-server architecture, API scalability, API documentation"
+      },
+      "results": {
+        "citations": {
+          "pass": true,
+          "score": 1,
+          "reason": "Found 4 citation(s) - all valid",
+          "metadata": {
+            "citation_count": 4,
+            "cited_doc_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_doc_count": 4,
+            "invalid_citations": [],
+            "out_of_range_ids": []
+          }
+        },
+        "completeness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively addresses the key principles of REST API design. It covers essential aspects like HTTP methods, statelessness, status codes, and HATEOAS. The inclusion of references to 'doc0', 'doc1', 'doc2', and 'doc3' suggests a deeper dive into each principle, though without seeing those documents, we can't verify the level of detail. The explanation is clear and concise.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer comprehensively addresses the key principles of REST API design. It covers essential aspects like HTTP methods, statelessness, status codes, and HATEOAS. The inclusion of references to 'doc0', 'doc1', 'doc2', and 'doc3' suggests a deeper dive into each principle, though without seeing those documents, we can't verify the level of detail. The explanation is clear and concise.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        },
+        "confidence": {
+          "pass": true,
+          "score": 0.949999988079071,
+          "reason": "Confidence: 0.95 (threshold: 0.70) ✓",
+          "metadata": {
+            "confidence": 0.949999988079071,
+            "min_confidence": 0.7
+          }
+        },
+        "coverage": {
+          "pass": true,
+          "score": 1,
+          "reason": "Cited 4/4 documents (100.0% coverage)",
+          "metadata": {
+            "cited_count": 4,
+            "cited_ids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "context_count": 4,
+            "coverage": 1,
+            "uncited_ids": []
+          }
+        },
+        "faithfulness": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the key principles of REST API design as described in the provided context documents. It correctly identifies the use of HTTP methods, statelessness, HTTP status codes, and HATEOAS. All information is directly derived from the given documents.\",\n  \"confidence\": 1.0\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 1.0,\n  \"reason\": \"The answer accurately summarizes the key principles of REST API design as described in the provided context documents. It correctly identifies the use of HTTP methods, statelessness, HTTP status codes, and HATEOAS. All information is directly derived from the given documents.\",\n  \"confidence\": 1.0\n}\n```"
+          }
+        },
+        "relevance": {
+          "pass": true,
+          "score": 1,
+          "reason": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by outlining key principles of REST API design – HTTP methods, statelessness, status codes, and HATEOAS. It provides a comprehensive overview of the core concepts.\",\n  \"confidence\": 0.95\n}\n```",
+          "metadata": {
+            "confidence": 0,
+            "raw_response": "```json\n{\n  \"pass\": true,\n  \"score\": 0.95,\n  \"reason\": \"The answer directly addresses the question by outlining key principles of REST API design – HTTP methods, statelessness, status codes, and HATEOAS. It provides a comprehensive overview of the core concepts.\",\n  \"confidence\": 0.95\n}\n```"
+          }
+        }
+      },
+      "duration": 8943697666,
+      "timestamp": "2025-11-12T10:13:46.372643-08:00"
+    }
+  ],
+  "config": {
+    "version": 1,
+    "evaluators": {},
+    "datasets": [],
+    "output": {
+      "format": "json",
+      "path": "",
+      "pretty": true
+    },
+    "execution": {
+      "parallel": false,
+      "max_concurrency": 1,
+      "timeout": "5m"
+    }
+  },
+  "timestamp": "2025-11-11T23:04:35.618666-08:00"
+}

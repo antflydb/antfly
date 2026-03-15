@@ -1,0 +1,25 @@
+name: Trigger Colony Docs Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'openapi.yaml'
+      - 'CHANGELOG.md'
+      - 'examples/**'
+      - 'docs/**'
+      - 'src/common/openapi.yaml'
+      - 'pkg/operator/docs/**'
+      - 'termite/pkg/termite/openapi.yaml'
+      - 'termite/registry/index.json'
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger colony rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.COLONY_DISPATCH_TOKEN }}
+          repository: antflydb/colony
+          event-type: antfly-docs-updated

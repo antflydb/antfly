@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "antfly"
+    static_configs:
+      - targets: ["antfly:4200"]

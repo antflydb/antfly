@@ -1,0 +1,11 @@
+packages:
+  - packages/*
+  - apps/*
+
+onlyBuiltDependencies:
+  - canvas
+  - core-js
+  - esbuild
+  - msw
+  - protobufjs
+  - sharp

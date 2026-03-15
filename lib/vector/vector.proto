@@ -1,0 +1,126 @@
+// Copyright 2025 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+edition = "2023";
+package antfly.lib.vector;
+import "google/protobuf/go_features.proto";
+option go_package = "github.com/antflydb/antfly/lib/vector";
+option features.(pb.go).api_level = API_OPAQUE;
+
+// Set of float32 vectors of equal dimension. Set vectors are stored contiguously
+// in a slice, in row-wise order. They are assumed to be unordered and some methods
+// do not preserve ordering.
+message Set {
+  // Dims (dimensions) of the vectors in the set.
+  int64 dims = 1 [ features.field_presence = IMPLICIT ];
+  // Count of the vectors in the set.
+  int64 count = 2 [ features.field_presence = IMPLICIT ];
+  // Data is a float32 slice that contains all vectors,
+  // laid out contiguously in row-wise order in memory.
+  // Access individual vectors using At()
+  repeated float data = 3;
+}
+
+// RotAlgorithm specifies the algorithm used to randomly rotate the original
+// vectors inserted into the index.
+enum RotAlgorithm {
+  // None vectors will not be randomly rotated.
+  // This is appropriate when the input vectors are already sufficiently mixed.
+  // For example, OpenAI embeddings are often already well-mixed, so additional
+  // random rotation provides little benefit and can be skipped to save
+  // computation.
+  None = 0;
+  // Givens vectors will be randomly rotated by applying a sequence of Givens rotations.
+  // Each Givens rotation mixes a pair of vector coordinates using a random angle,
+  // and applying O(N log N) such rotations (where N is the number of dimensions)
+  // is sufficient to approximate a Haar-random orthogonal transformation.
+  // This approach is much more computationally efficient than applying a full
+  // random orthogonal matrix, while still providing strong mixing and
+  // preserving all pairwise distances and angles between vectors.
+  Givens = 1;
+}
+
+// DistanceMetric defines the function that's used to compute similarity between
+// vectors.
+enum DistanceMetric {
+  // L2SquaredDistance specifies squared Euclidean distance between two vectors,
+  // defined as the square of the L2 norm of their difference:
+  //  ||vec1 - vec2||²
+  //
+  // This is equivalent to the dot product of the difference with itself:
+  //  (vec1 - vec2) · (vec1 - vec2)
+  L2Squared = 0;
+
+  // InnerProductDistance specifies inner product distance between two vectors,
+  // defined as the negative value of the dot product between them:
+  //  -(vec1 · vec2)
+  //
+  // Negating the distance ensures that the smaller the distance, the more
+  // similar are the vectors, aligning this metric with L2Squared and Cosine.
+  InnerProduct = 1;
+
+  // CosineDistance specifies the cosine distance between two vectors, defined
+  // as one minus their cosine similarity:
+  //  1 - cos(vec1, vec2)
+  //
+  // Cosine similarity is computed as the dot product of the vectors divided
+  // by the product of their norms (magnitudes):
+  //  cos(vec1, vec2) = (vec1 · vec2) / (||vec1|| * ||vec2||)
+  //
+  // However, when using Cosine distance, we always pre-normalize vectors, so
+  // that they are always unit vectors. This means the product of their norms
+  // is one. Therefore, cosine distance becomes simply:
+  //  1 - (vec1 · vec2)
+  Cosine = 2;
+}
+
+// SparseVector represents a sparse embedding as parallel arrays of term IDs
+// and weights. Indices are vocabulary term IDs (sorted ascending). Values are
+// corresponding weights (positive after SPLADE activation).
+message SparseVector {
+  repeated uint32 indices = 1;
+  repeated float values = 2;
+}
+
+// SparseSet is a collection of sparse vectors for test data serialization.
+message SparseSet {
+  int64 count = 1 [ features.field_presence = IMPLICIT ];
+  repeated SparseVector vectors = 2;
+}
+
+// ClustAlgorithm specifies the algorithm used to split clusters of vectors
+// inserted into the index.
+enum ClustAlgorithm {
+  // Kmeans uses the balanced k-means algorithm with k=2 to partition vectors
+  // into two clusters. This iterative algorithm:
+  // 1. Selects initial centroids using k-means++ initialization
+  // 2. Assigns vectors to the nearest centroid
+  // 3. Recomputes centroids as the mean of assigned vectors
+  // 4. Repeats until convergence or max iterations
+  // The algorithm enforces balance constraints ensuring neither partition
+  // contains less than 33% of the vectors. This prevents highly unbalanced
+  // trees and maintains good search performance.
+  Kmeans = 0;
+
+  // Hilbert uses Hilbert space-filling curves to partition vectors.
+  // This deterministic algorithm:
+  // 1. Maps each high-dimensional vector to a position on a 1D Hilbert curve
+  // 2. Sorts vectors by their Hilbert curve position
+  // 3. Splits the sorted list at the midpoint to create two balanced partitions
+  // The Hilbert curve preserves spatial locality, meaning vectors that are
+  // close in the original space tend to be close on the curve. This can
+  // produce more coherent clusters for certain data distributions and
+  // provides consistent, reproducible partitioning.
+  Hilbert = 1;
+}

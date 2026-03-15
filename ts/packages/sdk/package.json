@@ -1,0 +1,72 @@
+{
+  "name": "@antfly/sdk",
+  "version": "0.0.13",
+  "description": "TypeScript SDK for Antfly API",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check . --write --unsafe",
+
+    "generate": "openapi-typescript ../../../openapi.yaml -o ./src/antfly-api.d.ts --default-non-nullable=false && openapi-typescript ../../../bleve-query-openapi.yaml --client fetch -o ./src/bleve-query.d.ts --default-non-nullable=false",
+    "clean": "rm -rf dist",
+    "prepare": "pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run build",
+    "example:node": "tsx examples/node-example.ts"
+  },
+  "keywords": [
+    "antfly",
+    "sdk",
+    "typescript",
+    "api",
+    "client",
+    "database",
+    "vector",
+    "search"
+  ],
+  "author": "Antfly Contributors",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly-ts.git",
+    "directory": "packages/sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/sdk#readme",
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "@vitest/ui": "^4.0.18",
+    "openapi-typescript": "^7.13.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "openapi-fetch": "^0.17.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

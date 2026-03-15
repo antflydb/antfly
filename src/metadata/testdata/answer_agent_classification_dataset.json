@@ -1,0 +1,122 @@
+[
+  {
+    "input": "What is the weather today?",
+    "reference": "question",
+    "metadata": {
+      "category": "factual_query",
+      "expected_confidence_min": 0.7
+    }
+  },
+  {
+    "input": "How does photosynthesis work?",
+    "reference": "question",
+    "metadata": {
+      "category": "explanation_query",
+      "expected_confidence_min": 0.7
+    }
+  },
+  {
+    "input": "papers about neural networks",
+    "reference": "search",
+    "metadata": {
+      "category": "search_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "documents on distributed systems",
+    "reference": "search",
+    "metadata": {
+      "category": "search_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "research about quantum computing",
+    "reference": "search",
+    "metadata": {
+      "category": "search_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "Why is the sky blue?",
+    "reference": "question",
+    "metadata": {
+      "category": "explanation_query",
+      "expected_confidence_min": 0.7
+    }
+  },
+  {
+    "input": "articles on climate change",
+    "reference": "search",
+    "metadata": {
+      "category": "search_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "What are the symptoms of diabetes?",
+    "reference": "question",
+    "metadata": {
+      "category": "factual_query",
+      "expected_confidence_min": 0.7
+    }
+  },
+  {
+    "input": "best practices for code review",
+    "reference": "question",
+    "metadata": {
+      "category": "guidance_query",
+      "expected_confidence_min": 0.7
+    }
+  },
+  {
+    "input": "How do I install Docker?",
+    "reference": "question",
+    "metadata": {
+      "category": "how_to_query",
+      "expected_confidence_min": 0.7
+    }
+  },
+  {
+    "input": "examples of microservices architecture",
+    "reference": "question",
+    "metadata": {
+      "category": "example_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "When was the French Revolution?",
+    "reference": "question",
+    "metadata": {
+      "category": "factual_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "tutorials on machine learning",
+    "reference": "search",
+    "metadata": {
+      "category": "search_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "What is the capital of France?",
+    "reference": "question",
+    "metadata": {
+      "category": "factual_query",
+      "expected_confidence_min": 0.8
+    }
+  },
+  {
+    "input": "compare React vs Vue",
+    "reference": "question",
+    "metadata": {
+      "category": "comparison_query",
+      "expected_confidence_min": 0.7
+    }
+  }
+]

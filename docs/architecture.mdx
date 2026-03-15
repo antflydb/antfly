@@ -1,0 +1,221 @@
+---
+title: Architecture
+description: Deep dive into AntflyDB's distributed architecture and design principles
+---
+
+<Questions>
+- How does Antfly's distributed architecture work?
+- What is multi-Raft consensus?
+- How does Antfly handle sharding?
+- What storage engine does Antfly use?
+- How does Antfly ensure data consistency?
+</Questions>
+
+## Overview
+
+Antfly is a distributed key-value store and vector search engine built on a **multi-Raft consensus architecture**. It combines the best of traditional databases with modern AI capabilities to deliver hybrid search at scale.
+
+## What Makes Antfly Unique
+
+### Hybrid Search
+
+- **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)
+- **Multimodal**: Index and search text, images, audio, and video
+- **Embedding Providers**: Ollama, OpenAI, AWS Bedrock, Google Gemini, Anthropic
+
+### Distributed Consensus
+
+- **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
+- **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
+- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)
+
+### AI-Native Features
+
+- **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
+- **Answer Agent**: Intelligent query routing with automatic query generation
+- **Document Chunking**: Semantic chunking service (Termite) with multi-tier caching
+- **Async Enrichment**: Background embedding and summarization with leader-only processing
+
+### Developer Experience
+
+- **JSON Schema Extensions**: Custom `x-antfly-*` annotations for indexing
+- **MongoDB-Style Transforms**: In-place updates ($inc, $set, $push) without read-modify-write
+- **Linear Merge**: Stateless import of sorted records from external sources
+- **Template Rendering**: Handlebars templates for custom document rendering
+- **Graph Operations**: Declarative queries with traversals and pathfinding
+
+### Flexible Indexing
+
+- **Index Types**: `full_text` (BM25), `embeddings` (vector with RaBitQ), `graph` (relationship traversal)
+- **Enrichers**: summaries, embeddings, chunking (async background processing)
+- **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)
+- **Multimodal**: Vision model + embedder or native multimodal embeddings (Gemini)
+- **Pluggable Architecture**: Easy to add custom index types via registry pattern
+
+## Core Components
+
+### Storage Layer
+
+**Pebble Key-Value Store**
+
+At its core, AntflyDB uses Pebble, a high-performance key-value store developed by CockroachDB. This provides:
+- Efficient data storage and retrieval
+- Built-in compression
+- Fast range scans
+- Reliable crash recovery
+
+### Consensus and Distribution
+
+**Raft Consensus Algorithm**
+
+AntflyDB ensures data consistency across nodes using the Raft consensus algorithm:
+- Strong consistency guarantees
+- Automatic leader election
+- Log replication across nodes
+- Split-brain prevention
+
+### Multi-Raft Architecture
+
+Unlike single-raft systems, AntflyDB employs a sophisticated multi-raft design:
+
+- **Shard-Level Consensus**: Each data shard runs its own Raft group
+- **Independent Scaling**: Shards can be moved and replicated independently
+- **Fault Isolation**: Failures in one shard don't affect others
+- **Parallel Operations**: Multiple raft groups can process requests simultaneously
+
+## Data Model
+
+### Document Storage
+
+AntflyDB stores data as JSON documents with:
+- Schema-optional design for flexibility
+- Automatic indexing of fields
+- Support for nested structures
+- Efficient serialization with MessagePack
+
+### Sharding Strategy
+
+Data is automatically distributed across shards using:
+- Consistent hashing for even distribution
+- Configurable replication factor
+- Automatic rebalancing
+- Hot shard detection and splitting
+
+## Indexing Architecture
+
+### Full-Text Search
+
+Powered by Bleve, our full-text indexing provides:
+- Language-aware tokenization
+- Fuzzy matching and phrase search
+- Faceted search capabilities
+- Custom analyzers and filters
+
+### Vector Indexing
+
+Our SPANN-based vector index implementation offers:
+- Approximate nearest neighbor search
+- Configurable precision/performance tradeoffs
+- Support for high-dimensional vectors
+- Incremental index updates
+- Quantization using [RaBitQ](https://arxiv.org/pdf/2405.12497)
+
+### Hybrid Search Engine
+
+The query engine seamlessly combines both index types:
+- Unified scoring across text and vector results
+- Query-time weighting of different signals
+- Efficient multi-index traversal
+- Result deduplication and ranking
+
+## AI Integration
+
+### Embedding Pipeline
+
+- **Plugin Architecture**: Modular design supports multiple embedding providers through a unified interface
+- **Batch Processing**: Efficient batching of embedding requests to maximize throughput
+- **Caching Layer**: Smart caching of embeddings to reduce API calls and latency
+- **Async Processing**: Non-blocking embedding generation with progress tracking
+
+## Reliability Features
+
+### Write-Ahead Logging
+
+Every operation is logged before execution:
+- Durability guarantees
+- Point-in-time recovery
+- Efficient batch commits
+- Configurable sync policies
+
+### BASE Consistency Model
+
+AntflyDB follows the BASE model for distributed operations:
+- **Basically Available**: System remains operational during partial failures
+- **Soft State**: Data may be in flux during replication
+- **Eventually Consistent**: All replicas converge to the same state
+
+This model allows for:
+- High availability during network partitions
+- Better performance for read-heavy workloads
+- Tunable consistency levels per operation
+
+## Network Architecture
+
+### HTTP/3 with QUIC
+
+AntflyDB leverages QUIC protocol for:
+- Reduced connection establishment time
+- Better performance over lossy networks
+- Multiplexed streams without head-of-line blocking
+- Built-in encryption
+
+### API Design
+
+The REST API is designed for:
+- Intuitive resource-based operations
+- Streaming support for large responses
+- Comprehensive error handling
+- OpenAPI specification
+
+## Deployment Modes
+
+### Swarm Mode
+
+For development and small deployments:
+- Single binary runs all components
+- Automatic node discovery
+- Zero configuration required
+
+**Minimum Requirements (Swarm Mode):**
+- 2 CPU cores
+- 4GB RAM
+- 20GB storage
+- Suitable for small VPS or local development
+
+### Production Mode
+
+For scale and reliability:
+- Separate metadata and storage nodes
+- Configurable replication topology
+- Multi-datacenter support
+- Rolling upgrade capability
+
+**Recommended Requirements (Production):**
+- Metadata nodes: 4+ CPU cores, 8GB+ RAM
+- Storage nodes: 8+ CPU cores, 16GB+ RAM, SSD storage
+- Network: Low-latency connections between nodes
+
+## Performance Optimizations
+
+- **Adaptive Indexing**: Automatically adjusts index structures based on query patterns
+- **Query Planning**: Cost-based optimizer for complex queries
+- **Connection Pooling**: Efficient resource management for concurrent requests
+- **Memory Management**: Careful control of memory usage with configurable limits
+
+## Future Architecture Goals
+
+We're continuously evolving AntflyDB's architecture to:
+- Support even larger scale deployments
+- Reduce query latency further
+- Improve multi-model capabilities
+- Enhance operational simplicity

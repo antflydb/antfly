@@ -1,0 +1,99 @@
+# Example: Basic AntflyCluster on AWS EKS
+#
+# This example shows a standard EKS deployment without Spot Instances.
+# Suitable for production workloads that require stable, on-demand capacity.
+#
+# Prerequisites:
+# 1. EKS cluster with EBS CSI driver installed:
+#    kubectl get csidriver ebs.csi.aws.com
+#
+# 2. Create a storage class for EBS gp3 volumes (if not using default):
+#    kubectl apply -f - <<EOF
+#    apiVersion: storage.k8s.io/v1
+#    kind: StorageClass
+#    metadata:
+#      name: gp3
+#    provisioner: ebs.csi.aws.com
+#    parameters:
+#      type: gp3
+#      encrypted: "true"
+#    volumeBindingMode: WaitForFirstConsumer
+#    allowVolumeExpansion: true
+#    EOF
+#
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: antfly-eks
+---
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: antfly-eks-cluster
+  namespace: antfly-eks
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+
+  # AWS EKS configuration
+  eks:
+    enabled: true
+    # EBS volume configuration
+    ebsVolumeType: "gp3"      # gp3 provides best price/performance
+    ebsEncrypted: true        # Enable EBS encryption
+    # Pod Disruption Budget for high availability
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+
+  # Metadata nodes configuration (Raft consensus layer)
+  metadataNodes:
+    replicas: 3  # Required for Raft consensus
+    metadataAPI:
+      port: 12377
+    metadataRaft:
+      port: 9017
+    resources:
+      cpu: "500m"
+      memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+  # Data nodes configuration (Storage layer)
+  dataNodes:
+    replicas: 3
+    api:
+      port: 12380
+    raft:
+      port: 9021
+    resources:
+      cpu: "1000m"
+      memory: "2Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"
+
+  storage:
+    # Use EKS default storage class or custom gp3 class
+    storageClass: "gp3"
+    metadataStorage: "1Gi"
+    dataStorage: "10Gi"
+    # Optional: Automatically clean up PVCs when cluster is deleted.
+    # Default is Retain/Retain — PVCs are kept after deletion for safety.
+    # pvcRetentionPolicy:
+    #   whenDeleted: Delete   # Delete PVCs on cluster deletion
+    #   whenScaled: Retain    # Keep PVCs on scale-down (recommended)
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      },
+      "cache_size": 1000,
+      "enable_metrics": true,
+      "max_shard_size_bytes": 134217728,
+      "raft_snapshot_threshold": 10000
+    }

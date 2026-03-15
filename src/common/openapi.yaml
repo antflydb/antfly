@@ -1,0 +1,441 @@
+openapi: 3.0.3
+info:
+  title: Antfly Configuration Schema
+  description: "Configuration schema for Antfly distributed key-value store and vector search engine."
+  version: "0.0.1"
+
+components:
+  schemas:
+    Config:
+      type: object
+      required:
+        - metadata
+        - storage
+        - replication_factor
+        - max_shard_size_bytes
+        - max_shards_per_table
+        - default_shards_per_table
+      properties:
+        version:
+          type: string
+          description: "Internal version of antfly"
+          example: "0.0.1"
+        log:
+          $ref: "../../pkg/libaf/logging/openapi.yaml#/components/schemas/Config"
+        health_port:
+          type: integer
+          description: "Port for the health/metrics server. Defaults to 4200."
+          default: 4200
+          example: 4200
+        storage:
+          $ref: "#/components/schemas/StorageConfig"
+        metadata:
+          $ref: "#/components/schemas/MetadataInfo"
+        termite:
+          $ref: "../../termite/pkg/termite/openapi.yaml#/components/schemas/Config"
+        tls:
+          $ref: "#/components/schemas/TLSInfo"
+        remote_content:
+          $ref: "../../pkg/libaf/scraping/openapi.yaml#/components/schemas/RemoteContentConfig"
+        speech_to_text:
+          type: object
+          additionalProperties:
+            $ref: "../../lib/audio/openapi.yaml#/components/schemas/STTConfig"
+          description: |
+            Named speech-to-text provider configurations.
+
+            Define named STT providers that can be referenced by templates and API calls.
+            The first provider defined becomes the default when no provider name is specified.
+
+            **Example:**
+            ```yaml
+            speech_to_text:
+              whisper-local:
+                provider: termite
+                api_url: "http://localhost:8080"
+                model: openai/whisper-base
+              openai-whisper:
+                provider: openai
+                model: whisper-1
+            ```
+
+            Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
+          example:
+            whisper-local:
+              provider: termite
+              api_url: "http://localhost:8080"
+              model: openai/whisper-base
+            openai-whisper:
+              provider: openai
+              model: whisper-1
+        cors:
+          $ref: "../../lib/middleware/openapi.yaml#/components/schemas/CORSConfig"
+        replication_factor:
+          type: integer
+          description: "How many replicas of each shard should be maintained."
+          minimum: 1
+          maximum: 5
+          example: 3
+          x-go-type: uint64
+        enable_auth:
+          type: boolean
+          description: "Enables authentication and authorization (RBAC) for the API."
+          default: false
+        disable_shard_alloc:
+          type: boolean
+          description: "Disables automatic shard reallocation (splitting/merging)."
+          default: false
+        shard_cooldown_period:
+          type: string
+          description: "Cooldown period after shard operations (start/stop/split). Format: duration string like '1m', '30s'. Default: '1m' (one minute)."
+          example: "1m"
+          x-go-type: time.Duration
+        split_timeout:
+          type: string
+          description: "Maximum duration for a shard split operation before triggering rollback. Format: duration string like '5m', '30s'. Default: '5m' (five minutes)."
+          example: "5m"
+          x-go-type: time.Duration
+        max_shard_size_bytes:
+          type: integer
+          description: "Maximum size of a shard in bytes. Used to determine when to split shards."
+          minimum: 1048576
+          maximum: 46170898227200
+          example: 1073741824
+          x-go-type: uint64
+        max_shards_per_table:
+          type: integer
+          description: "Maximum number of shards that can be created for a single table."
+          minimum: 1
+          example: 100
+          x-go-type: uint64
+        default_shards_per_table:
+          type: integer
+          description: "Default number of shards to create for a new table."
+          minimum: 1
+          example: 4
+          x-go-type: uint64
+        swarm_mode:
+          type: boolean
+          description: "Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node."
+          default: false
+        registry_url:
+          type: string
+          format: uri
+          description: "URL of the model registry for the Antfarm dashboard. Defaults to https://registry.antfly.io/v1"
+          example: "https://registry.antfly.io/v1"
+        embedders:
+          type: object
+          additionalProperties:
+            $ref: "../../lib/embeddings/openapi.yaml#/components/schemas/EmbedderConfig"
+          description: |
+            Named embedder configurations for embedding operations.
+
+            Define named embedders that can be referenced by indexes, templates, and API calls.
+            The first embedder defined becomes the default when no embedder name is specified.
+
+            **API Key Configuration:**
+
+            API keys can be provided via the encrypted keystore (recommended) or environment variables:
+
+            1. **Keystore** (recommended for production):
+               ```bash
+               antfly keystore create
+               antfly keystore add openai.api_key
+               ```
+               Then reference in config: `api_key: ${secret:openai.api_key}`
+
+            2. **Environment variable** (simpler for development):
+               Omit `api_key` from config and set the appropriate env var:
+               - OpenAI: `OPENAI_API_KEY`
+               - Gemini: `GEMINI_API_KEY`
+               - Anthropic: `ANTHROPIC_API_KEY`
+               - Cohere: `COHERE_API_KEY`
+
+            See [Secrets Management](/docs/secrets) for complete documentation.
+
+            **Example:**
+            ```yaml
+            embedders:
+              openai-small:
+                provider: openai
+                model: text-embedding-3-small
+              termite-local:
+                provider: termite
+                model: bge-base-en-v1.5
+                api_url: "http://localhost:8082"
+            ```
+          example:
+            openai-small:
+              provider: openai
+              model: text-embedding-3-small
+            termite-local:
+              provider: termite
+              model: bge-base-en-v1.5
+              api_url: "http://localhost:8082"
+        generators:
+          type: object
+          additionalProperties:
+            $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          description: |
+            Named generator configurations for AI operations.
+
+            Define named generators that can be referenced by chains, templates, and API calls.
+            The first generator defined becomes the default when no generator name is specified.
+
+            **API Key Configuration:**
+
+            API keys can be provided via the encrypted keystore (recommended) or environment variables:
+
+            1. **Keystore** (recommended for production):
+               ```bash
+               antfly keystore create
+               antfly keystore add gemini.api_key
+               ```
+               Then reference in config: `api_key: ${secret:gemini.api_key}`
+
+            2. **Environment variable** (simpler for development):
+               Omit `api_key` from config and set the appropriate env var:
+               - Gemini: `GEMINI_API_KEY`
+               - OpenAI: `OPENAI_API_KEY`
+               - Anthropic: `ANTHROPIC_API_KEY`
+
+            See [Secrets Management](/docs/secrets) for complete documentation.
+
+            **Example:**
+            ```yaml
+            generators:
+              gemini-flash:
+                provider: gemini
+                model: gemini-2.5-flash
+              ollama-local:
+                provider: ollama
+                model: llama3
+              openai-gpt4:
+                provider: openai
+                model: gpt-4.1
+            ```
+          example:
+            gemini-flash:
+              provider: gemini
+              model: gemini-2.5-flash
+            ollama-local:
+              provider: ollama
+              model: llama3
+            openai-gpt4:
+              provider: openai
+              model: gpt-4.1
+        chains:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/NamedChainLink"
+          description: |
+            Named chain configurations for fallback/retry logic.
+
+            Chains are ordered lists of generators with retry and fallback logic.
+            Each link references a generator by name from the `generators` map.
+            The first chain defined becomes the default when no chain name is specified.
+
+            **Chain Conditions:**
+            - `on_error`: Try next generator on any error (default)
+            - `on_rate_limit`: Try next only on rate limit (429) errors
+            - `on_timeout`: Try next only on timeout errors
+            - `always`: Always try the next generator
+
+            **Example:**
+            ```yaml
+            chains:
+              default:
+                - generator: gemini-flash  # Reference by name
+                  retry:
+                    max_attempts: 3
+                  condition: on_rate_limit
+                - generator: ollama-local  # Reference by name
+              with-inline:
+                - generator: gemini-flash
+                - generator_config:  # Inline config
+                    provider: anthropic
+                    model: claude-sonnet-4-5-20250929
+            ```
+
+            Then in API calls: `chain: "default"` or `chain: "with-inline"`
+          example:
+            default:
+              - generator: gemini-flash
+                retry:
+                  max_attempts: 3
+                condition: on_rate_limit
+              - generator: ollama-local
+            with-inline:
+              - generator: gemini-flash
+              - generator_config:
+                  provider: anthropic
+                  model: claude-sonnet-4-5-20250929
+        rerankers:
+          type: object
+          additionalProperties:
+            $ref: "../../lib/reranking/openapi.yaml#/components/schemas/RerankerConfig"
+          description: |
+            Named reranker configurations for search result reranking.
+
+            Define named rerankers that can be referenced by indexes, search queries, and API calls.
+            The first reranker defined becomes the default when no reranker name is specified.
+
+            **Example:**
+            ```yaml
+            rerankers:
+              cohere-english:
+                provider: cohere
+                model: rerank-english-v3.0
+              termite-local:
+                provider: termite
+                model: mxbai-rerank-base-v1
+                url: "http://localhost:8080"
+            ```
+          example:
+            cohere-english:
+              provider: cohere
+              model: rerank-english-v3.0
+            termite-local:
+              provider: termite
+              model: mxbai-rerank-base-v1
+              url: "http://localhost:8080"
+        chunkers:
+          type: object
+          additionalProperties:
+            $ref: "../../lib/chunking/openapi.yaml#/components/schemas/ChunkerConfig"
+          description: |
+            Named chunker configurations for text chunking.
+
+            Define named chunkers that can be referenced by indexes and API calls.
+            The first chunker defined becomes the default when no chunker name is specified.
+
+            **Example:**
+            ```yaml
+            chunkers:
+              fixed-500:
+                provider: termite
+                model: fixed
+                target_tokens: 500
+                overlap_tokens: 50
+              semantic:
+                provider: termite
+                model: semantic-chunker
+                api_url: "http://localhost:8080"
+            ```
+          example:
+            fixed-500:
+              provider: termite
+              model: fixed
+              target_tokens: 500
+              overlap_tokens: 50
+            semantic:
+              provider: termite
+              model: semantic-chunker
+              api_url: "http://localhost:8080"
+
+    NamedChainLink:
+      type: object
+      description: |
+        A link in a chain that can reference a generator by name OR provide an inline config.
+
+        Use `generator` (string) to reference a named generator from the `generators` map.
+        Use `generator_config` (object) to provide an inline generator configuration.
+        Only one of `generator` or `generator_config` should be specified.
+      properties:
+        generator:
+          type: string
+          description: "Name of the generator from the generators map"
+        generator_config:
+          $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          description: "Inline generator configuration (alternative to referencing by name)"
+        retry:
+          $ref: "../../lib/ai/openapi.yaml#/components/schemas/RetryConfig"
+          description: "Retry configuration for this generator"
+        condition:
+          $ref: "../../lib/ai/openapi.yaml#/components/schemas/ChainCondition"
+          description: "When to try the next generator in chain"
+
+    MetadataInfo:
+      type: object
+      required:
+        - orchestration_urls
+      properties:
+        orchestration_urls:
+          type: object
+          description: "Mapping from Metadata Node ID (hex string) to its URL used by store nodes for enrolling into the cluster"
+          additionalProperties:
+            type: string
+            format: uri
+          example:
+            "1": "http://localhost:5001"
+            "2": "http://localhost:5002"
+            "3": "http://localhost:5003"
+
+    TLSInfo:
+      type: object
+      properties:
+        cert:
+          type: string
+          description: "Path to TLS certificate file"
+          example: "/path/to/cert.pem"
+        key:
+          type: string
+          description: "Path to TLS key file"
+          example: "/path/to/key.pem"
+
+    LocalStorageConfig:
+      type: object
+      required:
+        - base_dir
+      properties:
+        base_dir:
+          type: string
+          description: "Root directory for all antfly data storage. Defaults to 'antflydb'."
+          default: "antflydb"
+          minLength: 1
+          example: "antflydb"
+
+    S3Info:
+      type: object
+      allOf:
+        - $ref: "../../pkg/libaf/s3/openapi.yaml#/components/schemas/Credentials"
+        - type: object
+          required:
+            - endpoint
+            - bucket
+          properties:
+            bucket:
+              type: string
+              description: "S3 bucket name where SST files will be stored"
+              minLength: 3
+              maxLength: 63
+              example: "my-antfly-bucket"
+            prefix:
+              type: string
+              description: "Optional path prefix within the bucket (e.g., 'antfly/production/')"
+              example: "production/"
+
+    StorageBackend:
+      type: string
+      description: "Storage backend type"
+      enum:
+        - local
+        - s3
+      default: "local"
+      example: "local"
+
+    StorageConfig:
+      type: object
+      required:
+        - local
+      properties:
+        local:
+          $ref: "#/components/schemas/LocalStorageConfig"
+        data:
+          $ref: "#/components/schemas/StorageBackend"
+        metadata:
+          $ref: "#/components/schemas/StorageBackend"
+        s3:
+          $ref: "#/components/schemas/S3Info"

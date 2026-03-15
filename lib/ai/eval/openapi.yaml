@@ -1,0 +1,219 @@
+openapi: 3.0.3
+info:
+  title: Inline Evaluation Configuration
+  description: |
+    OpenAPI specification for inline evaluation in query endpoints.
+    Supports retrieval metrics (recall, precision, NDCG) and LLM-as-judge metrics
+    (faithfulness, relevance, completeness).
+  version: "1.0.0"
+
+components:
+  schemas:
+    EvalConfig:
+      type: object
+      x-go-type-skip-optional-pointer: true
+      description: |
+        Configuration for inline evaluation of query results.
+        Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+      properties:
+        evaluators:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluatorName"
+          description: List of evaluators to run
+        judge:
+          $ref: "../openapi.yaml#/components/schemas/GeneratorConfig"
+          description: |
+            LLM configuration for judge-based evaluators.
+            Falls back to default if not specified.
+        ground_truth:
+          $ref: "#/components/schemas/GroundTruth"
+          description: Ground truth data for retrieval metrics
+        options:
+          $ref: "#/components/schemas/EvalOptions"
+          description: Evaluation options (k, thresholds, etc.)
+
+    EvaluatorName:
+      type: string
+      enum:
+        # Retrieval metrics (require ground_truth.relevant_ids)
+        - recall
+        - precision
+        - ndcg
+        - mrr
+        - map
+        # LLM-as-judge metrics (require judge config)
+        - relevance
+        - faithfulness
+        - completeness
+        - coherence
+        - safety
+        - helpfulness
+        - correctness
+        - citation_quality
+      description: |
+        Available evaluator types:
+
+        **Retrieval metrics** (require ground_truth.relevant_ids):
+        - recall: Recall@k - fraction of relevant docs retrieved
+        - precision: Precision@k - fraction of retrieved docs that are relevant
+        - ndcg: Normalized Discounted Cumulative Gain
+        - mrr: Mean Reciprocal Rank
+        - map: Mean Average Precision
+
+        **LLM-as-judge metrics** (require judge config):
+        - relevance: Is output relevant to query? (works on retrieval-only too)
+        - faithfulness: Is output grounded in context?
+        - completeness: Does output fully address query?
+        - coherence: Is output well-structured?
+        - safety: Is output safe/appropriate?
+        - helpfulness: Is output useful?
+        - correctness: Is output factually correct? (uses expectations)
+        - citation_quality: Are citations accurate?
+
+    GroundTruth:
+      type: object
+      description: Ground truth data for evaluation
+      properties:
+        relevant_ids:
+          type: array
+          items:
+            type: string
+          description: Document IDs known to be relevant (for retrieval metrics)
+        expectations:
+          type: string
+          description: |
+            Context for evaluators about what to expect in the response.
+            Provides guidance for LLM judges (e.g., "Should mention pricing tiers").
+
+    EvalOptions:
+      type: object
+      description: Options for evaluation behavior
+      properties:
+        k:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 100
+          description: K value for @K metrics (precision@k, recall@k, ndcg@k)
+        pass_threshold:
+          type: number
+          format: float
+          default: 0.5
+          minimum: 0.0
+          maximum: 1.0
+          description: Score threshold for pass/fail determination
+        timeout_seconds:
+          type: integer
+          default: 30
+          minimum: 1
+          maximum: 300
+          description: Timeout for evaluation in seconds
+
+    EvalResult:
+      type: object
+      description: Complete evaluation result
+      properties:
+        scores:
+          $ref: "#/components/schemas/EvalScores"
+          description: Scores organized by category
+        summary:
+          $ref: "#/components/schemas/EvalSummary"
+          description: Aggregate statistics
+        duration_ms:
+          type: integer
+          description: Total evaluation duration in milliseconds
+
+    EvalScores:
+      type: object
+      description: Scores organized by category
+      properties:
+        retrieval:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/EvaluatorScore"
+          description: Retrieval metric scores (recall, precision, ndcg, etc.)
+        generation:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/EvaluatorScore"
+          description: Generation quality scores (faithfulness, relevance, etc.)
+
+    EvaluatorScore:
+      type: object
+      description: Result from a single evaluator
+      properties:
+        score:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: Numeric score (0-1)
+        pass:
+          type: boolean
+          description: Whether the evaluation passed the threshold
+        reason:
+          type: string
+          description: Human-readable explanation of the result
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Additional evaluator-specific data
+
+    EvalSummary:
+      type: object
+      description: Aggregate statistics across all evaluators
+      properties:
+        average_score:
+          type: number
+          format: float
+          description: Average score across all evaluators
+        passed:
+          type: integer
+          description: Number of evaluators that passed
+        failed:
+          type: integer
+          description: Number of evaluators that failed
+        total:
+          type: integer
+          description: Total number of evaluators run
+
+    EvalRequest:
+      type: object
+      x-go-type-skip-optional-pointer: true
+      description: |
+        Standalone evaluation request for POST /eval endpoint.
+        Useful for testing evaluators without running a query.
+      required:
+        - evaluators
+      properties:
+        evaluators:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluatorName"
+          description: List of evaluators to run
+        judge:
+          $ref: "../openapi.yaml#/components/schemas/GeneratorConfig"
+          description: LLM configuration for judge-based evaluators
+        ground_truth:
+          $ref: "#/components/schemas/GroundTruth"
+          description: Ground truth data
+        options:
+          $ref: "#/components/schemas/EvalOptions"
+          description: Evaluation options
+        query:
+          type: string
+          description: Original query/input to evaluate
+        output:
+          type: string
+          description: Generated output to evaluate (optional for retrieval-only)
+        context:
+          type: array
+          items:
+            type: object
+          description: Retrieved documents/context
+        retrieved_ids:
+          type: array
+          items:
+            type: string
+          description: IDs of retrieved documents (for retrieval metrics)

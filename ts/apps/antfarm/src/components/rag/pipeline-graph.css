@@ -1,0 +1,96 @@
+/* DFA Pipeline Graph — Animations & Transitions */
+
+/* Active edge: marching dashes */
+@keyframes pipeline-dash-flow {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+
+/* Running node: pulsing glow */
+@keyframes pipeline-node-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0px var(--color-blue-300, #93c5fd);
+  }
+  50% {
+    box-shadow: 0 0 8px var(--color-blue-300, #93c5fd);
+  }
+}
+
+/* Complete node: brief green flash */
+@keyframes pipeline-node-complete {
+  from {
+    background-color: var(--color-green-100, #dcfce7);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+/* Error node: shake */
+@keyframes pipeline-node-error {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25%,
+  75% {
+    transform: translateX(-3px);
+  }
+  50% {
+    transform: translateX(3px);
+  }
+}
+
+/* Pulse dot traveling along an edge path */
+@keyframes pipeline-edge-pulse {
+  from {
+    offset-distance: 0%;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  90% {
+    opacity: 1;
+  }
+  to {
+    offset-distance: 100%;
+    opacity: 0;
+  }
+}
+
+/* Animation classes */
+
+.pipeline-node-running {
+  animation: pipeline-node-glow 2s ease-in-out infinite;
+}
+
+.pipeline-node-complete-flash {
+  animation: pipeline-node-complete 0.6s ease-out forwards;
+}
+
+.pipeline-node-error-shake {
+  animation: pipeline-node-error 0.4s ease-out;
+}
+
+.pipeline-edge-active {
+  stroke-dasharray: 8 4;
+  animation: pipeline-dash-flow 0.6s linear infinite;
+}
+
+.pipeline-edge-pulse-dot {
+  animation: pipeline-edge-pulse 1.5s ease-in-out infinite;
+}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .pipeline-node-running,
+  .pipeline-node-complete-flash,
+  .pipeline-node-error-shake,
+  .pipeline-edge-active,
+  .pipeline-edge-pulse-dot {
+    animation: none;
+  }
+}

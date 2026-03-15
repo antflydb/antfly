@@ -1,0 +1,142 @@
+openapi: 3.0.3
+info:
+  title: Antfly Schema Types
+  version: 1.0.0
+  description: |
+    Shared schema type definitions used across Antfly.
+    This file defines the core schema types that are referenced by other OpenAPI specs.
+
+components:
+  schemas:
+    AntflyType:
+      type: string
+      description: Field type annotations for schema fields
+      enum:
+        - text
+        - html
+        - keyword
+        - numeric
+        - boolean
+        - datetime
+        - geopoint
+        - geoshape
+        - embedding
+        - blob
+        - link
+        - search_as_you_type
+
+    DocumentSchema:
+      type: object
+      description: Defines the structure of a document type
+      properties:
+        description:
+          type: string
+          description: A description of the document type.
+        schema:
+          type: object
+          additionalProperties: true
+          description: |
+            A valid JSON Schema defining the document's structure.
+            This is used to infer indexing rules and field types.
+
+    TableSchema:
+      type: object
+      description: Schema definition for a table with multiple document types
+      properties:
+        version:
+          type: integer
+          format: uint32
+          description: Version of the schema. Used for migrations.
+        default_type:
+          type: string
+          description: Default type to use from the document_types.
+        enforce_types:
+          type: boolean
+          description: |
+            Whether to enforce that documents must match one of the provided document types.
+            If false, documents not matching any type will be accepted but not indexed.
+        document_schemas:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/DocumentSchema"
+          description: A map of type names to their document json schemas.
+        ttl_field:
+          type: string
+          description: |
+            The field containing the timestamp for TTL expiration (optional).
+            Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+        ttl_duration:
+          type: string
+          description: |
+            The duration after which documents should expire, based on the ttl_field timestamp (optional).
+            Uses Go duration format (e.g., '24h', '7d', '168h').
+        dynamic_templates:
+          type: array
+          items:
+            $ref: "#/components/schemas/DynamicTemplate"
+          description: |
+            Rules for mapping dynamically detected fields. When a document contains fields
+            that don't have explicit mappings and dynamic mapping is enabled, templates are
+            evaluated in order to determine how those fields should be indexed.
+
+    DynamicTemplate:
+      type: object
+      description: |
+        A rule for mapping dynamically detected fields. Templates are checked in order
+        and the first matching template's mapping is used.
+      properties:
+        name:
+          type: string
+          description: Optional identifier for the template (useful for debugging)
+        match:
+          type: string
+          description: |
+            Glob pattern for field name (last path element).
+            Supports * and ** wildcards. Example: "*_text" matches "title_text", "body_text"
+        unmatch:
+          type: string
+          description: |
+            Exclusion pattern for field name. If it matches, the template is skipped.
+            Example: "skip_*" would exclude fields like "skip_this"
+        path_match:
+          type: string
+          description: |
+            Glob pattern for the full dotted path. Supports ** for matching multiple segments.
+            Example: "metadata.**" matches "metadata.author", "metadata.tags.primary"
+        path_unmatch:
+          type: string
+          description: Path exclusion pattern. If it matches the full path, the template is skipped.
+        match_mapping_type:
+          type: string
+          enum: [string, number, boolean, date, object]
+          description: Filter by detected JSON type
+        mapping:
+          $ref: "#/components/schemas/TemplateFieldMapping"
+
+    TemplateFieldMapping:
+      type: object
+      description: Field mapping to apply when a dynamic template matches
+      properties:
+        type:
+          $ref: "#/components/schemas/AntflyType"
+        analyzer:
+          type: string
+          description: |
+            Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer").
+            Used for text fields to control tokenization and normalization.
+        index:
+          type: boolean
+          default: true
+          description: Whether to index the field (default true)
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        doc_values:
+          type: boolean
+          default: false
+          description: Whether to enable doc values for sorting/faceting

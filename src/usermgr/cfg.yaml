@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: usermgr
+generate:
+  std-http-server: true
+  embedded-spec: true
+  models: true
+compatibility:
+  always-prefix-enum-values: true
+output: api.gen.go
+output-options:
+  prefer-skip-optional-pointer: false
+  prefer-skip-optional-pointer-with-omitzero: false

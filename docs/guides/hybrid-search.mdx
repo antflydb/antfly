@@ -1,0 +1,297 @@
+---
+title: Hybrid Search
+description: Combine keyword and semantic search for better results
+---
+
+<Questions>
+- How do I combine full-text and semantic search in AntflyDB?
+- What merge strategies are available for hybrid search?
+- How do I use reranking to improve search relevance?
+- How do I prune low-quality results from search results?
+- When should I use hybrid search vs full-text or semantic search alone?
+</Questions>
+
+## Overview
+
+Hybrid search combines two complementary retrieval methods:
+
+- **Full-text search (BM25)** excels at exact keyword matching. It finds documents containing specific terms, phrases, and field-scoped queries. But it misses synonyms and paraphrases entirely -- searching for "automobile" won't find documents about "cars."
+
+- **Semantic search (vector similarity)** understands meaning. It finds conceptually related documents even when they use different words. But it can miss exact matches that a keyword search would catch instantly.
+
+AntflyDB runs both searches in parallel and fuses the results into a single ranked list. You get the precision of keyword matching and the recall of semantic understanding in one query.
+
+## Getting Started
+
+This guide assumes you have AntflyDB running with the Wikipedia dataset from the [quickstart guide](/docs/guides/quickstart). If you haven't set that up yet, start there first.
+
+### Your First Hybrid Query
+
+A hybrid query uses both `--full-text-search` and `--semantic-search` together:
+
+```bash
+antfly query --table wikipedia \
+  --full-text-search 'body:Einstein' \
+  --semantic-search "theory of relativity and physics" \
+  --indexes "title_body" \
+  --fields "title,url" \
+  --limit 10
+```
+
+The same query via the REST API:
+
+```bash
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "full_text_search": {"query": "body:Einstein"},
+    "semantic_search": "theory of relativity and physics",
+    "indexes": ["title_body"],
+    "fields": ["title", "url"],
+    "limit": 10
+  }'
+```
+
+AntflyDB runs both searches simultaneously, then merges the results using Reciprocal Rank Fusion (the default strategy).
+
+## Merge Strategies
+
+When both full-text and semantic results come back, AntflyDB needs to combine them into a single ranked list. The `merge_strategy` field controls how this happens.
+
+### RRF (Reciprocal Rank Fusion) -- Default
+
+RRF scores each result based on its rank position across both result sets:
+
+```
+score = sum(1 / (k + rank))  for each source where the result appears
+```
+
+The constant `k` is set to 60. A result ranked #1 in both lists gets `1/61 + 1/61 = 0.0328`. A result ranked #1 in one list and #10 in the other gets `1/61 + 1/70 = 0.0307`.
+
+RRF ignores raw scores entirely -- only rank positions matter. This makes it robust across different scoring scales without any tuning. It is the right choice for most use cases.
+
+The tradeoff: because RRF compresses all scores into a narrow range, it can make it harder to distinguish high-relevance results from marginal ones when pruning.
+
+<Callout type="info">
+RRF is the default merge strategy. You do not need to specify it explicitly.
+</Callout>
+
+### RSF (Relative Score Fusion)
+
+RSF normalizes raw scores from each source using min-max normalization, then combines them:
+
+```
+normalized = (score - min) / (max - min)  within a sliding window
+```
+
+Because RSF preserves score magnitude information, it produces a wider spread of fused scores. This makes it a better fit when you plan to use pruning to filter out low-quality results.
+
+```bash
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "full_text_search": {"query": "body:Einstein"},
+    "semantic_search": "theory of relativity",
+    "indexes": ["title_body"],
+    "merge_strategy": "rsf",
+    "limit": 10
+  }'
+```
+
+<Callout type="info">
+RSF supports `weights` and `window_size` parameters internally, but these are not yet exposed in the public query API. Currently RSF uses equal weights for both sources. Weight configuration is coming in a future release. For now, RSF's main advantage over RRF is that it preserves score magnitude, which produces better results when combined with pruning.
+</Callout>
+
+### Failover
+
+Failover is a reliability strategy: it uses semantic search results when available, and falls back to full-text search if embedding generation fails.
+
+```bash
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "full_text_search": {"query": "body:Einstein"},
+    "semantic_search": "theory of relativity",
+    "indexes": ["title_body"],
+    "merge_strategy": "failover",
+    "limit": 10
+  }'
+```
+
+This is useful in production when your embedding service (Termite, Ollama, or an external provider) might be temporarily unavailable. Your queries will always return results.
+
+<Callout type="tip">
+The `merge_strategy` field is available in the REST API. The CLI uses RRF by default and does not currently expose a flag to change it. Use `curl` or the SDKs if you need RSF or failover.
+</Callout>
+
+## Reranking
+
+After fusion, results are ranked but not perfectly ordered. A cross-encoder reranker can re-score each result by looking at the full query-document pair, producing significantly more accurate relevance scores.
+
+```bash
+antfly query --table wikipedia \
+  --full-text-search 'body:Einstein' \
+  --semantic-search "theory of relativity and physics" \
+  --indexes "title_body" \
+  --fields "title,url" \
+  --limit 50 \
+  --reranker '{
+    "provider": "antfly",
+    "field": "body"
+  }'
+```
+
+The `field` parameter tells the reranker which document field to score against the query. The built-in `antfly` reranker uses a cross-encoder model bundled in the binary. For larger or custom models, use `"provider": "termite"` with a model like `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+
+<Callout type="tip">
+Retrieve more results than you need (50-100), then let the reranker sort them. Reranking a larger candidate set produces better final results than reranking a small set. The reranker typically adds 100-500ms of latency.
+</Callout>
+
+## Pruning
+
+Pruning filters out low-quality results after fusion (and after reranking, if configured). Instead of returning a fixed number of results, pruning returns only the results that meet a quality threshold.
+
+This is especially valuable for RAG pipelines, where sending marginally relevant documents to an LLM adds noise and degrades answer quality.
+
+### Pruning Strategies
+
+You can combine multiple strategies in a single pruner configuration:
+
+**`min_score_ratio`** -- Keep results scoring at least X% of the top result.
+
+```json
+{"min_score_ratio": 0.5}
+```
+
+A value of `0.5` keeps results with at least half the score of the best result.
+
+**`max_score_gap_percent`** -- Stop when the score drops too sharply from one result to the next.
+
+```json
+{"max_score_gap_percent": 30}
+```
+
+This detects "elbows" in the score distribution. A value of `30` stops returning results when a score drops more than 30% from the previous result.
+
+**`min_absolute_score`** -- Hard floor on score values.
+
+```json
+{"min_absolute_score": 0.01}
+```
+
+**`std_dev_threshold`** -- Statistical outlier removal. Keeps results within N standard deviations below the mean.
+
+```json
+{"std_dev_threshold": 1.5}
+```
+
+**`require_multi_index`** -- Only keep results that appear in both full-text and vector results.
+
+```json
+{"require_multi_index": true}
+```
+
+### Example with Pruning
+
+```bash
+antfly query --table wikipedia \
+  --full-text-search 'body:Einstein' \
+  --semantic-search "theory of relativity and physics" \
+  --indexes "title_body" \
+  --fields "title,url" \
+  --limit 50 \
+  --pruner '{"min_score_ratio": 0.5, "max_score_gap_percent": 30}'
+```
+
+<Callout type="tip">
+When using pruning with hybrid search, consider RSF over RRF as your merge strategy. RSF produces a wider score distribution, which gives pruning strategies more signal to work with.
+</Callout>
+
+## Putting It All Together
+
+Here is a complete hybrid search pipeline that combines all the pieces: full-text search, semantic search, merge strategy, reranking, and pruning.
+
+```bash
+curl -X POST http://localhost:8080/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "full_text_search": {"query": "body:Einstein"},
+    "semantic_search": "theory of relativity and physics",
+    "indexes": ["title_body"],
+    "fields": ["title", "body", "url"],
+    "merge_strategy": "rsf",
+    "limit": 50,
+    "reranker": {
+      "provider": "antfly",
+      "field": "body"
+    },
+    "pruner": {
+      "min_score_ratio": 0.5,
+      "max_score_gap_percent": 40
+    }
+  }'
+```
+
+This query:
+
+1. Runs a BM25 keyword search for "Einstein" in the body field
+2. Runs a semantic similarity search for "theory of relativity and physics"
+3. Fuses results using RSF (preserving score magnitude)
+4. Reranks the top 50 candidates with a cross-encoder model
+5. Prunes results below 50% of the top score or where the score drops sharply
+
+### Feeding Into RAG
+
+The same pipeline works with `antfly agents retrieval` to generate AI-powered answers from the search results:
+
+```bash
+antfly agents retrieval --table wikipedia \
+  --full-text-search 'body:Einstein' \
+  --semantic-search "What is the theory of relativity?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 50 \
+  --reranker '{
+    "provider": "antfly",
+    "field": "body"
+  }' \
+  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
+  --generator '{
+    "provider": "ollama",
+    "ollama": {
+      "model": "gemma3:4b-it-qat",
+      "url": "http://localhost:11434"
+    }
+  }' \
+  --system-prompt "Answer the question based on the provided context."
+```
+
+See the [quickstart guide](/docs/guides/quickstart#rag-retrieval-augmented-generation) for more on setting up RAG with Ollama.
+
+## When to Use What
+
+| Scenario | Approach |
+|----------|----------|
+| Users search for exact terms, IDs, error messages, or codes | Full-text search only |
+| Users describe what they want in natural language | Semantic search only |
+| General-purpose search with no tuning needed | Hybrid with RRF (default) |
+| Need score-aware fusion, especially with pruning | Hybrid with RSF |
+| Embedding service might be unavailable | Hybrid with failover |
+| High-precision use cases (RAG, question answering) | Hybrid + reranking |
+| Want to automatically filter irrelevant results | Hybrid + pruning |
+| Production RAG pipeline | Hybrid + reranking + pruning |
+
+<Callout type="info">
+You can always start with the defaults (hybrid search with RRF, no reranking, no pruning) and layer in additional stages as needed. Each stage is independent and optional.
+</Callout>
+
+## Additional Resources
+
+- [Getting Started](/docs/guides/quickstart) -- Set up AntflyDB and load the Wikipedia dataset
+- [REST API Reference](/docs/api) -- Full query API documentation
+- [Termite Guide](/docs/guides/termite) -- Configure custom embedding and reranking models
+- [Configuration Reference](/docs/configuration) -- Server and index configuration options

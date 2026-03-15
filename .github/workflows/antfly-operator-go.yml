@@ -1,0 +1,53 @@
+# Antfly Operator CI workflow
+# Tests, lints, and builds the Kubernetes operator
+
+name: Antfly Operator Tests
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - 'pkg/operator/**'
+      - '.github/workflows/antfly-operator-go.yml'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'pkg/operator/**'
+      - '.github/workflows/antfly-operator-go.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    defaults:
+      run:
+        working-directory: pkg/operator
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set Go experiment
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Download dependencies
+        run: GOWORK=off go mod download
+
+      - name: Run tests
+        run: make test
+
+      - name: Run lint
+        run: make lint
+
+      - name: Build
+        run: make build
