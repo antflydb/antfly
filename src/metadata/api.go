@@ -88,6 +88,65 @@ type ClusterApi struct {
 	logger *zap.Logger
 }
 
+func tableSchemaSnapshot(tableSchema *schema.TableSchema) schema.TableSchema {
+	if tableSchema == nil {
+		return schema.TableSchema{}
+	}
+	return *tableSchema
+}
+
+func tableMigration(table *store.Table) *TableMigration {
+	if table.ReadSchema == nil {
+		return nil
+	}
+	return &TableMigration{
+		State:      TableMigrationStateRebuilding,
+		ReadSchema: *table.ReadSchema,
+	}
+}
+
+func tableShardsMap(table *store.Table) map[string]ShardConfig {
+	shards := make(map[string]ShardConfig, len(table.Shards))
+	for id, shard := range table.Shards {
+		shards[id.String()] = ShardConfig{
+			ByteRange: ByteRange{shard.ByteRange[0], shard.ByteRange[1]},
+		}
+	}
+	return shards
+}
+
+func tableResponse(table *store.Table) Table {
+	return Table{
+		Name:               table.Name,
+		Description:        table.Description,
+		Shards:             tableShardsMap(table),
+		Indexes:            table.Indexes,
+		Schema:             tableSchemaSnapshot(table.Schema),
+		Migration:          tableMigration(table),
+		ReplicationSources: replicationSourcesToAPI(table.ReplicationSources),
+	}
+}
+
+func tableStatusResponse(
+	table *store.Table,
+	tm *tablemgr.TableManager,
+) TableStatus {
+	diskSize, empty := tableStorageStatus(table, tm)
+	return TableStatus{
+		Name:               table.Name,
+		Description:        table.Description,
+		Shards:             tableShardsMap(table),
+		Indexes:            normalizeTableIndexTypes(table.Indexes),
+		Schema:             tableSchemaSnapshot(table.Schema),
+		Migration:          tableMigration(table),
+		ReplicationSources: replicationSourcesToAPI(table.ReplicationSources),
+		StorageStatus: StorageStatus{
+			DiskUsage: diskSize,
+			Empty:     empty,
+		},
+	}
+}
+
 // handleGetStatus returns the current status of all stores and shards
 func (ca *ClusterApi) GetStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -251,29 +310,7 @@ func (t *TableApi) ListTables(w http.ResponseWriter, r *http.Request, params Lis
 
 	tableStatus := make([]TableStatus, len(tables))
 	for i, table := range tables {
-		shards := make(map[string]ShardConfig, len(table.Shards))
-		for id, shard := range table.Shards {
-			shards[id.String()] = ShardConfig{
-				ByteRange: ByteRange{shard.ByteRange[0], shard.ByteRange[1]},
-			}
-		}
-		diskSize, empty := tableStorageStatus(table, t.tm)
-		var tableSchema schema.TableSchema
-		if table.Schema != nil {
-			tableSchema = *table.Schema
-		}
-		tableStatus[i] = TableStatus{
-			Name:               table.Name,
-			Description:        table.Description,
-			Shards:             shards,
-			Indexes:            normalizeTableIndexTypes(table.Indexes),
-			Schema:             tableSchema,
-			ReplicationSources: replicationSourcesToAPI(table.ReplicationSources),
-			StorageStatus: StorageStatus{
-				DiskUsage: diskSize,
-				Empty:     empty,
-			},
-		}
+		tableStatus[i] = tableStatusResponse(table, t.tm)
 	}
 
 	// Return the enhanced response as JSON
@@ -314,31 +351,7 @@ func (t *TableApi) GetTable(w http.ResponseWriter, r *http.Request, tableName st
 		return
 	}
 
-	// Collect status information
-	shards := make(map[string]ShardConfig, len(table.Shards))
-	for id, shard := range table.Shards {
-		shards[id.String()] = ShardConfig{
-			ByteRange: ByteRange{shard.ByteRange[0], shard.ByteRange[1]},
-		}
-	}
-	diskSize, empty := tableStorageStatus(table, t.tm)
-
-	var tableSchema schema.TableSchema
-	if table.Schema != nil {
-		tableSchema = *table.Schema
-	}
-	tableStatus := TableStatus{
-		Name:               table.Name,
-		Description:        table.Description,
-		Shards:             shards,
-		Indexes:            normalizeTableIndexTypes(table.Indexes),
-		Schema:             tableSchema,
-		ReplicationSources: replicationSourcesToAPI(table.ReplicationSources),
-		StorageStatus: StorageStatus{
-			DiskUsage: diskSize,
-			Empty:     empty,
-		},
-	}
+	tableStatus := tableStatusResponse(table, t.tm)
 
 	// Return the enhanced response as JSON
 	w.Header().Set("Content-Type", "application/json")
@@ -487,23 +500,7 @@ func (t *TableApi) CreateTable(w http.ResponseWriter, r *http.Request, tableName
 	}
 	t.logger.Debug("Triggering shard reconciliation", zap.String("tableName", tableName))
 	t.ln.TriggerReconciliation()
-	var tableSchema schema.TableSchema
-	if table.Schema != nil {
-		tableSchema = *table.Schema
-	}
-	resp := Table{
-		Name:               table.Name,
-		Description:        table.Description,
-		Shards:             map[string]ShardConfig{},
-		Indexes:            table.Indexes,
-		Schema:             tableSchema,
-		ReplicationSources: replicationSourcesToAPI(table.ReplicationSources),
-	}
-	for id, shard := range table.Shards {
-		resp.Shards[id.String()] = ShardConfig{
-			ByteRange: ByteRange{shard.ByteRange[0], shard.ByteRange[1]},
-		}
-	}
+	resp := tableResponse(table)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -1501,22 +1498,7 @@ func (t *TableApi) UpdateSchema(w http.ResponseWriter, r *http.Request, tableNam
 		return
 	}
 	t.ln.TriggerReconciliation()
-	var updateSchema schema.TableSchema
-	if table.Schema != nil {
-		updateSchema = *table.Schema
-	}
-	resp := Table{
-		Name:               table.Name,
-		Shards:             map[string]ShardConfig{},
-		Indexes:            table.Indexes,
-		Schema:             updateSchema,
-		ReplicationSources: replicationSourcesToAPI(table.ReplicationSources),
-	}
-	for id, shard := range table.Shards {
-		resp.Shards[id.String()] = ShardConfig{
-			ByteRange: ByteRange{shard.ByteRange[0], shard.ByteRange[1]},
-		}
-	}
+	resp := tableResponse(table)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {

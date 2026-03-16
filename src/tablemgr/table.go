@@ -1007,7 +1007,7 @@ func (tm *TableManager) DropReadSchema(tableName string) error {
 	}
 	versionSuffix := fmt.Sprintf("_v%d", table.ReadSchema.Version)
 	for idxName, idx := range table.Indexes {
-		if idx.Type != indexes.IndexTypeFullTextV0 {
+		if idx.Type != indexes.IndexTypeFullTextV0 && idx.Type != indexes.IndexTypeFullText {
 			continue
 		}
 		if strings.HasSuffix(idxName, versionSuffix) {

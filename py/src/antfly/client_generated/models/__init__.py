@@ -261,6 +261,8 @@ from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table_backup_status import TableBackupStatus
 from .table_backup_status_status import TableBackupStatusStatus
+from .table_migration import TableMigration
+from .table_migration_state import TableMigrationState
 from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
@@ -563,6 +565,8 @@ __all__ = (
     "SyncLevel",
     "TableBackupStatus",
     "TableBackupStatusStatus",
+    "TableMigration",
+    "TableMigrationState",
     "TableRestoreStatus",
     "TableRestoreStatusStatus",
     "TableSchema",

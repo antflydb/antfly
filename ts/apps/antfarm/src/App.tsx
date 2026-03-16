@@ -92,7 +92,6 @@ function AppContent() {
                           element={
                             <TableDetailsPage
                               currentSection={currentSection}
-                              onSectionChange={setCurrentSection}
                             />
                           }
                         />

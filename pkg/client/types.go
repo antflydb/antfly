@@ -28,6 +28,7 @@ type (
 	// Table and Index types
 	CreateTableRequest = oapi.CreateTableRequest
 	TableStatus        = oapi.TableStatus
+	TableMigration     = oapi.TableMigration
 	TableSchema        = oapi.TableSchema
 	IndexConfig        = oapi.IndexConfig
 	IndexStatus        = oapi.IndexStatus

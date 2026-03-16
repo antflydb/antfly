@@ -173,6 +173,7 @@ export type {
   SparseEmbedding,
   // Table types
   Table,
+  TableMigration,
   TableSchema,
   TableStatus,
   TraversalResult,

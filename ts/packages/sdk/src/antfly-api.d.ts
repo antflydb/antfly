@@ -1141,8 +1141,16 @@ export interface components {
                 [key: string]: components["schemas"]["ShardConfig"];
             };
             schema?: components["schemas"]["TableSchema"];
+            /** @description Present only when the table is migrating between schema versions. Absent means the table is stable. */
+            migration?: components["schemas"]["TableMigration"];
             /** @description PostgreSQL CDC replication sources configured for this table. */
             replication_sources?: components["schemas"]["ReplicationSource"][];
+        };
+        /** @description Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema. */
+        TableMigration: {
+            /** @enum {string} */
+            state: "rebuilding";
+            read_schema: components["schemas"]["TableSchema"];
         };
         /**
          * @description Type of aggregation to compute:

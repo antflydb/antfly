@@ -1608,12 +1608,29 @@ components:
             $ref: "#/components/schemas/ShardConfig"
         schema:
           $ref: "../../lib/schema/openapi.yaml#/components/schemas/TableSchema"
+        migration:
+          description: Present only when the table is migrating between schema versions. Absent means the table is stable.
+          $ref: "#/components/schemas/TableMigration"
         replication_sources:
           type: array
           items:
             $ref: "#/components/schemas/ReplicationSource"
           description: |
             PostgreSQL CDC replication sources configured for this table.
+    TableMigration:
+      x-go-type-skip-optional-pointer: false
+      type: object
+      description: Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
+      required:
+        - state
+        - read_schema
+      properties:
+        state:
+          type: string
+          enum:
+            - rebuilding
+        read_schema:
+          $ref: "../../lib/schema/openapi.yaml#/components/schemas/TableSchema"
     # Aggregation schemas
     AggregationType:
       type: string

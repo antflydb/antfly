@@ -118,6 +118,13 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 	require.Less(t, resp.StatusCode, 300, "UpdateSchema returned error status %d", resp.StatusCode)
 	t.Log("Schema updated, full_text_index_v1 should now be created")
 
+	tableStatus, err := swarm.Client.GetTable(ctx, tableName)
+	require.NoError(t, err, "GetTable after schema update failed")
+	require.NotNil(t, tableStatus.Migration, "migration should be present during rebuild")
+	require.Equal(t, "rebuilding", string(tableStatus.Migration.State))
+	require.Equal(t, uint32(0), tableStatus.Migration.ReadSchema.Version, "read_schema should still serve v0")
+	require.Equal(t, uint32(1), tableStatus.Schema.Version, "schema should advance to v1")
+
 	// Verify both index versions now exist.
 	indexes, err := swarm.Client.ListIndexes(ctx, tableName)
 	require.NoError(t, err)
@@ -140,6 +147,11 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, indexes, "full_text_index_v0", "v0 should be dropped")
 	require.Contains(t, indexes, "full_text_index_v1", "v1 should remain")
+
+	tableStatus, err = swarm.Client.GetTable(ctx, tableName)
+	require.NoError(t, err, "GetTable after reconciler cleanup failed")
+	require.Nil(t, tableStatus.Migration, "migration should be absent when stable")
+	require.Equal(t, uint32(1), tableStatus.Schema.Version, "schema should remain on v1")
 
 	// Verify data integrity: a specific document is still accessible.
 	doc, err := swarm.Client.LookupKey(ctx, tableName, "doc-0500")

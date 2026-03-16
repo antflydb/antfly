@@ -1,8 +1,9 @@
-import type { IndexStatus, QueryRequest, QueryResult } from "@antfly/sdk";
+import type { IndexStatus, QueryRequest, QueryResult, Table as AntflyTable } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
+import { ChevronRight } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import {
   Accordion,
   AccordionContent,
@@ -154,7 +155,6 @@ function Row(props: {
 
 interface TableDetailsPageProps {
   currentSection?: string;
-  onSectionChange?: (section: string) => void;
 }
 
 const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "indexes" }) => {
@@ -162,6 +162,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
   const { tableName } = useParams<{ tableName: string }>();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
   const [tableSchema, setTableSchema] = useState<TableSchema | null>(null);
+  const [migration, setMigration] = useState<AntflyTable["migration"]>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [openCreateDialog, setOpenCreateDialog] = useState(false);
   const [openDropDialog, setOpenDropDialog] = useState(false);
@@ -304,17 +305,17 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
   const fetchTableSchema = useCallback(async () => {
     if (!tableName) return;
     try {
-      const response = (await api.tables.get(tableName)) as {
-        schema: TableSchema;
-      };
-      if (response.schema && Object.keys(response.schema).length > 0) {
-        setTableSchema(response.schema);
+      const response = await api.tables.get(tableName);
+      if (response?.schema && Object.keys(response.schema).length > 0) {
+        setTableSchema(response.schema as TableSchema);
       } else {
         setTableSchema(null);
       }
+      setMigration(response?.migration);
     } catch {
       // This is a 404, so we can ignore it.
       setTableSchema(null);
+      setMigration(undefined);
     }
   }, [tableName]);
 
@@ -522,8 +523,37 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
     return basicFields.sort((a, b) => a.fieldName.localeCompare(b.fieldName));
   }, [tableSchema]);
 
+  const sectionLabels: Record<string, string> = {
+    indexes: "Indexes",
+    schema: "Schema",
+    semantic: "Search",
+    faceted: "Component Builder",
+    bulk: "Upload",
+    "document-builder": "Document Builder",
+  };
+
   return (
     <div>
+      {/* Breadcrumb navigation */}
+      <nav className="flex items-center gap-1.5 text-sm text-muted-foreground mb-4">
+        <Link to="/" className="hover:text-foreground transition-colors">
+          Tables
+        </Link>
+        <ChevronRight className="size-3.5" />
+        <span className="font-medium text-foreground">{tableName}</span>
+        <ChevronRight className="size-3.5" />
+        <span>{sectionLabels[currentSection] ?? currentSection}</span>
+      </nav>
+
+      {migration && (
+        <Alert className="mb-4 border-amber-400 bg-amber-50 dark:border-amber-600 dark:bg-amber-950">
+          <AlertDescription className="text-amber-800 dark:text-amber-200">
+            <span className="font-medium">Schema migration in progress</span> — rebuilding full-text indexes.
+            Reads are served from schema v{migration.read_schema.version} while
+            v{tableSchema?.version ?? "?"} is being built.
+          </AlertDescription>
+        </Alert>
+      )}
       {error && <p className="text-red-500">{error}</p>}
       <div className="space-y-6">
         {/* Indexes Section */}

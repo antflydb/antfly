@@ -64,6 +64,7 @@ export interface BatchRequest {
 export type Table = components["schemas"]["Table"];
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
+export type TableMigration = components["schemas"]["TableMigration"];
 export type TableStatus = components["schemas"]["TableStatus"];
 
 // Index types

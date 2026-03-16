@@ -21,7 +21,6 @@ replace github.com/blevesearch/bleve/v2 => github.com/antflydb/bleve/v2 v2.5.8-a
 replace github.com/tidwall/wal => github.com/ajroetker/wal v0.0.0-antfly000
 
 replace (
-	github.com/gomlx/go-huggingface => github.com/ajroetker/go-huggingface v0.0.0-antfly002
 	github.com/gomlx/gomlx => github.com/ajroetker/gomlx v0.0.0-antfly008
 	github.com/gomlx/onnx-gomlx => github.com/ajroetker/onnx-gomlx v0.0.0-antfly008
 	github.com/knights-analytics/ortgenai => github.com/ajroetker/ortgenai v0.1.1-antfly002
@@ -165,7 +164,7 @@ require (
 	github.com/gomlx/exceptions v0.0.3 // indirect
 	github.com/gomlx/go-coreml v0.0.0-20260301010621-8fdf6ad8655e // indirect
 	github.com/gomlx/go-coreml/gomlx v0.0.0-20260301010621-8fdf6ad8655e // indirect
-	github.com/gomlx/go-huggingface v0.3.2-0.20260125064416-b0f56ca7fbef // indirect
+	github.com/gomlx/go-huggingface v0.3.3-0.20260316090437-1a6ca7ca09c4 // indirect
 	github.com/gomlx/go-xla v0.2.0 // indirect
 	github.com/gomlx/gomlx v0.26.1-0.20260220075116-8da82ca8aaad // indirect
 	github.com/gomlx/onnx-gomlx v0.3.5-0.20260130173634-2497f2c7652f // indirect

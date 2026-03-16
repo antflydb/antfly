@@ -164,8 +164,13 @@ func printTableList(tables []antfly.TableStatus) {
 			emptyStr = ", empty"
 		}
 
-		fmt.Fprintf(os.Stderr, "  - %s (shards: %d, indexes: %d, disk: %s%s)\n",
-			table.Name, shardCount, indexCount, diskUsageStr, emptyStr)
+		migrationStr := ""
+		if table.Migration != nil {
+			migrationStr = fmt.Sprintf(", migration: %s", table.Migration.State)
+		}
+
+		fmt.Fprintf(os.Stderr, "  - %s (shards: %d, indexes: %d, disk: %s%s%s)\n",
+			table.Name, shardCount, indexCount, diskUsageStr, emptyStr, migrationStr)
 
 		if len(table.Schema.DefaultType) > 0 {
 			fmt.Fprintf(os.Stderr, "    DefaultType: %v\n", table.Schema.DefaultType)
@@ -833,6 +838,11 @@ func printTableStatus(table *antfly.TableStatus) {
 	fmt.Fprintf(os.Stderr, "  Disk Usage: %s\n", diskUsageStr)
 	if table.StorageStatus.Empty {
 		fmt.Fprintf(os.Stderr, "  Empty: true\n")
+	}
+
+	if table.Migration != nil {
+		fmt.Fprintf(os.Stderr, "  Migration: %s (serving reads from schema v%d)\n",
+			table.Migration.State, table.Migration.ReadSchema.Version)
 	}
 
 	if len(table.Schema.DefaultType) > 0 {

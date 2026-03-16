@@ -167,8 +167,6 @@ github.com/agnivade/levenshtein v1.2.1 h1:EHBY3UOn1gwdy/VbFwgo4cxecRznFk7fKWN1KO
 github.com/agnivade/levenshtein v1.2.1/go.mod h1:QVVI16kDrtSuwcpd0p1+xMC6Z/VfhtCyDIjcwga4/DU=
 github.com/ajroetker/go-highway v0.0.12 h1:OcGp/l/W7WQtH5ELLuNnKXCuR7ePpWGh2RWZI/INtck=
 github.com/ajroetker/go-highway v0.0.12/go.mod h1:un7fcrwix7UOHJrr18Lgh5eeF+1yaZiGWdTw3FbfDv4=
-github.com/ajroetker/go-huggingface v0.0.0-antfly002 h1:Y/kG+D27NSxpPdajDWqwxgOlnIAgWA1EAD/U8+Pik5s=
-github.com/ajroetker/go-huggingface v0.0.0-antfly002/go.mod h1:SlU1LotT8Qh70wHqxUch1osKv3d7UQkSGqwOizdmXa0=
 github.com/ajroetker/go-jpeg2000 v0.0.2 h1:ni8brffZrci4Kacx3nM5d92ipmTDfak84KgHYi6IxFw=
 github.com/ajroetker/go-jpeg2000 v0.0.2/go.mod h1:7ld88W47lZy0x8gRQesRGAonDPOpr6ev8rckjCAfbzE=
 github.com/ajroetker/gomlx v0.0.0-antfly008 h1:gR4QU267YK+1N0tC23nip7NpVSqyGa+aZuCBVCqBnp0=
@@ -679,6 +677,8 @@ github.com/gomlx/go-coreml v0.0.0-20260301010621-8fdf6ad8655e h1:dTMN+0LOhEKnNcx
 github.com/gomlx/go-coreml v0.0.0-20260301010621-8fdf6ad8655e/go.mod h1:iZG+LBo+jgnd44RMPJCVDfYmDaIH5P7mg5p2rVNoaIM=
 github.com/gomlx/go-coreml/gomlx v0.0.0-20260301010621-8fdf6ad8655e h1:+EMDGV26SOEbpzypqAICKVdX8h74bN+mNC8oQMAuWnk=
 github.com/gomlx/go-coreml/gomlx v0.0.0-20260301010621-8fdf6ad8655e/go.mod h1:R++KkcIEfEioRbwtJKJtdVZmjKvx35tmHWLgp868U9Q=
+github.com/gomlx/go-huggingface v0.3.3-0.20260316090437-1a6ca7ca09c4 h1:kB/beMIoOg6RsNeKe3MZpUWrILuNKyZB/I1Vj1K3FXU=
+github.com/gomlx/go-huggingface v0.3.3-0.20260316090437-1a6ca7ca09c4/go.mod h1:SlU1LotT8Qh70wHqxUch1osKv3d7UQkSGqwOizdmXa0=
 github.com/gomlx/go-xla v0.2.0 h1:vPRgGjKUaN4Pq58ZswWtiKNGUkqcbUj95YmvELZNvTA=
 github.com/gomlx/go-xla v0.2.0/go.mod h1:T2CsL/E90te3k4qpuzlXv2uQU2FmLMLfUsRlAGqKSuI=
 github.com/google/certificate-transparency-go v1.3.2 h1:9ahSNZF2o7SYMaKaXhAumVEzXB2QaayzII9C8rv7v+A=

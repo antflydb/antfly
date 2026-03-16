@@ -1010,10 +1010,7 @@ func TestTableManager_UpdateSchema_UpdatesShardStatuses(t *testing.T) {
 		StartID:   100,
 		Schema:    initialSchema,
 		Indexes: map[string]indexes.IndexConfig{
-			"full_text_index_v0": {
-				Name: "full_text_index_v0",
-				Type: indexes.IndexTypeFullTextV0,
-			},
+			"full_text_index_v0": *indexes.NewFullTextIndexConfig("full_text_index_v0", false),
 		},
 	}
 

@@ -4,6 +4,7 @@ import { Trash2, X } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -221,16 +222,23 @@ const TablesListPage: React.FC = () => {
               <TableCell>{Object.keys(table.shards).length}</TableCell>
               <TableCell>{Object.keys(table.indexes).length}</TableCell>
               <TableCell>
-                {table.storage_status ? (
-                  <>
-                    {table.storage_status.empty && <span>Empty</span>}
-                    {table.storage_status.disk_usage !== undefined && (
-                      <span>{formatBytes(table.storage_status.disk_usage)}</span>
-                    )}
-                  </>
-                ) : (
-                  "N/A"
-                )}
+                <div className="flex items-center gap-2">
+                  {table.migration && (
+                    <Badge variant="outline" className="text-amber-600 border-amber-400 bg-amber-50 dark:text-amber-400 dark:border-amber-600 dark:bg-amber-950">
+                      Rebuilding v{table.migration.read_schema.version} → v{table.schema?.version ?? "?"}
+                    </Badge>
+                  )}
+                  {table.storage_status ? (
+                    <>
+                      {table.storage_status.empty && <span>Empty</span>}
+                      {table.storage_status.disk_usage !== undefined && (
+                        <span>{formatBytes(table.storage_status.disk_usage)}</span>
+                      )}
+                    </>
+                  ) : (
+                    "N/A"
+                  )}
+                </div>
               </TableCell>
               <TableCell>
                 <Button
