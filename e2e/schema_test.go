@@ -35,7 +35,7 @@ import (
 // skip setting rebuilding=false when total docs was an exact multiple of the
 // backfill batch size (1000).
 func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
-	skipUnlessEnv(t, "RUN_SCHEMA_MIGRATION_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
 	// Start a single-node swarm without Termite (only full-text indexing needed).

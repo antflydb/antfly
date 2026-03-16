@@ -38,14 +38,31 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
-// skipUnlessEnv skips the test in short mode or if the given env var is not "true".
-func skipUnlessEnv(t *testing.T, envVar string) {
+// skipInShortMode skips the test when -short is passed.
+func skipInShortMode(t *testing.T) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("Skipping e2e test in short mode")
 	}
-	if os.Getenv(envVar) != "true" {
-		t.Skipf("Set %s=true to run", envVar)
+}
+
+// skipUnlessML skips the test unless RUN_ML_TESTS=true. Use for tests that
+// require large model downloads (Ollama, ONNX CLIP/CLAP, etc.).
+func skipUnlessML(t *testing.T) {
+	t.Helper()
+	skipInShortMode(t)
+	if os.Getenv("RUN_ML_TESTS") != "true" {
+		t.Skip("Skipping ML test (set RUN_ML_TESTS=true to run)")
+	}
+}
+
+// skipUnlessPG skips the test unless RUN_PG_TESTS=true. Use for tests that
+// require a running PostgreSQL instance.
+func skipUnlessPG(t *testing.T) {
+	t.Helper()
+	skipInShortMode(t)
+	if os.Getenv("RUN_PG_TESTS") != "true" {
+		t.Skip("Skipping PostgreSQL test (set RUN_PG_TESTS=true to run)")
 	}
 }
 

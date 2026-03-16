@@ -44,14 +44,14 @@ ollama pull embeddinggemma
 
 ## Running the Tests
 
-### Run all e2e tests
-```bash
-go test -v ./e2e -timeout 15m
-```
+Most e2e tests run by default. Only tests requiring external services or large
+model downloads are gated behind environment variables.
 
-### Run specific test
+### Run all default e2e tests
 ```bash
-go test -v ./e2e -run TestE2E_RetrievalAgent_DocsEval -timeout 15m
+make e2e                            # All default tests (downloads ONNX deps on first run)
+make e2e E2E_TEST=TestName          # Run specific test
+make e2e E2E_TIMEOUT=45m            # Custom timeout (default: 30m)
 ```
 
 ### Skip e2e tests in short mode
@@ -60,23 +60,30 @@ go test -short ./e2e
 # All e2e tests will be skipped
 ```
 
-### Skip if Ollama unavailable
+### Gated test suites
+
+| Flag | Tests | Requires |
+|------|-------|----------|
+| `RUN_ML_TESTS=true` | Eval, retrieval generation, backup/restore with embeddings, remote content (CLIP/CLAP) | Ollama or large ONNX model downloads |
+| `RUN_PG_TESTS=true` | Foreign table queries, CDC replication | Running PostgreSQL instance |
+
 ```bash
-SKIP_OLLAMA_TESTS=1 go test ./e2e
-# Tests requiring Ollama will be skipped
+# Run ML tests (requires Ollama or model downloads)
+RUN_ML_TESTS=true make e2e E2E_TIMEOUT=45m
+
+# Run PostgreSQL tests
+RUN_PG_TESTS=true ANTFLY_E2E_PG_DSN=postgres://... cd e2e && go test -v ./... -timeout 10m
 ```
 
 ### Using Gemini instead of Ollama
 
-By default, e2e tests use Ollama for embeddings and generation. To use Google Gemini instead:
+By default, ML e2e tests use Ollama for embeddings and generation. To use Google Gemini instead:
 
 ```bash
-# Set provider and API key
 export E2E_PROVIDER=gemini
 export GEMINI_API_KEY=your-api-key
 
-# Run tests with Gemini
-RUN_EVAL_TESTS=true go test -v ./e2e -run TestE2E_RetrievalAgent_DocsEval -timeout 45m
+RUN_ML_TESTS=true go test -v ./e2e -run TestE2E_RetrievalAgent_DocsEval -timeout 45m
 ```
 
 This uses:
@@ -98,13 +105,13 @@ The `TestE2E_RetrievalAgent_DocsEval` test supports backing up and restoring the
 
 **First run (creates backup):**
 ```bash
-RUN_EVAL_TESTS=true go test -v ./e2e -run TestE2E_RetrievalAgent_DocsEval -timeout 45m
+RUN_ML_TESTS=true go test -v ./e2e -run TestE2E_RetrievalAgent_DocsEval -timeout 45m
 # Takes ~40 minutes, creates backup in e2e/backups/
 ```
 
 **Subsequent runs (restore from backup):**
 ```bash
-RUN_EVAL_TESTS=true RESTORE_DB=true go test -v ./e2e -run TestE2E_RetrievalAgent_DocsEval -timeout 10m
+RUN_ML_TESTS=true RESTORE_DB=true go test -v ./e2e -run TestE2E_RetrievalAgent_DocsEval -timeout 10m
 # Takes ~2-3 minutes, restores from backup
 ```
 

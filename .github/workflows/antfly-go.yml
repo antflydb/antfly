@@ -188,32 +188,13 @@ jobs:
       - name: Stop Ollama before E2E tests
         run: pkill ollama || true
 
-      - name: E2E Quickstart Test
+      - name: E2E Tests
         run: |
-          make e2e E2E_TEST=TestE2E_Quickstart E2E_TIMEOUT=10m
+          make e2e E2E_TIMEOUT=45m
 
-      - name: E2E Schema Migration Test
-        run: |
-          cd e2e && RUN_SCHEMA_MIGRATION_TESTS=true go test -v ./... -run TestE2E_SchemaMigration_FullTextIndexRebuild -timeout 10m
-
-      - name: E2E Builtin Providers Test
-        run: |
-          cd e2e && go test -v ./... -run TestE2E_BuiltinProviders -timeout 10m
-
-      - name: E2E Distributed Transaction Tests
-        run: |
-          cd e2e && RUN_TXN_TESTS=true go test -v ./... -run DistributedTransaction -timeout 5m
-
-      - name: E2E Autoscaling Tests
-        run: |
-          cd e2e && RUN_AUTOSCALING_TESTS=true go test -v ./... -run Autoscaling -timeout 20m
-
-      - name: E2E Online Shard Split Tests
-        run: |
-          cd e2e && RUN_SHARD_SPLIT_TESTS=true go test -v ./... -run OnlineSplit -timeout 30m
-
-      - name: E2E Foreign Table Tests
+      - name: E2E PostgreSQL Tests
         env:
+          RUN_PG_TESTS: "true"
           ANTFLY_E2E_PG_DSN: postgres://antfly:antfly_dev@${{ env.POSTGRES_HOST }}:5432/antfly_test?sslmode=disable
         run: |
-          cd e2e && RUN_FOREIGN_TABLE_TESTS=true go test -v ./... -run TestE2E_ForeignTable -timeout 10m
+          cd e2e && go test -v ./... -run "TestE2E_ForeignTable" -timeout 10m

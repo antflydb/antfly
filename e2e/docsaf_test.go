@@ -1126,12 +1126,7 @@ func loadJSON[T any](t *testing.T, filename string) T {
 
 // TestE2E_RetrievalAgent_DocsEval is the main e2e test
 func TestE2E_RetrievalAgent_DocsEval(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-	if os.Getenv("RUN_EVAL_TESTS") != "true" {
-		t.Skip("Skipping e2e test (set RUN_EVAL_TESTS=true to run)")
-	}
+	skipUnlessML(t)
 	SkipIfProviderUnavailable(t)
 
 	// Start pprof server for debugging memory issues

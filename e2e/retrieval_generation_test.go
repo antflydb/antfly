@@ -17,7 +17,6 @@ package e2e
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -96,12 +95,7 @@ func executeSingleRetrievalQuery(
 // TestE2E_RetrievalAgent_Suite runs all retrieval agent E2E tests under a single
 // swarm instance and shared table restore, dramatically reducing setup overhead.
 func TestE2E_RetrievalAgent_Suite(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-	if os.Getenv("RUN_EVAL_TESTS") != "true" {
-		t.Skip("Skipping e2e test (set RUN_EVAL_TESTS=true to run)")
-	}
+	skipUnlessML(t)
 	SkipIfProviderUnavailable(t)
 
 	// Single shared setup: one swarm, one table restore

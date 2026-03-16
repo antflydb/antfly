@@ -68,9 +68,9 @@ make e2e E2E_TIMEOUT=30m            # Custom timeout (default: 30m)
 **Long-running tests** (E2E, evals, `-race`) should write output to a file:
 
 ```bash
-RUN_TXN_TESTS=true go test -v ./e2e -run DistributedTransaction -timeout 5m > /tmp/test.log 2>&1
-RUN_AUTOSCALING_TESTS=true go test -v ./e2e -run Autoscaling -timeout 20m > /tmp/test.log 2>&1
-RUN_EVAL_TESTS=true go test -v ./... -timeout 10m > /tmp/test.log 2>&1
+make e2e E2E_TIMEOUT=45m > /tmp/test.log 2>&1
+RUN_ML_TESTS=true make e2e E2E_TIMEOUT=45m > /tmp/test.log 2>&1
+RUN_PG_TESTS=true cd e2e && go test -v ./... -timeout 10m > /tmp/test.log 2>&1
 go test -race -v ./... > /tmp/test.log 2>&1
 ```
 

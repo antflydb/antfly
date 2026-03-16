@@ -29,7 +29,7 @@ import (
 
 // TestE2E_AntflyJoin tests joining two Antfly tables (no foreign tables / PG needed).
 func TestE2E_AntflyJoin(t *testing.T) {
-	skipUnlessEnv(t, "RUN_E2E_TESTS")
+	skipInShortMode(t)
 
 	ctx := testContext(t, 5*time.Minute)
 
@@ -187,7 +187,7 @@ func TestE2E_AntflyJoin(t *testing.T) {
 // TestE2E_ForeignTable_BasicQuery queries a PostgreSQL table through the
 // Antfly foreign table API without any join.
 func TestE2E_ForeignTable_BasicQuery(t *testing.T) {
-	skipUnlessEnv(t, "RUN_FOREIGN_TABLE_TESTS")
+	skipUnlessPG(t)
 	skipIfPostgresUnavailable(t)
 
 	ctx := testContext(t, 3*time.Minute)
@@ -230,7 +230,7 @@ func TestE2E_ForeignTable_BasicQuery(t *testing.T) {
 
 // TestE2E_ForeignTable_FilteredQuery queries a foreign PG table with a filter.
 func TestE2E_ForeignTable_FilteredQuery(t *testing.T) {
-	skipUnlessEnv(t, "RUN_FOREIGN_TABLE_TESTS")
+	skipUnlessPG(t)
 	skipIfPostgresUnavailable(t)
 
 	ctx := testContext(t, 3*time.Minute)
@@ -272,7 +272,7 @@ func TestE2E_ForeignTable_FilteredQuery(t *testing.T) {
 // TestE2E_ForeignTable_UnsupportedOps verifies that unsupported operations
 // on foreign tables are rejected with 400.
 func TestE2E_ForeignTable_UnsupportedOps(t *testing.T) {
-	skipUnlessEnv(t, "RUN_FOREIGN_TABLE_TESTS")
+	skipUnlessPG(t)
 	skipIfPostgresUnavailable(t)
 
 	ctx := testContext(t, 3*time.Minute)
@@ -305,7 +305,7 @@ func TestE2E_ForeignTable_UnsupportedOps(t *testing.T) {
 // TestE2E_ForeignTable_JoinWithAntfly tests joining an Antfly table with a
 // foreign PostgreSQL table.
 func TestE2E_ForeignTable_JoinWithAntfly(t *testing.T) {
-	skipUnlessEnv(t, "RUN_FOREIGN_TABLE_TESTS")
+	skipUnlessPG(t)
 	skipIfPostgresUnavailable(t)
 
 	ctx := testContext(t, 5*time.Minute)
@@ -407,7 +407,7 @@ func TestE2E_ForeignTable_JoinWithAntfly(t *testing.T) {
 // TestE2E_ForeignTable_CDCJoin tests a CDC-replicated Antfly table joined with
 // a foreign PostgreSQL table. This validates the full path: PG → CDC → Antfly → JOIN → PG.
 func TestE2E_ForeignTable_CDCJoin(t *testing.T) {
-	skipUnlessEnv(t, "RUN_FOREIGN_TABLE_TESTS")
+	skipUnlessPG(t)
 	skipIfPostgresUnavailable(t)
 	skipIfWalLevelNotLogical(t)
 

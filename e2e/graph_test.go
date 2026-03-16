@@ -75,7 +75,7 @@ func setupGraphTestCluster(t *testing.T, ctx context.Context) *TestCluster {
 // TestE2E_GraphPattern_TwoHopPattern tests a 2-hop pattern query:
 // (a)-[KNOWS]->(b)-[KNOWS]->(c)
 func TestE2E_GraphPattern_TwoHopPattern(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupGraphTestCluster(t, ctx)
@@ -178,7 +178,7 @@ func TestE2E_GraphPattern_TwoHopPattern(t *testing.T) {
 // TestE2E_GraphPattern_VariableLengthPath tests variable-length path pattern:
 // (start)-[*1..3]->(end)
 func TestE2E_GraphPattern_VariableLengthPath(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupGraphTestCluster(t, ctx)
@@ -275,7 +275,7 @@ func TestE2E_GraphPattern_VariableLengthPath(t *testing.T) {
 // TestE2E_GraphPattern_CycleDetection tests cycle detection:
 // (x)-[*1..5]->(x) where x is reused alias
 func TestE2E_GraphPattern_CycleDetection(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupGraphTestCluster(t, ctx)
@@ -371,7 +371,7 @@ func TestE2E_GraphPattern_CycleDetection(t *testing.T) {
 // TestE2E_GraphPattern_DiamondPattern tests diamond pattern matching:
 // A -> B -> D and A -> C -> D (multiple paths to same destination)
 func TestE2E_GraphPattern_DiamondPattern(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupGraphTestCluster(t, ctx)
@@ -484,7 +484,7 @@ func TestE2E_GraphPattern_DiamondPattern(t *testing.T) {
 
 // TestE2E_GraphPattern_EdgeTypeFilter tests filtering by edge type
 func TestE2E_GraphPattern_EdgeTypeFilter(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupGraphTestCluster(t, ctx)
@@ -577,7 +577,7 @@ func TestE2E_GraphPattern_EdgeTypeFilter(t *testing.T) {
 
 // TestE2E_GraphPattern_MaxResultsLimit tests result limiting
 func TestE2E_GraphPattern_MaxResultsLimit(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupGraphTestCluster(t, ctx)

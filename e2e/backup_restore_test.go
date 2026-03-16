@@ -16,7 +16,6 @@ package e2e
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
@@ -27,14 +26,7 @@ import (
 // TestE2E_BackupRestore_Embeddings tests the full backup and restore flow
 // with embedding indexes to ensure embeddings are properly restored and indexed.
 func TestE2E_BackupRestore_Embeddings(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Run e2e tests only if RUN_EVAL_TESTS is set
-	if os.Getenv("RUN_EVAL_TESTS") != "true" {
-		t.Skip("Skipping e2e test (set RUN_EVAL_TESTS=true to run)")
-	}
+	skipUnlessML(t)
 
 	SkipIfProviderUnavailable(t)
 
