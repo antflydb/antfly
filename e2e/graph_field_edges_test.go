@@ -125,7 +125,7 @@ func waitForFieldEdges(t *testing.T, client *antfly.AntflyClient, startKey strin
 // are automatically created from document fields by the enricher, and that
 // the summarizer runs without error.
 func TestE2E_GraphFieldEdges_BasicFieldExtraction(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
 	swarm := setupFieldEdgeSwarm(t)
@@ -264,7 +264,7 @@ func TestE2E_GraphFieldEdges_BasicFieldExtraction(t *testing.T) {
 // TestE2E_GraphFieldEdges_TreeTopologyRejectsMultiParent tests that the tree
 // topology constraint prevents a node from having multiple parents.
 func TestE2E_GraphFieldEdges_TreeTopologyRejectsMultiParent(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
 	swarm := setupFieldEdgeSwarm(t)
@@ -363,7 +363,7 @@ func TestE2E_GraphFieldEdges_TreeTopologyRejectsMultiParent(t *testing.T) {
 // TestE2E_GraphFieldEdges_FieldEdgeUpdate tests that changing a document's
 // parent_id field causes the enricher to update the edges.
 func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
 	swarm := setupFieldEdgeSwarm(t)
@@ -488,7 +488,7 @@ func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
 // TestE2E_GraphFieldEdges_MixedExplicitAndFieldEdges tests that explicit
 // _edges and field-based edges coexist correctly in the same graph index.
 func TestE2E_GraphFieldEdges_MixedExplicitAndFieldEdges(t *testing.T) {
-	skipUnlessEnv(t, "RUN_GRAPH_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
 	swarm := setupFieldEdgeSwarm(t)

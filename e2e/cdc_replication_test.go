@@ -26,9 +26,9 @@ import (
 )
 
 // TestCDCReplication verifies end-to-end CDC from PostgreSQL into Antfly tables.
-// Requires: RUN_CDC_TESTS=true, a local PostgreSQL with wal_level=logical.
+// Requires: RUN_PG_TESTS=true, a local PostgreSQL with wal_level=logical.
 func TestCDCReplication(t *testing.T) {
-	skipUnlessEnv(t, "RUN_CDC_TESTS")
+	skipUnlessPG(t)
 	skipIfPostgresUnavailable(t)
 	skipIfWalLevelNotLogical(t)
 

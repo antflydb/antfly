@@ -114,7 +114,7 @@ func TestCommitTransaction(t *testing.T) {
 	commitOp := CommitTransactionOp_builder{
 		TxnId: txnID[:],
 	}.Build()
-	err = db.CommitTransaction(ctx, commitOp)
+	_, err = db.CommitTransaction(ctx, commitOp)
 	require.NoError(t, err)
 
 	// Verify status is now Committed
@@ -221,9 +221,10 @@ func TestResolveIntents_Commit(t *testing.T) {
 		},
 	}.Build()
 
+	ts := uint64(time.Now().Unix())
 	writeIntentOp := WriteIntentOp_builder{
 		TxnId:            txnID[:],
-		Timestamp:        uint64(time.Now().Unix()),
+		Timestamp:        ts,
 		CoordinatorShard: []byte{1, 0, 0, 0, 0, 0, 0, 0},
 		Batch:            batchOp,
 	}.Build()
@@ -233,8 +234,9 @@ func TestResolveIntents_Commit(t *testing.T) {
 
 	// Resolve intents with Committed status
 	resolveOp := ResolveIntentsOp_builder{
-		TxnId:  txnID[:],
-		Status: 1, // Committed
+		TxnId:         txnID[:],
+		Status:        1, // Committed
+		CommitVersion: ts,
 	}.Build()
 
 	err = db.ResolveIntents(ctx, resolveOp)

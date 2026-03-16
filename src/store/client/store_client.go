@@ -987,18 +987,19 @@ func (sc *StoreClient) WriteIntent(
 	return nil
 }
 
+// CommitTransaction commits the transaction on the coordinator shard and returns the commit version.
 func (sc *StoreClient) CommitTransaction(
 	ctx context.Context,
 	shardID types.ID,
 	txnID []byte,
-) error {
+) (uint64, error) {
 	commitOp := db.CommitTransactionOp_builder{
 		TxnId: txnID,
 	}.Build()
 
 	body, err := proto.Marshal(commitOp)
 	if err != nil {
-		return fmt.Errorf("marshaling commit transaction op: %w", err)
+		return 0, fmt.Errorf("marshaling commit transaction op: %w", err)
 	}
 
 	req, err := common.NewShardRequest(
@@ -1008,17 +1009,24 @@ func (sc *StoreClient) CommitTransaction(
 		bytes.NewBuffer(body),
 	)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return 0, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req = req.WithContext(ctx)
 
 	resp, err := sc.doRequest(req, http.StatusOK)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_ = resp.Body.Close()
-	return nil
+	defer func() { _ = resp.Body.Close() }()
+
+	var result struct {
+		CommitVersion uint64 `json:"commit_version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("decoding commit version response: %w", err)
+	}
+	return result.CommitVersion, nil
 }
 
 func (sc *StoreClient) AbortTransaction(
@@ -1060,10 +1068,12 @@ func (sc *StoreClient) ResolveIntent(
 	shardID types.ID,
 	txnID []byte,
 	status int32,
+	commitVersion uint64,
 ) error {
 	resolveOp := db.ResolveIntentsOp_builder{
-		TxnId:  txnID,
-		Status: status,
+		TxnId:         txnID,
+		Status:        status,
+		CommitVersion: commitVersion,
 	}.Build()
 
 	body, err := proto.Marshal(resolveOp)

@@ -224,9 +224,7 @@ func ensureCLIPModel(t *testing.T, modelsDir string) string {
 // 6. Inserts documents with S3 URLs
 // 7. Verifies documents are indexed and searchable
 func TestRemoteContentWithCLIP(t *testing.T) {
-	if os.Getenv("RUN_REMOTE_CONTENT_TESTS") == "" {
-		t.Skip("Skipping remote content E2E test (set RUN_REMOTE_CONTENT_TESTS=true to run)")
-	}
+	skipUnlessML(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -609,9 +607,7 @@ func createTestAudioWAV(t *testing.T, sampleRate int, durationSec float64, frequ
 // 5. Inserts documents with S3 URLs for images and audio
 // 6. Queries both indexes and verifies results
 func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
-	if os.Getenv("RUN_REMOTE_CONTENT_TESTS") == "" {
-		t.Skip("Skipping remote content E2E test (set RUN_REMOTE_CONTENT_TESTS=true to run)")
-	}
+	skipUnlessML(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -935,9 +931,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 // TestRemoteContentCredentialResolution tests credential resolution without starting the full swarm.
 // This is a lighter-weight test that verifies the configuration system works correctly.
 func TestRemoteContentCredentialResolution(t *testing.T) {
-	if os.Getenv("RUN_REMOTE_CONTENT_TESTS") == "" {
-		t.Skip("Skipping remote content E2E test (set RUN_REMOTE_CONTENT_TESTS=true to run)")
-	}
+	skipUnlessML(t)
 
 	// Set up fake S3 server
 	s3Client, _, endpoint, cleanup := setupFakeS3ForE2E(t)
@@ -998,9 +992,7 @@ func TestRemoteContentCredentialResolution(t *testing.T) {
 
 // TestRemoteContentMultipleCredentials tests bucket pattern matching with multiple credentials.
 func TestRemoteContentMultipleCredentials(t *testing.T) {
-	if os.Getenv("RUN_REMOTE_CONTENT_TESTS") == "" {
-		t.Skip("Skipping remote content E2E test (set RUN_REMOTE_CONTENT_TESTS=true to run)")
-	}
+	skipUnlessML(t)
 
 	// Set up two fake S3 servers simulating different environments
 	s3Client1, _, endpoint1, cleanup1 := setupFakeS3ForE2E(t)

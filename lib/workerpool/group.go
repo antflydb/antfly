@@ -48,9 +48,6 @@ func (g *Group) Go(f func(ctx context.Context) error) {
 	g.wg.Add(1)
 	if err := g.pool.submit(func() {
 		defer g.wg.Done()
-		if g.ctx.Err() != nil {
-			return
-		}
 		if err := f(g.ctx); err != nil {
 			g.errOnce.Do(func() {
 				g.err = err

@@ -76,7 +76,7 @@ func TestTransactionLifecycle_CommitFlow(t *testing.T) {
 	commitOp := CommitTransactionOp_builder{
 		TxnId: txnID[:],
 	}.Build()
-	err = db.CommitTransaction(ctx, commitOp)
+	cv, err := db.CommitTransaction(ctx, commitOp)
 	require.NoError(t, err)
 
 	// Verify transaction is in Committed state
@@ -86,8 +86,9 @@ func TestTransactionLifecycle_CommitFlow(t *testing.T) {
 
 	// Step 4: Resolve intents
 	resolveOp := ResolveIntentsOp_builder{
-		TxnId:  txnID[:],
-		Status: 1, // Committed
+		TxnId:         txnID[:],
+		Status:        1, // Committed
+		CommitVersion: cv,
 	}.Build()
 	err = db.ResolveIntents(ctx, resolveOp)
 	require.NoError(t, err)
@@ -211,11 +212,13 @@ func TestConcurrentTransactions(t *testing.T) {
 	}
 
 	// Commit half, abort half
+	commitVersions := make([]uint64, len(txnIDs))
 	for i, txnID := range txnIDs {
 		if i%2 == 0 {
 			commitOp := CommitTransactionOp_builder{TxnId: txnID[:]}.Build()
-			err := db.CommitTransaction(ctx, commitOp)
+			cv, err := db.CommitTransaction(ctx, commitOp)
 			require.NoError(t, err)
+			commitVersions[i] = cv
 		} else {
 			abortOp := AbortTransactionOp_builder{TxnId: txnID[:]}.Build()
 			err := db.AbortTransaction(ctx, abortOp)
@@ -245,8 +248,9 @@ func TestConcurrentTransactions(t *testing.T) {
 		}
 
 		resolveOp := ResolveIntentsOp_builder{
-			TxnId:  txnID[:],
-			Status: status,
+			TxnId:         txnID[:],
+			Status:        status,
+			CommitVersion: commitVersions[i],
 		}.Build()
 		err := db.ResolveIntents(ctx, resolveOp)
 		require.NoError(t, err)
@@ -304,12 +308,13 @@ func TestTransactionWithMultipleIntents(t *testing.T) {
 
 	// Commit and resolve
 	commitOp := CommitTransactionOp_builder{TxnId: txnID[:]}.Build()
-	err = db.CommitTransaction(ctx, commitOp)
+	cv, err := db.CommitTransaction(ctx, commitOp)
 	require.NoError(t, err)
 
 	resolveOp := ResolveIntentsOp_builder{
-		TxnId:  txnID[:],
-		Status: 1, // Committed
+		TxnId:         txnID[:],
+		Status:        1, // Committed
+		CommitVersion: cv,
 	}.Build()
 	err = db.ResolveIntents(ctx, resolveOp)
 	require.NoError(t, err)
@@ -349,7 +354,7 @@ func TestTransactionRecovery(t *testing.T) {
 		require.NoError(t, err)
 
 		commitOp := CommitTransactionOp_builder{TxnId: txnID[:]}.Build()
-		err = db.CommitTransaction(ctx, commitOp)
+		_, err = db.CommitTransaction(ctx, commitOp)
 		require.NoError(t, err)
 	}
 
@@ -394,13 +399,14 @@ func TestTransactionMetrics(t *testing.T) {
 
 	// Commit
 	commitOp := CommitTransactionOp_builder{TxnId: txnID[:]}.Build()
-	err = db.CommitTransaction(ctx, commitOp)
+	cv, err := db.CommitTransaction(ctx, commitOp)
 	require.NoError(t, err)
 
 	// Resolve
 	resolveOp := ResolveIntentsOp_builder{
-		TxnId:  txnID[:],
-		Status: 1,
+		TxnId:         txnID[:],
+		Status:        1,
+		CommitVersion: cv,
 	}.Build()
 	err = db.ResolveIntents(ctx, resolveOp)
 	require.NoError(t, err)
@@ -445,12 +451,13 @@ func TestTimestampBasedConflictResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	commitOp1 := CommitTransactionOp_builder{TxnId: txn1ID[:]}.Build()
-	err = db.CommitTransaction(ctx, commitOp1)
+	cv1, err := db.CommitTransaction(storeutils.WithTimestamp(ctx, timestamp1), commitOp1)
 	require.NoError(t, err)
 
 	resolveOp1 := ResolveIntentsOp_builder{
-		TxnId:  txn1ID[:],
-		Status: 1, // Committed
+		TxnId:         txn1ID[:],
+		Status:        1, // Committed
+		CommitVersion: cv1,
 	}.Build()
 	err = db.ResolveIntents(ctx, resolveOp1)
 	require.NoError(t, err)
@@ -498,12 +505,13 @@ func TestTimestampBasedConflictResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	commitOp2 := CommitTransactionOp_builder{TxnId: txn2ID[:]}.Build()
-	err = db.CommitTransaction(ctx, commitOp2)
+	cv2, err := db.CommitTransaction(storeutils.WithTimestamp(ctx, timestamp2), commitOp2)
 	require.NoError(t, err)
 
 	resolveOp2 := ResolveIntentsOp_builder{
-		TxnId:  txn2ID[:],
-		Status: 1, // Committed
+		TxnId:         txn2ID[:],
+		Status:        1, // Committed
+		CommitVersion: cv2,
 	}.Build()
 	err = db.ResolveIntents(ctx, resolveOp2)
 	require.NoError(t, err)
@@ -548,12 +556,13 @@ func TestTimestampBasedConflictResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	commitOp3 := CommitTransactionOp_builder{TxnId: txn3ID[:]}.Build()
-	err = db.CommitTransaction(ctx, commitOp3)
+	cv3, err := db.CommitTransaction(storeutils.WithTimestamp(ctx, timestamp3), commitOp3)
 	require.NoError(t, err)
 
 	resolveOp3 := ResolveIntentsOp_builder{
-		TxnId:  txn3ID[:],
-		Status: 1, // Committed
+		TxnId:         txn3ID[:],
+		Status:        1, // Committed
+		CommitVersion: cv3,
 	}.Build()
 	err = db.ResolveIntents(ctx, resolveOp3)
 	require.NoError(t, err)
@@ -577,4 +586,94 @@ func TestTimestampBasedConflictResolution(t *testing.T) {
 	t.Log("  - T2 (ts=50) tried 'second', skipped ✓")
 	t.Log("  - T3 (ts=200) wrote 'third' ✓")
 	t.Log("  - Timestamps stored in separate key:t metadata (not in document)")
+}
+
+func TestCommitTimestampBecomesVisibleVersion(t *testing.T) {
+	dir := t.TempDir()
+	db := createTestDB(t, dir)
+	defer db.Close()
+
+	ctx := t.Context()
+	key := []byte("txn:visible_version")
+	coordinatorShard := []byte{1, 0, 0, 0, 0, 0, 0, 0}
+
+	err := db.Batch(storeutils.WithTimestamp(ctx, 10000), [][2][]byte{
+		{key, []byte(`{"title":"v1"}`)},
+	}, nil, Op_SyncLevelWrite)
+	require.NoError(t, err)
+
+	txnID := uuid.New()
+	beginTS := uint64(11000)
+	commitTS := uint64(11001)
+
+	err = db.InitTransaction(ctx, InitTransactionOp_builder{
+		TxnId:        txnID[:],
+		Timestamp:    beginTS,
+		Participants: [][]byte{coordinatorShard},
+	}.Build())
+	require.NoError(t, err)
+
+	err = db.WriteIntent(ctx, WriteIntentOp_builder{
+		TxnId:            txnID[:],
+		Timestamp:        beginTS,
+		CoordinatorShard: coordinatorShard,
+		Batch: BatchOp_builder{
+			Writes: []*Write{
+				Write_builder{Key: key, Value: []byte(`{"title":"v2"}`)}.Build(),
+			},
+		}.Build(),
+		Predicates: []*VersionPredicate{
+			VersionPredicate_builder{Key: key, ExpectedVersion: 10000}.Build(),
+		},
+	}.Build())
+	require.NoError(t, err)
+
+	_, err = db.CommitTransaction(storeutils.WithTimestamp(ctx, commitTS), CommitTransactionOp_builder{
+		TxnId: txnID[:],
+	}.Build())
+	require.NoError(t, err)
+
+	err = db.ResolveIntents(ctx, ResolveIntentsOp_builder{
+		TxnId:         txnID[:],
+		Status:        TxnStatusCommitted,
+		CommitVersion: commitTS,
+	}.Build())
+	require.NoError(t, err)
+
+	doc, err := db.Get(ctx, key)
+	require.NoError(t, err)
+	assert.Equal(t, "v2", doc["title"])
+
+	metaKey := append(storeutils.KeyRangeStart(key), storeutils.TransactionSuffix...)
+	tsBytes, closer, err := db.pdb.Get(metaKey)
+	require.NoError(t, err)
+	defer closer.Close()
+
+	_, visibleTS, err := encoding.DecodeUint64Ascending(tsBytes)
+	require.NoError(t, err)
+	assert.Equal(t, commitTS, visibleTS, "Committed value should expose commit timestamp as visible version")
+
+	txn2ID := uuid.New()
+	err = db.InitTransaction(ctx, InitTransactionOp_builder{
+		TxnId:        txn2ID[:],
+		Timestamp:    12000,
+		Participants: [][]byte{coordinatorShard},
+	}.Build())
+	require.NoError(t, err)
+
+	err = db.WriteIntent(ctx, WriteIntentOp_builder{
+		TxnId:            txn2ID[:],
+		Timestamp:        12000,
+		CoordinatorShard: coordinatorShard,
+		Batch: BatchOp_builder{
+			Writes: []*Write{
+				Write_builder{Key: key, Value: []byte(`{"title":"stale"}`)}.Build(),
+			},
+		}.Build(),
+		Predicates: []*VersionPredicate{
+			VersionPredicate_builder{Key: key, ExpectedVersion: 10000}.Build(),
+		},
+	}.Build())
+	var versionConflict *ErrVersionConflict
+	require.ErrorAs(t, err, &versionConflict)
 }

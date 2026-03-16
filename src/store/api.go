@@ -1600,7 +1600,20 @@ func (h *StoreAPI) handleCommitTransaction(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Return the commit version so callers can pass it to ResolveIntents.
+	// This read-back is needed because SyncWriteOp only returns error.
+	cv, err := shard.GetCommitVersion(r.Context(), req.GetTxnId())
+	if err != nil {
+		// The transaction IS committed, so we must return 200.
+		// Log the error; the recovery loop will resolve intents using the record's version.
+		h.logger.Error("Failed to read commit version after successful commit",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"commit_version":%d}`, cv)
 }
 
 func (h *StoreAPI) handleAbortTransaction(w http.ResponseWriter, r *http.Request) {

@@ -88,7 +88,7 @@ func (ms *MetadataStore) handleForwardResolveIntent(w http.ResponseWriter, r *ht
 	}
 
 	// Forward to the leader of the target shard
-	if err := ms.forwardResolveIntentToShard(r.Context(), shardID, resolveOp.GetTxnId(), resolveOp.GetStatus()); err != nil {
+	if err := ms.forwardResolveIntentToShard(r.Context(), shardID, resolveOp.GetTxnId(), resolveOp.GetStatus(), resolveOp.GetCommitVersion()); err != nil {
 		ms.logger.Error("Failed to forward resolve intent",
 			zap.Stringer("shardID", shardID),
 			zap.Binary("txnID", resolveOp.GetTxnId()),

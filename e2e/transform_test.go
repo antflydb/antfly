@@ -33,7 +33,7 @@ const (
 // ensures the latest (highest) version value is always kept, regardless
 // of operation order.
 func TestE2E_Transform_MaxKeepsLatestValue(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TRANSFORM_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, transformTestTableName, transformTestNumShards)
@@ -105,7 +105,7 @@ func TestE2E_Transform_MaxKeepsLatestValue(t *testing.T) {
 // TestE2E_Transform_ConcurrentMaxUpdates tests that concurrent updates
 // using $max all converge to the highest version value.
 func TestE2E_Transform_ConcurrentMaxUpdates(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TRANSFORM_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, transformTestTableName, transformTestNumShards)
@@ -164,7 +164,7 @@ func TestE2E_Transform_ConcurrentMaxUpdates(t *testing.T) {
 // to atomically create a document with a version if it doesn't exist,
 // or update the version if the incoming value is higher.
 func TestE2E_Transform_UpsertWithMax(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TRANSFORM_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, transformTestTableName, transformTestNumShards)
@@ -240,7 +240,7 @@ func TestE2E_Transform_UpsertWithMax(t *testing.T) {
 // TestE2E_Transform_IncAtomicCounter tests that $inc operator provides
 // atomic counter increments without race conditions.
 func TestE2E_Transform_IncAtomicCounter(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TRANSFORM_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, transformTestTableName, transformTestNumShards)
@@ -299,7 +299,7 @@ func TestE2E_Transform_IncAtomicCounter(t *testing.T) {
 // TestE2E_Transform_MultipleOperators tests combining multiple transform
 // operators in a single batch to perform complex atomic updates.
 func TestE2E_Transform_MultipleOperators(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TRANSFORM_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, transformTestTableName, transformTestNumShards)

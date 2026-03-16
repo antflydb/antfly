@@ -16,6 +16,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"time"
 
@@ -159,43 +160,40 @@ func (db *DBImpl) extractAndWriteSpecialFields(
 }
 
 // finalizeTransaction updates a transaction record to the given status (1=Committed, 2=Aborted).
-func (db *DBImpl) finalizeTransaction(txnID []byte, status int32, label string) error {
+// Returns the commit version (non-zero only for commits).
+func (db *DBImpl) finalizeTransaction(ctx context.Context, txnID []byte, status int32, label string) (uint64, error) {
 	start := time.Now()
 	defer func() {
 		transactionDurationSeconds.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}()
 	defer activeTransactionsGauge.Dec()
 
-	txnKey := makeTxnKey(txnID)
-
-	// Load existing record
-	data, closer, err := db.pdb.Get(txnKey)
+	record, err := db.loadTxnRecord(txnID)
 	if err != nil {
 		transactionOpsTotal.WithLabelValues(label, "error").Inc()
-		return fmt.Errorf("loading transaction record: %w", err)
-	}
-	defer func() { _ = closer.Close() }()
-
-	var record map[string]any
-	if err := json.Unmarshal(data, &record); err != nil {
-		transactionOpsTotal.WithLabelValues(label, "error").Inc()
-		return fmt.Errorf("unmarshaling transaction record: %w", err)
+		return 0, err
 	}
 
-	// Update status
-	record["status"] = status
-	record["committed_at"] = time.Now().Unix()
+	record.Status = status
+	record.FinalizedAt = time.Now().Unix()
+	var commitVersion uint64
+	if status == TxnStatusCommitted {
+		commitVersion = storeutils.GetTimestampFromContext(ctx)
+		if commitVersion == 0 {
+			commitVersion = record.Version()
+		}
+		record.CommitVersion = commitVersion
+	}
 
-	// Save back
 	updatedData, err := json.Marshal(record)
 	if err != nil {
 		transactionOpsTotal.WithLabelValues(label, "error").Inc()
-		return fmt.Errorf("marshaling transaction record: %w", err)
+		return 0, fmt.Errorf("marshaling transaction record: %w", err)
 	}
 
-	if err := db.pdb.Set(txnKey, updatedData, pebble.Sync); err != nil {
+	if err := db.pdb.Set(makeTxnKey(txnID), updatedData, pebble.Sync); err != nil {
 		transactionOpsTotal.WithLabelValues(label, "error").Inc()
-		return fmt.Errorf("writing %s transaction record: %w", label, err)
+		return 0, fmt.Errorf("writing %s transaction record: %w", label, err)
 	}
 
 	transactionOpsTotal.WithLabelValues(label, "success").Inc()
@@ -204,5 +202,5 @@ func (db *DBImpl) finalizeTransaction(txnID []byte, status int32, label string) 
 		zap.Binary("txnID", txnID),
 		zap.String("status", label))
 
-	return nil
+	return commitVersion, nil
 }

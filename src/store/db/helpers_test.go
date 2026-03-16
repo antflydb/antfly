@@ -301,55 +301,55 @@ func TestFinalizeTransaction(t *testing.T) {
 		txnID := []byte("txn-commit-1")
 		txnKey := makeTxnKey(txnID)
 
-		record := map[string]any{
-			"status":     int32(0),
-			"created_at": 1000,
+		record := TxnRecord{
+			Status:    TxnStatusPending,
+			CreatedAt: 1000,
 		}
 		data, err := json.Marshal(record)
 		require.NoError(t, err)
 		require.NoError(t, db.pdb.Set(txnKey, data, pebble.Sync))
 
-		err = db.finalizeTransaction(txnID, int32(1), "commit")
+		_, err = db.finalizeTransaction(t.Context(), txnID, TxnStatusCommitted, "commit")
 		require.NoError(t, err)
 
 		updatedData, closer, err := db.pdb.Get(txnKey)
 		require.NoError(t, err)
 		defer closer.Close()
 
-		var updated map[string]any
+		var updated TxnRecord
 		require.NoError(t, json.Unmarshal(updatedData, &updated))
-		assert.Equal(t, float64(1), updated["status"])
-		assert.Contains(t, updated, "committed_at")
+		assert.Equal(t, TxnStatusCommitted, updated.Status)
+		assert.NotZero(t, updated.FinalizedAt)
 	})
 
 	t.Run("abort transaction", func(t *testing.T) {
 		txnID := []byte("txn-abort-1")
 		txnKey := makeTxnKey(txnID)
 
-		record := map[string]any{
-			"status":     int32(0),
-			"created_at": 1000,
+		record := TxnRecord{
+			Status:    TxnStatusPending,
+			CreatedAt: 1000,
 		}
 		data, err := json.Marshal(record)
 		require.NoError(t, err)
 		require.NoError(t, db.pdb.Set(txnKey, data, pebble.Sync))
 
-		err = db.finalizeTransaction(txnID, int32(2), "abort")
+		_, err = db.finalizeTransaction(t.Context(), txnID, TxnStatusAborted, "abort")
 		require.NoError(t, err)
 
 		updatedData, closer, err := db.pdb.Get(txnKey)
 		require.NoError(t, err)
 		defer closer.Close()
 
-		var updated map[string]any
+		var updated TxnRecord
 		require.NoError(t, json.Unmarshal(updatedData, &updated))
-		assert.Equal(t, float64(2), updated["status"])
+		assert.Equal(t, TxnStatusAborted, updated.Status)
 	})
 
 	t.Run("missing transaction record", func(t *testing.T) {
-		err := db.finalizeTransaction([]byte("nonexistent"), int32(1), "commit")
+		_, err := db.finalizeTransaction(t.Context(), []byte("nonexistent"), int32(1), "commit")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "loading transaction record")
+		assert.ErrorIs(t, err, ErrTxnNotFound)
 	})
 }
 

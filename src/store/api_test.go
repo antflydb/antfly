@@ -185,6 +185,11 @@ func (m *MockShard) GetTransactionStatus(ctx context.Context, txnID []byte) (int
 	return args.Get(0).(int32), args.Error(1)
 }
 
+func (m *MockShard) GetCommitVersion(ctx context.Context, txnID []byte) (uint64, error) {
+	args := m.Called(ctx, txnID)
+	return args.Get(0).(uint64), args.Error(1)
+}
+
 func (m *MockShard) GetEdges(ctx context.Context, indexName string, key []byte, edgeType string, direction indexes.EdgeDirection) ([]indexes.Edge, error) {
 	args := m.Called(ctx, indexName, key, edgeType, direction)
 	if args.Get(0) == nil {

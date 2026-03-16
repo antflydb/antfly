@@ -37,7 +37,7 @@ type mockNotification struct {
 	status  int32
 }
 
-func (m *mockShardNotifier) NotifyResolveIntent(ctx context.Context, shardID []byte, txnID []byte, status int32) error {
+func (m *mockShardNotifier) NotifyResolveIntent(ctx context.Context, shardID []byte, txnID []byte, status int32, commitVersion uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.notifications = append(m.notifications, mockNotification{
@@ -149,7 +149,7 @@ func TestDistributedTransaction_TwoPhaseCommit(t *testing.T) {
 	commitOp := CommitTransactionOp_builder{
 		TxnId: txnID[:],
 	}.Build()
-	err = coordinatorDB.CommitTransaction(ctx, commitOp)
+	commitVersion, err := coordinatorDB.CommitTransaction(ctx, commitOp)
 	require.NoError(t, err)
 
 	// Verify transaction is in Committed state
@@ -184,8 +184,9 @@ func TestDistributedTransaction_TwoPhaseCommit(t *testing.T) {
 
 	t.Log("Phase 3: Participant receives notification and resolves intents")
 	resolveOp := ResolveIntentsOp_builder{
-		TxnId:  txnID[:],
-		Status: 1, // Committed
+		TxnId:         txnID[:],
+		Status:        1, // Committed
+		CommitVersion: commitVersion,
 	}.Build()
 	err = participantDB.ResolveIntents(ctx, resolveOp)
 	require.NoError(t, err)
@@ -370,7 +371,7 @@ func TestTransactionRecovery_AutomaticNotification(t *testing.T) {
 	commitOp := CommitTransactionOp_builder{
 		TxnId: txnID[:],
 	}.Build()
-	err = db.CommitTransaction(ctx, commitOp)
+	_, err = db.CommitTransaction(ctx, commitOp)
 	require.NoError(t, err)
 
 	t.Log("Simulating recovery loop running (normally every 30 seconds)")

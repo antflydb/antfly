@@ -598,6 +598,7 @@ func (ms *MetadataStore) forwardResolveIntentToShard(
 	shardID types.ID,
 	txnID []byte,
 	status int32,
+	commitVersion uint64,
 ) error {
 	backoff := shardRetryBackoff()
 
@@ -611,7 +612,7 @@ func (ms *MetadataStore) forwardResolveIntentToShard(
 			}
 			return fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
 		}
-		err = targetClient.ResolveIntent(ctx, effectiveShardID, txnID, status)
+		err = targetClient.ResolveIntent(ctx, effectiveShardID, txnID, status, commitVersion)
 		if err != nil && isTransientShardError(err) {
 			return retry.RetryableError(err)
 		}

@@ -52,6 +52,7 @@ func (n *HTTPShardNotifier) NotifyResolveIntent(
 	shardIDBytes []byte,
 	txnID []byte,
 	status int32,
+	commitVersion uint64,
 ) error {
 	// Convert shard ID bytes to types.ID
 	if len(shardIDBytes) != 8 {
@@ -65,8 +66,9 @@ func (n *HTTPShardNotifier) NotifyResolveIntent(
 
 	// Build the ResolveIntentsOp
 	resolveOp := db.ResolveIntentsOp_builder{
-		TxnId:  txnID,
-		Status: status,
+		TxnId:         txnID,
+		Status:        status,
+		CommitVersion: commitVersion,
 	}.Build()
 
 	body, err := proto.Marshal(resolveOp)

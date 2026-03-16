@@ -2472,11 +2472,12 @@ func (b0 WriteIntentOp_builder) Build() *WriteIntentOp {
 }
 
 type ResolveIntentsOp struct {
-	state             protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_TxnId  []byte                 `protobuf:"bytes,1,opt,name=txn_id,json=txnId"`
-	xxx_hidden_Status int32                  `protobuf:"varint,2,opt,name=status"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state                    protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_TxnId         []byte                 `protobuf:"bytes,1,opt,name=txn_id,json=txnId"`
+	xxx_hidden_Status        int32                  `protobuf:"varint,2,opt,name=status"`
+	xxx_hidden_CommitVersion uint64                 `protobuf:"varint,3,opt,name=commit_version,json=commitVersion"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *ResolveIntentsOp) Reset() {
@@ -2518,6 +2519,13 @@ func (x *ResolveIntentsOp) GetStatus() int32 {
 	return 0
 }
 
+func (x *ResolveIntentsOp) GetCommitVersion() uint64 {
+	if x != nil {
+		return x.xxx_hidden_CommitVersion
+	}
+	return 0
+}
+
 func (x *ResolveIntentsOp) SetTxnId(v []byte) {
 	if v == nil {
 		v = []byte{}
@@ -2529,11 +2537,16 @@ func (x *ResolveIntentsOp) SetStatus(v int32) {
 	x.xxx_hidden_Status = v
 }
 
+func (x *ResolveIntentsOp) SetCommitVersion(v uint64) {
+	x.xxx_hidden_CommitVersion = v
+}
+
 type ResolveIntentsOp_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	TxnId  []byte
-	Status int32
+	TxnId         []byte
+	Status        int32
+	CommitVersion uint64
 }
 
 func (b0 ResolveIntentsOp_builder) Build() *ResolveIntentsOp {
@@ -2542,6 +2555,7 @@ func (b0 ResolveIntentsOp_builder) Build() *ResolveIntentsOp {
 	_, _ = b, x
 	x.xxx_hidden_TxnId = b.TxnId
 	x.xxx_hidden_Status = b.Status
+	x.xxx_hidden_CommitVersion = b.CommitVersion
 	return m0
 }
 
@@ -2871,10 +2885,11 @@ const file_ops_proto_rawDesc = "" +
 	"\x05batch\x18\x04 \x01(\v2\v.db.BatchOpR\x05batch\x124\n" +
 	"\n" +
 	"predicates\x18\x05 \x03(\v2\x14.db.VersionPredicateR\n" +
-	"predicates\"O\n" +
+	"predicates\"}\n" +
 	"\x10ResolveIntentsOp\x12\x1c\n" +
 	"\x06txn_id\x18\x01 \x01(\fB\x05\xaa\x01\x02\b\x02R\x05txnId\x12\x1d\n" +
-	"\x06status\x18\x02 \x01(\x05B\x05\xaa\x01\x02\b\x02R\x06status\"\xea\x02\n" +
+	"\x06status\x18\x02 \x01(\x05B\x05\xaa\x01\x02\b\x02R\x06status\x12,\n" +
+	"\x0ecommit_version\x18\x03 \x01(\x04B\x05\xaa\x01\x02\b\x02R\rcommitVersion\"\xea\x02\n" +
 	"\n" +
 	"SplitState\x121\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x14.db.SplitState.PhaseB\x05\xaa\x01\x02\b\x02R\x05phase\x12\"\n" +

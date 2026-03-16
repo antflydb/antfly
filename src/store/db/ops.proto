@@ -183,6 +183,7 @@ message WriteIntentOp {
 message ResolveIntentsOp {
   bytes txn_id = 1 [ features.field_presence = IMPLICIT ];
   int32 status = 2 [ features.field_presence = IMPLICIT ]; // TxnStatus from common.transaction
+  uint64 commit_version = 3 [ features.field_presence = IMPLICIT ]; // Coordinator's commit version for MVCC
 }
 
 // SplitState represents the current phase of a shard split operation.

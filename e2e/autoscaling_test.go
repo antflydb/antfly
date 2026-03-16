@@ -25,7 +25,7 @@ import (
 
 // TestE2E_Autoscaling_ShardSplit tests autoscaling behavior with shard splits
 func TestE2E_Autoscaling_ShardSplit(t *testing.T) {
-	skipUnlessEnv(t, "RUN_AUTOSCALING_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 15*time.Minute)
 
 	t.Log("=== Starting Autoscaling E2E Test ===")
@@ -222,7 +222,7 @@ func TestE2E_Autoscaling_ShardSplit(t *testing.T) {
 
 // TestE2E_Autoscaling_NodeChurn tests the system's resilience to node additions and removals
 func TestE2E_Autoscaling_NodeChurn(t *testing.T) {
-	skipUnlessEnv(t, "RUN_AUTOSCALING_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 10*time.Minute)
 
 	t.Log("=== Starting Node Churn E2E Test ===")

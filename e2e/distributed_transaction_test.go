@@ -32,7 +32,7 @@ const (
 // TestE2E_DistributedTransaction_MultiShardCommit verifies batch operation
 // touching multiple shards commits atomically via 2PC.
 func TestE2E_DistributedTransaction_MultiShardCommit(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, txnTestTableName, txnTestNumShards)
@@ -84,7 +84,7 @@ func TestE2E_DistributedTransaction_MultiShardCommit(t *testing.T) {
 // TestE2E_DistributedTransaction_AtomicMultiKeyUpdate tests the classic "bank transfer"
 // scenario - atomic update of multiple keys.
 func TestE2E_DistributedTransaction_AtomicMultiKeyUpdate(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, txnTestTableName, txnTestNumShards)
@@ -143,7 +143,7 @@ func TestE2E_DistributedTransaction_AtomicMultiKeyUpdate(t *testing.T) {
 // TestE2E_DistributedTransaction_MultiShardAbort verifies that when context is
 // cancelled mid-transaction, no data is committed.
 func TestE2E_DistributedTransaction_MultiShardAbort(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, txnTestTableName, txnTestNumShards)
@@ -237,7 +237,7 @@ func TestE2E_DistributedTransaction_MultiShardAbort(t *testing.T) {
 // TestE2E_DistributedTransaction_RecoveryNotification verifies the recovery loop
 // properly resolves committed transactions.
 func TestE2E_DistributedTransaction_RecoveryNotification(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
 	cluster := setupClusterWithTable(t, ctx, txnTestTableName, txnTestNumShards)

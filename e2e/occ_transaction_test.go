@@ -31,7 +31,7 @@ const (
 // TestE2E_OCC_BasicReadModifyWrite verifies a simple OCC read-modify-write cycle
 // succeeds when there is no contention.
 func TestE2E_OCC_BasicReadModifyWrite(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 	cluster := setupClusterWithTable(t, ctx, occTestTable, occTestNumShards)
 
@@ -78,7 +78,7 @@ func TestE2E_OCC_BasicReadModifyWrite(t *testing.T) {
 // TestE2E_OCC_ConflictDetection verifies that when two concurrent OCC transactions
 // read the same key, only one commits and the other gets a conflict (409).
 func TestE2E_OCC_ConflictDetection(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 	cluster := setupClusterWithTable(t, ctx, occTestTable, occTestNumShards)
 
@@ -144,7 +144,7 @@ func TestE2E_OCC_ConflictDetection(t *testing.T) {
 // TestE2E_OCC_CrossTableRMW verifies an OCC transaction that reads from one table
 // and writes to two tables atomically.
 func TestE2E_OCC_CrossTableRMW(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 	cluster := setupTwoTableCluster(t)
 
@@ -198,7 +198,7 @@ func TestE2E_OCC_CrossTableRMW(t *testing.T) {
 // TestE2E_OCC_NonExistentKey verifies that reading a non-existent key
 // captures version "0" and the transaction can commit a new write for that key.
 func TestE2E_OCC_NonExistentKey(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 	cluster := setupClusterWithTable(t, ctx, occTestTable, occTestNumShards)
 
@@ -248,7 +248,7 @@ func TestE2E_OCC_NonExistentKey(t *testing.T) {
 // The bug occurs because checkVersionPredicates only checks committed values,
 // not pending intents from other transactions.
 func TestE2E_OCC_LostUpdateBug(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 	cluster := setupClusterWithTable(t, ctx, occTestTable, occTestNumShards)
 
@@ -400,7 +400,7 @@ func TestE2E_OCC_LostUpdateBug(t *testing.T) {
 // TestE2E_OCC_ConcurrentRMW verifies that under concurrent RMW contention,
 // exactly one transaction wins and the others are aborted.
 func TestE2E_OCC_ConcurrentRMW(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 	cluster := setupClusterWithTable(t, ctx, occTestTable, occTestNumShards)
 

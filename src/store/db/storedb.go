@@ -2025,10 +2025,11 @@ func (s *StoreDB) applyOpCommitTransaction(
 	ctx context.Context,
 	op *CommitTransactionOp,
 ) error {
-	if err := s.coreDB.CommitTransaction(ctx, op); err != nil {
+	commitVersion, err := s.coreDB.CommitTransaction(ctx, op)
+	if err != nil {
 		return err
 	}
-	s.asyncResolveIntents(op.GetTxnId(), 1, "commit")
+	s.asyncResolveIntents(op.GetTxnId(), 1, commitVersion, "commit")
 	return nil
 }
 
@@ -2039,20 +2040,21 @@ func (s *StoreDB) applyOpAbortTransaction(
 	if err := s.coreDB.AbortTransaction(ctx, op); err != nil {
 		return err
 	}
-	s.asyncResolveIntents(op.GetTxnId(), 2, "abort")
+	s.asyncResolveIntents(op.GetTxnId(), 2, 0, "abort")
 	return nil
 }
 
 // asyncResolveIntents asynchronously resolves the coordinator's own intents
 // after a successful commit or abort, to avoid blocking the response.
-func (s *StoreDB) asyncResolveIntents(txnID []byte, status int32, action string) {
+func (s *StoreDB) asyncResolveIntents(txnID []byte, status int32, commitVersion uint64, action string) {
 	go func() {
 		resolveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		resolveOp := ResolveIntentsOp_builder{
-			TxnId:  txnID,
-			Status: status,
+			TxnId:         txnID,
+			Status:        status,
+			CommitVersion: commitVersion,
 		}.Build()
 
 		if err := s.proposeResolveIntents(resolveCtx, resolveOp); err != nil {
@@ -2118,6 +2120,10 @@ func (s *StoreDB) proposeSplitStateChange(ctx context.Context, state *SplitState
 // GetTransactionStatus retrieves the status of a transaction from the coordinator
 func (s *StoreDB) GetTransactionStatus(ctx context.Context, txnID []byte) (int32, error) {
 	return s.coreDB.GetTransactionStatus(ctx, txnID)
+}
+
+func (s *StoreDB) GetCommitVersion(ctx context.Context, txnID []byte) (uint64, error) {
+	return s.coreDB.GetCommitVersion(ctx, txnID)
 }
 
 // GetEdges retrieves edges for a document in a graph index

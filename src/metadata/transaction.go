@@ -101,18 +101,20 @@ func (ms *MetadataStore) ExecuteTransaction(
 	// PHASE 2: Commit
 
 	// Step 3: Commit transaction on coordinator (commit point!)
-	if err := ms.commitTransaction(ctx, coordinatorID, txnID); err != nil {
+	commitVersion, err := ms.commitTransaction(ctx, coordinatorID, txnID)
+	if err != nil {
 		// If this fails, coordinator will retry notifications via recovery loop
 		return fmt.Errorf("committing transaction: %w", err)
 	}
 
 	ms.logger.Info("Transaction committed successfully",
-		zap.String("txnID", txnID.String()))
+		zap.String("txnID", txnID.String()),
+		zap.Uint64("commitVersion", commitVersion))
 
 	// Resolve intents - synchronously if syncLevel >= Write, otherwise async
 	if syncLevel >= db.Op_SyncLevelWrite {
 		// Wait for all participants (and coordinator) to resolve their intents
-		if err := ms.notifyParticipantsSync(ctx, coordinatorID, txnID, allShards); err != nil {
+		if err := ms.notifyParticipantsSync(ctx, coordinatorID, txnID, allShards, commitVersion); err != nil {
 			// Log warning but don't fail - transaction is already committed
 			ms.logger.Warn("Some shards failed to resolve intents synchronously",
 				zap.String("txnID", txnID.String()),
@@ -120,7 +122,7 @@ func (ms *MetadataStore) ExecuteTransaction(
 		}
 	} else {
 		// Fire-and-forget async notification
-		go ms.notifyParticipantsAsync(coordinatorID, txnID, allShards) //nolint:gosec // G118: intentional fire-and-forget async notification
+		go ms.notifyParticipantsAsync(coordinatorID, txnID, allShards, commitVersion) //nolint:gosec // G118: intentional fire-and-forget async notification
 	}
 
 	return nil
@@ -131,6 +133,7 @@ func (ms *MetadataStore) notifyParticipantsAsync(
 	coordinatorID types.ID,
 	txnID uuid.UUID,
 	allShards map[types.ID]struct{},
+	commitVersion uint64,
 ) {
 	// Copy and remove coordinator — participants only.
 	participantShards := make(map[types.ID]struct{}, len(allShards))
@@ -154,7 +157,7 @@ func (ms *MetadataStore) notifyParticipantsAsync(
 				return nil // best-effort; recovery loop will retry
 			}
 
-			if err := storeClient.ResolveIntent(ctx, shardID, txnID[:], db.TxnStatusCommitted); err != nil {
+			if err := storeClient.ResolveIntent(ctx, shardID, txnID[:], db.TxnStatusCommitted, commitVersion); err != nil {
 				ms.logger.Warn("Failed to notify participant to resolve intents",
 					zap.Stringer("shardID", shardID),
 					zap.String("txnID", txnID.String()),
@@ -179,6 +182,7 @@ func (ms *MetadataStore) notifyParticipantsSync(
 	coordinatorID types.ID,
 	txnID uuid.UUID,
 	allShards map[types.ID]struct{},
+	commitVersion uint64,
 ) error {
 	g, _ := workerpool.NewGroup(ctx, ms.pool)
 
@@ -189,7 +193,7 @@ func (ms *MetadataStore) notifyParticipantsSync(
 				return fmt.Errorf("getting client for shard %s: %w", shardID, err)
 			}
 
-			if err := storeClient.ResolveIntent(ctx, shardID, txnID[:], db.TxnStatusCommitted); err != nil {
+			if err := storeClient.ResolveIntent(ctx, shardID, txnID[:], db.TxnStatusCommitted, commitVersion); err != nil {
 				return fmt.Errorf("resolving intents on shard %s: %w", shardID, err)
 			}
 
@@ -302,11 +306,11 @@ func (ms *MetadataStore) commitTransaction(
 	ctx context.Context,
 	coordinatorID types.ID,
 	txnID uuid.UUID,
-) error {
+) (uint64, error) {
 	// Get shard leader client
 	storeClient, err := ms.leaderClientForShard(ctx, coordinatorID)
 	if err != nil {
-		return fmt.Errorf("getting coordinator client: %w", err)
+		return 0, fmt.Errorf("getting coordinator client: %w", err)
 	}
 
 	return storeClient.CommitTransaction(ctx, coordinatorID, txnID[:])

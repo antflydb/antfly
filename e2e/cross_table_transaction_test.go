@@ -61,7 +61,7 @@ func setupTwoTableCluster(t *testing.T) *TestCluster {
 // TestE2E_CrossTableTransaction_Commit verifies that MultiBatch atomically
 // writes to two tables in a single transaction.
 func TestE2E_CrossTableTransaction_Commit(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 	cluster := setupTwoTableCluster(t)
 
@@ -109,7 +109,7 @@ func TestE2E_CrossTableTransaction_Commit(t *testing.T) {
 // TestE2E_CrossTableTransaction_MixedOps verifies atomicity of mixed insert+delete
 // across two tables.
 func TestE2E_CrossTableTransaction_MixedOps(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 	cluster := setupTwoTableCluster(t)
 
@@ -154,7 +154,7 @@ func TestE2E_CrossTableTransaction_MixedOps(t *testing.T) {
 // document in one table causes the entire cross-table batch to fail,
 // leaving both tables unmodified.
 func TestE2E_CrossTableTransaction_AbortOnInvalid(t *testing.T) {
-	skipUnlessEnv(t, "RUN_TXN_TESTS")
+	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 	cluster := setupTwoTableCluster(t)
 
