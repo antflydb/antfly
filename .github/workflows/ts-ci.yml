@@ -5,13 +5,13 @@ on:
     branches: [main]
     paths:
       - "ts/**"
-      - "pnpm-workspace.yaml"
+      - "ts/pnpm-workspace.yaml"
       - ".github/workflows/ts-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "ts/**"
-      - "pnpm-workspace.yaml"
+      - "ts/pnpm-workspace.yaml"
       - ".github/workflows/ts-ci.yml"
 
 concurrency:
@@ -21,6 +21,9 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
 
     strategy:
       matrix:
@@ -39,6 +42,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'pnpm'
+          cache-dependency-path: ts/pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -56,6 +60,9 @@ jobs:
     needs: [test]
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
     steps:
       - uses: actions/checkout@v6
 
@@ -68,6 +75,7 @@ jobs:
         with:
           node-version: lts/*
           cache: 'pnpm'
+          cache-dependency-path: ts/pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
