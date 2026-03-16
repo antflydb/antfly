@@ -148,11 +148,7 @@ func (bw *BackgroundWriter) Stats() (success, errors int64) {
 // TestE2E_OnlineSplit_ContinuousWrites tests that writes during shard split succeed
 // and no data is lost during the split process.
 func TestE2E_OnlineSplit_ContinuousWrites(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -351,11 +347,7 @@ func TestE2E_OnlineSplit_ContinuousWrites(t *testing.T) {
 // TestE2E_OnlineSplit_CrossShardBatchRejection verifies that batches spanning
 // multiple shards are correctly rejected during a split.
 func TestE2E_OnlineSplit_CrossShardBatchRejection(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -454,11 +446,7 @@ func TestE2E_OnlineSplit_CrossShardBatchRejection(t *testing.T) {
 // TestE2E_OnlineSplit_CatchupConvergence verifies that the new shard catches up
 // to the parent shard within acceptable bounds.
 func TestE2E_OnlineSplit_CatchupConvergence(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -550,11 +538,7 @@ func TestE2E_OnlineSplit_CatchupConvergence(t *testing.T) {
 // TestE2E_OnlineSplit_RoutingUpdateTiming verifies no writes are lost during
 // the routing table update when traffic switches to the new shard.
 func TestE2E_OnlineSplit_RoutingUpdateTiming(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -711,11 +695,7 @@ func TestE2E_OnlineSplit_RoutingUpdateTiming(t *testing.T) {
 
 // TestE2E_OnlineSplit_ConcurrentSplits tests multiple shards splitting simultaneously.
 func TestE2E_OnlineSplit_ConcurrentSplits(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -814,11 +794,7 @@ func TestE2E_OnlineSplit_ConcurrentSplits(t *testing.T) {
 // TestE2E_OnlineSplit_RaftLogCompaction tests that catchup works even when
 // the parent shard has compacted its Raft log.
 func TestE2E_OnlineSplit_RaftLogCompaction(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -917,11 +893,7 @@ func TestE2E_OnlineSplit_RaftLogCompaction(t *testing.T) {
 // TestE2E_OnlineSplit_TimeoutRollsBack tests that a split operation that exceeds
 // the configured timeout triggers a rollback, returning the shard to normal state.
 func TestE2E_OnlineSplit_TimeoutRollsBack(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -1187,11 +1159,7 @@ func (br *BackgroundReader) Stats() (success, errors int64) {
 // TestE2E_OnlineSplit_PreBuiltIndexes tests that new shards created from splits
 // can serve index queries immediately because indexes are pre-built in the archive.
 func TestE2E_OnlineSplit_PreBuiltIndexes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -1363,11 +1331,7 @@ func TestE2E_OnlineSplit_PreBuiltIndexes(t *testing.T) {
 // This validates the core improvement of using Raft-replicated split state over the
 // old pendingSplitKey approach.
 func TestE2E_OnlineSplit_LeadershipChange(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -1518,11 +1482,7 @@ func TestE2E_OnlineSplit_LeadershipChange(t *testing.T) {
 // TestE2E_SplitAvailabilityContinuousReads tests that reads remain available
 // during a shard split operation.
 func TestE2E_SplitAvailabilityContinuousReads(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -1653,11 +1613,7 @@ func TestE2E_SplitAvailabilityContinuousReads(t *testing.T) {
 // TestE2E_SplitAvailabilityIndexQueries tests that full-text and vector search
 // queries remain available during a shard split operation.
 func TestE2E_SplitAvailabilityIndexQueries(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -1864,11 +1820,7 @@ func TestE2E_SplitAvailabilityIndexQueries(t *testing.T) {
 // TestE2E_SplitFailureLeaderCrash tests that a split operation recovers correctly
 // when the leader crashes during the split process.
 func TestE2E_SplitFailureLeaderCrash(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()
@@ -2003,11 +1955,7 @@ func TestE2E_SplitFailureLeaderCrash(t *testing.T) {
 // TestE2E_SplitFailureNewShardFails tests that if the new shard fails to start,
 // the split operation times out and rolls back gracefully.
 func TestE2E_SplitFailureNewShardFails(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping e2e test in short mode")
-	}
-
-	// Online shard split tests run by default (skip with -short).
+	skipInShortMode(t)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer sigCancel()

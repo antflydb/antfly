@@ -931,7 +931,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 // TestRemoteContentCredentialResolution tests credential resolution without starting the full swarm.
 // This is a lighter-weight test that verifies the configuration system works correctly.
 func TestRemoteContentCredentialResolution(t *testing.T) {
-	skipUnlessML(t)
+	skipInShortMode(t)
 
 	// Set up fake S3 server
 	s3Client, _, endpoint, cleanup := setupFakeS3ForE2E(t)
@@ -992,7 +992,7 @@ func TestRemoteContentCredentialResolution(t *testing.T) {
 
 // TestRemoteContentMultipleCredentials tests bucket pattern matching with multiple credentials.
 func TestRemoteContentMultipleCredentials(t *testing.T) {
-	skipUnlessML(t)
+	skipInShortMode(t)
 
 	// Set up two fake S3 servers simulating different environments
 	s3Client1, _, endpoint1, cleanup1 := setupFakeS3ForE2E(t)

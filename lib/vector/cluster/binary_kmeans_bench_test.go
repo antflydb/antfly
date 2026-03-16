@@ -28,7 +28,7 @@ func BenchmarkAssignPartitions(b *testing.B) {
 	workspace := &allocator.StackAllocator{}
 
 	// Load datasets of different dimensionalities.
-	images := testutils.LoadDataset(b, testutils.ImagesDataset)       // 512d, 10k
+	images := testutils.LoadDataset(b, testutils.ImagesDataset)           // 512d, 10k
 	fashion := testutils.LoadDataset(b, testutils.FashionMinstDataset10k) // 784d, 10k
 
 	type benchCase struct {

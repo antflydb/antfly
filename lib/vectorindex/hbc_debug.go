@@ -158,7 +158,7 @@ func OpenDebugPebbleBackedHBCWithBatch(baseDir string, config HBCConfig, randSou
 func populateDebugVectors(db *pebble.DB, indexName string, batch *Batch) error {
 	suffix := fmt.Appendf(nil, ":i:%s:e", indexName)
 	pbatch := db.NewBatch()
-	defer pbatch.Close()
+	defer func() { _ = pbatch.Close() }()
 
 	if batch.MetadataList == nil {
 		batch.MetadataList = make([][]byte, len(batch.IDs))

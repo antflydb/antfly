@@ -43,7 +43,7 @@ func isActiveSplitParentStatus(status *store.ShardStatus) bool {
 func shouldRouteWriteToParent(status *store.ShardStatus) bool {
 	switch status.State {
 	case store.ShardState_SplittingOff, store.ShardState_SplitOffPreSnap:
-		return !status.ShardInfo.IsReadyForSplitReads()
+		return !status.IsReadyForSplitReads()
 	default:
 		return false
 	}

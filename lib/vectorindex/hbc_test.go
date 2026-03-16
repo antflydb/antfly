@@ -437,7 +437,7 @@ func TestHBCIndex_DeleteRepairsUnderfullLeaf(t *testing.T) {
 	dump, err := index.DebugDump()
 	require.NoError(t, err)
 	assert.EqualValues(t, 4, dump.ActiveCount)
-	assert.EqualValues(t, dump.RootNode, dump.Nodes[len(dump.Nodes)-1].ID)
+	assert.Equal(t, dump.RootNode, dump.Nodes[len(dump.Nodes)-1].ID)
 	for _, node := range dump.Nodes {
 		if node.IsLeaf {
 			assert.NotEmpty(t, node.Members)

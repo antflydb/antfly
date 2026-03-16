@@ -43,7 +43,7 @@ type spinner struct {
 
 func newSpinner(w io.Writer) *spinner {
 	f, ok := w.(*os.File)
-	isTTY := ok && term.IsTerminal(int(f.Fd()))
+	isTTY := ok && term.IsTerminal(int(f.Fd())) //nolint:gosec // standard pattern for term.IsTerminal
 	return &spinner{
 		w:     w,
 		isTTY: isTTY,
@@ -66,7 +66,7 @@ func (s *spinner) start(msg string) {
 			s.renderedLines = 0
 			s.render()
 		} else {
-			fmt.Fprintf(s.w, "%s\n", msg)
+			_, _ = fmt.Fprintf(s.w, "%s\n", msg)
 		}
 		return
 	}
@@ -76,7 +76,7 @@ func (s *spinner) start(msg string) {
 	s.done = make(chan struct{})
 
 	if !s.isTTY {
-		fmt.Fprintf(s.w, "%s\n", msg)
+		_, _ = fmt.Fprintf(s.w, "%s\n", msg)
 		return
 	}
 
@@ -90,7 +90,7 @@ func (s *spinner) setDetail(detail string) {
 	defer s.mu.Unlock()
 	s.detail = detail
 	if !s.isTTY && detail != "" {
-		fmt.Fprintf(s.w, "  %s\n", detail)
+		_, _ = fmt.Fprintf(s.w, "  %s\n", detail)
 	}
 }
 
@@ -102,10 +102,10 @@ func (s *spinner) log(msg string) {
 	if s.isTTY && s.running {
 		s.clear()
 		s.renderedLines = 0
-		fmt.Fprintln(s.w, msg)
+		_, _ = fmt.Fprintln(s.w, msg)
 		s.render()
 	} else {
-		fmt.Fprintln(s.w, msg)
+		_, _ = fmt.Fprintln(s.w, msg)
 	}
 }
 
@@ -133,9 +133,9 @@ func (s *spinner) finish(colorCode, icon, msg string) {
 
 	if s.isTTY {
 		s.clear()
-		fmt.Fprintf(s.w, "\033[%sm%s\033[0m %s\n", colorCode, icon, msg)
+		_, _ = fmt.Fprintf(s.w, "\033[%sm%s\033[0m %s\n", colorCode, icon, msg)
 	} else {
-		fmt.Fprintf(s.w, "%s %s\n", icon, msg)
+		_, _ = fmt.Fprintf(s.w, "%s %s\n", icon, msg)
 	}
 	s.renderedLines = 0
 }
@@ -143,16 +143,16 @@ func (s *spinner) finish(colorCode, icon, msg string) {
 // clear erases all rendered physical lines and moves cursor to the start. Must hold s.mu.
 func (s *spinner) clear() {
 	// Clear current line, then move up and clear each previous line
-	fmt.Fprint(s.w, "\r\033[K")
+	_, _ = fmt.Fprint(s.w, "\r\033[K")
 	for i := 1; i < s.renderedLines; i++ {
-		fmt.Fprint(s.w, "\033[A\r\033[K")
+		_, _ = fmt.Fprint(s.w, "\033[A\r\033[K")
 	}
 }
 
 // termWidth returns the terminal width, or 80 if it cannot be determined.
 func (s *spinner) termWidth() int {
 	if f, ok := s.w.(*os.File); ok {
-		if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 {
+		if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 { //nolint:gosec // standard pattern for term.GetSize
 			return w
 		}
 	}
@@ -199,11 +199,11 @@ func (s *spinner) render() {
 	w := s.termWidth()
 	frame := spinnerFrames[s.frame%len(spinnerFrames)]
 	line := fmt.Sprintf("\033[33m%s\033[0m %s", frame, s.message)
-	fmt.Fprint(s.w, line)
+	_, _ = fmt.Fprint(s.w, line)
 	lines := physicalLines(line, w)
 	if s.detail != "" {
 		detail := fmt.Sprintf("  \033[2m%s\033[0m", s.detail)
-		fmt.Fprintf(s.w, "\n%s", detail)
+		_, _ = fmt.Fprintf(s.w, "\n%s", detail)
 		lines += physicalLines(detail, w)
 	}
 	s.renderedLines = lines

@@ -189,12 +189,8 @@ jobs:
         run: pkill ollama || true
 
       - name: E2E Tests
-        run: |
-          make e2e E2E_TIMEOUT=45m
-
-      - name: E2E PostgreSQL Tests
         env:
           RUN_PG_TESTS: "true"
           ANTFLY_E2E_PG_DSN: postgres://antfly:antfly_dev@${{ env.POSTGRES_HOST }}:5432/antfly_test?sslmode=disable
         run: |
-          cd e2e && go test -v ./... -run "TestE2E_ForeignTable" -timeout 10m
+          make e2e E2E_TIMEOUT=45m

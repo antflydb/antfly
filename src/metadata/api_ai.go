@@ -32,7 +32,6 @@ import (
 // answer generation, and other overhead when max_context_tokens is set.
 const DefaultReserveTokens = 4000
 
-
 // cachedPruner returns a Pruner for the given document renderer template,
 // creating and caching one if it doesn't already exist. The Pruner is safe
 // for concurrent use, so a single instance per renderer string is sufficient.

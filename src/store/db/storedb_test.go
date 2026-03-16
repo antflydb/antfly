@@ -454,7 +454,7 @@ func TestApplyOpFinalizeSplit_WaitsForLocalChildReplayBeforeDeletingParentRange(
 
 	_, err = parent.coreDB.Get(context.Background(), []byte("mango"))
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrNotFound))
+	assert.ErrorIs(t, err, ErrNotFound)
 
 	assert.Nil(t, parent.GetSplitState())
 	splitDeltaSeq, err := parent.coreDB.GetSplitDeltaSeq()

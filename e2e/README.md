@@ -72,7 +72,7 @@ go test -short ./e2e
 RUN_ML_TESTS=true make e2e E2E_TIMEOUT=45m
 
 # Run PostgreSQL tests
-RUN_PG_TESTS=true ANTFLY_E2E_PG_DSN=postgres://... cd e2e && go test -v ./... -timeout 10m
+cd e2e && RUN_PG_TESTS=true ANTFLY_E2E_PG_DSN=postgres://... go test -v ./... -timeout 10m
 ```
 
 ### Using Gemini instead of Ollama
