@@ -318,7 +318,7 @@ func configureStreamingCallbacks(sp *spinner, ragOpts *antfly.RetrievalAgentOpti
 	var reasoningBuf string
 	ragOpts.OnClassification = func(c *antfly.ClassificationTransformationResult) error {
 		if reasoningBuf != "" {
-			for _, line := range strings.Split(strings.TrimSpace(reasoningBuf), "\n") {
+			for line := range strings.SplitSeq(strings.TrimSpace(reasoningBuf), "\n") {
 				sp.log(fmt.Sprintf("  \033[2m%s\033[0m", line))
 			}
 		}
@@ -338,7 +338,7 @@ func configureStreamingCallbacks(sp *spinner, ragOpts *antfly.RetrievalAgentOpti
 			generationStarted = true
 			sp.stop("Generating response")
 		}
-		fmt.Fprint(os.Stdout, chunk)
+		_, _ = fmt.Fprint(os.Stdout, chunk)
 		return nil
 	}
 	followupStarted := false

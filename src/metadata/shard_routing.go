@@ -370,9 +370,9 @@ func (ms *MetadataStore) leaderClientForShardNoFallback(
 func (ms *MetadataStore) shouldFallbackToParentShard(status *store.ShardStatus) bool {
 	switch status.State {
 	case store.ShardState_SplittingOff, store.ShardState_SplitOffPreSnap:
-		return !status.ShardInfo.IsReadyForSplitReads()
+		return !status.IsReadyForSplitReads()
 	case store.ShardState_Default:
-		if status.ShardInfo.IsReadyForSplitReads() {
+		if status.IsReadyForSplitReads() {
 			return false
 		}
 		allStatuses, err := ms.tm.GetShardStatuses()

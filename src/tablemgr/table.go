@@ -462,9 +462,9 @@ func (tm *TableManager) splitOffShardIsReady(parentStatus *store.ShardStatus) bo
 			// Found the split-off shard, check if it's ready
 			switch status.State {
 			case store.ShardState_SplittingOff, store.ShardState_SplitOffPreSnap:
-				return status.ShardInfo.IsReadyForSplitReads()
+				return status.IsReadyForSplitReads()
 			case store.ShardState_Default:
-				return status.ShardInfo.IsReadyForSplitReads()
+				return status.IsReadyForSplitReads()
 			default:
 				// Unexpected state, be conservative
 				return false

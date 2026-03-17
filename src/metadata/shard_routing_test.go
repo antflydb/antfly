@@ -158,15 +158,15 @@ func TestFindWriteShardForKey_FallsBackToParentUntilSplitOffReady(t *testing.T) 
 	table := &store.Table{
 		Name: "test_table",
 		Shards: map[types.ID]*store.ShardConfig{
-			parentID: {ByteRange: [2][]byte{[]byte{0x00}, splitKey}},
-			childID:  {ByteRange: [2][]byte{splitKey, []byte{0xff}}},
+			parentID: {ByteRange: [2][]byte{{0x00}, splitKey}},
+			childID:  {ByteRange: [2][]byte{splitKey, {0xff}}},
 		},
 	}
 
 	writeShardStatus(t, db, splitShardStatus(
 		parentID,
 		store.ShardState_PreSplit,
-		[2][]byte{[]byte{0x00}, splitKey},
+		[2][]byte{{0x00}, splitKey},
 		false,
 		false,
 		1,
@@ -181,7 +181,7 @@ func TestFindWriteShardForKey_FallsBackToParentUntilSplitOffReady(t *testing.T) 
 	writeShardStatus(t, db, splitShardStatus(
 		childID,
 		store.ShardState_SplitOffPreSnap,
-		[2][]byte{splitKey, []byte{0xff}},
+		[2][]byte{splitKey, {0xff}},
 		true,
 		false,
 		0,
@@ -202,15 +202,15 @@ func TestPartitionWriteKeysByShard_KeepsParentAsWriteOwnerWhileParentSplitIsActi
 	table := &store.Table{
 		Name: "test_table",
 		Shards: map[types.ID]*store.ShardConfig{
-			parentID: {ByteRange: [2][]byte{[]byte{0x00}, splitKey}},
-			childID:  {ByteRange: [2][]byte{splitKey, []byte{0xff}}},
+			parentID: {ByteRange: [2][]byte{{0x00}, splitKey}},
+			childID:  {ByteRange: [2][]byte{splitKey, {0xff}}},
 		},
 	}
 
 	writeShardStatus(t, db, splitShardStatus(
 		parentID,
 		store.ShardState_Splitting,
-		[2][]byte{[]byte{0x00}, splitKey},
+		[2][]byte{{0x00}, splitKey},
 		false,
 		false,
 		1,
@@ -225,7 +225,7 @@ func TestPartitionWriteKeysByShard_KeepsParentAsWriteOwnerWhileParentSplitIsActi
 	writeShardStatus(t, db, splitShardStatus(
 		childID,
 		store.ShardState_SplitOffPreSnap,
-		[2][]byte{splitKey, []byte{0xff}},
+		[2][]byte{splitKey, {0xff}},
 		true,
 		false,
 		2,
@@ -248,15 +248,15 @@ func TestPartitionWriteKeysByShard_UsesChildOnceParentSplitIsInactive(t *testing
 	table := &store.Table{
 		Name: "test_table",
 		Shards: map[types.ID]*store.ShardConfig{
-			parentID: {ByteRange: [2][]byte{[]byte{0x00}, splitKey}},
-			childID:  {ByteRange: [2][]byte{splitKey, []byte{0xff}}},
+			parentID: {ByteRange: [2][]byte{{0x00}, splitKey}},
+			childID:  {ByteRange: [2][]byte{splitKey, {0xff}}},
 		},
 	}
 
 	writeShardStatus(t, db, splitShardStatus(
 		parentID,
 		store.ShardState_Default,
-		[2][]byte{[]byte{0x00}, splitKey},
+		[2][]byte{{0x00}, splitKey},
 		false,
 		false,
 		1,
@@ -264,7 +264,7 @@ func TestPartitionWriteKeysByShard_UsesChildOnceParentSplitIsInactive(t *testing
 	writeShardStatus(t, db, splitShardStatus(
 		childID,
 		store.ShardState_Default,
-		[2][]byte{splitKey, []byte{0xff}},
+		[2][]byte{splitKey, {0xff}},
 		true,
 		false,
 		2,
@@ -294,7 +294,7 @@ func TestResolveWriteShardID_AdjacentShardNotReroutedDuringSplit(t *testing.T) {
 		splittingParentID: {
 			ShardInfo: storedb.ShardInfo{
 				ShardConfig: storedb.ShardConfig{
-					ByteRange: [2][]byte{[]byte{0x00}, splitKey},
+					ByteRange: [2][]byte{{0x00}, splitKey},
 				},
 				SplitState: activeSplitState,
 			},
@@ -304,7 +304,7 @@ func TestResolveWriteShardID_AdjacentShardNotReroutedDuringSplit(t *testing.T) {
 		splitChildID: {
 			ShardInfo: storedb.ShardInfo{
 				ShardConfig: storedb.ShardConfig{
-					ByteRange: [2][]byte{splitKey, []byte{0x80}},
+					ByteRange: [2][]byte{splitKey, {0x80}},
 				},
 			},
 			Table: "test_table",
@@ -313,7 +313,7 @@ func TestResolveWriteShardID_AdjacentShardNotReroutedDuringSplit(t *testing.T) {
 		adjacentShardID: {
 			ShardInfo: storedb.ShardInfo{
 				ShardConfig: storedb.ShardConfig{
-					ByteRange: [2][]byte{[]byte{0x80}, []byte{0xff}},
+					ByteRange: [2][]byte{{0x80}, {0xff}},
 				},
 			},
 			Table: "test_table",
@@ -346,7 +346,7 @@ func TestResolveWriteShardID_FinalizingParentIsNotWriteOwner(t *testing.T) {
 		parentID: {
 			ShardInfo: storedb.ShardInfo{
 				ShardConfig: storedb.ShardConfig{
-					ByteRange: [2][]byte{[]byte{0x00}, splitKey},
+					ByteRange: [2][]byte{{0x00}, splitKey},
 				},
 				SplitState: finalizingState,
 			},
@@ -356,7 +356,7 @@ func TestResolveWriteShardID_FinalizingParentIsNotWriteOwner(t *testing.T) {
 		childID: {
 			ShardInfo: storedb.ShardInfo{
 				ShardConfig: storedb.ShardConfig{
-					ByteRange: [2][]byte{splitKey, []byte{0xff}},
+					ByteRange: [2][]byte{splitKey, {0xff}},
 				},
 				SplitReplayRequired: true,
 				SplitReplayCaughtUp: true,
@@ -383,7 +383,7 @@ func TestResolveWriteShardID_PreSplitParentWithoutSplitStateIsNotWriteOwner(t *t
 		parentID: {
 			ShardInfo: storedb.ShardInfo{
 				ShardConfig: storedb.ShardConfig{
-					ByteRange: [2][]byte{[]byte{0x00}, splitKey},
+					ByteRange: [2][]byte{{0x00}, splitKey},
 				},
 			},
 			Table: "test_table",
@@ -392,7 +392,7 @@ func TestResolveWriteShardID_PreSplitParentWithoutSplitStateIsNotWriteOwner(t *t
 		childID: {
 			ShardInfo: storedb.ShardInfo{
 				ShardConfig: storedb.ShardConfig{
-					ByteRange: [2][]byte{splitKey, []byte{0xff}},
+					ByteRange: [2][]byte{splitKey, {0xff}},
 				},
 				SplitReplayRequired: true,
 				SplitReplayCaughtUp: true,
@@ -428,7 +428,7 @@ func TestFindParentShardForSplitOffStatus_NoParent(t *testing.T) {
 	childStatus := &store.ShardStatus{
 		ShardInfo: storedb.ShardInfo{
 			ShardConfig: storedb.ShardConfig{
-				ByteRange: [2][]byte{[]byte("m:\x00"), []byte{0xff}},
+				ByteRange: [2][]byte{[]byte("m:\x00"), {0xff}},
 			},
 		},
 		Table: "test_table",

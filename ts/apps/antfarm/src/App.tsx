@@ -89,11 +89,7 @@ function AppContent() {
                         <Route path="/create" element={<CreateTablePage />} />
                         <Route
                           path="/tables/:tableName"
-                          element={
-                            <TableDetailsPage
-                              currentSection={currentSection}
-                            />
-                          }
+                          element={<TableDetailsPage currentSection={currentSection} />}
                         />
                         <Route path="/users" element={<UsersPage />} />
                         <Route path="/secrets" element={<SecretsPage />} />

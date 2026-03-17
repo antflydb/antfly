@@ -415,6 +415,15 @@ func (db *DBImpl) SetPebbleDB(pdb *pebble.DB) {
 	db.pdbMu.Unlock()
 }
 
+// getPDB returns the Pebble database pointer, safely guarded against concurrent
+// Close() calls that nil out the pointer. Returns nil if the DB is closed.
+func (db *DBImpl) getPDB() *pebble.DB {
+	db.pdbMu.RLock()
+	pdb := db.pdb
+	db.pdbMu.RUnlock()
+	return pdb
+}
+
 func (db *DBImpl) AddIndex(config indexes.IndexConfig) error {
 	db.logger.Debug("Adding index", zap.Any("indexConfig", config))
 	if err := db.indexManager.Register(config.Name, true, config); err != nil {
@@ -496,12 +505,16 @@ func (db *DBImpl) UpdateSchema(schema *schema.TableSchema) error {
 }
 
 func (db *DBImpl) SetRange(byteRange types.Range) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	// Marshal the NEW byteRange parameter, not the old db.byteRange
 	data, err := json.Marshal(byteRange)
 	if err != nil {
 		return fmt.Errorf("marshaling byte range: %w", err)
 	}
-	if err := db.pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
+	if err := pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving byte range: %w", err)
 	}
 	db.byteRange = byteRange
@@ -512,7 +525,11 @@ func (db *DBImpl) SetRange(byteRange types.Range) error {
 }
 
 func (db *DBImpl) UpdateRange(byteRange types.Range) error {
-	batch := db.pdb.NewBatch()
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	batch := pdb.NewBatch()
 	defer func() {
 		_ = batch.Close()
 	}()
@@ -533,7 +550,7 @@ func (db *DBImpl) UpdateRange(byteRange types.Range) error {
 	if err != nil {
 		return fmt.Errorf("marshaling byte range: %w", err)
 	}
-	if err := db.pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
+	if err := pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving byte range: %w", err)
 	}
 	db.byteRange = byteRange
@@ -569,11 +586,15 @@ func (db *DBImpl) SetSplitState(state *SplitState) error {
 	if state == nil {
 		return db.ClearSplitState()
 	}
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	data, err := proto.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("marshaling split state: %w", err)
 	}
-	if err := db.pdb.Set(splitStateKey, data, pebble.Sync); err != nil {
+	if err := pdb.Set(splitStateKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving split state: %w", err)
 	}
 	db.splitState = state
@@ -583,7 +604,11 @@ func (db *DBImpl) SetSplitState(state *SplitState) error {
 // ClearSplitState removes the split state from Pebble and clears the in-memory state.
 // This is called after a split is finalized or rolled back.
 func (db *DBImpl) ClearSplitState() error {
-	if err := db.pdb.Delete(splitStateKey, pebble.Sync); err != nil {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	if err := pdb.Delete(splitStateKey, pebble.Sync); err != nil {
 		return fmt.Errorf("deleting split state: %w", err)
 	}
 	db.splitState = nil
@@ -593,7 +618,11 @@ func (db *DBImpl) ClearSplitState() error {
 // loadSplitState loads the split state from Pebble into memory.
 // This is called during Open() to restore split state across restarts.
 func (db *DBImpl) loadSplitState() error {
-	data, closer, err := db.pdb.Get(splitStateKey)
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	data, closer, err := pdb.Get(splitStateKey)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return nil // No split state stored
@@ -655,8 +684,12 @@ func (db *DBImpl) GetSplitDeltaFinalSeq() (uint64, error) {
 }
 
 func (db *DBImpl) SetSplitDeltaFinalSeq(seq uint64) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	encoded := encoding.EncodeUint64Ascending(nil, seq)
-	if err := db.pdb.Set(splitDeltaFinalSeqKey, encoded, pebble.Sync); err != nil {
+	if err := pdb.Set(splitDeltaFinalSeqKey, encoded, pebble.Sync); err != nil {
 		return fmt.Errorf("saving split delta final seq: %w", err)
 	}
 	db.splitDeltaFinalSeq = seq
@@ -664,7 +697,11 @@ func (db *DBImpl) SetSplitDeltaFinalSeq(seq uint64) error {
 }
 
 func (db *DBImpl) ClearSplitDeltaFinalSeq() error {
-	if err := db.pdb.Delete(splitDeltaFinalSeqKey, pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	if err := pdb.Delete(splitDeltaFinalSeqKey, pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
 		return fmt.Errorf("deleting split delta final seq: %w", err)
 	}
 	db.splitDeltaFinalSeq = 0
@@ -672,9 +709,13 @@ func (db *DBImpl) ClearSplitDeltaFinalSeq() error {
 }
 
 func (db *DBImpl) ListSplitDeltaEntriesAfter(afterSeq uint64) ([]*SplitDeltaEntry, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
 	lowerBound := splitDeltaEntryKey(afterSeq + 1)
 	upperBound := utils.PrefixSuccessor(splitDeltaPrefix)
-	iter, err := db.pdb.NewIter(&pebble.IterOptions{
+	iter, err := pdb.NewIter(&pebble.IterOptions{
 		LowerBound: lowerBound,
 		UpperBound: upperBound,
 	})
@@ -698,7 +739,11 @@ func (db *DBImpl) ListSplitDeltaEntriesAfter(afterSeq uint64) ([]*SplitDeltaEntr
 }
 
 func (db *DBImpl) ClearSplitDeltaEntries() error {
-	batch := db.pdb.NewBatch()
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	batch := pdb.NewBatch()
 	defer func() { _ = batch.Close() }()
 	if err := batch.DeleteRange(splitDeltaPrefix, utils.PrefixSuccessor(splitDeltaPrefix), nil); err != nil {
 		return fmt.Errorf("clearing split delta entries: %w", err)
@@ -910,6 +955,12 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 		return
 	default:
 	}
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return
+	}
+
 	var err error
 	defer func() {
 		pebbleutils.RecoverPebbleClosed(&err)
@@ -918,7 +969,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 		}
 	}()
 
-	iter, err := db.pdb.NewIter(&pebble.IterOptions{
+	iter, err := pdb.NewIter(&pebble.IterOptions{
 		LowerBound: txnRecordsPrefix,
 		UpperBound: utils.PrefixSuccessor(txnRecordsPrefix),
 	})
@@ -980,7 +1031,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 			// Check if all participants have resolved their intents
 			allResolved := len(record.ResolvedParticipants) >= len(record.Participants)
 			if allResolved {
-				if err := db.pdb.Delete(iter.Key(), pebble.Sync); err != nil {
+				if err := pdb.Delete(iter.Key(), pebble.Sync); err != nil {
 					db.logger.Warn("Failed to cleanup old transaction record",
 						zap.String("key", types.FormatKey(iter.Key())),
 						zap.Error(err))
@@ -1055,7 +1106,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 								zap.Binary("txnID", record.TxnID),
 								zap.Error(err))
 						} else {
-							if err := db.pdb.Set(iter.Key(), updatedData, pebble.Sync); err != nil {
+							if err := pdb.Set(iter.Key(), updatedData, pebble.Sync); err != nil {
 								db.logger.Warn("Failed to save updated transaction record",
 									zap.Binary("txnID", record.TxnID),
 									zap.Error(err))
@@ -1353,10 +1404,14 @@ func (db *DBImpl) Split(
 	}
 
 	// For non-prepareOnly splits, we need to rebuild indexes for the remaining range
+	splitPDB := db.getPDB()
+	if splitPDB == nil {
+		return pebble.ErrClosed
+	}
 	newIndexManager, err := NewIndexManager(
 		db.logger,
 		db.antflyConfig,
-		db.pdb,
+		splitPDB,
 		filepath.Join(destDir1, "indexes"),
 		db.schema,
 		range1,
@@ -1452,7 +1507,11 @@ func (db *DBImpl) FinalizeSplit(newRange types.Range) error {
 // finalizeSplitInternal handles the deletion of split-off data and byte range update.
 // If destDir1 is non-empty, the new indexes are moved into place.
 func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) error {
-	batch := db.pdb.NewBatch()
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	batch := pdb.NewBatch()
 	defer func() {
 		_ = batch.Close()
 	}()
@@ -1470,7 +1529,7 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 	if err != nil {
 		return fmt.Errorf("marshaling byte range: %w", err)
 	}
-	if err := db.pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
+	if err := pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving byte range: %w", err)
 	}
 	db.byteRange = newRange
@@ -1525,7 +1584,8 @@ func (db *DBImpl) streamRangeToDB(
 
 	// Guard against nil pdb: the shard may be shutting down concurrently
 	// (Close sets pdb=nil) while the Raft commit loop is still applying entries.
-	if db.pdb == nil {
+	pdb := db.getPDB()
+	if pdb == nil {
 		return 0, fmt.Errorf("source database closed during split streaming")
 	}
 
@@ -1541,11 +1601,11 @@ func (db *DBImpl) streamRangeToDB(
 	}
 
 	// Flush memtable to ensure all data is visible to the iterator
-	if err := db.pdb.Flush(); err != nil {
+	if err := pdb.Flush(); err != nil {
 		return 0, fmt.Errorf("flushing memtable before streaming: %w", err)
 	}
 
-	iter, err := db.pdb.NewIterWithContext(ctx, iterOpts)
+	iter, err := pdb.NewIterWithContext(ctx, iterOpts)
 	if err != nil {
 		return 0, fmt.Errorf("creating iterator: %w", err)
 	}
@@ -1554,7 +1614,11 @@ func (db *DBImpl) streamRangeToDB(
 	}()
 
 	const batchSize = 1000
-	batch := destDB.pdb.NewBatch()
+	destPDB := destDB.getPDB()
+	if destPDB == nil {
+		return 0, fmt.Errorf("destination database closed during split streaming")
+	}
+	batch := destPDB.NewBatch()
 	keyBatch := make([][2][]byte, 0, batchSize)
 	defer func() {
 		_ = batch.Close()
@@ -1627,11 +1691,15 @@ func (db *DBImpl) SetIndexManager(im *IndexManager) error {
 }
 
 func (db *DBImpl) openIndex(dir string, recoverIndex bool) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	var err error
 	im, err := NewIndexManager(
 		db.logger,
 		db.antflyConfig,
-		db.pdb,
+		pdb,
 		filepath.Join(dir, "indexes"),
 		db.schema,
 		db.byteRange,
@@ -1684,12 +1752,7 @@ func (db *DBImpl) getWithQueryOptions(
 	key []byte,
 	opts storeutils.QueryOptions,
 ) (docMap map[string]any, err error) {
-	// Take read lock to prevent access during close/reopen cycle (e.g., during splits)
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
-
-	// Guard against accessing a nil or closed database (can happen during splits)
+	pdb := db.getPDB()
 	if pdb == nil {
 		return nil, pebble.ErrClosed
 	}
@@ -1736,7 +1799,11 @@ func (db *DBImpl) FindMedianKey() ([]byte, error) {
 	skipMetadataKey := func(key []byte) bool {
 		return bytes.HasPrefix(key, storeutils.MetadataPrefix)
 	}
-	key, err := common.FindSplitKeyByFileSize(db.logger, db.pdb, db.byteRange, skipMetadataKey)
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+	key, err := common.FindSplitKeyByFileSize(db.logger, pdb, db.byteRange, skipMetadataKey)
 	if err != nil {
 		return nil, err
 	}
@@ -2134,11 +2201,15 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 		}
 
 		// For each graph index in _edges, find edges to delete
+		pdb := db.getPDB()
 		for indexName := range edgesObj {
+			if pdb == nil {
+				break
+			}
 			// Scan for existing edges with this index name
 			prefix := storeutils.EdgeIteratorPrefix(key, indexName, "")
 
-			iter, err := db.pdb.NewIter(&pebble.IterOptions{
+			iter, err := pdb.NewIter(&pebble.IterOptions{
 				LowerBound: prefix,
 				UpperBound: utils.PrefixSuccessor(prefix),
 			})
@@ -2247,11 +2318,7 @@ func (db *DBImpl) Batch(
 ) (err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
 
-	// Take read lock to prevent access during close/reopen cycle (e.g., during splits)
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
-
+	pdb := db.getPDB()
 	if pdb == nil {
 		return pebble.ErrClosed
 	}
@@ -2788,7 +2855,11 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 		Start: s.byteRange[0],             // Start of the original range
 		End:   s.byteRange.EndForPebble(), // Use helper for Pebble-compatible End
 	}
-	err := s.pdb.Checkpoint(stagingPebbleDir,
+	pdb := s.getPDB()
+	if pdb == nil {
+		return 0, pebble.ErrClosed
+	}
+	err := pdb.Checkpoint(stagingPebbleDir,
 		pebble.WithFlushedWAL(),
 		pebble.WithRestrictToSpans([]pebble.CheckpointSpan{span}),
 	)
@@ -3619,7 +3690,11 @@ func (s *DBImpl) expandFilterIDsForChunks(docKeys []string, indexName string) ([
 	expanded := make([]uint64, 0, len(docKeys)*2)
 	for _, docKey := range docKeys {
 		prefix := storeutils.MakeChunkPrefix([]byte(docKey), indexName)
-		iter, err := s.pdb.NewIter(&pebble.IterOptions{
+		pdb := s.getPDB()
+		if pdb == nil {
+			return nil, pebble.ErrClosed
+		}
+		iter, err := pdb.NewIter(&pebble.IterOptions{
 			LowerBound: prefix,
 			UpperBound: utils.PrefixSuccessor(prefix),
 		})
@@ -3841,8 +3916,10 @@ func (s *DBImpl) Stats() (diskSize uint64, empty bool, indexStats map[string]ind
 		empty = false
 	}
 
-	if storageMets := s.pdb.Metrics(); storageMets != nil {
-		diskSize = storageMets.DiskSpaceUsage()
+	if pdb := s.getPDB(); pdb != nil {
+		if storageMets := pdb.Metrics(); storageMets != nil {
+			diskSize = storageMets.DiskSpaceUsage()
+		}
 	}
 	indexStats = s.indexManager.Stats()
 	return
@@ -3850,13 +3927,17 @@ func (s *DBImpl) Stats() (diskSize uint64, empty bool, indexStats map[string]ind
 
 // loadMetadata loads all metadata from Pebble
 func (db *DBImpl) loadMetadata() error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	// Create iterator for metadata prefix
 	iterOpts := &pebble.IterOptions{
 		LowerBound: MetadataPrefix,
 		UpperBound: utils.PrefixSuccessor(MetadataPrefix),
 	}
 
-	iter, err := db.pdb.NewIterWithContext(context.Background(), iterOpts)
+	iter, err := pdb.NewIterWithContext(context.Background(), iterOpts)
 	if err != nil {
 		return fmt.Errorf("creating metadata iterator: %w", err)
 	}
@@ -3946,7 +4027,11 @@ func (db *DBImpl) loadMetadata() error {
 
 // saveMetadata saves all metadata to Pebble
 func (db *DBImpl) saveMetadata() error {
-	batch := db.pdb.NewBatch()
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	batch := pdb.NewBatch()
 	defer func() {
 		_ = batch.Close()
 	}()
@@ -3992,11 +4077,15 @@ func (db *DBImpl) saveSchema() error {
 	if db.schema == nil {
 		return nil
 	}
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	data, err := json.Marshal(db.schema)
 	if err != nil {
 		return fmt.Errorf("marshaling schema: %w", err)
 	}
-	if err := db.pdb.Set(schemaKey, data, pebble.Sync); err != nil {
+	if err := pdb.Set(schemaKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving schema: %w", err)
 	}
 	return nil
@@ -4004,11 +4093,15 @@ func (db *DBImpl) saveSchema() error {
 
 // saveIndexes saves the indexes configuration to Pebble
 func (db *DBImpl) saveIndexes() error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	data, err := json.Marshal(db.indexes)
 	if err != nil {
 		return fmt.Errorf("marshaling indexes: %w", err)
 	}
-	if err := db.pdb.Set(indexesKey, data, pebble.Sync); err != nil {
+	if err := pdb.Set(indexesKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving indexes: %w", err)
 	}
 	return nil
@@ -4099,7 +4192,11 @@ func (db *DBImpl) Scan(
 	resultCount := 0
 
 	// Use storeutils.Scan with appropriate options
-	err := storeutils.Scan(ctx, db.pdb, storeutils.ScanOptions{
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+	err := storeutils.Scan(ctx, pdb, storeutils.ScanOptions{
 		LowerBound: lowerBound,
 		UpperBound: upperBound,
 		SkipPoint: func(userKey []byte) bool {
@@ -4276,6 +4373,12 @@ func (db *DBImpl) InitTransaction(ctx context.Context, op *InitTransactionOp) er
 		transactionDurationSeconds.WithLabelValues("init").Observe(time.Since(start).Seconds())
 	}()
 
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+
 	activeTransactionsGauge.Inc()
 
 	txnKey := makeTxnKey(op.GetTxnId())
@@ -4295,7 +4398,7 @@ func (db *DBImpl) InitTransaction(ctx context.Context, op *InitTransactionOp) er
 		return fmt.Errorf("marshaling transaction record: %w", err)
 	}
 
-	if err := db.pdb.Set(txnKey, data, pebble.Sync); err != nil {
+	if err := pdb.Set(txnKey, data, pebble.Sync); err != nil {
 		transactionOpsTotal.WithLabelValues("init", "error").Inc()
 		return fmt.Errorf("writing transaction record: %w", err)
 	}
@@ -4328,7 +4431,13 @@ func (db *DBImpl) WriteIntent(ctx context.Context, op *WriteIntentOp) error {
 		transactionDurationSeconds.WithLabelValues("write_intent").Observe(time.Since(start).Seconds())
 	}()
 
-	batch := db.pdb.NewBatch()
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+
+	batch := pdb.NewBatch()
 	defer func() { _ = batch.Close() }()
 
 	txnID := op.GetTxnId()
@@ -4425,11 +4534,16 @@ func (db *DBImpl) ResolveIntents(ctx context.Context, op *ResolveIntentsOp) erro
 	defer func() {
 		intentResolutionDurationSeconds.Observe(time.Since(start).Seconds())
 	}()
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 
 	// Scan for all intents matching this txnID
 	prefix := slices.Concat(txnIntentsPrefix, op.GetTxnId())
 
-	iter, err := db.pdb.NewIter(&pebble.IterOptions{
+	iter, err := pdb.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: utils.PrefixSuccessor(prefix),
 	})
@@ -4439,7 +4553,7 @@ func (db *DBImpl) ResolveIntents(ctx context.Context, op *ResolveIntentsOp) erro
 	}
 	defer func() { _ = iter.Close() }()
 
-	batch := db.pdb.NewBatch()
+	batch := pdb.NewBatch()
 	defer func() { _ = batch.Close() }()
 
 	encoder := db.encoderPool.Get().(*zstd.Encoder)
@@ -4611,10 +4725,16 @@ func (db *DBImpl) ResolveIntents(ctx context.Context, op *ResolveIntentsOp) erro
 // GetTimestamp returns the HLC timestamp for a key from the :t suffix metadata key.
 // Returns 0 if the key has no timestamp (never written via transactions).
 func (db *DBImpl) GetTimestamp(key []byte) (uint64, error) {
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return 0, pebble.ErrClosed
+	}
+
 	normalizedKey := storeutils.KeyRangeStart(key)
 	txnKey := append(normalizedKey, storeutils.TransactionSuffix...)
 
-	existingBytes, closer, err := db.pdb.Get(txnKey)
+	existingBytes, closer, err := pdb.Get(txnKey)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return 0, nil
@@ -4698,7 +4818,13 @@ func (db *DBImpl) checkVersionPredicates(predicates []*VersionPredicate, exclude
 // buildConflictingIntentsMap scans all pending intents once and returns a map
 // of userKey → conflicting txnID for intents not belonging to excludeTxnID.
 func (db *DBImpl) buildConflictingIntentsMap(excludeTxnID []byte) (map[string][]byte, error) {
-	iter, err := db.pdb.NewIter(&pebble.IterOptions{
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+
+	iter, err := pdb.NewIter(&pebble.IterOptions{
 		LowerBound: txnIntentsPrefix,
 		UpperBound: utils.PrefixSuccessor(txnIntentsPrefix),
 	})
@@ -4738,7 +4864,13 @@ func (db *DBImpl) hasConflictingIntentForKey(userKey []byte, excludeTxnID []byte
 	// This is O(n) in the number of pending intents, but necessary for correctness.
 	// Could be optimized with a reverse index (userKey -> txnIDs) in the future.
 
-	iter, err := db.pdb.NewIter(&pebble.IterOptions{
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+
+	iter, err := pdb.NewIter(&pebble.IterOptions{
 		LowerBound: txnIntentsPrefix,
 		UpperBound: utils.PrefixSuccessor(txnIntentsPrefix),
 	})
@@ -4778,10 +4910,14 @@ func (db *DBImpl) hasConflictingIntentForKey(userKey []byte, excludeTxnID []byte
 // Returns true if the new timestamp is higher than the existing value's timestamp
 // Reads timestamp from separate key:t metadata key for optimal performance (~5x faster)
 func (db *DBImpl) shouldWriteValue(key []byte, newTimestamp uint64) (bool, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return false, pebble.ErrClosed
+	}
 	// Construct timestamp metadata key (key:t)
 	txnKey := slices.Concat(key, storeutils.TransactionSuffix)
 
-	existingBytes, closer, err := db.pdb.Get(txnKey)
+	existingBytes, closer, err := pdb.Get(txnKey)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			// No timestamp metadata, check for legacy _timestamp in document
@@ -4815,7 +4951,11 @@ func (db *DBImpl) shouldWriteValue(key []byte, newTimestamp uint64) (bool, error
 // shouldWriteValueLegacy handles backward compatibility by checking _timestamp field in document
 // This is used when key:t metadata doesn't exist (legacy documents)
 func (db *DBImpl) shouldWriteValueLegacy(key []byte, newTimestamp uint64) (bool, error) {
-	existingBytes, closer, err := db.pdb.Get(key)
+	pdb := db.getPDB()
+	if pdb == nil {
+		return false, pebble.ErrClosed
+	}
+	existingBytes, closer, err := pdb.Get(key)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			// Key doesn't exist, safe to write
@@ -4846,7 +4986,13 @@ func (db *DBImpl) shouldWriteValueLegacy(key []byte, newTimestamp uint64) (bool,
 // loadTxnRecord reads and unmarshals the TxnRecord for txnID from Pebble.
 // Returns ErrTxnNotFound when the record does not exist.
 func (db *DBImpl) loadTxnRecord(txnID []byte) (TxnRecord, error) {
-	data, closer, err := db.pdb.Get(makeTxnKey(txnID))
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		return TxnRecord{}, pebble.ErrClosed
+	}
+
+	data, closer, err := pdb.Get(makeTxnKey(txnID))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return TxnRecord{}, ErrTxnNotFound
@@ -4916,9 +5062,13 @@ func (db *DBImpl) AddEdge(
 	// Create outgoing edge key (unidirectional)
 	outKey := storeutils.MakeEdgeKey(source, target, indexName, edgeType)
 
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	// Write edge - the graph index will automatically update the edge index
 	// via its Batch() method when this write is propagated
-	if err := db.pdb.Set(outKey, edgeValue, pebble.Sync); err != nil {
+	if err := pdb.Set(outKey, edgeValue, pebble.Sync); err != nil {
 		return fmt.Errorf("writing outgoing edge: %w", err)
 	}
 
@@ -4978,9 +5128,13 @@ func (db *DBImpl) getOutgoingEdges(
 	key []byte,
 	edgeType string,
 ) ([]indexes.Edge, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
 	prefix := storeutils.EdgeIteratorPrefix(key, indexName, edgeType)
 
-	iter, err := db.pdb.NewIterWithContext(ctx, &pebble.IterOptions{
+	iter, err := pdb.NewIterWithContext(ctx, &pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: utils.PrefixSuccessor(prefix),
 	})
@@ -5054,11 +5208,15 @@ func (db *DBImpl) DeleteEdge(
 	source, target []byte,
 	edgeType string,
 ) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	outKey := storeutils.MakeEdgeKey(source, target, indexName, edgeType)
 
 	// Delete edge - the graph index will automatically update the edge index
 	// via its Batch() method when this delete is propagated
-	if err := db.pdb.Delete(outKey, pebble.Sync); err != nil {
+	if err := pdb.Delete(outKey, pebble.Sync); err != nil {
 		return fmt.Errorf("deleting outgoing edge: %w", err)
 	}
 
@@ -5084,10 +5242,14 @@ func (db *DBImpl) UpdateEdgeWeight(
 	edgeType string,
 	newWeight float64,
 ) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
 	outKey := storeutils.MakeEdgeKey(source, target, indexName, edgeType)
 
 	// Read existing edge
-	existingValue, closer, err := db.pdb.Get(outKey)
+	existingValue, closer, err := pdb.Get(outKey)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return fmt.Errorf("edge not found")
@@ -5112,7 +5274,7 @@ func (db *DBImpl) UpdateEdgeWeight(
 	}
 
 	// Write updated edge
-	if err := db.pdb.Set(outKey, updatedValue, pebble.Sync); err != nil {
+	if err := pdb.Set(outKey, updatedValue, pebble.Sync); err != nil {
 		return fmt.Errorf("writing updated edge: %w", err)
 	}
 
@@ -5134,6 +5296,10 @@ func (db *DBImpl) UpdateEdgeWeight(
 // collectOutgoingEdgeKeys scans and returns all outgoing edge keys for a document
 // This is used before deletion to ensure the edge index can be properly updated
 func (db *DBImpl) collectOutgoingEdgeKeys(key []byte) ([][]byte, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
 	edgeKeys := make([][]byte, 0)
 
 	// Iterate through all graph indexes
@@ -5150,7 +5316,7 @@ func (db *DBImpl) collectOutgoingEdgeKeys(key []byte) ([][]byte, error) {
 		// Scan for outgoing edges with this index name
 		prefix := storeutils.EdgeIteratorPrefix(key, indexName, "")
 
-		iter, err := db.pdb.NewIter(&pebble.IterOptions{
+		iter, err := pdb.NewIter(&pebble.IterOptions{
 			LowerBound: prefix,
 			UpperBound: utils.PrefixSuccessor(prefix),
 		})

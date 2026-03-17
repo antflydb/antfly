@@ -876,7 +876,6 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 	}
 }
 
-
 // mustMarshalJSON marshals v to json.RawMessage, failing the test on error.
 func mustMarshalJSON(t *testing.T, v any) []byte {
 	t.Helper()

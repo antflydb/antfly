@@ -191,7 +191,14 @@ func (db *DBImpl) finalizeTransaction(ctx context.Context, txnID []byte, status 
 		return 0, fmt.Errorf("marshaling transaction record: %w", err)
 	}
 
-	if err := db.pdb.Set(makeTxnKey(txnID), updatedData, pebble.Sync); err != nil {
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		transactionOpsTotal.WithLabelValues(label, "error").Inc()
+		return 0, pebble.ErrClosed
+	}
+
+	if err := pdb.Set(makeTxnKey(txnID), updatedData, pebble.Sync); err != nil {
 		transactionOpsTotal.WithLabelValues(label, "error").Inc()
 		return 0, fmt.Errorf("writing %s transaction record: %w", label, err)
 	}

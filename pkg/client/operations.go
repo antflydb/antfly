@@ -605,4 +605,3 @@ func (tx *Transaction) Commit(ctx context.Context, writes map[string]BatchReques
 
 	return nil, fmt.Errorf("commit transaction failed (%d): %s", resp.StatusCode, string(respBody))
 }
-

@@ -16,6 +16,7 @@ package join
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -302,14 +303,30 @@ func (p *Planner) estimateCosts(plan *Plan, leftStats, rightStats *TableStatisti
 
 // planCacheKey generates a cache key for the given plan input.
 func (p *Planner) planCacheKey(input *PlanInput) string {
-	// Create a simple cache key based on table names and join clause
-	key := fmt.Sprintf("%s:%s:%s:%s:%s",
-		input.LeftTable,
-		input.JoinClause.RightTable,
-		input.JoinClause.On.LeftField,
-		input.JoinClause.On.RightField,
-		input.JoinClause.StrategyHint)
-	return key
+	type planCacheKeyInput struct {
+		LeftTable  string   `json:"left_table"`
+		RightTable string   `json:"right_table"`
+		LeftFields []string `json:"left_fields,omitempty"`
+		JoinClause *Clause  `json:"join_clause"`
+	}
+
+	keyInput := planCacheKeyInput{
+		LeftTable:  input.LeftTable,
+		RightTable: input.RightTable,
+		LeftFields: input.LeftFields,
+		JoinClause: input.JoinClause,
+	}
+
+	encoded, err := json.Marshal(keyInput)
+	if err != nil {
+		// Fall back to a simpler key if JSON encoding fails unexpectedly.
+		return fmt.Sprintf("%s:%s:%+v:%+v",
+			input.LeftTable,
+			input.RightTable,
+			input.LeftFields,
+			input.JoinClause)
+	}
+	return string(encoded)
 }
 
 // UpdateStatistics updates cached statistics for a table.

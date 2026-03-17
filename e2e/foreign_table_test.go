@@ -133,7 +133,7 @@ func TestE2E_AntflyJoin(t *testing.T) {
 		Inserts: map[string]any{
 			"order-004": map[string]any{"customer_id": "cust-999", "product": "Widget D", "amount": 9.99},
 		},
-		SyncLevel: antfly.SyncLevelWrite,
+		SyncLevel: antfly.SyncLevelFullText,
 	})
 	require.NoError(t, err, "inserting unmatched order")
 	require.NoError(t,

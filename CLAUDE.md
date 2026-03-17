@@ -70,7 +70,7 @@ make e2e E2E_TIMEOUT=30m            # Custom timeout (default: 30m)
 ```bash
 make e2e E2E_TIMEOUT=45m > /tmp/test.log 2>&1
 RUN_ML_TESTS=true make e2e E2E_TIMEOUT=45m > /tmp/test.log 2>&1
-RUN_PG_TESTS=true cd e2e && go test -v ./... -timeout 10m > /tmp/test.log 2>&1
+cd e2e && RUN_PG_TESTS=true go test -v ./... -timeout 10m > /tmp/test.log 2>&1
 go test -race -v ./... > /tmp/test.log 2>&1
 ```
 

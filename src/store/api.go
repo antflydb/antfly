@@ -1613,7 +1613,7 @@ func (h *StoreAPI) handleCommitTransaction(w http.ResponseWriter, r *http.Reques
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"commit_version":%d}`, cv)
+	_ = json.NewEncoder(w).Encode(map[string]uint64{"commit_version": cv})
 }
 
 func (h *StoreAPI) handleAbortTransaction(w http.ResponseWriter, r *http.Request) {

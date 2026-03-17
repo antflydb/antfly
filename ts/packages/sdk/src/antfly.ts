@@ -78,4 +78,4 @@ async function batchInsert() {
 }
 
 // Export examples for testing
-export { listTables, queryData, createTable, batchInsert };
+export { batchInsert, createTable, listTables, queryData };

@@ -282,7 +282,7 @@ func TestTableManager_IndexOperations(t *testing.T) {
 		retrievedIndex.Equal(table.Indexes[indexName1]),
 		"Retrieved index config does not match",
 	)
-	assert.Equal(t, indexName1, retrievedIndex.IndexConfig.Name, "GetIndex should populate Name from map key")
+	assert.Equal(t, indexName1, retrievedIndex.Name, "GetIndex should populate Name from map key")
 
 	// Create another index
 	indexName2 := "idx2"
@@ -298,7 +298,7 @@ func TestTableManager_IndexOperations(t *testing.T) {
 	assert.Contains(t, allIndexes, indexName1)
 	assert.Contains(t, allIndexes, indexName2)
 	for name, idx := range allIndexes {
-		assert.Equal(t, name, idx.IndexConfig.Name, "Indexes() should populate Name from map key")
+		assert.Equal(t, name, idx.Name, "Indexes() should populate Name from map key")
 	}
 
 	// Try to create existing index

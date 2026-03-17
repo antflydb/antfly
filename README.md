@@ -88,6 +88,8 @@ Antfly uses a multi-raft design with separate consensus groups:
 - **Metadata raft** — table schemas, shard assignments, cluster topology
 - **Storage rafts** — one per shard, handling data, indexes, and queries
 
+End-to-end [chaos tests](e2e/) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
+
 Critical distributed protocols are formally specified and model-checked with [TLA+](specs/tla):
 
 - [AntflyTransaction](specs/tla/AntflyTransaction.tla) — distributed transaction protocol

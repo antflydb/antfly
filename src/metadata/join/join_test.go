@@ -752,3 +752,61 @@ func TestPlanCaching(t *testing.T) {
 		t.Error("New plan should have same strategy")
 	}
 }
+
+func TestPlanCaching_DistinguishesJoinShape(t *testing.T) {
+	ctx := context.Background()
+
+	config := DefaultPlannerConfig()
+	config.PlanCacheTTL = time.Minute
+
+	planner, err := NewPlanner(config, nil)
+	if err != nil {
+		t.Fatalf("Failed to create planner: %v", err)
+	}
+
+	innerInput := &PlanInput{
+		LeftTable:  "orders",
+		RightTable: "customers",
+		JoinClause: &Clause{
+			RightTable: "customers",
+			JoinType:   TypeInner,
+			On: Condition{
+				LeftField:  "customer_id",
+				RightField: "customer_id",
+			},
+		},
+	}
+
+	leftInput := &PlanInput{
+		LeftTable:  "orders",
+		RightTable: "customers",
+		JoinClause: &Clause{
+			RightTable: "customers",
+			JoinType:   TypeLeft,
+			On: Condition{
+				LeftField:  "customer_id",
+				RightField: "customer_id",
+			},
+		},
+	}
+
+	innerPlan, err := planner.CreatePlan(ctx, innerInput)
+	if err != nil {
+		t.Fatalf("CreatePlan failed: %v", err)
+	}
+	if innerPlan.JoinType != TypeInner {
+		t.Fatalf("Expected inner plan, got %s", innerPlan.JoinType)
+	}
+
+	leftPlan, err := planner.CreatePlan(ctx, leftInput)
+	if err != nil {
+		t.Fatalf("CreatePlan failed: %v", err)
+	}
+	if leftPlan.JoinType != TypeLeft {
+		t.Fatalf("Expected left plan, got %s", leftPlan.JoinType)
+	}
+
+	if innerPlan == leftPlan {
+		t.Fatal("Expected distinct cached plans for inner and left joins")
+	}
+}
