@@ -21,6 +21,17 @@ All notable changes to Antfly will be documented in this file.
 
 ## Releases
 
+### [0.0.19] - 2026-03-17
+
+#### Highlights
+
+- **Pruning Fix** — handle negative scores in pruning
+- **Build Version** — add build version ldflags
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.0.18...v0.0.19)
+
+---
+
 ### [0.0.18] - 2026-03-16
 
 #### Highlights
