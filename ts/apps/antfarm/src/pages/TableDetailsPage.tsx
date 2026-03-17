@@ -1,4 +1,4 @@
-import type { IndexStatus, QueryRequest, QueryResult, Table as AntflyTable } from "@antfly/sdk";
+import type { Table as AntflyTable, IndexStatus, QueryRequest, QueryResult } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { ChevronRight } from "lucide-react";
 import type React from "react";
@@ -548,9 +548,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
       {migration && (
         <Alert className="mb-4 border-amber-400 bg-amber-50 dark:border-amber-600 dark:bg-amber-950">
           <AlertDescription className="text-amber-800 dark:text-amber-200">
-            <span className="font-medium">Schema migration in progress</span> — rebuilding full-text indexes.
-            Reads are served from schema v{migration.read_schema.version} while
-            v{tableSchema?.version ?? "?"} is being built.
+            <span className="font-medium">Schema migration in progress</span> — rebuilding full-text
+            indexes. Reads are served from schema v{migration.read_schema.version} while v
+            {tableSchema?.version ?? "?"} is being built.
           </AlertDescription>
         </Alert>
       )}

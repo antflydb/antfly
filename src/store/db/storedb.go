@@ -113,7 +113,7 @@ func NewStoreDB(
 		schema:                 schema,
 		antflyConfig:           antflyConfig,
 		localSplitSourceLookup: localSplitSourceLookup,
-		coreDB: NewDBImpl(
+		coreDB: newCoreDB(
 			lg.Named("coreDB"),
 			antflyConfig,
 			schema,

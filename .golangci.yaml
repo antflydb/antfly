@@ -34,6 +34,15 @@ linters:
         linters:
           - errcheck
           - gosec
+      # Internal tools, not production code
+      - path: cmd/compat-runner/
+        linters:
+          - errcheck
+          - gosec
+      - path: cmd/hbc-parity/
+        linters:
+          - errcheck
+          - gosec
 formatters:
   # Enable specific formatter.
   # Default: [] (uses standard Go formatting)

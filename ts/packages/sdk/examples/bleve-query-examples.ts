@@ -108,4 +108,4 @@ const queryStringQuery: QueryRequest = {
 };
 
 // Export examples for use in other files
-export { simpleMatchQuery, booleanQuery, filteredQuery, complexQuery, queryStringQuery };
+export { booleanQuery, complexQuery, filteredQuery, queryStringQuery, simpleMatchQuery };

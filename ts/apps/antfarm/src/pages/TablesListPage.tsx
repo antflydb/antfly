@@ -224,8 +224,12 @@ const TablesListPage: React.FC = () => {
               <TableCell>
                 <div className="flex items-center gap-2">
                   {table.migration && (
-                    <Badge variant="outline" className="text-amber-600 border-amber-400 bg-amber-50 dark:text-amber-400 dark:border-amber-600 dark:bg-amber-950">
-                      Rebuilding v{table.migration.read_schema.version} → v{table.schema?.version ?? "?"}
+                    <Badge
+                      variant="outline"
+                      className="text-amber-600 border-amber-400 bg-amber-50 dark:text-amber-400 dark:border-amber-600 dark:bg-amber-950"
+                    >
+                      Rebuilding v{table.migration.read_schema.version} → v
+                      {table.schema?.version ?? "?"}
                     </Badge>
                   )}
                   {table.storage_status ? (
