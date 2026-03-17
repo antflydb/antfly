@@ -660,6 +660,11 @@ func (t *TableApi) runGenerationStep(
 		if err := eg.Wait(); err != nil {
 			if !errors.Is(err, context.Canceled) {
 				t.logger.Error("Generation step failed", zap.Error(err))
+				if streamCallback != nil {
+					_ = streamCallback(ctx, SSEEventError, map[string]string{
+						"error": fmt.Sprintf("Generation failed: %v", err),
+					})
+				}
 			}
 			return
 		}
