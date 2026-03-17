@@ -1196,7 +1196,16 @@ func pruneByScoreRatio(hits []*FusionHit, ratio float64) []*FusionHit {
 		}
 	}
 
-	threshold := maxScore * ratio
+	// For negative scores (e.g. cross-encoder logits), ratio-based pruning
+	// uses absolute value: keep hits where |score| >= |maxScore| * ratio.
+	// This avoids the case where maxScore * ratio produces a threshold
+	// less negative than all scores, filtering everything out.
+	var threshold float64
+	if maxScore < 0 {
+		threshold = maxScore / ratio
+	} else {
+		threshold = maxScore * ratio
+	}
 	result := make([]*FusionHit, 0, len(hits))
 	for _, hit := range hits {
 		if getEffectiveScore(hit) >= threshold {

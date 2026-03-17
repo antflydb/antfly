@@ -1,86 +1,51 @@
 ---
-title: Getting Started
-description: Get up and running with Antfly in 5 minutes
+title: Quickstart
+description: Install Antfly, load data, and run your first queries
 prerequisites:
-  - Go 1.26+ or a prebuilt binary from the Downloads page
   - "curl and jq (for sample data)"
 difficulty: beginner
 estimatedTime: "15 min"
-tags: [getting-started, setup, swarm]
+tags: [getting-started, setup, quickstart]
 ---
 
-<Questions>
-- How do I install Antfly?
-- How do I start Antfly for local development?
-- How do I create my first table and index?
-- How do I load data into Antfly?
-- How do I run a search query?
-- How do I use RAG with Termite for AI-powered answers?
-</Questions>
+This guide walks you through installing Antfly, loading data, and running your first queries — from full-text search to semantic search to AI-powered RAG.
 
-**_AntflyDB_** is a document database built on top of [Raft](https://github.com/etcd-io/raft) for distribution, [Pebble](https://github.com/cockroachdb/pebble) for persistance, [Bleve](https://github.com/blevesearch/bleve) for full text indexing, and [SPANN](https://www.microsoft.com/en-us/research/wp-content/uploads/2021/11/SPANN_finalversion1.pdf) for vector indexing. This guide will help you get started with setting up your **_AntflyDB_** instance!
+## Install Antfly
 
-## Download Antfly and CLI
+Visit the [Downloads page](/docs/downloads) and follow the instructions for your platform.
 
-Visit the [Downloads page](/docs/downloads) and follow the instructions for the your platform.
+## Start Antfly
 
-## Download Models
-
-Pull the embedding models and generation model using Termite (Antfly's built-in ML inference service):
+Pull a text embedding model for semantic search. [Termite](/docs/guides/termite) is Antfly's built-in ML inference engine — it runs ONNX-optimized models locally for fast CPU inference, no external APIs needed.
 
 ```bash
-antfly termite pull BAAI/bge-small-en-v1.5 openai/clip-vit-base-patch32 mixedbread-ai/mxbai-rerank-base-v1
-antfly termite pull hf:onnx-community/gemma-3-270m-it-ONNX
+antfly termite pull --variants i8 BAAI/bge-small-en-v1.5
 ```
 
-- `BAAI/bge-small-en-v1.5` is a small, fast text embedding model (384 dimensions) for semantic search
-- `openai/clip-vit-base-patch32` is a multimodal embedding model (512 dimensions) for image search
-- `mixedbread-ai/mxbai-rerank-base-v1` is a cross-encoder reranker for improving search result relevance
-- `onnx-community/gemma-3-270m-it-ONNX` is a small (~270M parameter) Gemma 3 model for query classification
-
-<Callout type="warning">
-**Model size matters for generation.** The `onnx-community/gemma-3-270m-it-ONNX` model is small and fast to download, but only suitable for **query classification** (`--classify`). For generation features like `--generate`, `--reasoning`, and `--followup`, you'll need a larger model. See the [RAG section](#rag-retrieval-augmented-generation) below for examples using Gemini, Ollama, or a larger Termite model.
-</Callout>
-
-<Callout type="info">
-Termite runs ONNX-optimized models locally for fast CPU inference without external API dependencies. Models are stored in `~/.termite/models/` and auto-discovered when Antfly starts. For more options, see `antfly termite list --remote` or the [Termite guide](/docs/guides/termite).
-</Callout>
-
-## Start Antfly in Swarm Mode
-Open up a new terminal and run:
+Start Antfly in swarm mode:
 
 ```bash
 antfly swarm 2>&1 | tee "antfly.log"
 ```
 
-You should see logs indicating the metadata server, storage nodes, and Termite are starting. The API will be available at `http://localhost:8080`.
-
 <Callout type="info">
-Swarm mode starts Antfly with metadata, data nodes, and Termite in a single process. Termite auto-discovers models from `~/.termite/models/` and serves them for embedding, chunking, reranking, and generation. For production deployments, consider running separate metadata and worker nodes.
+Swarm mode starts metadata, data nodes, and Termite in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
 </Callout>
 
-You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
-
 ## Download Sample Data
-In another terminal... We'll use a sample of 10,000 Wikipedia articles enriched with thumbnail images:
+
+In a new terminal, download 10,000 Wikipedia articles enriched with thumbnail images:
+
 ```bash
-# Download the sample data
 curl -L -o wiki-articles.json https://cdn.antfly.io/datasets/wiki-articles-10k-v001.json
-# Preview the data structure
 head -n 1 wiki-articles.json | jq '.'
 ```
 
-Each article has:
-- `url`: Wikipedia URL
-- `title`: Article title
-- `body`: Article content
-- `thumbnail_url`: Wikipedia thumbnail image (when available)
+Each article has `title`, `body`, `url`, and `thumbnail_url` fields.
 
 ## Create a Table
-<Steps>
-### Create a table and index
 
-Create a table with two indexes: a text embedding index for semantic search and a CLIP image index for searching by thumbnail. Both use Termite for local ONNX inference.
+Create a table with a text embedding index for semantic search:
 
 ```bash
 antfly table create --table wikipedia \
@@ -99,47 +64,26 @@ antfly table create --table wikipedia \
         "overlap_tokens": 25
       }
     }
-  }' \
-  --index '{
-    "name": "thumbnail",
-    "type": "embeddings",
-    "template": "{{media url=thumbnail_url}}",
-    "embedder": {
-      "provider": "termite",
-      "model": "openai/clip-vit-base-patch32"
-    },
-    "dimension": 512,
-    "distance_metric": "cosine"
   }'
 ```
 
-<Callout type="info">
-- `title_body` uses `BAAI/bge-small-en-v1.5` (384 dimensions) for text semantic search with chunking
-- `thumbnail` uses CLIP (512 dimensions) for image search with cosine similarity — Antfly automatically fetches and embeds each article's Wikipedia thumbnail. Articles without a `thumbnail_url` are skipped.
-
-For alternative models, run `antfly termite list --remote` or see the [Termite guide](/docs/guides/termite).
-</Callout>
-
-### Verify the table and indexes were created
+Verify the table and index were created:
 
 ```bash
 antfly table list
 antfly index list --table wikipedia
 ```
-</Steps>
 
-## Load the Sample Data
+## Load Data
 
 ```bash
-# Load the Wikipedia articles using the title as the document ID
+# Load all 10,000 articles using the title as the document ID
 antfly load --table wikipedia \
   --file wiki-articles.json \
   --id-field title
 ```
 
-This will load 10,000 articles in 10 batches of 1000 documents each.
-Generating embeddings can take some time, especially for larger datasets.
-You can monitor the progress in the logs or by checking `active_vectors` in the index:
+You can monitor embedding progress with:
 
 ```bash
 antfly index list --table wikipedia
@@ -178,7 +122,17 @@ antfly query --table wikipedia \
 
 ### Hybrid Search
 
-Combine full-text, vector search, reranking, and pruning for better relevance:
+Combine full-text and vector search with neural reranking for better relevance.
+
+Pull the reranker model:
+
+```bash
+antfly termite pull --variants i8 mixedbread-ai/mxbai-rerank-base-v1
+```
+
+<Callout type="info">
+If Antfly doesn't detect the new model, restart `antfly swarm`.
+</Callout>
 
 ```bash
 # Find articles about Einstein with semantic understanding
@@ -202,9 +156,37 @@ antfly query --table wikipedia \
 - **Pruning** filters out low-relevance results based on score quality. Use `min_score_ratio` to keep only results scoring at least N% of the top result, or `max_score_gap_percent` to detect "elbows" in score distribution.
 </Callout>
 
-### Image Search
+## Image Search
 
-Search for articles by visual content using the CLIP thumbnail index. CLIP understands visual concepts, so you can describe what you're looking for:
+Search by visual content using CLIP, a multimodal embedding model that understands both text descriptions and images.
+
+<Steps>
+### Pull the CLIP model
+
+```bash
+antfly termite pull openai/clip-vit-base-patch32
+```
+
+### Add a CLIP index to the table
+
+```bash
+antfly index create --table wikipedia \
+  --index '{
+    "name": "thumbnail",
+    "type": "embeddings",
+    "template": "{{media url=thumbnail_url}}",
+    "embedder": {
+      "provider": "termite",
+      "model": "openai/clip-vit-base-patch32"
+    },
+    "dimension": 512,
+    "distance_metric": "cosine"
+  }'
+```
+
+### Search by image content
+
+CLIP understands visual concepts, so you can describe what you're looking for:
 
 ```bash
 # Find articles with images of maps or geography
@@ -214,6 +196,7 @@ antfly query --table wikipedia \
   --fields "title,url,thumbnail_url" \
   --limit 5
 ```
+</Steps>
 
 <Callout type="info">
 CLIP responds best to concrete visual descriptions ("red sports car", "mountain landscape") rather than abstract concepts. Articles without a `thumbnail_url` are skipped by the CLIP index. For a deeper dive, see the [Image Search with CLIP](/docs/examples/image-search) example.
@@ -240,7 +223,11 @@ Combine search with LLM-powered classification and generation using the retrieva
 <Steps>
 ### Classify a query
 
-Use the small `gemma-3-270m-it-ONNX` model you pulled earlier to classify whether a query needs retrieval:
+Pull a small generator model and use it to classify whether a query needs retrieval:
+
+```bash
+antfly termite pull hf:onnx-community/gemma-3-270m-it-ONNX
+```
 
 ```bash
 antfly agents retrieval --table wikipedia \
@@ -330,7 +317,7 @@ antfly agents retrieval --table wikipedia \
   </TabsContent>
 
   <TabsContent value="gemini">
-Requires a [Google AI API key](https://aistudio.google.com/apikey). Set the `GEMINI_API_KEY` environment variable — Antfly picks it up automatically:
+Requires a [Google AI API key](https://aistudio.google.com/apikey). Set the `GEMINI_API_KEY` environment variable:
 
 ```bash
 export GEMINI_API_KEY="your-api-key-here"
@@ -342,14 +329,14 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
-  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${GEMINI_API_KEY}"}' \
   --max-context-tokens 2048 \
   --classify --reasoning --generate --followup
 ```
   </TabsContent>
 
   <TabsContent value="openai">
-Requires an [OpenAI API key](https://platform.openai.com/api-keys). Set the `OPENAI_API_KEY` environment variable — Antfly picks it up automatically:
+Requires an [OpenAI API key](https://platform.openai.com/api-keys). Set the `OPENAI_API_KEY` environment variable:
 
 ```bash
 export OPENAI_API_KEY="your-api-key-here"
@@ -361,7 +348,7 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
-  --generator '{"provider": "openai", "model": "gpt-4.1-mini"}' \
+  --generator '{"provider": "openai", "model": "gpt-4.1-mini", "api_key": "${OPENAI_API_KEY}"}' \
   --max-context-tokens 2048 \
   --classify --reasoning --generate --followup
 ```
@@ -387,7 +374,7 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body,url" \
   --limit 5 \
-  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${GEMINI_API_KEY}"}' \
   --streaming=false --generate
 ```
 
@@ -401,11 +388,11 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
-  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${GEMINI_API_KEY}"}' \
   --generate \
   --eval '{
     "evaluators": ["faithfulness", "relevance"],
-    "judge": {"provider": "gemini", "model": "gemini-3.0-flash"}
+    "judge": {"provider": "gemini", "model": "gemini-3.0-flash", "api_key": "${GEMINI_API_KEY}"}
   }'
 ```
 
@@ -433,3 +420,12 @@ antfly backup --table wikipedia \
 - [REST API Documentation](/docs/api)
 - [Termite Models](/termite) - Browse available embedding, chunking, and reranking models
 - [Configuration Reference](/docs/configuration) - Configure Termite, embedding providers, and more
+
+<Questions>
+- How do I install Antfly?
+- How do I start Antfly for local development?
+- How do I create my first table and index?
+- How do I load data into Antfly?
+- How do I run a search query?
+- How do I use RAG with Termite for AI-powered answers?
+</Questions>

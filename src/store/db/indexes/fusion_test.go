@@ -936,6 +936,27 @@ func TestPrunerSmallScores(t *testing.T) {
 		assert.Len(t, result, 3)
 	})
 
+	t.Run("negative scores with min_score_ratio", func(t *testing.T) {
+		// Cross-encoder rerankers often produce negative logit scores
+		hits := makeHits(-1.0, -2.0, -5.0, -8.0, -10.0)
+		rp := &Pruner{MinScoreRatio: 0.5}
+		result := rp.PruneResults(hits)
+		// maxScore = -1.0, threshold = -1.0 / 0.5 = -2.0
+		// Keeps scores >= -2.0: -1.0, -2.0
+		assert.Len(t, result, 2)
+		assert.Equal(t, "A", result[0].ID) // -1.0
+		assert.Equal(t, "B", result[1].ID) // -2.0
+	})
+
+	t.Run("all negative scores with low ratio", func(t *testing.T) {
+		hits := makeHits(-1.0, -2.0, -5.0, -8.0, -10.0)
+		rp := &Pruner{MinScoreRatio: 0.01}
+		result := rp.PruneResults(hits)
+		// maxScore = -1.0, threshold = -1.0 / 0.01 = -100.0
+		// All scores >= -100.0, so all kept
+		assert.Len(t, result, 5)
+	})
+
 	t.Run("small scores with min_score_ratio", func(t *testing.T) {
 		hits := makeHits(0.05, 0.045, 0.042, 0.01, 0.003)
 		rp := &Pruner{MinScoreRatio: 0.6}
