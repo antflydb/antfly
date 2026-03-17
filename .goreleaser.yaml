@@ -159,15 +159,21 @@ archives:
       - src: "onnxruntime/{{ .Os }}-{{ .Arch }}/lib/libonnxruntime*"
         dst: lib/
         strip_parent: true
+        info:
+          mode: 0755
       # Bundle ONNX Runtime GenAI libraries (for LLM generation)
       # Note: Not available for linux-arm64, glob silently skips if no match
       - src: "onnxruntime/{{ .Os }}-{{ .Arch }}/lib/libonnxruntime-genai*"
         dst: lib/
         strip_parent: true
+        info:
+          mode: 0755
       # Bundle PJRT CPU plugin for XLA backend
       - src: "pjrt/{{ .Os }}-{{ .Arch }}/lib/pjrt_c_api_cpu*"
         dst: lib/
         strip_parent: true
+        info:
+          mode: 0755
 
 changelog:
   sort: asc
@@ -261,6 +267,7 @@ homebrew_casks:
       post:
         install: |
           if OS.mac?
+            system_command "/bin/chmod", args: ["-R", "u+rw", "#{staged_path}/lib"]
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/antfly", "#{staged_path}/lib"]
           end
 nfpms:

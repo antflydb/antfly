@@ -12,7 +12,35 @@ This guide walks you through installing Antfly, loading data, and running your f
 
 ## Install Antfly
 
-Visit the [Downloads page](/docs/downloads) and follow the instructions for your platform.
+<Tabs defaultValue="macos">
+  <TabsList>
+    <TabsTrigger value="macos">macOS</TabsTrigger>
+    <TabsTrigger value="linux">Linux</TabsTrigger>
+    <TabsTrigger value="docker">Docker</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="macos">
+```bash
+brew install --cask antflydb/antfly/antfly
+
+# Verify
+antfly --version
+```
+  </TabsContent>
+
+  <TabsContent value="linux">
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni
+
+# Verify
+antfly --version
+```
+  </TabsContent>
+
+  <TabsContent value="docker">
+See the [Downloads page](/docs/downloads) for a complete Docker Compose setup with Antfly and Ollama.
+  </TabsContent>
+</Tabs>
 
 ## Start Antfly
 
@@ -47,6 +75,17 @@ Each article has `title`, `body`, `url`, and `thumbnail_url` fields.
 
 Create a table with a text embedding index for semantic search:
 
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
 ```bash
 antfly table create --table wikipedia \
   --index '{
@@ -66,6 +105,155 @@ antfly table create --table wikipedia \
     }
   }'
 ```
+  </TabsContent>
+
+  <TabsContent value="curl">
+```bash
+curl -X POST http://localhost:8080/api/v1/tables/wikipedia \
+  -H "Content-Type: application/json" \
+  -d '{
+    "indexes": {
+      "title_body": {
+        "type": "embeddings",
+        "template": "{{title}} {{body}}",
+        "embedder": {
+          "provider": "termite",
+          "model": "BAAI/bge-small-en-v1.5"
+        },
+        "chunker": {
+          "provider": "antfly",
+          "text": {
+            "target_tokens": 200,
+            "overlap_tokens": 25
+          }
+        }
+      }
+    }
+  }'
+```
+  </TabsContent>
+
+  <TabsContent value="typescript">
+```typescript
+import { AntflyClient } from '@antfly/sdk';
+
+const client = new AntflyClient({
+  baseUrl: 'http://localhost:8080',
+});
+
+await client.tables.create('wikipedia', {
+  indexes: {
+    title_body: {
+      type: 'embeddings',
+      template: '{{title}} {{body}}',
+      embedder: {
+        provider: 'termite',
+        model: 'BAAI/bge-small-en-v1.5',
+      },
+      chunker: {
+        provider: 'antfly',
+        text: { target_tokens: 200, overlap_tokens: 25 },
+      },
+    },
+  },
+});
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+from antfly import AntflyClient
+
+client = AntflyClient(base_url='http://localhost:8080')
+
+client.create_table(
+    name='wikipedia',
+    indexes={
+        'title_body': {
+            'type': 'embeddings',
+            'template': '{{title}} {{body}}',
+            'embedder': {
+                'provider': 'termite',
+                'model': 'BAAI/bge-small-en-v1.5',
+            },
+            'chunker': {
+                'provider': 'antfly',
+                'text': {'target_tokens': 200, 'overlap_tokens': 25},
+            },
+        },
+    },
+)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+import (
+	"context"
+	"log"
+	"github.com/antflydb/antfly-go/antfly"
+)
+
+client, err := antfly.NewAntflyClient("http://localhost:8080")
+if err != nil {
+	log.Fatal(err)
+}
+
+_, err = client.CreateTableWithResponse(
+	context.Background(),
+	"wikipedia",
+	antfly.CreateTableJSONRequestBody{
+		Indexes: &map[string]interface{}{
+			"title_body": map[string]interface{}{
+				"type":     "embeddings",
+				"template": "{{title}} {{body}}",
+				"embedder": map[string]interface{}{
+					"provider": "termite",
+					"model":    "BAAI/bge-small-en-v1.5",
+				},
+				"chunker": map[string]interface{}{
+					"provider": "antfly",
+					"text": map[string]interface{}{
+						"target_tokens":  200,
+						"overlap_tokens": 25,
+					},
+				},
+			},
+		},
+	},
+)
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+use antfly_client::Client;
+use serde_json::json;
+
+let client = Client::new("http://localhost:8080");
+
+client.create_table("wikipedia", &json!({
+    "indexes": {
+        "title_body": {
+            "type": "embeddings",
+            "template": "{{title}} {{body}}",
+            "embedder": {
+                "provider": "termite",
+                "model": "BAAI/bge-small-en-v1.5"
+            },
+            "chunker": {
+                "provider": "antfly",
+                "text": {
+                    "target_tokens": 200,
+                    "overlap_tokens": 25
+                }
+            }
+        }
+    }
+})).await?;
+```
+  </TabsContent>
+</Tabs>
 
 Verify the table and index were created:
 
@@ -76,53 +264,404 @@ antfly index list --table wikipedia
 
 ## Load Data
 
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
 ```bash
 # Load all 10,000 articles using the title as the document ID
 antfly load --table wikipedia \
   --file wiki-articles.json \
   --id-field title
 ```
+  </TabsContent>
 
-You can monitor embedding progress with:
+  <TabsContent value="curl">
+```bash
+# The CLI 'load' command handles batching automatically.
+# With cURL, send documents via the batch endpoint:
+curl -X POST http://localhost:8080/api/v1/tables/wikipedia/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inserts": {
+      "Albert Einstein": {
+        "title": "Albert Einstein",
+        "body": "Albert Einstein was a German-born theoretical physicist...",
+        "url": "https://en.wikipedia.org/wiki/Albert_Einstein"
+      },
+      "Marie Curie": {
+        "title": "Marie Curie",
+        "body": "Marie Curie was a Polish-French physicist and chemist...",
+        "url": "https://en.wikipedia.org/wiki/Marie_Curie"
+      }
+    }
+  }'
+```
+  </TabsContent>
+
+  <TabsContent value="typescript">
+```typescript
+// Using client from above
+await client.tables.batch('wikipedia', {
+  inserts: {
+    'Albert Einstein': {
+      title: 'Albert Einstein',
+      body: 'Albert Einstein was a German-born theoretical physicist...',
+      url: 'https://en.wikipedia.org/wiki/Albert_Einstein',
+    },
+    'Marie Curie': {
+      title: 'Marie Curie',
+      body: 'Marie Curie was a Polish-French physicist and chemist...',
+      url: 'https://en.wikipedia.org/wiki/Marie_Curie',
+    },
+  },
+});
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+# Using client from above
+client.batch(
+    table='wikipedia',
+    inserts={
+        'Albert Einstein': {
+            'title': 'Albert Einstein',
+            'body': 'Albert Einstein was a German-born theoretical physicist...',
+            'url': 'https://en.wikipedia.org/wiki/Albert_Einstein',
+        },
+        'Marie Curie': {
+            'title': 'Marie Curie',
+            'body': 'Marie Curie was a Polish-French physicist and chemist...',
+            'url': 'https://en.wikipedia.org/wiki/Marie_Curie',
+        },
+    },
+)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+// Using client from above
+_, err = client.BatchTableWithResponse(
+	context.Background(),
+	"wikipedia",
+	antfly.BatchTableJSONRequestBody{
+		Inserts: &map[string]interface{}{
+			"Albert Einstein": map[string]interface{}{
+				"title": "Albert Einstein",
+				"body":  "Albert Einstein was a German-born theoretical physicist...",
+				"url":   "https://en.wikipedia.org/wiki/Albert_Einstein",
+			},
+			"Marie Curie": map[string]interface{}{
+				"title": "Marie Curie",
+				"body":  "Marie Curie was a Polish-French physicist and chemist...",
+				"url":   "https://en.wikipedia.org/wiki/Marie_Curie",
+			},
+		},
+	},
+)
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+// Using client from above
+use antfly_client::types::BatchTableBody;
+use std::collections::HashMap;
+
+let mut inserts = HashMap::new();
+inserts.insert(
+    "Albert Einstein".to_string(),
+    json!({
+        "title": "Albert Einstein",
+        "body": "Albert Einstein was a German-born theoretical physicist...",
+        "url": "https://en.wikipedia.org/wiki/Albert_Einstein"
+    }),
+);
+inserts.insert(
+    "Marie Curie".to_string(),
+    json!({
+        "title": "Marie Curie",
+        "body": "Marie Curie was a Polish-French physicist and chemist...",
+        "url": "https://en.wikipedia.org/wiki/Marie_Curie"
+    }),
+);
+
+client
+    .batch_table(
+        "wikipedia",
+        &BatchTableBody {
+            inserts: Some(inserts),
+            ..Default::default()
+        },
+    )
+    .await?;
+```
+  </TabsContent>
+</Tabs>
+
+<Callout type="info">
+The CLI `load` command reads a JSON file and batches documents automatically. For SDK usage with large files, see the [Batch Operations](/docs/api/data-operations) documentation.
+</Callout>
+
+Embedding generation runs in the background. Monitor progress:
 
 ```bash
 antfly index list --table wikipedia
 ```
 
-## Query the Data
+## Search
 
 <Callout type="info">
-You can run these queries using the CLI (shown below) or the web dashboard at `http://localhost:8080`.
+You can run these queries using the CLI (shown below) or the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080`.
 </Callout>
 
 ### Full-Text Search
 
-Search for articles containing specific terms (a full specification of the query syntax is available in the [Bleve Query String Query documentation](https://blevesearch.com/docs/Query-String-Query/)):
+Search for articles containing specific terms:
 
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
 ```bash
-# Search for articles about Korea
 antfly query --table wikipedia \
   --full-text-search 'body:"Korea"' \
   --fields "title,url" \
   --limit 5
 ```
+  </TabsContent>
 
-### Semantic Similarity Search
-
-Find articles semantically similar to a query:
-
+  <TabsContent value="curl">
 ```bash
-# Find articles about anatomy and physiology
+curl -X POST http://localhost:8080/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "full_text_search": {"query": "body:\"Korea\""},
+    "fields": ["title", "url"],
+    "limit": 5
+  }'
+```
+  </TabsContent>
+
+  <TabsContent value="typescript">
+```typescript
+const results = await client.query({
+  table: 'wikipedia',
+  full_text_search: { query: 'body:"Korea"' },
+  fields: ['title', 'url'],
+  limit: 5,
+});
+
+for (const hit of results.hits) {
+  console.log(hit.key, hit.fields);
+}
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+results = client.query(
+    table='wikipedia',
+    full_text_search={'query': 'body:"Korea"'},
+    fields=['title', 'url'],
+    limit=5,
+)
+
+for hit in results.hits:
+    print(hit.key, hit.fields)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+resp, err := client.QueryWithResponse(
+	context.Background(),
+	antfly.QueryJSONRequestBody{
+		Table: strPtr("wikipedia"),
+		FullTextSearch: &antfly.FullTextSearch{
+			Query: strPtr("body:\"Korea\""),
+		},
+		Fields: &[]string{"title", "url"},
+		Limit:  intPtr(5),
+	},
+)
+if err != nil {
+	log.Fatal(err)
+}
+
+for _, hit := range resp.JSON200.Hits {
+	fmt.Printf("%s: %v\n", hit.Key, hit.Fields)
+}
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+use antfly_client::types::{GlobalQueryBody, FullTextSearch};
+
+let resp = client
+    .global_query(&GlobalQueryBody {
+        table: Some("wikipedia".to_string()),
+        full_text_search: Some(FullTextSearch {
+            query: Some("body:\"Korea\"".to_string()),
+            ..Default::default()
+        }),
+        fields: Some(vec!["title".to_string(), "url".to_string()]),
+        limit: Some(5),
+        ..Default::default()
+    })
+    .await?;
+
+for response in &resp.into_inner().responses {
+    if let Some(hits) = &response.hits {
+        for hit in &hits.hits {
+            println!("{}: {:?}", hit.id, hit.source);
+        }
+    }
+}
+```
+  </TabsContent>
+</Tabs>
+
+### Semantic Search
+
+Find articles semantically similar to a natural language query:
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
+```bash
 antfly query --table wikipedia \
   --semantic-search "anatomy and physiology" \
   --indexes "title_body" \
   --fields "title,url" \
   --limit 5
 ```
+  </TabsContent>
 
-### Hybrid Search
+  <TabsContent value="curl">
+```bash
+curl -X POST http://localhost:8080/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "semantic_search": "anatomy and physiology",
+    "indexes": ["title_body"],
+    "fields": ["title", "url"],
+    "limit": 5
+  }'
+```
+  </TabsContent>
 
-Combine full-text and vector search with neural reranking for better relevance.
+  <TabsContent value="typescript">
+```typescript
+const results = await client.query({
+  table: 'wikipedia',
+  semantic_search: 'anatomy and physiology',
+  indexes: ['title_body'],
+  fields: ['title', 'url'],
+  limit: 5,
+});
+
+for (const hit of results.hits) {
+  console.log(hit.key, hit.fields);
+}
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+results = client.query(
+    table='wikipedia',
+    semantic_search='anatomy and physiology',
+    indexes=['title_body'],
+    fields=['title', 'url'],
+    limit=5,
+)
+
+for hit in results.hits:
+    print(hit.key, hit.fields)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+resp, err := client.QueryWithResponse(
+	context.Background(),
+	antfly.QueryJSONRequestBody{
+		Table:          strPtr("wikipedia"),
+		SemanticSearch: strPtr("anatomy and physiology"),
+		Indexes:        &[]string{"title_body"},
+		Fields:         &[]string{"title", "url"},
+		Limit:          intPtr(5),
+	},
+)
+if err != nil {
+	log.Fatal(err)
+}
+
+for _, hit := range resp.JSON200.Hits {
+	fmt.Printf("%s: %v\n", hit.Key, hit.Fields)
+}
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+let resp = client
+    .global_query(&GlobalQueryBody {
+        table: Some("wikipedia".to_string()),
+        semantic_search: Some("anatomy and physiology".to_string()),
+        indexes: Some(vec!["title_body".to_string()]),
+        fields: Some(vec!["title".to_string(), "url".to_string()]),
+        limit: Some(5),
+        ..Default::default()
+    })
+    .await?;
+
+for response in &resp.into_inner().responses {
+    if let Some(hits) = &response.hits {
+        for hit in &hits.hits {
+            println!("{}: {:?}", hit.id, hit.source);
+        }
+    }
+}
+```
+  </TabsContent>
+</Tabs>
+
+<Callout type="tip">
+You've loaded 10,000 documents and run your first full-text and semantic searches. From here, the guide builds on what you have — adding reranking, image search, and RAG.
+</Callout>
+
+## Hybrid Search & Reranking
+
+Hybrid search combines full-text and semantic search using Reciprocal Rank Fusion (RRF). Adding a reranker further improves relevance by re-scoring results with a cross-encoder model.
 
 Pull the reranker model:
 
@@ -134,8 +673,18 @@ antfly termite pull --variants i8 mixedbread-ai/mxbai-rerank-base-v1
 If Antfly doesn't detect the new model, restart `antfly swarm`.
 </Callout>
 
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
 ```bash
-# Find articles about Einstein with semantic understanding
 antfly query --table wikipedia \
   --full-text-search 'body:Einstein' \
   --semantic-search "theory of relativity and physics" \
@@ -149,10 +698,122 @@ antfly query --table wikipedia \
     }' \
   --pruner '{"min_score_ratio": 0.01}'
 ```
+  </TabsContent>
+
+  <TabsContent value="curl">
+```bash
+curl -X POST http://localhost:8080/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "full_text_search": {"query": "body:Einstein"},
+    "semantic_search": "theory of relativity and physics",
+    "indexes": ["title_body"],
+    "fields": ["title", "url"],
+    "limit": 10,
+    "reranker": {
+      "provider": "termite",
+      "model": "mixedbread-ai/mxbai-rerank-base-v1",
+      "field": "body"
+    },
+    "pruner": {"min_score_ratio": 0.01}
+  }'
+```
+  </TabsContent>
+
+  <TabsContent value="typescript">
+```typescript
+const results = await client.query({
+  table: 'wikipedia',
+  full_text_search: { query: 'body:Einstein' },
+  semantic_search: 'theory of relativity and physics',
+  indexes: ['title_body'],
+  fields: ['title', 'url'],
+  limit: 10,
+  reranker: {
+    provider: 'termite',
+    model: 'mixedbread-ai/mxbai-rerank-base-v1',
+    field: 'body',
+  },
+  pruner: { min_score_ratio: 0.01 },
+});
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+results = client.query(
+    table='wikipedia',
+    full_text_search={'query': 'body:Einstein'},
+    semantic_search='theory of relativity and physics',
+    indexes=['title_body'],
+    fields=['title', 'url'],
+    limit=10,
+    reranker={
+        'provider': 'termite',
+        'model': 'mixedbread-ai/mxbai-rerank-base-v1',
+        'field': 'body',
+    },
+    pruner={'min_score_ratio': 0.01},
+)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+resp, err := client.QueryWithResponse(
+	context.Background(),
+	antfly.QueryJSONRequestBody{
+		Table:          strPtr("wikipedia"),
+		FullTextSearch: &antfly.FullTextSearch{
+			Query: strPtr("body:Einstein"),
+		},
+		SemanticSearch: strPtr("theory of relativity and physics"),
+		Indexes:        &[]string{"title_body"},
+		Fields:         &[]string{"title", "url"},
+		Limit:          intPtr(10),
+		Reranker: &antfly.Reranker{
+			Provider: strPtr("termite"),
+			Model:    strPtr("mixedbread-ai/mxbai-rerank-base-v1"),
+			Field:    strPtr("body"),
+		},
+		Pruner: &antfly.Pruner{
+			MinScoreRatio: float64Ptr(0.01),
+		},
+	},
+)
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+let resp = client
+    .global_query(&GlobalQueryBody {
+        table: Some("wikipedia".to_string()),
+        full_text_search: Some(FullTextSearch {
+            query: Some("body:Einstein".to_string()),
+            ..Default::default()
+        }),
+        semantic_search: Some("theory of relativity and physics".to_string()),
+        indexes: Some(vec!["title_body".to_string()]),
+        fields: Some(vec!["title".to_string(), "url".to_string()]),
+        limit: Some(10),
+        reranker: Some(json!({
+            "provider": "termite",
+            "model": "mixedbread-ai/mxbai-rerank-base-v1",
+            "field": "body"
+        })),
+        pruner: Some(json!({"min_score_ratio": 0.01})),
+        ..Default::default()
+    })
+    .await?;
+```
+  </TabsContent>
+</Tabs>
 
 <Callout type="info">
 **Reranking vs Pruning:**
-- **Reranking** uses a cross-encoder model (like `mixedbread-ai/mxbai-rerank-base-v1`) to re-score results based on query-document relevance. It improves ordering but keeps the same number of results.
+- **Reranking** uses a cross-encoder model to re-score results based on query-document relevance. It improves ordering but keeps the same number of results.
 - **Pruning** filters out low-relevance results based on score quality. Use `min_score_ratio` to keep only results scoring at least N% of the top result, or `max_score_gap_percent` to detect "elbows" in score distribution.
 </Callout>
 
@@ -167,8 +828,25 @@ Search by visual content using CLIP, a multimodal embedding model that understan
 antfly termite pull openai/clip-vit-base-patch32
 ```
 
-### Add a CLIP index to the table
+<Callout type="info">
+If Antfly doesn't detect the new model, restart `antfly swarm`.
+</Callout>
 
+### Add an image index to your table
+
+Add a CLIP-based index to embed each article's Wikipedia thumbnail:
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
 ```bash
 antfly index create --table wikipedia \
   --index thumbnail \
@@ -177,52 +855,229 @@ antfly index create --table wikipedia \
   --embedder '{"provider": "termite", "model": "openai/clip-vit-base-patch32"}' \
   --dimension 512
 ```
+  </TabsContent>
 
-### Search by image content
-
-CLIP understands visual concepts, so you can describe what you're looking for:
-
+  <TabsContent value="curl">
 ```bash
-# Find articles with images of maps or geography
+curl -X POST http://localhost:8080/api/v1/tables/wikipedia/indexes/thumbnail \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "embeddings",
+    "template": "{{media url=thumbnail_url}}",
+    "embedder": {
+      "provider": "termite",
+      "model": "openai/clip-vit-base-patch32"
+    },
+    "dimension": 512,
+    "distance_metric": "cosine"
+  }'
+```
+  </TabsContent>
+
+  <TabsContent value="typescript">
+```typescript
+await client.tables.addIndex('wikipedia', 'thumbnail', {
+  type: 'embeddings',
+  template: '{{media url=thumbnail_url}}',
+  embedder: {
+    provider: 'termite',
+    model: 'openai/clip-vit-base-patch32',
+  },
+  dimension: 512,
+  distance_metric: 'cosine',
+});
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+client.add_index(
+    table='wikipedia',
+    name='thumbnail',
+    type='embeddings',
+    template='{{media url=thumbnail_url}}',
+    embedder={
+        'provider': 'termite',
+        'model': 'openai/clip-vit-base-patch32',
+    },
+    dimension=512,
+    distance_metric='cosine',
+)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+_, err = client.AddIndexWithResponse(
+	context.Background(),
+	"wikipedia",
+	"thumbnail",
+	antfly.AddIndexJSONRequestBody{
+		Type:     strPtr("embeddings"),
+		Template: strPtr("{{media url=thumbnail_url}}"),
+		Embedder: &map[string]interface{}{
+			"provider": "termite",
+			"model":    "openai/clip-vit-base-patch32",
+		},
+		Dimension:      intPtr(512),
+		DistanceMetric: strPtr("cosine"),
+	},
+)
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+client
+    .add_index("wikipedia", "thumbnail", &json!({
+        "type": "embeddings",
+        "template": "{{media url=thumbnail_url}}",
+        "embedder": {
+            "provider": "termite",
+            "model": "openai/clip-vit-base-patch32"
+        },
+        "dimension": 512,
+        "distance_metric": "cosine"
+    }))
+    .await?;
+```
+  </TabsContent>
+</Tabs>
+
+Adding an index to a table with existing data triggers background embedding generation. Articles without a `thumbnail_url` are skipped. Monitor progress with `antfly index list --table wikipedia`.
+
+### Search by visual content
+
+CLIP understands visual concepts, so you can describe what you're looking for in natural language:
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
+```bash
 antfly query --table wikipedia \
   --semantic-search "map of a country" \
   --indexes "thumbnail" \
   --fields "title,url,thumbnail_url" \
   --limit 5
 ```
-</Steps>
+  </TabsContent>
 
-<Callout type="info">
-CLIP responds best to concrete visual descriptions ("red sports car", "mountain landscape") rather than abstract concepts. Articles without a `thumbnail_url` are skipped by the CLIP index. For a deeper dive, see the [Image Search with CLIP](/docs/examples/image-search) example.
-</Callout>
-
-### Multi-Index Hybrid Search
-
-Combine text, image, and full-text search across multiple indexes:
-
+  <TabsContent value="curl">
 ```bash
-# Search with both text and image indexes
-antfly query --table wikipedia \
-  --full-text-search 'title:History' \
-  --semantic-search "ancient civilizations and archaeology" \
-  --indexes "title_body,thumbnail" \
-  --fields "title,url,thumbnail_url" \
-  --limit 10
+curl -X POST http://localhost:8080/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "wikipedia",
+    "semantic_search": "map of a country",
+    "indexes": ["thumbnail"],
+    "fields": ["title", "url", "thumbnail_url"],
+    "limit": 5
+  }'
 ```
+  </TabsContent>
+
+  <TabsContent value="typescript">
+```typescript
+const results = await client.query({
+  table: 'wikipedia',
+  semantic_search: 'map of a country',
+  indexes: ['thumbnail'],
+  fields: ['title', 'url', 'thumbnail_url'],
+  limit: 5,
+});
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+results = client.query(
+    table='wikipedia',
+    semantic_search='map of a country',
+    indexes=['thumbnail'],
+    fields=['title', 'url', 'thumbnail_url'],
+    limit=5,
+)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+resp, err := client.QueryWithResponse(
+	context.Background(),
+	antfly.QueryJSONRequestBody{
+		Table:          strPtr("wikipedia"),
+		SemanticSearch: strPtr("map of a country"),
+		Indexes:        &[]string{"thumbnail"},
+		Fields:         &[]string{"title", "url", "thumbnail_url"},
+		Limit:          intPtr(5),
+	},
+)
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+let resp = client
+    .global_query(&GlobalQueryBody {
+        table: Some("wikipedia".to_string()),
+        semantic_search: Some("map of a country".to_string()),
+        indexes: Some(vec!["thumbnail".to_string()]),
+        fields: Some(vec![
+            "title".to_string(),
+            "url".to_string(),
+            "thumbnail_url".to_string(),
+        ]),
+        limit: Some(5),
+        ..Default::default()
+    })
+    .await?;
+```
+  </TabsContent>
+</Tabs>
+
+<Callout type="tip">
+CLIP responds best to concrete visual descriptions ("red sports car", "mountain landscape") rather than abstract concepts. For a deeper dive, see the [Image Search with CLIP](/docs/examples/image-search) example.
+</Callout>
+</Steps>
 
 ## RAG (Retrieval-Augmented Generation)
 
 Combine search with LLM-powered classification and generation using the retrieval agent.
 
 <Steps>
-### Classify a query
-
-Pull a small generator model and use it to classify whether a query needs retrieval:
+### Pull a generation model
 
 ```bash
-antfly termite pull hf:onnx-community/gemma-3-270m-it-ONNX
+antfly termite pull hf:onnxruntime/Gemma-3-ONNX
 ```
 
+<Callout type="info">
+`onnxruntime/Gemma-3-ONNX` (~4B params, 5.7 GB) runs locally via Termite and supports all RAG features — classification, generation, reasoning, and follow-up questions. For alternative providers, see the [next step](#rag-with-alternative-providers).
+</Callout>
+
+### Classify and generate
+
+Use the Gemma model to classify a query and generate an answer from search results:
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
+    <TabsTrigger value="python">Python</TabsTrigger>
+    <TabsTrigger value="go">Go</TabsTrigger>
+    <TabsTrigger value="rust">Rust</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
 ```bash
 antfly agents retrieval --table wikipedia \
   --semantic-search "What are the major events in Korean history?" \
@@ -237,50 +1092,6 @@ antfly agents retrieval --table wikipedia \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{
     "provider": "termite",
-    "model": "onnx-community/gemma-3-270m-it-ONNX"
-  }' \
-  --max-context-tokens 512 \
-  --classify
-```
-
-This command:
-1. Searches for semantically similar articles using the generated embeddings
-2. Reranks results using the built-in cross-encoder reranker for better relevance
-3. Prunes low-quality results (keeps only those scoring ≥60% of top result, stops at large score gaps)
-4. Fits the remaining documents into a 512-token context budget, dropping lowest-ranked documents that don't fit
-5. Classifies the query intent using the small Gemma 3 model
-
-<Callout type="tip">
-**Pruning for RAG:** Pruning is especially valuable for RAG pipelines. Score-based pruning (`--pruner`) filters out marginally relevant documents, while token-based pruning (`--max-context-tokens`) ensures the context fits within the model's limits.
-</Callout>
-
-### RAG with generation, reasoning, and followup
-
-For full generation features (`--generate`, `--reasoning`, `--followup`), you need a larger model. Choose a provider below:
-
-<Tabs defaultValue="termite">
-  <TabsList>
-    <TabsTrigger value="termite">Termite (large model)</TabsTrigger>
-    <TabsTrigger value="ollama">Ollama</TabsTrigger>
-    <TabsTrigger value="gemini">Gemini</TabsTrigger>
-    <TabsTrigger value="openai">OpenAI</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="termite">
-Pull the larger Gemma 3 ONNX model (~5.7 GB) first:
-
-```bash
-antfly termite pull hf:onnxruntime/Gemma-3-ONNX
-```
-
-```bash
-antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
-  --indexes "title_body" \
-  --fields "title,body" \
-  --limit 5 \
-  --generator '{
-    "provider": "termite",
     "model": "onnxruntime/Gemma-3-ONNX"
   }' \
   --max-context-tokens 512 \
@@ -288,36 +1099,185 @@ antfly agents retrieval --table wikipedia \
 ```
   </TabsContent>
 
-  <TabsContent value="ollama">
-Requires [Ollama](https://ollama.com) running locally. Pull the model first:
-
+  <TabsContent value="curl">
 ```bash
-ollama pull gemma3:4b-it-qat
-```
-
-```bash
-antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
-  --indexes "title_body" \
-  --fields "title,body" \
-  --limit 5 \
-  --generator '{
-    "provider": "ollama",
-    "model": "gemma3:4b-it-qat"
-  }' \
-  --max-context-tokens 2048 \
-  --classify --reasoning --generate --followup
+curl -X POST http://localhost:8080/api/v1/agents/retrieval \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queries": [{
+      "table": "wikipedia",
+      "semantic_search": "What are the major events in Korean history?",
+      "indexes": ["title_body"],
+      "fields": ["title", "body"],
+      "limit": 5,
+      "reranker": {
+        "provider": "termite",
+        "model": "mixedbread-ai/mxbai-rerank-base-v1",
+        "field": "body"
+      },
+      "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
+    }],
+    "generator": {
+      "provider": "termite",
+      "model": "onnxruntime/Gemma-3-ONNX"
+    },
+    "max_context_tokens": 512,
+    "classify": true,
+    "reasoning": true,
+    "generate": true,
+    "followup": true
+  }'
 ```
   </TabsContent>
 
+  <TabsContent value="typescript">
+```typescript
+const result = await client.agents.retrieval({
+  queries: [{
+    table: 'wikipedia',
+    semantic_search: 'What are the major events in Korean history?',
+    indexes: ['title_body'],
+    fields: ['title', 'body'],
+    limit: 5,
+    reranker: {
+      provider: 'termite',
+      model: 'mixedbread-ai/mxbai-rerank-base-v1',
+      field: 'body',
+    },
+    pruner: { min_score_ratio: 0.6, max_score_gap_percent: 40 },
+  }],
+  generator: {
+    provider: 'termite',
+    model: 'onnxruntime/Gemma-3-ONNX',
+  },
+  max_context_tokens: 512,
+  classify: true,
+  reasoning: true,
+  generate: true,
+  followup: true,
+});
+```
+  </TabsContent>
+
+  <TabsContent value="python">
+```python
+result = client.agents.retrieval(
+    queries=[{
+        'table': 'wikipedia',
+        'semantic_search': 'What are the major events in Korean history?',
+        'indexes': ['title_body'],
+        'fields': ['title', 'body'],
+        'limit': 5,
+        'reranker': {
+            'provider': 'termite',
+            'model': 'mixedbread-ai/mxbai-rerank-base-v1',
+            'field': 'body',
+        },
+        'pruner': {'min_score_ratio': 0.6, 'max_score_gap_percent': 40},
+    }],
+    generator={
+        'provider': 'termite',
+        'model': 'onnxruntime/Gemma-3-ONNX',
+    },
+    max_context_tokens=512,
+    classify=True,
+    reasoning=True,
+    generate=True,
+    followup=True,
+)
+```
+  </TabsContent>
+
+  <TabsContent value="go">
+```go
+resp, err := client.RetrievalAgentWithResponse(
+	context.Background(),
+	antfly.RetrievalAgentJSONRequestBody{
+		Queries: &[]antfly.QueryBody{{
+			Table:          strPtr("wikipedia"),
+			SemanticSearch: strPtr("What are the major events in Korean history?"),
+			Indexes:        &[]string{"title_body"},
+			Fields:         &[]string{"title", "body"},
+			Limit:          intPtr(5),
+			Reranker: &antfly.Reranker{
+				Provider: strPtr("termite"),
+				Model:    strPtr("mixedbread-ai/mxbai-rerank-base-v1"),
+				Field:    strPtr("body"),
+			},
+			Pruner: &antfly.Pruner{
+				MinScoreRatio:      float64Ptr(0.6),
+				MaxScoreGapPercent: float64Ptr(40),
+			},
+		}},
+		Generator: &antfly.Generator{
+			Provider: strPtr("termite"),
+			Model:    strPtr("onnxruntime/Gemma-3-ONNX"),
+		},
+		MaxContextTokens: intPtr(512),
+		Classify:         boolPtr(true),
+		Reasoning:        boolPtr(true),
+		Generate:         boolPtr(true),
+		Followup:         boolPtr(true),
+	},
+)
+```
+  </TabsContent>
+
+  <TabsContent value="rust">
+```rust
+let resp = client
+    .retrieval_agent(&json!({
+        "queries": [{
+            "table": "wikipedia",
+            "semantic_search": "What are the major events in Korean history?",
+            "indexes": ["title_body"],
+            "fields": ["title", "body"],
+            "limit": 5,
+            "reranker": {
+                "provider": "termite",
+                "model": "mixedbread-ai/mxbai-rerank-base-v1",
+                "field": "body"
+            },
+            "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
+        }],
+        "generator": {
+            "provider": "termite",
+            "model": "onnxruntime/Gemma-3-ONNX"
+        },
+        "max_context_tokens": 512,
+        "classify": true,
+        "reasoning": true,
+        "generate": true,
+        "followup": true
+    }))
+    .await?;
+```
+  </TabsContent>
+</Tabs>
+
+This command searches for semantically similar articles, reranks and prunes results for quality, classifies the query, generates an answer with reasoning, and suggests follow-up questions — all using the local Gemma model.
+
+<Callout type="tip">
+**Pruning for RAG:** Score-based pruning (`--pruner`) filters out marginally relevant documents, while token-based pruning (`--max-context-tokens`) ensures the context fits within the model's limits.
+</Callout>
+
+### RAG with alternative providers
+
+The previous step uses Termite for local inference. You can also use cloud APIs or Ollama:
+
+<Tabs defaultValue="gemini">
+  <TabsList>
+    <TabsTrigger value="gemini">Gemini</TabsTrigger>
+    <TabsTrigger value="openai">OpenAI</TabsTrigger>
+    <TabsTrigger value="ollama">Ollama</TabsTrigger>
+  </TabsList>
+
   <TabsContent value="gemini">
-Requires a [Google AI API key](https://aistudio.google.com/apikey). Set the `GEMINI_API_KEY` environment variable:
+Requires a [Google AI API key](https://aistudio.google.com/apikey). Set the `GEMINI_API_KEY` environment variable — Antfly picks it up automatically:
 
 ```bash
 export GEMINI_API_KEY="your-api-key-here"
-```
 
-```bash
 antfly agents retrieval --table wikipedia \
   --semantic-search "What are the major events in Korean history?" \
   --indexes "title_body" \
@@ -330,13 +1290,11 @@ antfly agents retrieval --table wikipedia \
   </TabsContent>
 
   <TabsContent value="openai">
-Requires an [OpenAI API key](https://platform.openai.com/api-keys). Set the `OPENAI_API_KEY` environment variable:
+Requires an [OpenAI API key](https://platform.openai.com/api-keys). Set the `OPENAI_API_KEY` environment variable — Antfly picks it up automatically:
 
 ```bash
 export OPENAI_API_KEY="your-api-key-here"
-```
 
-```bash
 antfly agents retrieval --table wikipedia \
   --semantic-search "What are the major events in Korean history?" \
   --indexes "title_body" \
@@ -347,20 +1305,37 @@ antfly agents retrieval --table wikipedia \
   --classify --reasoning --generate --followup
 ```
   </TabsContent>
+
+  <TabsContent value="ollama">
+Requires [Ollama](https://ollama.com) running locally. Pull the model first:
+
+```bash
+ollama pull gemma3:4b-it-qat
+
+antfly agents retrieval --table wikipedia \
+  --semantic-search "What are the major events in Korean history?" \
+  --indexes "title_body" \
+  --fields "title,body" \
+  --limit 5 \
+  --generator '{"provider": "ollama", "model": "gemma3:4b-it-qat"}' \
+  --max-context-tokens 2048 \
+  --classify --reasoning --generate --followup
+```
+  </TabsContent>
+
 </Tabs>
 
 <Callout type="info">
 **Choosing a generator model:**
-- **`onnx-community/gemma-3-270m-it-ONNX`** (~270M params, 1.1 GB) — fast, runs anywhere, good for `--classify` only
-- **`onnxruntime/Gemma-3-ONNX`** (~4B params, 5.7 GB) — local ONNX inference via Termite, supports all RAG features
+- **`onnxruntime/Gemma-3-ONNX`** (~4B params, 5.7 GB) — local ONNX inference via Termite, no API key needed, supports all RAG features
 - **Ollama `gemma3:4b-it-qat`** — local inference via Ollama, quantized for fast CPU/GPU performance
 - **Gemini `gemini-2.5-flash`** — cloud API, fast and high quality, requires API key
 - **OpenAI `gpt-4.1-mini`** — cloud API, fast and high quality, requires API key
 </Callout>
 
-### RAG with structured output
+### Structured output
 
-Add `--streaming=false` to get structured JSON output with source references instead of streaming text. This works with any of the generator providers above:
+Add `--streaming=false` to get structured JSON output with source references instead of streaming text:
 
 ```bash
 antfly agents retrieval --table wikipedia \
@@ -372,9 +1347,9 @@ antfly agents retrieval --table wikipedia \
   --streaming=false --generate
 ```
 
-### RAG with evaluation
+### Evaluation
 
-Add `--eval` to run evaluators on the query results and include scores in the response. Evaluation requires a model capable of generation — use a larger model as the judge:
+Add `--eval` to score the quality of retrieval and generation:
 
 ```bash
 antfly agents retrieval --table wikipedia \
@@ -397,27 +1372,22 @@ Available evaluators:
 
 ## Next Steps
 
-1. **Image Search Example**: Build a full image search app with CLIP — see the [Image Search with CLIP](/docs/examples/image-search) example
-2. **Explore Different Models**: Browse available Termite models with `antfly termite list --remote` — try `mixedbread-ai/mxbai-embed-large-v1` for higher quality text embeddings or `mixedbread-ai/mxbai-rerank-base-v1` for neural reranking
-3. **Backup and Restore**: Try backing up your data:
-```bash
-antfly backup --table wikipedia \
-  --backup-id wiki-backup-$(date +%Y%m%d) \
-  --location "file:///tmp/antfly_backups"
-```
-4. **Production Deployment**: For production, run metadata and storage nodes separately for better scalability
+1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://localhost:8080`
+2. **[Image Search with CLIP](/docs/examples/image-search)** — Build a full image search application
+3. **[Browse Models](/termite)** — Discover available embedding, reranking, and generation models with `antfly termite list --remote`
+4. **[SDKs](/docs/sdks)** — Build applications with Go, TypeScript, Python, or Rust
+5. **[Backup and Restore](/docs/api/data-operations)** — Protect your data
+6. **[Production Deployment](/docs/operator/getting-started/quickstart)** — Deploy on Kubernetes with the Antfly Operator
 
 ## Additional Resources
 
-- [Antfly CLI Documentation](/docs/api)
-- [Main Antfly README](https://github.com/antflydb/antfly/README.md)
-- [REST API Documentation](/docs/api)
-- [Termite Models](/termite) - Browse available embedding, chunking, and reranking models
-- [Configuration Reference](/docs/configuration) - Configure Termite, embedding providers, and more
+- [Antfly CLI & REST API Documentation](/docs/api)
+- [Hybrid Search Guide](/docs/guides/hybrid-search)
+- [Termite Guide](/docs/guides/termite) — Configure ML inference, embedding providers, and more
+- [Configuration Reference](/docs/configuration)
 
 <Questions>
 - How do I install Antfly?
-- How do I start Antfly for local development?
 - How do I create my first table and index?
 - How do I load data into Antfly?
 - How do I run a search query?
