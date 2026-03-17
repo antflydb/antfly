@@ -9,9 +9,9 @@ Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust.
 
 | Language | Package | Registry | Source |
 |----------|---------|----------|--------|
-| Go | `github.com/antflydb/antfly-go/antfly` | [pkg.go.dev](https://pkg.go.dev/github.com/antflydb/antfly-go/antfly) | [GitHub](https://github.com/antflydb/antfly-go) |
-| TypeScript | `@antfly/sdk` | [npm](https://www.npmjs.com/package/@antfly/sdk) | [GitHub](https://github.com/antflydb/antfly-ts) |
-| Python | `antfly-sdk` | [PyPI](https://pypi.org/project/antfly-sdk/) | [GitHub](https://github.com/antflydb/antfly-py) |
+| Go | `github.com/antflydb/antfly/pkg/client` | [pkg.go.dev](https://pkg.go.dev/github.com/antflydb/antfly/pkg/client) | [GitHub](https://github.com/antflydb/antfly/tree/main/pkg/client) |
+| TypeScript | `@antfly/sdk` | [npm](https://www.npmjs.com/package/@antfly/sdk) | [GitHub](https://github.com/antflydb/antfly/tree/main/ts) |
+| Python | `antfly-sdk` | [PyPI](https://pypi.org/project/antfly-sdk/) | [GitHub](https://github.com/antflydb/antfly/tree/main/py) |
 | Rust | `antfly-client` | [crates.io](https://crates.io/crates/antfly-client) | [GitHub](https://github.com/antflydb/antfly/tree/main/rs/antfly-client) |
 
 ## Installation
@@ -19,7 +19,7 @@ Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust.
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `go get github.com/antflydb/antfly-go/antfly`
+    code: `go get github.com/antflydb/antfly/pkg/client`
   },
   {
     language: "TypeScript",
@@ -44,7 +44,7 @@ All three authentication methods are supported across SDKs: basic auth, API key,
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `import "github.com/antflydb/antfly-go/antfly"\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)`
+    code: `antfly "github.com/antflydb/antfly/pkg/client"\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)`
   },
   {
     language: "TypeScript",
@@ -109,7 +109,7 @@ All three authentication methods are supported across SDKs: basic auth, API key,
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `import (\n\t"context"\n\t"github.com/antflydb/antfly-go/antfly"\n)\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)\nif err != nil {\n\tlog.Fatal(err)\n}\n\n// Batch insert documents\nresp, err := client.BatchTableWithResponse(\n\tcontext.Background(),\n\t"products",\n\tantfly.BatchTableJSONRequestBody{\n\t\tInserts: &map[string]interface{}{\n\t\t\t"prod:001": map[string]interface{}{\n\t\t\t\t"name":  "Laptop",\n\t\t\t\t"price": 1299.99,\n\t\t\t},\n\t\t\t"prod:002": map[string]interface{}{\n\t\t\t\t"name":  "Mouse",\n\t\t\t\t"price": 29.99,\n\t\t\t},\n\t\t},\n\t},\n)`
+    code: `import (\n\t"context"\n\tantfly "github.com/antflydb/antfly/pkg/client"\n)\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)\nif err != nil {\n\tlog.Fatal(err)\n}\n\n// Batch insert documents\nresp, err := client.BatchTableWithResponse(\n\tcontext.Background(),\n\t"products",\n\tantfly.BatchTableJSONRequestBody{\n\t\tInserts: &map[string]interface{}{\n\t\t\t"prod:001": map[string]interface{}{\n\t\t\t\t"name":  "Laptop",\n\t\t\t\t"price": 1299.99,\n\t\t\t},\n\t\t\t"prod:002": map[string]interface{}{\n\t\t\t\t"name":  "Mouse",\n\t\t\t\t"price": 29.99,\n\t\t\t},\n\t\t},\n\t},\n)`
   },
   {
     language: "TypeScript",
