@@ -910,6 +910,16 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 		return
 	default:
 	}
+
+	// Take read lock to prevent access after Close() sets pdb to nil
+	db.pdbMu.RLock()
+	pdb := db.pdb
+	db.pdbMu.RUnlock()
+
+	if pdb == nil {
+		return
+	}
+
 	var err error
 	defer func() {
 		pebbleutils.RecoverPebbleClosed(&err)
@@ -918,7 +928,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 		}
 	}()
 
-	iter, err := db.pdb.NewIter(&pebble.IterOptions{
+	iter, err := pdb.NewIter(&pebble.IterOptions{
 		LowerBound: txnRecordsPrefix,
 		UpperBound: utils.PrefixSuccessor(txnRecordsPrefix),
 	})
@@ -980,7 +990,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 			// Check if all participants have resolved their intents
 			allResolved := len(record.ResolvedParticipants) >= len(record.Participants)
 			if allResolved {
-				if err := db.pdb.Delete(iter.Key(), pebble.Sync); err != nil {
+				if err := pdb.Delete(iter.Key(), pebble.Sync); err != nil {
 					db.logger.Warn("Failed to cleanup old transaction record",
 						zap.String("key", types.FormatKey(iter.Key())),
 						zap.Error(err))
@@ -1055,7 +1065,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 								zap.Binary("txnID", record.TxnID),
 								zap.Error(err))
 						} else {
-							if err := db.pdb.Set(iter.Key(), updatedData, pebble.Sync); err != nil {
+							if err := pdb.Set(iter.Key(), updatedData, pebble.Sync); err != nil {
 								db.logger.Warn("Failed to save updated transaction record",
 									zap.Binary("txnID", record.TxnID),
 									zap.Error(err))
