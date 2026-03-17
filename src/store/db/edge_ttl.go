@@ -140,7 +140,13 @@ func (etc *EdgeTTLCleaner) cleanupExpiredEdges(
 		iterOpts.UpperBound = etc.db.byteRange[1]
 	}
 
-	iter, err := etc.db.pdb.NewIterWithContext(ctx, iterOpts)
+	pdb := etc.db.getPDB()
+	if pdb == nil {
+		etc.logger.Debug("Skipping edge TTL cleanup, database closed")
+		return 0, nil
+	}
+
+	iter, err := pdb.NewIterWithContext(ctx, iterOpts)
 	if err != nil {
 		// Check if error is due to closed database
 		if errors.Is(err, pebble.ErrClosed) {
@@ -258,7 +264,11 @@ func (etc *EdgeTTLCleaner) deleteExpiredBatch(
 ) error {
 	return deleteExpiredKeysBatch(ctx, keys, persistFunc, func(keys [][]byte) error {
 		// Direct deletion fallback for edges: delete individual keys + timestamp keys
-		batch := etc.db.pdb.NewBatch()
+		pdb := etc.db.getPDB()
+		if pdb == nil {
+			return fmt.Errorf("database closed during edge TTL cleanup")
+		}
+		batch := pdb.NewBatch()
 		defer func() { _ = batch.Close() }()
 
 		for _, key := range keys {

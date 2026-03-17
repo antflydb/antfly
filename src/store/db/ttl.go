@@ -144,7 +144,13 @@ func (tc *TTLCleaner) cleanupExpiredDocuments(
 		UpperBound: tc.db.byteRange[1],
 	}
 
-	iter, err := tc.db.pdb.NewIterWithContext(ctx, iterOpts)
+	pdb := tc.db.getPDB()
+	if pdb == nil {
+		tc.logger.Debug("Skipping TTL cleanup, database closed")
+		return 0, nil
+	}
+
+	iter, err := pdb.NewIterWithContext(ctx, iterOpts)
 	if err != nil {
 		// Check if error is due to closed database
 		if errors.Is(err, pebble.ErrClosed) {
@@ -250,7 +256,11 @@ func (tc *TTLCleaner) deleteExpiredBatch(
 ) error {
 	return deleteExpiredKeysBatch(ctx, keys, persistFunc, func(keys [][]byte) error {
 		// Direct deletion fallback for documents: delete entire key range
-		batch := tc.db.pdb.NewBatch()
+		pdb := tc.db.getPDB()
+		if pdb == nil {
+			return fmt.Errorf("database closed during TTL cleanup")
+		}
+		batch := pdb.NewBatch()
 		defer func() { _ = batch.Close() }()
 
 		for _, key := range keys {
