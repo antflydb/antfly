@@ -415,6 +415,15 @@ func (db *DBImpl) SetPebbleDB(pdb *pebble.DB) {
 	db.pdbMu.Unlock()
 }
 
+// getPDB returns the Pebble database pointer, safely guarded against concurrent
+// Close() calls that nil out the pointer. Returns nil if the DB is closed.
+func (db *DBImpl) getPDB() *pebble.DB {
+	db.pdbMu.RLock()
+	pdb := db.pdb
+	db.pdbMu.RUnlock()
+	return pdb
+}
+
 func (db *DBImpl) AddIndex(config indexes.IndexConfig) error {
 	db.logger.Debug("Adding index", zap.Any("indexConfig", config))
 	if err := db.indexManager.Register(config.Name, true, config); err != nil {
@@ -910,11 +919,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 		return
 	default:
 	}
-
-	// Take read lock to prevent access after Close() sets pdb to nil
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return
@@ -1694,12 +1699,7 @@ func (db *DBImpl) getWithQueryOptions(
 	key []byte,
 	opts storeutils.QueryOptions,
 ) (docMap map[string]any, err error) {
-	// Take read lock to prevent access during close/reopen cycle (e.g., during splits)
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
-
-	// Guard against accessing a nil or closed database (can happen during splits)
+	pdb := db.getPDB()
 	if pdb == nil {
 		return nil, pebble.ErrClosed
 	}
@@ -2257,11 +2257,7 @@ func (db *DBImpl) Batch(
 ) (err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
 
-	// Take read lock to prevent access during close/reopen cycle (e.g., during splits)
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
-
+	pdb := db.getPDB()
 	if pdb == nil {
 		return pebble.ErrClosed
 	}
@@ -4286,9 +4282,7 @@ func (db *DBImpl) InitTransaction(ctx context.Context, op *InitTransactionOp) er
 		transactionDurationSeconds.WithLabelValues("init").Observe(time.Since(start).Seconds())
 	}()
 
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return pebble.ErrClosed
@@ -4346,9 +4340,7 @@ func (db *DBImpl) WriteIntent(ctx context.Context, op *WriteIntentOp) error {
 		transactionDurationSeconds.WithLabelValues("write_intent").Observe(time.Since(start).Seconds())
 	}()
 
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return pebble.ErrClosed
@@ -4451,11 +4443,7 @@ func (db *DBImpl) ResolveIntents(ctx context.Context, op *ResolveIntentsOp) erro
 	defer func() {
 		intentResolutionDurationSeconds.Observe(time.Since(start).Seconds())
 	}()
-
-	// Take read lock to prevent access after Close() sets pdb to nil
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return pebble.ErrClosed
@@ -4646,9 +4634,7 @@ func (db *DBImpl) ResolveIntents(ctx context.Context, op *ResolveIntentsOp) erro
 // GetTimestamp returns the HLC timestamp for a key from the :t suffix metadata key.
 // Returns 0 if the key has no timestamp (never written via transactions).
 func (db *DBImpl) GetTimestamp(key []byte) (uint64, error) {
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return 0, pebble.ErrClosed
@@ -4741,9 +4727,7 @@ func (db *DBImpl) checkVersionPredicates(predicates []*VersionPredicate, exclude
 // buildConflictingIntentsMap scans all pending intents once and returns a map
 // of userKey → conflicting txnID for intents not belonging to excludeTxnID.
 func (db *DBImpl) buildConflictingIntentsMap(excludeTxnID []byte) (map[string][]byte, error) {
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return nil, pebble.ErrClosed
@@ -4789,9 +4773,7 @@ func (db *DBImpl) hasConflictingIntentForKey(userKey []byte, excludeTxnID []byte
 	// This is O(n) in the number of pending intents, but necessary for correctness.
 	// Could be optimized with a reverse index (userKey -> txnIDs) in the future.
 
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return nil, pebble.ErrClosed
@@ -4905,9 +4887,7 @@ func (db *DBImpl) shouldWriteValueLegacy(key []byte, newTimestamp uint64) (bool,
 // loadTxnRecord reads and unmarshals the TxnRecord for txnID from Pebble.
 // Returns ErrTxnNotFound when the record does not exist.
 func (db *DBImpl) loadTxnRecord(txnID []byte) (TxnRecord, error) {
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	if pdb == nil {
 		return TxnRecord{}, pebble.ErrClosed

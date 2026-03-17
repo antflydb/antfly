@@ -335,9 +335,7 @@ func (db *DBImpl) isDocumentExpiredByTimestamp(ctx context.Context, key []byte) 
 	}
 
 	// Take read lock to prevent access during close/reopen cycle (e.g., during splits)
-	db.pdbMu.RLock()
-	pdb := db.pdb
-	db.pdbMu.RUnlock()
+	pdb := db.getPDB()
 
 	// Guard against accessing a nil or closed database (can happen during splits)
 	if pdb == nil {
