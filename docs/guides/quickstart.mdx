@@ -29,11 +29,11 @@ Visit the [Downloads page](/docs/downloads) and follow the instructions for the 
 Pull the embedding models and generation model using Termite (Antfly's built-in ML inference service):
 
 ```bash
-antfly termite pull --variants i8 BAAI/bge-small-en-v1.5 openai/clip-vit-base-patch32 mixedbread-ai/mxbai-rerank-base-v1
+antfly termite pull BAAI/bge-small-en-v1.5 openai/clip-vit-base-patch32 mixedbread-ai/mxbai-rerank-base-v1
 antfly termite pull hf:onnx-community/gemma-3-270m-it-ONNX
 ```
 
-- `BAAI/bge-small-en-v1.5` is a small, fast text embedding model (384 dimensions) for semantic search, INT8 quantized for fast CPU inference
+- `BAAI/bge-small-en-v1.5` is a small, fast text embedding model (384 dimensions) for semantic search
 - `openai/clip-vit-base-patch32` is a multimodal embedding model (512 dimensions) for image search
 - `mixedbread-ai/mxbai-rerank-base-v1` is a cross-encoder reranker for improving search result relevance
 - `onnx-community/gemma-3-270m-it-ONNX` is a small (~270M parameter) Gemma 3 model for query classification
