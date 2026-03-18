@@ -156,13 +156,15 @@ func (g *GraphIndexV0) Type() IndexType {
 
 // Batch processes edge write/delete operations and updates the edge index
 func (g *GraphIndexV0) Batch(ctx context.Context, writes [][2][]byte, deletes [][]byte, sync bool) error {
-	// Check if paused - if so, skip processing (return nil, not error)
+	// Hold pauseMu for the duration of indexDB work so Pause() can wait
+	// for any in-flight Batch to complete before returning.
 	g.pauseMu.Lock()
+	defer g.pauseMu.Unlock()
+
+	// Check if paused - if so, skip processing (return nil, not error)
 	if g.paused.Load() {
-		g.pauseMu.Unlock()
 		return nil
 	}
-	g.pauseMu.Unlock()
 
 	// Use indexDB for reverse index writes (not main db)
 	batch := g.indexDB.NewBatch()
@@ -814,6 +816,12 @@ func (g *GraphIndexV0) Pause(ctx context.Context) error {
 			}
 		}
 	}
+
+	// Wait for any in-flight Batch() to complete. Batch() holds pauseMu for
+	// the duration of its indexDB work, so acquiring it here guarantees no
+	// Batch is mid-flight when we return.
+	g.pauseMu.Lock()
+	g.pauseMu.Unlock() //nolint:staticcheck // SA2001: intentional empty critical section to drain in-flight Batch()
 
 	g.logger.Debug("Paused graph index", zap.String("name", g.name))
 	return nil
