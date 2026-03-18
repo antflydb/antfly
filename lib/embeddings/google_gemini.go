@@ -84,7 +84,7 @@ func NewGenaiGoogleImpl(config EmbedderConfig) (Embedder, error) {
 		dimension:      dimension,
 		project:        project,
 		location:       location,
-		caps:           ResolveCapabilities(c.Model, nil),
+		caps:           ResolveCapabilities(c.Model, config.GetConfigCapabilities()),
 		limiter:        rate.NewLimiter(GeminiDefaultRPS, GeminiDefaultRPS),
 	}, nil
 }
@@ -102,13 +102,37 @@ func (l *GenaiGoogleImpl) Embed(ctx context.Context, contentParts [][]ai.Content
 		return [][]float32{}, nil
 	}
 
-	// Gemini only supports text embeddings
-	values := ExtractText(contentParts)
-
-	contents := make([]*genai.Content, len(values))
-	for i, v := range values {
-		contents[i] = genai.NewContentFromText(v, "" /* genai.Role */)
+	// If text-only model or all-text input, use the efficient text path
+	if l.caps.IsTextOnly() || allText(contentParts) {
+		values := ExtractText(contentParts)
+		contents := make([]*genai.Content, len(values))
+		for i, v := range values {
+			contents[i] = genai.NewContentFromText(v, "")
+		}
+		return l.embedContents(ctx, contents)
 	}
+
+	// Multimodal path: convert ai.ContentPart → genai.Part
+	contents := make([]*genai.Content, len(contentParts))
+	for i, parts := range contentParts {
+		genaiParts := make([]*genai.Part, 0, len(parts))
+		for _, part := range parts {
+			switch p := part.(type) {
+			case ai.TextContent:
+				genaiParts = append(genaiParts, genai.NewPartFromText(p.Text))
+			case ai.BinaryContent:
+				genaiParts = append(genaiParts, genai.NewPartFromBytes(p.Data, p.MIMEType))
+			case ai.ImageURLContent:
+				// Fall back to text with the URL
+				genaiParts = append(genaiParts, genai.NewPartFromText(p.URL))
+			}
+		}
+		contents[i] = genai.NewContentFromParts(genaiParts, "")
+	}
+	return l.embedContents(ctx, contents)
+}
+
+func (l *GenaiGoogleImpl) embedContents(ctx context.Context, contents []*genai.Content) ([][]float32, error) {
 	var cc *genai.EmbedContentConfig
 	if l.dimension > 0 {
 		d := int32(l.dimension) //nolint:gosec // G115: bounded value, cannot overflow in practice
@@ -129,7 +153,7 @@ func (l *GenaiGoogleImpl) Embed(ctx context.Context, contentParts [][]ai.Content
 	for i, e := range result.Embeddings {
 		emb[i] = e.Values
 	}
-	return emb, err
+	return emb, nil
 }
 
 func (l *GenaiGoogleImpl) GetModels(ctx context.Context) ([]string, error) {
@@ -138,7 +162,7 @@ func (l *GenaiGoogleImpl) GetModels(ctx context.Context) ([]string, error) {
 		// Filter: "",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("ollama list models failed: %w", err)
+		return nil, fmt.Errorf("gemini list models failed: %w", err)
 	}
 	models := make([]string, len(resp.Items))
 	// TODO (ajr) Use resp.Next with paging?

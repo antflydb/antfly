@@ -103,7 +103,7 @@ func NewCohereEmbedder(config EmbedderConfig) (Embedder, error) {
 		model:     model,
 		inputType: inputType,
 		truncate:  truncate,
-		caps:      ResolveCapabilities(model, nil),
+		caps:      ResolveCapabilities(model, config.GetConfigCapabilities()),
 		limiter:   rate.NewLimiter(CohereDefaultRPS, CohereDefaultRPS),
 	}, nil
 }

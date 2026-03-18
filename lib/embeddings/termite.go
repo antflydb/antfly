@@ -35,7 +35,7 @@ type TermiteClient struct {
 	caps   EmbedderCapabilities
 }
 
-func NewTermiteClient(url string, model string) (Embedder, error) {
+func NewTermiteClient(url string, model string, configCaps *EmbedderCapabilities) (Embedder, error) {
 	if model == "" {
 		return nil, fmt.Errorf("model is required for Termite embeddings")
 	}
@@ -49,7 +49,7 @@ func NewTermiteClient(url string, model string) (Embedder, error) {
 	return &TermiteClient{
 		client: termiteClient,
 		model:  model,
-		caps:   ResolveCapabilities(model, nil),
+		caps:   ResolveCapabilities(model, configCaps),
 	}, nil
 }
 

@@ -96,3 +96,42 @@ func TestResolveCapabilities_ConfigOverride(t *testing.T) {
 	caps := ResolveCapabilities("clip-vit-base-patch32", customCaps)
 	assert.Equal(t, 1024, caps.DefaultDimension, "Config should override registry")
 }
+
+func TestResolveCapabilities_GeminiEmbedding2Preview(t *testing.T) {
+	caps := ResolveCapabilities("gemini-embedding-2-preview", nil)
+	assert.False(t, caps.IsTextOnly(), "gemini-embedding-2-preview should be multimodal")
+	assert.Equal(t, 3072, caps.DefaultDimension)
+	assert.True(t, caps.SupportsMIMEType("image/png"))
+	assert.True(t, caps.SupportsMIMEType("audio/wav"))
+	assert.True(t, caps.SupportsMIMEType("video/mp4"))
+	assert.True(t, caps.SupportsMIMEType("application/pdf"))
+	assert.True(t, caps.SupportsFusion)
+}
+
+func TestGetConfigCapabilities_MultimodalTrue(t *testing.T) {
+	cfg := NewEmbedderConfigFromJSON("vertex", []byte(`{"model":"future-model","multimodal":true}`))
+	caps := cfg.GetConfigCapabilities()
+	require.NotNil(t, caps, "multimodal: true should produce capabilities")
+	assert.False(t, caps.IsTextOnly())
+	assert.True(t, caps.SupportsMIMEType("image/png"))
+	assert.True(t, caps.SupportsMIMEType("audio/wav"))
+}
+
+func TestGetConfigCapabilities_MultimodalFalse(t *testing.T) {
+	cfg := NewEmbedderConfigFromJSON("vertex", []byte(`{"model":"text-model","multimodal":false}`))
+	caps := cfg.GetConfigCapabilities()
+	assert.Nil(t, caps, "multimodal: false should not produce capabilities")
+}
+
+func TestGetConfigCapabilities_NotSet(t *testing.T) {
+	cfg := NewEmbedderConfigFromJSON("openai", []byte(`{"model":"text-embedding-3-small"}`))
+	caps := cfg.GetConfigCapabilities()
+	assert.Nil(t, caps, "missing multimodal should not produce capabilities")
+}
+
+func TestResolveCapabilities_MultimodalOverridesTextOnly(t *testing.T) {
+	// An unknown model with multimodal: true should resolve as multimodal
+	cfg := NewEmbedderConfigFromJSON("vertex", []byte(`{"model":"brand-new-model","multimodal":true}`))
+	caps := ResolveCapabilities("brand-new-model", cfg.GetConfigCapabilities())
+	assert.False(t, caps.IsTextOnly(), "multimodal config should override text-only default")
+}

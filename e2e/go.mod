@@ -16,7 +16,7 @@ replace (
 
 replace github.com/danaugrs/go-tsne => github.com/danaugrs/go-tsne/tsne v0.0.0-20220306155740-2250969e057f
 
-replace github.com/blevesearch/bleve/v2 => github.com/antflydb/bleve/v2 v2.5.8-antfly001
+replace github.com/blevesearch/bleve/v2 => github.com/antflydb/bleve/v2 v2.5.8-antfly002
 
 replace github.com/tidwall/wal => github.com/ajroetker/wal v0.0.0-antfly000
 
@@ -98,13 +98,13 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/blevesearch/bleve/v2 v2.5.7 // indirect
-	github.com/blevesearch/bleve_index_api v1.3.2 // indirect
+	github.com/blevesearch/bleve_index_api v1.3.4 // indirect
 	github.com/blevesearch/geo v0.2.5 // indirect
-	github.com/blevesearch/go-faiss v1.0.27 // indirect
+	github.com/blevesearch/go-faiss v1.0.28 // indirect
 	github.com/blevesearch/go-porterstemmer v1.0.3 // indirect
 	github.com/blevesearch/gtreap v0.1.1 // indirect
 	github.com/blevesearch/mmap-go v1.2.0 // indirect
-	github.com/blevesearch/scorch_segment_api/v2 v2.4.1 // indirect
+	github.com/blevesearch/scorch_segment_api/v2 v2.4.3 // indirect
 	github.com/blevesearch/sear v0.4.1 // indirect
 	github.com/blevesearch/segment v0.9.1 // indirect
 	github.com/blevesearch/snowballstem v0.9.0 // indirect
@@ -116,7 +116,7 @@ require (
 	github.com/blevesearch/zapx/v14 v14.4.3 // indirect
 	github.com/blevesearch/zapx/v15 v15.4.3 // indirect
 	github.com/blevesearch/zapx/v16 v16.3.1 // indirect
-	github.com/blevesearch/zapx/v17 v17.0.2 // indirect
+	github.com/blevesearch/zapx/v17 v17.0.3-0.20260311100439-7e7434b4f844 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/buger/jsonparser v1.1.1 // indirect
 	github.com/casbin/casbin/v3 v3.10.0 // indirect

@@ -104,7 +104,7 @@ func NewVertexAIEmbedder(config EmbedderConfig) (Embedder, error) {
 		dimension:      dimension,
 		project:        project,
 		location:       location,
-		caps:           ResolveCapabilities(c.Model, nil),
+		caps:           ResolveCapabilities(c.Model, config.GetConfigCapabilities()),
 		limiter:        rate.NewLimiter(VertexDefaultRPS, VertexDefaultRPS),
 	}, nil
 }
@@ -125,28 +125,21 @@ func (v *VertexAIEmbedderImpl) Embed(ctx context.Context, contents [][]ai.Conten
 		return [][]float32{}, nil
 	}
 
-	// Check if this is a multimodal model
-	isMultimodal := strings.HasPrefix(v.embeddingModel, "multimodalembedding")
-
-	// Determine if content has binary data
-	hasBinaryContent := false
-	for _, parts := range contents {
-		for _, part := range parts {
-			if _, ok := part.(ai.BinaryContent); ok {
-				hasBinaryContent = true
-				break
-			}
-		}
-		if hasBinaryContent {
-			break
-		}
-	}
-
 	// Route to appropriate embedding method
-	if hasBinaryContent {
-		if !isMultimodal {
+	if !allText(contents) {
+		if v.caps.IsTextOnly() {
 			return nil, fmt.Errorf(
-				"binary content (images, audio, video) requires multimodalembedding model, got %s",
+				"binary content (images, audio, video) requires a multimodal model (set multimodal: true in config), got %s",
+				v.embeddingModel,
+			)
+		}
+		// The legacy Vertex Prediction API only supports multimodalembedding@001
+		// for binary content. For gemini-embedding-2-preview on Vertex, use
+		// provider: "gemini" with GOOGLE_GENAI_USE_VERTEXAI=1 instead.
+		if !strings.HasPrefix(v.embeddingModel, "multimodalembedding") {
+			return nil, fmt.Errorf(
+				"the vertex provider only supports multimodalembedding models for binary content; "+
+					"for %s on Vertex AI, use provider: \"gemini\" with GOOGLE_GENAI_USE_VERTEXAI=1",
 				v.embeddingModel,
 			)
 		}

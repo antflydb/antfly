@@ -70,7 +70,7 @@ func NewOllamaEmbedderImpl(config EmbedderConfig) (Embedder, error) {
 	return &OllamaImpl{
 		client:         client,
 		embeddingModel: c.Model,
-		caps:           ResolveCapabilities(c.Model, nil),
+		caps:           ResolveCapabilities(c.Model, config.GetConfigCapabilities()),
 	}, nil
 }
 

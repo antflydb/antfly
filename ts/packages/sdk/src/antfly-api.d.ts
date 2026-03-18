@@ -6057,6 +6057,28 @@ export interface components {
          */
         EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["TermiteEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
             provider: components["schemas"]["EmbedderProvider"];
+            /**
+             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
+             *     even if the model isn't in Antfly's built-in model registry yet.
+             *
+             *     When `true`, Antfly treats the model as multimodal and will send binary content
+             *     (images, audio, etc.) to the provider instead of extracting text. The provider's
+             *     API is still responsible for accepting the content — this flag just tells Antfly
+             *     not to strip it.
+             *
+             *     Not needed for models already in the registry (e.g., `multimodalembedding`,
+             *     `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+             *
+             *     **Example:**
+             *     ```json
+             *     {
+             *       "provider": "vertex",
+             *       "model": "some-future-multimodal-model",
+             *       "multimodal": true
+             *     }
+             *     ```
+             */
+            multimodal?: boolean;
         };
         /** @description Options specific to text chunking. */
         TextChunkOptions: {

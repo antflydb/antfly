@@ -1480,9 +1480,9 @@ export interface components {
              */
             keep_alive?: string;
             /**
-             * @description Maximum number of models to keep loaded in memory simultaneously.
-             *     When this limit is reached, the least recently used model is unloaded (LRU eviction).
-             *     Set to 0 for unlimited (default). Only effective when keep_alive is non-zero.
+             * @description Maximum total models loaded across all registry types (embedders, rerankers,
+             *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
              * @default 0
              * @example 3
              */
@@ -1490,8 +1490,9 @@ export interface components {
             /**
              * @description Number of concurrent inference pipelines per model. Each pipeline loads
              *     a copy of the model, so higher values use more memory but allow more
-             *     concurrent requests. Set to 0 to use the default (min(NumCPU, 4)).
-             * @default 0
+             *     concurrent requests. Note: pool_size multiplies per-model memory
+             *     independently of max_loaded_models.
+             * @default 1
              * @example 1
              */
             pool_size?: number;

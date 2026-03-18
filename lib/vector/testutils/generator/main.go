@@ -441,7 +441,7 @@ func generateSparseFromModel(termiteURL, model, output, promptFile, promptField,
 	}
 
 	// Create Termite client (implements SparseEmbedder)
-	embedder, err := embeddings.NewTermiteClient(termiteURL, model)
+	embedder, err := embeddings.NewTermiteClient(termiteURL, model, nil)
 	if err != nil {
 		log.Fatalf("Failed to create Termite client: %v", err)
 	}

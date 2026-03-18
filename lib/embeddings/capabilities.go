@@ -216,6 +216,21 @@ var KnownModelCapabilities = map[string]EmbedderCapabilities{
 		Dimensions:         []int{768, 1536, 3072},
 		DefaultDimension:   768,
 	},
+	"gemini-embedding-2-preview": {
+		SupportedMIMETypes: []MIMETypeSupport{
+			{MIMEType: "text/plain"},
+			{MIMEType: "image/png", MaxSizeBytes: 20 * 1024 * 1024},
+			{MIMEType: "image/jpeg", MaxSizeBytes: 20 * 1024 * 1024},
+			{MIMEType: "image/gif", MaxSizeBytes: 20 * 1024 * 1024},
+			{MIMEType: "image/webp", MaxSizeBytes: 20 * 1024 * 1024},
+			{MIMEType: "audio/*"},
+			{MIMEType: "video/*"},
+			{MIMEType: "application/pdf"},
+		},
+		Dimensions:       []int{768, 1536, 3072},
+		DefaultDimension: 3072,
+		SupportsFusion:   true,
+	},
 	"embedding-001": {
 		SupportedMIMETypes: []MIMETypeSupport{{MIMEType: "text/plain"}},
 		Dimensions:         []int{768},
@@ -412,6 +427,41 @@ var KnownModelCapabilities = map[string]EmbedderCapabilities{
 		Dimensions:         []int{1024},
 		DefaultDimension:   1024,
 	},
+}
+
+// multimodalCapabilities returns a broad multimodal capability set for models
+// declared multimodal via config. This is intentionally permissive — the
+// provider's Embed() method is responsible for rejecting unsupported content.
+func multimodalCapabilities() EmbedderCapabilities {
+	return EmbedderCapabilities{
+		SupportedMIMETypes: []MIMETypeSupport{
+			{MIMEType: "text/plain"},
+			{MIMEType: "image/*"},
+			{MIMEType: "audio/*"},
+			{MIMEType: "video/*"},
+			{MIMEType: "application/pdf"},
+		},
+	}
+}
+
+// GetConfigCapabilities returns capability overrides from the embedder config.
+// Returns nil if no override was specified.
+//
+// Setting "multimodal": true tells Antfly the model accepts non-text content
+// (images, audio, video, PDFs), even if the model isn't in the built-in
+// registry yet:
+//
+//	{
+//	  "provider": "vertex",
+//	  "model": "some-future-model",
+//	  "multimodal": true
+//	}
+func (t EmbedderConfig) GetConfigCapabilities() *EmbedderCapabilities {
+	if t.Multimodal != nil && *t.Multimodal {
+		caps := multimodalCapabilities()
+		return &caps
+	}
+	return nil
 }
 
 // ResolveCapabilities determines capabilities for a model.
