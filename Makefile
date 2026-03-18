@@ -58,7 +58,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate lint license-headers license-check update-deps build-antfarm build-termite-dashboard
+.PHONY: build build-docs generate lint license-headers license-check update-deps tidy build-antfarm build-termite-dashboard
 
 build-antfarm: build-antfarm-main build-termite-dashboard
 
@@ -83,7 +83,7 @@ build-docs:
 	npx @redocly/cli@latest join src/metadata/api.yaml src/usermgr/api.yaml
 	npx @redocly/cli@latest lint openapi.yaml
 
-generate: build-docs build-termite-dashboard
+generate: build-docs build-termite-dashboard tidy
 	$(GO) generate ./...
 	$(MAKE) -C ./termite generate
 	@for mod in $(GO_SUBMODULES); do \
@@ -170,6 +170,13 @@ lint:
 download-omni-deps:
 	$(MAKE) -C termite download-omni-deps
 
+tidy:
+	$(GO) mod tidy
+	@for mod in $(GO_SUBMODULES); do \
+		echo "==> Tidying $$mod"; \
+		(cd $$mod && go mod tidy) || exit 1; \
+	done
+
 update-deps:
 	$(GO) get -u ./... && $(GO) mod tidy
 	@for mod in $(GO_SUBMODULES); do \
@@ -186,7 +193,7 @@ update-deps:
 
 .PHONY: build-omni
 
-build-omni: download-omni-deps
+build-omni: download-omni-deps tidy
 	@echo "Building antfly with ONNX + XLA backends (omni)..."
 	@echo "Platform: $(E2E_PLATFORM)"
 	export ONNXRUNTIME_ROOT=$$(pwd)/termite/onnxruntime && \
