@@ -477,19 +477,15 @@ func (g *GraphIndexV0) backfillReverseIndex(startKey []byte) error {
 
 		// Check if paused at start of each iteration
 		if g.paused.Load() {
-			// Send acknowledgment without holding any mutex
+			// Send acknowledgment so Pause() knows backfill has stopped
 			select {
 			case g.pauseAckCh <- struct{}{}:
 			default:
 			}
 
-			// Now wait for resume
+			// Wait for resume
 			g.pauseMu.Lock()
 			for g.paused.Load() {
-				select {
-				case g.pauseAckCh <- struct{}{}:
-				default:
-				}
 				g.pauseCond.Wait()
 			}
 			g.pauseMu.Unlock()
@@ -798,22 +794,16 @@ func (g *GraphIndexV0) Pause(ctx context.Context) error {
 	// Release mutex BEFORE waiting for ack to avoid deadlock with backfill
 	g.pauseMu.Unlock()
 
-	// If backfill is running, wait for it to acknowledge the pause
+	// If backfill is running, wait for it to acknowledge the pause or finish
 	if g.backfillDone != nil {
 		select {
+		case <-g.pauseAckCh:
+			// Backfill acknowledged pause
 		case <-g.backfillDone:
-			// Backfill already finished, no ack needed
-		default:
-			// Backfill is running, wait for ack
-			select {
-			case <-g.pauseAckCh:
-				// Backfill acknowledged pause
-			case <-g.backfillDone:
-				// Backfill finished while waiting
-			case <-ctx.Done():
-				g.paused.Store(false)
-				return ctx.Err()
-			}
+			// Backfill already finished or finished while waiting
+		case <-ctx.Done():
+			g.paused.Store(false)
+			return ctx.Err()
 		}
 	}
 
