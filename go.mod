@@ -15,8 +15,8 @@ replace (
 replace github.com/danaugrs/go-tsne => github.com/danaugrs/go-tsne/tsne v0.0.0-20220306155740-2250969e057f
 
 replace (
-	github.com/blevesearch/bleve/v2 => github.com/antflydb/bleve/v2 v2.5.8-antfly001
-	github.com/blevesearch/zapx/v17 => github.com/antflydb/zapx/v17 v17.0.2-antfly003
+	github.com/blevesearch/bleve/v2 => github.com/antflydb/bleve/v2 v2.5.8-antfly002
+	github.com/blevesearch/zapx/v17 => github.com/antflydb/zapx/v17 v17.0.2-antfly004
 )
 
 replace github.com/tidwall/wal => github.com/ajroetker/wal v0.0.0-antfly000
@@ -47,7 +47,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.50.2
 	github.com/blevesearch/bleve/v2 v2.5.7
-	github.com/blevesearch/bleve_index_api v1.3.2
+	github.com/blevesearch/bleve_index_api v1.3.4
 	github.com/blevesearch/sear v0.4.1
 	github.com/casbin/casbin/v3 v3.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -98,7 +98,7 @@ require (
 	github.com/avast/retry-go/v4 v4.7.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.8 // indirect
 	github.com/axiomhq/hyperloglog v0.2.6 // indirect
-	github.com/blevesearch/zapx/v17 v17.0.2 // indirect
+	github.com/blevesearch/zapx/v17 v17.0.3-0.20260311100439-7e7434b4f844 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20251112162901-46098fed0961 // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect
 	github.com/charmbracelet/x/windows v0.2.2 // indirect
@@ -498,11 +498,11 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/blevesearch/geo v0.2.5 // indirect
-	github.com/blevesearch/go-faiss v1.0.27 // indirect
+	github.com/blevesearch/go-faiss v1.0.28 // indirect
 	github.com/blevesearch/go-porterstemmer v1.0.3 // indirect
 	github.com/blevesearch/gtreap v0.1.1 // indirect
 	github.com/blevesearch/mmap-go v1.2.0 // indirect
-	github.com/blevesearch/scorch_segment_api/v2 v2.4.1 // indirect
+	github.com/blevesearch/scorch_segment_api/v2 v2.4.3 // indirect
 	github.com/blevesearch/segment v0.9.1 // indirect
 	github.com/blevesearch/snowballstem v0.9.0 // indirect
 	github.com/blevesearch/upsidedown_store_api v1.0.2 // indirect

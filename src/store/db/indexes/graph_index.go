@@ -66,8 +66,10 @@ type GraphIndexV0 struct {
 	eg           *errgroup.Group
 
 	// Pause/Resume support
-	pauseMu sync.Mutex
-	paused  atomic.Bool
+	pauseMu    sync.Mutex
+	pauseCond  *sync.Cond
+	pauseAckCh chan struct{} // Separate channel for backfill pause acknowledgment
+	paused     atomic.Bool
 
 	// Enricher for field-based edges and summaries
 	enricherMu sync.Mutex
@@ -132,7 +134,9 @@ func NewGraphIndexV0(
 		rebuildState:   NewRebuildState(indexPath),
 		antflyConfig:   antflyConfig,
 		edgeTypeCounts: make(map[string]uint64),
+		pauseAckCh:     make(chan struct{}, 1),
 	}
+	g.pauseCond = sync.NewCond(&g.pauseMu)
 
 	// Initialize errgroup context for background operations
 	g.egCtx, g.egCancel = context.WithCancel(context.Background())
@@ -152,13 +156,15 @@ func (g *GraphIndexV0) Type() IndexType {
 
 // Batch processes edge write/delete operations and updates the edge index
 func (g *GraphIndexV0) Batch(ctx context.Context, writes [][2][]byte, deletes [][]byte, sync bool) error {
-	// Check if paused - if so, skip processing (return nil, not error)
+	// Hold pauseMu for the duration of indexDB work so Pause() can wait
+	// for any in-flight Batch to complete before returning.
 	g.pauseMu.Lock()
+	defer g.pauseMu.Unlock()
+
+	// Check if paused - if so, skip processing (return nil, not error)
 	if g.paused.Load() {
-		g.pauseMu.Unlock()
 		return nil
 	}
-	g.pauseMu.Unlock()
 
 	// Use indexDB for reverse index writes (not main db)
 	batch := g.indexDB.NewBatch()
@@ -469,6 +475,22 @@ func (g *GraphIndexV0) backfillReverseIndex(startKey []byte) error {
 		default:
 		}
 
+		// Check if paused at start of each iteration
+		if g.paused.Load() {
+			// Send acknowledgment so Pause() knows backfill has stopped
+			select {
+			case g.pauseAckCh <- struct{}{}:
+			default:
+			}
+
+			// Wait for resume
+			g.pauseMu.Lock()
+			for g.paused.Load() {
+				g.pauseCond.Wait()
+			}
+			g.pauseMu.Unlock()
+		}
+
 		key := iter.Key()
 		totalScanned++
 
@@ -750,11 +772,46 @@ func (g *GraphIndexV0) GetIndexDB() *pebble.DB {
 	return g.indexDB
 }
 
-// Pause pauses the graph index (waits for in-flight Batch operations)
+// Pause pauses the graph index (waits for in-flight Batch operations and backfill)
 func (g *GraphIndexV0) Pause(ctx context.Context) error {
+	g.pauseMu.Lock()
+
+	// Check if already paused
+	if g.paused.Load() {
+		g.pauseMu.Unlock()
+		return nil
+	}
+
+	// Set paused flag
 	g.paused.Store(true)
-	g.pauseMu.Lock()   // Wait for in-flight Batch() to complete
-	g.pauseMu.Unlock() //nolint:staticcheck // SA2001: intentional empty critical section to synchronize with in-flight operations
+
+	// Drain any stale acknowledgments from the channel before signaling
+	select {
+	case <-g.pauseAckCh:
+	default:
+	}
+
+	// Release mutex BEFORE waiting for ack to avoid deadlock with backfill
+	g.pauseMu.Unlock()
+
+	// If backfill is running, wait for it to acknowledge the pause or finish
+	if g.backfillDone != nil {
+		select {
+		case <-g.pauseAckCh:
+			// Backfill acknowledged pause
+		case <-g.backfillDone:
+			// Backfill already finished or finished while waiting
+		case <-ctx.Done():
+			g.paused.Store(false)
+			return ctx.Err()
+		}
+	}
+
+	// Wait for any in-flight Batch() to complete. Batch() holds pauseMu for
+	// the duration of its indexDB work, so acquiring it here guarantees no
+	// Batch is mid-flight when we return.
+	g.pauseMu.Lock()
+	g.pauseMu.Unlock() //nolint:staticcheck // SA2001: intentional empty critical section to drain in-flight Batch()
 
 	g.logger.Debug("Paused graph index", zap.String("name", g.name))
 	return nil
@@ -762,7 +819,15 @@ func (g *GraphIndexV0) Pause(ctx context.Context) error {
 
 // Resume resumes the graph index
 func (g *GraphIndexV0) Resume() {
+	g.pauseMu.Lock()
+	defer g.pauseMu.Unlock()
+
+	if !g.paused.Load() {
+		return
+	}
+
 	g.paused.Store(false)
+	g.pauseCond.Broadcast()
 
 	g.logger.Debug("Resumed graph index", zap.String("name", g.name))
 }

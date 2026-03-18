@@ -16,6 +16,7 @@ package indexes
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
+	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -169,4 +171,83 @@ func TestGraphIndex_PauseResume(t *testing.T) {
 		graphIndex.Resume()
 		assert.False(t, graphIndex.paused.Load())
 	})
+}
+
+func TestGraphIndex_PauseStopsBackfill(t *testing.T) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+
+	// Open pebble database
+	pdb, err := pebble.Open(dir, pebbleutils.NewMemPebbleOpts())
+	require.NoError(t, err)
+	defer pdb.Close()
+
+	edgeTypes := []EdgeTypeConfig{
+		{Name: "test_edge", MaxWeight: 1.0},
+	}
+	config := GraphIndexConfig{
+		EdgeTypes:           &edgeTypes,
+		MaxEdgesPerDocument: 100,
+	}
+	indexConfig, err := NewIndexConfig("test_graph", config)
+	require.NoError(t, err)
+
+	index, err := NewGraphIndexV0(lg, &common.Config{}, pdb, dir, "test_graph", indexConfig, nil)
+	require.NoError(t, err)
+
+	graphIndex := index.(*GraphIndexV0)
+	defer graphIndex.Close()
+
+	// Write many edges to main DB so backfill has work to do
+	edgeValue, err := EncodeEdgeValue(&Edge{Weight: 1.0})
+	require.NoError(t, err)
+
+	const numEdges = 500
+	batch := pdb.NewBatch()
+	for i := 0; i < numEdges; i++ {
+		source := []byte(fmt.Sprintf("source_%04d", i))
+		target := []byte(fmt.Sprintf("target_%04d", i))
+		edgeKey := storeutils.MakeEdgeKey(source, target, "test_graph", "test_edge")
+		require.NoError(t, batch.Set(edgeKey, edgeValue, nil))
+	}
+	require.NoError(t, batch.Commit(pebble.Sync))
+	require.NoError(t, batch.Close())
+
+	// Open with rebuild=true to trigger backfill
+	byteRange := types.Range{[]byte(""), []byte("\xff")}
+	err = graphIndex.Open(true, nil, byteRange)
+	require.NoError(t, err)
+
+	// Pause while backfill is running
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = graphIndex.Pause(ctx)
+	require.NoError(t, err)
+
+	// Record the edge count at time of pause
+	graphIndex.edgeTypeCountsMu.RLock()
+	countAtPause := graphIndex.edgeTypeCounts["test_edge"]
+	graphIndex.edgeTypeCountsMu.RUnlock()
+
+	// Wait a bit — if backfill isn't actually paused, the count will increase
+	time.Sleep(100 * time.Millisecond)
+
+	graphIndex.edgeTypeCountsMu.RLock()
+	countAfterWait := graphIndex.edgeTypeCounts["test_edge"]
+	graphIndex.edgeTypeCountsMu.RUnlock()
+
+	assert.Equal(t, countAtPause, countAfterWait,
+		"edge count should not change while paused (backfill should be stopped)")
+
+	// Resume and wait for backfill to finish
+	graphIndex.Resume()
+	graphIndex.WaitForBackfill(context.Background())
+
+	// After backfill completes, all edges should be indexed
+	graphIndex.edgeTypeCountsMu.RLock()
+	finalCount := graphIndex.edgeTypeCounts["test_edge"]
+	graphIndex.edgeTypeCountsMu.RUnlock()
+
+	assert.Equal(t, uint64(numEdges), finalCount,
+		"all edges should be indexed after backfill completes")
 }

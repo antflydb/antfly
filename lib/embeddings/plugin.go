@@ -292,7 +292,7 @@ func NewOpenAIImpl(config EmbedderConfig) (Embedder, error) {
 	return &OpenAIImpl{
 		client:  &client,
 		model:   c.Model,
-		caps:    ResolveCapabilities(c.Model, nil),
+		caps:    ResolveCapabilities(c.Model, config.GetConfigCapabilities()),
 		limiter: rate.NewLimiter(OpenAIDefaultRPS, OpenAIDefaultRPS),
 	}, nil
 }
@@ -374,7 +374,7 @@ func NewBedrockImpl(cfg EmbedderConfig) (Embedder, error) {
 		model:         string(c.Model),
 		stripNewLines: stripNewLines,
 		batchSize:     batchSize,
-		caps:          ResolveCapabilities(c.Model, nil),
+		caps:          ResolveCapabilities(c.Model, cfg.GetConfigCapabilities()),
 		limiter:       rate.NewLimiter(BedrockDefaultRPS, BedrockDefaultRPS),
 	}, nil
 }
@@ -442,12 +442,13 @@ func (l *BedrockImpl) Embed(ctx context.Context, contents [][]ai.ContentPart) ([
 	return results, nil
 }
 
-// Mostly useful for testing
+// NewEmbedderConfigFromJSON creates an EmbedderConfig from raw JSON. Mostly useful for testing.
 func NewEmbedderConfigFromJSON(provider string, data []byte) *EmbedderConfig {
-	return &EmbedderConfig{
-		Provider: EmbedderProvider(provider),
-		union:    data,
-	}
+	cfg := &EmbedderConfig{union: data}
+	// Populate generated fields (e.g. Multimodal) from the JSON payload.
+	_ = json.Unmarshal(data, cfg)
+	cfg.Provider = EmbedderProvider(provider)
+	return cfg
 }
 
 // defaultEmbedderConfig is the default embedder configuration, set from config at startup.
@@ -481,5 +482,5 @@ func NewTermiteEmbedderFromConfig(config EmbedderConfig) (Embedder, error) {
 		return nil, fmt.Errorf("termite URL is required: set api_url in config or ANTFLY_TERMITE_URL environment variable")
 	}
 
-	return NewTermiteClient(url, c.Model)
+	return NewTermiteClient(url, c.Model, config.GetConfigCapabilities())
 }

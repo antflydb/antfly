@@ -60,7 +60,7 @@ func NewOpenRouterImpl(config EmbedderConfig) (Embedder, error) {
 
 	// Resolve capabilities for the model
 	// OpenRouter model names are prefixed with provider, e.g., "openai/text-embedding-3-small"
-	caps := ResolveCapabilities(c.Model, nil)
+	caps := ResolveCapabilities(c.Model, config.GetConfigCapabilities())
 
 	return &OpenRouterImpl{
 		client:     client,

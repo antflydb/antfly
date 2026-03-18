@@ -1,10 +1,11 @@
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, Union
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.embedder_provider import EmbedderProvider
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="EmbedderConfig")
 
@@ -184,13 +185,35 @@ class EmbedderConfig:
 
         Attributes:
             provider (EmbedderProvider): The embedding provider to use.
+            multimodal (Union[Unset, bool]): Declare that this model supports non-text content (images, audio, video, PDFs),
+                even if the model isn't in Antfly's built-in model registry yet.
+
+                When `true`, Antfly treats the model as multimodal and will send binary content
+                (images, audio, etc.) to the provider instead of extracting text. The provider's
+                API is still responsible for accepting the content — this flag just tells Antfly
+                not to strip it.
+
+                Not needed for models already in the registry (e.g., `multimodalembedding`,
+                `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+
+                **Example:**
+                ```json
+                {
+                  "provider": "vertex",
+                  "model": "some-future-multimodal-model",
+                  "multimodal": true
+                }
+                ```
     """
 
     provider: EmbedderProvider
+    multimodal: Union[Unset, bool] = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        multimodal = self.multimodal
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -199,6 +222,8 @@ class EmbedderConfig:
                 "provider": provider,
             }
         )
+        if multimodal is not UNSET:
+            field_dict["multimodal"] = multimodal
 
         return field_dict
 
@@ -207,8 +232,11 @@ class EmbedderConfig:
         d = dict(src_dict)
         provider = EmbedderProvider(d.pop("provider"))
 
+        multimodal = d.pop("multimodal", UNSET)
+
         embedder_config = cls(
             provider=provider,
+            multimodal=multimodal,
         )
 
         embedder_config.additional_properties = d
