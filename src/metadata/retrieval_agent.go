@@ -819,7 +819,8 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 			var err error
 			generator, err = ai.NewGenKitGenerator(r.Context(), chain[0].Generator)
 			if err != nil {
-				errorResponse(w, fmt.Sprintf("Failed to create generator: %v", err), http.StatusBadRequest)
+				classified := ai.ClassifyGenerationError(resolveProviderName(&req), err)
+				errorResponse(w, classified.UserMessage, http.StatusBadRequest)
 				return
 			}
 		}
