@@ -41,6 +41,10 @@ type GenerationError struct {
 	UserMessage string
 }
 
+func (c GenerationError) Error() string {
+	return c.UserMessage
+}
+
 // HTTPStatusCode returns the appropriate HTTP status code for this error kind.
 func (c GenerationError) HTTPStatusCode() int {
 	switch c.Kind {
@@ -149,4 +153,3 @@ func generationErrorFromStatusCode(provider string, statusCode int) GenerationEr
 		}
 	}
 }
-

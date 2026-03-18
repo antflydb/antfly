@@ -26,11 +26,11 @@ import (
 
 func TestAsGenerationError(t *testing.T) {
 	tests := []struct {
-		name        string
-		provider    string
-		err         error
-		wantKind    GenerationErrorKind
-		wantMessage string // exact match; use wantContains for substring
+		name         string
+		provider     string
+		err          error
+		wantKind     GenerationErrorKind
+		wantMessage  string // exact match; use wantContains for substring
 		wantContains string
 	}{
 		{
@@ -129,5 +129,17 @@ func TestAsGenerationError(t *testing.T) {
 				t.Errorf("UserMessage = %q, want substring %q", result.UserMessage, tt.wantContains)
 			}
 		})
+	}
+}
+
+func TestGenerationErrorImplementsError(t *testing.T) {
+	genErr := GenerationError{
+		Kind:        GenerationErrorRateLimit,
+		UserMessage: "Rate limit reached for provider 'openrouter'. Please wait and try again.",
+	}
+
+	var err error = genErr
+	if err.Error() != genErr.UserMessage {
+		t.Fatalf("Error() = %q, want %q", err.Error(), genErr.UserMessage)
 	}
 }

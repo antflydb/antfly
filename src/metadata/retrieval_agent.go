@@ -801,18 +801,13 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 	var generator *ai.GenKitModelImpl
 
 	if needsGenerator {
-		chain := ai.ResolveGeneratorOrChain(req.Generator, req.Chain)
+		chain := resolveEffectiveGeneratorChain(&req)
 		if len(chain) == 0 {
-			defaultChain := ai.GetDefaultChain()
-			if len(defaultChain) == 0 {
-				if req.MaxIterations != 0 {
-					errorResponse(w, "either 'generator' or 'chain' must be provided (no default chain configured)", http.StatusBadRequest)
-					return
-				}
-				// Pipeline mode without generator steps — proceed without LLM
-			} else {
-				chain = defaultChain
+			if req.MaxIterations != 0 {
+				errorResponse(w, "either 'generator' or 'chain' must be provided (no default chain configured)", http.StatusBadRequest)
+				return
 			}
+			// Pipeline mode without generator steps — proceed without LLM
 		}
 
 		if len(chain) > 0 {
@@ -1166,7 +1161,7 @@ func (t *TableApi) RunAgenticRetrieval(
 	}
 
 	// Check provider capabilities
-	caps := ai.GetProviderCapabilities(ai.GeneratorProvider(req.Generator.Provider))
+	caps := ai.GetProviderCapabilities(resolveProvider(req))
 
 	if caps.SupportsTools {
 		t.runAgenticWithTools(ctx, req, generator, executor, availableIndexes, toolsConfig, result)
@@ -1958,16 +1953,35 @@ func (e *retrievalToolExecutor) fallbackToSemanticSearch(
 	return []QueryHit{}
 }
 
-// resolveProviderName returns the provider name from the request for use in
+// resolveEffectiveGeneratorChain returns the effective generator chain in precedence
+// order: explicit chain, explicit single generator, then the configured default chain.
+func resolveEffectiveGeneratorChain(req *RetrievalAgentRequest) []ai.ChainLink {
+	if len(req.Chain) > 0 {
+		return ai.ResolveGeneratorOrChain(req.Generator, req.Chain)
+	}
+	if req.Generator.Provider != "" {
+		return ai.ResolveGeneratorOrChain(req.Generator, nil)
+	}
+	return ai.GetDefaultChain()
+}
+
+// resolveProvider returns the first provider from the effective generator chain.
+func resolveProvider(req *RetrievalAgentRequest) ai.GeneratorProvider {
+	chain := resolveEffectiveGeneratorChain(req)
+	if len(chain) == 0 {
+		return ""
+	}
+	return chain[0].Generator.Provider
+}
+
+// resolveProviderName returns the effective provider name from the request for use in
 // user-facing error messages.
 func resolveProviderName(req *RetrievalAgentRequest) string {
-	if req.Generator.Provider != "" {
-		return string(req.Generator.Provider)
+	provider := resolveProvider(req)
+	if provider == "" {
+		return "unknown"
 	}
-	if len(req.Chain) > 0 && req.Chain[0].Generator.Provider != "" {
-		return string(req.Chain[0].Generator.Provider)
-	}
-	return "unknown"
+	return string(provider)
 }
 
 func convertQueryHitsToDocuments(hits []QueryHit) []schema.Document {
