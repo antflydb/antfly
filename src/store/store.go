@@ -334,10 +334,13 @@ func (m *Store) Scan(
 func (m *Store) StopRaftGroup(shardID types.ID) {
 	_, err, _ := m.sg.Do(shardID.String()+":stop", func() (any, error) {
 		m.logger.Info("Stopping Raft Group", zap.Stringer("shardID", shardID))
-		if shard, ok := m.shardsMap.LoadAndDelete(shardID); ok {
+		// Load and Delete are not atomic, but this is safe because the
+		// entire stop operation is serialized per-shard via singleflight.
+		if shard, ok := m.shardsMap.Load(shardID); ok {
 			if shard.IsInitializing() {
 				return nil, errors.New("shard is still initializing")
 			}
+			m.shardsMap.Delete(shardID)
 			if err := shard.Close(); err != nil {
 				m.logger.Warn("Error closing shard while stopping Raft Group",
 					zap.String("shardID", shardID.String()),
