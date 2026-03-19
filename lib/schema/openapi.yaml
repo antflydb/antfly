@@ -43,6 +43,8 @@ components:
       type: object
       description: Schema definition for a table with multiple document types
       properties:
+        analysis_config:
+          $ref: "#/components/schemas/AnalysisConfig"
         version:
           type: integer
           format: uint32
@@ -78,6 +80,55 @@ components:
             Rules for mapping dynamically detected fields. When a document contains fields
             that don't have explicit mappings and dynamic mapping is enabled, templates are
             evaluated in order to determine how those fields should be indexed.
+
+    AnalysisConfig:
+      type: object
+      description: |
+        Compiled full-text analysis configuration derived from schema-level intent.
+        This is runtime-oriented metadata used by local backends to resolve
+        analyzers, token filters, and query-time date parser behavior without
+        reconstructing ad hoc mapping state.
+      properties:
+        default_datetime_parser:
+          type: string
+        date_time_parsers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AnalysisComponentConfig"
+        field_date_time_parsers:
+          type: object
+          additionalProperties:
+            type: string
+        field_analyzers:
+          type: object
+          additionalProperties:
+            type: string
+        token_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AnalysisComponentConfig"
+        char_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AnalysisComponentConfig"
+        tokenizers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AnalysisComponentConfig"
+        analyzers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AnalysisComponentConfig"
+
+    AnalysisComponentConfig:
+      type: object
+      description: Declarative analysis component configuration.
+      properties:
+        type:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
 
     DynamicTemplate:
       type: object

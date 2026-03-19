@@ -255,3 +255,202 @@ func TestTableSchema_Validate(t *testing.T) {
 		})
 	}
 }
+
+func TestTableSchema_EnsureAnalysisConfig(t *testing.T) {
+	schemaJSON := `{
+		"schema": {
+			"type": "object",
+			"properties": {
+				"title": {
+					"type": "string",
+					"x-antfly-types": ["search_as_you_type"]
+				},
+				"body": {
+					"type": "string",
+					"x-antfly-types": ["html"]
+				}
+			}
+		}
+	}`
+	var docSchema DocumentSchema
+	err := json.Unmarshal([]byte(schemaJSON), &docSchema)
+	require.NoError(t, err)
+
+	tableSchema := &TableSchema{
+		DefaultType: "doc",
+		DocumentSchemas: map[string]DocumentSchema{
+			"doc": docSchema,
+		},
+	}
+
+	tableSchema.EnsureAnalysisConfig()
+	require.NotNil(t, tableSchema.AnalysisConfig)
+	require.Equal(t, "dateTimeOptional", tableSchema.AnalysisConfig.DefaultDateTimeParser)
+	require.Contains(t, tableSchema.AnalysisConfig.TokenFilters, EdgeNgramTokenFilter)
+	require.Contains(t, tableSchema.AnalysisConfig.Analyzers, SearchAsYouTypeAnalyzer)
+	require.Contains(t, tableSchema.AnalysisConfig.Analyzers, HTMLAnalyzer)
+	require.Equal(t, SearchAsYouTypeAnalyzer, tableSchema.AnalysisConfig.FieldAnalyzers["title"])
+	require.Equal(t, HTMLAnalyzer, tableSchema.AnalysisConfig.FieldAnalyzers["body"])
+}
+
+func TestTableSchema_EnsureAnalysisConfig_CustomDateTimeParsers(t *testing.T) {
+	schemaJSON := `{
+		"schema": {
+			"type": "object",
+			"x-antfly-default-date-time-parser": "queryDT",
+			"x-antfly-date-time-parsers": {
+				"queryDT": {
+					"type": "sanitizedgo",
+					"layouts": ["02/01/2006 3:04PM"]
+				}
+			},
+			"properties": {
+				"published_at": {
+					"type": "string",
+					"x-antfly-types": ["datetime"],
+					"x-antfly-date-time-parser": "queryDT"
+				}
+			}
+		}
+	}`
+	var docSchema DocumentSchema
+	err := json.Unmarshal([]byte(schemaJSON), &docSchema)
+	require.NoError(t, err)
+
+	tableSchema := &TableSchema{
+		DefaultType: "doc",
+		DocumentSchemas: map[string]DocumentSchema{
+			"doc": docSchema,
+		},
+	}
+
+	tableSchema.EnsureAnalysisConfig()
+	require.NotNil(t, tableSchema.AnalysisConfig)
+	require.Equal(t, "queryDT", tableSchema.AnalysisConfig.DefaultDateTimeParser)
+	require.Contains(t, tableSchema.AnalysisConfig.DateTimeParsers, "queryDT")
+	require.Equal(t, "queryDT", tableSchema.AnalysisConfig.FieldDateTimeParsers["published_at"])
+
+	indexMapping := NewIndexMapFromSchema(tableSchema).(*mapping.IndexMappingImpl)
+	docMapping := indexMapping.TypeMapping["doc"]
+	require.NotNil(t, docMapping)
+	require.Contains(t, docMapping.Properties, "published_at")
+	require.Len(t, docMapping.Properties["published_at"].Fields, 1)
+	require.Equal(t, "queryDT", docMapping.Properties["published_at"].Fields[0].DateFormat)
+}
+
+func TestTableSchema_EnsureAnalysisConfig_CustomAnalyzers(t *testing.T) {
+	schemaJSON := `{
+		"schema": {
+			"type": "object",
+			"x-antfly-token-filters": {
+				"tri_edge": {
+					"type": "edge_ngram",
+					"min": 3,
+					"max": 5
+				}
+			},
+			"x-antfly-analyzers": {
+				"tri_edge_analyzer": {
+					"type": "custom",
+					"tokenizer": "unicode",
+					"token_filters": ["to_lower", "tri_edge"]
+				}
+			},
+			"properties": {
+				"title": {
+					"type": "string",
+					"x-antfly-types": ["text"],
+					"x-antfly-analyzer": "tri_edge_analyzer"
+				}
+			}
+		}
+	}`
+	var docSchema DocumentSchema
+	err := json.Unmarshal([]byte(schemaJSON), &docSchema)
+	require.NoError(t, err)
+
+	tableSchema := &TableSchema{
+		DefaultType: "doc",
+		DocumentSchemas: map[string]DocumentSchema{
+			"doc": docSchema,
+		},
+	}
+
+	tableSchema.EnsureAnalysisConfig()
+	require.NotNil(t, tableSchema.AnalysisConfig)
+	require.Contains(t, tableSchema.AnalysisConfig.TokenFilters, "tri_edge")
+	require.Contains(t, tableSchema.AnalysisConfig.Analyzers, "tri_edge_analyzer")
+	require.Equal(t, "tri_edge_analyzer", tableSchema.AnalysisConfig.FieldAnalyzers["title"])
+
+	indexMapping := NewIndexMapFromSchema(tableSchema).(*mapping.IndexMappingImpl)
+	docMapping := indexMapping.TypeMapping["doc"]
+	require.NotNil(t, docMapping)
+	require.Contains(t, docMapping.Properties, "title")
+	require.Len(t, docMapping.Properties["title"].Fields, 1)
+	require.Equal(t, "tri_edge_analyzer", docMapping.Properties["title"].Fields[0].Analyzer)
+}
+
+func TestTableSchema_EnsureAnalysisConfig_CustomTokenizersAndCharFilters(t *testing.T) {
+	schemaJSON := `{
+		"schema": {
+			"type": "object",
+			"x-antfly-char-filters": {
+				"strip_html_alias": {
+					"type": "html"
+				}
+			},
+			"x-antfly-token-filters": {
+				"tri_gram_filter": {
+					"type": "ngram",
+					"min": 3,
+					"max": 3
+				}
+			},
+			"x-antfly-tokenizers": {
+				"whitespace_alias": {
+					"type": "whitespace"
+				}
+			},
+			"x-antfly-analyzers": {
+				"tri_html_analyzer": {
+					"type": "custom",
+					"tokenizer": "whitespace_alias",
+					"char_filters": ["strip_html_alias"],
+					"token_filters": ["to_lower", "tri_gram_filter"]
+				}
+			},
+			"properties": {
+				"title": {
+					"type": "string",
+					"x-antfly-types": ["text"],
+					"x-antfly-analyzer": "tri_html_analyzer"
+				}
+			}
+		}
+	}`
+	var docSchema DocumentSchema
+	err := json.Unmarshal([]byte(schemaJSON), &docSchema)
+	require.NoError(t, err)
+
+	tableSchema := &TableSchema{
+		DefaultType: "doc",
+		DocumentSchemas: map[string]DocumentSchema{
+			"doc": docSchema,
+		},
+	}
+
+	tableSchema.EnsureAnalysisConfig()
+	require.NotNil(t, tableSchema.AnalysisConfig)
+	require.Contains(t, tableSchema.AnalysisConfig.CharFilters, "strip_html_alias")
+	require.Contains(t, tableSchema.AnalysisConfig.TokenFilters, "tri_gram_filter")
+	require.Contains(t, tableSchema.AnalysisConfig.Tokenizers, "whitespace_alias")
+	require.Contains(t, tableSchema.AnalysisConfig.Analyzers, "tri_html_analyzer")
+	require.Equal(t, "tri_html_analyzer", tableSchema.AnalysisConfig.FieldAnalyzers["title"])
+
+	indexMapping := NewIndexMapFromSchema(tableSchema).(*mapping.IndexMappingImpl)
+	docMapping := indexMapping.TypeMapping["doc"]
+	require.NotNil(t, docMapping)
+	require.Contains(t, docMapping.Properties, "title")
+	require.Len(t, docMapping.Properties["title"].Fields, 1)
+	require.Equal(t, "tri_html_analyzer", docMapping.Properties["title"].Fields[0].Analyzer)
+}

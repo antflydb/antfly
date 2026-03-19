@@ -43,6 +43,42 @@ const (
 // AntflyType Field type annotations for schema fields
 type AntflyType string
 
+// AnalysisComponentConfig Declarative analysis component configuration.
+type AnalysisComponentConfig struct {
+	// Config
+	Config map[string]interface{} `json:"config,omitempty,omitzero"`
+
+	// Type
+	Type string `json:"type,omitempty,omitzero"`
+}
+
+// AnalysisConfig Compiled full-text analysis configuration derived from schema-level intent.
+type AnalysisConfig struct {
+	// Analyzers
+	Analyzers map[string]AnalysisComponentConfig `json:"analyzers,omitempty,omitzero"`
+
+	// CharFilters
+	CharFilters map[string]AnalysisComponentConfig `json:"char_filters,omitempty,omitzero"`
+
+	// DateTimeParsers
+	DateTimeParsers map[string]AnalysisComponentConfig `json:"date_time_parsers,omitempty,omitzero"`
+
+	// DefaultDateTimeParser
+	DefaultDateTimeParser string `json:"default_datetime_parser,omitempty,omitzero"`
+
+	// FieldDateTimeParsers
+	FieldDateTimeParsers map[string]string `json:"field_date_time_parsers,omitempty,omitzero"`
+
+	// FieldAnalyzers
+	FieldAnalyzers map[string]string `json:"field_analyzers,omitempty,omitzero"`
+
+	// TokenFilters
+	TokenFilters map[string]AnalysisComponentConfig `json:"token_filters,omitempty,omitzero"`
+
+	// Tokenizers
+	Tokenizers map[string]AnalysisComponentConfig `json:"tokenizers,omitempty,omitzero"`
+}
+
 // DocumentSchema Defines the structure of a document type
 type DocumentSchema struct {
 	// Description A description of the document type.
@@ -86,6 +122,9 @@ type DynamicTemplateMatchMappingType string
 
 // TableSchema Schema definition for a table with multiple document types
 type TableSchema struct {
+	// AnalysisConfig Compiled full-text analysis configuration derived from schema-level intent.
+	AnalysisConfig *AnalysisConfig `json:"analysis_config,omitempty,omitzero"`
+
 	// DefaultType Default type to use from the document_types.
 	DefaultType string `json:"default_type,omitempty,omitzero"`
 

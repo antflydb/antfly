@@ -56,6 +56,7 @@ func (s *TableSchema) Validate() error {
 	if s == nil {
 		return nil
 	}
+	s.EnsureAnalysisConfig()
 	// Validate the `document_schemas` are valid JSON schemas
 	compiler := jsonschema.NewCompiler()
 	for typeName, schema := range s.DocumentSchemas {

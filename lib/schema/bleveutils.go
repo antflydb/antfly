@@ -19,12 +19,7 @@ import (
 	"slices"
 
 	"github.com/blevesearch/bleve/v2"
-	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
-	"github.com/blevesearch/bleve/v2/analysis/char/html"
-	"github.com/blevesearch/bleve/v2/analysis/char/zerowidthnonjoiner"
-	"github.com/blevesearch/bleve/v2/analysis/token/edgengram"
-	"github.com/blevesearch/bleve/v2/analysis/tokenizer/unicode"
 	"github.com/blevesearch/bleve/v2/mapping"
 	index "github.com/blevesearch/bleve_index_api"
 )
@@ -121,9 +116,17 @@ func translateTemplateFieldMapping(m TemplateFieldMapping) *mapping.FieldMapping
 }
 
 const (
-	XAntflyTypes        = "x-antfly-types"
-	XAntflyIndex        = "x-antfly-index"
-	XAntflyIncludeInAll = "x-antfly-include-in-all"
+	XAntflyTypes                 = "x-antfly-types"
+	XAntflyIndex                 = "x-antfly-index"
+	XAntflyIncludeInAll          = "x-antfly-include-in-all"
+	XAntflyAnalyzer              = "x-antfly-analyzer"
+	XAntflyAnalyzers             = "x-antfly-analyzers"
+	XAntflyCharFilters           = "x-antfly-char-filters"
+	XAntflyTokenFilters          = "x-antfly-token-filters"
+	XAntflyTokenizers            = "x-antfly-tokenizers"
+	XAntflyDateTimeParser        = "x-antfly-date-time-parser"
+	XAntflyDateTimeParsers       = "x-antfly-date-time-parsers"
+	XAntflyDefaultDateTimeParser = "x-antfly-default-date-time-parser"
 )
 
 const (
@@ -359,6 +362,9 @@ func buildMappingFromJSONSchema(
 			case AntflyTypeDatetime:
 				fieldMapping.Type = "datetime"
 				fieldMapping.DocValues = true // Enable for date aggregations (date_range, date_histogram)
+				if parserName, ok := fieldSchema[XAntflyDateTimeParser].(string); ok && parserName != "" {
+					fieldMapping.DateFormat = parserName
+				}
 			case AntflyTypeGeopoint:
 				fieldMapping.Type = "geopoint"
 				fieldMapping.DocValues = true // Enable for geo aggregations (geohash_grid, geo_distance)
@@ -368,6 +374,9 @@ func buildMappingFromJSONSchema(
 				fieldMapping.Index = false
 			default:
 				continue // Skip unknown types
+			}
+			if analyzerName, ok := fieldSchema[XAntflyAnalyzer].(string); ok && analyzerName != "" {
+				fieldMapping.Analyzer = analyzerName
 			}
 			docMapping.AddFieldMappingsAt(fieldName, fieldMapping)
 
@@ -402,12 +411,11 @@ func NewIndexMapFromSchema(schema *TableSchema) mapping.IndexMapping {
 
 	var anyAllFieldUsed bool
 	if schema != nil && len(schema.DocumentSchemas) > 0 {
+		schema.EnsureAnalysisConfig()
 		if schema.EnforceTypes {
 			indexMapping.IndexDynamic = false
 		}
 		// New JSON Schema-based logic
-		var searchAsYouTypeAnalyzerNeeded bool
-		var htmlAnalyzerNeeded bool
 		for typeName, docSchema := range schema.DocumentSchemas {
 			// Add default fields to the schema if not already present
 			properties, ok := docSchema.Schema["properties"].(map[string]any)
@@ -480,8 +488,8 @@ func NewIndexMapFromSchema(schema *TableSchema) mapping.IndexMapping {
 				docSchema.Schema,
 				includeInAll,
 			)
-			searchAsYouTypeAnalyzerNeeded = searchAsYouTypeAnalyzerNeeded || analyzerNeeded
-			htmlAnalyzerNeeded = htmlAnalyzerNeeded || htmlNeeded
+			_ = analyzerNeeded
+			_ = htmlNeeded
 			anyAllFieldUsed = anyAllFieldUsed || allFieldUsed
 
 			if schema.DefaultType == typeName {
@@ -489,57 +497,9 @@ func NewIndexMapFromSchema(schema *TableSchema) mapping.IndexMapping {
 			}
 			indexMapping.AddDocumentMapping(typeName, docMapping)
 		}
-
-		if searchAsYouTypeAnalyzerNeeded {
-			// Define edge-ngram token filter
-			edgeGramFilter := map[string]any{
-				"type": edgengram.Name,
-				"min":  2.0,
-				"max":  4.0, // Increased max for better matching on longer words
-			}
-			err := indexMapping.AddCustomTokenFilter(EdgeNgramTokenFilter, edgeGramFilter)
-			if err != nil {
-				panic(fmt.Errorf("failed to add custom token filter: %w", err))
-			}
-
-			// Define custom analyzer using the edge-ngram filter
-			customAnalyzer := map[string]any{
-				"type":      custom.Name,
-				"tokenizer": unicode.Name,
-				"char_filters": []string{
-					zerowidthnonjoiner.Name,
-				},
-				"token_filters": []string{
-					"to_lower",
-					"stop_en", // Consider making stop words configurable
-					EdgeNgramTokenFilter,
-				},
-			}
-			err = indexMapping.AddCustomAnalyzer(SearchAsYouTypeAnalyzer, customAnalyzer)
-			if err != nil {
-				panic(fmt.Errorf("failed to add custom analyzer: %w", err))
-			}
+		if err := applyAnalysisConfig(indexMapping, schema.AnalysisConfig); err != nil {
+			panic(fmt.Errorf("failed to apply analysis config: %w", err))
 		}
-
-		if htmlAnalyzerNeeded {
-			// Define custom analyzer with HTML character filter
-			htmlCustomAnalyzer := map[string]any{
-				"type":      custom.Name,
-				"tokenizer": unicode.Name,
-				"char_filters": []string{
-					html.Name, // "html" - strips HTML tags
-				},
-				"token_filters": []string{
-					"to_lower",
-					"stop_en",
-				},
-			}
-			err := indexMapping.AddCustomAnalyzer(HTMLAnalyzer, htmlCustomAnalyzer)
-			if err != nil {
-				panic(fmt.Errorf("failed to add HTML custom analyzer: %w", err))
-			}
-		}
-
 	}
 
 	// Apply dynamic templates to the default mapping
@@ -555,4 +515,101 @@ func NewIndexMapFromSchema(schema *TableSchema) mapping.IndexMapping {
 	indexMapping.AddDocumentMapping("_all", allDocumentMapping)
 
 	return indexMapping
+}
+
+func analysisComponentConfigMap(component AnalysisComponentConfig) map[string]any {
+	if nested, ok := component.Config["config"].(map[string]any); ok && len(component.Config) == 1 {
+		config := make(map[string]any, len(nested)+1)
+		config["type"] = component.Type
+		for k, v := range nested {
+			config[k] = canonicalizeAnalysisValue(v)
+		}
+		return config
+	}
+	config := make(map[string]any, len(component.Config)+1)
+	config["type"] = component.Type
+	for k, v := range component.Config {
+		config[k] = canonicalizeAnalysisValue(v)
+	}
+	return config
+}
+
+func canonicalizeAnalysisValue(value any) any {
+	switch v := value.(type) {
+	case int:
+		return float64(v)
+	case int8:
+		return float64(v)
+	case int16:
+		return float64(v)
+	case int32:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case uint:
+		return float64(v)
+	case uint8:
+		return float64(v)
+	case uint16:
+		return float64(v)
+	case uint32:
+		return float64(v)
+	case uint64:
+		return float64(v)
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = canonicalizeAnalysisValue(item)
+		}
+		return out
+	case []string:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = item
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = canonicalizeAnalysisValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func applyAnalysisConfig(indexMapping *mapping.IndexMappingImpl, cfg *AnalysisConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.DefaultDateTimeParser != "" {
+		indexMapping.DefaultDateTimeParser = cfg.DefaultDateTimeParser
+	}
+	for name, component := range cfg.TokenFilters {
+		if err := indexMapping.AddCustomTokenFilter(name, analysisComponentConfigMap(component)); err != nil {
+			return err
+		}
+	}
+	for name, component := range cfg.CharFilters {
+		if err := indexMapping.AddCustomCharFilter(name, analysisComponentConfigMap(component)); err != nil {
+			return err
+		}
+	}
+	for name, component := range cfg.Tokenizers {
+		if err := indexMapping.AddCustomTokenizer(name, analysisComponentConfigMap(component)); err != nil {
+			return err
+		}
+	}
+	for name, component := range cfg.Analyzers {
+		if err := indexMapping.AddCustomAnalyzer(name, analysisComponentConfigMap(component)); err != nil {
+			return err
+		}
+	}
+	for name, component := range cfg.DateTimeParsers {
+		if err := indexMapping.AddCustomDateTimeParser(name, analysisComponentConfigMap(component)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
