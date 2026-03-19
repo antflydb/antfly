@@ -2822,9 +2822,13 @@ func decodeBleveSearchResult(payload *zbridge.SearchResultPayload, req *bleve.Se
 	hits := make(bleveSearch.DocumentMatchCollection, 0, len(payload.Hits))
 	maxScore := 0.0
 	for _, hit := range payload.Hits {
-		id, err := zbridge.DecodeBase64(hit.IDB64)
-		if err != nil {
-			return nil, err
+		id := hit.IDRaw
+		if len(id) == 0 {
+			var err error
+			id, err = zbridge.DecodeBase64(hit.IDB64)
+			if err != nil {
+				return nil, err
+			}
 		}
 		score := 0.0
 		if hit.Score != nil {
@@ -2860,9 +2864,13 @@ func decodeBleveSearchResult(payload *zbridge.SearchResultPayload, req *bleve.Se
 func decodeVectorSearchResult(indexName string, payload *zbridge.SearchResultPayload) (*vectorindex.SearchResult, error) {
 	hits := make([]*vectorindex.SearchHit, 0, len(payload.Hits))
 	for _, hit := range payload.Hits {
-		id, err := zbridge.DecodeBase64(hit.IDB64)
-		if err != nil {
-			return nil, err
+		id := hit.IDRaw
+		if len(id) == 0 {
+			var err error
+			id, err = zbridge.DecodeBase64(hit.IDB64)
+			if err != nil {
+				return nil, err
+			}
 		}
 		score := float32(0)
 		if hit.Score != nil {

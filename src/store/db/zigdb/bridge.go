@@ -19,6 +19,18 @@ typedef struct {
 } AntflyBuffer;
 
 typedef struct {
+	uint8_t* id_ptr;
+	size_t id_len;
+	float score;
+} AntflyDenseSearchHit;
+
+typedef struct {
+	AntflyDenseSearchHit* hits_ptr;
+	size_t hit_count;
+	uint32_t total_hits;
+} AntflyDenseSearchResult;
+
+typedef struct {
 	AntflySlice key;
 	AntflySlice value;
 	_Bool is_delete;
@@ -34,6 +46,7 @@ typedef int32_t AntflyErrorCode;
 AntflyErrorCode antfly_db_open(const char* path, void** out_handle);
 void antfly_db_close(void* handle);
 void antfly_db_buffer_free(uint8_t* ptr, size_t len);
+void antfly_db_dense_search_result_free(AntflyDenseSearchResult* result);
 AntflyErrorCode antfly_db_batch(void* handle, const AntflyWriteIntent* writes, size_t write_count, const AntflyVersionPredicate* predicates, size_t predicate_count, uint64_t timestamp_ns, uint8_t sync_level);
 AntflyErrorCode antfly_db_begin_transaction_with_id(void* handle, const uint8_t (*txn_id)[16], uint64_t timestamp_ns, const AntflySlice* participants, size_t participant_count);
 AntflyErrorCode antfly_db_write_transaction(void* handle, const uint8_t (*txn_id)[16], const AntflyWriteIntent* writes, size_t write_count, const AntflyVersionPredicate* predicates, size_t predicate_count);
@@ -48,6 +61,8 @@ AntflyErrorCode antfly_db_extract_enrichments_json(void* handle, AntflySlice req
 AntflyErrorCode antfly_db_compute_enrichments_json(void* handle, AntflySlice request_json, AntflyBuffer* out_buf);
 AntflyErrorCode antfly_db_scan_json(void* handle, AntflySlice request_json, AntflyBuffer* out_buf);
 AntflyErrorCode antfly_db_search_json(void* handle, AntflySlice request_json, AntflyBuffer* out_buf);
+AntflyErrorCode antfly_db_search_hits_json(void* handle, AntflySlice request_json, AntflyDenseSearchResult* out_result);
+AntflyErrorCode antfly_db_search_dense(void* handle, AntflySlice index_name, const float* vector_ptr, size_t vector_len, uint32_t k, uint32_t limit, uint32_t offset, AntflyDenseSearchResult* out_result);
 AntflyErrorCode antfly_db_execute_graph_queries_json(void* handle, AntflySlice request_json, AntflyBuffer* out_buf);
 AntflyErrorCode antfly_db_aggregate_hits_json(void* handle, AntflySlice request_json, AntflyBuffer* out_buf);
 AntflyErrorCode antfly_db_stats_json(void* handle, AntflyBuffer* out_buf);
@@ -370,12 +385,14 @@ type SearchDistanceRangePayload struct {
 
 type SearchChunkHitPayload struct {
 	IDB64      string   `json:"id_b64"`
+	IDRaw      []byte   `json:"-"`
 	Score      *float32 `json:"score,omitempty"`
 	StoredJSON string   `json:"stored_json,omitempty"`
 }
 
 type SearchHitPayload struct {
 	IDB64      string                  `json:"id_b64"`
+	IDRaw      []byte                  `json:"-"`
 	Score      *float32                `json:"score,omitempty"`
 	StoredJSON string                  `json:"stored_json,omitempty"`
 	ChunkHits  []SearchChunkHitPayload `json:"chunk_hits,omitempty"`
@@ -983,6 +1000,17 @@ func (b *Bridge) Scan(req ScanRequestPayload) (*ScanResultPayload, error) {
 }
 
 func (b *Bridge) Search(req SearchRequestPayload) (*SearchResultPayload, error) {
+	if densePayload, ok, err := b.searchDenseFast(req); err != nil {
+		return nil, err
+	} else if ok {
+		return densePayload, nil
+	}
+	if simplePayload, ok, err := b.searchHitsFast(req); err != nil {
+		return nil, err
+	} else if ok {
+		return simplePayload, nil
+	}
+
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -997,6 +1025,95 @@ func (b *Bridge) Search(req SearchRequestPayload) (*SearchResultPayload, error) 
 		return nil, err
 	}
 	return &payload, nil
+}
+
+func (b *Bridge) searchDenseFast(req SearchRequestPayload) (*SearchResultPayload, bool, error) {
+	if req.Mode != "dense" || req.IndexName == "" || len(req.Vector) == 0 {
+		return nil, false, nil
+	}
+	if req.IncludeStored || len(req.Aggregations) > 0 {
+		return nil, false, nil
+	}
+	if req.ReturnMode != "" && req.ReturnMode != "parent" {
+		return nil, false, nil
+	}
+
+	var result C.AntflyDenseSearchResult
+	var vecPtr *C.float
+	if len(req.Vector) > 0 {
+		vecPtr = (*C.float)(unsafe.Pointer(&req.Vector[0]))
+	}
+	if err := mapError(C.antfly_db_search_dense(
+		b.handle,
+		toSlice([]byte(req.IndexName)),
+		vecPtr,
+		C.size_t(len(req.Vector)),
+		C.uint32_t(req.K),
+		C.uint32_t(req.Limit),
+		C.uint32_t(req.Offset),
+		&result,
+	)); err != nil {
+		return nil, false, err
+	}
+	defer C.antfly_db_dense_search_result_free(&result)
+
+	hits := make([]SearchHitPayload, int(result.hit_count))
+	if result.hit_count > 0 {
+		rawHits := unsafe.Slice(result.hits_ptr, int(result.hit_count))
+		for i, hit := range rawHits {
+			id := C.GoBytes(unsafe.Pointer(hit.id_ptr), C.int(hit.id_len))
+			score := float32(hit.score)
+			hits[i] = SearchHitPayload{
+				IDB64: base64.StdEncoding.EncodeToString(id),
+				Score: &score,
+			}
+		}
+	}
+
+	return &SearchResultPayload{
+		TotalHits: uint32(result.total_hits),
+		Hits:      hits,
+	}, true, nil
+}
+
+func (b *Bridge) searchHitsFast(req SearchRequestPayload) (*SearchResultPayload, bool, error) {
+	if req.Mode != "full_text" && req.Mode != "sparse" {
+		return nil, false, nil
+	}
+	if req.IncludeStored || len(req.Aggregations) > 0 || len(req.GraphQueries) > 0 {
+		return nil, false, nil
+	}
+	if req.ReturnMode != "" && req.ReturnMode != "parent" {
+		return nil, false, nil
+	}
+
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, false, err
+	}
+	var result C.AntflyDenseSearchResult
+	if err := mapError(C.antfly_db_search_hits_json(b.handle, toSlice(raw), &result)); err != nil {
+		return nil, false, err
+	}
+	defer C.antfly_db_dense_search_result_free(&result)
+
+	hits := make([]SearchHitPayload, int(result.hit_count))
+	if result.hit_count > 0 {
+		rawHits := unsafe.Slice(result.hits_ptr, int(result.hit_count))
+		for i, hit := range rawHits {
+			id := C.GoBytes(unsafe.Pointer(hit.id_ptr), C.int(hit.id_len))
+			score := float32(hit.score)
+			hits[i] = SearchHitPayload{
+				IDRaw: id,
+				Score: &score,
+			}
+		}
+	}
+
+	return &SearchResultPayload{
+		TotalHits: uint32(result.total_hits),
+		Hits:      hits,
+	}, true, nil
 }
 
 func (b *Bridge) ExecuteGraphQueries(req ExecuteGraphQueriesRequestPayload) ([]SearchGraphResultPayload, error) {
