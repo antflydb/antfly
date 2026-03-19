@@ -1,6 +1,6 @@
 # Publish packages to npm when tagged
-# - ts-sdk-v* tags publish @antfly/sdk
-# - ts-components-v* tags publish @antfly/components
+# - ts/antfly/sdk/v* tags publish @antfly/sdk
+# - ts/antfly/components/v* tags publish @antfly/components
 #
 # Uses npm Trusted Publishing (OIDC) - no secrets required.
 # Configure trusted publishers at: https://www.npmjs.com/package/@antfly/sdk/access
@@ -11,8 +11,8 @@ name: Publish to npm
 on:
   push:
     tags:
-      - 'ts-sdk-v*'
-      - 'ts-components-v*'
+      - 'ts/antfly/sdk/v*'
+      - 'ts/antfly/components/v*'
 
 jobs:
   publish:
@@ -48,9 +48,9 @@ jobs:
         run: npm install -g npm@latest
 
       - name: Publish SDK
-        if: startsWith(github.ref, 'refs/tags/sdk-v')
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/sdk/v')
         run: pnpm --filter @antfly/sdk publish --access public --no-git-checks --provenance
 
       - name: Publish Components
-        if: startsWith(github.ref, 'refs/tags/components-v')
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/components/v')
         run: pnpm --filter @antfly/components publish --access public --no-git-checks --provenance
