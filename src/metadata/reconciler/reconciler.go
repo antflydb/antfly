@@ -221,7 +221,7 @@ func (r *Reconciler) ComputePlan(
 	plan.RaftVoterFixes = r.computeRaftVoterFixes(desired)
 
 	// 4. Compute split/merge state advancements
-	plan.SplitStateActions = r.computeSplitStateActions(desired)
+	plan.SplitStateActions = r.computeSplitStateActions(current, desired)
 	if len(plan.SplitStateActions) > 0 {
 		plan.HasUnreconciledSplitOrMerge = true
 		plan.SkipRemainingSteps = true
@@ -394,8 +394,18 @@ func (r *Reconciler) isSplitTimedOut(splitState *db.SplitState) bool {
 }
 
 // computeSplitStateActions computes split/merge state advancement actions
-func (r *Reconciler) computeSplitStateActions(desired DesiredClusterState) []SplitStateAction {
+func (r *Reconciler) computeSplitStateActions(current CurrentClusterState, desired DesiredClusterState) []SplitStateAction {
 	actions := []SplitStateAction{}
+	currentShardStatuses := make(map[types.ID]*store.ShardStatus, len(current.Shards))
+	for shardID, shardInfo := range current.Shards {
+		if shardInfo == nil {
+			continue
+		}
+		currentShardStatuses[shardID] = &store.ShardStatus{
+			ID:        shardID,
+			ShardInfo: *shardInfo.DeepCopy(),
+		}
+	}
 
 	// Sort shards by state priority (PreMerge > PreSplit > SplittingOff)
 	sortedShardIDs := r.sortShardsByStatePriority(desired.Shards)
@@ -405,7 +415,13 @@ func (r *Reconciler) computeSplitStateActions(desired DesiredClusterState) []Spl
 
 		// Check for zero-downtime split state transitions (based on Raft-replicated SplitState)
 		if splitState := shardStatus.SplitState; splitState != nil {
-			action := r.computeSplitStatePhaseAction(shardID, shardStatus, splitState, desired.Shards)
+			action := r.computeSplitStatePhaseActionWithDesired(
+				shardID,
+				shardStatus,
+				splitState,
+				currentShardStatuses,
+				desired.Shards,
+			)
 			if action != nil {
 				actions = append(actions, *action)
 			}
@@ -515,7 +531,23 @@ func (r *Reconciler) computeSplitStatePhaseAction(
 	shardID types.ID,
 	shardStatus *store.ShardStatus,
 	splitState *db.SplitState,
-	allShards map[types.ID]*store.ShardStatus,
+	currentShards map[types.ID]*store.ShardStatus,
+) *SplitStateAction {
+	return r.computeSplitStatePhaseActionWithDesired(
+		shardID,
+		shardStatus,
+		splitState,
+		currentShards,
+		currentShards,
+	)
+}
+
+func (r *Reconciler) computeSplitStatePhaseActionWithDesired(
+	shardID types.ID,
+	shardStatus *store.ShardStatus,
+	splitState *db.SplitState,
+	currentShards map[types.ID]*store.ShardStatus,
+	desiredShards map[types.ID]*store.ShardStatus,
 ) *SplitStateAction {
 	phase := splitState.GetPhase()
 
@@ -564,8 +596,22 @@ func (r *Reconciler) computeSplitStatePhaseAction(
 		// Archive created and new shard is starting.
 		// Check if new shard has been continuously ready for the grace period.
 		newShardID := types.ID(splitState.GetNewShardId())
-		newShard, exists := allShards[newShardID]
-		isReady := exists && newShard.CanInitiateSplitCutover()
+		if newShardID == 0 {
+			if inferredShardID, found := r.findCorrespondingSplittingShard(
+				shardID,
+				shardStatus,
+				desiredShards,
+			); found {
+				newShardID = inferredShardID
+			}
+		}
+		if newShardID == 0 {
+			return nil
+		}
+		currentShard, currentExists := currentShards[newShardID]
+		desiredShard, desiredExists := desiredShards[newShardID]
+		isReady := currentExists && currentShard.CanInitiateSplitCutover() ||
+			desiredExists && desiredShard.CanInitiateSplitCutover()
 		if r.trackAndCheckSplitFinalizeReady(newShardID, isReady) {
 			r.logger.Info("New shard is stable, transitioning to FINALIZING phase",
 				zap.Stringer("parentShardID", shardID),
@@ -580,13 +626,17 @@ func (r *Reconciler) computeSplitStatePhaseAction(
 				TargetRange: [2][]byte{shardStatus.ByteRange[0], splitState.GetSplitKey()},
 			}
 		}
-		if exists && !isReady {
-			hasLeader := newShard.RaftStatus != nil && newShard.RaftStatus.Lead != 0
+		if (currentExists || desiredExists) && !isReady {
+			shardForLog := currentShard
+			if shardForLog == nil {
+				shardForLog = desiredShard
+			}
+			hasLeader := shardForLog != nil && shardForLog.RaftStatus != nil && shardForLog.RaftStatus.Lead != 0
 			r.logger.Debug("New shard not fully ready yet, waiting before finalize",
 				zap.Stringer("parentShardID", shardID),
 				zap.Stringer("newShardID", newShardID),
-				zap.Bool("hasSnapshot", newShard.HasSnapshot),
-				zap.Bool("initializing", newShard.Initializing),
+				zap.Bool("hasSnapshot", shardForLog != nil && shardForLog.HasSnapshot),
+				zap.Bool("initializing", shardForLog != nil && shardForLog.Initializing),
 				zap.Bool("hasLeader", hasLeader))
 		}
 		return nil
@@ -596,8 +646,10 @@ func (r *Reconciler) computeSplitStatePhaseAction(
 		// finalize attempt timed out waiting for the child to catch up, retry once
 		// the child can serve reads directly.
 		newShardID := types.ID(splitState.GetNewShardId())
-		newShard, exists := allShards[newShardID]
-		if exists && newShard.IsReadyForSplitReads() {
+		currentShard, currentExists := currentShards[newShardID]
+		desiredShard, desiredExists := desiredShards[newShardID]
+		if currentExists && currentShard.IsReadyForSplitReads() ||
+			desiredExists && desiredShard.IsReadyForSplitReads() {
 			return &SplitStateAction{
 				ShardID:     shardID,
 				State:       shardStatus.State,
@@ -992,6 +1044,17 @@ func computeSplitTransitions(
 
 		// Skip shards that have an active SplitState (handled by computeSplitStateActions)
 		if status.SplitState != nil && status.SplitState.GetPhase() != db.SplitState_PHASE_NONE {
+			continue
+		}
+
+		// Skip split children that are still replaying parent deltas or are
+		// otherwise in split-only serving states. These shards are mid-cutover
+		// and must not be selected for another size-based split yet.
+		if status.SplitReplayRequired && !status.SplitCutoverReady {
+			continue
+		}
+		if status.State == store.ShardState_SplittingOff ||
+			status.State == store.ShardState_SplitOffPreSnap {
 			continue
 		}
 

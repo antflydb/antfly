@@ -15,6 +15,8 @@
 package tablemgr
 
 import (
+	"context"
+	"fmt"
 	"maps"
 	"time"
 
@@ -33,19 +35,37 @@ func (ns *StoreStatus) IsReachable() bool {
 // StoreStatus represents the status of a node with its shards
 type StoreStatus struct {
 	store.StoreInfo
-	State               store.StoreState              `json:"state,omitzero"`
-	LastSeen            time.Time                     `json:"last_seen"`
-	Shards              map[types.ID]*store.ShardInfo `json:"shards"`
-	*client.StoreClient `json:"-"`
+	State       store.StoreState              `json:"state,omitzero"`
+	LastSeen    time.Time                     `json:"last_seen"`
+	Shards      map[types.ID]*store.ShardInfo `json:"shards"`
+	StoreClient client.StoreRPC               `json:"-"`
 }
 
 func (ss *StoreStatus) Equivalent(other *StoreStatus) bool {
 	if ss == nil || other == nil {
 		return ss == nil && other == nil
 	}
-	return ss.StoreInfo.ID == other.StoreInfo.ID &&
+	return ss.ID == other.ID &&
 		ss.State == other.State &&
 		maps.EqualFunc(ss.Shards, other.Shards, func(v1, v2 *store.ShardInfo) bool {
 			return v1.Equal(v2)
 		})
+}
+
+func (ss *StoreStatus) Status(ctx context.Context) (*store.StoreStatus, error) {
+	if ss == nil || ss.StoreClient == nil {
+		return nil, fmt.Errorf("store client not initialized")
+	}
+	return ss.StoreClient.Status(ctx)
+}
+
+func (ss *StoreStatus) StartShard(
+	ctx context.Context,
+	shardID types.ID,
+	req *store.ShardStartRequest,
+) error {
+	if ss == nil || ss.StoreClient == nil {
+		return fmt.Errorf("store client not initialized")
+	}
+	return ss.StoreClient.StartShard(ctx, shardID, req)
 }

@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/antflydb/antfly/lib/clock"
 )
 
 // HLC implements a Hybrid Logical Clock for globally unique timestamps.
@@ -35,6 +37,7 @@ type HLC struct {
 	nodeID       uint64 // unique identifier for this HLC instance (0-255)
 	lastPhysical uint64 // last wall clock time in milliseconds
 	logical      uint64 // logical counter within the same millisecond
+	clock        clock.Clock
 }
 
 const (
@@ -58,17 +61,37 @@ func NewHLC() *HLC {
 	// Atomically increment and get a unique node ID
 	// Use crypto/rand for initial seed + atomic counter for uniqueness
 	nodeID := atomic.AddUint64(&hlcNodeCounter, 1) & hlcNodeIDMask
-	return &HLC{
-		nodeID: nodeID,
-	}
+	return NewHLCWithNodeIDAndClock(nodeID, clock.RealClock{})
+}
+
+// NewHLCWithClock creates a new HLC instance with a unique node ID and custom clock.
+func NewHLCWithClock(clk clock.Clock) *HLC {
+	nodeID := atomic.AddUint64(&hlcNodeCounter, 1) & hlcNodeIDMask
+	return NewHLCWithNodeIDAndClock(nodeID, clk)
 }
 
 // NewHLCWithNodeID creates a new HLC instance with a specific node ID.
 // This is useful when the node ID should be deterministic (e.g., from config).
 func NewHLCWithNodeID(nodeID uint64) *HLC {
+	return NewHLCWithNodeIDAndClock(nodeID, clock.RealClock{})
+}
+
+// NewHLCWithNodeIDAndClock creates a new HLC instance with a specific node ID and clock.
+func NewHLCWithNodeIDAndClock(nodeID uint64, clk clock.Clock) *HLC {
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 	return &HLC{
 		nodeID: nodeID & hlcNodeIDMask,
+		clock:  clk,
 	}
+}
+
+func (h *HLC) clockOrReal() clock.Clock {
+	if h.clock == nil {
+		return clock.RealClock{}
+	}
+	return h.clock
 }
 
 // Now returns a new globally unique, monotonically increasing timestamp.
@@ -79,7 +102,8 @@ func (h *HLC) Now() uint64 {
 	defer h.mu.Unlock()
 
 	// Get current wall clock time in milliseconds
-	nowMs := uint64(time.Now().UnixMilli())
+	clk := h.clockOrReal()
+	nowMs := uint64(clk.Now().UnixMilli())
 
 	if nowMs > h.lastPhysical {
 		// Time moved forward - reset logical counter
@@ -92,8 +116,8 @@ func (h *HLC) Now() uint64 {
 			// Logical counter overflow - wait for next millisecond
 			// This should be extremely rare (>1M timestamps/ms)
 			for nowMs <= h.lastPhysical {
-				time.Sleep(time.Millisecond)
-				nowMs = uint64(time.Now().UnixMilli())
+				clk.Sleep(time.Millisecond)
+				nowMs = uint64(clk.Now().UnixMilli())
 			}
 			h.lastPhysical = nowMs
 			h.logical = 0

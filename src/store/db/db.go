@@ -116,6 +116,17 @@ func (r *TxnRecord) Version() uint64 {
 	return r.Timestamp
 }
 
+// TxnIntent is the on-disk JSON representation of a provisional transaction intent.
+type TxnIntent struct {
+	TxnID            []byte `json:"txn_id"`
+	UserKey          []byte `json:"user_key"`
+	Value            []byte `json:"value"`
+	Timestamp        uint64 `json:"timestamp"`
+	CoordinatorShard []byte `json:"coordinator_shard"`
+	Status           int32  `json:"status"`
+	IsDelete         bool   `json:"is_delete"`
+}
+
 // Transaction key prefixes
 var (
 	txnRecordsPrefix = []byte("\x00\x00__txn_records__:")
@@ -298,6 +309,8 @@ type DB interface {
 	ResolveIntents(ctx context.Context, op *ResolveIntentsOp) error
 	GetTransactionStatus(ctx context.Context, txnID []byte) (int32, error)
 	GetCommitVersion(ctx context.Context, txnID []byte) (uint64, error)
+	ListTxnRecords(ctx context.Context) ([]TxnRecord, error)
+	ListTxnIntents(ctx context.Context) ([]TxnIntent, error)
 	GetTimestamp(key []byte) (uint64, error)
 
 	// Graph operations
@@ -3803,6 +3816,40 @@ func decodeGraphNodeKey(encodedKey string) string {
 
 // applyGraphFusion merges or filters search and graph results based on fusion strategy
 func applyGraphFusion(res *indexes.RemoteIndexSearchResult, fusionMode string, logger *zap.Logger) error {
+	appendVectorHits := func(dst map[string]*indexes.FusionHit) {
+		if len(res.VectorSearchResult) == 0 {
+			return
+		}
+		for _, vectorRes := range res.VectorSearchResult {
+			if vectorRes == nil {
+				continue
+			}
+			for _, hit := range vectorRes.Hits {
+				if hit == nil {
+					continue
+				}
+				score := float64(hit.Score)
+				if score == 0 {
+					score = 1.0 / (1.0 + float64(hit.Distance))
+				}
+				if existing, ok := dst[hit.ID]; ok {
+					if existing.Fields == nil && hit.Fields != nil {
+						existing.Fields = hit.Fields
+					}
+					if score > existing.Score {
+						existing.Score = score
+					}
+					continue
+				}
+				dst[hit.ID] = &indexes.FusionHit{
+					ID:     hit.ID,
+					Score:  score,
+					Fields: hit.Fields,
+				}
+			}
+		}
+	}
+
 	switch fusionMode {
 	case "union":
 		// Collect all keys from search results (use RRF results if available, else Bleve)
@@ -3822,6 +3869,10 @@ func applyGraphFusion(res *indexes.RemoteIndexSearchResult, fusionMode string, l
 					Fields: hit.Fields,
 				}
 			}
+		} else {
+			// Vector-only search paths can still define an authoritative result set
+			// for graph expansion even without a precomputed fusion result.
+			appendVectorHits(searchKeys)
 		}
 
 		// Add graph nodes that aren't already in search results
@@ -3884,6 +3935,19 @@ func applyGraphFusion(res *indexes.RemoteIndexSearchResult, fusionMode string, l
 						Score:  hit.Score,
 						Fields: hit.Fields,
 					})
+				}
+			}
+			res.FusionResult = &indexes.FusionResult{
+				Hits:  filteredHits,
+				Total: uint64(len(filteredHits)),
+			}
+		} else if len(res.VectorSearchResult) > 0 {
+			baseHits := make(map[string]*indexes.FusionHit)
+			appendVectorHits(baseHits)
+			filteredHits := make([]*indexes.FusionHit, 0)
+			for _, hit := range baseHits {
+				if graphKeys[hit.ID] {
+					filteredHits = append(filteredHits, hit)
 				}
 			}
 			res.FusionResult = &indexes.FusionResult{
@@ -5028,6 +5092,109 @@ func (db *DBImpl) GetCommitVersion(ctx context.Context, txnID []byte) (uint64, e
 		return 0, err
 	}
 	return record.Version(), nil
+}
+
+func (db *DBImpl) ListTxnRecords(_ context.Context) ([]TxnRecord, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+
+	iter, err := pdb.NewIter(&pebble.IterOptions{
+		LowerBound: txnRecordsPrefix,
+		UpperBound: utils.PrefixSuccessor(txnRecordsPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating transaction record iterator: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	records := make([]TxnRecord, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		var record TxnRecord
+		if err := json.Unmarshal(iter.Value(), &record); err != nil {
+			return nil, fmt.Errorf("unmarshaling transaction record: %w", err)
+		}
+		record.TxnID = bytes.Clone(record.TxnID)
+		record.Participants = cloneTxnParticipants(record.Participants)
+		record.ResolvedParticipants = append([]string(nil), record.ResolvedParticipants...)
+		records = append(records, record)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterating transaction records: %w", err)
+	}
+	return records, nil
+}
+
+func (db *DBImpl) ListTxnIntents(_ context.Context) ([]TxnIntent, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+
+	iter, err := pdb.NewIter(&pebble.IterOptions{
+		LowerBound: txnIntentsPrefix,
+		UpperBound: utils.PrefixSuccessor(txnIntentsPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating transaction intent iterator: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	intents := make([]TxnIntent, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		intent, err := decodeTxnIntent(iter.Key(), iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		intents = append(intents, intent)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterating transaction intents: %w", err)
+	}
+	return intents, nil
+}
+
+func cloneTxnParticipants(participants [][]byte) [][]byte {
+	if len(participants) == 0 {
+		return nil
+	}
+	cloned := make([][]byte, 0, len(participants))
+	for _, participant := range participants {
+		cloned = append(cloned, bytes.Clone(participant))
+	}
+	return cloned
+}
+
+func decodeTxnIntent(intentKey, payload []byte) (TxnIntent, error) {
+	var raw struct {
+		Value            []byte `json:"value"`
+		TxnID            []byte `json:"txn_id"`
+		Timestamp        uint64 `json:"timestamp"`
+		CoordinatorShard []byte `json:"coordinator_shard"`
+		Status           int32  `json:"status"`
+		IsDelete         bool   `json:"is_delete"`
+	}
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return TxnIntent{}, fmt.Errorf("unmarshaling transaction intent: %w", err)
+	}
+	parsedTxnID, userKey := parseIntentKey(intentKey)
+	if parsedTxnID == nil || userKey == nil {
+		return TxnIntent{}, fmt.Errorf("parsing transaction intent key %q", types.FormatKey(intentKey))
+	}
+	txnID := raw.TxnID
+	if len(txnID) == 0 {
+		txnID = parsedTxnID
+	}
+	return TxnIntent{
+		TxnID:            bytes.Clone(txnID),
+		UserKey:          bytes.Clone(userKey),
+		Value:            bytes.Clone(raw.Value),
+		Timestamp:        raw.Timestamp,
+		CoordinatorShard: bytes.Clone(raw.CoordinatorShard),
+		Status:           raw.Status,
+		IsDelete:         raw.IsDelete,
+	}, nil
 }
 
 // ========================================

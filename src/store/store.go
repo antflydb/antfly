@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/logger"
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
@@ -70,9 +71,11 @@ type Store struct {
 
 	sg singleflight.Group
 
-	config    *StoreInfo
-	shardsMap *xsync.Map[types.ID, *Shard]
-	rs        *raft.MultiRaft
+	config     *StoreInfo
+	shardsMap  *xsync.Map[types.ID, *Shard]
+	rs         raft.Transport
+	clock      clock.Clock
+	httpClient *http.Client
 
 	db       *pebble.DB
 	cache    *pebbleutils.Cache // shared Pebble block cache (may be nil)
@@ -87,12 +90,28 @@ type Store struct {
 // - Add GC of snapshots
 // - Save state of shards in pebble so we can recover from a crash
 
+type Options struct {
+	Clock      clock.Clock
+	HTTPClient *http.Client
+}
+
 func NewStore(
 	zl *zap.Logger,
 	antflyConfig *common.Config,
-	rs *raft.MultiRaft,
+	rs raft.Transport,
 	conf *StoreInfo,
 	cache *pebbleutils.Cache,
+) (*Store, chan error, error) {
+	return NewStoreWithOptions(zl, antflyConfig, rs, conf, cache, Options{})
+}
+
+func NewStoreWithOptions(
+	zl *zap.Logger,
+	antflyConfig *common.Config,
+	rs raft.Transport,
+	conf *StoreInfo,
+	cache *pebbleutils.Cache,
+	opts Options,
 ) (*Store, chan error, error) {
 	dataDir := antflyConfig.GetBaseDir()
 	storeMetadataDir := common.NodeDir(dataDir, conf.ID) + "/storeMetadataDB"
@@ -131,8 +150,10 @@ func NewStore(
 		logger:       zl.With(zap.String("module", "store")),
 		antflyConfig: antflyConfig,
 
-		config: conf,
-		rs:     rs,
+		config:     conf,
+		rs:         rs,
+		clock:      opts.Clock,
+		httpClient: opts.HTTPClient,
 
 		db:       db,
 		cache:    cache,
@@ -166,6 +187,13 @@ func NewStore(
 	}
 	wg.Wait()
 	return s, errChan, nil
+}
+
+func (s *Store) clockOrReal() clock.Clock {
+	if s.clock == nil {
+		return clock.RealClock{}
+	}
+	return s.clock
 }
 
 // FIXME (ajr) Maybe let's save some local state in pebble with the metadata of what shards we
@@ -514,6 +542,7 @@ func (m *Store) StartRaftGroup(
 				Join:                      join,
 				Timetstamp:                conf.Timestamp,
 				Cache:                     m.cache,
+				Clock:                     m.clockOrReal(),
 			}
 			// Pass the store's logger to the raft node
 			commitC, errorC, raftNode = raft.NewRaftNode(
@@ -558,8 +587,12 @@ func (m *Store) StartRaftGroup(
 				}
 			}
 		}
+		httpClient := m.httpClient
+		if httpClient == nil {
+			httpClient = &http.Client{Timeout: 5 * time.Second}
+		}
 		shardNotifier := NewHTTPShardNotifier(
-			&http.Client{Timeout: 5 * time.Second},
+			httpClient,
 			metadataURL,
 			lg.Named("shardNotifier"),
 		)

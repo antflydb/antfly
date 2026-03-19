@@ -18,6 +18,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/store"
@@ -31,33 +32,62 @@ import (
 // INTERFACES - Abstractions for external dependencies
 // ============================================================================
 
-// TimeProvider abstracts time for testing
-type TimeProvider interface {
-	Now() time.Time
-}
+// TimeProvider abstracts time for testing.
+type TimeProvider = clock.Clock
 
 // RealTimeProvider uses actual system time
-type RealTimeProvider struct{}
-
-func (RealTimeProvider) Now() time.Time {
-	return time.Now()
-}
+type RealTimeProvider struct{ clock.RealClock }
 
 // MockTimeProvider allows controlling time in tests
 type MockTimeProvider struct {
 	current time.Time
+	mock    *clock.MockClock
 }
 
 func (m *MockTimeProvider) Now() time.Time {
+	if m.mock != nil {
+		return m.mock.Now()
+	}
 	return m.current
 }
 
 func (m *MockTimeProvider) Advance(d time.Duration) {
+	if m.mock != nil {
+		m.mock.Advance(d)
+		m.current = m.mock.Now()
+		return
+	}
 	m.current = m.current.Add(d)
 }
 
 func (m *MockTimeProvider) Set(t time.Time) {
 	m.current = t
+	if m.mock != nil {
+		m.mock.Set(t)
+	}
+}
+
+func (m *MockTimeProvider) After(d time.Duration) <-chan time.Time {
+	return m.ensureMockClock().After(d)
+}
+
+func (m *MockTimeProvider) NewTimer(d time.Duration) clock.Timer {
+	return m.ensureMockClock().NewTimer(d)
+}
+
+func (m *MockTimeProvider) NewTicker(d time.Duration) clock.Ticker {
+	return m.ensureMockClock().NewTicker(d)
+}
+
+func (m *MockTimeProvider) Sleep(d time.Duration) {
+	m.Advance(d)
+}
+
+func (m *MockTimeProvider) ensureMockClock() *clock.MockClock {
+	if m.mock == nil {
+		m.mock = clock.NewMockClock(m.current)
+	}
+	return m.mock
 }
 
 // ShardOperations abstracts all shard-level operations for testing
@@ -108,7 +138,7 @@ type ShardOperations interface {
 	AddPeer(
 		ctx context.Context,
 		shardID types.ID,
-		leaderClient *client.StoreClient,
+		leaderClient client.StoreRPC,
 		newPeerID types.ID,
 	) error
 
@@ -117,7 +147,7 @@ type ShardOperations interface {
 	RemovePeer(
 		ctx context.Context,
 		shardID types.ID,
-		leaderClient *client.StoreClient,
+		leaderClient client.StoreRPC,
 		peerToRemoveID types.ID,
 		async bool,
 	) error
@@ -129,7 +159,7 @@ type ShardOperations interface {
 	IsIDRemoved(
 		ctx context.Context,
 		shardID types.ID,
-		leaderClient *client.StoreClient,
+		leaderClient client.StoreRPC,
 		peerID types.ID,
 	) (bool, error)
 }
@@ -172,7 +202,7 @@ type TableOperations interface {
 // StoreOperations abstracts store/node operations
 type StoreOperations interface {
 	// GetStoreClient gets a client for a specific store
-	GetStoreClient(ctx context.Context, nodeID types.ID) (*client.StoreClient, bool, error)
+	GetStoreClient(ctx context.Context, nodeID types.ID) (client.StoreRPC, bool, error)
 
 	// GetStoreStatus gets the status of a specific store
 	GetStoreStatus(ctx context.Context, nodeID types.ID) (*tablemgr.StoreStatus, error)
@@ -181,7 +211,7 @@ type StoreOperations interface {
 	GetShardStatuses() (map[types.ID]*store.ShardStatus, error)
 
 	// GetLeaderClientForShard gets a client for the leader of a shard
-	GetLeaderClientForShard(ctx context.Context, shardID types.ID) (*client.StoreClient, error)
+	GetLeaderClientForShard(ctx context.Context, shardID types.ID) (client.StoreRPC, error)
 
 	// UpdateShardSplitState updates the SplitState of a shard in the metadata store.
 	// This is called after PrepareSplit succeeds to ensure the SplitState is immediately

@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/multirafthttp/transport"
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
@@ -46,7 +47,8 @@ type MetadataStore struct {
 
 	antflyConfig *common.Config
 	config       *store.StoreInfo
-	rs           *raft.MultiRaft
+	rs           raft.Transport
+	clock        clock.Clock
 	cache        *pebbleutils.Cache // shared Pebble block cache (may be nil)
 	metadataKV   *metadataKV
 
@@ -57,14 +59,40 @@ type MetadataStore struct {
 // - Add GC of snapshots
 // - Save state of shards in pebble so we can recover from a crash
 
+type Options struct {
+	Clock clock.Clock
+}
+
 func NewMetadataStore(
 	zl *zap.Logger,
 	antflyConfig *common.Config,
-	rs *raft.MultiRaft,
+	rs raft.Transport,
 	conf *store.StoreInfo,
 	bootstrapPeers common.Peers,
 	join bool,
 	cache *pebbleutils.Cache,
+) (*MetadataStore, error) {
+	return NewMetadataStoreWithOptions(
+		zl,
+		antflyConfig,
+		rs,
+		conf,
+		bootstrapPeers,
+		join,
+		cache,
+		Options{},
+	)
+}
+
+func NewMetadataStoreWithOptions(
+	zl *zap.Logger,
+	antflyConfig *common.Config,
+	rs raft.Transport,
+	conf *store.StoreInfo,
+	bootstrapPeers common.Peers,
+	join bool,
+	cache *pebbleutils.Cache,
+	opts Options,
 ) (*MetadataStore, error) {
 	s := &MetadataStore{
 		logger: zl.With(zap.String("module", "metadataStore")),
@@ -72,9 +100,17 @@ func NewMetadataStore(
 		antflyConfig: antflyConfig,
 		config:       conf,
 		rs:           rs,
+		clock:        opts.Clock,
 		cache:        cache,
 	}
 	return s, s.StartRaftGroup(bootstrapPeers, join)
+}
+
+func (m *MetadataStore) clockOrReal() clock.Clock {
+	if m.clock == nil {
+		return clock.RealClock{}
+	}
+	return m.clock
 }
 
 func (m *MetadataStore) SetLeaderFactory(f func(ctx context.Context) error) {
@@ -228,6 +264,7 @@ func (m *MetadataStore) StartRaftGroup(peers []common.Peer, join bool) error {
 			Join:                      join,
 			EnableProposalForwarding:  true,
 			Cache:                     m.cache,
+			Clock:                     m.clockOrReal(),
 		}
 		// Pass the store's logger to the raft node
 		commitC, errorC, raftNode = raft.NewRaftNode(

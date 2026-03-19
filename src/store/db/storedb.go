@@ -113,7 +113,7 @@ func NewStoreDB(
 		schema:                 schema,
 		antflyConfig:           antflyConfig,
 		localSplitSourceLookup: localSplitSourceLookup,
-		coreDB: NewDBImpl(
+		coreDB: newCoreDB(
 			lg.Named("coreDB"),
 			antflyConfig,
 			schema,
@@ -692,7 +692,7 @@ func (s *StoreDB) Split(ctx context.Context, newShardID uint64, splitKey []byte)
 	}
 
 	// Now propose the actual split operation
-	if err := s.proposeOnlyWriteOp(ctx, NewSplitOp(newShardID, splitKey)); err != nil {
+	if err := s.syncWriteOp(ctx, NewSplitOp(newShardID, splitKey)); err != nil {
 		// On failure, we should ideally rollback to PREPARE phase, but for now
 		// leave in SPLITTING phase - the reconciler will handle cleanup
 		return fmt.Errorf("proposing split op: %w", err)
@@ -1284,7 +1284,7 @@ func (s *StoreDB) applyOpSplit(_ context.Context, split *SplitOp) error {
 // This should be called when the new shard is ready (has HasSnapshot=true).
 // It deletes the split-off data and updates the byte range.
 func (s *StoreDB) FinalizeSplit(ctx context.Context, newRangeEnd []byte) error {
-	return s.proposeOnlyWriteOp(ctx, newFinalizeSplitOp(newRangeEnd))
+	return s.syncWriteOp(ctx, newFinalizeSplitOp(newRangeEnd))
 }
 
 // RollbackSplit aborts a split operation and restores the shard to its pre-split state.
@@ -2107,7 +2107,7 @@ func (s *StoreDB) proposeSplitStateChange(ctx context.Context, state *SplitState
 		Op:            Op_OpSetSplitState,
 		SetSplitState: op,
 	}.Build()
-	return s.proposeOnlyWriteOp(ctx, kvOp)
+	return s.syncWriteOp(ctx, kvOp)
 }
 
 // GetTransactionStatus retrieves the status of a transaction from the coordinator
@@ -2117,6 +2117,14 @@ func (s *StoreDB) GetTransactionStatus(ctx context.Context, txnID []byte) (int32
 
 func (s *StoreDB) GetCommitVersion(ctx context.Context, txnID []byte) (uint64, error) {
 	return s.coreDB.GetCommitVersion(ctx, txnID)
+}
+
+func (s *StoreDB) ListTxnRecords(ctx context.Context) ([]TxnRecord, error) {
+	return s.coreDB.ListTxnRecords(ctx)
+}
+
+func (s *StoreDB) ListTxnIntents(ctx context.Context) ([]TxnIntent, error) {
+	return s.coreDB.ListTxnIntents(ctx)
 }
 
 // GetEdges retrieves edges for a document in a graph index

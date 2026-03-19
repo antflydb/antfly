@@ -909,7 +909,6 @@ func (h *StoreAPI) handleIsIDRemoved(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
 }
 
 // handleTransferLeadership handles requests to transfer leadership of a shard
@@ -1268,6 +1267,12 @@ func (h *StoreAPI) handleConfChange(w http.ResponseWriter, r *http.Request) {
 		syncMode := r.URL.Query().Get("sync") == "true"
 		if syncMode {
 			if err := shard.ApplyConfChange(r.Context(), cc); err != nil {
+				if errors.Is(err, context.Canceled) {
+					h.logger.Info("Conf change for removing node canceled during shutdown",
+						zap.Uint64("nodeID", nodeID),
+						zap.Stringer("shardID", shardID))
+					return
+				}
 				h.logger.Error("Failed to apply conf change for removing node",
 					zap.Uint64("nodeID", nodeID),
 					zap.Stringer("shardID", shardID),

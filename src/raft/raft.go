@@ -27,6 +27,7 @@ import (
 	"time"
 
 	// Needed for transport layer currently
+	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/logger"
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
@@ -100,6 +101,7 @@ type raftNode struct {
 	cache                 *pebbleutils.Cache // shared Pebble block cache (may be nil)
 	createStorageSnapshot func(id string) error
 	snapStore             snapstore.SnapStore
+	clock                 clock.Clock
 
 	leaderFactory  func(ctx context.Context) error
 	leaderEg       *errgroup.Group
@@ -241,6 +243,7 @@ type RaftNodeConfig struct {
 	EnableProposalForwarding  bool
 	DisableAsyncStorageWrites bool
 	Cache                     *pebbleutils.Cache
+	Clock                     clock.Clock
 }
 
 // NewRaftNode initiates a raft instance and returns a committed log entry
@@ -260,6 +263,10 @@ func NewRaftNode(logger *zap.Logger, shardID types.ID, id types.ID,
 	// This is important because startRaft runs in a goroutine and may fail before
 	// the caller sets up the error handler.
 	errorC := make(chan error, 1)
+	clk := config.Clock
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 
 	rc := &raftNode{
 		shardID:                   shardID,
@@ -274,6 +281,7 @@ func NewRaftNode(logger *zap.Logger, shardID types.ID, id types.ID,
 		raftLogDir:                config.RaftLogDir,
 		cache:                     config.Cache,
 		snapStore:                 config.SnapStore,
+		clock:                     clk,
 		initWithStorageSnapshot:   config.InitWithStorageSnapshot,
 		disableProposalForwarding: !config.EnableProposalForwarding,
 		disableAsyncStorageWrites: config.DisableAsyncStorageWrites,
@@ -976,7 +984,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 	// FIXME (ajr) Save the confState and with the hardState so we can recover conf together
 	rc.appliedIndex.Store(max(snap.Metadata.Index, hardState.Commit))
 	rc.logger.Info("Initialized from snapshot", zap.Uint64("index", rc.snapshotIndex.Load()))
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := rc.clock.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	stop := sync.OnceFunc(func() {
@@ -1188,7 +1196,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 	// event loop on raft state machine updates
 	for {
 		select {
-		case <-ticker.C:
+		case <-ticker.C():
 			rc.node.Tick()
 
 		// store raft entries, then publish over commit channel

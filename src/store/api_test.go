@@ -35,6 +35,8 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
+	"github.com/blevesearch/bleve/v2"
+	blevesearch "github.com/blevesearch/bleve/v2/search"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -52,6 +54,8 @@ func signalOnCall(call *mock.Call) <-chan struct{} {
 }
 
 var _ ShardIface = (*MockShard)(nil)
+
+const bleveCompositeSortSentinel = "\U0010ffff\U0010ffff\U0010ffff"
 
 // MockShard is a mock type for the Shard interface
 type MockShard struct {
@@ -188,6 +192,22 @@ func (m *MockShard) GetTransactionStatus(ctx context.Context, txnID []byte) (int
 func (m *MockShard) GetCommitVersion(ctx context.Context, txnID []byte) (uint64, error) {
 	args := m.Called(ctx, txnID)
 	return args.Get(0).(uint64), args.Error(1)
+}
+
+func (m *MockShard) ListTxnRecords(ctx context.Context) ([]db.TxnRecord, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]db.TxnRecord), args.Error(1)
+}
+
+func (m *MockShard) ListTxnIntents(ctx context.Context) ([]db.TxnIntent, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]db.TxnIntent), args.Error(1)
 }
 
 func (m *MockShard) GetEdges(ctx context.Context, indexName string, key []byte, edgeType string, direction indexes.EdgeDirection) ([]indexes.Edge, error) {
@@ -608,6 +628,113 @@ func setupStoreAPI(t *testing.T, storeNodeID types.ID) (http.Handler, *MockStore
 		startingShards: make(map[types.ID]struct{}),
 	}
 	return api.setupRoutes(), mockStore, baseDir
+}
+
+func TestHandleSearch_PreservesCompositeSortCursorAndTokens(t *testing.T) {
+	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
+	shardID := types.ID(301)
+	mockShard := &MockShard{}
+
+	reqBody := indexes.RemoteIndexSearchRequest{
+		Limit: 10,
+		BlevePagingOpts: indexes.FullTextPagingOptions{
+			OrderBy: []indexes.SortField{{Field: "tags"}},
+			Limit:   2,
+			SearchAfter: []string{
+				"bravo",
+			},
+		},
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+
+	respBytes, err := json.Marshal(indexes.RemoteIndexSearchResult{
+		BleveSearchResult: &bleve.SearchResult{
+			Hits: []*blevesearch.DocumentMatch{
+				{ID: "doc3", Sort: []string{"charlie"}},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	mockStore.On("Shard", shardID).Return(mockShard, true)
+	mockShard.On("Search", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		var forwarded indexes.RemoteIndexSearchRequest
+		require.NoError(t, json.Unmarshal(args.Get(1).([]byte), &forwarded))
+		require.Equal(t, []string{"bravo"}, forwarded.BlevePagingOpts.SearchAfter)
+		require.Equal(t, "tags", forwarded.BlevePagingOpts.OrderBy[0].Field)
+	}).Return(respBytes, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/search", bytes.NewReader(jsonBody))
+	req.Header.Set("X-Raft-Shard-Id", shardID.String())
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	api.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var resp indexes.RemoteIndexSearchResult
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.NotNil(t, resp.BleveSearchResult)
+	require.Len(t, resp.BleveSearchResult.Hits, 1)
+	assert.Equal(t, "doc3", resp.BleveSearchResult.Hits[0].ID)
+	assert.Equal(t, []string{"charlie"}, resp.BleveSearchResult.Hits[0].Sort)
+	mockStore.AssertExpectations(t)
+	mockShard.AssertExpectations(t)
+}
+
+func TestHandleSearch_PreservesSyntheticCompositeSortSentinel(t *testing.T) {
+	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
+	shardID := types.ID(302)
+	mockShard := &MockShard{}
+
+	reqBody := indexes.RemoteIndexSearchRequest{
+		Limit: 10,
+		BlevePagingOpts: indexes.FullTextPagingOptions{
+			OrderBy: []indexes.SortField{{Field: "mixed_scalar"}},
+			Limit:   2,
+			SearchAfter: []string{
+				bleveCompositeSortSentinel,
+			},
+		},
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+
+	respBytes, err := json.Marshal(indexes.RemoteIndexSearchResult{
+		BleveSearchResult: &bleve.SearchResult{
+			Hits: []*blevesearch.DocumentMatch{
+				{ID: "doc1", Sort: []string{bleveCompositeSortSentinel}},
+				{ID: "doc2", Sort: []string{bleveCompositeSortSentinel}},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	mockStore.On("Shard", shardID).Return(mockShard, true)
+	mockShard.On("Search", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		var forwarded indexes.RemoteIndexSearchRequest
+		require.NoError(t, json.Unmarshal(args.Get(1).([]byte), &forwarded))
+		require.Equal(t, []string{bleveCompositeSortSentinel}, forwarded.BlevePagingOpts.SearchAfter)
+	}).Return(respBytes, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/search", bytes.NewReader(jsonBody))
+	req.Header.Set("X-Raft-Shard-Id", shardID.String())
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	api.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var resp indexes.RemoteIndexSearchResult
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.NotNil(t, resp.BleveSearchResult)
+	require.Len(t, resp.BleveSearchResult.Hits, 2)
+	for _, hit := range resp.BleveSearchResult.Hits {
+		assert.Equal(t, []string{bleveCompositeSortSentinel}, hit.Sort)
+	}
+	mockStore.AssertExpectations(t)
+	mockShard.AssertExpectations(t)
 }
 
 func TestHandleStartShard_Success_JSON(t *testing.T) {
