@@ -669,13 +669,14 @@ func (db *ZigCoreDB) Search(ctx context.Context, encodedRequest []byte) ([]byte,
 		if len(nonTextBackendAggReqs) > 0 && len(req.VectorSearches)+len(req.SparseSearches) == 1 && filterQuery == nil && len(req.FilterPrefix) == 0 {
 			aggregations = nonTextBackendAggReqs
 		}
+		includeStored := filterQuery != nil
 		payload, err := bridge.Search(zbridge.SearchRequestPayload{
 			Mode:          "dense",
 			IndexName:     indexName,
 			Vector:        vec,
 			K:             uint32(vectorLimit),
 			Limit:         uint32(vectorLimit),
-			IncludeStored: true,
+			IncludeStored: includeStored,
 			Aggregations:  aggregations,
 		})
 		if err != nil {
@@ -714,6 +715,7 @@ func (db *ZigCoreDB) Search(ctx context.Context, encodedRequest []byte) ([]byte,
 		if len(nonTextBackendAggReqs) > 0 && len(req.VectorSearches)+len(req.SparseSearches) == 1 && filterQuery == nil && len(req.FilterPrefix) == 0 {
 			aggregations = nonTextBackendAggReqs
 		}
+		includeStored := filterQuery != nil
 		payload, err := bridge.Search(zbridge.SearchRequestPayload{
 			Mode:          "sparse",
 			IndexName:     indexName,
@@ -721,7 +723,7 @@ func (db *ZigCoreDB) Search(ctx context.Context, encodedRequest []byte) ([]byte,
 			Values:        sparse.Values,
 			K:             uint32(vectorLimit),
 			Limit:         uint32(vectorLimit),
-			IncludeStored: true,
+			IncludeStored: includeStored,
 			Aggregations:  aggregations,
 		})
 		if err != nil {

@@ -1064,7 +1064,7 @@ func (b *Bridge) searchDenseFast(req SearchRequestPayload) (*SearchResultPayload
 			id := C.GoBytes(unsafe.Pointer(hit.id_ptr), C.int(hit.id_len))
 			score := float32(hit.score)
 			hits[i] = SearchHitPayload{
-				IDB64: base64.StdEncoding.EncodeToString(id),
+				IDRaw: id,
 				Score: &score,
 			}
 		}
