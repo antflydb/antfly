@@ -337,6 +337,186 @@ describe("Listener", () => {
       expect(input.value).toBe("semantic test");
     });
 
+    it("should omit full_text_search for semantic-only Results queries", async () => {
+      const utils = await import("./utils");
+      const msearchSpy = vi.spyOn(utils, "multiquery").mockResolvedValue({
+        responses: [
+          {
+            status: 200,
+            took: 10,
+            hits: { hits: [], total: 0 },
+          },
+        ],
+      });
+
+      const { container } = render(
+        <TestWrapper>
+          <QueryBox id="main" mode="live" />
+          <Results
+            id="results-sem"
+            searchBoxId="main"
+            semanticIndexes={["main_semantic_index"]}
+            limit={20}
+            items={() => <div />}
+          />
+        </TestWrapper>
+      );
+
+      const input = container.querySelector("input") as HTMLInputElement;
+      expect(input).toBeTruthy();
+
+      await userEvent.type(input, "what's");
+
+      await waitFor(() => {
+        expect(msearchSpy).toHaveBeenCalled();
+      });
+
+      const queries = msearchSpy.mock.calls.flatMap((call) => call[1] || []);
+      const semanticQuery = queries.find(
+        (request: { query?: { semantic_search?: string; indexes?: string[] } }) =>
+          request.query?.semantic_search === "what's"
+      );
+
+      expect(semanticQuery?.query?.indexes).toEqual(["main_semantic_index"]);
+      expect(semanticQuery?.query).not.toHaveProperty("full_text_search");
+
+      msearchSpy.mockRestore();
+    });
+
+    it("should refetch autosuggest queries when autosuggest configuration changes", async () => {
+      const utils = await import("./utils");
+      const msearchSpy = vi.spyOn(utils, "multiquery").mockImplementation(async (_url, requests) => ({
+        responses: requests.map(() => ({
+          status: 200,
+          took: 10,
+          hits: { hits: [], total: 0 },
+        })),
+      }));
+
+      const { container, rerender } = render(
+        <TestWrapper>
+          <QueryBox id="main" mode="live">
+            <Autosuggest fields={["title__keyword"]} minChars={1} debounceMs={0} />
+          </QueryBox>
+          <Results
+            id="results-main"
+            searchBoxId="main"
+            fields={["title__keyword"]}
+            items={() => <div />}
+          />
+        </TestWrapper>
+      );
+
+      const input = container.querySelector("input") as HTMLInputElement;
+      expect(input).toBeTruthy();
+
+      await userEvent.type(input, "foo");
+
+      await waitFor(() => {
+        expect(msearchSpy).toHaveBeenCalled();
+      });
+
+      const callCountBeforeRerender = msearchSpy.mock.calls.length;
+
+      rerender(
+        <TestWrapper>
+          <QueryBox id="main" mode="live">
+            <Autosuggest fields={["name__keyword"]} minChars={1} debounceMs={0} />
+          </QueryBox>
+          <Results
+            id="results-main"
+            searchBoxId="main"
+            fields={["title__keyword"]}
+            items={() => <div />}
+          />
+        </TestWrapper>
+      );
+
+      await waitFor(() => {
+        expect(msearchSpy.mock.calls.length).toBeGreaterThan(callCountBeforeRerender);
+      });
+
+      const latestQueries = msearchSpy.mock.calls[msearchSpy.mock.calls.length - 1][1];
+      const autosuggestQuery = latestQueries.find(
+        (request: { query?: { fields?: string[] } }) => request.query?.fields?.[0] === "name__keyword"
+      );
+
+      expect(autosuggestQuery).toBeTruthy();
+
+      msearchSpy.mockRestore();
+    });
+
+    it("should refetch existing queries when Antfly backend context changes", async () => {
+      const utils = await import("./utils");
+      const msearchSpy = vi.spyOn(utils, "multiquery").mockResolvedValue({
+        responses: [
+          {
+            status: 200,
+            took: 10,
+            hits: { hits: [], total: 0 },
+          },
+        ],
+      });
+
+      const { container, rerender } = render(
+        <Antfly
+          url="http://localhost:8082/api/v1"
+          table="docs"
+          headers={{ Authorization: "ApiKey one" }}
+        >
+          <QueryBox id="main" mode="live" />
+          <Results
+            id="results-main"
+            searchBoxId="main"
+            fields={["title__keyword"]}
+            items={() => <div />}
+          />
+        </Antfly>
+      );
+
+      const input = container.querySelector("input") as HTMLInputElement;
+      expect(input).toBeTruthy();
+
+      await userEvent.type(input, "foo");
+
+      await waitFor(() => {
+        expect(msearchSpy).toHaveBeenCalled();
+      });
+
+      const initialCallCount = msearchSpy.mock.calls.length;
+      const firstCall = msearchSpy.mock.calls[initialCallCount - 1];
+      expect(firstCall[0]).toBe("http://localhost:8082/api/v1");
+      expect(firstCall[2]).toEqual({ Authorization: "ApiKey one" });
+      expect(firstCall[1][0].query.table).toBe("docs");
+
+      rerender(
+        <Antfly
+          url="http://localhost:8083/api/v1"
+          table="docs_v2"
+          headers={{ Authorization: "ApiKey two" }}
+        >
+          <QueryBox id="main" mode="live" />
+          <Results
+            id="results-main"
+            searchBoxId="main"
+            fields={["title__keyword"]}
+            items={() => <div />}
+          />
+        </Antfly>
+      );
+
+      await waitFor(() => {
+        expect(msearchSpy.mock.calls.length).toBeGreaterThan(initialCallCount);
+      });
+
+      const latestCall = msearchSpy.mock.calls[msearchSpy.mock.calls.length - 1];
+      expect(latestCall[0]).toBe("http://localhost:8083/api/v1");
+      expect(latestCall[2]).toEqual({ Authorization: "ApiKey two" });
+      expect(latestCall[1][0].query.table).toBe("docs_v2");
+
+      msearchSpy.mockRestore();
+    });
+
     it("should include autosuggest's own semantic query when autosuggest queries for results", async () => {
       // Regression test for bug where:
       // - Autosuggest has semanticIndexes configured and wantResults: true

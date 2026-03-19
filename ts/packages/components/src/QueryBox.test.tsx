@@ -246,6 +246,126 @@ describe("QueryBox", () => {
         expect(capturedWidget?.submittedAt).not.toBe(beforeSubmit);
       });
     });
+
+    it("should auto-submit an initial value when requested", async () => {
+      let capturedWidget: Widget | undefined;
+      const onWidgetUpdate = vi.fn((widget: Widget | undefined) => {
+        capturedWidget = widget;
+      });
+      const onSubmit = vi.fn();
+
+      render(
+        <TestWrapper>
+          <QueryBox
+            id="test-search"
+            mode="submit"
+            initialValue="retry me"
+            autoSubmit={true}
+            onSubmit={onSubmit}
+          />
+          <WidgetSpy widgetId="test-search" onWidgetUpdate={onWidgetUpdate} />
+        </TestWrapper>
+      );
+
+      await waitFor(() => {
+        expect(onSubmit).toHaveBeenCalledWith("retry me");
+        expect(capturedWidget?.value).toBe("retry me");
+        expect(capturedWidget?.submittedAt).toBeDefined();
+      });
+    });
+
+    it("should re-submit the same initial value when submitSignal changes", async () => {
+      const onSubmit = vi.fn();
+
+      const { rerender } = render(
+        <TestWrapper>
+          <QueryBox
+            id="test-search"
+            mode="submit"
+            initialValue="retry me"
+            autoSubmit={true}
+            submitSignal={1}
+            onSubmit={onSubmit}
+          />
+        </TestWrapper>
+      );
+
+      await waitFor(() => {
+        expect(onSubmit).toHaveBeenCalledTimes(1);
+      });
+
+      rerender(
+        <TestWrapper>
+          <QueryBox
+            id="test-search"
+            mode="submit"
+            initialValue="retry me"
+            autoSubmit={true}
+            submitSignal={2}
+            onSubmit={onSubmit}
+          />
+        </TestWrapper>
+      );
+
+      await waitFor(() => {
+        expect(onSubmit).toHaveBeenCalledTimes(2);
+      });
+    });
+
+    it("should clear the visible input after submit when clearOnSubmit is enabled", async () => {
+      let capturedWidget: Widget | undefined;
+      const onWidgetUpdate = vi.fn((widget: Widget | undefined) => {
+        capturedWidget = widget;
+      });
+      const onSubmit = vi.fn();
+
+      const { container } = render(
+        <TestWrapper>
+          <QueryBox id="test-search" mode="submit" clearOnSubmit={true} onSubmit={onSubmit} />
+          <WidgetSpy widgetId="test-search" onWidgetUpdate={onWidgetUpdate} />
+        </TestWrapper>
+      );
+
+      const input = container.querySelector("input") as HTMLInputElement;
+      await userEvent.type(input, "clear me");
+
+      const form = container.querySelector("form");
+      expect(form).toBeTruthy();
+
+      if (form) {
+        await act(async () => {
+          fireEvent.submit(form);
+        });
+      }
+
+      await waitFor(() => {
+        expect(onSubmit).toHaveBeenCalledWith("clear me");
+        expect(input.value).toBe("");
+        expect(capturedWidget?.value).toBe("clear me");
+        expect(capturedWidget?.submittedAt).toBeDefined();
+      });
+    });
+
+    it("should auto-submit for custom inputs without relying on a form wrapper", async () => {
+      const onSubmit = vi.fn();
+
+      render(
+        <TestWrapper>
+          <QueryBox
+            id="test-search"
+            mode="submit"
+            initialValue="custom retry"
+            autoSubmit={true}
+            renderInput={({ value }) => <textarea aria-label="Custom Query" value={value} readOnly />}
+            onSubmit={onSubmit}
+          />
+        </TestWrapper>
+      );
+
+      await waitFor(() => {
+        expect(onSubmit).toHaveBeenCalledWith("custom retry");
+      });
+    });
   });
 
   describe("live mode behavior", () => {

@@ -1,6 +1,6 @@
-import { type ReactNode, useEffect } from "react";
+import { type ReactNode, useEffect, useMemo } from "react";
 import Listener from "./Listener";
-import type { SharedAction, SharedState } from "./SharedContext";
+import { useSharedContext, type SharedAction, type SharedState } from "./SharedContext";
 import { SharedContextProvider } from "./SharedContextProvider";
 import { initializeAntflyClient } from "./utils";
 
@@ -12,18 +12,44 @@ export interface AntflyProps {
   headers?: Record<string, string>;
 }
 
+function SharedConfigSync({
+  url,
+  table,
+  headers,
+}: {
+  url: string;
+  table: string;
+  headers: Record<string, string>;
+}) {
+  const [, dispatch] = useSharedContext();
+
+  useEffect(() => {
+    dispatch({
+      type: "setSharedConfig",
+      url,
+      table,
+      headers,
+    });
+  }, [dispatch, url, table, headers]);
+
+  return null;
+}
+
 export default function Antfly({ children, url, table, onChange, headers = {} }: AntflyProps) {
+  const headersKey = JSON.stringify(headers);
+  const stableHeaders = useMemo(() => headers, [headersKey]);
+
   const initialState: SharedState = {
     url,
     table,
     listenerEffect: null,
     widgets: new Map(),
-    headers,
+    headers: stableHeaders,
   };
 
   useEffect(() => {
-    initializeAntflyClient(url, headers);
-  }, [url, headers]);
+    initializeAntflyClient(url, stableHeaders);
+  }, [url, stableHeaders]);
 
   const reducer = (state: SharedState, action: SharedAction): SharedState => {
     switch (action.type) {
@@ -81,6 +107,13 @@ export default function Antfly({ children, url, table, onChange, headers = {} }:
       }
       case "setListenerEffect":
         return { ...state, listenerEffect: action.value };
+      case "setSharedConfig":
+        return {
+          ...state,
+          url: action.url,
+          table: action.table,
+          headers: action.headers,
+        };
       default:
         return state;
     }
@@ -88,6 +121,7 @@ export default function Antfly({ children, url, table, onChange, headers = {} }:
 
   return (
     <SharedContextProvider initialState={initialState} reducer={reducer}>
+      <SharedConfigSync url={url} table={table} headers={stableHeaders} />
       <Listener onChange={onChange}>{children}</Listener>
     </SharedContextProvider>
   );
