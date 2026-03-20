@@ -80,20 +80,81 @@ func (pq *PriorityQueue) Clone(asMaxHeap bool) *PriorityQueue {
 	return newPQ
 }
 
+func (pq *PriorityQueue) Best() *PriorityItem {
+	if len(pq.items) == 0 {
+		return nil
+	}
+	best := pq.items[0]
+	if best.Removed {
+		best = nil
+	}
+	for _, item := range pq.items[1:] {
+		if item.Removed {
+			continue
+		}
+		if best == nil || item.Distance < best.Distance {
+			best = item
+		}
+	}
+	return best
+}
+
 func (pq *PriorityQueue) Items(k int) []*PriorityItem {
-	k = min(k, pq.Len())
-	// Return a copy of the items to avoid external modification
-	itemsCopy := make([]*PriorityItem, pq.Len())
-	copy(itemsCopy, pq.items)
+	if k <= 0 || len(pq.items) == 0 {
+		return nil
+	}
+	if k == 1 {
+		best := pq.Best()
+		if best == nil {
+			return nil
+		}
+		return []*PriorityItem{best}
+	}
+
+	liveCount := 0
+	for _, item := range pq.items {
+		if !item.Removed {
+			liveCount++
+		}
+	}
+	if liveCount == 0 {
+		return nil
+	}
+	k = min(k, liveCount)
+	if k == liveCount {
+		itemsCopy := make([]*PriorityItem, 0, liveCount)
+		for _, item := range pq.items {
+			if !item.Removed {
+				itemsCopy = append(itemsCopy, item)
+			}
+		}
+		slices.SortFunc(itemsCopy, func(a, b *PriorityItem) int {
+			return cmp.Compare(a.Distance, b.Distance)
+		})
+		return itemsCopy
+	}
+
+	bestK := NewPriorityQueue(true, k)
+	for _, item := range pq.items {
+		if item.Removed {
+			continue
+		}
+		if bestK.Len() < k {
+			heap.Push(bestK, item)
+			continue
+		}
+		if item.Distance < bestK.Peek().Distance {
+			heap.Pop(bestK)
+			heap.Push(bestK, item)
+		}
+	}
+
+	itemsCopy := make([]*PriorityItem, len(bestK.items))
+	copy(itemsCopy, bestK.items)
 	slices.SortFunc(itemsCopy, func(a, b *PriorityItem) int {
-		// if pq.isMaxHeap {
-		// 	// For max-heap, we want higher distances first
-		// 	return cmp.Compare(a.Distance, b.Distance)
-		// }
-		// // For min-heap, we want lower distances first
 		return cmp.Compare(a.Distance, b.Distance)
 	})
-	return itemsCopy[:k]
+	return itemsCopy
 }
 
 func (pq *PriorityQueue) Len() int { return len(pq.items) }

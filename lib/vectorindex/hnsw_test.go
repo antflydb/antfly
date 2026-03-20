@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/antflydb/antfly/lib/utils"
 	"github.com/antflydb/antfly/lib/vector"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -496,6 +497,72 @@ func TestHNSWIndex_SearchWithFilterPrefix(t *testing.T) {
 	})
 }
 
+func TestHNSWIndex_SearchWithFilterPrefixGraphTraversal(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "pebble_index")
+
+	config := HNSWConfig{
+		Dimension:             1,
+		IndexPath:             indexPath,
+		Neighbors:             8,
+		NeighborsHigherLayers: 8,
+		EfConstruction:        16,
+		EfSearch:              4,
+		CacheSizeNodes:        100,
+		PebbleSyncWrite:       true,
+		LevelMultiplier:       1.0 / math.Log(2.0),
+		DirectFiltering:       true,
+	}
+
+	index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	batch := index.db.NewIndexedBatch()
+	defer func() { _ = batch.Close() }()
+
+	nodes := []struct {
+		id       uint64
+		vec      vector.T
+		metadata []byte
+	}{
+		{1, vector.T{10}, []byte("other:start")},
+		{2, vector.T{7}, []byte("match:far")},
+		{3, vector.T{1}, []byte("other:bridge")},
+		{4, vector.T{0}, []byte("match:best")},
+	}
+	vecBuf := make([]byte, 0, 16)
+	for _, node := range nodes {
+		require.NoError(t, index.InitializeNodeData(vecBuf, batch, 0, node.id, node.vec, node.metadata))
+	}
+
+	buf := bytes.NewBuffer(nil)
+	require.NoError(t, serializeNeighbors(buf, []*PriorityItem{
+		{ID: 2, Distance: 49},
+		{ID: 3, Distance: 1},
+	}))
+	require.NoError(t, batch.Set(makePebbleGraphLayerKey(1, 0), bytes.Clone(buf.Bytes()), nil))
+	require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 1, Distance: 49}}))
+	require.NoError(t, batch.Set(makePebbleGraphLayerKey(2, 0), bytes.Clone(buf.Bytes()), nil))
+	require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 4, Distance: 1}}))
+	require.NoError(t, batch.Set(makePebbleGraphLayerKey(3, 0), bytes.Clone(buf.Bytes()), nil))
+	require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 3, Distance: 1}}))
+	require.NoError(t, batch.Set(makePebbleGraphLayerKey(4, 0), bytes.Clone(buf.Bytes()), nil))
+	require.NoError(t, index.setEntryPoint(batch, 1))
+	require.NoError(t, index.setActiveCount(batch, 4))
+	require.NoError(t, batch.Commit(index.writeOpts))
+
+	results, err := index.Search(&SearchRequest{
+		Embedding:    vector.T{0},
+		K:            1,
+		FilterPrefix: []byte("match:"),
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.EqualValues(t, 4, results[0].ID)
+	assert.Equal(t, []byte("match:best"), results[0].Metadata)
+}
+
 func TestHNSWIndex_Delete(t *testing.T) {
 	tempDir := t.TempDir()
 	indexPath := filepath.Join(tempDir, "pebble_index")
@@ -575,6 +642,102 @@ func TestHNSWIndex_Delete(t *testing.T) {
 	// Verify counts after deleting entry point
 	stats = index.Stats()
 	assert.EqualValues(t, 1, stats["nodes_active"])
+}
+
+func TestHNSWIndex_DeleteByMetadataDeletesAllMatches(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "pebble_index")
+
+	config := HNSWConfig{
+		Dimension:             2,
+		IndexPath:             indexPath,
+		Neighbors:             8,
+		NeighborsHigherLayers: 8,
+		EfConstruction:        32,
+		EfSearch:              16,
+		CacheSizeNodes:        128,
+		PebbleSyncWrite:       true,
+		LevelMultiplier:       1.0 / math.Log(2.0),
+	}
+
+	index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	err = index.BatchInsert(t.Context(),
+		[]uint64{1, 2, 3},
+		[]vector.T{{1, 0}, {0, 1}, {1, 1}},
+		[][]byte{[]byte("dup"), []byte("dup"), []byte("keep")},
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, index.DeleteByMetadata([]byte("dup")))
+
+	stats := index.Stats()
+	assert.EqualValues(t, 1, stats["nodes_active"])
+
+	_, err = index.GetMetadata(1)
+	assert.Error(t, err)
+	_, err = index.GetMetadata(2)
+	assert.Error(t, err)
+
+	meta, err := index.GetMetadata(3)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("keep"), meta)
+}
+
+func TestHNSWIndex_BatchInsertUpdatesExistingIDs(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "pebble_index")
+
+	config := HNSWConfig{
+		Dimension:             1,
+		IndexPath:             indexPath,
+		Neighbors:             8,
+		NeighborsHigherLayers: 8,
+		EfConstruction:        32,
+		EfSearch:              16,
+		CacheSizeNodes:        128,
+		PebbleSyncWrite:       true,
+		LevelMultiplier:       1.0 / math.Log(2.0),
+	}
+
+	index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	require.NoError(t, index.BatchInsert(
+		t.Context(),
+		[]uint64{1, 2, 3},
+		[]vector.T{{10}, {5}, {2}},
+		[][]byte{[]byte("old-1"), []byte("node-2"), []byte("node-3")},
+	))
+
+	entryPoint, err := index.getEntryPoint(index.db)
+	require.NoError(t, err)
+
+	require.NoError(t, index.BatchInsert(
+		t.Context(),
+		[]uint64{entryPoint, entryPoint},
+		[]vector.T{{9}, {0}},
+		[][]byte{[]byte("stale"), []byte("updated")},
+	))
+
+	stats := index.Stats()
+	assert.EqualValues(t, 3, stats["nodes_active"])
+
+	meta, err := index.GetMetadata(entryPoint)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("updated"), meta)
+
+	results, err := index.Search(&SearchRequest{
+		Embedding: vector.T{0},
+		K:         1,
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.EqualValues(t, entryPoint, results[0].ID)
+	assert.Equal(t, []byte("updated"), results[0].Metadata)
 }
 
 func TestHNSWIndex_GetVector(t *testing.T) {
@@ -914,6 +1077,237 @@ func TestHNSWIndex_CloseAndReopen(t *testing.T) {
 	}
 }
 
+func TestHNSWIndex_RebuildsReverseGraphOnReopen(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "pebble_index")
+
+	config := HNSWConfig{
+		Dimension:             3,
+		IndexPath:             indexPath,
+		Neighbors:             16,
+		NeighborsHigherLayers: 16,
+		EfConstruction:        100,
+		EfSearch:              50,
+		CacheSizeNodes:        1000,
+		PebbleSyncWrite:       true,
+		LevelMultiplier:       1.0 / math.Log(2.0),
+	}
+
+	randSource := rand.NewPCG(42, 1024)
+	{
+		index, err := NewHNSWIndex(config, randSource)
+		require.NoError(t, err)
+
+		err = index.BatchInsert(
+			t.Context(),
+			[]uint64{1, 2, 3, 4},
+			[]vector.T{
+				{1, 0, 0},
+				{0.9, 0.1, 0},
+				{0, 1, 0},
+				{0, 0, 1},
+			},
+			[][]byte{
+				[]byte("meta 1"),
+				[]byte("meta 2"),
+				[]byte("meta 3"),
+				[]byte("meta 4"),
+			},
+		)
+		require.NoError(t, err)
+
+		batch := index.db.NewIndexedBatch()
+		require.NoError(t, batch.DeleteRange(pebbleReverseGraphPrefix, utils.PrefixSuccessor(pebbleReverseGraphPrefix), nil))
+		require.NoError(t, batch.Commit(index.writeOpts))
+		require.NoError(t, batch.Close())
+		require.NoError(t, index.Close())
+	}
+
+	index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	err = index.Delete(2)
+	require.NoError(t, err)
+
+	stats := index.Stats()
+	assert.EqualValues(t, 3, stats["nodes_active"])
+
+	results, err := index.Search(&SearchRequest{
+		Embedding: []float32{1, 0, 0},
+		K:         3,
+	})
+	require.NoError(t, err)
+	for _, result := range results {
+		assert.NotEqualValues(t, 2, result.ID)
+	}
+}
+
+func TestHNSWIndex_SearchUsesOverlayEntryPointAfterReopen(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "pebble_index")
+
+	config := HNSWConfig{
+		Dimension:             1,
+		IndexPath:             indexPath,
+		Neighbors:             8,
+		NeighborsHigherLayers: 8,
+		EfConstruction:        16,
+		EfSearch:              4,
+		CacheSizeNodes:        64,
+		PebbleSyncWrite:       true,
+		LevelMultiplier:       1.0 / math.Log(2.0),
+	}
+
+	{
+		index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+		require.NoError(t, err)
+
+		batch := index.db.NewIndexedBatch()
+		vecBuf := make([]byte, 0, 16)
+		nodes := []struct {
+			id        uint64
+			layer     int
+			vector    vector.T
+			metadata  []byte
+			isOverlay bool
+		}{
+			{1, 1, vector.T{10}, []byte("base:entry"), false},
+			{2, 0, vector.T{8}, []byte("base:neighbor"), false},
+			{3, 1, vector.T{2}, []byte("overlay:entry"), true},
+			{4, 0, vector.T{0}, []byte("overlay:best"), true},
+		}
+		for _, node := range nodes {
+			require.NoError(t, index.InitializeNodeData(vecBuf, batch, node.layer, node.id, node.vector, node.metadata))
+			if node.isOverlay {
+				require.NoError(t, batch.Set(makePebbleOverlayKey(node.id), []byte{1}, nil))
+			}
+		}
+
+		buf := bytes.NewBuffer(nil)
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 2, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(1, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 1, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(2, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 4, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(3, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 3, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(4, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(1, 1), []byte{}, nil))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(3, 1), []byte{}, nil))
+
+		require.NoError(t, index.setActiveCount(batch, 4))
+		require.NoError(t, index.setEntryPoint(batch, 1))
+		require.NoError(t, index.setBaseEntryPoint(batch, 1))
+		require.NoError(t, index.setOverlayEntryPoint(batch, 3))
+		require.NoError(t, index.setOverlayCount(batch, 2))
+		require.NoError(t, batch.Commit(index.writeOpts))
+		require.NoError(t, batch.Close())
+		require.NoError(t, index.Close())
+	}
+
+	index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	stats := index.Stats()
+	assert.EqualValues(t, 1, stats["base_entry_point"])
+	assert.EqualValues(t, 3, stats["overlay_entry_point"])
+	assert.EqualValues(t, 2, stats["overlay_count"])
+
+	results, err := index.Search(&SearchRequest{
+		Embedding: vector.T{0},
+		K:         1,
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.EqualValues(t, 4, results[0].ID)
+	assert.Equal(t, []byte("overlay:best"), results[0].Metadata)
+}
+
+func TestHNSWIndex_RepairsStaleEntryPointsOnReopen(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "pebble_index")
+
+	config := HNSWConfig{
+		Dimension:             1,
+		IndexPath:             indexPath,
+		Neighbors:             8,
+		NeighborsHigherLayers: 8,
+		EfConstruction:        16,
+		EfSearch:              4,
+		CacheSizeNodes:        64,
+		PebbleSyncWrite:       true,
+		LevelMultiplier:       1.0 / math.Log(2.0),
+	}
+
+	{
+		index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+		require.NoError(t, err)
+
+		batch := index.db.NewIndexedBatch()
+		vecBuf := make([]byte, 0, 16)
+		nodes := []struct {
+			id        uint64
+			layer     int
+			vector    vector.T
+			metadata  []byte
+			isOverlay bool
+		}{
+			{1, 1, vector.T{10}, []byte("base:entry"), false},
+			{2, 0, vector.T{8}, []byte("base:neighbor"), false},
+			{3, 1, vector.T{2}, []byte("overlay:entry"), true},
+			{4, 0, vector.T{0}, []byte("overlay:best"), true},
+		}
+		for _, node := range nodes {
+			require.NoError(t, index.InitializeNodeData(vecBuf, batch, node.layer, node.id, node.vector, node.metadata))
+			if node.isOverlay {
+				require.NoError(t, batch.Set(makePebbleOverlayKey(node.id), []byte{1}, nil))
+			}
+		}
+
+		buf := bytes.NewBuffer(nil)
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 2, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(1, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 1, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(2, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 4, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(3, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, serializeNeighbors(buf, []*PriorityItem{{ID: 3, Distance: 4}}))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(4, 0), bytes.Clone(buf.Bytes()), nil))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(1, 1), []byte{}, nil))
+		require.NoError(t, batch.Set(makePebbleGraphLayerKey(3, 1), []byte{}, nil))
+
+		require.NoError(t, index.setActiveCount(batch, 4))
+		require.NoError(t, index.setEntryPoint(batch, 999))
+		require.NoError(t, index.setBaseEntryPoint(batch, 998))
+		require.NoError(t, index.setOverlayEntryPoint(batch, 997))
+		require.NoError(t, index.setOverlayCount(batch, 2))
+		require.NoError(t, batch.Commit(index.writeOpts))
+		require.NoError(t, batch.Close())
+		require.NoError(t, index.Close())
+	}
+
+	index, err := NewHNSWIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	stats := index.Stats()
+	assert.EqualValues(t, 1, stats["entry_point"])
+	assert.EqualValues(t, 1, stats["base_entry_point"])
+	assert.EqualValues(t, 3, stats["overlay_entry_point"])
+	assert.EqualValues(t, 2, stats["overlay_count"])
+
+	results, err := index.Search(&SearchRequest{
+		Embedding: vector.T{0},
+		K:         1,
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.EqualValues(t, 4, results[0].ID)
+	assert.Equal(t, []byte("overlay:best"), results[0].Metadata)
+}
+
 // generateRandomVectors generates random vectors for testing
 func generateRandomVectors(dim int, count int, r *rand.Rand) []vector.T {
 	vectors := make([]vector.T, count)
@@ -1139,7 +1533,7 @@ func BenchmarkHNSWIndex_Search(b *testing.B) {
 		query[i] = r.Float32()
 	}
 
-	// Reset benchmark timer
+	b.ResetTimer()
 
 	// Run the benchmark
 	for b.Loop() {

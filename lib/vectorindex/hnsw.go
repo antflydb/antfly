@@ -28,13 +28,13 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 
 	"github.com/antflydb/antfly/lib/logger"
@@ -45,17 +45,20 @@ import (
 )
 
 const (
-	pebbleDirname = "pebble" // Directory for PebbleDB data
-	indexVersion  = 2        // Version of the index metadata format - bumped for HNSW support
+	pebbleDirname          = "pebble" // Directory for PebbleDB data
+	indexVersion           = 2        // Version of the index metadata format - bumped for HNSW support
+	serializedNeighborSize = 12
 )
 
 // PebbleDB key prefixes for different data types
 var (
-	pebbleNodeKeyPrefix     = []byte("n:") // Key prefix for node data
-	pebbleGraphKeySuffix    = []byte(":g") // Suffix for graph keys
-	pebbleVectorKeySuffix   = []byte(":v") // Suffix for vector keys
-	pebbleMetadataKeySuffix = []byte(":m") // Suffix for metadata keys
-	pebbleLayerKeySuffix    = []byte(":l") // Suffix for layer assignment
+	pebbleNodeKeyPrefix      = []byte("n:") // Key prefix for node data
+	pebbleGraphKeySuffix     = []byte(":g") // Suffix for graph keys
+	pebbleVectorKeySuffix    = []byte(":v") // Suffix for vector keys
+	pebbleMetadataKeySuffix  = []byte(":m") // Suffix for metadata keys
+	pebbleLayerKeySuffix     = []byte(":l") // Suffix for layer assignment
+	pebbleOverlayKeySuffix   = []byte(":o") // Suffix for overlay membership marker
+	pebbleReverseGraphPrefix = []byte("r:")
 	// Key structure: i:<[]byte> -> nodeID (user metadata invert)
 	pebbleMetadataInvertKeyPrefix = []byte("i:")
 	// Key structure: meta -> serialized index metadata
@@ -64,7 +67,15 @@ var (
 	activeCountPrefix = []byte("\x00\x00__active_count__:")
 	// Key structure: __entry_point__:<indexName> -> uint64
 	entryPointPrefix = []byte("\x00\x00__entry_point__:")
+	// Key structure: __base_entry_point__:<indexName> -> uint64
+	baseEntryPointPrefix = []byte("\x00\x00__base_entry_point__:")
+	// Key structure: __overlay_entry_point__:<indexName> -> uint64
+	overlayEntryPointPrefix = []byte("\x00\x00__overlay_entry_point__:")
+	// Key structure: __overlay_count__:<indexName> -> uint64
+	overlayCountPrefix = []byte("\x00\x00__overlay_count__:")
 )
+
+var hnswOverlayActivationMinNodes uint64 = 256
 
 func makePebbleNodePrefix(node uint64) []byte {
 	// Key structure: n:<nodeID>:g
@@ -91,31 +102,28 @@ func makePebbleNodeRange(nodeID uint64) (lower, upper []byte) {
 	return lower, upper
 }
 
-func makePebbleVectorKey(node uint64) []byte {
-	// Key structure: n:<nodeID>:v
-	key := make([]byte, len(pebbleNodeKeyPrefix)+8+2)
+func makePebbleNodeKey(node uint64, suffix []byte) []byte {
+	key := make([]byte, len(pebbleNodeKeyPrefix)+8+len(suffix))
 	copy(key, pebbleNodeKeyPrefix)
 	binary.BigEndian.PutUint64(key[len(pebbleNodeKeyPrefix):], node)
-	copy(key[len(pebbleNodeKeyPrefix)+8:], pebbleVectorKeySuffix)
+	copy(key[len(pebbleNodeKeyPrefix)+8:], suffix)
 	return key
+}
+
+func makePebbleVectorKey(node uint64) []byte {
+	return makePebbleNodeKey(node, pebbleVectorKeySuffix)
 }
 
 func makePebbleMetadataKey(node uint64) []byte {
-	// Key structure: n:<nodeID>:m
-	key := make([]byte, len(pebbleNodeKeyPrefix)+8+2)
-	copy(key, pebbleNodeKeyPrefix)
-	binary.BigEndian.PutUint64(key[len(pebbleNodeKeyPrefix):], node)
-	copy(key[len(pebbleNodeKeyPrefix)+8:], pebbleMetadataKeySuffix)
-	return key
+	return makePebbleNodeKey(node, pebbleMetadataKeySuffix)
 }
 
 func makePebbleLayerKey(node uint64) []byte {
-	// Key structure: n:<nodeID>:l
-	key := make([]byte, len(pebbleNodeKeyPrefix)+8+2)
-	copy(key, pebbleNodeKeyPrefix)
-	binary.BigEndian.PutUint64(key[len(pebbleNodeKeyPrefix):], node)
-	copy(key[len(pebbleNodeKeyPrefix)+8:], pebbleLayerKeySuffix)
-	return key
+	return makePebbleNodeKey(node, pebbleLayerKeySuffix)
+}
+
+func makePebbleOverlayKey(node uint64) []byte {
+	return makePebbleNodeKey(node, pebbleOverlayKeySuffix)
 }
 
 // makePebbleGraphLayerKey creates a key for graph connections at a specific layer
@@ -130,12 +138,61 @@ func makePebbleGraphLayerKey(node uint64, layer int) []byte {
 	return key
 }
 
-// makePebbleMetadataInvertKey creates a PebbleDB key for user metadata
-func makePebbleMetadataInvertKey(metadata []byte) []byte {
+func makePebbleReverseGraphPrefix(target uint64) []byte {
+	key := make([]byte, len(pebbleReverseGraphPrefix)+8)
+	copy(key, pebbleReverseGraphPrefix)
+	binary.BigEndian.PutUint64(key[len(pebbleReverseGraphPrefix):], target)
+	return key
+}
+
+func makePebbleReverseGraphKey(target uint64, layer int, source uint64) []byte {
+	key := make([]byte, len(pebbleReverseGraphPrefix)+8+4+8)
+	copy(key, pebbleReverseGraphPrefix)
+	binary.BigEndian.PutUint64(key[len(pebbleReverseGraphPrefix):], target)
+	binary.BigEndian.PutUint32(key[len(pebbleReverseGraphPrefix)+8:], uint32(layer)) //nolint:gosec // G115
+	binary.BigEndian.PutUint64(key[len(pebbleReverseGraphPrefix)+8+4:], source)
+	return key
+}
+
+func decodePebbleReverseGraphKey(key []byte) (target uint64, layer int, source uint64, ok bool) {
+	if len(key) != len(pebbleReverseGraphPrefix)+8+4+8 || !bytes.HasPrefix(key, pebbleReverseGraphPrefix) {
+		return 0, 0, 0, false
+	}
+	target = binary.BigEndian.Uint64(key[len(pebbleReverseGraphPrefix):])
+	layer = int(binary.BigEndian.Uint32(key[len(pebbleReverseGraphPrefix)+8:]))
+	source = binary.BigEndian.Uint64(key[len(pebbleReverseGraphPrefix)+8+4:])
+	return target, layer, source, true
+}
+
+// makePebbleMetadataInvertPrefix creates the prefix for metadata->node reverse lookups.
+func makePebbleMetadataInvertPrefix(metadata []byte) []byte {
 	key := make([]byte, len(pebbleMetadataInvertKeyPrefix)+len(metadata))
 	copy(key, pebbleMetadataInvertKeyPrefix)
 	copy(key[len(pebbleMetadataInvertKeyPrefix):], metadata)
 	return key
+}
+
+// makePebbleMetadataInvertKey creates a PebbleDB key for user metadata and node ID.
+func makePebbleMetadataInvertKey(metadata []byte, id uint64) []byte {
+	key := make([]byte, len(pebbleMetadataInvertKeyPrefix)+len(metadata)+8)
+	copy(key, pebbleMetadataInvertKeyPrefix)
+	copy(key[len(pebbleMetadataInvertKeyPrefix):], metadata)
+	binary.BigEndian.PutUint64(key[len(pebbleMetadataInvertKeyPrefix)+len(metadata):], id)
+	return key
+}
+
+func decodeMetadataInvertKey(prefix []byte, key, value []byte) (uint64, []byte, bool) {
+	if len(key) >= len(prefix)+8 && bytes.HasPrefix(key, prefix) {
+		id := binary.BigEndian.Uint64(key[len(key)-8:])
+		metadata := key[len(pebbleMetadataInvertKeyPrefix) : len(key)-8]
+		return id, metadata, true
+	}
+	if len(key) != len(prefix) || len(value) != 8 || !bytes.Equal(key, prefix) {
+		return 0, nil, false
+	}
+	id := binary.BigEndian.Uint64(value)
+	metadata := key[len(pebbleMetadataInvertKeyPrefix):]
+	return id, metadata, true
 }
 
 // makeActiveCountKey creates a PebbleDB key for the active count
@@ -146,6 +203,18 @@ func makeActiveCountKey(indexName string) []byte {
 // makeEntryPointKey creates a PebbleDB key for the entry point
 func makeEntryPointKey(indexName string) []byte {
 	return append(bytes.Clone(entryPointPrefix), indexName...)
+}
+
+func makeBaseEntryPointKey(indexName string) []byte {
+	return append(bytes.Clone(baseEntryPointPrefix), indexName...)
+}
+
+func makeOverlayEntryPointKey(indexName string) []byte {
+	return append(bytes.Clone(overlayEntryPointPrefix), indexName...)
+}
+
+func makeOverlayCountKey(indexName string) []byte {
+	return append(bytes.Clone(overlayCountPrefix), indexName...)
 }
 
 // HNSWConfig holds configuration parameters specific to the PebbleDB-based index.
@@ -220,6 +289,14 @@ type HNSWIndex struct {
 	db     *pebble.DB
 	dbPath string // Path to the PebbleDB directory
 
+	activeCountKey       []byte
+	entryPointKey        []byte
+	baseEntryPointKey    []byte
+	overlayEntryPointKey []byte
+	overlayCountKey      []byte
+	indexMetaKey         []byte
+	nodeKeyUpperEnd      []byte
+
 	// LRU Cache implementation for node data (vector + neighbors)
 
 	cacheMu     sync.RWMutex
@@ -236,6 +313,42 @@ type HNSWIndex struct {
 	visitedPool  *sync.Pool
 }
 
+type hnswEntryPointClass int
+
+const (
+	hnswEntryPointAny hnswEntryPointClass = iota
+	hnswEntryPointBase
+	hnswEntryPointOverlay
+)
+
+type hnswMutableState struct {
+	activeCount uint64
+
+	globalEntryPoint  uint64
+	globalMaxLayer    int
+	baseEntryPoint    uint64
+	baseMaxLayer      int
+	overlayEntryPoint uint64
+	overlayMaxLayer   int
+	overlayCount      uint64
+}
+
+func (s *hnswMutableState) overlayActive() bool {
+	return s.overlayCount > 0 || s.activeCount >= hnswOverlayActivationMinNodes
+}
+
+type hnswBatchContext struct {
+	batch *pebble.Batch
+	nodes map[uint64]*HNSWNodeData
+}
+
+func newHNSWBatchContext(batch *pebble.Batch) *hnswBatchContext {
+	return &hnswBatchContext{
+		batch: batch,
+		nodes: make(map[uint64]*HNSWNodeData, 256),
+	}
+}
+
 // Name returns the base path of the index.
 func (idx *HNSWIndex) Name() string {
 	return idx.config.IndexPath
@@ -243,60 +356,221 @@ func (idx *HNSWIndex) Name() string {
 
 var ErrActiveCountNotFound = errors.New("active count not found in index")
 
-// getActiveCount reads the active count from PebbleDB
-func (idx *HNSWIndex) getActiveCount(db pebble.Reader) (uint64, error) {
-	key := makeActiveCountKey(idx.config.Name)
+func readUint64Key(db pebble.Reader, key []byte, notFound error, name string) (uint64, error) {
 	value, closer, err := db.Get(key)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return 0, ErrActiveCountNotFound
+			return 0, notFound
 		}
-		return 0, fmt.Errorf("failed to read active count: %w", err)
+		return 0, fmt.Errorf("failed to read %s: %w", name, err)
 	}
 	defer func() { _ = closer.Close() }()
 
 	if len(value) != 8 {
-		return 0, fmt.Errorf("invalid active count value size: %d", len(value))
+		return 0, fmt.Errorf("invalid %s value size: %d", name, len(value))
 	}
 
 	return binary.LittleEndian.Uint64(value), nil
+}
+
+func setUint64Key(batch *pebble.Batch, key []byte, value uint64) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], value)
+	return batch.Set(key, buf[:], nil)
+}
+
+func nodeExists(db pebble.Reader, id uint64) (bool, error) {
+	value, closer, err := db.Get(makePebbleVectorKey(id))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to check vector for ID %d: %w", id, err)
+	}
+	defer func() { _ = closer.Close() }()
+	return len(value) > 0, nil
+}
+
+func hasReverseGraphEntries(db pebble.Reader) (bool, error) {
+	lower := pebbleReverseGraphPrefix
+	upper := utils.PrefixSuccessor(pebbleReverseGraphPrefix)
+	iter, err := db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return false, fmt.Errorf("creating reverse graph iterator: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+	if iter.First() {
+		return true, nil
+	}
+	return false, iter.Error()
+}
+
+func (idx *HNSWIndex) rebuildReverseGraphIndex(batch *pebble.Batch) error {
+	if err := batch.DeleteRange(pebbleReverseGraphPrefix, utils.PrefixSuccessor(pebbleReverseGraphPrefix), nil); err != nil {
+		return fmt.Errorf("clearing reverse graph index: %w", err)
+	}
+
+	iter, err := idx.db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
+		LowerBound: pebbleNodeKeyPrefix,
+		UpperBound: idx.nodeKeyUpperEnd,
+	})
+	if err != nil {
+		return fmt.Errorf("creating graph iterator for reverse graph rebuild: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebbleNodeKeyPrefix)+8+len(pebbleGraphKeySuffix)+1+4 ||
+			!bytes.HasSuffix(key[:len(key)-5], pebbleGraphKeySuffix) {
+			continue
+		}
+
+		source := binary.BigEndian.Uint64(key[len(pebbleNodeKeyPrefix) : len(pebbleNodeKeyPrefix)+8])
+		layer := int(binary.BigEndian.Uint32(key[len(key)-4:]))
+		neighbors, err := idx.deserializeNeighborsWithPool(iter.Value())
+		if err != nil {
+			return fmt.Errorf("rebuilding reverse graph for node %d layer %d: %w", source, layer, err)
+		}
+		for _, neighbor := range neighbors {
+			if err := batch.Set(makePebbleReverseGraphKey(neighbor.ID, layer, source), nil, nil); err != nil {
+				return fmt.Errorf("writing reverse graph edge %d <- %d at layer %d: %w", neighbor.ID, source, layer, err)
+			}
+		}
+	}
+
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("iterating graph for reverse graph rebuild: %w", err)
+	}
+	return nil
+}
+
+func readIncomingEdges(db pebble.Reader, target uint64) (map[int][]uint64, error) {
+	prefix := makePebbleReverseGraphPrefix(target)
+	iter, err := db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: utils.PrefixSuccessor(prefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating reverse graph iterator for %d: %w", target, err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	incoming := make(map[int][]uint64)
+	for iter.First(); iter.Valid(); iter.Next() {
+		_, layer, source, ok := decodePebbleReverseGraphKey(iter.Key())
+		if !ok {
+			continue
+		}
+		incoming[layer] = append(incoming[layer], source)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterating reverse graph for %d: %w", target, err)
+	}
+	return incoming, nil
+}
+
+func (idx *HNSWIndex) resetEntryPoint(batch *pebble.Batch, invalidEntry uint64) (bool, error) {
+	iter, err := batch.NewIterWithContext(context.TODO(), &pebble.IterOptions{
+		LowerBound: pebbleNodeKeyPrefix,
+		UpperBound: idx.nodeKeyUpperEnd,
+		SkipPoint: func(userKey []byte) bool {
+			suffixToCheck := make([]byte, len(pebbleGraphKeySuffix)+1+4)
+			copy(suffixToCheck, pebbleGraphKeySuffix)
+			suffixToCheck[len(pebbleGraphKeySuffix)] = ':'
+			binary.LittleEndian.PutUint32(suffixToCheck[len(pebbleGraphKeySuffix)+1:], uint32(0)) // Layer 0
+			return len(userKey) < len(pebbleNodeKeyPrefix)+8 || !bytes.HasSuffix(userKey, suffixToCheck)
+		},
+	})
+	if err != nil {
+		return false, fmt.Errorf("error creating iterator: %w", err)
+	}
+	defer func() {
+		_ = iter.Close()
+	}()
+
+	if !iter.First() {
+		return false, nil
+	}
+
+	key := iter.Key()
+	newEntryID := binary.BigEndian.Uint64(key[len(pebbleNodeKeyPrefix) : len(pebbleNodeKeyPrefix)+8])
+	log.Printf("Info: Found new valid entry point: %d (replacing invalid %d)", newEntryID, invalidEntry)
+	if err := idx.setEntryPoint(batch, newEntryID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// getActiveCount reads the active count from PebbleDB
+func (idx *HNSWIndex) getActiveCount(db pebble.Reader) (uint64, error) {
+	return readUint64Key(db, idx.activeCountKey, ErrActiveCountNotFound, "active count")
 }
 
 // setActiveCount writes the active count to PebbleDB
 func (idx *HNSWIndex) setActiveCount(batch *pebble.Batch, count uint64) error {
-	key := makeActiveCountKey(idx.config.Name)
-	value := make([]byte, 8)
-	binary.LittleEndian.PutUint64(value, count)
-	return batch.Set(key, value, nil)
+	return setUint64Key(batch, idx.activeCountKey, count)
 }
 
 var ErrEntryPointNotFound = errors.New("entry point not found")
+var ErrBaseEntryPointNotFound = errors.New("base entry point not found")
+var ErrOverlayEntryPointNotFound = errors.New("overlay entry point not found")
+var ErrOverlayCountNotFound = errors.New("overlay count not found")
 
 // getEntryPoint reads the entry point from PebbleDB
 func (idx *HNSWIndex) getEntryPoint(db pebble.Reader) (uint64, error) {
-	key := makeEntryPointKey(idx.config.Name)
-	value, closer, err := db.Get(key)
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return 0, ErrEntryPointNotFound
-		}
-		return 0, fmt.Errorf("failed to read entry point: %w", err)
-	}
-	defer func() { _ = closer.Close() }()
-
-	if len(value) != 8 {
-		return 0, fmt.Errorf("invalid entry point value size: %d", len(value))
-	}
-
-	return binary.LittleEndian.Uint64(value), nil
+	return readUint64Key(db, idx.entryPointKey, ErrEntryPointNotFound, "entry point")
 }
 
 // setEntryPoint writes the entry point to PebbleDB
 func (idx *HNSWIndex) setEntryPoint(batch *pebble.Batch, entryPoint uint64) error {
-	key := makeEntryPointKey(idx.config.Name)
-	value := make([]byte, 8)
-	binary.LittleEndian.PutUint64(value, entryPoint)
-	return batch.Set(key, value, nil)
+	return setUint64Key(batch, idx.entryPointKey, entryPoint)
+}
+
+func (idx *HNSWIndex) getBaseEntryPoint(db pebble.Reader) (uint64, error) {
+	return readUint64Key(db, idx.baseEntryPointKey, ErrBaseEntryPointNotFound, "base entry point")
+}
+
+func (idx *HNSWIndex) setBaseEntryPoint(batch *pebble.Batch, entryPoint uint64) error {
+	return setUint64Key(batch, idx.baseEntryPointKey, entryPoint)
+}
+
+func (idx *HNSWIndex) getOverlayEntryPoint(db pebble.Reader) (uint64, error) {
+	return readUint64Key(db, idx.overlayEntryPointKey, ErrOverlayEntryPointNotFound, "overlay entry point")
+}
+
+func (idx *HNSWIndex) setOverlayEntryPoint(batch *pebble.Batch, entryPoint uint64) error {
+	return setUint64Key(batch, idx.overlayEntryPointKey, entryPoint)
+}
+
+func (idx *HNSWIndex) getOverlayCount(db pebble.Reader) (uint64, error) {
+	return readUint64Key(db, idx.overlayCountKey, ErrOverlayCountNotFound, "overlay count")
+}
+
+func (idx *HNSWIndex) setOverlayCount(batch *pebble.Batch, count uint64) error {
+	return setUint64Key(batch, idx.overlayCountKey, count)
+}
+
+func (idx *HNSWIndex) nodeIsOverlay(db pebble.Reader, id uint64) (bool, error) {
+	value, closer, err := db.Get(makePebbleOverlayKey(id))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to read overlay marker for node %d: %w", id, err)
+	}
+	defer func() { _ = closer.Close() }()
+	return len(value) > 0, nil
+}
+
+func (idx *HNSWIndex) setNodeOverlay(batch *pebble.Batch, id uint64, isOverlay bool) error {
+	if isOverlay {
+		return batch.Set(makePebbleOverlayKey(id), []byte{1}, nil)
+	}
+	return batch.Delete(makePebbleOverlayKey(id), nil)
 }
 
 // NewHNSWIndex creates or loads a PebbleANN index.
@@ -338,16 +612,24 @@ func NewHNSWIndex(config HNSWConfig, randSource rand.Source) (*HNSWIndex, error)
 	}
 
 	idx := &HNSWIndex{
-		config:          config,
-		assignmentProbs: assignmentProbs,
-		rand:            rand.New(randSource),           //nolint:gosec // G404: non-security randomness for ML/jitter
-		cacheList:       list.New(),                     // Initialize LRU list
-		nodeCache:       make(map[uint64]*list.Element), // Initialize cache map
-		dbPath:          filepath.Join(config.IndexPath, pebbleDirname),
+		config:               config,
+		assignmentProbs:      assignmentProbs,
+		rand:                 rand.New(randSource),           //nolint:gosec // G404: non-security randomness for ML/jitter
+		cacheList:            list.New(),                     // Initialize LRU list
+		nodeCache:            make(map[uint64]*list.Element), // Initialize cache map
+		dbPath:               filepath.Join(config.IndexPath, pebbleDirname),
+		activeCountKey:       makeActiveCountKey(config.Name),
+		entryPointKey:        makeEntryPointKey(config.Name),
+		baseEntryPointKey:    makeBaseEntryPointKey(config.Name),
+		overlayEntryPointKey: makeOverlayEntryPointKey(config.Name),
+		overlayCountKey:      makeOverlayCountKey(config.Name),
+		indexMetaKey:         append(bytes.Clone(indexMetaPrefix), config.Name...),
+		nodeKeyUpperEnd:      utils.PrefixSuccessor(pebbleNodeKeyPrefix),
 		nodeDataPool: &sync.Pool{
 			New: func() any {
 				return &HNSWNodeData{
 					neighbors: make(map[int][]*PriorityItem, 4),
+					layer:     -1,
 				}
 			},
 		},
@@ -421,6 +703,28 @@ func NewHNSWIndex(config HNSWConfig, randSource rand.Source) (*HNSWIndex, error)
 	defer func() {
 		_ = batch.Close()
 	}()
+	activeCount, err := idx.getActiveCount(batch)
+	if err != nil && !errors.Is(err, ErrActiveCountNotFound) {
+		_ = idx.db.Close()
+		return nil, fmt.Errorf("checking active count during open: %w", err)
+	}
+	if err == nil && activeCount > 0 {
+		hasReverseEdges, reverseErr := hasReverseGraphEntries(batch)
+		if reverseErr != nil {
+			_ = idx.db.Close()
+			return nil, fmt.Errorf("checking reverse graph index: %w", reverseErr)
+		}
+		if !hasReverseEdges {
+			if err := idx.rebuildReverseGraphIndex(batch); err != nil {
+				_ = idx.db.Close()
+				return nil, fmt.Errorf("rebuilding reverse graph index: %w", err)
+			}
+		}
+	}
+	if err := idx.ensureMutableState(batch); err != nil {
+		_ = idx.db.Close()
+		return nil, fmt.Errorf("ensuring mutable state: %w", err)
+	}
 	// Final consistency check
 	if err := idx.checkConsistency(batch); err != nil {
 		_ = idx.db.Close() // Close DB on error
@@ -459,8 +763,7 @@ func (idx *HNSWIndex) saveIndex(batch *pebble.Batch) error {
 	}
 
 	// Write to PebbleDB
-	indexMetaKey := append(bytes.Clone(indexMetaPrefix), idx.config.Name...)
-	if err := batch.Set(indexMetaKey, buf.Bytes(), nil); err != nil {
+	if err := batch.Set(idx.indexMetaKey, buf.Bytes(), nil); err != nil {
 		return fmt.Errorf("failed to write index metadata to PebbleDB: %w", err)
 	}
 
@@ -481,6 +784,15 @@ func (idx *HNSWIndex) initializeNewIndex() error {
 	if err := idx.setEntryPoint(batch, 0); err != nil {
 		return fmt.Errorf("failed to set initial entry point: %w", err)
 	}
+	if err := idx.setBaseEntryPoint(batch, 0); err != nil {
+		return fmt.Errorf("failed to set initial base entry point: %w", err)
+	}
+	if err := idx.setOverlayEntryPoint(batch, 0); err != nil {
+		return fmt.Errorf("failed to set initial overlay entry point: %w", err)
+	}
+	if err := idx.setOverlayCount(batch, 0); err != nil {
+		return fmt.Errorf("failed to set initial overlay count: %w", err)
+	}
 
 	if err := idx.saveIndex(batch); err != nil {
 		return fmt.Errorf("failed to save initial index metadata: %w", err)
@@ -496,8 +808,7 @@ func (idx *HNSWIndex) initializeNewIndex() error {
 // Does NOT load tombstones (done separately in loadTombstones).
 // Assumes that PebbleDB is already open.
 func (idx *HNSWIndex) loadIndex() (bool, error) {
-	indexMetaKey := append(bytes.Clone(indexMetaPrefix), idx.config.Name...)
-	value, closer, err := idx.db.Get(indexMetaKey)
+	value, closer, err := idx.db.Get(idx.indexMetaKey)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return false, nil
@@ -540,6 +851,341 @@ func (idx *HNSWIndex) loadIndex() (bool, error) {
 	return true, nil
 }
 
+func (idx *HNSWIndex) loadMutableState(db pebble.Reader) (*hnswMutableState, error) {
+	state := &hnswMutableState{
+		globalMaxLayer:  -1,
+		baseMaxLayer:    -1,
+		overlayMaxLayer: -1,
+	}
+
+	activeCount, err := idx.getActiveCount(db)
+	if err != nil {
+		return nil, fmt.Errorf("loading active count: %w", err)
+	}
+	state.activeCount = activeCount
+
+	globalEntryPoint, err := idx.getEntryPoint(db)
+	if err != nil {
+		return nil, fmt.Errorf("loading global entry point: %w", err)
+	}
+	state.globalEntryPoint = globalEntryPoint
+	if globalEntryPoint != 0 {
+		state.globalMaxLayer, err = idx.getNodeLayer(db, globalEntryPoint)
+		if err != nil {
+			return nil, fmt.Errorf("loading global entry point layer for %d: %w", globalEntryPoint, err)
+		}
+	}
+
+	baseEntryPoint, err := idx.getBaseEntryPoint(db)
+	if err != nil {
+		if !errors.Is(err, ErrBaseEntryPointNotFound) {
+			return nil, fmt.Errorf("loading base entry point: %w", err)
+		}
+		baseEntryPoint = globalEntryPoint
+	}
+	state.baseEntryPoint = baseEntryPoint
+	if baseEntryPoint != 0 {
+		state.baseMaxLayer, err = idx.getNodeLayer(db, baseEntryPoint)
+		if err != nil {
+			return nil, fmt.Errorf("loading base entry point layer for %d: %w", baseEntryPoint, err)
+		}
+	}
+
+	overlayEntryPoint, err := idx.getOverlayEntryPoint(db)
+	if err != nil {
+		if !errors.Is(err, ErrOverlayEntryPointNotFound) {
+			return nil, fmt.Errorf("loading overlay entry point: %w", err)
+		}
+		overlayEntryPoint = 0
+	}
+	state.overlayEntryPoint = overlayEntryPoint
+	if overlayEntryPoint != 0 {
+		state.overlayMaxLayer, err = idx.getNodeLayer(db, overlayEntryPoint)
+		if err != nil {
+			return nil, fmt.Errorf("loading overlay entry point layer for %d: %w", overlayEntryPoint, err)
+		}
+	}
+
+	overlayCount, err := idx.getOverlayCount(db)
+	if err != nil {
+		if !errors.Is(err, ErrOverlayCountNotFound) {
+			return nil, fmt.Errorf("loading overlay count: %w", err)
+		}
+		overlayCount = 0
+	}
+	state.overlayCount = overlayCount
+
+	return state, nil
+}
+
+func (idx *HNSWIndex) persistMutableState(batch *pebble.Batch, state *hnswMutableState) error {
+	if err := idx.setActiveCount(batch, state.activeCount); err != nil {
+		return fmt.Errorf("writing active count: %w", err)
+	}
+	if err := idx.setEntryPoint(batch, state.globalEntryPoint); err != nil {
+		return fmt.Errorf("writing global entry point: %w", err)
+	}
+	if err := idx.setBaseEntryPoint(batch, state.baseEntryPoint); err != nil {
+		return fmt.Errorf("writing base entry point: %w", err)
+	}
+	if err := idx.setOverlayEntryPoint(batch, state.overlayEntryPoint); err != nil {
+		return fmt.Errorf("writing overlay entry point: %w", err)
+	}
+	if err := idx.setOverlayCount(batch, state.overlayCount); err != nil {
+		return fmt.Errorf("writing overlay count: %w", err)
+	}
+	return nil
+}
+
+func (idx *HNSWIndex) findEntryPointCandidate(
+	db pebble.Reader,
+	class hnswEntryPointClass,
+) (uint64, int, bool, error) {
+	iter, err := db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
+		LowerBound: pebbleNodeKeyPrefix,
+		UpperBound: idx.nodeKeyUpperEnd,
+		SkipPoint: func(userKey []byte) bool {
+			return !bytes.HasSuffix(userKey, pebbleLayerKeySuffix)
+		},
+	})
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("creating entry point iterator: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	var (
+		bestID    uint64
+		bestLayer = -1
+	)
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebbleNodeKeyPrefix)+8+len(pebbleLayerKeySuffix) {
+			continue
+		}
+		id := binary.BigEndian.Uint64(key[len(pebbleNodeKeyPrefix) : len(pebbleNodeKeyPrefix)+8])
+		isOverlay, err := idx.nodeIsOverlay(db, id)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		switch class {
+		case hnswEntryPointBase:
+			if isOverlay {
+				continue
+			}
+		case hnswEntryPointOverlay:
+			if !isOverlay {
+				continue
+			}
+		}
+		value := iter.Value()
+		if len(value) != 4 {
+			continue
+		}
+		layer := int(binary.LittleEndian.Uint32(value))
+		if layer > bestLayer || (layer == bestLayer && (bestID == 0 || id < bestID)) {
+			bestID = id
+			bestLayer = layer
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, 0, false, fmt.Errorf("iterating entry point candidates: %w", err)
+	}
+	if bestID == 0 {
+		return 0, 0, false, nil
+	}
+	return bestID, bestLayer, true, nil
+}
+
+func (idx *HNSWIndex) ensureMutableState(batch *pebble.Batch) error {
+	state, err := idx.loadMutableState(batch)
+	if err != nil {
+		return err
+	}
+	if state.activeCount == 0 {
+		state.globalEntryPoint = 0
+		state.baseEntryPoint = 0
+		state.overlayEntryPoint = 0
+		state.globalMaxLayer = -1
+		state.baseMaxLayer = -1
+		state.overlayMaxLayer = -1
+		state.overlayCount = 0
+		return idx.persistMutableState(batch, state)
+	}
+
+	globalValid, err := idx.isValidEntryPoint(batch, state.globalEntryPoint, hnswEntryPointAny)
+	if err != nil {
+		return err
+	}
+	if !globalValid {
+		id, layer, ok, err := idx.findEntryPointCandidate(batch, hnswEntryPointAny)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state.globalEntryPoint = id
+			state.globalMaxLayer = layer
+		} else {
+			state.globalEntryPoint = 0
+			state.globalMaxLayer = -1
+		}
+	}
+
+	baseValid, err := idx.isValidEntryPoint(batch, state.baseEntryPoint, hnswEntryPointBase)
+	if err != nil {
+		return err
+	}
+	if !baseValid {
+		id, layer, ok, err := idx.findEntryPointCandidate(batch, hnswEntryPointBase)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state.baseEntryPoint = id
+			state.baseMaxLayer = layer
+		} else {
+			state.baseEntryPoint = 0
+			state.baseMaxLayer = -1
+		}
+	}
+
+	if state.overlayCount == 0 {
+		state.overlayEntryPoint = 0
+		state.overlayMaxLayer = -1
+	} else {
+		overlayValid, err := idx.isValidEntryPoint(batch, state.overlayEntryPoint, hnswEntryPointOverlay)
+		if err != nil {
+			return err
+		}
+		if !overlayValid {
+			id, layer, ok, err := idx.findEntryPointCandidate(batch, hnswEntryPointOverlay)
+			if err != nil {
+				return err
+			}
+			if ok {
+				state.overlayEntryPoint = id
+				state.overlayMaxLayer = layer
+			} else {
+				state.overlayEntryPoint = 0
+				state.overlayMaxLayer = -1
+				state.overlayCount = 0
+			}
+		}
+	}
+
+	if state.globalEntryPoint == 0 {
+		state.globalEntryPoint = state.baseEntryPoint
+		state.globalMaxLayer = state.baseMaxLayer
+		if state.globalEntryPoint == 0 {
+			state.globalEntryPoint = state.overlayEntryPoint
+			state.globalMaxLayer = state.overlayMaxLayer
+		}
+	}
+	if state.baseEntryPoint == 0 && state.overlayCount == 0 {
+		state.baseEntryPoint = state.globalEntryPoint
+		state.baseMaxLayer = state.globalMaxLayer
+	}
+
+	return idx.persistMutableState(batch, state)
+}
+
+func (idx *HNSWIndex) refreshStateEntryPoint(
+	db pebble.Reader,
+	state *hnswMutableState,
+	class hnswEntryPointClass,
+) error {
+	id, layer, ok, err := idx.findEntryPointCandidate(db, class)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		id = 0
+		layer = -1
+	}
+	switch class {
+	case hnswEntryPointAny:
+		state.globalEntryPoint = id
+		state.globalMaxLayer = layer
+	case hnswEntryPointBase:
+		state.baseEntryPoint = id
+		state.baseMaxLayer = layer
+	case hnswEntryPointOverlay:
+		state.overlayEntryPoint = id
+		state.overlayMaxLayer = layer
+	}
+	return nil
+}
+
+func (idx *HNSWIndex) isValidEntryPoint(db pebble.Reader, id uint64, class hnswEntryPointClass) (bool, error) {
+	if id == 0 {
+		return false, nil
+	}
+	exists, err := nodeExists(db, id)
+	if err != nil || !exists {
+		return exists, err
+	}
+	if class == hnswEntryPointAny {
+		return true, nil
+	}
+	isOverlay, err := idx.nodeIsOverlay(db, id)
+	if err != nil {
+		return false, err
+	}
+	switch class {
+	case hnswEntryPointBase:
+		return !isOverlay, nil
+	case hnswEntryPointOverlay:
+		return isOverlay, nil
+	default:
+		return true, nil
+	}
+}
+
+func (ctx *hnswBatchContext) getNodeData(idx *HNSWIndex, id uint64, includeVector bool) (*HNSWNodeData, error) {
+	if nodeData, ok := ctx.nodes[id]; ok {
+		if includeVector && nodeData.vector == nil {
+			vec, err := idx.readVector(ctx.batch, id)
+			if err != nil {
+				return nil, err
+			}
+			nodeData.vector = vec
+		}
+		return nodeData, nil
+	}
+
+	nodeData, err := idx.getNodeDataForUpdate(ctx.batch, id, includeVector)
+	if err != nil {
+		return nil, err
+	}
+	ctx.nodes[id] = nodeData
+	return nodeData, nil
+}
+
+func (ctx *hnswBatchContext) getTraversalNodeData(idx *HNSWIndex, id uint64) (*HNSWNodeData, error) {
+	return ctx.getNodeData(idx, id, true)
+}
+
+func (ctx *hnswBatchContext) storeNodeData(nodeData *HNSWNodeData) {
+	ctx.nodes[nodeData.id] = nodeData
+}
+
+func (ctx *hnswBatchContext) invalidate(id uint64) {
+	delete(ctx.nodes, id)
+}
+
+func (ctx *hnswBatchContext) updateNeighbors(id uint64, layer int, neighbors []*PriorityItem) {
+	nodeData, ok := ctx.nodes[id]
+	if !ok {
+		return
+	}
+	if nodeData.neighbors == nil {
+		nodeData.neighbors = make(map[int][]*PriorityItem, max(layer+1, 1))
+	}
+	nodeData.neighbors[layer] = neighbors
+	if layer > nodeData.layer {
+		nodeData.layer = layer
+	}
+}
+
 // checkConsistency verifies internal counts against loaded data.
 // Assumes Lock is held and PebbleDB is already open.
 func (idx *HNSWIndex) checkConsistency(batch *pebble.Batch) error {
@@ -559,38 +1205,10 @@ func (idx *HNSWIndex) checkConsistency(batch *pebble.Batch) error {
 		if err == nil {
 			_ = closer.Close()
 		} else if errors.Is(err, pebble.ErrNotFound) {
-			iter, err := batch.NewIterWithContext(context.TODO(), &pebble.IterOptions{
-				LowerBound: pebbleNodeKeyPrefix,
-				UpperBound: utils.PrefixSuccessor(pebbleNodeKeyPrefix),
-				SkipPoint: func(userKey []byte) bool {
-					suffixToCheck := make([]byte, len(pebbleGraphKeySuffix)+1+4)
-					copy(suffixToCheck, pebbleGraphKeySuffix)
-					suffixToCheck[len(pebbleGraphKeySuffix)] = ':'
-					binary.LittleEndian.PutUint32(suffixToCheck[len(pebbleGraphKeySuffix)+1:], uint32(0)) // Layer 0
-					return len(userKey) < len(pebbleNodeKeyPrefix)+8 || !bytes.HasSuffix(userKey, suffixToCheck)
-				},
-			})
+			entryPointValid, err := idx.resetEntryPoint(batch, entryPoint)
 			if err != nil {
-				return fmt.Errorf("error creating iterator: %w", err)
+				log.Printf("Warning: Failed to save entry point after update: %v", err)
 			}
-			defer func() {
-				_ = iter.Close()
-			}()
-
-			var entryPointValid bool
-			if iter.First() {
-				// FIXME (ajr): Set the entrypoint into the highest layer
-				key := iter.Key()
-				// Extract node ID from the key (after prefix)
-				newEntryID := binary.BigEndian.Uint64(key[len(pebbleNodeKeyPrefix) : len(pebbleNodeKeyPrefix)+8])
-				log.Printf("Info: Found new valid entry point: %d (replacing invalid %d)", newEntryID, entryPoint)
-				// Save updated entry point
-				if err := idx.setEntryPoint(batch, newEntryID); err != nil {
-					log.Printf("Warning: Failed to save entry point after update: %v", err)
-				}
-				entryPointValid = true
-			}
-
 			if !entryPointValid {
 				log.Printf("Error: Could not find valid entry point. Index may be unusable until new vectors are added.")
 			}
@@ -695,9 +1313,9 @@ func (idx *HNSWIndex) InitializeNodeData(
 	}
 
 	// 2. Store layer assignment
-	layerBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(layerBuf, uint32(nodeLayer)) //nolint:gosec // G115: bounded value, cannot overflow in practice
-	if err := batch.Set(makePebbleLayerKey(id), layerBuf, nil); err != nil {
+	var layerBuf [4]byte
+	binary.LittleEndian.PutUint32(layerBuf[:], uint32(nodeLayer)) //nolint:gosec // G115: bounded value, cannot overflow in practice
+	if err := batch.Set(makePebbleLayerKey(id), layerBuf[:], nil); err != nil {
 		return fmt.Errorf("adding %d layer to batch: %w", id, err)
 	}
 
@@ -706,7 +1324,9 @@ func (idx *HNSWIndex) InitializeNodeData(
 			return fmt.Errorf("adding %d metadata to batch: %w", id, err)
 		}
 		// TODO (ajr) If metadata changes we should remove the old metadata invert key
-		if err := batch.Set(makePebbleMetadataInvertKey(metadata), binary.BigEndian.AppendUint64(nil, id), nil); err != nil {
+		var idBuf [8]byte
+		binary.BigEndian.PutUint64(idBuf[:], id)
+		if err := batch.Set(makePebbleMetadataInvertKey(metadata, id), idBuf[:], nil); err != nil {
 			return fmt.Errorf("adding %d metadata invert to batch: %w", id, err)
 		}
 	}
@@ -721,6 +1341,149 @@ func (idx *HNSWIndex) InitializeNodeData(
 				err,
 			)
 		}
+	}
+	return nil
+}
+
+func compactBatchInsertInputs(
+	ids []uint64,
+	vectors []vector.T,
+	metadataList [][]byte,
+) ([]uint64, []vector.T, [][]byte) {
+	lastIndex := make(map[uint64]int, len(ids))
+	for i, id := range ids {
+		lastIndex[id] = i
+	}
+
+	compactIDs := make([]uint64, 0, len(lastIndex))
+	compactVectors := make([]vector.T, 0, len(lastIndex))
+	var compactMetadata [][]byte
+	if metadataList != nil {
+		compactMetadata = make([][]byte, 0, len(lastIndex))
+	}
+
+	for i, id := range ids {
+		if lastIndex[id] != i {
+			continue
+		}
+		compactIDs = append(compactIDs, id)
+		compactVectors = append(compactVectors, vectors[i])
+		if metadataList != nil {
+			compactMetadata = append(compactMetadata, metadataList[i])
+		}
+	}
+
+	return compactIDs, compactVectors, compactMetadata
+}
+
+func (idx *HNSWIndex) classifyExistingIDs(ids []uint64) ([]bool, bool, error) {
+	existing := make([]bool, len(ids))
+	var hasExisting bool
+	for i, id := range ids {
+		found, err := nodeExists(idx.db, id)
+		if err != nil {
+			return nil, false, err
+		}
+		existing[i] = found
+		hasExisting = hasExisting || found
+	}
+	return existing, hasExisting, nil
+}
+
+func metadataAt(metadataList [][]byte, i int) []byte {
+	if metadataList == nil {
+		return nil
+	}
+	return metadataList[i]
+}
+
+func (idx *HNSWIndex) insertNewNode(
+	batchCtx *hnswBatchContext,
+	batch *pebble.Batch,
+	buf *bytes.Buffer,
+	vecBuf []byte,
+	id uint64,
+	vec vector.T,
+	metadata []byte,
+	state *hnswMutableState,
+) error {
+	nodeLayer := idx.assignLayer()
+	if state.activeCount == 0 {
+		if err := idx.InitializeNodeData(vecBuf, batch, nodeLayer, id, vec, metadata); err != nil {
+			return fmt.Errorf("initializing node data for %d: %w", id, err)
+		}
+		if err := idx.setNodeOverlay(batch, id, false); err != nil {
+			return fmt.Errorf("clearing overlay marker for %d: %w", id, err)
+		}
+		state.activeCount++
+		state.globalEntryPoint = id
+		state.globalMaxLayer = nodeLayer
+		state.baseEntryPoint = id
+		state.baseMaxLayer = nodeLayer
+		state.overlayEntryPoint = 0
+		state.overlayMaxLayer = -1
+		state.overlayCount = 0
+		batchCtx.storeNodeData(&HNSWNodeData{
+			id:        id,
+			vector:    vec,
+			neighbors: make(map[int][]*PriorityItem, nodeLayer+1),
+			metadata:  bytes.Clone(metadata),
+			layer:     nodeLayer,
+		})
+		return nil
+	}
+
+	isOverlay := state.overlayActive()
+	graphUpdateEntryPoint := state.globalEntryPoint
+	graphUpdateEntryPointLayer := state.globalMaxLayer
+	if isOverlay && state.overlayEntryPoint != 0 {
+		graphUpdateEntryPoint = state.overlayEntryPoint
+		graphUpdateEntryPointLayer = state.overlayMaxLayer
+	}
+	if graphUpdateEntryPoint == 0 {
+		graphUpdateEntryPoint = state.baseEntryPoint
+		graphUpdateEntryPointLayer = state.baseMaxLayer
+	}
+
+	if err := idx.InitializeNodeData(vecBuf, batch, nodeLayer, id, vec, metadata); err != nil {
+		return fmt.Errorf("initializing node data for %d: %w", id, err)
+	}
+	batchCtx.storeNodeData(&HNSWNodeData{
+		id:        id,
+		vector:    vec,
+		neighbors: make(map[int][]*PriorityItem, nodeLayer+1),
+		metadata:  bytes.Clone(metadata),
+		layer:     nodeLayer,
+	})
+	if err := idx.setNodeOverlay(batch, id, isOverlay); err != nil {
+		return fmt.Errorf("writing overlay marker for %d: %w", id, err)
+	}
+	state.activeCount++
+	if isOverlay {
+		state.overlayCount++
+		if state.overlayEntryPoint == 0 || nodeLayer > state.overlayMaxLayer {
+			state.overlayEntryPoint = id
+			state.overlayMaxLayer = nodeLayer
+		}
+	} else if state.baseEntryPoint == 0 || nodeLayer > state.baseMaxLayer {
+		state.baseEntryPoint = id
+		state.baseMaxLayer = nodeLayer
+	}
+	if nodeLayer > state.globalMaxLayer {
+		state.globalEntryPoint = id
+		state.globalMaxLayer = nodeLayer
+	}
+	if err := idx.updateGraphForNode(
+		batchCtx,
+		buf,
+		batch,
+		graphUpdateEntryPoint,
+		graphUpdateEntryPointLayer,
+		min(nodeLayer, graphUpdateEntryPointLayer),
+		id,
+		vec,
+	); err != nil {
+		return fmt.Errorf("updating graph for node %d: %w", id, err)
 	}
 	return nil
 }
@@ -741,6 +1504,10 @@ func (idx *HNSWIndex) BatchInsert(
 	}
 	if len(ids) != len(vectors) {
 		return errors.New("ids length must match vectors length")
+	}
+	ids, vectors, metadataList = compactBatchInsertInputs(ids, vectors, metadataList)
+	if len(vectors) == 0 {
+		return nil
 	}
 
 	if idx.db == nil {
@@ -765,151 +1532,85 @@ func (idx *HNSWIndex) BatchInsert(
 		)
 	}
 
-	// Get current active count
-	activeCount, err := idx.getActiveCount(batch)
+	state, err := idx.loadMutableState(batch)
 	if err != nil {
-		return fmt.Errorf("failed to get active count: %w", err)
+		return fmt.Errorf("failed to load mutable state: %w", err)
 	}
-
-	// Track successful insertions to update active count accurately
-	insertedCount := uint64(0)
+	batchCtx := newHNSWBatchContext(batch)
+	existingIDs, hasExistingIDs, err := idx.classifyExistingIDs(ids)
+	if err != nil {
+		return fmt.Errorf("classifying existing IDs: %w", err)
+	}
 
 	vecBuf := make([]byte, 4*idx.config.Dimension)
-
-	var maxLayer int
-	var entryPoint uint64
-	var entryPointNeighbors map[int][]*PriorityItem
-	if activeCount == 0 {
-		// Assign layer for this node
-		nodeLayer := idx.assignLayer()
-		if err := idx.setEntryPoint(batch, ids[0]); err != nil {
-			return fmt.Errorf("setting entry point for new node %d: %w", ids[0], err)
-		}
-		entryPoint = ids[0] // Update entryPoint to the new node
-
-		var metadata []byte
-		if len(metadataList) > 0 {
-			metadata = metadataList[0]
-		}
-		if err := idx.InitializeNodeData(vecBuf, batch, nodeLayer, ids[0], vectors[0], metadata); err != nil {
-			return fmt.Errorf("initializing node data for %d: %w", ids[0], err)
-		}
-		insertedCount++
-		maxLayer = nodeLayer // Set maxLayer to the layer of the first node
-
-		// Process remaining vectors (skip the first one)
-		vectors = vectors[1:] // Remove first vector since it's already processed
-		ids = ids[1:]         // Remove first ID since it's already processed
-		if len(metadataList) > 0 {
-			metadataList = metadataList[1:] // Remove first metadata since it's already processed
+	buf := bytes.NewBuffer(nil)
+	if !hasExistingIDs {
+		for i, vec := range vectors {
+			vecLen := len(vec)
+			if vecLen > math.MaxUint32 {
+				return fmt.Errorf(
+					"vector at index %d exceeds maximum length of %d: got %d",
+					i,
+					math.MaxUint32,
+					vecLen,
+				)
+			}
+			if uint32(vecLen) != idx.config.Dimension {
+				return fmt.Errorf("vector at index %d has wrong dimension: expected %d, got %d",
+					i, idx.config.Dimension, vecLen)
+			}
+			if err := idx.insertNewNode(
+				batchCtx,
+				batch,
+				buf,
+				vecBuf,
+				ids[i],
+				vec,
+				metadataAt(metadataList, i),
+				state,
+			); err != nil {
+				return err
+			}
 		}
 	} else {
-		var err error
-		entryPoint, err = idx.getEntryPoint(batch)
-		if err != nil {
-			return fmt.Errorf("getting entry point: %w", err)
-		}
-		entryPointData, err := idx.getNodeData(batch, entryPoint)
-		if err != nil {
-			return fmt.Errorf("getting node data for entry point %d: %w", entryPoint, err)
-		}
-		maxLayer = entryPointData.layer
-		entryPointNeighbors = entryPointData.neighbors
-	}
-
-	buf := bytes.NewBuffer(nil)
-	for i, vec := range vectors {
-		if ids[i] == 0 {
-			return fmt.Errorf("vector at index %d has zero ID, which is not allowed", i)
-		}
-		vecLen := len(vec)
-		if vecLen > math.MaxUint32 {
-			return fmt.Errorf(
-				"vector at index %d exceeds maximum length of %d: got %d",
-				i,
-				math.MaxUint32,
-				vecLen,
-			)
-		}
-		if uint32(vecLen) != idx.config.Dimension {
-			return fmt.Errorf("vector at index %d has wrong dimension: expected %d, got %d",
-				i, idx.config.Dimension, vecLen)
-		}
-		if entryPoint == ids[i] {
-			// return fmt.Errorf("entry point %d is the same as the new node ID %d", entryPoint, ids[i])
-			// We're updating the entryPoint doc here so find a new entryPoint
-			if len(entryPointNeighbors) == 0 {
-				// If we have no neighbors we're the only node in the index so just update
-				clear(vecBuf)
-				vecBuf, err = vector.Encode(vecBuf, vec)
-				if err != nil {
-					return fmt.Errorf("encoding vector for node %d: %w", ids[i], err)
-				}
-				vecKey := makePebbleVectorKey(ids[i])
-				// Clone buffer to prevent aliasing when vecBuf is reused
-				vecCopy := bytes.Clone(vecBuf)
-				if err := batch.Set(vecKey, vecCopy, nil); err != nil {
-					return fmt.Errorf("adding vector %d to batch: %w", i, err)
-				}
-				vecBuf = vecBuf[:0]
-				if metadataList != nil && len(metadataList[i]) > 0 {
-					if err := batch.Set(makePebbleMetadataKey(ids[i]), metadataList[i], nil); err != nil {
-						return fmt.Errorf("adding metadata %d to batch: %w", i, err)
-					}
-					if err := batch.Set(makePebbleMetadataInvertKey(metadataList[i]), binary.BigEndian.AppendUint64(nil, ids[i]), nil); err != nil {
-						return fmt.Errorf("adding metadata invert %d to batch: %w", i, err)
-					}
-				}
-				continue
+		for i, vec := range vectors {
+			vecLen := len(vec)
+			if vecLen > math.MaxUint32 {
+				return fmt.Errorf(
+					"vector at index %d exceeds maximum length of %d: got %d",
+					i,
+					math.MaxUint32,
+					vecLen,
+				)
 			}
-			for layer := maxLayer; layer >= 0; layer-- {
-				if len(entryPointNeighbors[layer]) == 0 {
-					continue
-				}
-				if err := idx.setEntryPoint(batch, entryPointNeighbors[layer][0].ID); err != nil {
-					return fmt.Errorf("failed to update entry point: %w", err)
-				}
-				entryPoint = entryPointNeighbors[layer][0].ID // Update entryPoint to the first neighbor
-				maxLayer = layer                              // Update maxLayer to the layer of the new entry point
-				break                                         // Use the highest-layer neighbor
+			if uint32(vecLen) != idx.config.Dimension {
+				return fmt.Errorf("vector at index %d has wrong dimension: expected %d, got %d",
+					i, idx.config.Dimension, vecLen)
 			}
-		}
 
-		// Assign layer for this node
-		nodeLayer := idx.assignLayer()
-		graphUpdateEntryPoint := entryPoint
-		graphUpdateEntryPointLayer := maxLayer
-		if nodeLayer > maxLayer {
-			if err := idx.setEntryPoint(batch, ids[i]); err != nil {
-				return fmt.Errorf("setting entry point for new node %d: %w", ids[i], err)
+			if existingIDs[i] {
+				if err := idx.deleteNodeFromBatch(batchCtx, batch, buf, ids[i], state); err != nil {
+					return fmt.Errorf("updating existing node %d: %w", ids[i], err)
+				}
 			}
-			entryPoint = ids[i]  // Update entryPoint to the new node
-			maxLayer = nodeLayer // Update maxLayer to the new node's layer
-		}
 
-		var metadata []byte
-		if len(metadataList) > 0 {
-			metadata = metadataList[i]
-		}
-		if err := idx.InitializeNodeData(vecBuf, batch, nodeLayer, ids[i], vectors[i], metadata); err != nil {
-			return fmt.Errorf("initializing node data for %d: %w", ids[i], err)
-		}
-		insertedCount++
-		if err := idx.updateGraphForNode(buf, batch, graphUpdateEntryPoint, graphUpdateEntryPointLayer, min(nodeLayer, graphUpdateEntryPointLayer), ids[i], vectors[i]); err != nil {
-			log.Printf(
-				"Warning: Error updating graph for node %d (%d/%d in batch): %v. Continuing...",
+			if err := idx.insertNewNode(
+				batchCtx,
+				batch,
+				buf,
+				vecBuf,
 				ids[i],
-				i+1,
-				len(ids),
-				err,
-			)
+				vec,
+				metadataAt(metadataList, i),
+				state,
+			); err != nil {
+				return err
+			}
 		}
 	}
 
-	// Set active count based on actual successful insertions
-	newActiveCount := activeCount + insertedCount
-	if err := idx.setActiveCount(batch, newActiveCount); err != nil {
-		return fmt.Errorf("failed to update active count: %w", err)
+	if err := idx.persistMutableState(batch, state); err != nil {
+		return fmt.Errorf("failed to update mutable state: %w", err)
 	}
 
 	// Save updated metadata
@@ -923,6 +1624,90 @@ func (idx *HNSWIndex) BatchInsert(
 	}
 
 	return nil
+}
+
+func mergePriorityItems(k int, resultSets ...[]*PriorityItem) []*PriorityItem {
+	if k <= 0 {
+		return nil
+	}
+	byID := make(map[uint64]*PriorityItem)
+	for _, resultSet := range resultSets {
+		for _, item := range resultSet {
+			current, exists := byID[item.ID]
+			if !exists || item.Distance < current.Distance {
+				byID[item.ID] = item
+			}
+		}
+	}
+	if len(byID) == 0 {
+		return nil
+	}
+	items := make([]*PriorityItem, 0, len(byID))
+	for _, item := range byID {
+		items = append(items, item)
+	}
+	slices.SortFunc(items, func(a, b *PriorityItem) int {
+		return cmp.Compare(a.Distance, b.Distance)
+	})
+	if len(items) > k {
+		items = items[:k]
+	}
+	return items
+}
+
+func (idx *HNSWIndex) searchFromEntryPoint(
+	query []float32,
+	filterPrefix []byte,
+	entryPoint uint64,
+	k int,
+) ([]*PriorityItem, error) {
+	entryPointLayer, err := idx.getNodeLayer(idx.db, entryPoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get entry point layer: %w", err)
+	}
+
+	currentNearest := entryPoint
+	minDist := float32(math.MaxFloat32)
+	for layer := entryPointLayer; layer > 0; layer-- {
+		pqueue, err := idx.searchLayerPebbleInternal(
+			nil,
+			nil,
+			query,
+			nil,
+			currentNearest,
+			1,
+			layer,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("search failed at layer %d: %w", layer, err)
+		}
+		if pqueue.Len() == 0 {
+			continue
+		}
+		nearest := pqueue.Best()
+		if nearest.Distance > minDist {
+			return nil, fmt.Errorf(
+				"invariant violated: candidate at layer %d with distance %f > minimum distance %f",
+				layer, nearest.Distance, minDist,
+			)
+		}
+		currentNearest = nearest.ID
+		minDist = nearest.Distance
+	}
+
+	pqueue, err := idx.searchLayerPebbleInternal(
+		nil,
+		nil,
+		query,
+		filterPrefix,
+		currentNearest,
+		max(int(idx.config.EfSearch), k),
+		0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search failed at layer 0: %w", err)
+	}
+	return pqueue.Items(k), nil
 }
 
 // Search finds k nearest neighbors for the query vector using HNSW algorithm.
@@ -952,18 +1737,13 @@ func (idx *HNSWIndex) Search(req *SearchRequest) ([]*Result, error) {
 	if db == nil {
 		return nil, errors.New("index database is not open")
 	}
-	activeCount, err := idx.getActiveCount(db)
+	state, err := idx.loadMutableState(db)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get active count: %w", err)
+		return nil, fmt.Errorf("failed to load mutable state: %w", err)
 	}
 
-	if activeCount == 0 {
+	if state.activeCount == 0 {
 		return nil, nil // Empty index
-	}
-
-	entryPoint, err := idx.getEntryPoint(db)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get entry point: %w", err)
 	}
 
 	// If we have a filter prefix, decide between graph search and direct iteration
@@ -985,60 +1765,26 @@ func (idx *HNSWIndex) Search(req *SearchRequest) ([]*Result, error) {
 		}
 	}
 
-	// Get the layer of the entry point
-	entryPointLayer, err := idx.getNodeLayer(db, entryPoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get entry point layer: %w", err)
+	entryPoints := make([]uint64, 0, 3)
+	if state.baseEntryPoint != 0 {
+		entryPoints = append(entryPoints, state.baseEntryPoint)
+	}
+	if state.overlayEntryPoint != 0 && state.overlayEntryPoint != state.baseEntryPoint {
+		entryPoints = append(entryPoints, state.overlayEntryPoint)
+	}
+	if len(entryPoints) == 0 && state.globalEntryPoint != 0 {
+		entryPoints = append(entryPoints, state.globalEntryPoint)
 	}
 
-	// Start search from the top layer
-	currentNearest := entryPoint
-	var prev *PriorityQueue
-	minDist := float32(math.MaxFloat32)
-	for layer := entryPointLayer; layer > 0; layer-- {
-		// Search at current layer with ef=1 to find nearest point
-		var err error
-		prev, err = idx.searchLayerPebbleInternal(
-			nil,
-			query,
-			nil,
-			currentNearest,
-			int(idx.config.EfSearch),
-			layer,
-			nil,
-			nil,
-		)
+	var resultSets [][]*PriorityItem
+	for _, entryPoint := range entryPoints {
+		items, err := idx.searchFromEntryPoint(query, filterPrefix, entryPoint, k)
 		if err != nil {
-			return nil, fmt.Errorf("search failed at layer %d: %w", layer, err)
+			return nil, err
 		}
-		if prev.Len() > 0 {
-			nearest := prev.Items(1)[0]
-			if nearest.Distance > minDist {
-				return nil, fmt.Errorf(
-					"invariant violated: candidate at layer %d with distance %f > minimum distance %f",
-					layer, nearest.Distance, minDist,
-				)
-			}
-			currentNearest = nearest.ID
-			minDist = nearest.Distance
-		}
+		resultSets = append(resultSets, items)
 	}
-
-	// Search at layer 0 with full ef
-	pqueue, err := idx.searchLayerPebbleInternal(
-		nil,
-		query,
-		filterPrefix,
-		currentNearest,
-		max(int(idx.config.EfSearch), k),
-		0,
-		nil,
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("search failed at layer 0: %w", err)
-	}
-	candidateItems := pqueue.Items(k)
+	candidateItems := mergePriorityItems(k, resultSets...)
 
 	// 3. Extract top K results from the candidates found
 	results := make([]*Result, len(candidateItems))
@@ -1056,13 +1802,158 @@ func (idx *HNSWIndex) Search(req *SearchRequest) ([]*Result, error) {
 }
 
 func (idx *HNSWIndex) DeleteByMetadata(key []byte) error {
-	if idBytes, closer, err := idx.db.Get(makePebbleMetadataInvertKey(key)); err == nil {
-		id := binary.BigEndian.Uint64(idBytes)
-		_ = closer.Close()
-		if err := idx.Delete(id); err != nil {
-			return fmt.Errorf("failed to add metadata invert delete to batch: %w", err)
+	prefix := makePebbleMetadataInvertPrefix(key)
+	iter, err := idx.db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: utils.PrefixSuccessor(prefix),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create metadata iterator: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	var ids []uint64
+	for iter.First(); iter.Valid(); iter.Next() {
+		id, metadata, ok := decodeMetadataInvertKey(prefix, iter.Key(), iter.Value())
+		if !ok || !bytes.Equal(metadata, key) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("failed to iterate metadata entries: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return idx.Delete(ids...)
+}
+
+func (idx *HNSWIndex) deleteNodeFromBatch(
+	batchCtx *hnswBatchContext,
+	batch *pebble.Batch,
+	buf *bytes.Buffer,
+	id uint64,
+	state *hnswMutableState,
+) error {
+	isOverlay, err := idx.nodeIsOverlay(batch, id)
+	if err != nil {
+		return err
+	}
+
+	nodeData, err := batchCtx.getNodeData(idx, id, false)
+	if err != nil {
+		return err
+	}
+
+	if len(nodeData.metadata) > 0 {
+		if err := batch.Delete(makePebbleMetadataInvertKey(nodeData.metadata, id), nil); err != nil {
+			return fmt.Errorf("failed to delete metadata invert key for node %d: %w", id, err)
+		}
+		// Also delete the legacy exact-metadata key if this node came from an older index.
+		if err := batch.Delete(makePebbleMetadataInvertPrefix(nodeData.metadata), nil); err != nil {
+			return fmt.Errorf("failed to delete legacy metadata invert key for node %d: %w", id, err)
 		}
 	}
+
+	lower, upper := makePebbleNodeRange(id)
+	if err := batch.DeleteRange(lower, upper, nil); err != nil {
+		return fmt.Errorf("failed to add tombstone for ID %d to batch: %w", id, err)
+	}
+	if err := batch.Delete(makePebbleOverlayKey(id), nil); err != nil {
+		return fmt.Errorf("failed to delete overlay marker for node %d: %w", id, err)
+	}
+	incomingEdges, err := readIncomingEdges(batch, id)
+	if err != nil {
+		return fmt.Errorf("reading incoming edges for node %d: %w", id, err)
+	}
+	if err := batch.DeleteRange(
+		makePebbleReverseGraphPrefix(id),
+		utils.PrefixSuccessor(makePebbleReverseGraphPrefix(id)),
+		nil,
+	); err != nil {
+		return fmt.Errorf("failed to delete reverse edges targeting node %d: %w", id, err)
+	}
+	for layer, layerNeighbors := range nodeData.neighbors {
+		for _, neighbor := range layerNeighbors {
+			if err := batch.Delete(makePebbleReverseGraphKey(neighbor.ID, layer, id), nil); err != nil {
+				return fmt.Errorf("failed to delete reverse edge %d <- %d at layer %d: %w", neighbor.ID, id, layer, err)
+			}
+		}
+	}
+
+	for layer, sources := range incomingEdges {
+		for _, sourceID := range sources {
+			currentNeighborNeighbors, neighborReadErr := idx.readNodeNeighbors(batch, sourceID, layer)
+			if neighborReadErr != nil {
+				if !errors.Is(neighborReadErr, ErrNotFound) {
+					log.Printf("Warning: Failed to read neighbors for neighbor %d at layer %d during cleanup: %v. Skipping edge removal.",
+						sourceID, layer, neighborReadErr)
+				}
+				continue
+			}
+
+			i := slices.IndexFunc(currentNeighborNeighbors, func(item *PriorityItem) bool {
+				return item.ID == id
+			})
+			if i == -1 {
+				continue
+			}
+			oldNeighbors := slices.Clone(currentNeighborNeighbors)
+			newNeighbors := slices.Delete(currentNeighborNeighbors, i, i+1)
+
+			if err := idx.writeNodeNeighbors(batch, buf, sourceID, layer, oldNeighbors, newNeighbors); err != nil {
+				log.Printf("Warning: Failed to add update for neighbor %d at layer %d to batch: %v. Skipping.",
+					sourceID, layer, err)
+				continue
+			}
+			idx.updateCache(sourceID, layer, newNeighbors)
+			batchCtx.updateNeighbors(sourceID, layer, newNeighbors)
+		}
+	}
+
+	idx.invalidateCache(id)
+	batchCtx.invalidate(id)
+
+	if state != nil && state.activeCount > 0 {
+		state.activeCount--
+		if isOverlay && state.overlayCount > 0 {
+			state.overlayCount--
+		}
+		if state.activeCount == 0 {
+			state.globalEntryPoint = 0
+			state.globalMaxLayer = -1
+			state.baseEntryPoint = 0
+			state.baseMaxLayer = -1
+			state.overlayEntryPoint = 0
+			state.overlayMaxLayer = -1
+			state.overlayCount = 0
+			return nil
+		}
+		if state.globalEntryPoint == id {
+			if err := idx.refreshStateEntryPoint(batch, state, hnswEntryPointAny); err != nil {
+				return fmt.Errorf("failed to refresh global entry point during deletion: %w", err)
+			}
+		}
+		if state.baseEntryPoint == id {
+			if err := idx.refreshStateEntryPoint(batch, state, hnswEntryPointBase); err != nil {
+				return fmt.Errorf("failed to refresh base entry point during deletion: %w", err)
+			}
+		}
+		if state.overlayCount == 0 {
+			state.overlayEntryPoint = 0
+			state.overlayMaxLayer = -1
+		} else if state.overlayEntryPoint == id {
+			if err := idx.refreshStateEntryPoint(batch, state, hnswEntryPointOverlay); err != nil {
+				return fmt.Errorf("failed to refresh overlay entry point during deletion: %w", err)
+			}
+		}
+		if state.baseEntryPoint == 0 && state.overlayCount == 0 {
+			state.baseEntryPoint = state.globalEntryPoint
+			state.baseMaxLayer = state.globalMaxLayer
+		}
+	}
+
 	return nil
 }
 
@@ -1078,104 +1969,24 @@ func (idx *HNSWIndex) Delete(ids ...uint64) error {
 	batch := idx.db.NewIndexedBatchWithSize(1 << 20)
 	defer func() { _ = batch.Close() }()
 
+	state, err := idx.loadMutableState(batch)
+	if err != nil {
+		return fmt.Errorf("failed to load mutable state during delete: %w", err)
+	}
+
 	buf := bytes.NewBuffer(nil)
+	batchCtx := newHNSWBatchContext(batch)
 	for _, id := range ids {
-		// --- Read node data BEFORE marking deleted (needed for cleanup) ---
-		nodeData, err := idx.getNodeData(batch, id)
-		if err != nil {
+		if err := idx.deleteNodeFromBatch(batchCtx, batch, buf, id, state); err != nil {
 			if errors.Is(err, ErrNotFound) {
 				continue
 			}
-			// Other read errors are more problematic
-			return fmt.Errorf("failed to read node data for cleanup of node %d: %w", id, err)
+			return fmt.Errorf("failed to delete node %d: %w", id, err)
 		}
+	}
 
-		if len(nodeData.metadata) > 0 {
-			if err := batch.Delete(makePebbleMetadataInvertKey(nodeData.metadata), nil); err != nil {
-				return fmt.Errorf("failed to add metadata invert delete to batch: %w", err)
-			}
-		}
-		lower, upper := makePebbleNodeRange(id)
-		if err := batch.DeleteRange(lower, upper, nil); err != nil {
-			return fmt.Errorf("failed to add tombstone for ID %d to batch: %w", id, err)
-		}
-
-		// Handle entry point replacement before neighbor cleanup.
-		// Select replacement from the highest layer neighbor.
-		entryPoint, err := idx.getEntryPoint(batch)
-		if err != nil {
-			log.Printf("Warning: Failed to get entry point during deletion: %v", err)
-		} else if entryPoint == id {
-			replaced := false
-			for layer := nodeData.layer; layer >= 0 && !replaced; layer-- {
-				for _, neighbor := range nodeData.neighbors[layer] {
-					if err := idx.setEntryPoint(batch, neighbor.ID); err != nil {
-						log.Printf("Warning: Failed to update entry point during deletion: %v", err)
-					} else {
-						replaced = true
-						break
-					}
-				}
-			}
-		}
-
-		// Update neighbor nodes to remove references to this node at all layers
-		for layer, layerNeighbors := range nodeData.neighbors {
-			for _, neighbor := range layerNeighbors {
-				// Read current neighbors of the neighbor node at this layer
-				currentNeighborNeighbors, neighborReadErr := idx.readNodeNeighbors(
-					batch,
-					neighbor.ID,
-					layer,
-				)
-				if neighborReadErr != nil {
-					if !errors.Is(neighborReadErr, ErrNotFound) {
-						log.Printf("Warning: Failed to read neighbors for neighbor %d at layer %d during cleanup: %v. Skipping edge removal.",
-							neighbor.ID, layer, neighborReadErr)
-					}
-					continue
-				}
-
-				// Remove the deleted node from neighbor's connections
-				i := slices.IndexFunc(currentNeighborNeighbors, func(item *PriorityItem) bool {
-					return item.ID == id
-				})
-				if i == -1 {
-					continue
-				}
-				newNeighbors := slices.Delete(currentNeighborNeighbors, i, i+1)
-
-				// Save updated connections
-				buf.Reset()
-				if err := serializeNeighbors(buf, newNeighbors); err != nil {
-					log.Printf(
-						"Warning: Failed to serialize updated neighbors for neighbor %d at layer %d: %v. Skipping.",
-						neighbor.ID,
-						layer,
-						err,
-					)
-					continue
-				} else if err := batch.Set(makePebbleGraphLayerKey(neighbor.ID, layer), buf.Bytes(), nil); err != nil {
-					log.Printf("Warning: Failed to add update for neighbor %d at layer %d to batch: %v. Skipping.",
-						neighbor.ID, layer, err)
-					continue
-				}
-				idx.updateCache(neighbor.ID, layer, newNeighbors)
-			}
-		}
-
-		idx.invalidateCache(id)
-
-		// Update active count
-		activeCount, err := idx.getActiveCount(batch)
-		if err != nil {
-			return fmt.Errorf("failed to get active count during delete: %w", err)
-		}
-		if activeCount > 0 {
-			if err := idx.setActiveCount(batch, activeCount-1); err != nil {
-				return fmt.Errorf("failed to update active count during delete: %w", err)
-			}
-		}
+	if err := idx.persistMutableState(batch, state); err != nil {
+		return fmt.Errorf("failed to update mutable state during delete: %w", err)
 	}
 
 	// Consistency check and metadata save once after all deletions
@@ -1239,18 +2050,24 @@ func (idx *HNSWIndex) Stats() map[string]any {
 
 	activeCount, _ := idx.getActiveCount(idx.db)
 	entryPoint, _ := idx.getEntryPoint(idx.db)
+	baseEntryPoint, _ := idx.getBaseEntryPoint(idx.db)
+	overlayEntryPoint, _ := idx.getOverlayEntryPoint(idx.db)
+	overlayCount, _ := idx.getOverlayCount(idx.db)
 
 	stats := map[string]any{
-		"implementation": "PebbleANN",
-		"dimension":      idx.config.Dimension,
-		"index_path":     idx.config.IndexPath,
-		"db_path":        idx.dbPath,
-		"nodes_active":   activeCount,
-		"entry_point":    entryPoint,
-		"config_M":       idx.config.Neighbors,
-		"config_EfC":     idx.config.EfConstruction,
-		"config_EfS":     idx.config.EfSearch,
-		"sync_writes":    idx.config.PebbleSyncWrite,
+		"implementation":      "PebbleANN",
+		"dimension":           idx.config.Dimension,
+		"index_path":          idx.config.IndexPath,
+		"db_path":             idx.dbPath,
+		"nodes_active":        activeCount,
+		"entry_point":         entryPoint,
+		"base_entry_point":    baseEntryPoint,
+		"overlay_entry_point": overlayEntryPoint,
+		"overlay_count":       overlayCount,
+		"config_M":            idx.config.Neighbors,
+		"config_EfC":          idx.config.EfConstruction,
+		"config_EfS":          idx.config.EfSearch,
+		"sync_writes":         idx.config.PebbleSyncWrite,
 	}
 
 	// PebbleDB statistics
@@ -1303,7 +2120,7 @@ func (idx *HNSWIndex) getLayerCounts() map[int]int {
 
 	iter, err := idx.db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
 		LowerBound: pebbleNodeKeyPrefix,
-		UpperBound: utils.PrefixSuccessor(pebbleNodeKeyPrefix),
+		UpperBound: idx.nodeKeyUpperEnd,
 		SkipPoint: func(userKey []byte) bool {
 			return !bytes.HasSuffix(userKey, pebbleLayerKeySuffix)
 		},
@@ -1354,7 +2171,7 @@ func (idx *HNSWIndex) countMetadataPrefix(prefix []byte) (int, error) {
 	}
 
 	count := 0
-	p := makePebbleMetadataInvertKey(prefix)
+	p := makePebbleMetadataInvertPrefix(prefix)
 	iter, err := idx.db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
 		LowerBound: p,
 		UpperBound: utils.PrefixSuccessor(p),
@@ -1379,12 +2196,10 @@ func (idx *HNSWIndex) searchDirect(
 	// Priority queue to keep top k results
 	results := NewPriorityQueue(true, k) // Max-heap for keeping closest k
 
+	prefix := makePebbleMetadataInvertPrefix(filterPrefix)
 	iter, err := idx.db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
-		LowerBound: pebbleNodeKeyPrefix,
-		UpperBound: utils.PrefixSuccessor(pebbleNodeKeyPrefix),
-		SkipPoint: func(userKey []byte) bool {
-			return !bytes.HasSuffix(userKey, pebbleMetadataKeySuffix)
-		},
+		LowerBound: prefix,
+		UpperBound: utils.PrefixSuccessor(prefix),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create iterator: %w", err)
@@ -1392,21 +2207,10 @@ func (idx *HNSWIndex) searchDirect(
 	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
-		metadataValue := iter.Value()
-
-		// Check if metadata matches the filter prefix
-		if len(filterPrefix) > 0 && !bytes.HasPrefix(metadataValue, filterPrefix) {
+		nodeID, metadataValue, ok := decodeMetadataInvertKey(prefix, iter.Key(), iter.Value())
+		if !ok || !bytes.HasPrefix(metadataValue, filterPrefix) {
 			continue
 		}
-
-		// Extract node ID from the key
-		key := iter.Key()
-		if len(key) < len(pebbleNodeKeyPrefix)+8 {
-			continue // Invalid key
-		}
-		nodeID := binary.BigEndian.Uint64(
-			key[len(pebbleNodeKeyPrefix) : len(pebbleNodeKeyPrefix)+8],
-		)
 
 		// Read the vector for this node
 		vec, err := idx.readVector(idx.db, nodeID)
@@ -1435,6 +2239,9 @@ func (idx *HNSWIndex) searchDirect(
 			})
 		}
 	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("failed to iterate metadata entries: %w", err)
+	}
 
 	// Extract final results from the heap
 	finalResults := make([]*Result, results.Len())
@@ -1452,6 +2259,7 @@ func (idx *HNSWIndex) searchDirect(
 
 // serializeNeighbors converts a slice of neighbor IDs into a byte slice.
 func serializeNeighbors(buf *bytes.Buffer, neighbors []*PriorityItem) error {
+	buf.Reset()
 	numNeighbors := len(neighbors)
 	if numNeighbors == 0 {
 		return nil // Return empty slice for no neighbors
@@ -1459,18 +2267,18 @@ func serializeNeighbors(buf *bytes.Buffer, neighbors []*PriorityItem) error {
 	if numNeighbors > math.MaxUint32 {
 		return fmt.Errorf("too many neighbors: %d exceeds maximum %d", numNeighbors, math.MaxUint32)
 	}
-	count := uint32(numNeighbors)
-	if err := binary.Write(buf, binary.LittleEndian, count); err != nil {
+	buf.Grow(4 + numNeighbors*serializedNeighborSize)
+	var countBuf [4]byte
+	binary.LittleEndian.PutUint32(countBuf[:], uint32(numNeighbors))
+	if _, err := buf.Write(countBuf[:]); err != nil {
 		return fmt.Errorf("failed to write neighbor count: %w", err)
 	}
+	var entryBuf [serializedNeighborSize]byte
 	for _, n := range neighbors {
-		if err := binary.Write(buf, binary.LittleEndian, n.ID); err != nil {
+		binary.LittleEndian.PutUint64(entryBuf[:8], n.ID)
+		binary.LittleEndian.PutUint32(entryBuf[8:], math.Float32bits(n.Distance))
+		if _, err := buf.Write(entryBuf[:]); err != nil {
 			return fmt.Errorf("failed to write neighbor id %d: %w", n.ID, err)
-		}
-		// FIXME (ajr) This distance could be out of data if the neighbor gets updated
-		// or the id could become invalid after a deletion
-		if err := binary.Write(buf, binary.LittleEndian, n.Distance); err != nil {
-			return fmt.Errorf("failed to write neighbor distance %f: %w", n.Distance, err)
 		}
 	}
 	return nil
@@ -1482,42 +2290,27 @@ func (idx *HNSWIndex) deserializeNeighborsWithPool(data []byte) ([]*PriorityItem
 		// Return an empty slice without using the pool
 		return []*PriorityItem{}, nil
 	}
-	reader := bytes.NewReader(data)
-
-	// Optional: Read count first if serializeNeighbors writes it
-	var count uint32
-	if err := binary.Read(reader, binary.LittleEndian, &count); err != nil {
-		return nil, fmt.Errorf("failed to read neighbor count: %w", err)
+	if len(data) < 4 {
+		return nil, fmt.Errorf("failed to read neighbor count: buffer too short: %d", len(data))
 	}
+	count := binary.LittleEndian.Uint32(data[:4])
+	data = data[4:]
+	requiredBytes := int(count) * serializedNeighborSize
+	if len(data) < requiredBytes {
+		return nil, fmt.Errorf(
+			"unexpected end of data while reading neighbors: need %d bytes, got %d",
+			requiredBytes,
+			len(data),
+		)
+	}
+	data = data[:requiredBytes]
 
 	neighbors := make([]*PriorityItem, count)
 	for i := range neighbors {
-		if neighbors[i] == nil {
-			neighbors[i] = &PriorityItem{}
-		}
-		if err := binary.Read(reader, binary.LittleEndian, &neighbors[i].ID); err != nil {
-			// Check for unexpected EOF
-			if err == io.ErrUnexpectedEOF || err == io.EOF {
-				return nil, fmt.Errorf(
-					"unexpected end of data while reading neighbor %d of %d: %w",
-					i+1,
-					count,
-					err,
-				)
-			}
-			return nil, fmt.Errorf("failed to read neighbor ID at index %d: %w", i, err)
-		}
-		if err := binary.Read(reader, binary.LittleEndian, &neighbors[i].Distance); err != nil {
-			// Check for unexpected EOF
-			if err == io.ErrUnexpectedEOF || err == io.EOF {
-				return nil, fmt.Errorf(
-					"unexpected end of data while reading neighbor %d of %d: %w",
-					i+1,
-					count,
-					err,
-				)
-			}
-			return nil, fmt.Errorf("failed to read neighbor ID at index %d: %w", i, err)
+		offset := i * serializedNeighborSize
+		neighbors[i] = &PriorityItem{
+			ID:       binary.LittleEndian.Uint64(data[offset : offset+8]),
+			Distance: math.Float32frombits(binary.LittleEndian.Uint32(data[offset+8 : offset+serializedNeighborSize])),
 		}
 	}
 	return neighbors, nil
@@ -1534,7 +2327,7 @@ func (idx *HNSWIndex) readVector(db pebble.Reader, id uint64) ([]float32, error)
 	vectorData, closer, err := db.Get(makePebbleVectorKey(id))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, fmt.Errorf("vector data for ID %d not found", id)
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("failed to read vector data for ID %d from database: %w", id, err)
 	}
@@ -1574,6 +2367,67 @@ func (idx *HNSWIndex) readNodeNeighbors(
 	return neighbors, nil
 }
 
+func (idx *HNSWIndex) getNodeDataForUpdate(
+	db pebble.Reader,
+	id uint64,
+	includeVector bool,
+) (*HNSWNodeData, error) {
+	layer, err := idx.getNodeLayer(db, id)
+	if err != nil {
+		return nil, err
+	}
+
+	nodeData := &HNSWNodeData{
+		id:        id,
+		layer:     layer,
+		neighbors: make(map[int][]*PriorityItem, layer+1),
+	}
+	if includeVector {
+		nodeData.vector, err = idx.readVector(db, id)
+		if err != nil {
+			return nil, err
+		}
+	}
+	metadata, err := idx.readMetadata(db, id)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	if err == nil {
+		nodeData.metadata = metadata
+	}
+
+	foundAnyGraph := false
+	for currentLayer := 0; currentLayer <= layer; currentLayer++ {
+		neighbors, err := idx.readNodeNeighbors(db, id, currentLayer)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		nodeData.neighbors[currentLayer] = neighbors
+		foundAnyGraph = true
+	}
+	if !foundAnyGraph {
+		return nil, ErrNotFound
+	}
+	return nodeData, nil
+}
+
+func (idx *HNSWIndex) getNodeDataForTraversal(
+	batchCtx *hnswBatchContext,
+	batch *pebble.Batch,
+	id uint64,
+) (*HNSWNodeData, error) {
+	if batchCtx != nil {
+		return batchCtx.getTraversalNodeData(idx, id)
+	}
+	if batch != nil {
+		return idx.getNodeDataForUpdate(batch, id, true)
+	}
+	return idx.getNodeData(nil, id)
+}
+
 // getNodeData retrieves vector and neighbors for a node, using the cache.
 // Reads vector from file and neighbors from PebbleDB if not cached.
 // Assumes RLock is held.
@@ -1593,7 +2447,8 @@ func (idx *HNSWIndex) getNodeData(batch *pebble.Batch, id uint64) (*HNSWNodeData
 	idx.cacheMisses++
 	idx.cacheMu.Unlock()
 
-	// Use iterator to scan all keys for this node
+	// Use iterator to scan all keys for this node. In practice this is faster
+	// than multiple point-lookups when search is touching many nodes.
 	lower, upper := makePebbleNodeRange(id)
 	iter, err := db.NewIterWithContext(context.TODO(), &pebble.IterOptions{
 		LowerBound: lower,
@@ -1609,6 +2464,9 @@ func (idx *HNSWIndex) getNodeData(batch *pebble.Batch, id uint64) (*HNSWNodeData
 	// Get nodeData from pool
 	nodeData := idx.nodeDataPool.Get().(*HNSWNodeData)
 	nodeData.id = id // Store the ID within the cached data
+	nodeData.layer = -1
+	nodeData.vector = nil
+	nodeData.metadata = nil
 	// Clear the neighbors map
 	for k := range nodeData.neighbors {
 		delete(nodeData.neighbors, k)
@@ -1625,11 +2483,13 @@ func (idx *HNSWIndex) getNodeData(batch *pebble.Batch, id uint64) (*HNSWNodeData
 		if bytes.HasSuffix(key, pebbleVectorKeySuffix) {
 			_, vec, err := vector.Decode(value)
 			if err != nil {
+				idx.releaseNodeData(nodeData)
 				return nil, fmt.Errorf("decoding vector for node %d: %w", id, err)
 			}
 			nodeData.vector = vec
 			foundVector = true
-		} else if bytes.HasSuffix(key[:len(key)-5], pebbleGraphKeySuffix) {
+		} else if len(key) >= len(pebbleNodeKeyPrefix)+8+len(pebbleGraphKeySuffix)+1+4 &&
+			bytes.HasSuffix(key[:len(key)-5], pebbleGraphKeySuffix) {
 			layer := int(binary.BigEndian.Uint32(key[len(key)-4:]))
 			neighbors, err := idx.deserializeNeighborsWithPool(value)
 			if err != nil {
@@ -1691,99 +2551,36 @@ func (idx *HNSWIndex) getNodeData(batch *pebble.Batch, id uint64) (*HNSWNodeData
 	return nodeData, nil
 }
 
-func (idx *HNSWIndex) GetClosestEntryAtLayer(
-	batch *pebble.Batch,
-	query []float32,
-	entryPoint uint64,
-	distance float32,
-	layer int,
-	visited map[uint64]struct{},
-) (uint64, float32, error) {
-	epData, err := idx.getNodeData(batch, entryPoint) // Fetches vector + neighbors (from Pebble)
-	if err != nil {
-		return 0, 0, fmt.Errorf(
-			"failed to get entry point data for ID %d in search: %w",
-			entryPoint,
-			err,
-		)
-	}
-	results := entryPoint
-	if distance == math.MaxFloat32 {
-		// Calculate distance to entry point
-		distance = vector.MeasureDistance(idx.config.DistanceMetric, query, epData.vector)
-	}
-	for _, neighbor := range epData.neighbors[layer] {
-		if _, isVisited := visited[neighbor.ID]; isVisited {
-			continue // Already processed this node
-		}
-		visited[neighbor.ID] = struct{}{} // Mark as visited
-		neighborData, err := idx.getNodeData(batch, neighbor.ID)
-		if err != nil {
-			if !errors.Is(err, ErrNotFound) {
-				return 0, 0, fmt.Errorf(
-					"failed to get entry point data for ID %d in search: %w",
-					entryPoint,
-					err,
-				)
-			}
-			continue
-		}
-		neighborDist := vector.MeasureDistance(
-			idx.config.DistanceMetric,
-			query,
-			neighborData.vector,
-		)
-		if neighborDist < distance {
-			// If this neighbor is closer than the current best, update results
-			results = neighborData.id
-			distance = neighborDist
-		}
-	}
-	return results, distance, nil
-}
-
 // searchLayerPebbleInternal performs graph traversal using PebbleDB to find candidate neighbors at a specific layer.
 // Returns a sorted list of the top 'ef' closest items found.
 // Assumes RLock is held.
 // , candidates *PriorityQueue, results *PriorityQueue, visited map[uint64]struct{}
 func (idx *HNSWIndex) searchLayerPebbleInternal(
+	batchCtx *hnswBatchContext,
 	batch *pebble.Batch,
 	query []float32,
 	filterPrefix []byte,
 	entryPoint uint64,
 	ef int,
 	layer int,
-	prev *PriorityQueue,
-	visited map[uint64]struct{},
 ) (*PriorityQueue, error) {
 	// candidates: Min-heap storing distances of nodes to visit.
 	// results: Max-heap storing distances (keeps track of the 'ef' furthest among the closest found so far).
-	var candidates *PriorityQueue
-	if prev != nil {
-		candidates = prev.Clone(false)
-	} else {
-		candidates = NewPriorityQueue(false, ef) // Min-heap
+	candidates := NewPriorityQueue(false, ef) // Min-heap
+	bestSeen := NewPriorityQueue(true, ef)    // Max-heap
+	filteredResults := bestSeen
+	if len(filterPrefix) > 0 {
+		filteredResults = NewPriorityQueue(true, ef)
 	}
-	var results *PriorityQueue
-	if prev != nil {
-		results = prev
-	} else {
-		results = NewPriorityQueue(true, ef) // Max-heap
-	}
-	if visited == nil {
-		visited = idx.visitedPool.Get().(map[uint64]struct{})
-		defer func() {
-			// Clear the map before returning to pool
-			clear(visited)
-			idx.visitedPool.Put(visited)
-		}()
-	}
+	visited := idx.visitedPool.Get().(map[uint64]struct{})
+	defer func() {
+		// Clear the map before returning to pool
+		clear(visited)
+		idx.visitedPool.Put(visited)
+	}()
 
 	if _, isVisited := visited[entryPoint]; !isVisited {
-		epData, err := idx.getNodeData(
-			batch,
-			entryPoint,
-		) // Fetches vector + neighbors (from Pebble)
+		epData, err := idx.getNodeDataForTraversal(batchCtx, batch, entryPoint)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"failed to get entry point data for ID %d in search: %w",
@@ -1796,14 +2593,11 @@ func (idx *HNSWIndex) searchLayerPebbleInternal(
 		epDist := vector.MeasureDistance(idx.config.DistanceMetric, query, epData.vector)
 		item := &PriorityItem{ID: entryPoint, Distance: epDist, Metadata: epData.metadata}
 		heap.Push(candidates, item)
+		heap.Push(bestSeen, item)
 		if len(filterPrefix) > 0 {
 			if epData.metadata != nil && bytes.HasPrefix(epData.metadata, filterPrefix) {
-				// If the entry point matches the filter, add it to results
-				heap.Push(results, item)
+				heap.Push(filteredResults, item)
 			}
-			// If not found or doesn't match, we don't add it to results.
-		} else {
-			heap.Push(results, item)
 		}
 		visited[entryPoint] = struct{}{}
 	}
@@ -1811,13 +2605,12 @@ func (idx *HNSWIndex) searchLayerPebbleInternal(
 	// Perform Greedy/Beam Search
 	for candidates.Len() > 0 {
 		currentCandidateItem := heap.Pop(candidates).(*PriorityItem)
-		// Termination: if the closest candidate is further than the worst in results, stop.
-		if results.Len() >= ef && len(visited) > ef &&
-			currentCandidateItem.Distance > results.Peek().Distance {
+		// Termination should depend on the best unfiltered frontier, not filtered matches.
+		if bestSeen.Len() >= ef && currentCandidateItem.Distance > bestSeen.Peek().Distance {
 			break
 		}
 
-		nodeData, err := idx.getNodeData(batch, currentCandidateItem.ID)
+		nodeData, err := idx.getNodeDataForTraversal(batchCtx, batch, currentCandidateItem.ID)
 		if err != nil {
 			if !errors.Is(err, ErrNotFound) {
 				// TODO (ajr) Add a metric for this?
@@ -1845,7 +2638,7 @@ func (idx *HNSWIndex) searchLayerPebbleInternal(
 			visited[neighbor.ID] = struct{}{} // Mark as visited
 
 			// Fetch neighbor data (vector required for distance calculation)
-			neighborData, err := idx.getNodeData(batch, neighbor.ID)
+			neighborData, err := idx.getNodeDataForTraversal(batchCtx, batch, neighbor.ID)
 			if err != nil {
 				if !errors.Is(err, ErrNotFound) {
 					log.Printf(
@@ -1863,58 +2656,43 @@ func (idx *HNSWIndex) searchLayerPebbleInternal(
 				neighborData.vector,
 			)
 
-			// Check if this neighbor should be added to our potential results
-			// Add to results max-heap if it's better than the current worst in the heap, or if heap isn't full.
-			addToResults := false
-			addToCandidates := false
-			if results.Len() < ef {
-				addToCandidates = true
-				if len(filterPrefix) > 0 {
-					if neighborData.metadata != nil &&
-						bytes.HasPrefix(neighborData.metadata, filterPrefix) {
-						addToResults = true
-					}
-				} else {
-					addToResults = true // Add if results heap is not yet full
-				}
-			} else {
-				// Get the current worst distance in results
-				if neighborDist < results.Peek().Distance {
-					// If neighbor is closer than the worst, remove the worst and plan to add neighbor
-					if len(filterPrefix) > 0 {
-						if neighborData.metadata != nil && bytes.HasPrefix(neighborData.metadata, filterPrefix) {
-							heap.Pop(results)
-							addToResults = true
-							addToCandidates = true
-						}
-					} else {
-						heap.Pop(results)
-						addToResults = true
-						addToCandidates = true
-					}
-				}
+			addToCandidates := bestSeen.Len() < ef || neighborDist < bestSeen.Peek().Distance
+			if !addToCandidates {
+				continue
 			}
 
-			if addToCandidates {
-				// Add to both results (max-heap, positive distance) and candidates (min-heap, negative distance)
-				item := &PriorityItem{
-					ID:       neighbor.ID,
-					Distance: neighborDist,
-					Metadata: neighborData.metadata,
+			item := &PriorityItem{
+				ID:       neighbor.ID,
+				Distance: neighborDist,
+				Metadata: neighborData.metadata,
+			}
+			if bestSeen.Len() >= ef {
+				heap.Pop(bestSeen)
+			}
+			heap.Push(bestSeen, item)
+			heap.Push(candidates, item)
+
+			if len(filterPrefix) == 0 {
+				continue
+			}
+			if neighborData.metadata != nil && bytes.HasPrefix(neighborData.metadata, filterPrefix) {
+				if filteredResults.Len() >= ef {
+					if neighborDist >= filteredResults.Peek().Distance {
+						continue
+					}
+					heap.Pop(filteredResults)
 				}
-				heap.Push(candidates, item)
-				if addToResults {
-					heap.Push(results, item)
-				}
+				heap.Push(filteredResults, item)
 			}
 		}
 	}
 
-	return results, nil
+	return filteredResults, nil
 }
 
 // Add this optimized version that works with a batch
 func (idx *HNSWIndex) selectNeighborsHeuristicWithBatch(
+	batchCtx *hnswBatchContext,
 	batch *pebble.Batch,
 	candidates []*PriorityItem,
 	M int,
@@ -1925,9 +2703,9 @@ func (idx *HNSWIndex) selectNeighborsHeuristicWithBatch(
 	}
 
 	// Pre-load all candidate vectors
-	candidateNeighbors := make(map[uint64][]*PriorityItem)
+	candidateNeighbors := make(map[uint64][]*PriorityItem, len(candidates))
 	for _, candidate := range candidates {
-		if nodeData, err := idx.getNodeData(batch, candidate.ID); err == nil {
+		if nodeData, err := batchCtx.getNodeData(idx, candidate.ID, false); err == nil {
 			candidateNeighbors[candidate.ID] = nodeData.neighbors[layer]
 		}
 	}
@@ -1956,15 +2734,10 @@ func (idx *HNSWIndex) selectNeighborsHeuristicWithBatch(
 			if !ok {
 				continue
 			}
-			i := slices.IndexFunc(selectedVec, func(a *PriorityItem) bool {
-				return a.ID == candidate.ID
-			})
-			if i < 0 {
+			distBetweenNeighbors, ok := findNeighborDistance(selectedVec, candidate.ID)
+			if !ok {
 				continue // Skip if candidate is not in selected neighbors
 			}
-
-			distBetweenNeighbors := selectedVec[i].Distance
-			// distBetweenNeighbors := idx.config.DistanceFunc(candidateVec, selectedVec)
 
 			if distBetweenNeighbors < candidate.Distance {
 				shouldAdd = false
@@ -1994,10 +2767,91 @@ func (idx *HNSWIndex) selectNeighborsHeuristicWithBatch(
 	return selected
 }
 
+func findNeighborDistance(neighbors []*PriorityItem, id uint64) (float32, bool) {
+	for _, neighbor := range neighbors {
+		if neighbor.ID == id {
+			return neighbor.Distance, true
+		}
+	}
+	return 0, false
+}
+
+func (idx *HNSWIndex) writeNodeNeighbors(
+	batch *pebble.Batch,
+	buf *bytes.Buffer,
+	nodeID uint64,
+	layer int,
+	oldNeighbors []*PriorityItem,
+	newNeighbors []*PriorityItem,
+) error {
+	if err := serializeNeighbors(buf, newNeighbors); err != nil {
+		return fmt.Errorf("serializing neighbors for node %d at layer %d: %w", nodeID, layer, err)
+	}
+	if err := batch.Set(makePebbleGraphLayerKey(nodeID, layer), buf.Bytes(), nil); err != nil {
+		return fmt.Errorf("writing neighbors for node %d at layer %d: %w", nodeID, layer, err)
+	}
+
+	oldSet := make(map[uint64]struct{}, len(oldNeighbors))
+	for _, neighbor := range oldNeighbors {
+		oldSet[neighbor.ID] = struct{}{}
+	}
+	newSet := make(map[uint64]struct{}, len(newNeighbors))
+	for _, neighbor := range newNeighbors {
+		newSet[neighbor.ID] = struct{}{}
+		if _, exists := oldSet[neighbor.ID]; exists {
+			continue
+		}
+		if err := batch.Set(makePebbleReverseGraphKey(neighbor.ID, layer, nodeID), nil, nil); err != nil {
+			return fmt.Errorf("writing reverse edge %d <- %d at layer %d: %w", neighbor.ID, nodeID, layer, err)
+		}
+	}
+	for _, neighbor := range oldNeighbors {
+		if _, exists := newSet[neighbor.ID]; exists {
+			continue
+		}
+		if err := batch.Delete(makePebbleReverseGraphKey(neighbor.ID, layer, nodeID), nil); err != nil {
+			return fmt.Errorf("deleting reverse edge %d <- %d at layer %d: %w", neighbor.ID, nodeID, layer, err)
+		}
+	}
+	return nil
+}
+
+func insertNeighborByDistance(
+	neighbors []*PriorityItem,
+	newNeighbor *PriorityItem,
+	maxConnections int,
+) ([]*PriorityItem, bool) {
+	existingIdx := slices.IndexFunc(neighbors, func(item *PriorityItem) bool {
+		return item.ID == newNeighbor.ID
+	})
+	if existingIdx >= 0 {
+		if neighbors[existingIdx].Distance <= newNeighbor.Distance {
+			return neighbors, false
+		}
+		neighbors = slices.Delete(neighbors, existingIdx, existingIdx+1)
+	}
+
+	insertIdx := sort.Search(len(neighbors), func(i int) bool {
+		return neighbors[i].Distance > newNeighbor.Distance
+	})
+	if len(neighbors) >= maxConnections && insertIdx == len(neighbors) {
+		return neighbors, false
+	}
+
+	neighbors = append(neighbors, nil)
+	copy(neighbors[insertIdx+1:], neighbors[insertIdx:])
+	neighbors[insertIdx] = newNeighbor
+	if len(neighbors) > maxConnections {
+		neighbors = neighbors[:maxConnections]
+	}
+	return neighbors, true
+}
+
 // updateGraphForNode connects a new node into the HNSW graph stored in PebbleDB.
 // Uses a Pebble Batch for atomicity of reciprocal updates.
 // Assumes Lock is held.
 func (idx *HNSWIndex) updateGraphForNode(
+	batchCtx *hnswBatchContext,
 	buf *bytes.Buffer,
 	batch *pebble.Batch,
 	entryPoint uint64,
@@ -2012,34 +2866,24 @@ func (idx *HNSWIndex) updateGraphForNode(
 
 	// Start from the top layer and search down to the node's layer
 	currentNearest := entryPoint
-	// var currentNearestDist float32 = math.MaxFloat32
-	visited := idx.visitedPool.Get().(map[uint64]struct{}) // Get visited map from pool
-	defer func() {
-		// Clear the map before returning to pool
-		clear(visited)
-		idx.visitedPool.Put(visited)
-	}()
-	var prev *PriorityQueue
 	minDist := float32(math.MaxFloat32)
 	for layer := entryPointLayer; layer > nodeLayer; layer-- {
 		// Search at current layer with ef=M to find nearest point
-		var err error
 		// currentNearest, currentNearestDist, err = idx.GetClosestEntryAtLayer(batch, nodeVector, currentNearest, currentNearestDist, layer, entryVisits)
-		prev, err = idx.searchLayerPebbleInternal(
+		pqueue, err := idx.searchLayerPebbleInternal(
+			batchCtx,
 			batch,
 			nodeVector,
 			nil,
 			currentNearest,
 			1,
 			layer,
-			nil,
-			nil,
 		)
 		if err != nil {
 			return fmt.Errorf("searching at layer %d for node %d: %w", layer, nodeID, err)
 		}
-		if prev.Len() > 0 {
-			nearest := prev.Items(1)[0]
+		if pqueue.Len() > 0 {
+			nearest := pqueue.Best()
 			if nearest.Distance > minDist {
 				return fmt.Errorf(
 					"invariant violated: candidate at layer %d with distance %f > minimum distance %f",
@@ -2051,8 +2895,6 @@ func (idx *HNSWIndex) updateGraphForNode(
 		}
 	}
 
-	// Clear visited map for reuse at insertion layers
-	clear(visited)
 	// Now insert at all layers from nodeLayer down to 0
 	for layer := nodeLayer; layer >= 0; layer-- {
 		// Determine M for this layer
@@ -2062,16 +2904,14 @@ func (idx *HNSWIndex) updateGraphForNode(
 		}
 
 		// Search for neighbors at this layer
-		var err error
-		prev, err = idx.searchLayerPebbleInternal(
+		pqueue, err := idx.searchLayerPebbleInternal(
+			batchCtx,
 			batch,
 			nodeVector,
 			nil,
 			currentNearest,
 			int(idx.config.EfConstruction),
 			layer,
-			nil,
-			nil,
 		)
 		if err != nil {
 			return fmt.Errorf(
@@ -2083,20 +2923,11 @@ func (idx *HNSWIndex) updateGraphForNode(
 		}
 		// prev.ShrinkTo(int(M))
 		// candidates := prev.Items(int(M))
-		allCandidates := prev.Items(prev.Len()) // Get all candidates
-		candidates := idx.selectNeighborsHeuristicWithBatch(batch, allCandidates, int(M), layer)
+		allCandidates := pqueue.Items(pqueue.Len()) // Get all candidates
+		candidates := idx.selectNeighborsHeuristicWithBatch(batchCtx, batch, allCandidates, int(M), layer)
 
 		// Update the new node's neighbor list at this layer
-		buf.Reset()
-		if err := serializeNeighbors(buf, candidates); err != nil {
-			return fmt.Errorf(
-				"serializing neighbors for node %d at layer %d: %w",
-				nodeID,
-				layer,
-				err,
-			)
-		}
-		if err := batch.Set(makePebbleGraphLayerKey(nodeID, layer), buf.Bytes(), nil); err != nil {
+		if err := idx.writeNodeNeighbors(batch, buf, nodeID, layer, nil, candidates); err != nil {
 			return fmt.Errorf(
 				"failed adding node %d layer %d update to batch: %w",
 				nodeID,
@@ -2104,6 +2935,7 @@ func (idx *HNSWIndex) updateGraphForNode(
 				err,
 			)
 		}
+		batchCtx.updateNeighbors(nodeID, layer, candidates)
 		buf.Reset()
 		// Update reciprocal connections
 		for _, neighbor := range candidates {
@@ -2111,7 +2943,7 @@ func (idx *HNSWIndex) updateGraphForNode(
 				continue
 			}
 
-			neighborData, err := idx.getNodeData(batch, neighbor.ID)
+			neighborData, err := batchCtx.getNodeData(idx, neighbor.ID, false)
 			if err != nil {
 				log.Printf(
 					"Warning: Failed to read neighbors for node %d at layer %d: %v",
@@ -2122,41 +2954,23 @@ func (idx *HNSWIndex) updateGraphForNode(
 				continue
 			}
 			neighborNeighbors := neighborData.neighbors[layer]
+			oldNeighbors := slices.Clone(neighborNeighbors)
 
 			// Add new node to neighbor's connections
 			maxConnections := int(M)
-			i := slices.IndexFunc(neighborNeighbors, func(item *PriorityItem) bool {
-				return item.Distance < neighbor.Distance
-			})
-			if i == -1 && len(neighborNeighbors) >= maxConnections {
-				continue // Don't add if list is full and new node is worse
-			}
-
-			neighborNeighbors = append(
+			updatedNeighbors, changed := insertNeighborByDistance(
 				neighborNeighbors,
 				&PriorityItem{ID: nodeID, Distance: neighbor.Distance},
+				maxConnections,
 			)
-			if i != -1 {
-				slices.SortFunc(neighborNeighbors, func(a, b *PriorityItem) int {
-					return cmp.Compare(a.Distance, b.Distance)
-				})
-				if len(neighborNeighbors) > maxConnections {
-					neighborNeighbors = neighborNeighbors[:maxConnections]
-				}
+			if !changed {
+				continue
 			}
+			neighborNeighbors = updatedNeighbors
 
 			// Save updated neighbor connections
 
-			if err := serializeNeighbors(buf, neighborNeighbors); err != nil {
-				log.Printf(
-					"Warning: Failed to serialize neighbors for node %d at layer %d: %v",
-					neighbor.ID,
-					layer,
-					err,
-				)
-				continue
-			}
-			if err := batch.Set(makePebbleGraphLayerKey(neighbor.ID, layer), buf.Bytes(), nil); err != nil {
+			if err := idx.writeNodeNeighbors(batch, buf, neighbor.ID, layer, oldNeighbors, neighborNeighbors); err != nil {
 				return fmt.Errorf(
 					"failed adding neighbor %d layer %d update to batch: %w",
 					neighbor.ID,
@@ -2166,6 +2980,7 @@ func (idx *HNSWIndex) updateGraphForNode(
 			}
 			buf.Reset()
 			idx.updateCache(neighbor.ID, layer, neighborNeighbors)
+			batchCtx.updateNeighbors(neighbor.ID, layer, neighborNeighbors)
 		}
 
 		// Use the found neighbors as starting points for the next layer
