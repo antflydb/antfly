@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -109,21 +110,32 @@ func getE2EDir() string {
 	return filepath.Dir(filename)
 }
 
-// GetFreePort returns an available port on localhost
+// allocatedPorts tracks ports returned by GetFreePort to avoid returning the
+// same port twice when the OS recycles ephemeral ports between sequential
+// Listen/Close cycles (TOCTOU race).
+var allocatedPorts sync.Map
+
+// GetFreePort returns an available port on localhost. It keeps track of
+// previously allocated ports so that rapid sequential calls never return
+// the same port.
 func GetFreePort(t *testing.T) int {
 	t.Helper()
 
-	listener, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("Failed to get free port: %v", err)
+	for range 20 {
+		listener, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			t.Fatalf("Failed to get free port: %v", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		_ = listener.Close()
+
+		if _, taken := allocatedPorts.LoadOrStore(port, struct{}{}); !taken {
+			return port
+		}
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	_ = listener.Close()
 
-	// Give OS time to release the port
-	time.Sleep(10 * time.Millisecond)
-
-	return port
+	t.Fatalf("Failed to get unique free port after 20 attempts")
+	return 0
 }
 
 // CreateTestConfig generates a test configuration with temp directories

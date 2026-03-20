@@ -1,46 +1,25 @@
-import type { GeneratorProvider, QueryBuilderResult } from "@antfly/sdk";
+import type { GeneratorConfig, QueryBuilderResult } from "@antfly/sdk";
 import { GearIcon } from "@radix-ui/react-icons";
 import { Sparkles } from "lucide-react";
 import type React from "react";
 import { useState } from "react";
+import {
+  formatGeneratorSummary,
+  GENERATOR_DEFAULT_CONFIG,
+  GeneratorSelector,
+  getInheritedGeneratorLabels,
+  QUERY_BUILDER_PROVIDERS,
+} from "@/components/playground/GeneratorSelector";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/hooks/use-api-config";
+import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { normalizeSimplifiedDSL, usesSimplifiedDSL } from "@/utils/normalizeQuery";
 import { QueryDiffView } from "./QueryDiffView";
-
-const PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, string>> = {
-  gemini: "gemini-2.5-flash",
-  vertex: "gemini-2.5-flash",
-  ollama: "llama3.3:70b",
-  openai: "gpt-4.1",
-  bedrock: "anthropic.claude-sonnet-4-5-20250929-v1:0",
-  anthropic: "claude-sonnet-4-5-20250929",
-  cohere: "command-r-plus",
-};
-
-const PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
-  gemini: "Google AI (Gemini)",
-  vertex: "Google Cloud Vertex AI",
-  ollama: "Ollama (Local)",
-  openai: "OpenAI",
-  bedrock: "AWS Bedrock",
-  anthropic: "Anthropic (Claude)",
-  cohere: "Cohere",
-};
 
 interface AIQueryAssistantProps {
   tableName?: string;
@@ -58,6 +37,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
   onQueryAppliedAndRun,
 }) => {
   const client = useApi();
+  const { dashboardGenerator } = useGeneratorPreference();
   const [intent, setIntent] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -66,13 +46,10 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
   const [wasNormalized, setWasNormalized] = useState(false);
 
   // Generator configuration
-  const [provider, setProvider] = useState<GeneratorProvider | "">("");
-  const [model, setModel] = useState("");
-
-  const handleProviderChange = (value: GeneratorProvider) => {
-    setProvider(value);
-    setModel(PROVIDER_DEFAULTS[value] || "");
-  };
+  const [generatorOverride, setGeneratorOverride] = useState<GeneratorConfig | null>(null);
+  const effectiveGenerator = generatorOverride ?? dashboardGenerator ?? null;
+  const { label: inheritedGeneratorLabel, description: inheritedGeneratorDescription } =
+    getInheritedGeneratorLabels(dashboardGenerator);
 
   const handleGenerate = async () => {
     if (!intent.trim()) {
@@ -91,10 +68,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
         intent: intent.trim(),
         ...(tableName && { table: tableName }),
         ...(schemaFields && schemaFields.length > 0 && { schema_fields: schemaFields }),
-        ...(provider &&
-          model && {
-            generator: { provider, model },
-          }),
+        ...(effectiveGenerator ? { generator: effectiveGenerator } : {}),
       });
 
       setResult(data);
@@ -164,54 +138,23 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
             <PopoverTrigger asChild>
               <Button variant="ghost" size="sm" className="h-7 gap-1.5 text-muted-foreground">
                 <GearIcon className="h-3.5 w-3.5" />
-                {provider && (
-                  <span className="text-xs">{PROVIDER_LABELS[provider] || provider}</span>
-                )}
+                <span className="text-xs truncate max-w-[180px]">
+                  {formatGeneratorSummary(effectiveGenerator)}
+                </span>
               </Button>
             </PopoverTrigger>
-            <PopoverContent className="w-80" align="end">
+            <PopoverContent className="w-[420px]" align="end">
               <div className="space-y-3">
                 <h4 className="text-sm font-medium">Generator Settings</h4>
-                <div className="space-y-2">
-                  <Label htmlFor="ai-provider" className="text-xs">
-                    Provider
-                  </Label>
-                  <Select
-                    value={provider}
-                    onValueChange={(v) => handleProviderChange(v as GeneratorProvider)}
-                  >
-                    <SelectTrigger id="ai-provider" className="h-8">
-                      <SelectValue placeholder="Server default" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="gemini">Google AI (Gemini)</SelectItem>
-                      <SelectItem value="vertex">Google Cloud Vertex</SelectItem>
-                      <SelectItem value="openai">OpenAI</SelectItem>
-                      <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
-                      <SelectItem value="bedrock">AWS Bedrock</SelectItem>
-                      <SelectItem value="ollama">Ollama (Local)</SelectItem>
-                      <SelectItem value="cohere">Cohere</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="ai-model" className="text-xs">
-                    Model
-                  </Label>
-                  <Input
-                    id="ai-model"
-                    placeholder={provider ? PROVIDER_DEFAULTS[provider] : "Default"}
-                    value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                    disabled={!provider}
-                    className="h-8"
-                  />
-                </div>
-                {!provider && (
-                  <p className="text-xs text-muted-foreground">
-                    Leave empty to use the server's default generator configuration.
-                  </p>
-                )}
+                <GeneratorSelector
+                  value={generatorOverride}
+                  onChange={setGeneratorOverride}
+                  defaultConfig={GENERATOR_DEFAULT_CONFIG}
+                  defaultLabel={inheritedGeneratorLabel}
+                  defaultDescription={inheritedGeneratorDescription}
+                  providers={QUERY_BUILDER_PROVIDERS}
+                  showTemperature={false}
+                />
               </div>
             </PopoverContent>
           </Popover>

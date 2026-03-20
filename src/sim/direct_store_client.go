@@ -214,8 +214,7 @@ func (c *directStoreClient) StopShard(ctx context.Context, shardID types.ID) err
 	if err != nil {
 		return err
 	}
-	node.store.StopRaftGroup(shardID)
-	return nil
+	return node.store.StopRaftGroup(shardID)
 }
 
 func (c *directStoreClient) StartShard(ctx context.Context, shardID types.ID, req *store.ShardStartRequest) error {

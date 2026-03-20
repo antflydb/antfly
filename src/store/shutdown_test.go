@@ -15,9 +15,18 @@
 package store
 
 import (
+	"path/filepath"
+	"sync"
 	"testing"
 
+	"github.com/antflydb/antfly/lib/types"
+	"github.com/antflydb/antfly/src/common"
+	"github.com/antflydb/antfly/src/store/db"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // TestDBWrapperCloseMethods verifies that the Close, CloseProposeC, and CloseDB methods
@@ -56,4 +65,70 @@ func TestShutdownSequence(t *testing.T) {
 	// The actual test happens through integration tests and real usage.
 	// See src/store/store.go StopRaftGroup() for the implementation.
 	assert.True(t, true, "Shutdown sequence is documented and implemented in StopRaftGroup")
+}
+
+// newTestStore creates a minimal Store suitable for testing StopRaftGroup.
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	tmpDir := t.TempDir()
+	metaDB, err := pebble.Open(filepath.Join(tmpDir, "meta"), &pebble.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = metaDB.Close() })
+	return &Store{
+		logger: zap.NewNop(),
+		antflyConfig: &common.Config{
+			Storage: common.StorageConfig{
+				Local: common.LocalStorageConfig{
+					BaseDir: tmpDir,
+				},
+			},
+		},
+		config:    &StoreInfo{ID: 1},
+		shardMu:   xsync.NewMap[types.ID, *sync.Mutex](),
+		shardsMap: xsync.NewMap[types.ID, *Shard](),
+		db:        metaDB,
+	}
+}
+
+func TestStopRaftGroup_AbsentShard(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.StopRaftGroup(types.ID(42))
+	require.ErrorIs(t, err, ErrShardNotFound)
+}
+
+func TestStopRaftGroup_InitializingShard(t *testing.T) {
+	s := newTestStore(t)
+	shardID := types.ID(42)
+
+	s.shardsMap.Store(shardID, db.NewInitializingShard())
+
+	err := s.StopRaftGroup(shardID)
+	require.ErrorIs(t, err, ErrShardInitializing)
+
+	// Shard should still be in the map (not deleted)
+	_, ok := s.shardsMap.Load(shardID)
+	assert.True(t, ok, "initializing shard should remain in the map")
+}
+
+func TestStopRaftGroup_ConcurrentStops(t *testing.T) {
+	s := newTestStore(t)
+	shardID := types.ID(42)
+
+	s.shardsMap.Store(shardID, db.NewInitializingShard())
+
+	var wg sync.WaitGroup
+	errs := make([]error, 10)
+	for i := range errs {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = s.StopRaftGroup(shardID)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.ErrorIs(t, err, ErrShardInitializing, "goroutine %d", i)
+	}
 }

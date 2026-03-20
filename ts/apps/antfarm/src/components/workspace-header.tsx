@@ -3,6 +3,7 @@ import { Maximize2, Minimize2, Monitor, Search } from "lucide-react";
 import type * as React from "react";
 import { useCommandPalette } from "@/components/command-palette-provider";
 import { useContentWidth } from "@/components/content-width-provider";
+import { DashboardGeneratorControl } from "@/components/playground/DashboardGeneratorControl";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { Button } from "@/components/ui/button";
 import { useTheme } from "@/hooks/use-theme";
@@ -35,6 +36,8 @@ export function WorkspaceHeader({ title, className, ...props }: WorkspaceHeaderP
           <Search className="size-4" />
           <span className="hidden md:inline">⌘K</span>
         </Button>
+
+        <DashboardGeneratorControl />
 
         {/* Settings */}
         <SettingsDialog />

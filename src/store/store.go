@@ -40,15 +40,23 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/singleflight"
 )
+
+// ErrShardInitializing is returned when a shard operation is attempted on a
+// shard that is still initializing. The client package matches this via
+// substring for HTTP error responses.
+var ErrShardInitializing = errors.New("shard is initializing")
+
+// ErrShardNotFound is returned when a shard lifecycle operation targets a
+// shard that does not exist on this store node.
+var ErrShardNotFound = errors.New("shard not found")
 
 var _ StoreIface = (*Store)(nil)
 
 type StoreIface interface {
 	Shard(id types.ID) (ShardIface, bool)
 	Status() *StoreStatus
-	StopRaftGroup(shardID types.ID)
+	StopRaftGroup(shardID types.ID) error
 	StartRaftGroup(shardID types.ID, peers []common.Peer, join bool, config *ShardStartConfig) error
 	ID() types.ID
 	Scan(
@@ -69,7 +77,11 @@ type Store struct {
 	logger       *zap.Logger
 	antflyConfig *common.Config
 
-	sg singleflight.Group
+	// shardMu provides per-shard mutexes to serialize lifecycle operations
+	// (Start/Stop) for the same shard, preventing disk-level races where
+	// StopRaftGroup could RemoveAll directories while StartRaftGroup is
+	// opening Pebble.
+	shardMu *xsync.Map[types.ID, *sync.Mutex]
 
 	config     *StoreInfo
 	shardsMap  *xsync.Map[types.ID, *Shard]
@@ -160,6 +172,7 @@ func NewStoreWithOptions(
 		eg:       eg,
 		egCancel: cancel,
 
+		shardMu:    xsync.NewMap[types.ID, *sync.Mutex](),
 		shardsMap:  xsync.NewMap[types.ID, *Shard](),
 		errorChanC: make(chan errorChanCItem, 1),
 		closingCh:  make(chan struct{}),
@@ -317,7 +330,11 @@ func (m *Store) ErrorC(ctx context.Context) chan error {
 				m.logger.Info("ID removed: shutting down Raft group",
 					zap.Stringer("shardID", shardID),
 					zap.Error(err))
-				m.StopRaftGroup(shardID)
+				if stopErr := m.StopRaftGroup(shardID); stopErr != nil {
+					m.logger.Warn("Failed to stop removed Raft group",
+						zap.Stringer("shardID", shardID),
+						zap.Error(stopErr))
+				}
 				continue
 			}
 			m.logger.Info("Received error from shard",
@@ -359,37 +376,59 @@ func (m *Store) Scan(
 	return shard.Scan(ctx, fromKey, toKey, opts)
 }
 
-func (m *Store) StopRaftGroup(shardID types.ID) {
-	_, err, _ := m.sg.Do(shardID.String()+":stop", func() (any, error) {
-		m.logger.Info("Stopping Raft Group", zap.Stringer("shardID", shardID))
-		// Load and Delete are not atomic, but this is safe because the
-		// entire stop operation is serialized per-shard via singleflight.
-		if shard, ok := m.shardsMap.Load(shardID); ok {
-			if shard.IsInitializing() {
-				return nil, errors.New("shard is still initializing")
-			}
-			m.shardsMap.Delete(shardID)
-			if err := shard.Close(); err != nil {
-				m.logger.Warn("Error closing shard while stopping Raft Group",
-					zap.String("shardID", shardID.String()),
-					zap.Error(err))
-			}
-		}
-		// TODO (ajr) Delete the snapshots and pebble databases
-		dataDir := m.antflyConfig.GetBaseDir()
-		_ = os.RemoveAll(common.StorageDBDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
-		// Clean up snapshots using SnapStore abstraction
-		if snapStore, err := snapstore.NewLocalSnapStore(dataDir, shardID, m.config.ID); err == nil {
-			_ = snapStore.RemoveAll(context.Background())
-		}
-		_ = os.RemoveAll(common.RaftLogDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
-		_ = m.deleteMetadataForShard(shardID)
-		m.logger.Info("Deleted Raft Group disk footprint", zap.Stringer("shardID", shardID))
-		return nil, nil
+// shardLifecycleMu returns a per-shard mutex that serializes Start and Stop
+// operations, preventing disk-level races.
+func (m *Store) shardLifecycleMu(shardID types.ID) *sync.Mutex {
+	mu, _ := m.shardMu.LoadOrCompute(shardID, func() (*sync.Mutex, bool) {
+		return &sync.Mutex{}, false
 	})
-	if err != nil {
-		m.logger.Warn("Error stopping Raft Group", zap.Stringer("shardID", shardID), zap.Error(err))
+	return mu
+}
+
+func (m *Store) StopRaftGroup(shardID types.ID) error {
+	mu := m.shardLifecycleMu(shardID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	m.logger.Info("Stopping Raft Group", zap.Stringer("shardID", shardID))
+
+	// Atomically check the shard state and remove it from the map.
+	var shardToClose *Shard
+	var wasInitializing bool
+	m.shardsMap.Compute(shardID, func(shard *Shard, loaded bool) (*Shard, xsync.ComputeOp) {
+		if !loaded {
+			return shard, xsync.CancelOp
+		}
+		if shard.IsInitializing() {
+			wasInitializing = true
+			return shard, xsync.CancelOp // keep in map
+		}
+		shardToClose = shard
+		return shard, xsync.DeleteOp
+	})
+
+	if wasInitializing {
+		return ErrShardInitializing
 	}
+	if shardToClose == nil {
+		return ErrShardNotFound
+	}
+	if err := shardToClose.Close(); err != nil {
+		m.logger.Warn("Error closing shard while stopping Raft Group",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+	}
+
+	dataDir := m.antflyConfig.GetBaseDir()
+	_ = os.RemoveAll(common.StorageDBDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
+	// Clean up snapshots using SnapStore abstraction
+	if snapStore, err := snapstore.NewLocalSnapStore(dataDir, shardID, m.config.ID); err == nil {
+		_ = snapStore.RemoveAll(context.Background())
+	}
+	_ = os.RemoveAll(common.RaftLogDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
+	_ = m.deleteMetadataForShard(shardID)
+	m.logger.Info("Deleted Raft Group disk footprint", zap.Stringer("shardID", shardID))
+	return nil
 }
 
 func (m *Store) createPassThroughChannels(
@@ -471,230 +510,230 @@ func (m *Store) StartRaftGroup(
 	join bool,
 	conf *ShardStartConfig,
 ) error {
-	_, err, _ := m.sg.Do(shardID.String()+":start", func() (any, error) {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Println("Recovered from panic:", r)              // Print the panic value
-				fmt.Println("Stack trace:\n", string(debug.Stack())) // Print the stack trace
-				panic(r)
-			}
-		}()
-		lg := m.logger.With(zap.Stringer("shardID", shardID))
-		if _, ok := m.shardsMap.Load(shardID); ok {
-			lg.Info("Shard already started")
-			return nil, nil
-		}
+	mu := m.shardLifecycleMu(shardID)
+	mu.Lock()
+	defer mu.Unlock()
 
-		lg.Debug("Starting Raft Group")
-		m.shardsMap.Store(shardID, db.NewInitializingShard())
-		// If we fail to start the shard, remove it from the map
-		removeShard := true
-		defer func() {
-			if removeShard {
-				m.shardsMap.Delete(shardID)
-			}
-		}()
-		var dbw *db.StoreDB
-		storeDBReady := make(chan struct{})
-		defer close(storeDBReady)
-		createDBSnapshot := func(id string) error {
-			<-storeDBReady
-			return dbw.CreateDBSnapshot(id)
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("Recovered from panic:", r)              // Print the panic value
+			fmt.Println("Stack trace:\n", string(debug.Stack())) // Print the stack trace
+			panic(r)
 		}
-		proposeC := make(chan *raft.Proposal)
-		confChangeC := make(chan *raft.ConfChangeProposal)
-		dataDir := m.antflyConfig.GetBaseDir()
-		snapStore, err := snapstore.NewLocalSnapStore(dataDir, shardID, m.config.ID)
-		if err != nil {
-			return nil, fmt.Errorf("creating snapshot store: %w", err)
+	}()
+	lg := m.logger.With(zap.Stringer("shardID", shardID))
+	if _, ok := m.shardsMap.Load(shardID); ok {
+		lg.Info("Shard already started")
+		return nil
+	}
+	m.shardsMap.Store(shardID, db.NewInitializingShard())
+	lg.Debug("Starting Raft Group")
+	// If we fail to start the shard, remove it from the map
+	removeShard := true
+	defer func() {
+		if removeShard {
+			m.shardsMap.Delete(shardID)
 		}
+	}()
+	var dbw *db.StoreDB
+	storeDBReady := make(chan struct{})
+	defer close(storeDBReady)
+	createDBSnapshot := func(id string) error {
+		<-storeDBReady
+		return dbw.CreateDBSnapshot(id)
+	}
+	proposeC := make(chan *raft.Proposal)
+	confChangeC := make(chan *raft.ConfChangeProposal)
+	dataDir := m.antflyConfig.GetBaseDir()
+	snapStore, err := snapstore.NewLocalSnapStore(dataDir, shardID, m.config.ID)
+	if err != nil {
+		return fmt.Errorf("creating snapshot store: %w", err)
+	}
 
-		// For new shards (not rejoining existing cluster) or split shards,
-		// clean up any leftover raft log state from failed previous attempts.
-		// This prevents "could not open manifest file" errors when Pebble finds
-		// partial state (e.g., CURRENT file without corresponding MANIFEST).
-		raftLogDir := common.RaftLogDir(dataDir, shardID, m.config.ID)
-		if !join || conf.InitWithDBArchive != "" {
-			if err := os.RemoveAll(raftLogDir); err != nil && !os.IsNotExist(err) { //nolint:gosec // G703: path from internal config
-				lg.Warn("Failed to clean raft log directory before start",
-					zap.String("raftLogDir", raftLogDir),
-					zap.Error(err))
-			} else {
-				lg.Debug("Cleaned raft log directory for fresh start",
-					zap.String("raftLogDir", raftLogDir),
-					zap.Bool("join", join),
-					zap.String("initArchive", conf.InitWithDBArchive))
-			}
-		}
-
-		var commitC <-chan *raft.Commit
-		var errorC <-chan error
-		var raftNode raft.RaftNode
-
-		// In swarm mode, bypass Raft consensus with a pass-through channel
-		if m.antflyConfig != nil && m.antflyConfig.SwarmMode {
-			lg.Info("Starting shard in swarm mode (bypassing Raft)")
-			commitC, errorC = m.createPassThroughChannels(proposeC)
+	// For new shards (not rejoining existing cluster) or split shards,
+	// clean up any leftover raft log state from failed previous attempts.
+	// This prevents "could not open manifest file" errors when Pebble finds
+	// partial state (e.g., CURRENT file without corresponding MANIFEST).
+	raftLogDir := common.RaftLogDir(dataDir, shardID, m.config.ID)
+	if !join || conf.InitWithDBArchive != "" {
+		if err := os.RemoveAll(raftLogDir); err != nil && !os.IsNotExist(err) { //nolint:gosec // G703: path from internal config
+			lg.Warn("Failed to clean raft log directory before start",
+				zap.String("raftLogDir", raftLogDir),
+				zap.Error(err))
 		} else {
-			raftConf := raft.RaftNodeConfig{
-				InitWithStorageSnapshot:   conf.InitWithDBArchive,
-				DisableAsyncStorageWrites: true,
-				SnapStore:                 snapStore,
-				RaftLogDir:                raftLogDir,
-				Peers:                     peers,
-				Join:                      join,
-				Timetstamp:                conf.Timestamp,
-				Cache:                     m.cache,
-				Clock:                     m.clockOrReal(),
-			}
-			// Pass the store's logger to the raft node
-			commitC, errorC, raftNode = raft.NewRaftNode(
-				lg,
-				shardID,
-				m.config.ID,
-				raftConf,
-				m.rs,
-				createDBSnapshot,
-				proposeC,
-				confChangeC,
-			)
+			lg.Debug("Cleaned raft log directory for fresh start",
+				zap.String("raftLogDir", raftLogDir),
+				zap.Bool("join", join),
+				zap.String("initArchive", conf.InitWithDBArchive))
 		}
+	}
 
-		dbDir := common.StorageDBDir(dataDir, shardID, m.config.ID)
-		var err2 error
+	var commitC <-chan *raft.Commit
+	var errorC <-chan error
+	var raftNode raft.RaftNode
 
-		// In swarm mode without Raft, provide a stub function that returns the restore archive ID if set,
-		// or an empty snapshot ID. This allows backup/restore to work in swarm mode.
-		var getSnapshotID func(ctx context.Context) (string, error)
-		if raftNode != nil {
-			getSnapshotID = raftNode.GetSnapshotID
-		} else {
-			// In swarm mode, return the restore archive ID if provided, otherwise empty
-			initArchive := conf.InitWithDBArchive
-			getSnapshotID = func(ctx context.Context) (string, error) {
-				return initArchive, nil
-			}
+	// In swarm mode, bypass Raft consensus with a pass-through channel
+	if m.antflyConfig != nil && m.antflyConfig.SwarmMode {
+		lg.Info("Starting shard in swarm mode (bypassing Raft)")
+		commitC, errorC = m.createPassThroughChannels(proposeC)
+	} else {
+		raftConf := raft.RaftNodeConfig{
+			InitWithStorageSnapshot:   conf.InitWithDBArchive,
+			DisableAsyncStorageWrites: true,
+			SnapStore:                 snapStore,
+			RaftLogDir:                raftLogDir,
+			Peers:                     peers,
+			Join:                      join,
+			Timetstamp:                conf.Timestamp,
+			Cache:                     m.cache,
+			Clock:                     m.clockOrReal(),
 		}
-
-		// Create a shard notifier for cross-shard transaction notifications
-		// The notifier routes requests through the metadata server, which handles
-		// finding the correct node for each shard
-		var metadataURL string
-		if m.antflyConfig != nil && len(m.antflyConfig.Metadata.OrchestrationUrls) > 0 {
-			urls, err := m.antflyConfig.Metadata.GetOrchestrationURLs()
-			if err == nil && len(urls) > 0 {
-				// Pick the first available metadata server URL
-				for _, url := range urls {
-					metadataURL = url
-					break
-				}
-			}
-		}
-		httpClient := m.httpClient
-		if httpClient == nil {
-			httpClient = &http.Client{Timeout: 5 * time.Second}
-		}
-		shardNotifier := NewHTTPShardNotifier(
-			httpClient,
-			metadataURL,
-			lg.Named("shardNotifier"),
-		)
-
-		dbw, err2 = db.NewStoreDB(
+		// Pass the store's logger to the raft node
+		commitC, errorC, raftNode = raft.NewRaftNode(
 			lg,
-			m.antflyConfig,
-			dbDir,
-			snapStore,
-			conf.Indexes,
-			conf.Schema,
-			conf.ByteRange,
-			getSnapshotID,
+			shardID,
+			m.config.ID,
+			raftConf,
+			m.rs,
+			createDBSnapshot,
 			proposeC,
-			commitC,
-			errorC,
-			shardNotifier,
-			func(id types.ID) *db.StoreDB {
-				shard, ok := m.shardsMap.Load(id)
-				if !ok || shard == nil {
-					return nil
-				}
-				return shard.StoreDB()
-			},
-			m.cache,
+			confChangeC,
 		)
-		if err2 != nil {
-			// First, trigger Raft node shutdown by closing the proposal channels.
-			// This must happen BEFORE we delete the Raft log directory to avoid
-			// a race condition where the Raft node tries to access Pebble files
-			// that we're deleting.
-			close(confChangeC)
-			close(proposeC)
+	}
 
-			// Wait for the Raft node to fully stop by draining errorC.
-			// The Raft node closes errorC when it stops (see raftNode.stop()).
-			// In swarm mode, errorC is closed by the pass-through goroutine.
-			if errorC != nil {
-				for range errorC {
-					// Drain any remaining errors
-				}
+	dbDir := common.StorageDBDir(dataDir, shardID, m.config.ID)
+	var err2 error
+
+	// In swarm mode without Raft, provide a stub function that returns the restore archive ID if set,
+	// or an empty snapshot ID. This allows backup/restore to work in swarm mode.
+	var getSnapshotID func(ctx context.Context) (string, error)
+	if raftNode != nil {
+		getSnapshotID = raftNode.GetSnapshotID
+	} else {
+		// In swarm mode, return the restore archive ID if provided, otherwise empty
+		initArchive := conf.InitWithDBArchive
+		getSnapshotID = func(ctx context.Context) (string, error) {
+			return initArchive, nil
+		}
+	}
+
+	// Create a shard notifier for cross-shard transaction notifications
+	// The notifier routes requests through the metadata server, which handles
+	// finding the correct node for each shard
+	var metadataURL string
+	if m.antflyConfig != nil && len(m.antflyConfig.Metadata.OrchestrationUrls) > 0 {
+		urls, err := m.antflyConfig.Metadata.GetOrchestrationURLs()
+		if err == nil && len(urls) > 0 {
+			// Pick the first available metadata server URL
+			for _, url := range urls {
+				metadataURL = url
+				break
 			}
+		}
+	}
+	httpClient := m.httpClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 5 * time.Second}
+	}
+	shardNotifier := NewHTTPShardNotifier(
+		httpClient,
+		metadataURL,
+		lg.Named("shardNotifier"),
+	)
 
-			// FIXME (ajr) Only remove the directories if we failed to start the raft group from scratch (on restart we might lose everything)
-			// Now safe to remove directories since Raft has stopped
-			_ = os.RemoveAll(common.StorageDBDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
-			_ = snapStore.RemoveAll(context.Background())
-			_ = os.RemoveAll(common.RaftLogDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
-			lg.Warn("Error starting raft group", zap.Error(err2))
-			return nil, fmt.Errorf("creating dbwrapper: %w", err2)
-		}
-
-		var cancelLeaderFactory context.CancelFunc
-		if raftNode != nil {
-			raftNode.SetLeaderFactory(dbw.LeaderFactory)
-		} else {
-			// In swarm mode without Raft, call the leader factory directly
-			// since we're always the leader. Use a cancellable context so we
-			// can properly stop the LeaderFactory when the shard is removed.
-			ctx, cancel := context.WithCancel(context.Background())
-			cancelLeaderFactory = cancel
-			m.eg.Go(func() error {
-				return dbw.LeaderFactory(ctx)
-			})
-		}
-
-		// Send to errorChanC, but abort if store is closing
-		select {
-		case m.errorChanC <- errorChanCItem{errorC: errorC, id: shardID}:
-			// Successfully registered error channel
-		case <-m.closingCh:
-			// Store is closing, abort shard start
-			lg.Info("Store is closing, aborting shard start")
-			return nil, fmt.Errorf("store is closing")
-		}
-		lg.Info("Started Raft Group")
-		m.shardsMap.Store(shardID, db.NewShard(dbw, raftNode, confChangeC, errorC, cancelLeaderFactory))
-		// Check again if store is closing before saving metadata to avoid
-		// race condition where Close() closes m.db between the earlier check
-		// and this point.
-		select {
-		case <-m.closingCh:
-			lg.Info("Store is closing, skipping metadata save")
-			removeShard = false // Keep shard in map, Close() will clean it up
-			return nil, nil
-		default:
-		}
-		if err := m.saveMetadataForShard(shardID, conf.Timestamp); err != nil {
-			// If pebble is closed, the store is shutting down - don't treat as error
-			if errors.Is(err, pebble.ErrClosed) {
-				lg.Info("Store closed during metadata save, continuing")
-				removeShard = false
-				return nil, nil
+	dbw, err2 = db.NewStoreDB(
+		lg,
+		m.antflyConfig,
+		dbDir,
+		snapStore,
+		conf.Indexes,
+		conf.Schema,
+		conf.ByteRange,
+		getSnapshotID,
+		proposeC,
+		commitC,
+		errorC,
+		shardNotifier,
+		func(id types.ID) *db.StoreDB {
+			shard, ok := m.shardsMap.Load(id)
+			if !ok || shard == nil {
+				return nil
 			}
-			return nil, fmt.Errorf("saving metadata for shard %s: %w", shardID, err)
+			return shard.StoreDB()
+		},
+		m.cache,
+	)
+	if err2 != nil {
+		// First, trigger Raft node shutdown by closing the proposal channels.
+		// This must happen BEFORE we delete the Raft log directory to avoid
+		// a race condition where the Raft node tries to access Pebble files
+		// that we're deleting.
+		close(confChangeC)
+		close(proposeC)
+
+		// Wait for the Raft node to fully stop by draining errorC.
+		// The Raft node closes errorC when it stops (see raftNode.stop()).
+		// In swarm mode, errorC is closed by the pass-through goroutine.
+		if errorC != nil {
+			for range errorC {
+				// Drain any remaining errors
+			}
 		}
-		lg.Info("Saved shard metadata to local store")
-		removeShard = false
-		return nil, nil
-	})
-	return err
+
+		// FIXME (ajr) Only remove the directories if we failed to start the raft group from scratch (on restart we might lose everything)
+		// Now safe to remove directories since Raft has stopped
+		_ = os.RemoveAll(common.StorageDBDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
+		_ = snapStore.RemoveAll(context.Background())
+		_ = os.RemoveAll(common.RaftLogDir(dataDir, shardID, m.config.ID)) //nolint:gosec // G703: path from internal config
+		lg.Warn("Error starting raft group", zap.Error(err2))
+		return fmt.Errorf("creating dbwrapper: %w", err2)
+	}
+
+	var cancelLeaderFactory context.CancelFunc
+	if raftNode != nil {
+		raftNode.SetLeaderFactory(dbw.LeaderFactory)
+	} else {
+		// In swarm mode without Raft, call the leader factory directly
+		// since we're always the leader. Use a cancellable context so we
+		// can properly stop the LeaderFactory when the shard is removed.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelLeaderFactory = cancel
+		m.eg.Go(func() error {
+			return dbw.LeaderFactory(ctx)
+		})
+	}
+
+	// Send to errorChanC, but abort if store is closing
+	select {
+	case m.errorChanC <- errorChanCItem{errorC: errorC, id: shardID}:
+		// Successfully registered error channel
+	case <-m.closingCh:
+		// Store is closing, abort shard start
+		lg.Info("Store is closing, aborting shard start")
+		return fmt.Errorf("store is closing")
+	}
+	lg.Info("Started Raft Group")
+	m.shardsMap.Store(shardID, db.NewShard(dbw, raftNode, confChangeC, errorC, cancelLeaderFactory))
+	// Check again if store is closing before saving metadata to avoid
+	// race condition where Close() closes m.db between the earlier check
+	// and this point.
+	select {
+	case <-m.closingCh:
+		lg.Info("Store is closing, skipping metadata save")
+		removeShard = false // Keep shard in map, Close() will clean it up
+		return nil
+	default:
+	}
+	if err := m.saveMetadataForShard(shardID, conf.Timestamp); err != nil {
+		// If pebble is closed, the store is shutting down - don't treat as error
+		if errors.Is(err, pebble.ErrClosed) {
+			lg.Info("Store closed during metadata save, continuing")
+			removeShard = false
+			return nil
+		}
+		return fmt.Errorf("saving metadata for shard %s: %w", shardID, err)
+	}
+	lg.Info("Saved shard metadata to local store")
+	removeShard = false
+	return nil
 }

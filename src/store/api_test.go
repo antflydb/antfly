@@ -129,8 +129,9 @@ func (m *MockShard) Delete(ctx context.Context, key []byte) error {
 }
 
 func (m *MockShard) Lookup(ctx context.Context, key string) (map[string]any, error) {
-	args := m.Called(key)
-	return args.Get(0).(map[string]any), args.Error(0)
+	args := m.Called(ctx, key)
+	res, _ := args.Get(0).(map[string]any)
+	return res, args.Error(1)
 }
 
 func (m *MockShard) GetTimestamp(key string) (uint64, error) {
@@ -284,8 +285,9 @@ func (m *MockStore) Status() *StoreStatus {
 	return args.Get(0).(*StoreStatus)
 }
 
-func (m *MockStore) StopRaftGroup(shardID types.ID) {
-	m.Called(shardID)
+func (m *MockStore) StopRaftGroup(shardID types.ID) error {
+	args := m.Called(shardID)
+	return args.Error(0)
 }
 
 func (m *MockStore) StartRaftGroup(

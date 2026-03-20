@@ -6,6 +6,7 @@ import { CommandPaletteProvider } from "@/components/command-palette-provider";
 import { ConnectionStatusBanner } from "@/components/connection-status-banner";
 import { ContentWidthProvider, useContentWidth } from "@/components/content-width-provider";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { GeneratorPreferenceProvider } from "@/components/generator-preference-provider";
 import { PrivateRoute } from "@/components/private-route";
 import { AppSidebar } from "@/components/sidebar";
 import { TableProvider } from "@/components/table-provider";
@@ -149,13 +150,15 @@ function App() {
       <ErrorBoundary>
         <ApiConfigProvider>
           <AuthProvider>
-            <ContentWidthProvider>
-              <CommandPaletteProvider>
-                <TableProvider>
-                  <AppContent />
-                </TableProvider>
-              </CommandPaletteProvider>
-            </ContentWidthProvider>
+            <GeneratorPreferenceProvider>
+              <ContentWidthProvider>
+                <CommandPaletteProvider>
+                  <TableProvider>
+                    <AppContent />
+                  </TableProvider>
+                </CommandPaletteProvider>
+              </ContentWidthProvider>
+            </GeneratorPreferenceProvider>
           </AuthProvider>
         </ApiConfigProvider>
       </ErrorBoundary>

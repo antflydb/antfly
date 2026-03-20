@@ -1,4 +1,4 @@
-import { generatorProviders } from "@antfly/sdk";
+import type { GeneratorConfig } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   Check,
@@ -20,6 +20,12 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  formatGeneratorSummary,
+  GENERATOR_DEFAULT_CONFIG,
+  GeneratorSelector,
+  getInheritedGeneratorLabels,
+} from "@/components/playground/GeneratorSelector";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -45,17 +51,11 @@ import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/hooks/use-api-config";
 import { useEvalSets } from "@/hooks/use-eval-sets";
+import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { useTable } from "@/hooks/use-table";
 import type { EvalItem, EvalItemResult, EvalRunResult } from "@/types/evals";
 
-// Generator provider type from SDK
-type GeneratorProvider = (typeof generatorProviders)[number];
-
-interface JudgeConfig {
-  provider: GeneratorProvider;
-  model: string;
-  temperature?: number;
-}
+type JudgeConfig = GeneratorConfig;
 
 const DEFAULT_JUDGE: JudgeConfig = {
   provider: "openai",
@@ -85,6 +85,7 @@ const SAMPLE_EVAL_SET = {
 
 const EvalsPlaygroundPage: React.FC = () => {
   const apiClient = useApi();
+  const { dashboardGenerator } = useGeneratorPreference();
   const {
     evalSets,
     createEvalSet,
@@ -102,7 +103,11 @@ const EvalsPlaygroundPage: React.FC = () => {
 
   // State
   const [selectedSetName, setSelectedSetName] = useState<string>("");
-  const [judge, setJudge] = useState<JudgeConfig>(DEFAULT_JUDGE);
+  const [answerGeneratorOverride, setAnswerGeneratorOverride] = useState<GeneratorConfig | null>(
+    null
+  );
+  const [judgeOverride, setJudgeOverride] = useState<JudgeConfig | null>(null);
+  const [showAnswerGeneratorSettings, setShowAnswerGeneratorSettings] = useState(false);
   const [showJudgeSettings, setShowJudgeSettings] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
@@ -123,6 +128,12 @@ const EvalsPlaygroundPage: React.FC = () => {
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const effectiveAnswerGenerator = answerGeneratorOverride ?? dashboardGenerator ?? null;
+  const { label: inheritedAnswerGeneratorLabel, description: inheritedAnswerGeneratorDescription } =
+    getInheritedGeneratorLabels(dashboardGenerator);
+  const effectiveJudge = judgeOverride ?? DEFAULT_JUDGE;
+  const inheritedJudgeLabel = "Playground default judge";
+  const inheritedJudgeDescription = "Keep Antfarm's built-in judge selection for evals.";
 
   // Set first eval set as default
   useEffect(() => {
@@ -327,19 +338,23 @@ const EvalsPlaygroundPage: React.FC = () => {
                 },
               ],
               stream: false,
-              generator: {
-                provider: judge.provider,
-                model: judge.model,
-                temperature: judge.temperature,
-              },
+              ...(effectiveAnswerGenerator
+                ? {
+                    generator: {
+                      provider: effectiveAnswerGenerator.provider,
+                      model: effectiveAnswerGenerator.model,
+                      temperature: effectiveAnswerGenerator.temperature,
+                    },
+                  }
+                : {}),
               steps: {
                 generation: { enabled: true },
                 eval: {
                   evaluators: ["correctness"],
                   judge: {
-                    provider: judge.provider,
-                    model: judge.model,
-                    temperature: judge.temperature,
+                    provider: effectiveJudge.provider,
+                    model: effectiveJudge.model,
+                    temperature: effectiveJudge.temperature,
                   },
                   ground_truth: {
                     expectations: item.referenceAnswer,
@@ -419,7 +434,15 @@ const EvalsPlaygroundPage: React.FC = () => {
       setIsLoading(false);
       setProgress(null);
     }
-  }, [selectedSet, selectedTable, selectedSetName, judge, apiClient, selectedIndex]);
+  }, [
+    selectedSet,
+    selectedTable,
+    selectedSetName,
+    effectiveJudge,
+    apiClient,
+    selectedIndex,
+    effectiveAnswerGenerator,
+  ]);
 
   return (
     <div className="h-full">
@@ -479,17 +502,36 @@ const EvalsPlaygroundPage: React.FC = () => {
               </Select>
             </div>
 
-            {/* Judge Settings Button */}
             <div className="space-y-2">
-              <Label>Judge</Label>
+              <Label>Answer Model</Label>
+              <p className="text-xs text-muted-foreground">
+                Generates the RAG answer that will be scored.
+              </p>
+              <Button
+                variant="outline"
+                onClick={() => setShowAnswerGeneratorSettings(true)}
+                className="w-full justify-start"
+              >
+                <Settings className="h-4 w-4 mr-2" />
+                {formatGeneratorSummary(answerGeneratorOverride, inheritedAnswerGeneratorLabel)}
+                {answerGeneratorOverride?.temperature !== undefined &&
+                  ` (t=${answerGeneratorOverride.temperature})`}
+              </Button>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Judge Model</Label>
+              <p className="text-xs text-muted-foreground">
+                Scores the generated answer against the reference answer.
+              </p>
               <Button
                 variant="outline"
                 onClick={() => setShowJudgeSettings(true)}
                 className="w-full justify-start"
               >
                 <Settings className="h-4 w-4 mr-2" />
-                {judge.provider}/{judge.model}
-                {judge.temperature !== undefined && ` (t=${judge.temperature})`}
+                {formatGeneratorSummary(judgeOverride, inheritedJudgeLabel)}
+                {judgeOverride?.temperature !== undefined && ` (t=${judgeOverride.temperature})`}
               </Button>
             </div>
 
@@ -903,47 +945,53 @@ const EvalsPlaygroundPage: React.FC = () => {
         </DialogContent>
       </Dialog>
 
+      {/* Answer Generator Settings Dialog */}
+      <Dialog open={showAnswerGeneratorSettings} onOpenChange={setShowAnswerGeneratorSettings}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Answer Model Settings</DialogTitle>
+            <DialogDescription>
+              Configure the model that generates the RAG answers before they are evaluated.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <GeneratorSelector
+              value={answerGeneratorOverride}
+              onChange={setAnswerGeneratorOverride}
+              defaultConfig={GENERATOR_DEFAULT_CONFIG}
+              defaultLabel={inheritedAnswerGeneratorLabel}
+              defaultDescription={inheritedAnswerGeneratorDescription}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowAnswerGeneratorSettings(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Judge Settings Dialog */}
       <Dialog open={showJudgeSettings} onOpenChange={setShowJudgeSettings}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Judge Settings</DialogTitle>
-            <DialogDescription>Configure the LLM judge for evaluating answers.</DialogDescription>
+            <DialogTitle>Judge Model Settings</DialogTitle>
+            <DialogDescription>
+              Configure the LLM judge for evaluating answers. This remains separate from the
+              server's retrieval generator default.
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label>Provider</Label>
-              <Select
-                value={judge.provider}
-                onValueChange={(v) => setJudge((j) => ({ ...j, provider: v as GeneratorProvider }))}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {generatorProviders.map((p) => (
-                    <SelectItem key={p} value={p}>
-                      {p}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label>Model</Label>
-              <Input
-                value={judge.model}
-                onChange={(e) => setJudge((j) => ({ ...j, model: e.target.value }))}
-                placeholder="gpt-4o"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">Temperature</Label>
-              <Input type="number" value={0} disabled className="bg-muted" />
-              <p className="text-xs text-muted-foreground">
-                Backend hardcodes temperature=0. Use models that support it (e.g., gpt-4o).
-              </p>
-            </div>
+            <GeneratorSelector
+              value={judgeOverride}
+              onChange={setJudgeOverride}
+              defaultConfig={DEFAULT_JUDGE}
+              defaultLabel={inheritedJudgeLabel}
+              defaultDescription={inheritedJudgeDescription}
+              showTemperature
+              temperatureDisabled
+              temperatureHelpText="Backend hardcodes temperature=0 for judge calls."
+            />
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowJudgeSettings(false)}>
@@ -957,8 +1005,8 @@ const EvalsPlaygroundPage: React.FC = () => {
       <div className="mt-6 text-xs text-muted-foreground space-y-1">
         <p>
           <strong>Evals Playground:</strong> Build evaluation sets with Q+A pairs, then run them
-          against your RAG system. The correctness evaluator uses an LLM judge to compare the RAG
-          answer against your reference answer.
+          against your RAG system. Configure the answer generator and the judge independently when
+          you want to compare one model's answers against another model's scoring.
         </p>
       </div>
     </div>

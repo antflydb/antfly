@@ -13,7 +13,7 @@ export interface ChatBarProps extends ChatMessagesProps, ChatInputProps {
   /** Unique identifier for this chat bar */
   id: string;
   /** Generator configuration (provider, model, temperature) */
-  generator: GeneratorConfig;
+  generator?: GeneratorConfig;
   /** Table override */
   table?: string;
   /** Semantic indexes to use */

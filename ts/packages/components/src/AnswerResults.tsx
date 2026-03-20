@@ -17,7 +17,7 @@ import { resolveTable, streamAnswer } from "./utils";
 export interface AnswerResultsProps {
   id: string;
   searchBoxId: string; // Links to the QueryBox that provides the search value
-  generator: GeneratorConfig;
+  generator?: GeneratorConfig;
   agentKnowledge?: string; // Additional context for the answer agent
   table?: string; // Optional table override - auto-inherits from QueryBox if not specified
   filterQuery?: Record<string, unknown>; // Filter query to constrain search results
@@ -178,7 +178,7 @@ export default function AnswerResults({
     // QueryBox only provides the text value, AnswerResults owns the query configuration
     const retrievalRequest: RetrievalAgentRequest = {
       query: currentQuery,
-      generator: generator,
+      ...(generator ? { generator } : {}),
       agent_knowledge: agentKnowledge,
       stream: true,
       queries: [
