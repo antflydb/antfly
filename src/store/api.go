@@ -174,12 +174,19 @@ func (h *StoreAPI) validateShard(w http.ResponseWriter, _ *http.Request, shardID
 
 func (h *StoreAPI) handleStopShard(w http.ResponseWriter, r *http.Request) {
 	shardID, ok := h.getShardID(w, r)
-	if !ok || !h.validateShard(w, r, shardID) {
+	if !ok {
 		return
 	}
 
 	if err := h.store.StopRaftGroup(shardID); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
+		switch {
+		case errors.Is(err, ErrShardNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, ErrShardInitializing):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	w.WriteHeader(http.StatusOK)

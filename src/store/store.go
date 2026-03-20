@@ -48,6 +48,10 @@ import (
 // substring for HTTP error responses.
 var ErrShardInitializing = errors.New("shard is initializing")
 
+// ErrShardNotFound is returned when a shard lifecycle operation targets a
+// shard that does not exist on this store node.
+var ErrShardNotFound = errors.New("shard not found")
+
 var _ StoreIface = (*Store)(nil)
 
 type StoreIface interface {
@@ -374,8 +378,7 @@ func (m *Store) StopRaftGroup(shardID types.ID) error {
 
 		// Atomically check the shard state and remove it from the map.
 		// Using Compute prevents a race where a concurrent StartRaftGroup
-		// (which runs under a different singleflight key) stores a new
-		// initializing shard between our Load and Delete.
+		// stores a new initializing shard between a separate Load and Delete.
 		var shardToClose *Shard
 		var wasInitializing bool
 		m.shardsMap.Compute(shardID, func(shard *Shard, loaded bool) (*Shard, xsync.ComputeOp) {
@@ -394,8 +397,7 @@ func (m *Store) StopRaftGroup(shardID types.ID) error {
 			return nil, ErrShardInitializing
 		}
 		if shardToClose == nil {
-			// Shard was never in the map; nothing to clean up.
-			return nil, nil
+			return nil, ErrShardNotFound
 		}
 		if err := shardToClose.Close(); err != nil {
 			m.logger.Warn("Error closing shard while stopping Raft Group",

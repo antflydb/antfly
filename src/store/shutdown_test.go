@@ -93,7 +93,7 @@ func TestStopRaftGroup_AbsentShard(t *testing.T) {
 	s := newTestStore(t)
 
 	err := s.StopRaftGroup(types.ID(42))
-	assert.NoError(t, err, "stopping a non-existent shard should succeed (idempotent cleanup)")
+	require.ErrorIs(t, err, ErrShardNotFound)
 }
 
 func TestStopRaftGroup_InitializingShard(t *testing.T) {
