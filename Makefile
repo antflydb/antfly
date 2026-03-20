@@ -11,6 +11,7 @@ GO_SUBMODULES := \
 	./pkg/operator \
 	./pkg/libaf \
 	./pkg/docsaf \
+	./pkg/generating \
 	./pkg/evalaf \
 	./pkg/evalaf/plugins/antfly \
 	./pkg/genkit/antfly \

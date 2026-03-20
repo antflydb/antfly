@@ -8,6 +8,7 @@ replace (
 	github.com/antflydb/antfly/pkg/docsaf => ../pkg/docsaf
 	github.com/antflydb/antfly/pkg/evalaf => ../pkg/evalaf
 	github.com/antflydb/antfly/pkg/evalaf/plugins/antfly => ../pkg/evalaf/plugins/antfly
+	github.com/antflydb/antfly/pkg/generating => ../pkg/generating
 	github.com/antflydb/antfly/pkg/genkit/openrouter => ../pkg/genkit/openrouter
 	github.com/antflydb/antfly/pkg/libaf => ../pkg/libaf
 	github.com/antflydb/termite => ../termite
@@ -73,8 +74,9 @@ require (
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
 	github.com/antflydb/antfly/pkg/evalaf v0.0.0 // indirect
-	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0-20260313151000-3c73f35767a3 // indirect
-	github.com/antflydb/termite/pkg/client v0.0.0-20260314031946-6e50e4c79451 // indirect
+	github.com/antflydb/antfly/pkg/generating v0.0.0 // indirect
+	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0 // indirect
+	github.com/antflydb/termite/pkg/client v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.4 // indirect
