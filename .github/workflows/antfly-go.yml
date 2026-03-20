@@ -30,53 +30,15 @@ jobs:
       - name: Verify Go version
         run: go version
 
-      - name: Configure Go for private modules
-        run: |
-          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
-
       - name: Verify Go modules
         run: go mod download
 
       - name: Simulator Validate
         run: make sim-validate
 
-  antfly:
+  unit:
     runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - name: Install zstd
-        run: sudo apt-get update && sudo apt-get install -y zstd
-
-      - name: Install ollama
-        run: curl -fsSL https://ollama.com/install.sh | bash
-
-      - name: Run Ollama Server
-        run: |
-          ollama serve &
-          pid=$!
-          sleep 5 # Give server time to start
-          # Pull model with retry on digest mismatch (clears corrupted cache)
-          for i in 1 2 3; do
-            if ollama pull gemma3:4b 2>&1 | tee /tmp/ollama-pull.log; then
-              echo "Model pulled successfully"
-              break
-            fi
-
-            if grep -q "digest mismatch" /tmp/ollama-pull.log; then
-              echo "Digest mismatch detected, clearing Ollama cache and retrying ($i/3)..."
-              rm -rf ~/.ollama/models
-              sleep 2
-            else
-              echo "Pull failed with non-digest error, retrying ($i/3)..."
-              sleep 5
-            fi
-
-            if [ $i -eq 3 ]; then
-              echo "Failed to pull model after 3 attempts"
-              exit 1
-            fi
-          done
-
       - uses: actions/checkout@v6
         with:
           submodules: true
@@ -93,23 +55,11 @@ jobs:
       - name: Verify Go version
         run: go version
 
-      - name: Configure Go for private modules
-        # git config --global url."https://oauth2:${{ secrets.GH_TOKEN }}@github.com".insteadOf "https://github.com"
-        run: |
-          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
-
-      - name: Clean Go module cache
-        run: go clean -modcache
-
       - name: Verify Go modules
         run: go mod download
 
       - name: Build Antfly
         run: go build -v -o antfly ./cmd/antfly
-
-      - name: Clean Go module cache before swarm test
-        run: go clean -modcache
 
       - name: Test swarm startup
         run: |
@@ -162,6 +112,28 @@ jobs:
       - name: Test
         run: go test -v ./...
 
+  e2e:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set Go experiment
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Verify Go modules
+        run: go mod download
+
       - name: Start PostgreSQL
         run: |
           # Clean up any existing postgres-test container from previous runs
@@ -211,9 +183,6 @@ jobs:
 
           docker exec postgres-test psql -U antfly -d antfly_test -c "SELECT 1" || exit 1
           echo "PostgreSQL connection verified"
-
-      - name: Stop Ollama before E2E tests
-        run: pkill ollama || true
 
       - name: E2E Tests
         env:
