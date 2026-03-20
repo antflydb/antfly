@@ -660,6 +660,11 @@ func (t *TableApi) runGenerationStep(
 		if err := eg.Wait(); err != nil {
 			if !errors.Is(err, context.Canceled) {
 				t.logger.Error("Generation step failed", zap.Error(err))
+				if streamCallback != nil {
+					_ = streamCallback(ctx, SSEEventError, map[string]string{
+						"error": classifyGenerationError(req, err).UserMessage,
+					})
+				}
 			}
 			return
 		}
@@ -679,6 +684,9 @@ func (t *TableApi) runGenerationStep(
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				t.logger.Error("Generation step failed", zap.Error(err))
+				classified := classifyGenerationError(req, err)
+				result.Status = RetrievalAgentStatusFailed
+				result.Generation = classified.UserMessage
 			}
 			return
 		}
@@ -793,25 +801,21 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 	var generator *ai.GenKitModelImpl
 
 	if needsGenerator {
-		chain := ai.ResolveGeneratorOrChain(req.Generator, req.Chain)
+		chain := resolveEffectiveGeneratorChain(&req)
 		if len(chain) == 0 {
-			defaultChain := ai.GetDefaultChain()
-			if len(defaultChain) == 0 {
-				if req.MaxIterations != 0 {
-					errorResponse(w, "either 'generator' or 'chain' must be provided (no default chain configured)", http.StatusBadRequest)
-					return
-				}
-				// Pipeline mode without generator steps — proceed without LLM
-			} else {
-				chain = defaultChain
+			if req.MaxIterations != 0 {
+				errorResponse(w, "either 'generator' or 'chain' must be provided (no default chain configured)", http.StatusBadRequest)
+				return
 			}
+			// Pipeline mode without generator steps — proceed without LLM
 		}
 
 		if len(chain) > 0 {
 			var err error
 			generator, err = ai.NewGenKitGenerator(r.Context(), chain[0].Generator)
 			if err != nil {
-				errorResponse(w, fmt.Sprintf("Failed to create generator: %v", err), http.StatusBadRequest)
+				classified := classifyGenerationError(&req, err)
+				errorResponse(w, classified.UserMessage, classified.HTTPStatusCode())
 				return
 			}
 		}
@@ -860,7 +864,8 @@ func (t *TableApi) streamRetrievalPipeline(
 
 	result, err := t.ExecutePipeline(ctx, req, generator, streamCb)
 	if err != nil {
-		_ = streamEvent(w, rc, SSEEventError, map[string]string{"error": err.Error()})
+		classified := classifyGenerationError(req, err)
+		_ = streamEvent(w, rc, SSEEventError, map[string]string{"error": classified.UserMessage})
 		return
 	}
 
@@ -878,7 +883,8 @@ func (t *TableApi) jsonRetrievalPipeline(
 ) {
 	result, err := t.ExecutePipeline(r.Context(), req, generator, nil)
 	if err != nil {
-		errorResponse(w, err.Error(), http.StatusBadRequest)
+		classified := classifyGenerationError(req, err)
+		errorResponse(w, classified.UserMessage, classified.HTTPStatusCode())
 		return
 	}
 
@@ -1103,7 +1109,8 @@ func (t *TableApi) RunAgenticRetrieval(
 			t.logger.Error("Classification step failed", zap.Error(err))
 		}
 		if streamCallback != nil {
-			_ = streamCallback(ctx, SSEEventError, map[string]string{"error": err.Error()})
+			classified := classifyGenerationError(req, err)
+			_ = streamCallback(ctx, SSEEventError, map[string]string{"error": classified.UserMessage})
 		}
 		// Continue without classification
 	}
@@ -1154,7 +1161,7 @@ func (t *TableApi) RunAgenticRetrieval(
 	}
 
 	// Check provider capabilities
-	caps := ai.GetProviderCapabilities(ai.GeneratorProvider(req.Generator.Provider))
+	caps := ai.GetProviderCapabilities(resolveProvider(req))
 
 	if caps.SupportsTools {
 		t.runAgenticWithTools(ctx, req, generator, executor, availableIndexes, toolsConfig, result)
@@ -1946,7 +1953,41 @@ func (e *retrievalToolExecutor) fallbackToSemanticSearch(
 	return []QueryHit{}
 }
 
-// convertQueryHitsToDocuments converts QueryHit slice to schema.Document slice
+// resolveEffectiveGeneratorChain returns the effective generator chain in precedence
+// order: explicit chain, explicit single generator, then the configured default chain.
+func resolveEffectiveGeneratorChain(req *RetrievalAgentRequest) []ai.ChainLink {
+	if len(req.Chain) > 0 {
+		return ai.ResolveGeneratorOrChain(req.Generator, req.Chain)
+	}
+	if req.Generator.Provider != "" {
+		return ai.ResolveGeneratorOrChain(req.Generator, nil)
+	}
+	return ai.GetDefaultChain()
+}
+
+// resolveProvider returns the first provider from the effective generator chain.
+func resolveProvider(req *RetrievalAgentRequest) ai.GeneratorProvider {
+	chain := resolveEffectiveGeneratorChain(req)
+	if len(chain) == 0 {
+		return ""
+	}
+	return chain[0].Generator.Provider
+}
+
+// resolveProviderName returns the effective provider name from the request for use in
+// user-facing error messages.
+func resolveProviderName(req *RetrievalAgentRequest) string {
+	provider := resolveProvider(req)
+	if provider == "" {
+		return "unknown"
+	}
+	return string(provider)
+}
+
+func classifyGenerationError(req *RetrievalAgentRequest, err error) ai.GenerationError {
+	return ai.AsGenerationError(resolveProviderName(req), err)
+}
+
 func convertQueryHitsToDocuments(hits []QueryHit) []schema.Document {
 	docs := make([]schema.Document, 0, len(hits))
 	for _, hit := range hits {

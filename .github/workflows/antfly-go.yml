@@ -99,6 +99,9 @@ jobs:
           echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
           echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
 
+      - name: Verify Go module tidiness
+        run: make tidy-check
+
       - name: Clean Go module cache
         run: go clean -modcache
 

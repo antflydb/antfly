@@ -264,6 +264,7 @@ export class AntflyClient {
               } else if (line.startsWith("data: ")) {
                 const data = line.slice(6).trim();
 
+                let sseError: Error | undefined;
                 try {
                   switch (currentEvent) {
                     case "classification":
@@ -336,15 +337,20 @@ export class AntflyClient {
                         callbacks.onDone(JSON.parse(data));
                       }
                       return;
-                    case "error":
+                    case "error": {
+                      const parsed = JSON.parse(data);
+                      const message = typeof parsed === "object" && parsed.error ? parsed.error : String(parsed);
                       if (callbacks.onError) {
-                        callbacks.onError(JSON.parse(data));
+                        callbacks.onError(message);
                       }
-                      throw new Error(data);
+                      sseError = new Error(message);
+                      break;
+                    }
                   }
                 } catch (e) {
                   console.warn("Failed to parse SSE data:", currentEvent, data, e);
                 }
+                if (sseError) throw sseError;
               }
             }
           }
