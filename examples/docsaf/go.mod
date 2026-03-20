@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/antflydb/antfly/pkg/client v0.0.0-20260207183149-045031239f8a
 	github.com/antflydb/antfly/pkg/docsaf v0.0.0-20260207183149-045031239f8a
+	github.com/mbleigh/raymond v0.0.0-20250414171441-6b3a58ab9e0a
 	github.com/antflydb/termite/pkg/client v0.0.0
 )
 

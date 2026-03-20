@@ -175,7 +175,7 @@ components:
         generators:
           type: object
           additionalProperties:
-            $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+            $ref: "../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: |
             Named generator configurations for AI operations.
 
@@ -348,13 +348,13 @@ components:
           type: string
           description: "Name of the generator from the generators map"
         generator_config:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: "Inline generator configuration (alternative to referencing by name)"
         retry:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/RetryConfig"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/RetryConfig"
           description: "Retry configuration for this generator"
         condition:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/ChainCondition"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/ChainCondition"
           description: "When to try the next generator in chain"
 
     MetadataInfo:

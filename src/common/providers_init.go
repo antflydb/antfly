@@ -17,11 +17,11 @@ package common
 import (
 	"log"
 
-	"github.com/antflydb/antfly/lib/ai"
 	"github.com/antflydb/antfly/lib/audio"
 	"github.com/antflydb/antfly/lib/chunking"
 	"github.com/antflydb/antfly/lib/embeddings"
 	"github.com/antflydb/antfly/lib/reranking"
+	generating "github.com/antflydb/antfly/pkg/generating"
 )
 
 // InitRegistryFromConfig initializes the global provider registry from configuration.
@@ -85,11 +85,11 @@ func InitRegistryFromConfig(config *Config) {
 		log.Printf("Registered chain: %s (%d links)", name, len(links))
 	}
 
-	// Set default chain for backwards compatibility with ai package
+	// Set default chain for shared generator config resolution.
 	if defaultChain := reg.DefaultChainName(); defaultChain != "" {
 		chain, err := reg.GetChain(defaultChain)
 		if err == nil {
-			ai.SetDefaultChain(chain)
+			generating.SetDefaultChain(chain)
 		}
 	}
 

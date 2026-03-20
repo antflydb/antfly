@@ -6,6 +6,7 @@ replace (
 	github.com/antflydb/antfly/pkg/client => ./pkg/client
 	github.com/antflydb/antfly/pkg/evalaf => ./pkg/evalaf
 	github.com/antflydb/antfly/pkg/evalaf/plugins/antfly => ./pkg/evalaf/plugins/antfly
+	github.com/antflydb/antfly/pkg/generating => ./pkg/generating
 	github.com/antflydb/antfly/pkg/genkit/openrouter => ./pkg/genkit/openrouter
 	github.com/antflydb/antfly/pkg/libaf => ./pkg/libaf
 	github.com/antflydb/termite => ./termite
@@ -40,10 +41,10 @@ require (
 	github.com/alpkeskin/gotoon v0.1.1
 	github.com/antflydb/antfly/pkg/client v0.0.0-00010101000000-000000000000
 	github.com/antflydb/antfly/pkg/evalaf v0.0.0
-	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0-20260313151000-3c73f35767a3
+	github.com/antflydb/antfly/pkg/generating v0.0.0
 	github.com/antflydb/antfly/pkg/libaf v0.0.1
 	github.com/antflydb/termite v0.0.0-00010101000000-000000000000
-	github.com/antflydb/termite/pkg/client v0.0.0-00010101000000-000000000000
+	github.com/antflydb/termite/pkg/client v0.0.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.50.2
 	github.com/blevesearch/bleve/v2 v2.5.7
@@ -95,6 +96,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/internal v1.2.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/ajroetker/go-jpeg2000 v0.0.2 // indirect
+	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0 // indirect
 	github.com/avast/retry-go/v4 v4.7.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.8 // indirect
 	github.com/axiomhq/hyperloglog v0.2.6 // indirect

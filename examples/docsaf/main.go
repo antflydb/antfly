@@ -12,10 +12,9 @@ import (
 	"strings"
 	"time"
 
+	exampleentity "github.com/antflydb/antfly/examples/docsaf/entity"
 	antfly "github.com/antflydb/antfly/pkg/client"
 	"github.com/antflydb/antfly/pkg/docsaf"
-	termiteclient "github.com/antflydb/termite/pkg/client"
-	"github.com/cespare/xxhash/v2"
 )
 
 // StringSliceFlag allows repeated flags to build a slice
@@ -30,220 +29,6 @@ func (s *StringSliceFlag) Set(value string) error {
 	return nil
 }
 
-// nerFlags holds the parsed NER-related command-line flags.
-type nerFlags struct {
-	termiteURL string
-	model      string
-	threshold  float64
-	batchSize  int
-	labels     StringSliceFlag
-}
-
-// registerNERFlags registers NER-related flags on the given FlagSet.
-func registerNERFlags(fs *flag.FlagSet) *nerFlags {
-	nf := &nerFlags{}
-	fs.StringVar(&nf.termiteURL, "termite-url", "http://localhost:8088", "Termite API URL for NER")
-	fs.StringVar(&nf.model, "ner-model", "", "Termite recognizer model for entity extraction (e.g., fastino/gliner2-base-v1)")
-	fs.Float64Var(&nf.threshold, "ner-threshold", 0.5, "Minimum confidence score for extracted entities")
-	fs.IntVar(&nf.batchSize, "ner-batch-size", 32, "Number of texts per NER batch")
-	fs.Var(&nf.labels, "ner-label", "Entity label for zero-shot NER (can be repeated, e.g., --ner-label technology --ner-label concept)")
-	return nf
-}
-
-// enabled returns true if a NER model was specified.
-func (nf *nerFlags) enabled() bool {
-	return nf.model != ""
-}
-
-// printConfig prints the NER configuration to stdout.
-func (nf *nerFlags) printConfig() {
-	if !nf.enabled() {
-		return
-	}
-	fmt.Printf("NER model: %s\n", nf.model)
-	if len(nf.labels) > 0 {
-		fmt.Printf("NER labels: %v\n", nf.labels)
-	}
-	fmt.Printf("NER threshold: %.2f\n", nf.threshold)
-}
-
-// run performs entity extraction if NER is enabled, returning nil result if disabled.
-func (nf *nerFlags) run(ctx context.Context, sections []docsaf.DocumentSection) (*entityResult, error) {
-	if !nf.enabled() {
-		return nil, nil
-	}
-
-	if len(nf.labels) == 0 {
-		return nil, fmt.Errorf("at least one --ner-label is required when using --ner-model (GLiNER2 requires labels for zero-shot NER)")
-	}
-
-	tc, err := termiteclient.NewTermiteClient(nf.termiteURL, http.DefaultClient)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create termite client: %w", err)
-	}
-
-	return extractEntities(ctx, tc, nf.model, nf.labels, float32(nf.threshold), sections, nf.batchSize)
-}
-
-// entityResult holds the output of NER entity extraction.
-type entityResult struct {
-	// entityRecords maps entity key to entity document
-	entityRecords map[string]map[string]any
-	// sectionEntityKeys maps section index to entity keys mentioned in that section
-	sectionEntityKeys map[int][]string
-}
-
-// normalizeEntityKey creates a stable, sortable key from an entity label and text.
-// Example: normalizeEntityKey("technology", "Raft Consensus") returns "entity:technology:raft-consensus"
-// Non-ASCII characters are preserved via hex encoding to avoid silent collisions.
-func normalizeEntityKey(label, text string) string {
-	normalized := strings.ToLower(strings.TrimSpace(text))
-	normalized = strings.ReplaceAll(normalized, " ", "-")
-	var b strings.Builder
-	for _, r := range normalized {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else if r > 127 {
-			// Hex-encode non-ASCII to avoid silent collisions
-			fmt.Fprintf(&b, "%x", r)
-		}
-	}
-	key := b.String()
-	if key == "" {
-		// Fallback for names that normalize to empty (e.g., all punctuation)
-		key = fmt.Sprintf("%x", xxhash.Sum64String(text))
-	}
-	return fmt.Sprintf("entity:%s:%s", strings.ToLower(label), key)
-}
-
-// extractEntities calls termite's NER API to extract named entities from document sections.
-func extractEntities(
-	ctx context.Context,
-	tc *termiteclient.TermiteClient,
-	model string,
-	labels []string,
-	threshold float32,
-	sections []docsaf.DocumentSection,
-	batchSize int,
-) (*entityResult, error) {
-	result := &entityResult{
-		entityRecords:     make(map[string]map[string]any),
-		sectionEntityKeys: make(map[int][]string),
-	}
-
-	totalBatches := (len(sections) + batchSize - 1) / batchSize
-	fmt.Printf("Extracting entities with %s (%d labels, threshold %.2f)\n", model, len(labels), threshold)
-	fmt.Printf("Processing %d sections in %d NER batches of %d\n\n", len(sections), totalBatches, batchSize)
-
-	for start := 0; start < len(sections); start += batchSize {
-		end := min(start+batchSize, len(sections))
-		batchNum := start/batchSize + 1
-
-		// Build texts: title + content for better extraction context
-		texts := make([]string, end-start)
-		for i, s := range sections[start:end] {
-			texts[i] = s.Title + "\n\n" + s.Content
-		}
-
-		fmt.Printf("[NER Batch %d/%d] Processing sections %d-%d\n", batchNum, totalBatches, start+1, end)
-
-		resp, err := tc.Recognize(ctx, model, texts, labels)
-		if err != nil {
-			return nil, fmt.Errorf("NER batch %d (sections %d-%d): %w", batchNum, start+1, end, err)
-		}
-
-		batchEntities := 0
-		for i, entities := range resp.Entities {
-			sectionIdx := start + i
-			var keys []string
-			seen := make(map[string]bool)
-
-			for _, entity := range entities {
-				if entity.Score < threshold {
-					continue
-				}
-
-				key := normalizeEntityKey(entity.Label, entity.Text)
-				if seen[key] {
-					continue
-				}
-				seen[key] = true
-				keys = append(keys, key)
-				batchEntities++
-
-				if existing, ok := result.entityRecords[key]; ok {
-					if cnt, ok := existing["mention_count"].(int); ok {
-						existing["mention_count"] = cnt + 1
-					}
-				} else {
-					result.entityRecords[key] = map[string]any{
-						"id":            key,
-						"name":          entity.Text,
-						"label":         entity.Label,
-						"_type":         "entity",
-						"mention_count": 1,
-					}
-				}
-			}
-
-			if len(keys) > 0 {
-				result.sectionEntityKeys[sectionIdx] = keys
-			}
-		}
-		fmt.Printf("  Found %d entity mentions across %d sections\n", batchEntities, end-start)
-	}
-
-	fmt.Printf("\nEntity extraction complete: %d unique entities across %d sections\n",
-		len(result.entityRecords), len(result.sectionEntityKeys))
-
-	// Print entity type distribution
-	labelCounts := make(map[string]int)
-	for _, doc := range result.entityRecords {
-		labelCounts[doc["label"].(string)]++
-	}
-	fmt.Printf("Entity types:\n")
-	for label, count := range labelCounts {
-		fmt.Printf("  - %s: %d\n", label, count)
-	}
-	fmt.Printf("\n")
-
-	return result, nil
-}
-
-// buildRecords converts sections to a records map, optionally enriching with entity data.
-func buildRecords(sections []docsaf.DocumentSection, nerResult *entityResult) map[string]any {
-	records := make(map[string]any)
-	for i, section := range sections {
-		doc := section.ToDocument()
-		if nerResult != nil {
-			if keys, ok := nerResult.sectionEntityKeys[i]; ok {
-				doc["entities"] = keys
-			}
-		}
-		records[section.ID] = doc
-	}
-
-	if nerResult != nil {
-		for key, entityDoc := range nerResult.entityRecords {
-			records[key] = entityDoc
-		}
-	}
-
-	return records
-}
-
-// hasEntityRecords checks if any records in the map are entity documents.
-func hasEntityRecords(records map[string]any) bool {
-	for _, v := range records {
-		if doc, ok := v.(map[string]any); ok {
-			if docType, ok := doc["_type"]; ok && docType == "entity" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // ANCHOR: prepare_cmd
 func prepareCmd(args []string) error {
 	fs := flag.NewFlagSet("prepare", flag.ExitOnError)
@@ -251,7 +36,7 @@ func prepareCmd(args []string) error {
 	outputFile := fs.String("output", "docs.json", "Output JSON file path")
 	baseURL := fs.String("base-url", "", "Base URL for generating document links (optional)")
 
-	ner := registerNERFlags(fs)
+	entityExtraction := exampleentity.RegisterFlags(fs)
 
 	var includePatterns StringSliceFlag
 	var excludePatterns StringSliceFlag
@@ -285,7 +70,7 @@ func prepareCmd(args []string) error {
 	if len(excludePatterns) > 0 {
 		fmt.Printf("Exclude patterns: %v\n", excludePatterns)
 	}
-	ner.printConfig()
+	entityExtraction.Print(os.Stdout)
 	fmt.Printf("\n")
 
 	// Create filesystem source and processor using library
@@ -334,14 +119,14 @@ func prepareCmd(args []string) error {
 	}
 	fmt.Printf("\n")
 
-	// Extract entities if NER model specified
-	nerResult, err := ner.run(context.Background(), sections)
+	// Extract entities if an extractor model is configured.
+	entityResult, err := entityExtraction.Run(context.Background(), sections)
 	if err != nil {
 		return fmt.Errorf("entity extraction failed: %w", err)
 	}
 
-	// Convert sections to records map (enriched with entities if NER was used)
-	records := buildRecords(sections, nerResult)
+	// Convert sections to records map, enriching sections with extraction results when configured.
+	records := exampleentity.BuildRecords(sections, entityResult)
 
 	// Write to JSON file
 	fmt.Printf("Writing %d records to %s...\n", len(records), *outputFile)
@@ -423,7 +208,7 @@ func loadCmd(args []string) error {
 		}
 
 		// Auto-detect entity records and add graph index
-		if hasEntityRecords(records) {
+		if exampleentity.HasEntityRecords(records) {
 			graphIndex, err := createGraphIndex()
 			if err != nil {
 				return fmt.Errorf("failed to create graph index config: %w", err)
@@ -448,7 +233,7 @@ func loadCmd(args []string) error {
 		fmt.Printf("\nPerforming final cleanup to remove orphaned documents...\n")
 		cleanupResult, err := client.LinearMerge(ctx, *tableName, antfly.LinearMergeRequest{
 			Records:      map[string]any{}, // Empty records
-			LastMergedId: finalCursor,       // Start from last cursor
+			LastMergedId: finalCursor,      // Start from last cursor
 			DryRun:       false,
 			SyncLevel:    antfly.SyncLevelAknn,
 		})
@@ -481,7 +266,7 @@ func syncCmd(args []string) error {
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens for chunking")
 
-	ner := registerNERFlags(fs)
+	entityExtraction := exampleentity.RegisterFlags(fs)
 
 	var includePatterns StringSliceFlag
 	var excludePatterns StringSliceFlag
@@ -524,7 +309,7 @@ func syncCmd(args []string) error {
 	if len(excludePatterns) > 0 {
 		fmt.Printf("Exclude patterns: %v\n", excludePatterns)
 	}
-	ner.printConfig()
+	entityExtraction.Print(os.Stdout)
 	fmt.Printf("\n")
 
 	// Create table if requested
@@ -541,8 +326,8 @@ func syncCmd(args []string) error {
 			"embeddings": *embeddingIndex,
 		}
 
-		// Add graph index when NER is enabled
-		if ner.enabled() {
+		// Add a graph index when extraction is enabled.
+		if entityExtraction.Enabled() {
 			graphIndex, err := createGraphIndex()
 			if err != nil {
 				return fmt.Errorf("failed to create graph index config: %w", err)
@@ -601,14 +386,14 @@ func syncCmd(args []string) error {
 	}
 	fmt.Printf("\n")
 
-	// Extract entities if NER model specified
-	nerResult, err := ner.run(ctx, sections)
+	// Extract entities if an extractor model is configured.
+	entityResult, err := entityExtraction.Run(ctx, sections)
 	if err != nil {
 		return fmt.Errorf("entity extraction failed: %w", err)
 	}
 
-	// Convert sections to records map (enriched with entities if NER was used)
-	records := buildRecords(sections, nerResult)
+	// Convert sections to records map, enriching sections with extraction results when configured.
+	records := exampleentity.BuildRecords(sections, entityResult)
 
 	// Perform batched linear merge
 	finalCursor, err := performBatchedLinearMerge(ctx, client, *tableName, records, *batchSize, *dryRun)
@@ -621,7 +406,7 @@ func syncCmd(args []string) error {
 		fmt.Printf("\nPerforming final cleanup to remove orphaned documents...\n")
 		cleanupResult, err := client.LinearMerge(ctx, *tableName, antfly.LinearMergeRequest{
 			Records:      map[string]any{}, // Empty records
-			LastMergedId: finalCursor,       // Start from last cursor
+			LastMergedId: finalCursor,      // Start from last cursor
 			DryRun:       false,
 			SyncLevel:    antfly.SyncLevelAknn,
 		})
@@ -684,9 +469,7 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 
 // ANCHOR_END: create_embedding_index
 
-// createGraphIndex creates a graph index with a mentions_entity edge type.
-// The edge type uses field-based extraction: it reads the "entities" array field
-// from each document and automatically creates edges to the referenced entity nodes.
+// createGraphIndex creates a graph index for entity and relation enrichment.
 func createGraphIndex() (*antfly.IndexConfig, error) {
 	graphIndexConfig := antfly.IndexConfig{
 		Name: "knowledge",
@@ -698,6 +481,18 @@ func createGraphIndex() (*antfly.IndexConfig, error) {
 			{
 				Name:  "mentions_entity",
 				Field: "entities",
+			},
+			{
+				Name:  "mentions_relation",
+				Field: "relations",
+			},
+			{
+				Name:  "relation_head",
+				Field: "head_entity",
+			},
+			{
+				Name:  "relation_tail",
+				Field: "tail_entity",
 			},
 		},
 	})
@@ -883,16 +678,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Prepare data\n")
 		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json\n\n")
-		fmt.Fprintf(os.Stderr, "  # Prepare with NER entity extraction\n")
+		fmt.Fprintf(os.Stderr, "  # Prepare with recognizer-based entity extraction\n")
 		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json \\\n")
-		fmt.Fprintf(os.Stderr, "    --ner-model fastino/gliner2-base-v1 \\\n")
-		fmt.Fprintf(os.Stderr, "    --ner-label technology --ner-label concept --ner-label api_endpoint\n\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-model fastino/gliner2-base-v1 \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-kind recognizer \\\n")
+		fmt.Fprintf(os.Stderr, "    --entity-label technology --entity-label concept --entity-label api_endpoint\n\n")
+		fmt.Fprintf(os.Stderr, "  # Prepare with relation extraction\n")
+		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-model some-relations-model \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-kind recognizer --extractor-relations \\\n")
+		fmt.Fprintf(os.Stderr, "    --relation-label depends_on --relation-label implements\n\n")
 		fmt.Fprintf(os.Stderr, "  # Load prepared data\n")
 		fmt.Fprintf(os.Stderr, "  docsaf load --input docs.json --table docs --create-table\n\n")
-		fmt.Fprintf(os.Stderr, "  # Full pipeline with NER + knowledge graph\n")
+		fmt.Fprintf(os.Stderr, "  # Full pipeline with generator-based extraction + knowledge graph\n")
 		fmt.Fprintf(os.Stderr, "  docsaf sync --dir /path/to/docs --table docs --create-table \\\n")
-		fmt.Fprintf(os.Stderr, "    --ner-model fastino/gliner2-base-v1 \\\n")
-		fmt.Fprintf(os.Stderr, "    --ner-label technology --ner-label concept\n\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-model functiongemma-270m-it \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-kind generator \\\n")
+		fmt.Fprintf(os.Stderr, "    --entity-label technology --entity-label concept\n\n")
 		os.Exit(1)
 	}
 

@@ -19,6 +19,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	generating "github.com/antflydb/antfly/pkg/generating"
 )
 
 // DocumentSummarizer is the interface for document summarization providers
@@ -84,58 +86,5 @@ func DeregisterDocumentSummarizer(typ GeneratorProvider) {
 // NewGeneratorConfigFromJSON creates a GeneratorConfig from a JSON byte slice.
 // Mostly useful for testing.
 func NewGeneratorConfigFromJSON(provider string, data []byte) *GeneratorConfig {
-	return &GeneratorConfig{
-		Provider: GeneratorProvider(provider),
-		union:    data,
-	}
-}
-
-// GetModel extracts the model name from a GeneratorConfig
-func (gc *GeneratorConfig) GetModel() (string, error) {
-	switch gc.Provider {
-	case GeneratorProviderOllama:
-		c, err := gc.AsOllamaGeneratorConfig()
-		if err != nil {
-			return "", err
-		}
-		return c.Model, nil
-	case GeneratorProviderGemini:
-		c, err := gc.AsGoogleGeneratorConfig()
-		if err != nil {
-			return "", err
-		}
-		return c.Model, nil
-	case GeneratorProviderOpenai:
-		c, err := gc.AsOpenAIGeneratorConfig()
-		if err != nil {
-			return "", err
-		}
-		return c.Model, nil
-	case GeneratorProviderBedrock:
-		c, err := gc.AsBedrockGeneratorConfig()
-		if err != nil {
-			return "", err
-		}
-		return c.Model, nil
-	case GeneratorProviderAnthropic:
-		c, err := gc.AsAnthropicGeneratorConfig()
-		if err != nil {
-			return "", err
-		}
-		return c.Model, nil
-	case GeneratorProviderCohere:
-		c, err := gc.AsCohereGeneratorConfig()
-		if err != nil {
-			return "", err
-		}
-		return c.Model, nil
-	case GeneratorProviderTermite:
-		c, err := gc.AsTermiteGeneratorConfig()
-		if err != nil {
-			return "", err
-		}
-		return c.Model, nil
-	default:
-		return "", fmt.Errorf("unsupported provider: %s", gc.Provider)
-	}
+	return (*GeneratorConfig)(generating.NewGeneratorConfigFromJSON(provider, data))
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/a2aproject/a2a-go/a2asrv"
 	"github.com/antflydb/antfly/lib/ai"
+	generating "github.com/antflydb/antfly/pkg/generating"
 	a2afacade "github.com/antflydb/antfly/src/a2a"
 	"github.com/antflydb/antfly/src/tablemgr"
 	"go.uber.org/zap"
@@ -120,9 +121,9 @@ func (a *a2aAdapter) buildRetrievalRequest(req *a2afacade.RetrievalRequest) *Ret
 }
 
 func (a *a2aAdapter) resolveGenerator(ctx context.Context, req *RetrievalAgentRequest) (*ai.GenKitModelImpl, error) {
-	chain := ai.ResolveGeneratorOrChain(req.Generator, req.Chain)
+	chain := generating.ResolveGeneratorOrChain(req.Generator, req.Chain)
 	if len(chain) == 0 {
-		chain = ai.GetDefaultChain()
+		chain = generating.GetDefaultChain()
 	}
 	if len(chain) == 0 {
 		return nil, nil

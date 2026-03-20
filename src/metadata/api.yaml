@@ -2581,7 +2581,7 @@ components:
           description: List of searchable field names to consider. Overrides table schema if provided.
           example: ["title", "content", "status", "published_at"]
         generator:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
     QueryBuilderResult:
       type: object
       required:
@@ -3041,12 +3041,12 @@ components:
           default: true
           description: Enable SSE streaming vs JSON response
         generator:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: Generator for the retrieval agent's LLM calls
         chain:
           type: array
           items:
-            $ref: "../../lib/ai/openapi.yaml#/components/schemas/ChainLink"
+            $ref: "../../pkg/generating/openapi.yaml#/components/schemas/ChainLink"
           description: Chain of generators
         steps:
           $ref: "#/components/schemas/RetrievalAgentSteps"
@@ -3202,12 +3202,12 @@ components:
             DEPRECATED: Use stream on RetrievalAgentRequest instead.
             Enable SSE streaming vs JSON response.
         generator:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: Generator for LLM calls
         chain:
           type: array
           items:
-            $ref: "../../lib/ai/openapi.yaml#/components/schemas/ChainLink"
+            $ref: "../../pkg/generating/openapi.yaml#/components/schemas/ChainLink"
           description: Chain of generators
         agent_knowledge:
           type: string

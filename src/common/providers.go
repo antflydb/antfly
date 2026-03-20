@@ -21,11 +21,11 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/antflydb/antfly/lib/ai"
 	"github.com/antflydb/antfly/lib/audio"
 	"github.com/antflydb/antfly/lib/chunking"
 	"github.com/antflydb/antfly/lib/embeddings"
 	"github.com/antflydb/antfly/lib/reranking"
+	generating "github.com/antflydb/antfly/pkg/generating"
 )
 
 // Registry holds named provider configurations.
@@ -45,7 +45,7 @@ type Registry struct {
 	defaultEmbedder string
 
 	// Named generator configs
-	generatorConfigs map[string]ai.GeneratorConfig
+	generatorConfigs map[string]generating.GeneratorConfig
 	defaultGenerator string
 
 	// Named chains (arrays of chain links that can reference generators by name)
@@ -67,11 +67,11 @@ type ChainLinkConfig struct {
 	// GeneratorName references a named generator (mutually exclusive with GeneratorConfig)
 	GeneratorName string
 	// GeneratorConfig is an inline generator config (mutually exclusive with GeneratorName)
-	GeneratorConfig *ai.GeneratorConfig
+	GeneratorConfig *generating.GeneratorConfig
 	// Retry configuration
-	Retry *ai.RetryConfig
+	Retry *generating.RetryConfig
 	// Condition for trying the next generator
-	Condition *ai.ChainCondition
+	Condition *generating.ChainCondition
 }
 
 // Global registry instance
@@ -79,7 +79,7 @@ var globalRegistry = &Registry{
 	sttProviders:     make(map[string]audio.STT),
 	ttsProviders:     make(map[string]audio.TTS),
 	embedderConfigs:  make(map[string]embeddings.EmbedderConfig),
-	generatorConfigs: make(map[string]ai.GeneratorConfig),
+	generatorConfigs: make(map[string]generating.GeneratorConfig),
 	chains:           make(map[string][]ChainLinkConfig),
 	rerankerConfigs:  make(map[string]reranking.RerankerConfig),
 	chunkerConfigs:   make(map[string]chunking.ChunkerConfig),
@@ -226,7 +226,7 @@ func (r *Registry) EmbedderNames() []string {
 
 // RegisterGeneratorConfig registers a named generator configuration.
 // The first registered generator becomes the default.
-func (r *Registry) RegisterGeneratorConfig(name string, config ai.GeneratorConfig) {
+func (r *Registry) RegisterGeneratorConfig(name string, config generating.GeneratorConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -238,7 +238,7 @@ func (r *Registry) RegisterGeneratorConfig(name string, config ai.GeneratorConfi
 
 // GetGeneratorConfig returns the generator config by name.
 // If name is empty, returns the default generator config.
-func (r *Registry) GetGeneratorConfig(name string) (ai.GeneratorConfig, error) {
+func (r *Registry) GetGeneratorConfig(name string) (generating.GeneratorConfig, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -246,12 +246,12 @@ func (r *Registry) GetGeneratorConfig(name string) (ai.GeneratorConfig, error) {
 		name = r.defaultGenerator
 	}
 	if name == "" {
-		return ai.GeneratorConfig{}, fmt.Errorf("no generators registered")
+		return generating.GeneratorConfig{}, fmt.Errorf("no generators registered")
 	}
 
 	config, ok := r.generatorConfigs[name]
 	if !ok {
-		return ai.GeneratorConfig{}, fmt.Errorf("generator %q not found", name)
+		return generating.GeneratorConfig{}, fmt.Errorf("generator %q not found", name)
 	}
 	return config, nil
 }
@@ -287,10 +287,10 @@ func (r *Registry) RegisterChain(name string, links []ChainLinkConfig) {
 	r.chains[name] = links
 }
 
-// GetChain resolves and returns a chain by name as []ai.ChainLink.
+// GetChain resolves and returns a chain by name as []generating.ChainLink.
 // If name is empty, returns the default chain.
 // This resolves generator name references to actual GeneratorConfig values.
-func (r *Registry) GetChain(name string) ([]ai.ChainLink, error) {
+func (r *Registry) GetChain(name string) ([]generating.ChainLink, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -307,9 +307,9 @@ func (r *Registry) GetChain(name string) ([]ai.ChainLink, error) {
 	}
 
 	// Resolve generator references
-	links := make([]ai.ChainLink, 0, len(linkConfigs))
+	links := make([]generating.ChainLink, 0, len(linkConfigs))
 	for i, cfg := range linkConfigs {
-		var genConfig ai.GeneratorConfig
+		var genConfig generating.GeneratorConfig
 
 		if cfg.GeneratorName != "" {
 			// Lookup by name
@@ -325,7 +325,7 @@ func (r *Registry) GetChain(name string) ([]ai.ChainLink, error) {
 			return nil, fmt.Errorf("chain %q link %d: no generator specified", name, i)
 		}
 
-		links = append(links, ai.ChainLink{
+		links = append(links, generating.ChainLink{
 			Generator: genConfig,
 			Retry:     cfg.Retry,
 			Condition: cfg.Condition,
@@ -467,7 +467,7 @@ func (r *Registry) Clear() {
 	r.defaultTTS = ""
 	r.embedderConfigs = make(map[string]embeddings.EmbedderConfig)
 	r.defaultEmbedder = ""
-	r.generatorConfigs = make(map[string]ai.GeneratorConfig)
+	r.generatorConfigs = make(map[string]generating.GeneratorConfig)
 	r.defaultGenerator = ""
 	r.chains = make(map[string][]ChainLinkConfig)
 	r.defaultChain = ""

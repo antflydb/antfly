@@ -1,9 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
-package: indexes
+package: generating
 generate:
-  std-http-server: true
-  embedded-spec: true
   models: true
+  embedded-spec: true
 compatibility:
   always-prefix-enum-values: true
 output: openapi.gen.go
@@ -11,7 +10,3 @@ output-options:
   skip-prune: true
   prefer-skip-optional-pointer: false
   prefer-skip-optional-pointer-with-omitzero: false
-import-mapping:
-  ../../../../lib/embeddings/openapi.yaml: github.com/antflydb/antfly/lib/embeddings
-  ../../../../pkg/generating/openapi.yaml: github.com/antflydb/antfly/pkg/generating
-  ../../../../lib/chunking/openapi.yaml: github.com/antflydb/antfly/lib/chunking

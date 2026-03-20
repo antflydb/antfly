@@ -12,4 +12,5 @@ output-options:
   prefer-skip-optional-pointer: false
   prefer-skip-optional-pointer-with-omitzero: false
 import-mapping:
+  ../../pkg/generating/openapi.yaml: github.com/antflydb/antfly/pkg/generating
   ../websearch/openapi.yaml: github.com/antflydb/antfly/lib/websearch

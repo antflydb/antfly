@@ -29,6 +29,7 @@ import (
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/websearch"
 	"github.com/antflydb/antfly/lib/workerpool"
+	generating "github.com/antflydb/antfly/pkg/generating"
 	"github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/usermgr"
@@ -793,9 +794,9 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 	var generator *ai.GenKitModelImpl
 
 	if needsGenerator {
-		chain := ai.ResolveGeneratorOrChain(req.Generator, req.Chain)
+		chain := generating.ResolveGeneratorOrChain(req.Generator, req.Chain)
 		if len(chain) == 0 {
-			defaultChain := ai.GetDefaultChain()
+			defaultChain := generating.GetDefaultChain()
 			if len(defaultChain) == 0 {
 				if req.MaxIterations != 0 {
 					errorResponse(w, "either 'generator' or 'chain' must be provided (no default chain configured)", http.StatusBadRequest)
