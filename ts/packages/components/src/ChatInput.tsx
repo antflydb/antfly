@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useCallback, useState } from "react";
 import { useChatContext } from "./ChatContext";
+import { SafeRender } from "./SafeRender";
 
 export interface ChatInputProps {
   /** Placeholder text for the input */
@@ -44,14 +45,10 @@ export default function ChatInput({
   if (renderInput) {
     return (
       <div className="react-af-chat-input">
-        {renderInput({
-          value,
-          onChange: setValue,
-          onSubmit: handleSubmit,
-          isStreaming,
-          placeholder,
-          abort,
-        })}
+        <SafeRender
+          render={renderInput}
+          args={[{ value, onChange: setValue, onSubmit: handleSubmit, isStreaming, placeholder, abort }] as const}
+        />
       </div>
     );
   }

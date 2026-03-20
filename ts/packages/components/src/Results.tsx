@@ -1,6 +1,7 @@
 import type { QueryHit } from "@antfly/sdk";
 import React, { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import Pagination from "./Pagination";
+import { SafeRender } from "./SafeRender";
 import { useSharedContext } from "./SharedContext";
 import { disjunctsFrom } from "./utils";
 
@@ -211,7 +212,7 @@ export default function Results({
   return (
     <div className="react-af-results">
       {stats ? (
-        stats(total)
+        <SafeRender render={stats} args={[total] as const} />
       ) : isSemanticEnabled ? (
         <>
           {data.length} out of {total} results
@@ -219,9 +220,15 @@ export default function Results({
       ) : (
         <>{total} results</>
       )}
-      <div className="react-af-results-items">{items(data)}</div>
+      <div className="react-af-results-items">
+        <SafeRender render={items} args={[data] as const} />
+      </div>
       {!isSemanticEnabled &&
-        (pagination ? pagination(total, itemsPerPage, page, setPage) : defaultPagination())}
+        (pagination ? (
+          <SafeRender render={pagination} args={[total, itemsPerPage, page, setPage] as const} />
+        ) : (
+          defaultPagination()
+        ))}
     </div>
   );
 }
