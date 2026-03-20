@@ -84,6 +84,7 @@ func newTestStore(t *testing.T) *Store {
 			},
 		},
 		config:    &StoreInfo{ID: 1},
+		shardMu:   xsync.NewMap[types.ID, *sync.Mutex](),
 		shardsMap: xsync.NewMap[types.ID, *Shard](),
 		db:        metaDB,
 	}
