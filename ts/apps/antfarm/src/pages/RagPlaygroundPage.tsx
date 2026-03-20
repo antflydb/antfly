@@ -3,9 +3,10 @@ import { AnswerResults, Antfly, QueryBox } from "@antfly/components";
 import type {
   ClassificationTransformationResult,
   GenerationConfidence,
+  GeneratorConfig,
+  GeneratorProvider,
   QueryHit,
 } from "@antfly/sdk";
-import { generatorProviders } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   BookOpen,
@@ -22,6 +23,12 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useMemo, useReducer, useRef, useState } from "react";
+import {
+  formatGeneratorSummary,
+  GENERATOR_DEFAULT_CONFIG,
+  GeneratorSelector,
+  getInheritedGeneratorLabels,
+} from "@/components/playground/GeneratorSelector";
 import { PipelineTrace } from "@/components/rag/PipelineTrace";
 import {
   type ConfidenceStepData,
@@ -38,28 +45,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { useTable } from "@/hooks/use-table";
 import { cn } from "@/lib/utils";
-
-// Generator provider type from SDK
-type GeneratorProvider = (typeof generatorProviders)[number];
-
-interface GeneratorConfig {
-  provider: GeneratorProvider;
-  model: string;
-  temperature?: number;
-}
 
 interface StepsConfig {
   classification: {
@@ -79,12 +71,6 @@ interface StepsConfig {
     enabled: boolean;
   };
 }
-
-const DEFAULT_GENERATOR: GeneratorConfig = {
-  provider: "openai",
-  model: "gpt-4o-mini",
-  temperature: 0.7,
-};
 
 const DEFAULT_STEPS: StepsConfig = {
   classification: { enabled: false, with_reasoning: false },
@@ -176,14 +162,18 @@ function formatAnswer(text: string): React.ReactNode {
 
 const RagPlaygroundPage: React.FC = () => {
   const { apiUrl } = useApiConfig();
+  const { dashboardGenerator } = useGeneratorPreference();
   const { selectedTable, selectedIndex } = useTable();
 
   // Config state
   const [query, setQuery] = useState("");
-  const [generator, setGenerator] = useState<GeneratorConfig>(DEFAULT_GENERATOR);
+  const [generatorOverride, setGeneratorOverride] = useState<GeneratorConfig | null>(null);
   const [limit, setLimit] = useState(10);
   const [steps, setSteps] = useState<StepsConfig>(DEFAULT_STEPS);
   const [settingsOpen, setSettingsOpen] = useState(true);
+  const effectiveGenerator = generatorOverride ?? dashboardGenerator ?? null;
+  const { label: inheritedGeneratorLabel, description: inheritedGeneratorDescription } =
+    getInheritedGeneratorLabels(dashboardGenerator);
 
   // Pipeline state
   const [pipeline, dispatchPipeline] = useReducer(pipelineReducer, initialPipelineState);
@@ -206,7 +196,7 @@ const RagPlaygroundPage: React.FC = () => {
     setError(null);
     setProcessingTime(null);
     setSteps(DEFAULT_STEPS);
-    setGenerator(DEFAULT_GENERATOR);
+    setGeneratorOverride(null);
     setLimit(10);
     setContextOpen(false);
     dispatchPipeline({ type: "RESET" });
@@ -281,12 +271,12 @@ const RagPlaygroundPage: React.FC = () => {
         stepId: "generation",
         data: {
           answer: accumulatedAnswerRef.current,
-          provider: generator.provider,
-          model: generator.model,
+          provider: effectiveGenerator?.provider,
+          model: effectiveGenerator?.model,
         } as GenerationStepData,
       });
     },
-    [generator.provider, generator.model]
+    [effectiveGenerator?.model, effectiveGenerator?.provider]
   );
 
   const handleFollowUpQuestion = useCallback((q: string) => {
@@ -328,8 +318,8 @@ const RagPlaygroundPage: React.FC = () => {
       stepId: "generation",
       data: {
         answer: accumulatedAnswerRef.current,
-        provider: generator.provider,
-        model: generator.model,
+        provider: effectiveGenerator?.provider,
+        model: effectiveGenerator?.model,
       } as GenerationStepData,
     });
     if (accumulatedFollowupsRef.current.length > 0) {
@@ -340,7 +330,7 @@ const RagPlaygroundPage: React.FC = () => {
       });
     }
     dispatchPipeline({ type: "COMPLETE" });
-  }, [generator.provider, generator.model]);
+  }, [effectiveGenerator?.model, effectiveGenerator?.provider]);
 
   const handleError = useCallback((e: string) => {
     setError(e);
@@ -371,12 +361,17 @@ const RagPlaygroundPage: React.FC = () => {
         {/* Stats Bar */}
         {pipeline.overallStatus !== "idle" && (
           <div className="flex flex-wrap gap-2">
-            {generationData?.provider && generationData?.model && (
-              <Badge variant="secondary" className="gap-1.5">
-                <Zap className="h-3 w-3" />
-                {generationData.provider}/{generationData.model}
-              </Badge>
-            )}
+            <Badge variant="secondary" className="gap-1.5">
+              <Zap className="h-3 w-3" />
+              {formatGeneratorSummary(
+                generationData?.provider && generationData?.model
+                  ? {
+                      provider: generationData.provider as GeneratorProvider,
+                      model: generationData.model,
+                    }
+                  : effectiveGenerator
+              )}
+            </Badge>
             {(searchData?.hits?.length ?? 0) > 0 && (
               <Badge variant="outline" className="gap-1.5">
                 <BookOpen className="h-3 w-3" />
@@ -407,11 +402,7 @@ const RagPlaygroundPage: React.FC = () => {
           id="rag-answer"
           searchBoxId="rag-query"
           table={selectedTable}
-          generator={{
-            provider: generator.provider,
-            model: generator.model,
-            temperature: generator.temperature,
-          }}
+          {...(effectiveGenerator ? { generator: effectiveGenerator } : {})}
           systemPrompt={steps.generation.system_prompt || undefined}
           generationContext={steps.generation.generation_context || undefined}
           limit={limit}
@@ -548,7 +539,7 @@ const RagPlaygroundPage: React.FC = () => {
       generationData,
       searchData,
       confidenceData,
-      generator,
+      effectiveGenerator,
       steps,
       limit,
       selectedIndex,
@@ -677,52 +668,13 @@ const RagPlaygroundPage: React.FC = () => {
                     {/* Generator Config */}
                     <div className="space-y-4">
                       <Label className="text-sm font-medium">Generator</Label>
-                      <div className="grid grid-cols-3 gap-4">
-                        <div className="space-y-2">
-                          <Label className="text-xs text-muted-foreground">Provider</Label>
-                          <Select
-                            value={generator.provider}
-                            onValueChange={(v) =>
-                              setGenerator((g) => ({ ...g, provider: v as GeneratorProvider }))
-                            }
-                          >
-                            <SelectTrigger>
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {generatorProviders.map((p) => (
-                                <SelectItem key={p} value={p}>
-                                  {p}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </div>
-                        <div className="space-y-2">
-                          <Label className="text-xs text-muted-foreground">Model</Label>
-                          <Input
-                            value={generator.model}
-                            onChange={(e) => setGenerator((g) => ({ ...g, model: e.target.value }))}
-                            placeholder="gpt-5-mini"
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <Label className="text-xs text-muted-foreground">Temperature</Label>
-                          <Input
-                            type="number"
-                            value={generator.temperature ?? 0.7}
-                            onChange={(e) =>
-                              setGenerator((g) => ({
-                                ...g,
-                                temperature: parseFloat(e.target.value) || 0.7,
-                              }))
-                            }
-                            min={0}
-                            max={2}
-                            step={0.1}
-                          />
-                        </div>
-                      </div>
+                      <GeneratorSelector
+                        value={generatorOverride}
+                        onChange={setGeneratorOverride}
+                        defaultConfig={GENERATOR_DEFAULT_CONFIG}
+                        defaultLabel={inheritedGeneratorLabel}
+                        defaultDescription={inheritedGeneratorDescription}
+                      />
                     </div>
 
                     {/* Query Options */}

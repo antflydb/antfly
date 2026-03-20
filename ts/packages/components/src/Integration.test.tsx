@@ -180,6 +180,37 @@ describe("Integration Tests", () => {
         expect(container.querySelector(".react-af-results")).toBeTruthy();
       });
     });
+
+    it("should call onResults when query results arrive", async () => {
+      const hits: QueryHit[] = [
+        { _id: "1", _score: 1.0, _source: { title: "First result" } },
+        { _id: "2", _score: 0.8, _source: { title: "Second result" } },
+      ];
+      const msearchSpy = mockMultiquery(hits);
+      const onResults = vi.fn();
+
+      const { container } = render(
+        <TestWrapper>
+          <QueryBox id="search" mode="live" />
+          <Results
+            id="results"
+            searchBoxId="search"
+            fields={["title"]}
+            onResults={onResults}
+            items={() => <div />}
+          />
+        </TestWrapper>
+      );
+
+      const input = container.querySelector("input") as HTMLInputElement;
+      await userEvent.type(input, "test");
+
+      await waitFor(() => {
+        expect(onResults).toHaveBeenCalledWith(hits, hits.length);
+      });
+
+      msearchSpy.mockRestore();
+    });
   });
 
   describe("Full search workflow", () => {

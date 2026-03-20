@@ -14,9 +14,10 @@ export interface CitationMetadata {
  * Represents a single search result in history
  */
 export interface SearchResult {
+  id: string;
   query: string;
   timestamp: number;
-  summary: string;
+  summary?: string;
   hits: QueryHit[];
   citations?: CitationMetadata[];
 }
@@ -39,10 +40,11 @@ export interface SearchHistory {
  *
  * @example
  * ```typescript
- * const { history, isReady, saveSearch, clearHistory } = useSearchHistory(10);
+ * const { history, isReady, upsertSearch, clearHistory } = useSearchHistory(10);
  *
  * // Save a search result
- * saveSearch({
+ * upsertSearch({
+ *   id: "search-123",
  *   query: "how does raft work",
  *   timestamp: Date.now(),
  *   summary: "Raft is a consensus algorithm...",
@@ -75,13 +77,14 @@ export function useSearchHistory(maxResults = 10) {
   // History is loaded synchronously via lazy initializer, so always ready
   const isReady = true;
 
-  // Save search result
-  const saveSearch = useCallback(
+  // Insert or update a search result by id
+  const upsertSearch = useCallback(
     (result: SearchResult) => {
       if (maxResults === 0) return; // History disabled
 
       setHistory((prev) => {
-        const updated = [result, ...prev].slice(0, maxResults);
+        const existingWithoutCurrent = prev.filter((entry) => entry.id !== result.id);
+        const updated = [result, ...existingWithoutCurrent].slice(0, maxResults);
 
         if (typeof window === "undefined") return updated;
 
@@ -96,6 +99,9 @@ export function useSearchHistory(maxResults = 10) {
     [maxResults]
   );
 
+  // Backward-compatible alias
+  const saveSearch = upsertSearch;
+
   // Clear history
   const clearHistory = useCallback(() => {
     setHistory([]);
@@ -109,5 +115,5 @@ export function useSearchHistory(maxResults = 10) {
     }
   }, []);
 
-  return { history, isReady, saveSearch, clearHistory };
+  return { history, isReady, saveSearch, upsertSearch, clearHistory };
 }

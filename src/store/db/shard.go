@@ -60,6 +60,8 @@ type ShardIface interface {
 	SyncWriteOp(ctx context.Context, op *Op) error
 	GetTransactionStatus(ctx context.Context, txnID []byte) (int32, error)
 	GetCommitVersion(ctx context.Context, txnID []byte) (uint64, error)
+	ListTxnRecords(ctx context.Context) ([]TxnRecord, error)
+	ListTxnIntents(ctx context.Context) ([]TxnIntent, error)
 	// Graph methods
 	GetEdges(ctx context.Context, indexName string, key []byte, edgeType string, direction indexes.EdgeDirection) ([]indexes.Edge, error)
 	TraverseEdges(ctx context.Context, indexName string, startKey []byte, rules indexes.TraversalRules) ([]*indexes.TraversalResult, error)
@@ -461,6 +463,20 @@ func (s *Shard) GetCommitVersion(ctx context.Context, txnID []byte) (uint64, err
 		return 0, err
 	}
 	return s.storeDB.GetCommitVersion(ctx, txnID)
+}
+
+func (s *Shard) ListTxnRecords(ctx context.Context) ([]TxnRecord, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
+	return s.storeDB.ListTxnRecords(ctx)
+}
+
+func (s *Shard) ListTxnIntents(ctx context.Context) ([]TxnIntent, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
+	return s.storeDB.ListTxnIntents(ctx)
 }
 
 // GetEdges retrieves edges for a document in a graph index

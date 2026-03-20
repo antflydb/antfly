@@ -40,6 +40,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/goccy/go-json"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -57,7 +58,8 @@ type TableManager struct {
 	db kv.DB
 
 	// client is used for making HTTP requests using the store client
-	client *http.Client
+	client        *http.Client
+	clientFactory StoreClientFactory
 
 	// maxShardSizeBytes is the threshold for triggering shard splits.
 	// When a shard's disk size crosses this threshold, we persist the ShardStats
@@ -65,13 +67,20 @@ type TableManager struct {
 	maxShardSizeBytes uint64
 }
 
+type StoreClientFactory func(client *http.Client, id types.ID, url string) client.StoreRPC
+
+func defaultStoreClientFactory(c *http.Client, id types.ID, url string) client.StoreRPC {
+	return client.NewStoreClient(c, id, url)
+}
+
 // NewTableManager creates a new TableManager instance
 // maxShardSizeBytes is used to determine when to persist ShardStats for split detection
 // (pass 0 to disable threshold-based persistence)
-func NewTableManager(db kv.DB, client *http.Client, maxShardSizeBytes uint64) (*TableManager, error) {
+func NewTableManager(db kv.DB, httpClient *http.Client, maxShardSizeBytes uint64) (*TableManager, error) {
 	tm := &TableManager{
 		db:                db,
-		client:            client,
+		client:            httpClient,
+		clientFactory:     defaultStoreClientFactory,
 		maxShardSizeBytes: maxShardSizeBytes,
 	}
 	return tm, nil
@@ -84,6 +93,24 @@ func (tm *TableManager) HttpClient() *http.Client {
 		}
 	}
 	return tm.client
+}
+
+func (tm *TableManager) SetStoreClientFactory(factory StoreClientFactory) {
+	tm.Lock()
+	defer tm.Unlock()
+	if factory == nil {
+		tm.clientFactory = defaultStoreClientFactory
+		return
+	}
+	tm.clientFactory = factory
+}
+
+func (tm *TableManager) newStoreClient(id types.ID, url string) client.StoreRPC {
+	factory := tm.clientFactory
+	if factory == nil {
+		factory = defaultStoreClientFactory
+	}
+	return factory(tm.client, id, url)
 }
 
 func (tm *TableManager) UpdateStatuses(
@@ -225,17 +252,26 @@ func (tm *TableManager) needsUpdates(
 	}
 	// Copy SplitState from storage node reports so reconciler can see it.
 	// SplitState is the Raft-replicated split phase from the shard leader.
-	// First, preserve existing SplitState (in case newShardInfo is from a follower with nil SplitState)
+	// Preserve the richer version when heartbeats briefly report a partial state
+	// during failover, but still persist upgrades within the same phase such as
+	// the child shard ID appearing after metadata already recorded PHASE_SPLITTING.
 	if oldShardStatus.SplitState != nil {
-		newShardStatus.SplitState = oldShardStatus.SplitState
+		newShardStatus.SplitState = proto.Clone(oldShardStatus.SplitState).(*db.SplitState)
 	}
-	// Then update if newShardInfo has a SplitState (from the leader)
-	if newShardInfo.SplitState != nil {
-		if oldShardStatus.SplitState == nil ||
-			oldShardStatus.SplitState.GetPhase() != newShardInfo.SplitState.GetPhase() {
-			needsPersist = true
-		}
-		newShardStatus.SplitState = newShardInfo.SplitState
+	leaderClearedSplitState := oldShardStatus.SplitState != nil &&
+		oldShardStatus.SplitState.GetPhase() != db.SplitState_PHASE_NONE &&
+		newShardInfo.SplitState == nil &&
+		newShardInfo.RaftStatus != nil &&
+		newShardInfo.RaftStatus.Lead != 0
+	if leaderClearedSplitState {
+		newShardStatus.SplitState = nil
+		needsPersist = true
+	} else if mergedSplitState, splitStateChanged := mergeSplitStates(
+		oldShardStatus.SplitState,
+		newShardInfo.SplitState,
+	); mergedSplitState != nil {
+		newShardStatus.SplitState = mergedSplitState
+		needsPersist = needsPersist || splitStateChanged
 	}
 	if newShardInfo.RaftStatus != nil {
 		newShardStatus.RaftStatus = newShardInfo.RaftStatus
@@ -355,13 +391,9 @@ func (tm *TableManager) needsUpdates(
 					log.Printf("SPLIT_STATE: Shard %s transitioning PreSplit -> Default (splitOffShardIsReady=true)", oldShardStatus.ID)
 					newShardStatus.State = store.ShardState_Default
 					needsPersist = true
-				} else {
-					log.Printf("SPLIT_STATE: Shard %s staying in PreSplit (splitOffShardIsReady=false, Splitting=false)", oldShardStatus.ID)
 				}
 			}
 		} else {
-			log.Printf("SPLIT_STATE: Shard %s split in progress, current byte range: %+v, expected: %+v",
-				oldShardStatus.ID, newShardInfo.ByteRange, oldShardStatus.ByteRange)
 		}
 	case store.ShardState_Splitting:
 		if !newShardInfo.Splitting {
@@ -374,8 +406,6 @@ func (tm *TableManager) needsUpdates(
 				log.Printf("SPLIT_STATE: Shard %s transitioning Splitting -> Default (splitOffShardIsReady=true)", oldShardStatus.ID)
 				newShardStatus.State = store.ShardState_Default
 				needsPersist = true
-			} else {
-				log.Printf("SPLIT_STATE: Shard %s staying in Splitting (splitOffShardIsReady=false)", oldShardStatus.ID)
 			}
 		}
 	case store.ShardState_SplittingOff:
@@ -400,14 +430,6 @@ func (tm *TableManager) needsUpdates(
 			// through the parent's final fence.
 			log.Printf("SPLIT_STATE: Shard %s transitioning SplitOffPreSnap -> Default (cutoverReady=true)", oldShardStatus.ID)
 			newShardStatus.State = store.ShardState_Default
-		} else {
-			log.Printf("SPLIT_STATE: Shard %s staying in SplitOffPreSnap (hasSnapshot=%v, initializing=%v, hasLeader=%v, cutoverReady=%v)",
-				oldShardStatus.ID,
-				newShardInfo.HasSnapshot,
-				newShardInfo.Initializing,
-				newShardInfo.RaftStatus != nil && newShardInfo.RaftStatus.Lead != 0,
-				newShardInfo.SplitCutoverReady,
-			)
 		}
 	case store.ShardState_Default:
 	default:
@@ -418,7 +440,53 @@ func (tm *TableManager) needsUpdates(
 			needsPersist = true
 		}
 	}
+	if newShardStatus.State == store.ShardState_Default &&
+		newShardStatus.SplitState != nil &&
+		newShardStatus.SplitState.GetPhase() != db.SplitState_PHASE_NONE &&
+		newShardInfo.SplitState == nil &&
+		!newShardInfo.Splitting {
+		newShardStatus.SplitState = nil
+		needsPersist = true
+	}
+	if newShardStatus.State == store.ShardState_Default &&
+		newShardStatus.SplitState != nil &&
+		newShardStatus.SplitState.GetPhase() != db.SplitState_PHASE_NONE &&
+		newShardStatus.SplitReplayRequired &&
+		newShardStatus.SplitCutoverReady &&
+		newShardStatus.SplitParentShardID != 0 {
+		newShardStatus.SplitState = nil
+		needsPersist = true
+	}
 	return newShardStatus, needsPersist
+}
+
+func mergeSplitStates(oldState, newState *db.SplitState) (*db.SplitState, bool) {
+	switch {
+	case oldState == nil && newState == nil:
+		return nil, false
+	case newState == nil:
+		return proto.Clone(oldState).(*db.SplitState), false
+	case oldState == nil:
+		return proto.Clone(newState).(*db.SplitState), true
+	}
+
+	merged := proto.Clone(newState).(*db.SplitState)
+	if oldState.GetPhase() == merged.GetPhase() {
+		if merged.GetNewShardId() == 0 && oldState.GetNewShardId() != 0 {
+			merged.SetNewShardId(oldState.GetNewShardId())
+		}
+		if len(merged.GetSplitKey()) == 0 && len(oldState.GetSplitKey()) > 0 {
+			merged.SetSplitKey(oldState.GetSplitKey())
+		}
+		if len(merged.GetOriginalRangeEnd()) == 0 && len(oldState.GetOriginalRangeEnd()) > 0 {
+			merged.SetOriginalRangeEnd(oldState.GetOriginalRangeEnd())
+		}
+		if merged.GetStartedAtUnixNanos() == 0 && oldState.GetStartedAtUnixNanos() != 0 {
+			merged.SetStartedAtUnixNanos(oldState.GetStartedAtUnixNanos())
+		}
+	}
+
+	return merged, !proto.Equal(oldState, merged)
 }
 
 // diffExceedsPercent reports whether new differs from old by more than pct percent.
@@ -528,7 +596,7 @@ func (tm *TableManager) GetStoreStatus(ctx context.Context, peerID types.ID) (*S
 	if err := json.Unmarshal(b, status); err != nil {
 		return nil, fmt.Errorf("unmarshalling store status for %s: %w", peerID, err)
 	}
-	status.StoreClient = client.NewStoreClient(tm.client, peerID, status.ApiURL)
+	status.StoreClient = tm.newStoreClient(peerID, status.ApiURL)
 	return status, nil
 }
 
@@ -550,7 +618,7 @@ func (tm *TableManager) RangeStoreStatuses(
 func (tm *TableManager) GetStoreClient(
 	ctx context.Context,
 	peerID types.ID,
-) (*client.StoreClient, bool, error) {
+) (client.StoreRPC, bool, error) {
 	status, err := tm.GetStoreStatus(ctx, peerID)
 	if err != nil {
 		return nil, false, err
@@ -1380,12 +1448,11 @@ func (tm *TableManager) loadStoreStatuses() (map[types.ID]*StoreStatus, error) {
 		if err := json.Unmarshal(iter.Value(), &storeStatus); err != nil {
 			return nil, fmt.Errorf("unmarshalling table: %w", err)
 		}
-		storeStatus.StoreClient = client.NewStoreClient(
-			tm.client,
-			storeStatus.StoreInfo.ID,
+		storeStatus.StoreClient = tm.newStoreClient(
+			storeStatus.ID,
 			storeStatus.ApiURL,
 		)
-		resp[storeStatus.StoreInfo.ID] = &storeStatus
+		resp[storeStatus.ID] = &storeStatus
 	}
 	if err := iter.Error(); err != nil {
 		return nil, fmt.Errorf("iterator error while loading store statuses: %w", err)

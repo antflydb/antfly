@@ -1,6 +1,6 @@
 {
   "name": "@antfly/sdk",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "description": "TypeScript SDK for Antfly API",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -48,8 +48,8 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/antflydb/antfly-ts.git",
-    "directory": "packages/sdk"
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/sdk"
   },
   "bugs": {
     "url": "https://github.com/antflydb/antfly/issues"

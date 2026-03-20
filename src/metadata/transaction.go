@@ -17,17 +17,26 @@ package metadata
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
+	storeclient "github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/cespare/xxhash/v2"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
+// Distributed transaction control-plane RPCs can cross leader elections,
+// store restarts, and simulator-induced proposal drops. Keep the retry
+// budget long enough to ride out a couple of election intervals without
+// forcing callers to build their own retry loops around ExecuteTransaction.
+const maxTxnRetryAttempts = 20
 
 // collectShards returns the union of shard IDs across writes, deletes, and transforms.
 func collectShards(
@@ -61,7 +70,11 @@ func (ms *MetadataStore) ExecuteTransaction(
 	syncLevel db.Op_SyncLevel,
 ) error {
 	// Generate transaction ID
-	txnID := uuid.New()
+	generateTxnID := ms.txnIDGenerator
+	if generateTxnID == nil {
+		generateTxnID = uuid.New
+	}
+	txnID := generateTxnID()
 
 	// Allocate timestamp
 	timestamp := ms.hlc.Now()
@@ -175,8 +188,12 @@ func (ms *MetadataStore) notifyParticipantsAsync(
 	go func() { _ = g.Wait() }()
 }
 
-// notifyParticipantsSync sends resolve intent notifications to all shards and waits for completion.
-// Unlike notifyParticipantsAsync, this includes the coordinator shard and blocks until all resolve.
+// notifyParticipantsSync sends resolve intent notifications to all shards and
+// waits for completion.
+//
+// The coordinator still participates in the SyncLevelWrite contract: the local
+// resolve path started by commit is asynchronous, so this explicit wait keeps
+// the API from returning before the coordinator's own intents are durable.
 func (ms *MetadataStore) notifyParticipantsSync(
 	ctx context.Context,
 	coordinatorID types.ID,
@@ -188,13 +205,17 @@ func (ms *MetadataStore) notifyParticipantsSync(
 
 	for shardID := range allShards {
 		g.Go(func(ctx context.Context) error {
-			storeClient, err := ms.leaderClientForShard(ctx, shardID)
-			if err != nil {
-				return fmt.Errorf("getting client for shard %s: %w", shardID, err)
-			}
-
-			if err := storeClient.ResolveIntent(ctx, shardID, txnID[:], db.TxnStatusCommitted, commitVersion); err != nil {
-				return fmt.Errorf("resolving intents on shard %s: %w", shardID, err)
+			if err := ms.retryTxnOp(ctx, "resolve intents", func(ctx context.Context) error {
+				storeClient, err := ms.leaderClientForShard(ctx, shardID)
+				if err != nil {
+					return fmt.Errorf("getting client for shard %s: %w", shardID, err)
+				}
+				if err := storeClient.ResolveIntent(ctx, shardID, txnID[:], db.TxnStatusCommitted, commitVersion); err != nil {
+					return fmt.Errorf("resolving intents on shard %s: %w", shardID, err)
+				}
+				return nil
+			}); err != nil {
+				return err
 			}
 
 			ms.logger.Debug("Resolved intents synchronously",
@@ -248,13 +269,13 @@ func (ms *MetadataStore) initTransaction(
 		participants = append(participants, b)
 	}
 
-	// Get shard leader client
-	storeClient, err := ms.leaderClientForShard(ctx, coordinatorID)
-	if err != nil {
-		return fmt.Errorf("getting coordinator client: %w", err)
-	}
-
-	return storeClient.InitTransaction(ctx, coordinatorID, txnID[:], timestamp, participants)
+	return ms.retryTxnOp(ctx, "init transaction", func(ctx context.Context) error {
+		storeClient, err := ms.leaderClientForShard(ctx, coordinatorID)
+		if err != nil {
+			return fmt.Errorf("getting coordinator client: %w", err)
+		}
+		return storeClient.InitTransaction(ctx, coordinatorID, txnID[:], timestamp, participants)
+	})
 }
 
 // writeIntents sends write intents to all participating shards.
@@ -284,16 +305,17 @@ func (ms *MetadataStore) writeIntents(
 		shardPredicates := predicates[shardID] // nil if no predicates for this shard
 
 		g.Go(func(ctx context.Context) error {
-			// Get shard leader client. Uses leaderClientForShard (with follower fallback)
-			// rather than the strict path because writes are rejected by followers with
-			// "not leader", causing the transaction to abort — the fallback is harmless
-			// and helps during rebalancing when Raft leadership moves but metadata is stale.
-			storeClient, err := ms.leaderClientForShard(ctx, shardID)
-			if err != nil {
-				return fmt.Errorf("getting client for shard %s: %w", shardID, err)
-			}
-
-			return storeClient.WriteIntent(ctx, shardID, txnID[:], timestamp, coordinatorBytes, kvPairs, deleteKeys, shardTransforms, shardPredicates)
+			return ms.retryTxnOp(ctx, "write intents", func(ctx context.Context) error {
+				// Get shard leader client. Uses leaderClientForShard (with follower fallback)
+				// rather than the strict path because writes are rejected by followers with
+				// "not leader", causing the transaction to abort — the fallback is harmless
+				// and helps during rebalancing when Raft leadership moves but metadata is stale.
+				storeClient, err := ms.leaderClientForShard(ctx, shardID)
+				if err != nil {
+					return fmt.Errorf("getting client for shard %s: %w", shardID, err)
+				}
+				return storeClient.WriteIntent(ctx, shardID, txnID[:], timestamp, coordinatorBytes, kvPairs, deleteKeys, shardTransforms, shardPredicates)
+			})
 		})
 	}
 
@@ -307,13 +329,13 @@ func (ms *MetadataStore) commitTransaction(
 	coordinatorID types.ID,
 	txnID uuid.UUID,
 ) (uint64, error) {
-	// Get shard leader client
-	storeClient, err := ms.leaderClientForShard(ctx, coordinatorID)
-	if err != nil {
-		return 0, fmt.Errorf("getting coordinator client: %w", err)
-	}
-
-	return storeClient.CommitTransaction(ctx, coordinatorID, txnID[:])
+	return ms.retryTxnUint64Op(ctx, "commit transaction", func(ctx context.Context) (uint64, error) {
+		storeClient, err := ms.leaderClientForShard(ctx, coordinatorID)
+		if err != nil {
+			return 0, fmt.Errorf("getting coordinator client: %w", err)
+		}
+		return storeClient.CommitTransaction(ctx, coordinatorID, txnID[:])
+	})
 }
 
 // abortTransaction tells coordinator to abort
@@ -322,11 +344,73 @@ func (ms *MetadataStore) abortTransaction(
 	coordinatorID types.ID,
 	txnID uuid.UUID,
 ) error {
-	// Get shard leader client
-	storeClient, err := ms.leaderClientForShard(ctx, coordinatorID)
-	if err != nil {
-		return fmt.Errorf("getting coordinator client: %w", err)
-	}
+	return ms.retryTxnOp(ctx, "abort transaction", func(ctx context.Context) error {
+		storeClient, err := ms.leaderClientForShard(ctx, coordinatorID)
+		if err != nil {
+			return fmt.Errorf("getting coordinator client: %w", err)
+		}
+		return storeClient.AbortTransaction(ctx, coordinatorID, txnID[:])
+	})
+}
 
-	return storeClient.AbortTransaction(ctx, coordinatorID, txnID[:])
+func (ms *MetadataStore) retryTxnOp(ctx context.Context, label string, fn func(context.Context) error) error {
+	var lastErr error
+	for attempt := range maxTxnRetryAttempts {
+		if err := fn(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if !isRetryableTxnError(err) || attempt == maxTxnRetryAttempts-1 {
+				return err
+			}
+			ms.clockOrReal().Sleep(ms.txnRetryDelay(attempt))
+			ms.logger.Debug("Retrying transaction step",
+				zap.String("step", label),
+				zap.Int("attempt", attempt+2),
+				zap.Error(err))
+		}
+	}
+	return lastErr
+}
+
+func (ms *MetadataStore) retryTxnUint64Op(ctx context.Context, label string, fn func(context.Context) (uint64, error)) (uint64, error) {
+	var lastErr error
+	for attempt := range maxTxnRetryAttempts {
+		value, err := fn(ctx)
+		if err == nil {
+			return value, nil
+		}
+		lastErr = err
+		if !isRetryableTxnError(err) || attempt == maxTxnRetryAttempts-1 {
+			return 0, err
+		}
+		ms.clockOrReal().Sleep(ms.txnRetryDelay(attempt))
+		ms.logger.Debug("Retrying transaction step",
+			zap.String("step", label),
+			zap.Int("attempt", attempt+2),
+			zap.Error(err))
+	}
+	return 0, lastErr
+}
+
+func (ms *MetadataStore) txnRetryDelay(attempt int) time.Duration {
+	return 250 * time.Millisecond
+}
+
+func isRetryableTxnError(err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, storeclient.ErrProposalDropped),
+		errors.Is(err, storeclient.ErrNotLeader),
+		errors.Is(err, storeclient.ErrNoHealthyPeer),
+		errors.Is(err, storeclient.ErrShardInitializing),
+		errors.Is(err, storeclient.ErrShardNotReady):
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "proposal dropped") ||
+		strings.Contains(msg, "operation did not complete") ||
+		strings.Contains(msg, "no leader") ||
+		strings.Contains(msg, "not leader")
 }

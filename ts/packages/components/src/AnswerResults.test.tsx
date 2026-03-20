@@ -2,8 +2,10 @@ import type { EvalResult, GeneratorConfig } from "@antfly/sdk";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type React from "react";
+import { useMemo } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import AnswerResults from "./AnswerResults";
+import { useAnswerResultsContext } from "./AnswerResultsContext";
 import Antfly from "./Antfly";
 import QueryBox from "./QueryBox";
 import * as utils from "./utils";
@@ -532,6 +534,154 @@ describe("AnswerResults", () => {
         expect(onStreamStart).toHaveBeenCalled();
         expect(onStreamEnd).toHaveBeenCalled();
       });
+    });
+  });
+
+  describe("renderAnswer with hooks (regression: React error #310)", () => {
+    it("should not throw when renderAnswer itself uses hooks and answer streams progressively", async () => {
+      const mockStreamAnswer = vi.mocked(utils.streamAnswer);
+      let generateCallback: ((chunk: string) => void) | undefined;
+      let completeCallback: (() => void) | undefined;
+
+      mockStreamAnswer.mockImplementation(async (_url, _request, _headers, callbacks) => {
+        generateCallback = callbacks.onGeneration;
+        completeCallback = callbacks.onComplete;
+        return new AbortController();
+      });
+
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const renderAnswer = (answer: string, isStreaming: boolean) => {
+        // These hooks execute inside the render prop itself.
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        const ctx = useAnswerResultsContext();
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        const displayText = useMemo(() => `Custom: ${answer}`, [answer]);
+        return (
+          <div data-testid="custom-answer-with-hooks">
+            {displayText}
+            {isStreaming && <span data-testid="streaming-indicator">streaming</span>}
+            {ctx.hits.length > 0 && <span data-testid="hit-count">{ctx.hits.length} hits</span>}
+          </div>
+        );
+      };
+
+      render(
+        <TestWrapper>
+          <QueryBox id="question" mode="submit" />
+          <AnswerResults
+            id="answer"
+            searchBoxId="question"
+            generator={mockGenerator}
+            fields={["content"]}
+            renderAnswer={renderAnswer}
+          />
+        </TestWrapper>
+      );
+
+      const input = screen.getByPlaceholderText(/ask a question/i);
+      const button = screen.getByRole("button", { name: /submit/i });
+
+      // Submit query — triggers streaming, but no answer yet
+      await act(async () => {
+        await userEvent.type(input, "test question");
+        await userEvent.click(button);
+      });
+
+      await waitFor(() => {
+        expect(mockStreamAnswer).toHaveBeenCalled();
+      });
+
+      expect(screen.queryByTestId("custom-answer-with-hooks")).toBeNull();
+
+      await act(async () => {
+        generateCallback?.("Hello ");
+        generateCallback?.("world");
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("custom-answer-with-hooks").textContent).toContain(
+          "Custom: Hello world"
+        );
+      });
+
+      // Complete the stream
+      await act(async () => {
+        completeCallback?.();
+      });
+
+      // Verify no React errors were logged
+      const reactHookErrors = consoleErrorSpy.mock.calls.filter(
+        (call) =>
+          typeof call[0] === "string" &&
+          (call[0].includes("Rendered more hooks") || call[0].includes("error #310"))
+      );
+      expect(reactHookErrors).toHaveLength(0);
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it("should not call renderAnswer until an answer exists", async () => {
+      const mockStreamAnswer = vi.mocked(utils.streamAnswer);
+      mockStreamAnswer.mockImplementation(async (_url, _request, _headers, _callbacks) => {
+        return new AbortController();
+      });
+
+      const renderAnswer = vi.fn((answer: string, isStreaming: boolean) => (
+        <div data-testid="custom-answer">{answer || (isStreaming ? "Waiting..." : "")}</div>
+      ));
+
+      render(
+        <TestWrapper>
+          <QueryBox id="question" mode="submit" />
+          <AnswerResults
+            id="answer"
+            searchBoxId="question"
+            generator={mockGenerator}
+            fields={["content"]}
+            renderAnswer={renderAnswer}
+          />
+        </TestWrapper>
+      );
+
+      const input = screen.getByPlaceholderText(/ask a question/i);
+      const button = screen.getByRole("button", { name: /submit/i });
+
+      await act(async () => {
+        await userEvent.type(input, "test question");
+        await userEvent.click(button);
+      });
+
+      await waitFor(() => {
+        expect(mockStreamAnswer).toHaveBeenCalled();
+      });
+
+      expect(screen.queryByTestId("custom-answer")).toBeNull();
+      expect(renderAnswer).not.toHaveBeenCalled();
+    });
+
+    it("should keep renderEmpty separate from renderAnswer before submission", () => {
+      const renderEmpty = vi.fn(() => <div data-testid="custom-empty">Empty</div>);
+      const renderAnswer = vi.fn(() => <div data-testid="custom-answer">Answer</div>);
+
+      render(
+        <TestWrapper>
+          <QueryBox id="question" mode="submit" />
+          <AnswerResults
+            id="answer"
+            searchBoxId="question"
+            generator={mockGenerator}
+            fields={["content"]}
+            renderEmpty={renderEmpty}
+            renderAnswer={renderAnswer}
+          />
+        </TestWrapper>
+      );
+
+      expect(screen.getByTestId("custom-empty")).toBeTruthy();
+      expect(screen.queryByTestId("custom-answer")).toBeNull();
+      expect(renderEmpty).toHaveBeenCalled();
+      expect(renderAnswer).not.toHaveBeenCalled();
     });
   });
 });

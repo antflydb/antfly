@@ -47,7 +47,7 @@ const innerFanOutLimit = 24
 func (ms *MetadataStore) leaderClientForShard(
 	ctx context.Context,
 	shardID types.ID,
-) (*client.StoreClient, error) {
+) (client.StoreRPC, error) {
 	// FIXME (ajr) This whole function should be moved to the table manager
 
 	status, err := ms.tm.GetShardStatus(shardID)
@@ -107,7 +107,7 @@ func (ms *MetadataStore) leaderClientForShard(
 		// reported the shard), fall back to any healthy registered store.
 		// This handles the race condition between table creation and store registration.
 		if len(peersToCheck) == 0 {
-			var foundClient *client.StoreClient
+			var foundClient client.StoreRPC
 			_ = ms.tm.RangeStoreStatuses(func(storeID types.ID, _ *tablemgr.StoreStatus) bool {
 				c, reachable, err := ms.tm.GetStoreClient(ctx, storeID)
 				if err == nil && reachable {
@@ -195,7 +195,7 @@ func shardRetryBackoff() retry.Backoff {
 func (ms *MetadataStore) leaderClientForShardWithEffectiveID(
 	ctx context.Context,
 	shardID types.ID,
-) (effectiveShardID types.ID, c *client.StoreClient, err error) {
+) (effectiveShardID types.ID, c client.StoreRPC, err error) {
 	status, err := ms.tm.GetShardStatus(shardID)
 	if err != nil || status == nil {
 		return 0, nil, fmt.Errorf("no status info available: %w", err)
@@ -273,7 +273,7 @@ var ErrNoLeaderElected = errors.New("no leader elected for shard")
 func (ms *MetadataStore) strictLeaderClientForShardWithEffectiveID(
 	ctx context.Context,
 	shardID types.ID,
-) (effectiveShardID types.ID, c *client.StoreClient, err error) {
+) (effectiveShardID types.ID, c client.StoreRPC, err error) {
 	status, err := ms.tm.GetShardStatus(shardID)
 	if err != nil || status == nil {
 		return 0, nil, fmt.Errorf("no status info available: %w", err)
@@ -324,7 +324,7 @@ var ErrShardInitializing = errors.New("shard is initializing, retry later")
 func (ms *MetadataStore) leaderClientForShardNoFallback(
 	ctx context.Context,
 	shardID types.ID,
-) (effectiveShardID types.ID, c *client.StoreClient, err error) {
+) (effectiveShardID types.ID, c client.StoreRPC, err error) {
 	status, err := ms.tm.GetShardStatus(shardID)
 	if err != nil || status == nil {
 		return 0, nil, fmt.Errorf("no status info available: %w", err)
@@ -398,7 +398,7 @@ func (ms *MetadataStore) findParentShardForSplitOff(splitOffStatus *store.ShardS
 	return findParentShardForSplitOffStatus(allStatuses, splitOffStatus)
 }
 
-func (ms *MetadataStore) healthyPeerForShard(shardID types.ID) (*client.StoreClient, error) {
+func (ms *MetadataStore) healthyPeerForShard(shardID types.ID) (client.StoreRPC, error) {
 	// FIXME (ajr) This whole function should be moved to the table manager
 	// Find a healthy peer for this shard to get the median key
 	status, err := ms.tm.GetShardStatus(shardID)

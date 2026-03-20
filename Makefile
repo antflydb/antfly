@@ -36,6 +36,9 @@ help:
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
 	@echo "  cleanup-goreman    Clean up goreman logs and data"
+	@echo "  sim-validate       Run simulator-focused validation"
+	@echo "  sim-validate-repo  Run broader repo validation including go test ./..."
+	@echo "  sim-soak           Run simulator soak scenarios"
 	@echo ""
 	@echo "E2E Testing Commands:"
 	@echo "  e2e                Run e2e tests with ONNX+XLA (downloads deps on first run)"
@@ -61,7 +64,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-termite-dashboard
+.PHONY: build build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-termite-dashboard sim-validate sim-validate-repo sim-soak
 
 build-antfarm: build-antfarm-main build-termite-dashboard
 
@@ -156,6 +159,15 @@ lint:
 	done
 	$(MAKE) -C termite lint
 	cd ts && pnpm run lint
+
+sim-validate:
+	$(GO) run ./cmd/debugging/sim -action validate -scope sim
+
+sim-validate-repo:
+	$(GO) run ./cmd/debugging/sim -action validate -scope repo
+
+sim-soak:
+	$(GO) run ./cmd/debugging/sim -action soak -json
 
 
 # ====================================================================================

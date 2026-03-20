@@ -32,6 +32,7 @@ var ErrClosing = errors.New("store is closing")
 type Proposer struct {
 	proposeC        chan<- *raft.Proposal
 	closedC         chan struct{}
+	closeOnce       sync.Once
 	inflight        sync.WaitGroup
 	callbackChanMap *xsync.Map[uuid.UUID, chan error]
 }
@@ -79,8 +80,15 @@ func (p *Proposer) ProposeOnly(ctx context.Context, data []byte) error {
 		return ctx.Err()
 	}
 
-	if err := <-proposeDoneC; err != nil {
-		return fmt.Errorf("proposing to raft: %w", err)
+	select {
+	case err := <-proposeDoneC:
+		if err != nil {
+			return fmt.Errorf("proposing to raft: %w", err)
+		}
+	case <-p.closedC:
+		return ErrClosing
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	return nil
 }
@@ -97,12 +105,7 @@ func (p *Proposer) ProposeAndWait(ctx context.Context, data []byte, id uuid.UUID
 		return err
 	}
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-commitDoneC:
-		return err
-	}
+	return p.WaitForCommit(ctx, commitDoneC)
 }
 
 // NotifyCommit sends the result of a commit to any waiting caller.
@@ -143,6 +146,8 @@ func (p *Proposer) WaitForCommit(ctx context.Context, commitDoneC chan error) er
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-p.closedC:
+		return ErrClosing
 	case err := <-commitDoneC:
 		return err
 	}
@@ -159,11 +164,26 @@ func (p *Proposer) HasCallback(id uuid.UUID) bool {
 // After Close is called, new proposals will return ErrClosing.
 // This also closes proposeC to trigger raft node shutdown.
 func (p *Proposer) Close() {
-	// Close closedC first to signal any in-flight proposals to exit their select.
-	close(p.closedC)
-	// Wait for all in-flight ProposeOnly calls to finish before closing proposeC.
-	// This prevents "send on closed channel" panics from goroutines still in the
-	// select between closedC and proposeC.
-	p.inflight.Wait()
-	close(p.proposeC)
+	p.closeOnce.Do(func() {
+		// Close closedC first to signal any in-flight proposals and waiters to exit.
+		close(p.closedC)
+
+		// Wake all commit waiters so shutdown does not hang on operations that will
+		// never be applied after raft is being torn down.
+		p.callbackChanMap.Range(func(id uuid.UUID, _ chan error) bool {
+			if ch, ok := p.callbackChanMap.LoadAndDelete(id); ok {
+				select {
+				case ch <- ErrClosing:
+				default:
+				}
+			}
+			return true
+		})
+
+		// Wait for all in-flight ProposeOnly calls to finish before closing proposeC.
+		// This prevents "send on closed channel" panics from goroutines still in the
+		// select between closedC and proposeC.
+		p.inflight.Wait()
+		close(p.proposeC)
+	})
 }

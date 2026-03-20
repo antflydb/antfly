@@ -66,6 +66,47 @@ func TestProposer_ProposeOnly_Closing(t *testing.T) {
 	}
 }
 
+func TestProposer_ProposeOnly_ClosingWhileWaitingForAcceptance(t *testing.T) {
+	proposeC := make(chan *raft.Proposal)
+	p := NewProposer(proposeC)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.ProposeOnly(context.Background(), []byte("test data"))
+	}()
+
+	var proposal *raft.Proposal
+	select {
+	case proposal = <-proposeC:
+	case <-time.After(time.Second):
+		t.Fatal("proposal was not sent")
+	}
+	if proposal == nil {
+		t.Fatal("proposal is nil")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosing) {
+			t.Fatalf("ProposeOnly() error = %v, want %v", err, ErrClosing)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ProposeOnly() did not return after Close")
+	}
+
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close() did not return after proposal waiter exited")
+	}
+}
+
 func TestProposer_ProposeAndWait(t *testing.T) {
 	proposeC := make(chan *raft.Proposal, 1)
 	p := NewProposer(proposeC)
@@ -224,6 +265,54 @@ func TestProposer_WaitForCommit_ContextCanceled(t *testing.T) {
 
 	// Clean up
 	p.UnregisterCallback(id)
+}
+
+func TestProposer_WaitForCommit_Closing(t *testing.T) {
+	proposeC := make(chan *raft.Proposal, 1)
+	p := NewProposer(proposeC)
+
+	id := uuid.New()
+	ch := p.RegisterCallback(id)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.WaitForCommit(context.Background(), ch)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	p.Close()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosing) {
+			t.Fatalf("WaitForCommit() error = %v, want %v", err, ErrClosing)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForCommit() did not return after Close")
+	}
+}
+
+func TestProposer_Close_ReleasesRegisteredCallbacks(t *testing.T) {
+	proposeC := make(chan *raft.Proposal, 1)
+	p := NewProposer(proposeC)
+
+	id1 := uuid.New()
+	id2 := uuid.New()
+	ch1 := p.RegisterCallback(id1)
+	ch2 := p.RegisterCallback(id2)
+
+	p.Close()
+
+	for _, ch := range []chan error{ch1, ch2} {
+		select {
+		case err := <-ch:
+			if !errors.Is(err, ErrClosing) {
+				t.Fatalf("callback error = %v, want %v", err, ErrClosing)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("callback not released on close")
+		}
+	}
 }
 
 func TestProposer_UnregisterCallback(t *testing.T) {

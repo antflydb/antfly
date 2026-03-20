@@ -257,7 +257,7 @@ func (m *MetadataShardOperations) RollbackSplit(
 func (m *MetadataShardOperations) AddPeer(
 	ctx context.Context,
 	shardID types.ID,
-	leaderClient *client.StoreClient,
+	leaderClient client.StoreRPC,
 	newPeerID types.ID,
 ) error {
 	newNodeStatus, err := m.ms.tm.GetStoreStatus(ctx, newPeerID)
@@ -273,7 +273,7 @@ func (m *MetadataShardOperations) AddPeer(
 func (m *MetadataShardOperations) RemovePeer(
 	ctx context.Context,
 	shardID types.ID,
-	leaderClient *client.StoreClient,
+	leaderClient client.StoreRPC,
 	peerToRemoveID types.ID,
 	async bool,
 ) error {
@@ -298,7 +298,7 @@ func (m *MetadataShardOperations) GetMedianKey(
 func (m *MetadataShardOperations) IsIDRemoved(
 	ctx context.Context,
 	shardID types.ID,
-	leaderClient *client.StoreClient,
+	leaderClient client.StoreRPC,
 	peerID types.ID,
 ) (bool, error) {
 	return leaderClient.IsIDRemoved(ctx, shardID, peerID)
@@ -396,7 +396,7 @@ func NewMetadataStoreOperations(ms *MetadataStore) *MetadataStoreOperations {
 func (m *MetadataStoreOperations) GetStoreClient(
 	ctx context.Context,
 	nodeID types.ID,
-) (*client.StoreClient, bool, error) {
+) (client.StoreRPC, bool, error) {
 	return m.ms.tm.GetStoreClient(ctx, nodeID)
 }
 
@@ -414,7 +414,7 @@ func (m *MetadataStoreOperations) GetShardStatuses() (map[types.ID]*store.ShardS
 func (m *MetadataStoreOperations) GetLeaderClientForShard(
 	ctx context.Context,
 	shardID types.ID,
-) (*client.StoreClient, error) {
+) (client.StoreRPC, error) {
 	return m.ms.leaderClientForShard(ctx, shardID)
 }
 

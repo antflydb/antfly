@@ -158,6 +158,51 @@ func TestComputeSplitTransitions(t *testing.T) {
 		assert.Empty(t, merges)
 	})
 
+	t.Run("split child awaiting cutover is skipped", func(t *testing.T) {
+		shards := map[types.ID]*store.ShardStatus{
+			1: {
+				ShardInfo: store.ShardInfo{
+					RaftStatus: &common.RaftStatus{
+						Lead:   1,
+						Voters: common.NewPeerSet(1, 2, 3),
+					},
+					ShardStats: &store.ShardStats{
+						Updated: time.Now(),
+						Storage: &store.StorageStats{
+							DiskSize: 1024 * 1024 * 200,
+						},
+					},
+					HasSnapshot:         true,
+					SplitReplayRequired: true,
+					SplitReplayCaughtUp: true,
+					SplitCutoverReady:   false,
+				},
+				ID:    1,
+				Table: "test",
+				State: store.ShardState_Default,
+			},
+		}
+
+		getMedianKeyCalled := false
+		splits, merges := computeSplitTransitions(
+			t.Context(),
+			3,
+			shards,
+			1024*1024*100,
+			100,
+			map[types.ID]time.Time{},
+			func(ctx context.Context, id types.ID) ([]byte, error) {
+				getMedianKeyCalled = true
+				return []byte("median-key"), nil
+			},
+			RealTimeProvider{},
+		)
+
+		assert.False(t, getMedianKeyCalled, "split child awaiting cutover should be skipped")
+		assert.Empty(t, splits)
+		assert.Empty(t, merges)
+	})
+
 	t.Run("shard with stale stats is skipped", func(t *testing.T) {
 		shards := map[types.ID]*store.ShardStatus{
 			1: {
@@ -735,6 +780,81 @@ func TestSplitStatePhaseActions(t *testing.T) {
 		assert.Nil(t, action, "Should wait for new shard to be ready")
 	})
 
+	t.Run("PHASE_SPLITTING infers new shard when split state child id is missing", func(t *testing.T) {
+		mockTime := &MockTimeProvider{}
+		now := time.Now()
+		mockTime.Set(now)
+
+		reconciler := NewReconcilerWithTimeProvider(
+			nil, nil, nil,
+			ReconciliationConfig{
+				SplitTimeout:             5 * time.Minute,
+				SplitFinalizeGracePeriod: time.Second,
+			},
+			logger,
+			mockTime,
+		)
+
+		shardID := types.ID(1)
+		newShardID := types.ID(2)
+		splitKey := []byte("split-key")
+
+		splitState := &db.SplitState{}
+		splitState.SetPhase(db.SplitState_PHASE_SPLITTING)
+		splitState.SetSplitKey(splitKey)
+		splitState.SetStartedAtUnixNanos(now.UnixNano())
+
+		shardStatus := &store.ShardStatus{
+			ID:    shardID,
+			Table: "docs",
+			ShardInfo: store.ShardInfo{
+				ShardConfig: store.ShardConfig{
+					ByteRange: [2][]byte{{0x00}, splitKey},
+				},
+				SplitState: splitState,
+			},
+		}
+
+		allShards := map[types.ID]*store.ShardStatus{
+			shardID: shardStatus,
+			newShardID: {
+				ID:    newShardID,
+				Table: "docs",
+				State: store.ShardState_SplitOffPreSnap,
+				ShardInfo: store.ShardInfo{
+					ShardConfig: store.ShardConfig{
+						ByteRange: [2][]byte{splitKey, {0xff}},
+					},
+					HasSnapshot:         true,
+					SplitReplayRequired: true,
+					SplitReplayCaughtUp: true,
+					RaftStatus:          &common.RaftStatus{Lead: 10},
+				},
+			},
+		}
+
+		action := reconciler.computeSplitStatePhaseActionWithDesired(
+			shardID,
+			shardStatus,
+			splitState,
+			allShards,
+			allShards,
+		)
+		assert.Nil(t, action, "Should start grace tracking before finalizing")
+
+		mockTime.Advance(1100 * time.Millisecond)
+		action = reconciler.computeSplitStatePhaseActionWithDesired(
+			shardID,
+			shardStatus,
+			splitState,
+			allShards,
+			allShards,
+		)
+		assert.NotNil(t, action)
+		assert.Equal(t, SplitStateActionFinalizeSplit, action.Action)
+		assert.Equal(t, newShardID, action.NewShardID)
+	})
+
 	t.Run("PHASE_SPLITTING waits when new shard has snapshot but still initializing", func(t *testing.T) {
 		// This test verifies the fix for flaky e2e tests where a shard could have
 		// HasSnapshot=true (SnapshotIndex > 0) but still be Initializing=true
@@ -1003,7 +1123,7 @@ func TestSplitStatePreventsDuplicateSplit(t *testing.T) {
 		},
 	}
 
-	actions := reconciler.computeSplitStateActions(desired)
+	actions := reconciler.computeSplitStateActions(CurrentClusterState{}, desired)
 
 	// Should NOT produce a SplitStateActionSplit (which would try to re-split
 	// with the already-narrowed ByteRange[1] and fail with "key out of range")

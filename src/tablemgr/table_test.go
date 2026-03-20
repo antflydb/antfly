@@ -1305,6 +1305,293 @@ func TestPreSplitStateTransitionsToSplittingWhenSplitStateActive(t *testing.T) {
 		"Parent shard should transition to Splitting when an active split state is reported")
 }
 
+func TestUpdateStatuses_PreservesAndUpgradesSplitStateFieldsWithinPhase(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	tableName := "splitStateUpgradeTable"
+	parentShardID := types.ID(10)
+	childShardID := types.ID(11)
+	splitKey := []byte("M")
+	originalRangeEnd := []byte{0xFF}
+
+	existingSplitState := &storedb.SplitState{}
+	existingSplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	existingSplitState.SetSplitKey(splitKey)
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: tableName,
+		State: store.ShardState_Splitting,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, splitKey},
+			},
+			Peers:      common.NewPeerSet(10),
+			SplitState: existingSplitState,
+		},
+	}
+
+	err = tm.saveStoreAndShardStatuses(nil, map[types.ID]*store.ShardStatus{
+		parentShardID: parentStatus,
+		childShardID: {
+			ID:    childShardID,
+			Table: tableName,
+			State: store.ShardState_SplittingOff,
+			ShardInfo: store.ShardInfo{
+				ShardConfig: store.ShardConfig{
+					ByteRange: [2][]byte{splitKey, originalRangeEnd},
+				},
+				Peers: common.NewPeerSet(10),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	leaderSplitState := &storedb.SplitState{}
+	leaderSplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	leaderSplitState.SetSplitKey(splitKey)
+	leaderSplitState.SetNewShardId(uint64(childShardID))
+	leaderSplitState.SetOriginalRangeEnd(originalRangeEnd)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(10): {
+			StoreInfo: store.StoreInfo{ID: types.ID(10)},
+			Shards: map[types.ID]*store.ShardInfo{
+				parentShardID: {
+					ShardConfig: parentStatus.ShardConfig,
+					Peers:       parentStatus.Peers,
+					SplitState:  leaderSplitState,
+					RaftStatus:  &common.RaftStatus{Lead: 10},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	updatedParent, err := tm.GetShardStatus(parentShardID)
+	require.NoError(t, err)
+	require.NotNil(t, updatedParent.SplitState)
+	assert.Equal(t, uint64(11), updatedParent.SplitState.GetNewShardId())
+	assert.Equal(t, originalRangeEnd, updatedParent.SplitState.GetOriginalRangeEnd())
+
+	partialFollowerState := &storedb.SplitState{}
+	partialFollowerState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	partialFollowerState.SetSplitKey(splitKey)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(10): {
+			StoreInfo: store.StoreInfo{ID: types.ID(10)},
+			Shards: map[types.ID]*store.ShardInfo{
+				parentShardID: {
+					ShardConfig: parentStatus.ShardConfig,
+					Peers:       parentStatus.Peers,
+					SplitState:  partialFollowerState,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	updatedParent, err = tm.GetShardStatus(parentShardID)
+	require.NoError(t, err)
+	require.NotNil(t, updatedParent.SplitState)
+	assert.Equal(t, uint64(11), updatedParent.SplitState.GetNewShardId())
+	assert.Equal(t, originalRangeEnd, updatedParent.SplitState.GetOriginalRangeEnd())
+}
+
+func TestUpdateStatuses_ClearsSplitStateWhenLeaderHeartbeatClearsIt(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	tableName := "splitLeaderClearTable"
+	parentShardID := types.ID(10)
+	splitKey := []byte("M")
+
+	parentSplitState := &storedb.SplitState{}
+	parentSplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	parentSplitState.SetSplitKey(splitKey)
+	parentSplitState.SetNewShardId(uint64(types.ID(11)))
+
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: tableName,
+		State: store.ShardState_Splitting,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, splitKey},
+			},
+			Peers:      common.NewPeerSet(10),
+			SplitState: parentSplitState,
+			RaftStatus: &common.RaftStatus{Lead: 10},
+		},
+	}
+
+	err = tm.saveStoreAndShardStatuses(nil, map[types.ID]*store.ShardStatus{
+		parentShardID: parentStatus,
+	})
+	require.NoError(t, err)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(10): {
+			StoreInfo: store.StoreInfo{ID: types.ID(10)},
+			Shards: map[types.ID]*store.ShardInfo{
+				parentShardID: {
+					ShardConfig: parentStatus.ShardConfig,
+					Peers:       parentStatus.Peers,
+					RaftStatus:  &common.RaftStatus{Lead: 10},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	updatedParent, err := tm.GetShardStatus(parentShardID)
+	require.NoError(t, err)
+	assert.Nil(t, updatedParent.SplitState)
+}
+
+func TestUpdateStatuses_ClearsStaleSplitStateAfterParentFinalizes(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	tableName := "splitFinalizeTable"
+	parentShardID := types.ID(10)
+	childShardID := types.ID(11)
+	splitKey := []byte("M")
+
+	parentSplitState := &storedb.SplitState{}
+	parentSplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	parentSplitState.SetSplitKey(splitKey)
+	parentSplitState.SetNewShardId(uint64(childShardID))
+
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: tableName,
+		State: store.ShardState_Splitting,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, splitKey},
+			},
+			Peers:      common.NewPeerSet(10),
+			SplitState: parentSplitState,
+		},
+	}
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: tableName,
+		State: store.ShardState_Default,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xFF}},
+			},
+			Peers:             common.NewPeerSet(10),
+			HasSnapshot:       true,
+			RaftStatus:        &common.RaftStatus{Lead: 10},
+			SplitCutoverReady: true,
+		},
+	}
+
+	err = tm.saveStoreAndShardStatuses(nil, map[types.ID]*store.ShardStatus{
+		parentShardID: parentStatus,
+		childShardID:  childStatus,
+	})
+	require.NoError(t, err)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(10): {
+			StoreInfo: store.StoreInfo{ID: types.ID(10)},
+			Shards: map[types.ID]*store.ShardInfo{
+				parentShardID: {
+					ShardConfig: parentStatus.ShardConfig,
+					Peers:       parentStatus.Peers,
+					Splitting:   false,
+					RaftStatus:  &common.RaftStatus{Lead: 10},
+				},
+				childShardID: {
+					ShardConfig:       childStatus.ShardConfig,
+					Peers:             childStatus.Peers,
+					HasSnapshot:       true,
+					RaftStatus:        &common.RaftStatus{Lead: 10},
+					SplitCutoverReady: true,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	updatedParent, err := tm.GetShardStatus(parentShardID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardState_Default, updatedParent.State)
+	assert.Nil(t, updatedParent.SplitState)
+}
+
+func TestUpdateStatuses_ClearsStaleSplitStateForReadySplitChild(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	tableName := "splitChildFinalizeTable"
+	childShardID := types.ID(11)
+	splitKey := []byte("M")
+
+	childSplitState := &storedb.SplitState{}
+	childSplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	childSplitState.SetSplitKey(splitKey)
+
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: tableName,
+		State: store.ShardState_Default,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xFF}},
+			},
+			Peers:               common.NewPeerSet(10),
+			SplitState:          childSplitState,
+			HasSnapshot:         true,
+			RaftStatus:          &common.RaftStatus{Lead: 10},
+			SplitReplayRequired: true,
+			SplitCutoverReady:   true,
+			SplitParentShardID:  types.ID(10),
+		},
+	}
+
+	err = tm.saveStoreAndShardStatuses(nil, map[types.ID]*store.ShardStatus{
+		childShardID: childStatus,
+	})
+	require.NoError(t, err)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(10): {
+			StoreInfo: store.StoreInfo{ID: types.ID(10)},
+			Shards: map[types.ID]*store.ShardInfo{
+				childShardID: {
+					ShardConfig:         childStatus.ShardConfig,
+					Peers:               childStatus.Peers,
+					HasSnapshot:         true,
+					RaftStatus:          &common.RaftStatus{Lead: 10},
+					SplitReplayRequired: true,
+					SplitCutoverReady:   true,
+					SplitParentShardID:  types.ID(10),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	updatedChild, err := tm.GetShardStatus(childShardID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardState_Default, updatedChild.State)
+	assert.Nil(t, updatedChild.SplitState)
+}
+
 // TestSplitOffShardIsReady tests the helper function that checks if a split-off
 // shard is ready to serve traffic.
 func TestSplitOffShardIsReady(t *testing.T) {

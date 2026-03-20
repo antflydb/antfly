@@ -30,7 +30,6 @@ import (
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
-	"github.com/antflydb/antfly/src/raft"
 	"github.com/goccy/go-json"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -132,27 +131,17 @@ func RunAsStore(
 		zap.Any("config", c),
 		zap.Any("storeInfo", conf))
 
-	dataDir := c.GetBaseDir()
-	rs, err := raft.NewMultiRaftServer(zl, dataDir, storeID, conf.RaftURL)
+	runtime, err := NewRuntime(zl, c, conf, cache)
 	if err != nil {
-		zl.Fatal("Failed to create Raft server", zap.Error(err))
+		zl.Fatal("Failed to create store runtime", zap.Error(err))
 	}
 	eg, egCtx := errgroup.WithContext(ctx)
-	go rs.Start()
+	runtime.StartRaft()
 	defer func() {
-		err := rs.Stop()
-		if err != nil {
-			zl.Error("Failed to stop Raft server", zap.Error(err))
-		} else {
-			zl.Info("Raft server stopped gracefully")
+		if err := runtime.Close(); err != nil {
+			zl.Error("Failed to close store runtime", zap.Error(err))
 		}
 	}()
-
-	store, errChan, err := NewStore(zl, c, rs, conf, cache)
-	if err != nil {
-		zl.Fatal("Failed to create store", zap.Error(err))
-	}
-	defer store.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -179,7 +168,7 @@ func RunAsStore(
 			server := &http3.Server{
 				QUICConfig:  &quic.Config{},
 				Addr:        url.Host,
-				Handler:     store.NewHttpAPI(),
+				Handler:     runtime.HTTPHandler(),
 				IdleTimeout: time.Minute,
 				TLSConfig:   tlsConfig,
 			}
@@ -187,7 +176,7 @@ func RunAsStore(
 				wg.Done()
 				if err := server.ListenAndServe(); err != nil {
 					if err == http.ErrServerClosed {
-						store.logger.Info("HTTP server closed gracefully")
+						runtime.Store().logger.Info("HTTP server closed gracefully")
 						return nil
 					}
 					return fmt.Errorf("HTTP/3 server failed: %w", err)
@@ -198,14 +187,14 @@ func RunAsStore(
 		} else {
 			server := &http.Server{
 				Addr:        url.Host,
-				Handler:     store.NewHttpAPI(),
+				Handler:     runtime.HTTPHandler(),
 				ReadTimeout: time.Minute,
 			}
 			eg.Go(func() error {
 				wg.Done()
 				if err := server.ListenAndServe(); err != nil {
 					if err == http.ErrServerClosed {
-						store.logger.Info("HTTP server closed gracefully")
+						runtime.Store().logger.Info("HTTP server closed gracefully")
 						return nil
 					}
 					return fmt.Errorf("HTTP server failed: %w", err)
@@ -216,11 +205,11 @@ func RunAsStore(
 		}
 		select {
 		case <-egCtx.Done():
-			store.logger.Info("HTTP server stopped")
+			runtime.Store().logger.Info("HTTP server stopped")
 			return nil
-		case err, ok := <-errChan:
+		case err, ok := <-runtime.ErrorC():
 			if !ok {
-				store.logger.Info("Error channel closed, stopping store")
+				runtime.Store().logger.Info("Error channel closed, stopping store")
 				return nil
 			}
 			// FIXME (ajr) How do we handle the error channels for multiraft?
@@ -280,7 +269,7 @@ func RunAsStore(
 		}
 		// Errors are checked at configuration parsing time
 		orchURLs, _ := c.Metadata.GetOrchestrationURLs()
-		return registerWithLeaderWithRetry(egCtx, zl, client, store, conf, orchURLs)
+		return registerWithLeaderWithRetry(egCtx, zl, client, runtime.Store(), conf, orchURLs)
 	})
 	if err := eg.Wait(); err != nil {
 		if errors.Is(err, context.Canceled) {

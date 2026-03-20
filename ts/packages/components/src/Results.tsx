@@ -1,5 +1,5 @@
 import type { QueryHit } from "@antfly/sdk";
-import React, { type ReactNode, useCallback, useEffect, useState } from "react";
+import React, { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import Pagination from "./Pagination";
 import { useSharedContext } from "./SharedContext";
 import { disjunctsFrom } from "./utils";
@@ -25,6 +25,7 @@ export interface ResultsProps {
   ) => ReactNode;
   stats?: (total: number) => ReactNode;
   items: (data: QueryHit[]) => ReactNode;
+  onResults?: (data: QueryHit[], total: number) => void;
 
   // Optional overrides
   sort?: unknown;
@@ -45,6 +46,7 @@ export default function Results({
   pagination,
   stats,
   items,
+  onResults,
   sort,
   table,
   filterQuery,
@@ -54,6 +56,7 @@ export default function Results({
   const [page, setPage] = useState(initialPage);
   const [lastQueryHash, setLastQueryHash] = useState<string | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
+  const lastNotifiedResultRef = useRef<unknown>(undefined);
 
   const widget = widgets.get(id);
   const data = widget?.result?.data ? widget.result.data : [];
@@ -184,6 +187,17 @@ export default function Results({
 
   // Destroy widget from context (remove from the list to unapply its effects)
   useEffect(() => () => dispatch({ type: "deleteWidget", key: id }), [dispatch, id]);
+
+  useEffect(() => {
+    if (!onResults || !widget?.result || widget.result.error) {
+      return;
+    }
+    if (lastNotifiedResultRef.current === widget.result) {
+      return;
+    }
+    lastNotifiedResultRef.current = widget.result;
+    onResults(data, total);
+  }, [data, onResults, total, widget?.result]);
 
   const defaultPagination = () => (
     <Pagination

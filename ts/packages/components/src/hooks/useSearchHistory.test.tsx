@@ -25,6 +25,7 @@ describe("useSearchHistory", () => {
   it("should load existing history from localStorage", () => {
     const existingHistory: SearchResult[] = [
       {
+        id: "existing-1",
         query: "test query",
         timestamp: Date.now(),
         summary: "test summary",
@@ -43,6 +44,7 @@ describe("useSearchHistory", () => {
     const { result } = renderHook(() => useSearchHistory(10));
 
     const searchResult: SearchResult = {
+      id: "search-1",
       query: "how does raft work",
       timestamp: Date.now(),
       summary: "Raft is a consensus algorithm",
@@ -66,6 +68,7 @@ describe("useSearchHistory", () => {
     const { result } = renderHook(() => useSearchHistory(10));
 
     const firstResult: SearchResult = {
+      id: "first-1",
       query: "first",
       timestamp: 1,
       summary: "first summary",
@@ -73,6 +76,7 @@ describe("useSearchHistory", () => {
     };
 
     const secondResult: SearchResult = {
+      id: "second-1",
       query: "second",
       timestamp: 2,
       summary: "second summary",
@@ -98,6 +102,7 @@ describe("useSearchHistory", () => {
     const results: SearchResult[] = [];
     for (let i = 0; i < 5; i++) {
       results.push({
+        id: `result-${i}`,
         query: `query ${i}`,
         timestamp: i,
         summary: `summary ${i}`,
@@ -122,6 +127,7 @@ describe("useSearchHistory", () => {
     const { result } = renderHook(() => useSearchHistory(10));
 
     const searchResult: SearchResult = {
+      id: "clear-1",
       query: "test",
       timestamp: Date.now(),
       summary: "test",
@@ -146,6 +152,7 @@ describe("useSearchHistory", () => {
     const { result } = renderHook(() => useSearchHistory(0));
 
     const searchResult: SearchResult = {
+      id: "disabled-1",
       query: "test",
       timestamp: Date.now(),
       summary: "test",
@@ -181,6 +188,7 @@ describe("useSearchHistory", () => {
     };
 
     const searchResult: SearchResult = {
+      id: "quota-1",
       query: "test",
       timestamp: Date.now(),
       summary: "test",
@@ -208,6 +216,7 @@ describe("useSearchHistory", () => {
     act(() => {
       for (let i = 0; i < 5; i++) {
         result.current.saveSearch({
+          id: `dynamic-${i}`,
           query: `query ${i}`,
           timestamp: i,
           summary: `summary ${i}`,
@@ -224,6 +233,7 @@ describe("useSearchHistory", () => {
     // Add one more result
     act(() => {
       result.current.saveSearch({
+        id: "dynamic-5",
         query: "query 5",
         timestamp: 5,
         summary: "summary 5",

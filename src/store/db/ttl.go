@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/encoding"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/store/storeutils"
@@ -44,13 +45,23 @@ type TTLCleaner struct {
 	logger              *zap.Logger
 	documentsExpired    int64 // Total documents expired since start
 	lastCleanupDuration time.Duration
+	clock               clock.Clock
 }
 
 // NewTTLCleaner creates a new TTL cleanup worker
 func NewTTLCleaner(db *DBImpl) *TTLCleaner {
+	return NewTTLCleanerWithClock(db, clock.RealClock{})
+}
+
+// NewTTLCleanerWithClock creates a new TTL cleanup worker with a custom clock.
+func NewTTLCleanerWithClock(db *DBImpl, clk clock.Clock) *TTLCleaner {
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 	return &TTLCleaner{
 		db:     db,
 		logger: db.logger.Named("ttl-cleaner"),
+		clock:  clk,
 	}
 }
 
@@ -73,7 +84,7 @@ func (tc *TTLCleaner) Start(ctx context.Context, persistFunc PersistFunc) error 
 		zap.Duration("cleanup_interval", TTLCleanupInterval),
 		zap.Duration("grace_period", TTLGracePeriod))
 
-	ticker := time.NewTicker(TTLCleanupInterval)
+	ticker := tc.clock.NewTicker(TTLCleanupInterval)
 	defer ticker.Stop()
 
 	for {
@@ -83,10 +94,10 @@ func (tc *TTLCleaner) Start(ctx context.Context, persistFunc PersistFunc) error 
 				zap.Int64("total_documents_expired", tc.documentsExpired))
 			return ctx.Err()
 
-		case <-ticker.C:
-			startTime := time.Now()
+		case <-ticker.C():
+			startTime := tc.clock.Now()
 			expired, err := tc.cleanupExpiredDocuments(ctx, ttlDuration, persistFunc)
-			tc.lastCleanupDuration = time.Since(startTime)
+			tc.lastCleanupDuration = tc.clock.Now().Sub(startTime)
 
 			if err != nil && !errors.Is(err, context.Canceled) {
 				tc.logger.Error("Failed to cleanup expired documents",
@@ -163,7 +174,7 @@ func (tc *TTLCleaner) cleanupExpiredDocuments(
 		_ = iter.Close()
 	}()
 
-	now := time.Now().UTC()
+	now := tc.clock.Now().UTC()
 	// Calculate expiration threshold with grace period
 	// Documents expire when: write_timestamp + ttl_duration + grace_period < now
 	expirationThreshold := uint64(now.Add(-ttlDuration - TTLGracePeriod).UnixNano())

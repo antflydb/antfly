@@ -14,6 +14,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sim-validate:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Configure Go for private modules
+        run: |
+          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
+          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
+
+      - name: Verify Go modules
+        run: go mod download
+
+      - name: Simulator Validate
+        run: make sim-validate
+
   antfly:
     runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
     steps:

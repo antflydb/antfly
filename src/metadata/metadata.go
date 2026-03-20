@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
@@ -36,6 +37,7 @@ import (
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/antflydb/antfly/src/usermgr"
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/google/uuid"
 	"github.com/jellydator/ttlcache/v3"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -62,7 +64,17 @@ type MetadataStore struct {
 	reconcileShardsC chan struct{}
 
 	// HLC for transaction timestamp allocation
-	hlc *HLC
+	hlc   *HLC
+	clock clock.Clock
+
+	txnIDGenerator func() uuid.UUID
+}
+
+func (ms *MetadataStore) clockOrReal() clock.Clock {
+	if ms.clock == nil {
+		return clock.RealClock{}
+	}
+	return ms.clock
 }
 
 // handleForwardResolveIntent forwards ResolveIntent requests from coordinator shards to participant shards
@@ -257,7 +269,7 @@ func (ms *MetadataStore) runHealthCheck(ctx context.Context) {
 				StoreClient: status.StoreClient,
 				StoreInfo:   status.StoreInfo,
 				State:       store.StoreState_Healthy,
-				LastSeen:    time.Now(),
+				LastSeen:    ms.clockOrReal().Now(),
 				Shards:      storeStatus.Shards,
 			}
 			// Store successful result
@@ -309,7 +321,8 @@ func (ms *MetadataStore) runHealthCheck(ctx context.Context) {
 // reconcileShards checks if nodes are running the correct shards
 func (ms *MetadataStore) reconcileShards(ctx context.Context) {
 	defaultTick := 1 * time.Second
-	ticker := time.NewTimer(defaultTick)
+	clk := ms.clockOrReal()
+	ticker := clk.NewTimer(defaultTick)
 	defer ticker.Stop()
 
 	var i int
@@ -334,13 +347,13 @@ func (ms *MetadataStore) reconcileShards(ctx context.Context) {
 		case <-ms.reconcileShardsC:
 			select {
 			// Wait so we can dedupe autoscaling events
-			case <-time.After(1 * time.Second):
+			case <-clk.After(1 * time.Second):
 			case <-ctx.Done():
 				return
 			}
 			run(true)
 			ticker.Reset(defaultTick)
-		case <-ticker.C:
+		case <-ticker.C():
 			run(false)
 			ticker.Reset(defaultTick)
 		}
@@ -410,26 +423,32 @@ func (ms *MetadataStore) checkShardAssignments(ctx context.Context) {
 		}
 		for shardID, shardInfo := range storeStatus.Shards {
 			if _, ok := currentShards[shardID]; !ok {
-				if desiredShardStatus, ok := desiredShards[shardID]; ok {
-					if desiredShardStatus != nil {
-						currentShards[shardID] = desiredShardStatus.ShardInfo.DeepCopy()
-						currentShards[shardID].Merge(peerID, shardInfo)
-						// Use the shardStatus as the currentShards ShardStats
-						currentShards[shardID].ShardStats = desiredShardStatus.ShardStats
-						// Use the actual shard's index configs (from its heartbeat) so
-						// the reconciler can detect indexes that need to be added or dropped.
-						if shardInfo.Indexes != nil {
-							currentShards[shardID].Indexes = shardInfo.Indexes
-						}
-					}
-				} else {
-					currentShards[shardID] = shardInfo
-				}
+				// Build the reconciler's current view from live store heartbeats, not
+				// the desired metadata record. Seeding from desired state can preserve
+				// stale split-readiness fields such as SplitReplayCaughtUp /
+				// SplitCutoverReady and prevent split finalization from observing that
+				// the child shard is actually ready.
+				currentShards[shardID] = shardInfo.DeepCopy()
+				currentShards[shardID].ReportedBy = make(map[types.ID]struct{})
+				currentShards[shardID].Merge(peerID, shardInfo)
+				continue
 			}
-			// Use the shardStatus as the currentShards ShardStats
-			statsTmp := currentShards[shardID].ShardStats
 			currentShards[shardID].Merge(peerID, shardInfo)
-			currentShards[shardID].ShardStats = statsTmp
+			if shardInfo.RaftStatus != nil && types.ID(shardInfo.RaftStatus.Lead) == peerID {
+				// Split finalization is gated on the split-child leader being able to
+				// serve traffic after replay. Using replica-wide AND semantics for these
+				// fields can leave the parent stuck behind lagging followers even though
+				// the serving leader is ready to take over. Keep the live reconciler view
+				// aligned to leader-observed split readiness while still merging the rest
+				// of the shard state conservatively.
+				currentShards[shardID].HasSnapshot = shardInfo.HasSnapshot
+				currentShards[shardID].Initializing = shardInfo.Initializing
+				currentShards[shardID].SplitReplayRequired = shardInfo.SplitReplayRequired
+				currentShards[shardID].SplitReplayCaughtUp = shardInfo.SplitReplayCaughtUp
+				currentShards[shardID].SplitCutoverReady = shardInfo.SplitCutoverReady
+				currentShards[shardID].SplitReplaySeq = shardInfo.SplitReplaySeq
+				currentShards[shardID].SplitParentShardID = shardInfo.SplitParentShardID
+			}
 		}
 		return true
 	})

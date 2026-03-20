@@ -80,6 +80,12 @@ export type SharedAction =
   | {
       type: "setListenerEffect";
       value: (() => void) | null;
+    }
+  | {
+      type: "setSharedConfig";
+      url?: string;
+      table: string;
+      headers?: Record<string, string>;
     };
 
 export type SharedContextType = [SharedState, Dispatch<SharedAction>] | null;

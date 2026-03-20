@@ -31,12 +31,15 @@ export interface QueryBoxProps {
   id: string;
   mode?: "live" | "submit";
   initialValue?: string;
+  autoSubmit?: boolean;
+  submitSignal?: string | number;
   placeholder?: string;
   children?: ReactNode;
   buttonLabel?: string;
   onSubmit?: (value: string) => void;
   onInputChange?: (value: string) => void;
   onEscape?: (clearInput: () => void) => boolean; // Return true to prevent default clear behavior
+  clearOnSubmit?: boolean;
   /**
    * Custom input renderer. When provided, replaces the default <input> element.
    * The custom component receives props for value management, submission, and keyboard handling.
@@ -50,17 +53,22 @@ export default function QueryBox({
   id,
   mode = "live",
   initialValue,
+  autoSubmit = false,
+  submitSignal,
   placeholder,
   children,
   buttonLabel = "Submit",
   onSubmit,
   onInputChange,
   onEscape,
+  clearOnSubmit = false,
   renderInput,
 }: QueryBoxProps) {
   const [{ widgets }, dispatch] = useSharedContext();
   const [value, setValue] = useState(initialValue || "");
   const isExternalUpdate = useRef(false);
+  const lastAppliedInitialValueRef = useRef<string | undefined>(initialValue);
+  const lastAutoSubmitKeyRef = useRef<string | null>(null);
   const [isSuggestOpen, setIsSuggestOpen] = useState(false);
   const [containerRefObject] = useState<{ current: HTMLDivElement | null }>({ current: null });
   const containerRef = useCallback(
@@ -91,10 +99,51 @@ export default function QueryBox({
 
   // Initialize on mount
   useEffect(() => {
-    const valueToSet = initialValue || "";
-    setValue(valueToSet);
-    updateWidget(valueToSet);
-  }, [initialValue, updateWidget]); // eslint-disable-line react-hooks/exhaustive-deps
+    updateWidget(initialValue || "");
+  }, [updateWidget, initialValue]);
+
+  useEffect(() => {
+    if (initialValue === undefined || initialValue === lastAppliedInitialValueRef.current) {
+      return;
+    }
+    lastAppliedInitialValueRef.current = initialValue;
+    setValue(initialValue);
+    updateWidget(initialValue);
+  }, [initialValue, updateWidget]);
+
+  const submitValue = useCallback(
+    (submittedValue: string) => {
+      setIsSuggestOpen(false);
+
+      if (onSubmit) {
+        onSubmit(submittedValue);
+      }
+
+      updateWidget(submittedValue, true);
+
+      if (clearOnSubmit) {
+        setValue("");
+        onInputChange?.("");
+      }
+    },
+    [clearOnSubmit, onInputChange, onSubmit, updateWidget]
+  );
+
+  useEffect(() => {
+    if (!autoSubmit || mode !== "submit" || initialValue === undefined || !initialValue.trim()) {
+      return;
+    }
+
+    const autoSubmitKey = `${String(submitSignal ?? "__default__")}::${initialValue}`;
+    if (autoSubmitKey === lastAutoSubmitKeyRef.current) {
+      return;
+    }
+
+    lastAutoSubmitKeyRef.current = autoSubmitKey;
+    lastAppliedInitialValueRef.current = initialValue;
+    setValue(initialValue);
+    submitValue(initialValue);
+  }, [autoSubmit, initialValue, mode, submitSignal, submitValue]);
 
   // Sync with external updates (e.g., from ActiveFilters)
   // NOTE: Only sync in "live" mode - in "submit" mode, local state is authoritative until form submission
@@ -139,19 +188,9 @@ export default function QueryBox({
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
-
-      // Close autosuggest dropdown on submit
-      setIsSuggestOpen(false);
-
-      // Call custom onSubmit callback if provided
-      if (onSubmit) {
-        onSubmit(value);
-      }
-
-      // Update widget state with submission timestamp
-      updateWidget(value, true);
+      submitValue(value);
     },
-    [value, updateWidget, onSubmit]
+    [submitValue, value]
   );
 
   // Handle clear button click
@@ -185,17 +224,7 @@ export default function QueryBox({
       // For custom inputs like PromptInput, Shift+Enter is used for newlines
       if (e.key === "Enter" && !e.shiftKey && mode === "submit") {
         e.preventDefault();
-
-        // Close autosuggest dropdown on submit
-        setIsSuggestOpen(false);
-
-        // Call custom onSubmit callback if provided
-        if (onSubmit) {
-          onSubmit(value);
-        }
-
-        // Update widget state and trigger query
-        updateWidget(value, true);
+        submitValue(value);
       } else if (e.key === "Escape") {
         e.preventDefault();
 
@@ -220,7 +249,7 @@ export default function QueryBox({
         }
       }
     },
-    [mode, value, isSuggestOpen, onSubmit, onEscape, updateWidget, clearInputOnly, handleClear]
+    [mode, value, isSuggestOpen, onEscape, clearInputOnly, handleClear, submitValue]
   );
 
   // Handle suggestion selection from Autosuggest
@@ -321,15 +350,9 @@ export default function QueryBox({
   // Handler for custom input onSubmit
   const handleCustomInputSubmit = useCallback(
     (submittedValue: string) => {
-      setIsSuggestOpen(false);
-
-      if (onSubmit) {
-        onSubmit(submittedValue);
-      }
-
-      updateWidget(submittedValue, true);
+      submitValue(submittedValue);
     },
-    [onSubmit, updateWidget]
+    [submitValue]
   );
 
   // Build props for custom input

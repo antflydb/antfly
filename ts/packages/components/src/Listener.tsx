@@ -99,10 +99,38 @@ export default function Listener({ children, onChange }: ListenerProps) {
   const configurations = mapFrom("configuration");
   const values = mapFrom("value");
 
-  // Create stable keys for dependency comparison
-  const queriesKey = JSON.stringify(Array.from(queries.entries()).sort());
-  const semanticQueriesKey = JSON.stringify(Array.from(semanticQueries.entries()).sort());
-  const configurationsKey = JSON.stringify(Array.from(configurations.entries()).sort());
+  const isAutosuggestWidget = (widgetId: string) => widgets.get(widgetId)?.isAutosuggest === true;
+
+  function entriesForGroup<T>(
+    entries: Iterable<[string, T]>,
+    autosuggestOnly: boolean
+  ): Array<[string, T]> {
+    return Array.from(entries)
+      .filter(([widgetId]) => isAutosuggestWidget(widgetId) === autosuggestOnly)
+      .sort();
+  }
+
+  // Track change groups using the actual widget inputs that drive requests.
+  // This keeps autosuggest keystrokes isolated from submitted search widgets
+  // while still invalidating correctly when configuration or backend context changes.
+  const autosuggestGroupKey = JSON.stringify({
+    context: { url, table, headers },
+    queries: entriesForGroup(queries.entries(), true),
+    semanticQueries: entriesForGroup(semanticQueries.entries(), true),
+    configurations: entriesForGroup(configurations.entries(), true),
+  });
+  const nonAutosuggestGroupKey = JSON.stringify({
+    context: { url, table, headers },
+    queries: entriesForGroup(queries.entries(), false),
+    semanticQueries: entriesForGroup(semanticQueries.entries(), false),
+    configurations: entriesForGroup(configurations.entries(), false),
+  });
+
+  // Track previous group keys to determine which request families changed.
+  const prevGroupKeysRef = useRef({
+    autosuggest: "",
+    nonAutosuggest: "",
+  });
 
   useEffect(() => {
     // Apply custom callback effect on every change, useful for query params.
@@ -146,8 +174,22 @@ export default function Listener({ children, onChange }: ListenerProps) {
           dispatch({
             type: "setListenerEffect",
             value: () => {
+              // Determine which request groups changed to avoid re-sending stale queries.
+              // Autosuggest updates should not invalidate submitted search results unless the
+              // non-autosuggest request inputs actually changed.
+              const prev = prevGroupKeysRef.current;
+              const autosuggestChanged = autosuggestGroupKey !== prev.autosuggest;
+              const nonAutosuggestChanged = nonAutosuggestGroupKey !== prev.nonAutosuggest;
+              prevGroupKeysRef.current = {
+                autosuggest: autosuggestGroupKey,
+                nonAutosuggest: nonAutosuggestGroupKey,
+              };
+
               const multiqueryData: MSSearchItem[] = [];
               resultWidgets.forEach((r, id) => {
+                // Skip widgets whose query group hasn't changed
+                if (r.isAutosuggest && !autosuggestChanged) return;
+                if (!r.isAutosuggest && !nonAutosuggestChanged) return;
                 const config = r.configuration;
                 // Type guard to ensure configuration has required SearchWidgetConfig properties
                 if (!isSearchWidgetConfig(config)) {
@@ -168,6 +210,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
 
                 const nonAutosuggestSemanticQueries = filteredSemanticQueries.map(([, v]) => v);
                 const semanticQuery = nonAutosuggestSemanticQueries.map((v) => v.query).join(" ");
+                const hasSemanticQuery = semanticQuery.length > 0;
                 // Get the first indexes configured for the widget
                 const indexes = nonAutosuggestSemanticQueries
                   .map((v) => v.indexes)
@@ -201,13 +244,15 @@ export default function Listener({ children, onChange }: ListenerProps) {
                 // Build the query object
                 const queryObj: Record<string, unknown> = {
                   table: tableName,
-                  semantic_search: semanticQuery || undefined,
-                  indexes: semanticQuery ? indexes : undefined,
-                  full_text_search: conjunctsFrom(filteredQueries),
+                  semantic_search: hasSemanticQuery ? semanticQuery : undefined,
+                  indexes: hasSemanticQuery ? indexes : undefined,
                   limit: itemsPerPage,
                   offset: (page - 1) * itemsPerPage,
                   order_by: sort,
                 };
+                if (filteredQueries.size > 0 || !hasSemanticQuery) {
+                  queryObj.full_text_search = conjunctsFrom(filteredQueries);
+                }
                 if (config.fields) {
                   queryObj.fields = config.fields;
                 }
@@ -233,7 +278,6 @@ export default function Listener({ children, onChange }: ListenerProps) {
                   queryObj.aggregations = aggregations;
                 }
 
-                // If there is no indexes, use the default one.
                 multiqueryData.push({
                   query: queryObj,
                   data: (result: QueryResult) => result.hits?.hits || [],
@@ -252,8 +296,9 @@ export default function Listener({ children, onChange }: ListenerProps) {
                 });
               });
 
-              // Fetch data for internal facet components.
+              // Fetch data for internal facet components (non-autosuggest only).
               facetWidgets.forEach((f, id) => {
+                if (!nonAutosuggestChanged) return;
                 // Resolve table for this widget
                 const tableName = resolveTable(f.table, table);
 
@@ -483,11 +528,10 @@ export default function Listener({ children, onChange }: ListenerProps) {
     headers,
     searchWidgets.size,
     configurableWidgets.size,
-    configurationsKey,
     facetWidgets.size,
-    queriesKey,
     resultWidgets.size,
-    semanticQueriesKey,
+    autosuggestGroupKey,
+    nonAutosuggestGroupKey,
     semanticQueries.size,
     table,
     widgets.size,

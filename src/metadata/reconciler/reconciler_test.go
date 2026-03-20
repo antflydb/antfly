@@ -120,7 +120,7 @@ func (m *MockShardOperations) RollbackSplit(
 func (m *MockShardOperations) AddPeer(
 	ctx context.Context,
 	shardID types.ID,
-	leaderClient *client.StoreClient,
+	leaderClient client.StoreRPC,
 	newPeerID types.ID,
 ) error {
 	args := m.Called(ctx, shardID, leaderClient, newPeerID)
@@ -130,7 +130,7 @@ func (m *MockShardOperations) AddPeer(
 func (m *MockShardOperations) RemovePeer(
 	ctx context.Context,
 	shardID types.ID,
-	leaderClient *client.StoreClient,
+	leaderClient client.StoreRPC,
 	peerToRemoveID types.ID,
 	async bool,
 ) error {
@@ -146,7 +146,7 @@ func (m *MockShardOperations) GetMedianKey(ctx context.Context, shardID types.ID
 func (m *MockShardOperations) IsIDRemoved(
 	ctx context.Context,
 	shardID types.ID,
-	leaderClient *client.StoreClient,
+	leaderClient client.StoreRPC,
 	peerID types.ID,
 ) (bool, error) {
 	args := m.Called(ctx, shardID, leaderClient, peerID)
@@ -238,12 +238,12 @@ type MockStoreOperations struct {
 func (m *MockStoreOperations) GetStoreClient(
 	ctx context.Context,
 	nodeID types.ID,
-) (*client.StoreClient, bool, error) {
+) (client.StoreRPC, bool, error) {
 	args := m.Called(ctx, nodeID)
 	if args.Get(0) == nil {
 		return nil, args.Bool(1), args.Error(2)
 	}
-	return args.Get(0).(*client.StoreClient), args.Bool(1), args.Error(2)
+	return args.Get(0).(client.StoreRPC), args.Bool(1), args.Error(2)
 }
 
 func (m *MockStoreOperations) GetStoreStatus(
@@ -265,12 +265,12 @@ func (m *MockStoreOperations) GetShardStatuses() (map[types.ID]*store.ShardStatu
 func (m *MockStoreOperations) GetLeaderClientForShard(
 	ctx context.Context,
 	shardID types.ID,
-) (*client.StoreClient, error) {
+) (client.StoreRPC, error) {
 	args := m.Called(ctx, shardID)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
-	return args.Get(0).(*client.StoreClient), args.Error(1)
+	return args.Get(0).(client.StoreRPC), args.Error(1)
 }
 
 func (m *MockStoreOperations) UpdateShardSplitState(
@@ -505,7 +505,7 @@ func TestComputeSplitStateActions(t *testing.T) {
 			},
 		}
 
-		actions := reconciler.computeSplitStateActions(desired)
+		actions := reconciler.computeSplitStateActions(CurrentClusterState{}, desired)
 		assert.Len(t, actions, 1)
 		assert.Equal(t, SplitStateActionStartShard, actions[0].Action)
 		assert.Equal(t, store.ShardState_SplittingOff, actions[0].State)
@@ -521,7 +521,7 @@ func TestComputeSplitStateActions(t *testing.T) {
 			},
 		}
 
-		actions := reconciler.computeSplitStateActions(desired)
+		actions := reconciler.computeSplitStateActions(CurrentClusterState{}, desired)
 		assert.Len(t, actions, 1)
 		assert.Equal(t, SplitStateActionMerge, actions[0].Action)
 		assert.Equal(t, store.ShardState_PreMerge, actions[0].State)

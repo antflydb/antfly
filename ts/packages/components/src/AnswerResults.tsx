@@ -17,7 +17,7 @@ import { resolveTable, streamAnswer } from "./utils";
 export interface AnswerResultsProps {
   id: string;
   searchBoxId: string; // Links to the QueryBox that provides the search value
-  generator: GeneratorConfig;
+  generator?: GeneratorConfig;
   agentKnowledge?: string; // Additional context for the answer agent
   table?: string; // Optional table override - auto-inherits from QueryBox if not specified
   filterQuery?: Record<string, unknown>; // Filter query to constrain search results
@@ -65,6 +65,22 @@ export interface AnswerResultsProps {
   onFollowup?: (question: string) => void;
 
   children?: ReactNode;
+}
+
+interface CustomAnswerRendererProps {
+  answer: string;
+  isStreaming: boolean;
+  hits: QueryHit[];
+  renderAnswer: NonNullable<AnswerResultsProps["renderAnswer"]>;
+}
+
+function CustomAnswerRenderer({
+  answer,
+  isStreaming,
+  hits,
+  renderAnswer,
+}: CustomAnswerRendererProps) {
+  return <>{renderAnswer(answer, isStreaming, hits)}</>;
 }
 
 export default function AnswerResults({
@@ -162,7 +178,7 @@ export default function AnswerResults({
     // QueryBox only provides the text value, AnswerResults owns the query configuration
     const retrievalRequest: RetrievalAgentRequest = {
       query: currentQuery,
-      generator: generator,
+      ...(generator ? { generator } : {}),
       agent_knowledge: agentKnowledge,
       stream: true,
       queries: [
@@ -583,10 +599,18 @@ export default function AnswerResults({
           (renderReasoning
             ? renderReasoning(reasoning, isStreaming)
             : defaultRenderReasoning(reasoning, isStreaming))}
-        {answer &&
-          (renderAnswer
-            ? renderAnswer(answer, isStreaming, hits)
-            : defaultRenderAnswer(answer, isStreaming, hits))}
+        {!error &&
+          answer &&
+          (renderAnswer ? (
+            <CustomAnswerRenderer
+              answer={answer}
+              isStreaming={isStreaming}
+              hits={hits}
+              renderAnswer={renderAnswer}
+            />
+          ) : (
+            defaultRenderAnswer(answer, isStreaming, hits)
+          ))}
         {showConfidence &&
           confidence &&
           !isStreaming &&

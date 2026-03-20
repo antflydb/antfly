@@ -133,6 +133,13 @@ func RecoverPebbleClosed(err *error) {
 				*err = e
 				return
 			}
+			// Some Pebble call paths panic with a raw "pebble: closed" error that does
+			// not satisfy errors.Is against pebble.ErrClosed after crossing package
+			// boundaries. Treat that as the same shutdown condition.
+			if strings.Contains(e.Error(), "pebble: closed") {
+				*err = pebble.ErrClosed
+				return
+			}
 			// Also handle "closed LogWriter" panics from Pebble's WAL
 			if strings.Contains(e.Error(), "pebble/record: closed LogWriter") {
 				*err = pebble.ErrClosed
