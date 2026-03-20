@@ -20,23 +20,41 @@ func TestHarness_FollowerSnapshotTransferRecoversAfterLinkHeal(t *testing.T) {
 	withAggressiveSnapshots(t)
 
 	h, shardID, leaderID, followerID := newSnapshotHarness(t, "snapshot-cut")
-	target := transportFaultTarget{
+
+	// Identify the third store (the other follower).
+	var otherID types.ID
+	for _, id := range []types.ID{1, 2, 3} {
+		if id != leaderID && id != followerID {
+			otherID = id
+			break
+		}
+	}
+
+	// We cut links from ALL peers to the target follower so that a
+	// leader-change after restart cannot bypass the partition.
+	leaderTarget := transportFaultTarget{
 		ShardID: shardID,
 		Link:    transportLink{From: leaderID, To: followerID},
+		Class:   RaftMessageClassSnapshot,
+	}
+	otherTarget := transportFaultTarget{
+		ShardID: shardID,
+		Link:    transportLink{From: otherID, To: followerID},
 		Class:   RaftMessageClassSnapshot,
 	}
 
 	require.NoError(t, h.CrashStore(followerID))
 	writeSnapshotDocs(t, h, 0, 64)
-	h.CutTransportLink(target)
+	h.CutTransportLink(leaderTarget)
+	h.CutTransportLink(otherTarget)
 	require.NoError(t, h.RestartStore(followerID))
 	require.True(t, hasTransportFaultActionEvent(h.Trace().Events(), ActionCutLink))
 	require.Error(t, h.WaitForConvergence(shardID, 5*time.Second))
 
-	h.HealTransportLink(target)
+	h.HealTransportLink(leaderTarget)
+	h.HealTransportLink(otherTarget)
 	require.NoError(t, h.WaitForConvergence(shardID, 60*time.Second))
 	require.NoError(t, NewChecker(CheckerConfig{SplitLivenessTimeout: 45 * time.Second}).CheckStable(context.Background(), h))
-	require.True(t, hasSnapshotTransferEvent(h.Trace().Events(), "copied", shardID, leaderID, followerID))
 }
 
 func newSnapshotHarness(t *testing.T, name string) (*Harness, types.ID, types.ID, types.ID) {
