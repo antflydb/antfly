@@ -13,20 +13,13 @@ T = TypeVar("T", bound="BedrockGeneratorConfig")
 class BedrockGeneratorConfig:
     """Configuration for the AWS Bedrock generative AI provider.
 
-    Provides access to models from Anthropic, Meta, Amazon, Cohere, Mistral, and others.
-
-    **Example Models:** anthropic.claude-sonnet-4-5-20250929-v1:0, meta.llama3-3-70b-instruct-v1:0, amazon.nova-pro-v1:0
-
-    **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-
-        Attributes:
-            model (str): The Bedrock model ID to use (e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0'). Example:
-                anthropic.claude-sonnet-4-5-20250929-v1:0.
-            region (Union[Unset, str]): The AWS region for the Bedrock service.
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-1.0).
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
-            top_p (Union[Unset, float]): Nucleus sampling parameter.
-            top_k (Union[Unset, int]): Top-k sampling parameter.
+    Attributes:
+        model (str): The Bedrock model ID to use. Example: anthropic.claude-sonnet-4-5-20250929-v1:0.
+        region (Union[Unset, str]): The AWS region for the Bedrock service.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-1.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
+        top_p (Union[Unset, float]): Nucleus sampling parameter.
+        top_k (Union[Unset, int]): Top-k sampling parameter.
     """
 
     model: str

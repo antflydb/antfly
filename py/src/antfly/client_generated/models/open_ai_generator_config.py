@@ -13,20 +13,15 @@ T = TypeVar("T", bound="OpenAIGeneratorConfig")
 class OpenAIGeneratorConfig:
     """Configuration for the OpenAI generative AI provider.
 
-    **Example Models:** gpt-4.1 (default), gpt-4.1-mini, o3, o4-mini
-
-    **Docs:** https://platform.openai.com/docs/models
-
-        Attributes:
-            model (str): The name of the OpenAI model to use (e.g., 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini'). Default:
-                'gpt-4.1'. Example: gpt-4.1.
-            url (Union[Unset, str]): The URL of the OpenAI API endpoint.
-            api_key (Union[Unset, str]): The OpenAI API key.
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
-            top_p (Union[Unset, float]): Nucleus sampling parameter.
-            frequency_penalty (Union[Unset, float]): Penalty for token frequency (-2.0 to 2.0).
-            presence_penalty (Union[Unset, float]): Penalty for token presence (-2.0 to 2.0).
+    Attributes:
+        model (str): The name of the OpenAI model to use. Default: 'gpt-4.1'. Example: gpt-4.1.
+        url (Union[Unset, str]): The URL of the OpenAI API endpoint.
+        api_key (Union[Unset, str]): The OpenAI API key.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
+        top_p (Union[Unset, float]): Nucleus sampling parameter.
+        frequency_penalty (Union[Unset, float]): Penalty for token frequency (-2.0 to 2.0).
+        presence_penalty (Union[Unset, float]): Penalty for token presence (-2.0 to 2.0).
     """
 
     model: str = "gpt-4.1"

@@ -11,34 +11,17 @@ T = TypeVar("T", bound="VertexGeneratorConfig")
 
 @_attrs_define
 class VertexGeneratorConfig:
-    """Configuration for Google Cloud Vertex AI generative models (enterprise-grade).
+    """Configuration for Google Cloud Vertex AI generative models.
 
-    Uses Application Default Credentials (ADC) for authentication. In GCP environments
-    (Cloud Run, GKE, Compute Engine) this is automatic. For local dev, run
-    `gcloud auth application-default login`. Requires IAM role `roles/aiplatform.user`.
-
-    **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
-
-    **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
-
-        Example:
-            {'provider': 'vertex', 'model': 'gemini-2.5-flash', 'project_id': 'my-gcp-project', 'location': 'us-central1',
-                'temperature': 0.7, 'max_tokens': 4096}
-
-        Attributes:
-            model (str): The name of the Vertex AI model to use. Default: 'gemini-2.5-flash'. Example: gemini-2.5-flash.
-            project_id (Union[Unset, str]): Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment
-                variable.
-            location (Union[Unset, str]): Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can
-                also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'. Default: 'us-central1'.
-            credentials_path (Union[Unset, str]): Path to service account JSON key file. Sets GOOGLE_APPLICATION_CREDENTIALS
-                environment variable. Alternative to ADC for non-GCP environments.
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0). Higher values make output more
-                random.
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
-            top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-            top_k (Union[Unset, int]): Top-k sampling parameter. Only sample from the top K options for each subsequent
-                token.
+    Attributes:
+        model (str): The name of the Vertex AI model to use. Default: 'gemini-2.5-flash'. Example: gemini-2.5-flash.
+        project_id (Union[Unset, str]): Google Cloud project ID.
+        location (Union[Unset, str]): Google Cloud region for Vertex AI API. Default: 'us-central1'.
+        credentials_path (Union[Unset, str]): Path to service account JSON key file.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
+        top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0).
+        top_k (Union[Unset, int]): Top-k sampling parameter.
     """
 
     model: str = "gemini-2.5-flash"

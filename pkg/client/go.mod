@@ -7,8 +7,8 @@ replace github.com/antflydb/antfly/pkg/libaf => ../libaf
 require (
 	github.com/antflydb/antfly/pkg/libaf v0.0.1
 	github.com/getkin/kin-openapi v0.133.0
-	github.com/kaptinlin/jsonschema v0.7.5
-	github.com/oapi-codegen/runtime v1.2.0
+	github.com/kaptinlin/jsonschema v0.7.6
+	github.com/oapi-codegen/runtime v1.3.0
 )
 
 require (
@@ -23,7 +23,7 @@ require (
 	github.com/kaptinlin/go-i18n v0.2.12 // indirect
 	github.com/kaptinlin/jsonpointer v0.4.17 // indirect
 	github.com/kaptinlin/messageformat-go v0.4.18 // indirect
-	github.com/mailru/easyjson v0.9.1 // indirect
+	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826 // indirect
 	github.com/oapi-codegen/oapi-codegen/v2 v2.5.1 // indirect
 	github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037 // indirect
