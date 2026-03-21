@@ -1574,11 +1574,12 @@ func splitOffRangeForNewRange(currentRange, newRange types.Range, splitState *Sp
 	return types.Range{newRange[1], splitOffEnd}, true, nil
 }
 
-func (db *DBImpl) denseEmbeddingsIndexesForSplitRebuild() []string {
+func (db *DBImpl) embeddingsIndexesForSplitRebuild() (dense []string, sparse []string) {
 	db.indexesMu.RLock()
 	defer db.indexesMu.RUnlock()
 
-	names := make([]string, 0, len(db.indexes))
+	dense = make([]string, 0, len(db.indexes))
+	sparse = make([]string, 0, len(db.indexes))
 	for name, conf := range db.indexes {
 		if !indexes.IsEmbeddingsType(conf.Type) {
 			continue
@@ -1591,12 +1592,14 @@ func (db *DBImpl) denseEmbeddingsIndexesForSplitRebuild() []string {
 			continue
 		}
 		if embCfg.Sparse {
+			sparse = append(sparse, name)
 			continue
 		}
-		names = append(names, name)
+		dense = append(dense, name)
 	}
-	slices.Sort(names)
-	return names
+	slices.Sort(dense)
+	slices.Sort(sparse)
+	return dense, sparse
 }
 
 func (db *DBImpl) deleteDenseEmbeddingsSplitRebuildState(batch *pebble.Batch, indexNames []string) error {
@@ -1752,11 +1755,13 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 	}
 	rebuildDenseEmbeddings := hasSplitOffRange && destDir1 == ""
 	denseEmbeddingsToRebuild := []string(nil)
+	sparseEmbeddingsToRebuild := []string(nil)
 	if rebuildDenseEmbeddings {
-		denseEmbeddingsToRebuild = db.denseEmbeddingsIndexesForSplitRebuild()
-		if len(denseEmbeddingsToRebuild) > 0 {
-			db.logger.Info("Finalize split will rebuild dense embeddings indexes for retained parent range",
-				zap.Strings("indexes", denseEmbeddingsToRebuild),
+		denseEmbeddingsToRebuild, sparseEmbeddingsToRebuild = db.embeddingsIndexesForSplitRebuild()
+		if len(denseEmbeddingsToRebuild) > 0 || len(sparseEmbeddingsToRebuild) > 0 {
+			db.logger.Info("Finalize split will rebuild embeddings indexes for retained parent range",
+				zap.Strings("dense_indexes", denseEmbeddingsToRebuild),
+				zap.Strings("sparse_indexes", sparseEmbeddingsToRebuild),
 				zap.Stringer("range", newRange))
 		}
 	}
@@ -1805,9 +1810,10 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 		// The workers handle pebble.ErrClosed gracefully, so this is non-fatal.
 		db.logger.Warn("Error closing db after range update", zap.Error(err))
 	}
-	if len(denseEmbeddingsToRebuild) > 0 {
-		if err := db.removeSplitRebuildIndexDirs(denseEmbeddingsToRebuild); err != nil {
-			return fmt.Errorf("removing dense embeddings index directories for split rebuild: %w", err)
+	rebuildIndexDirs := append(append([]string(nil), denseEmbeddingsToRebuild...), sparseEmbeddingsToRebuild...)
+	if len(rebuildIndexDirs) > 0 {
+		if err := db.removeSplitRebuildIndexDirs(rebuildIndexDirs); err != nil {
+			return fmt.Errorf("removing embeddings index directories for split rebuild: %w", err)
 		}
 	}
 
@@ -1836,8 +1842,8 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 	if err := db.Open(db.dir, true, db.schema, db.byteRange); err != nil {
 		return fmt.Errorf("re-opening db after range update: %w", err)
 	}
-	if len(denseEmbeddingsToRebuild) > 0 {
-		db.indexManager.WaitForNamedBackfills(context.Background(), denseEmbeddingsToRebuild)
+	if len(rebuildIndexDirs) > 0 {
+		db.indexManager.WaitForNamedBackfills(context.Background(), rebuildIndexDirs)
 	}
 
 	return nil

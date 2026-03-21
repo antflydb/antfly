@@ -53,6 +53,7 @@ import (
 )
 
 var _ Index = (*SparseIndex)(nil)
+var _ BackfillableIndex = (*SparseIndex)(nil)
 var _ EnrichableIndex = (*SparseIndex)(nil)
 var _ EnrichmentComputer = (*SparseIndex)(nil)
 
@@ -241,6 +242,23 @@ func (si *SparseIndex) Open(
 	si.schema = tableSchema
 	si.logger.Debug("Opening sparse index", zap.String("path", si.indexPath))
 
+	if !rebuild {
+		indexWALPath := filepath.Join(si.indexPath, "indexWAL")
+		if _, statErr := os.Stat(indexWALPath); errors.Is(statErr, os.ErrNotExist) {
+			si.logger.Info("Rebuilding sparse index, indexWAL does not exist")
+			rebuild = true
+		} else if statErr != nil {
+			return fmt.Errorf("checking sparse index WAL %s: %w", indexWALPath, statErr)
+		}
+		sparseDBPath := filepath.Join(si.indexPath, "sparsedb")
+		if _, statErr := os.Stat(sparseDBPath); errors.Is(statErr, os.ErrNotExist) {
+			si.logger.Info("Rebuilding sparse index, sparsedb does not exist")
+			rebuild = true
+		} else if statErr != nil {
+			return fmt.Errorf("checking sparse index db %s: %w", sparseDBPath, statErr)
+		}
+	}
+
 	if rebuild {
 		_ = os.RemoveAll(si.indexPath)
 	}
@@ -286,7 +304,10 @@ func (si *SparseIndex) Open(
 
 	// Start background goroutines for WAL processing
 	backfillWait := make(chan struct{})
-	si.backfillDone = make(chan struct{})
+	si.backfillDone = nil
+	if rebuild {
+		si.backfillDone = make(chan struct{})
+	}
 	si.enqueueChan = make(chan int, 5)
 
 	si.eg.Go(func() error {
@@ -301,7 +322,9 @@ func (si *SparseIndex) Open(
 	})
 
 	si.eg.Go(func() error {
-		defer close(si.backfillDone)
+		if si.backfillDone != nil {
+			defer close(si.backfillDone)
+		}
 		if rebuild {
 			return si.runBackfill(si.egCtx, backfillWait, nil)
 		}
@@ -385,43 +408,75 @@ func (si *SparseIndex) runBackfill(ctx context.Context, backfillWait chan struct
 	si.startBackfill()
 	defer si.finishBackfill()
 
-	maxBatchSize := enricherMaxBatches * enricherPartitionSize
-	totalProcessed := 0
+	if bytes.Compare(rebuildFrom, si.byteRange[0]) < 0 {
+		rebuildFrom = si.byteRange[0]
+	}
 
-	err := storeutils.ScanForEnrichment(ctx, si.db, storeutils.EnrichmentScanOptions{
-		ByteRange:        si.byteRange,
-		PrimarySuffix:    nil, // defaults to DBRangeStart (documents)
-		EnrichmentSuffix: si.sparseSuffix,
-		BatchSize:        maxBatchSize,
-		ProcessBatch: func(ctx context.Context, batch []storeutils.DocumentScanState) error {
-			keys := make([][]byte, len(batch))
-			for i, state := range batch {
-				keys[i] = state.CurrentDocKey
-			}
-			if err := si.enrichBatch(ctx, keys); err != nil {
-				si.logger.Error("Backfill batch error", zap.Error(err))
-			}
-			totalProcessed += len(batch)
-			si.addBackfillItems(len(batch))
-			if len(batch) > 0 {
-				lastKey := batch[len(batch)-1].CurrentDocKey
-				si.updateBackfillProgress(estimateProgress(si.byteRange[0], si.byteRange[1], lastKey))
-			}
-			si.logger.Debug("Processed batch during sparse backfill",
-				zap.Int("batchSize", len(batch)),
-				zap.Int("totalProcessed", totalProcessed))
+	const maxBatchSize = 5_000
+	totalScanned := 0
+	totalIndexed := 0
+	inserts := make([]sparseindex.BatchInsert, 0, maxBatchSize)
+
+	flushBatch := func() error {
+		if len(inserts) == 0 {
 			return nil
-		},
-	})
+		}
+		if err := si.sparseIdx.Batch(inserts, nil); err != nil {
+			return fmt.Errorf("batch sparse index rebuild: %w", err)
+		}
+		inserts = inserts[:0]
+		return nil
+	}
 
+	err := storeutils.Scan(ctx, si.db, storeutils.ScanOptions{
+		LowerBound: rebuildFrom,
+		UpperBound: si.byteRange[1],
+		SkipPoint: func(userKey []byte) bool {
+			return !bytes.HasSuffix(userKey, si.sparseSuffix)
+		},
+	}, func(key []byte, value []byte) (bool, error) {
+		totalScanned++
+		if len(value) < 8 {
+			return true, nil
+		}
+
+		docKey := extractDocKey(key, si.sparseSuffix)
+		if docKey == nil {
+			return true, nil
+		}
+
+		sv, err := decodeSparseVec(value[8:])
+		if err != nil {
+			return false, fmt.Errorf("decoding sparse vector for key %s: %w", key, err)
+		}
+
+		inserts = append(inserts, sparseindex.BatchInsert{
+			DocID: docKey,
+			Vec:   sv,
+		})
+		totalIndexed++
+		si.addBackfillItems(1)
+		si.updateBackfillProgress(estimateProgress(si.byteRange[0], si.byteRange[1], key))
+
+		if len(inserts) >= maxBatchSize {
+			if err := flushBatch(); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	})
 	if err != nil {
-		return fmt.Errorf("scanning for sparse enrichment: %w", err)
+		return fmt.Errorf("scanning sparse vectors for rebuild: %w", err)
+	}
+	if err := flushBatch(); err != nil {
+		return err
 	}
 
 	si.logger.Debug("Finished sparse backfill",
 		zap.Stringer("range", si.byteRange),
 		zap.String("path", si.indexPath),
-		zap.Int("totalProcessed", totalProcessed))
+		zap.Int("total_indexed", totalIndexed),
+		zap.Int("total_scanned", totalScanned))
 	return nil
 }
 
@@ -761,6 +816,17 @@ func (si *SparseIndex) UpdateSchema(tableSchema *schema.TableSchema) error {
 	defer si.Unlock()
 	si.schema = tableSchema
 	return nil
+}
+
+// WaitForBackfill waits for sparse index backfill to complete.
+// Returns immediately if no backfill is running or context is canceled.
+func (si *SparseIndex) WaitForBackfill(ctx context.Context) {
+	if si.backfillDone != nil {
+		select {
+		case <-si.backfillDone:
+		case <-ctx.Done():
+		}
+	}
 }
 
 func (si *SparseIndex) Pause(ctx context.Context) error {

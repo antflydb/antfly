@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/lib/chunking"
 	"github.com/antflydb/antfly/lib/encoding"
@@ -138,11 +139,34 @@ func setupSplitBenchDB(
 			},
 		},
 	)
+	sparseIndex := indexes.NewEmbeddingsConfig(
+		"sparse_index",
+		indexes.EmbeddingsIndexConfig{
+			Field:  "content",
+			Sparse: true,
+		},
+	)
+	graphEdgeTypes := []indexes.EdgeTypeConfig{
+		{
+			Name:             "cites",
+			MaxWeight:        1.0,
+			MinWeight:        0.0,
+			AllowSelfLoops:   false,
+			RequiredMetadata: &[]string{},
+		},
+	}
+	graphIndex, err := indexes.NewIndexConfig("graph_index", indexes.GraphIndexConfig{
+		EdgeTypes:           &graphEdgeTypes,
+		MaxEdgesPerDocument: 4,
+	})
+	require.NoError(b, err)
 	require.NoError(b, db.AddIndex(*fullTextIndex))
 	require.NoError(b, db.AddIndex(*chunkedEmbeddingIndex))
+	require.NoError(b, db.AddIndex(*sparseIndex))
+	require.NoError(b, db.AddIndex(*graphIndex))
 
 	docWrites := make([][2][]byte, 0, cfg.docs)
-	chunkWrites := make([][2][]byte, 0, cfg.docs*cfg.chunksPerDoc*2)
+	indexWrites := make([][2][]byte, 0, cfg.docs*(cfg.chunksPerDoc*2+2))
 	for i := range cfg.docs {
 		key := fmt.Sprintf("key:%07d", i)
 		docJSON, err := json.Marshal(testDocument{
@@ -152,6 +176,23 @@ func setupSplitBenchDB(
 		})
 		require.NoError(b, err)
 		docWrites = append(docWrites, [2][]byte{[]byte(key), docJSON})
+
+		sparseKey := fmt.Appendf(nil, "%s:i:sparse_index%s", key, storeutils.SparseSuffix)
+		sparseValue := encodeSparseEmbeddingValue(generateTestSparseEmbedding(i), xxhash.Sum64String(key))
+		indexWrites = append(indexWrites, [2][]byte{sparseKey, sparseValue})
+
+		if i+1 < cfg.docs {
+			target := fmt.Sprintf("key:%07d", i+1)
+			edgeKey := storeutils.MakeEdgeKey([]byte(key), []byte(target), "graph_index", "cites")
+			edgeValue, err := indexes.EncodeEdgeValue(&indexes.Edge{
+				Source: []byte(key),
+				Target: []byte(target),
+				Type:   "cites",
+				Weight: 1.0,
+			})
+			require.NoError(b, err)
+			indexWrites = append(indexWrites, [2][]byte{edgeKey, edgeValue})
+		}
 
 		for chunkID := range cfg.chunksPerDoc {
 			chunkKey := storeutils.MakeChunkKey([]byte(key), "chunked_embedding_index", uint32(chunkID))
@@ -171,24 +212,25 @@ func setupSplitBenchDB(
 			)
 			require.NoError(b, err)
 
-			chunkWrites = append(chunkWrites,
+			indexWrites = append(indexWrites,
 				[2][]byte{chunkKey, chunkValue},
 				[2][]byte{embKey, embValue},
 			)
 		}
 	}
 
-	err := db.Batch(ctx, docWrites, nil, Op_SyncLevelEmbeddings)
+	err = db.Batch(ctx, docWrites, nil, Op_SyncLevelEmbeddings)
 	if err != nil && !errors.Is(err, ErrPartialSuccess) {
 		require.NoError(b, err)
 	}
-	if len(chunkWrites) > 0 {
-		err = db.Batch(ctx, chunkWrites, nil, Op_SyncLevelEmbeddings)
+	if len(indexWrites) > 0 {
+		err = db.Batch(ctx, indexWrites, nil, Op_SyncLevelEmbeddings)
 		if err != nil && !errors.Is(err, ErrPartialSuccess) {
 			require.NoError(b, err)
 		}
 	}
 	require.NoError(b, db.pdb.Flush())
+	time.Sleep(200 * time.Millisecond)
 
 	splitKey := []byte(fmt.Sprintf("key:%07d", cfg.docs/2))
 	return db, splitKey, destDir1, destDir2, fullRange
@@ -201,6 +243,8 @@ func BenchmarkSplitPrepareOnlyCheckpoint(b *testing.B) {
 			b.ReportAllocs()
 			b.ReportMetric(float64(cfg.docs), "docs")
 			b.ReportMetric(float64(cfg.docs*cfg.chunksPerDoc), "chunks")
+			b.ReportMetric(float64(cfg.docs), "sparse_vectors")
+			b.ReportMetric(float64(max(cfg.docs-1, 0)), "graph_edges")
 
 			root := b.TempDir()
 			b.StopTimer()
@@ -229,6 +273,8 @@ func BenchmarkFinalizeSplitPrune(b *testing.B) {
 			b.ReportAllocs()
 			b.ReportMetric(float64(cfg.docs), "docs")
 			b.ReportMetric(float64(cfg.docs*cfg.chunksPerDoc), "chunks")
+			b.ReportMetric(float64(cfg.docs), "sparse_vectors")
+			b.ReportMetric(float64(max(cfg.docs-1, 0)), "graph_edges")
 
 			root := b.TempDir()
 			b.StopTimer()

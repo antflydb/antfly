@@ -17,6 +17,7 @@ package db
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -108,14 +109,38 @@ func TestSplit(t *testing.T) {
 			Field:     "content",
 		},
 	)
+	sparseIndexConfig := indexes.NewEmbeddingsConfig(
+		"sparse_index",
+		indexes.EmbeddingsIndexConfig{
+			Field:  "content",
+			Sparse: true,
+		},
+	)
+	graphEdgeTypes := []indexes.EdgeTypeConfig{
+		{
+			Name:             "cites",
+			MaxWeight:        1.0,
+			MinWeight:        0.0,
+			AllowSelfLoops:   false,
+			RequiredMetadata: &[]string{},
+		},
+	}
+	graphIndexConfig, err := indexes.NewIndexConfig("graph_index", indexes.GraphIndexConfig{
+		EdgeTypes:           &graphEdgeTypes,
+		MaxEdgesPerDocument: 4,
+	})
+	require.NoError(t, err)
 
 	require.NoError(t, srcDB.AddIndex(*bleveIndexConfig))
 	require.NoError(t, srcDB.AddIndex(*embeddingIndexConfig))
+	require.NoError(t, srcDB.AddIndex(*sparseIndexConfig))
+	require.NoError(t, srcDB.AddIndex(*graphIndexConfig))
 
 	// Generate test data - using 1000 documents for a moderate load
 	numDocs := 1000
 	testData := make(map[string]testDocument)
-	writes := make([][2][]byte, 0, numDocs*2) // documents + embeddings
+	graphTargets := make(map[string]string, numDocs)
+	writes := make([][2][]byte, 0, numDocs*4) // docs + dense + sparse + edges
 
 	for i := range numDocs {
 		key := fmt.Sprintf("key:%05d", i)
@@ -144,10 +169,28 @@ func TestSplit(t *testing.T) {
 		require.NoError(t, err)
 
 		writes = append(writes, [2][]byte{embeddingKey, embeddingBytes})
+
+		sparseEmbeddingKey := fmt.Appendf(nil, "%s:i:sparse_index%s", key, storeutils.SparseSuffix)
+		sparseEmbeddingBytes := encodeSparseEmbeddingValue(generateTestSparseEmbedding(i), hashID)
+		writes = append(writes, [2][]byte{sparseEmbeddingKey, sparseEmbeddingBytes})
+
+		if i+1 < numDocs {
+			targetKey := fmt.Sprintf("key:%05d", i+1)
+			graphTargets[key] = targetKey
+			edgeKey := storeutils.MakeEdgeKey([]byte(key), []byte(targetKey), "graph_index", "cites")
+			edgeValue, err := indexes.EncodeEdgeValue(&indexes.Edge{
+				Source: []byte(key),
+				Target: []byte(targetKey),
+				Type:   "cites",
+				Weight: 1.0,
+			})
+			require.NoError(t, err)
+			writes = append(writes, [2][]byte{edgeKey, edgeValue})
+		}
 	}
 
 	// Batch write all documents
-	err := srcDB.Batch(t.Context(), writes, nil, Op_SyncLevelFullText)
+	err = srcDB.Batch(t.Context(), writes, nil, Op_SyncLevelFullText)
 	// FullText sync level returns ErrPartialSuccess indicating KV write succeeded
 	if err != nil && !errors.Is(err, ErrPartialSuccess) {
 		require.NoError(t, err)
@@ -156,12 +199,28 @@ func TestSplit(t *testing.T) {
 	// Force a flush to ensure data is written to SSTables for split
 	require.NoError(t, srcDB.pdb.Flush())
 
-	// Wait for indexes to catch up
-	time.Sleep(200 * time.Millisecond)
+	// Wait for async indexes to catch up before asserting pre-split state.
+	require.Eventually(t, func() bool {
+		_, _, indexStats, err := srcDB.Stats()
+		if err != nil {
+			return false
+		}
+		sparseStats, err := indexStats["sparse_index"].AsEmbeddingsIndexStats()
+		if err != nil || sparseStats.TotalIndexed != uint64(numDocs) {
+			return false
+		}
+		graphStats, err := indexStats["graph_index"].AsGraphIndexStats()
+		if err != nil || graphStats.TotalEdges != uint64(numDocs-1) {
+			return false
+		}
+		return true
+	}, 5*time.Second, 50*time.Millisecond)
 
 	// Verify all data is present in source DB before split
 	t.Run("VerifySourceBeforeSplit", func(t *testing.T) {
 		verifyDBContents(t, ctx, srcDB, testData, fullRange)
+		verifySparseIndexState(t, srcDB, "sparse_index", numDocs)
+		verifyGraphIndexState(t, ctx, srcDB, "graph_index", graphTargets, []int{0, 499, 998})
 	})
 
 	// Verify the DB range is correct
@@ -261,6 +320,8 @@ func TestSplit(t *testing.T) {
 
 		// Verify source DB only has range1 data
 		verifyDBContents(t, ctx, srcDB, filterDataByRange(testData, range1), range1)
+		verifySparseIndexState(t, srcDB, "sparse_index", len(filterDataByRange(testData, range1)))
+		verifyGraphIndexState(t, ctx, srcDB, "graph_index", graphTargets, []int{0, 499})
 	})
 
 	// Open and verify the new shard (destDir2)
@@ -286,6 +347,8 @@ func TestSplit(t *testing.T) {
 
 		// Verify new DB has range2 data
 		verifyDBContents(t, ctx, newDB, filterDataByRange(testData, range2), range2)
+		verifySparseIndexState(t, newDB, "sparse_index", len(filterDataByRange(testData, range2)))
+		verifyGraphIndexState(t, ctx, newDB, "graph_index", graphTargets, []int{500, 998})
 	})
 
 	// Verify no data was lost across both shards
@@ -316,6 +379,8 @@ func TestSplit(t *testing.T) {
 		srcIndexes := srcDB.GetIndexes()
 		assert.Contains(t, srcIndexes, "full_text_index")
 		assert.Contains(t, srcIndexes, "embedding_index")
+		assert.Contains(t, srcIndexes, "sparse_index")
+		assert.Contains(t, srcIndexes, "graph_index")
 
 		// Check new DB indexes - force metadata loading by passing nil schema and empty range
 		newDB := &DBImpl{
@@ -329,6 +394,8 @@ func TestSplit(t *testing.T) {
 		newIndexes := newDB.GetIndexes()
 		assert.Contains(t, newIndexes, "full_text_index")
 		assert.Contains(t, newIndexes, "embedding_index")
+		assert.Contains(t, newIndexes, "sparse_index")
+		assert.Contains(t, newIndexes, "graph_index")
 	})
 
 	// Clean up
@@ -358,6 +425,60 @@ func generateTestEmbedding(seed int, dimensions int) []float32 {
 		embedding[i] = float32(seed*dimensions+i) / 1000.0
 	}
 	return embedding
+}
+
+func generateTestSparseEmbedding(seed int) *vector.SparseVector {
+	base := uint32(seed % 97)
+	return vector.NewSparseVector(
+		[]uint32{base + 1, base + 101, base + 1001},
+		[]float32{1.0, float32((seed%5)+1) / 10.0, float32((seed%7)+1) / 20.0},
+	)
+}
+
+func encodeSparseEmbeddingValue(sv *vector.SparseVector, hashID uint64) []byte {
+	encoded := indexes.EncodeSparseVec(sv)
+	value := make([]byte, 8+len(encoded))
+	binary.LittleEndian.PutUint64(value[:8], hashID)
+	copy(value[8:], encoded)
+	return value
+}
+
+func verifySparseIndexState(
+	t *testing.T,
+	db *DBImpl,
+	indexName string,
+	expectedCount int,
+) {
+	t.Helper()
+
+	_, _, indexStats, err := db.Stats()
+	require.NoError(t, err)
+	stats, ok := indexStats[indexName]
+	require.True(t, ok, "missing sparse index stats for %s", indexName)
+	embStats, err := stats.AsEmbeddingsIndexStats()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(expectedCount), embStats.TotalIndexed, "unexpected sparse index count for %s", indexName)
+}
+
+func verifyGraphIndexState(
+	t *testing.T,
+	ctx context.Context,
+	db *DBImpl,
+	indexName string,
+	expectedTargets map[string]string,
+	sampleSourceIndexes []int,
+) {
+	t.Helper()
+
+	for _, idx := range sampleSourceIndexes {
+		source := fmt.Sprintf("key:%05d", idx)
+		target, ok := expectedTargets[source]
+		require.True(t, ok, "missing expected graph target for %s", source)
+		edges, err := db.GetEdges(ctx, indexName, []byte(source), "cites", indexes.EdgeDirectionOut)
+		require.NoError(t, err)
+		require.Len(t, edges, 1, "expected one outgoing edge for %s", source)
+		assert.Equal(t, target, string(edges[0].Target))
+	}
 }
 
 // verifyDBContents checks that a database contains expected documents

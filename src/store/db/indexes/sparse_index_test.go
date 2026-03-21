@@ -194,6 +194,18 @@ func TestSparseIndex_Open(t *testing.T) {
 	err = si.Open(false, &schema.TableSchema{}, types.Range{nil, nil})
 	require.NoError(t, err)
 	assert.NotNil(t, si.sparseIdx)
+
+	waitDone := make(chan struct{})
+	go func() {
+		si.WaitForBackfill(context.Background())
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("WaitForBackfill blocked after sparse reopen without rebuild")
+	}
 }
 
 func TestSparseIndex_BatchAndSearch(t *testing.T) {
