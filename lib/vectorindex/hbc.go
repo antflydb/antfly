@@ -1450,11 +1450,11 @@ func (idx *HBCIndex) insertIntoTree(
 	cacheBatch nodeCache,
 	meta *hbcIndexMetadata,
 	vectorID uint64,
-	vec vector.T,
+	inputVector vector.T,
 	existingLeafID uint64, // Optional existing leaf ID if known
 ) error {
 	q := &queryVector{}
-	q.InitOriginal(idx.config.DistanceMetric, vec, idx.rot)
+	q.InitOriginal(idx.config.DistanceMetric, inputVector, idx.rot)
 	// Start from root and find the best leaf
 	currentID := meta.RootNode
 
