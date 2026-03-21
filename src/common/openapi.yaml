@@ -95,6 +95,11 @@ components:
           description: "Maximum duration for a shard split operation before triggering rollback. Format: duration string like '5m', '30s'. Default: '5m' (five minutes)."
           example: "5m"
           x-go-type: time.Duration
+        split_finalize_grace_period:
+          type: string
+          description: "Minimum continuous readiness duration required before finalizing a split. Format: duration string like '15s', '1m'. Default: '15s'."
+          example: "15s"
+          x-go-type: time.Duration
         max_shard_size_bytes:
           type: integer
           description: "Maximum size of a shard in bytes. Used to determine when to split shards."
@@ -175,7 +180,7 @@ components:
         generators:
           type: object
           additionalProperties:
-            $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+            $ref: "../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: |
             Named generator configurations for AI operations.
 
@@ -348,13 +353,13 @@ components:
           type: string
           description: "Name of the generator from the generators map"
         generator_config:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: "Inline generator configuration (alternative to referencing by name)"
         retry:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/RetryConfig"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/RetryConfig"
           description: "Retry configuration for this generator"
         condition:
-          $ref: "../../lib/ai/openapi.yaml#/components/schemas/ChainCondition"
+          $ref: "../../pkg/generating/openapi.yaml#/components/schemas/ChainCondition"
           description: "When to try the next generator in chain"
 
     MetadataInfo:

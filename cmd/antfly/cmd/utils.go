@@ -88,7 +88,7 @@ func parseConfig(v *viper.Viper) (*common.Config, error) {
 	if v.GetInt("max_shards_per_table") == 0 {
 		v.SetDefault("max_shards_per_table", 20)
 	}
-	v.SetDefault("disable_shard_allocation", true)
+	v.SetDefault("disable_shard_alloc", true)
 	if v.GetInt("replication_factor") == 0 {
 		// If the default wasn't set by swarm mode set it here
 		v.SetDefault("replication_factor", 3)

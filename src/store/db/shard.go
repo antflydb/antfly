@@ -206,6 +206,9 @@ func (s *Shard) Close() error {
 		if s.storeDB != nil {
 			s.storeDB.CloseProposeC()
 		}
+		if s.raftNode != nil {
+			s.raftNode.Shutdown()
+		}
 
 		// Wait for raft node to fully stop (errorC will close when raft stops)
 		if s.errorC != nil {

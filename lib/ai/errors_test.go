@@ -135,7 +135,7 @@ func TestAsGenerationErrorPanicsOnNil(t *testing.T) {
 }
 
 func TestGenerationErrorImplementsError(t *testing.T) {
-	genErr := GenerationError{
+	genErr := &GenerationError{
 		Kind:        GenerationErrorRateLimit,
 		UserMessage: "Rate limit reached for provider 'openrouter'. Please wait and try again.",
 	}
@@ -143,5 +143,14 @@ func TestGenerationErrorImplementsError(t *testing.T) {
 	var err error = genErr
 	if err.Error() != genErr.UserMessage {
 		t.Fatalf("Error() = %q, want %q", err.Error(), genErr.UserMessage)
+	}
+}
+
+func TestGenerationErrorUnwrap(t *testing.T) {
+	cause := errors.New("upstream timeout")
+	genErr := AsGenerationError("openai", cause)
+
+	if !errors.Is(genErr, cause) {
+		t.Error("expected Unwrap to expose the cause")
 	}
 }

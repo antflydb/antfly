@@ -365,6 +365,20 @@ func (r *Reconciler) getSplitFinalizeGracePeriod() time.Duration {
 	return 15 * time.Second
 }
 
+func (r *Reconciler) getAutoSplitPerTableLimit() int {
+	if r.config.AutoSplitPerTableLimit > 0 {
+		return r.config.AutoSplitPerTableLimit
+	}
+	return 1
+}
+
+func (r *Reconciler) getAutoSplitClusterLimit() int {
+	if r.config.AutoSplitClusterLimit > 0 {
+		return r.config.AutoSplitClusterLimit
+	}
+	return 1
+}
+
 // trackAndCheckSplitFinalizeReady updates readiness tracking for the split-off shard
 // and returns true if it has been continuously ready for the grace period.
 // Mutates splitReadySince: records first-ready time, clears it if readiness is lost.
@@ -821,6 +835,8 @@ func (r *Reconciler) computeSplitAndMergeTransitions(
 		r.shardCooldown,
 		r.shardOps.GetMedianKey,
 		r.timeProvider,
+		r.getAutoSplitPerTableLimit(),
+		r.getAutoSplitClusterLimit(),
 	)
 }
 
@@ -1003,6 +1019,8 @@ func computeSplitTransitions(
 	shardCooldown map[types.ID]time.Time,
 	getMedianKey MedianKeyGetter,
 	timeProvider TimeProvider,
+	autoSplitPerTableLimit int,
+	autoSplitClusterLimit int,
 ) ([]tablemgr.SplitTransition, []tablemgr.MergeTransition) {
 	splits := []tablemgr.SplitTransition{}
 	merges := []tablemgr.MergeTransition{}
@@ -1015,6 +1033,15 @@ func computeSplitTransitions(
 	for _, status := range shards {
 		shardsPerTable[status.Table]++
 	}
+	if autoSplitPerTableLimit <= 0 {
+		autoSplitPerTableLimit = 1
+	}
+	if autoSplitClusterLimit <= 0 {
+		autoSplitClusterLimit = 1
+	}
+	activeSplitCount := countActiveAutoSplitWork(shards)
+	remainingAutoSplitBudget := max(autoSplitClusterLimit-activeSplitCount, 0)
+	autoSplitsPerTable := make(map[string]int)
 
 	// Build list of candidate shards for split/merge
 	shardIDs := make([]types.ID, 0, len(shards))
@@ -1135,6 +1162,12 @@ func computeSplitTransitions(
 
 		// Check for split conditions (shard exceeds size threshold)
 		if size > maxShardSizeBytes {
+			if remainingAutoSplitBudget <= 0 {
+				continue
+			}
+			if autoSplitsPerTable[status.Table] >= autoSplitPerTableLimit {
+				continue
+			}
 			// Get median key for splitting
 			medianKey, err := getMedianKey(ctx, shardID)
 			if err != nil {
@@ -1160,6 +1193,8 @@ func computeSplitTransitions(
 
 			// Increment shard count for this table
 			shardsPerTable[status.Table]++
+			autoSplitsPerTable[status.Table]++
+			remainingAutoSplitBudget--
 
 			// Create split transition
 			splits = append(splits, tablemgr.SplitTransition{
@@ -1172,4 +1207,22 @@ func computeSplitTransitions(
 	}
 
 	return splits, merges
+}
+
+func countActiveAutoSplitWork(shards map[types.ID]*store.ShardStatus) int {
+	active := 0
+	for _, status := range shards {
+		if status == nil {
+			continue
+		}
+		if status.SplitState != nil && status.SplitState.GetPhase() != db.SplitState_PHASE_NONE {
+			active++
+			continue
+		}
+		switch status.State {
+		case store.ShardState_PreSplit, store.ShardState_Splitting, store.ShardState_SplittingOff, store.ShardState_SplitOffPreSnap:
+			active++
+		}
+	}
+	return active
 }

@@ -13,22 +13,14 @@ T = TypeVar("T", bound="OllamaGeneratorConfig")
 class OllamaGeneratorConfig:
     """Configuration for the Ollama generative AI provider.
 
-    Ollama provides local LLM inference for privacy and offline use.
-
-    **Example Models:** llama3.3:70b, qwen2.5:72b, deepseek-r1:70b, mistral:7b, llava:34b
-
-    **Docs:** https://ollama.com/library
-
-        Attributes:
-            model (str): The name of the Ollama model to use (e.g., 'llama3.3:70b', 'qwen2.5:72b', 'deepseek-coder:33b').
-                Example: llama3.3:70b.
-            url (Union[Unset, str]): The URL of the Ollama API endpoint.
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
-            top_p (Union[Unset, float]): Nucleus sampling parameter.
-            top_k (Union[Unset, int]): Top-k sampling parameter.
-            timeout (Union[Unset, int]): HTTP response timeout in seconds for Ollama API calls. Defaults to 540 (9 minutes).
-                Increase for large models on slow hardware.
+    Attributes:
+        model (str): The name of the Ollama model to use. Example: llama3.3:70b.
+        url (Union[Unset, str]): The URL of the Ollama API endpoint.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
+        top_p (Union[Unset, float]): Nucleus sampling parameter.
+        top_k (Union[Unset, int]): Top-k sampling parameter.
+        timeout (Union[Unset, int]): HTTP response timeout in seconds for Ollama API calls.
     """
 
     model: str

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	exampleentity "github.com/antflydb/antfly/examples/docsaf/entity"
 	antfly "github.com/antflydb/antfly/pkg/client"
 	"github.com/antflydb/antfly/pkg/docsaf"
 )
@@ -34,6 +35,8 @@ func prepareCmd(args []string) error {
 	dirPath := fs.String("dir", "", "Path to directory containing documentation files (required)")
 	outputFile := fs.String("output", "docs.json", "Output JSON file path")
 	baseURL := fs.String("base-url", "", "Base URL for generating document links (optional)")
+
+	entityExtraction := exampleentity.RegisterFlags(fs)
 
 	var includePatterns StringSliceFlag
 	var excludePatterns StringSliceFlag
@@ -67,6 +70,7 @@ func prepareCmd(args []string) error {
 	if len(excludePatterns) > 0 {
 		fmt.Printf("Exclude patterns: %v\n", excludePatterns)
 	}
+	entityExtraction.Print(os.Stdout)
 	fmt.Printf("\n")
 
 	// Create filesystem source and processor using library
@@ -85,7 +89,7 @@ func prepareCmd(args []string) error {
 		return fmt.Errorf("failed to process directory: %w", err)
 	}
 
-	fmt.Printf("✓ Found %d documents\n\n", len(sections))
+	fmt.Printf("Found %d documents\n\n", len(sections))
 
 	if len(sections) == 0 {
 		return fmt.Errorf("no supported files found in directory")
@@ -115,11 +119,14 @@ func prepareCmd(args []string) error {
 	}
 	fmt.Printf("\n")
 
-	// Convert sections to records map (sorted by ID for consistent ordering)
-	records := make(map[string]any)
-	for _, section := range sections {
-		records[section.ID] = section.ToDocument()
+	// Extract entities if an extractor model is configured.
+	entityResult, err := entityExtraction.Run(context.Background(), sections)
+	if err != nil {
+		return fmt.Errorf("entity extraction failed: %w", err)
 	}
+
+	// Convert sections to records map, enriching sections with extraction results when configured.
+	records := exampleentity.BuildRecords(sections, entityResult)
 
 	// Write to JSON file
 	fmt.Printf("Writing %d records to %s...\n", len(records), *outputFile)
@@ -133,7 +140,7 @@ func prepareCmd(args []string) error {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
-	fmt.Printf("✓ Prepared data written to %s\n", *outputFile)
+	fmt.Printf("Prepared data written to %s\n", *outputFile)
 	return nil
 }
 
@@ -171,36 +178,7 @@ func loadCmd(args []string) error {
 	fmt.Printf("Input: %s\n", *inputFile)
 	fmt.Printf("Dry run: %v\n\n", *dryRun)
 
-	// Create table if requested
-	if *createTable {
-		fmt.Printf("Creating table '%s' with %d shards...\n", *tableName, *numShards)
-
-		// Create embedding index configuration
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
-		if err != nil {
-			return fmt.Errorf("failed to create embedding index config: %w", err)
-		}
-
-		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
-			NumShards: uint(*numShards),
-			Indexes: map[string]antfly.IndexConfig{
-				"embeddings": *embeddingIndex,
-			},
-		})
-		if err != nil {
-			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
-		} else {
-			fmt.Printf("✓ Table created with BM25 and embedding indexes (%s with %s chunking)\n\n",
-				*embeddingModel, *chunkerModel)
-		}
-
-		// Wait for shards to be ready
-		if err := waitForShardsReady(ctx, client, *tableName, 30*time.Second); err != nil {
-			return fmt.Errorf("error waiting for shards: %w", err)
-		}
-	}
-
-	// Read JSON file
+	// Read JSON file first (needed to detect entity records for graph index)
 	fmt.Printf("Reading records from %s...\n", *inputFile)
 	jsonData, err := os.ReadFile(*inputFile)
 	if err != nil {
@@ -213,7 +191,36 @@ func loadCmd(args []string) error {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
-	fmt.Printf("✓ Loaded %d records\n\n", len(records))
+	fmt.Printf("Loaded %d records\n\n", len(records))
+
+	// Create table if requested
+	if *createTable {
+		fmt.Printf("Creating table '%s' with %d shards...\n", *tableName, *numShards)
+
+		// Create embedding index configuration
+		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
+		if err != nil {
+			return fmt.Errorf("failed to create embedding index config: %w", err)
+		}
+
+		indexes := map[string]antfly.IndexConfig{
+			"embeddings": *embeddingIndex,
+		}
+
+		// Auto-detect entity records and add graph index
+		if exampleentity.HasEntityRecords(records) {
+			graphIndex, err := createGraphIndex()
+			if err != nil {
+				return fmt.Errorf("failed to create graph index config: %w", err)
+			}
+			indexes["knowledge"] = *graphIndex
+			fmt.Printf("Detected entity records, adding knowledge graph index\n")
+		}
+
+		if err := createTableWithIndexes(ctx, client, *tableName, *numShards, indexes); err != nil {
+			return fmt.Errorf("error creating table: %w", err)
+		}
+	}
 
 	// Perform batched linear merge
 	finalCursor, err := performBatchedLinearMerge(ctx, client, *tableName, records, *batchSize, *dryRun)
@@ -233,11 +240,11 @@ func loadCmd(args []string) error {
 		if err != nil {
 			return fmt.Errorf("final cleanup failed: %w", err)
 		}
-		fmt.Printf("✓ Final cleanup completed in %s\n", cleanupResult.Took)
+		fmt.Printf("Final cleanup completed in %s\n", cleanupResult.Took)
 		fmt.Printf("  Deleted: %d orphaned documents\n", cleanupResult.Deleted)
 	}
 
-	fmt.Printf("\n✓ Load completed successfully\n")
+	fmt.Printf("\nLoad completed successfully\n")
 	return nil
 }
 
@@ -259,6 +266,8 @@ func syncCmd(args []string) error {
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens for chunking")
 
+	entityExtraction := exampleentity.RegisterFlags(fs)
+
 	var includePatterns StringSliceFlag
 	var excludePatterns StringSliceFlag
 	fs.Var(&includePatterns, "include", "Include pattern (can be repeated, supports ** wildcards)")
@@ -270,6 +279,15 @@ func syncCmd(args []string) error {
 
 	if *dirPath == "" {
 		return fmt.Errorf("--dir flag is required")
+	}
+
+	// Verify path exists and is a directory before any remote operations
+	fileInfo, err := os.Stat(*dirPath)
+	if err != nil {
+		return fmt.Errorf("failed to access path: %w", err)
+	}
+	if !fileInfo.IsDir() {
+		return fmt.Errorf("--dir must be a directory")
 	}
 
 	ctx := context.Background()
@@ -291,6 +309,7 @@ func syncCmd(args []string) error {
 	if len(excludePatterns) > 0 {
 		fmt.Printf("Exclude patterns: %v\n", excludePatterns)
 	}
+	entityExtraction.Print(os.Stdout)
 	fmt.Printf("\n")
 
 	// Create table if requested
@@ -303,33 +322,22 @@ func syncCmd(args []string) error {
 			return fmt.Errorf("failed to create embedding index config: %w", err)
 		}
 
-		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
-			NumShards: uint(*numShards),
-			Indexes: map[string]antfly.IndexConfig{
-				"embeddings": *embeddingIndex,
-			},
-		})
-		if err != nil {
-			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
-		} else {
-			fmt.Printf("✓ Table created with BM25 and embedding indexes (%s with %s chunking)\n\n",
-				*embeddingModel, *chunkerModel)
+		indexes := map[string]antfly.IndexConfig{
+			"embeddings": *embeddingIndex,
 		}
 
-		// Wait for shards to be ready
-		if err := waitForShardsReady(ctx, client, *tableName, 30*time.Second); err != nil {
-			return fmt.Errorf("error waiting for shards: %w", err)
+		// Add a graph index when extraction is enabled.
+		if entityExtraction.Enabled() {
+			graphIndex, err := createGraphIndex()
+			if err != nil {
+				return fmt.Errorf("failed to create graph index config: %w", err)
+			}
+			indexes["knowledge"] = *graphIndex
 		}
-	}
 
-	// Verify path exists and is a directory
-	fileInfo, err := os.Stat(*dirPath)
-	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
-	}
-
-	if !fileInfo.IsDir() {
-		return fmt.Errorf("--dir must be a directory")
+		if err := createTableWithIndexes(ctx, client, *tableName, *numShards, indexes); err != nil {
+			return fmt.Errorf("error creating table: %w", err)
+		}
 	}
 
 	// Create filesystem source and processor using library
@@ -348,7 +356,7 @@ func syncCmd(args []string) error {
 		return fmt.Errorf("failed to process directory: %w", err)
 	}
 
-	fmt.Printf("✓ Found %d documents\n\n", len(sections))
+	fmt.Printf("Found %d documents\n\n", len(sections))
 
 	if len(sections) == 0 {
 		return fmt.Errorf("no supported files found in directory")
@@ -378,11 +386,14 @@ func syncCmd(args []string) error {
 	}
 	fmt.Printf("\n")
 
-	// Convert sections to records map
-	records := make(map[string]any)
-	for _, section := range sections {
-		records[section.ID] = section.ToDocument()
+	// Extract entities if an extractor model is configured.
+	entityResult, err := entityExtraction.Run(ctx, sections)
+	if err != nil {
+		return fmt.Errorf("entity extraction failed: %w", err)
 	}
+
+	// Convert sections to records map, enriching sections with extraction results when configured.
+	records := exampleentity.BuildRecords(sections, entityResult)
 
 	// Perform batched linear merge
 	finalCursor, err := performBatchedLinearMerge(ctx, client, *tableName, records, *batchSize, *dryRun)
@@ -402,11 +413,11 @@ func syncCmd(args []string) error {
 		if err != nil {
 			return fmt.Errorf("final cleanup failed: %w", err)
 		}
-		fmt.Printf("✓ Final cleanup completed in %s\n", cleanupResult.Took)
+		fmt.Printf("Final cleanup completed in %s\n", cleanupResult.Took)
 		fmt.Printf("  Deleted: %d orphaned documents\n", cleanupResult.Deleted)
 	}
 
-	fmt.Printf("\n✓ Sync completed successfully\n")
+	fmt.Printf("\nSync completed successfully\n")
 	return nil
 }
 
@@ -432,9 +443,11 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 	// Model can be "fixed-bert-tokenizer", "fixed-bpe-tokenizer", or any ONNX model directory name
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
-		Model:         chunkerModel,
-		TargetTokens:  targetTokens,
-		OverlapTokens: overlapTokens,
+		Model: chunkerModel,
+		Text: antfly.TextChunkOptions{
+			TargetTokens:  targetTokens,
+			OverlapTokens: overlapTokens,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure chunker: %w", err)
@@ -455,6 +468,59 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 }
 
 // ANCHOR_END: create_embedding_index
+
+// createGraphIndex creates a graph index for entity and relation enrichment.
+func createGraphIndex() (*antfly.IndexConfig, error) {
+	graphIndexConfig := antfly.IndexConfig{
+		Name: "knowledge",
+		Type: antfly.IndexTypeGraph,
+	}
+
+	err := graphIndexConfig.FromGraphIndexConfig(antfly.GraphIndexConfig{
+		EdgeTypes: []antfly.EdgeTypeConfig{
+			{
+				Name:  "mentions_entity",
+				Field: "entities",
+			},
+			{
+				Name:  "mentions_relation",
+				Field: "relations",
+			},
+			{
+				Name:  "relation_head",
+				Field: "head_entity",
+			},
+			{
+				Name:  "relation_tail",
+				Field: "tail_entity",
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &graphIndexConfig, nil
+}
+
+// createTableWithIndexes creates the table, logs the result, and waits for shards to be ready.
+func createTableWithIndexes(ctx context.Context, client *antfly.AntflyClient, tableName string, numShards int, indexes map[string]antfly.IndexConfig) error {
+	err := client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+		NumShards: uint(numShards),
+		Indexes:   indexes,
+	})
+	if err != nil {
+		log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
+	} else {
+		indexNames := make([]string, 0, len(indexes))
+		for name := range indexes {
+			indexNames = append(indexNames, name)
+		}
+		fmt.Printf("Table created with indexes: %s\n\n", strings.Join(indexNames, ", "))
+	}
+
+	return waitForShardsReady(ctx, client, tableName, 30*time.Second)
+}
 
 // ANCHOR: batched_linear_merge
 // performBatchedLinearMerge performs LinearMerge in batches with progress logging
@@ -587,7 +653,7 @@ func waitForShardsReady(ctx context.Context, client *antfly.AntflyClient, tableN
 			if len(status.Shards) > 0 {
 				// Wait longer to ensure leader election completes and propagates
 				if pollCount >= 6 {
-					fmt.Printf("✓ Shards ready after %d polls (~%dms)\n\n", pollCount, pollCount*500)
+					fmt.Printf("Shards ready after %d polls (~%dms)\n\n", pollCount, pollCount*500)
 					return nil
 				}
 				fmt.Printf("  [Poll %d] Found %d shard(s), waiting for leader status to propagate\n", pollCount, len(status.Shards))
@@ -612,10 +678,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Prepare data\n")
 		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json\n\n")
+		fmt.Fprintf(os.Stderr, "  # Prepare with recognizer-based entity extraction\n")
+		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-model fastino/gliner2-base-v1 \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-kind recognizer \\\n")
+		fmt.Fprintf(os.Stderr, "    --entity-label technology --entity-label concept --entity-label api_endpoint\n\n")
+		fmt.Fprintf(os.Stderr, "  # Prepare with relation extraction\n")
+		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-model some-relations-model \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-kind recognizer --extractor-relations \\\n")
+		fmt.Fprintf(os.Stderr, "    --relation-label depends_on --relation-label implements\n\n")
 		fmt.Fprintf(os.Stderr, "  # Load prepared data\n")
 		fmt.Fprintf(os.Stderr, "  docsaf load --input docs.json --table docs --create-table\n\n")
-		fmt.Fprintf(os.Stderr, "  # Full pipeline\n")
-		fmt.Fprintf(os.Stderr, "  docsaf sync --dir /path/to/docs --table docs --create-table\n\n")
+		fmt.Fprintf(os.Stderr, "  # Full pipeline with generator-based extraction + knowledge graph\n")
+		fmt.Fprintf(os.Stderr, "  docsaf sync --dir /path/to/docs --table docs --create-table \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-model functiongemma-270m-it \\\n")
+		fmt.Fprintf(os.Stderr, "    --extractor-kind generator \\\n")
+		fmt.Fprintf(os.Stderr, "    --entity-label technology --entity-label concept\n\n")
 		os.Exit(1)
 	}
 

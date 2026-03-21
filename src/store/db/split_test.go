@@ -15,21 +15,30 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/antflydb/antfly/lib/chunking"
+	"github.com/antflydb/antfly/lib/encoding"
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
+	"github.com/antflydb/antfly/lib/vector"
+	"github.com/antflydb/antfly/lib/vector/testutils"
 	"github.com/antflydb/antfly/lib/vectorindex"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store/db/indexes"
+	"github.com/antflydb/antfly/src/store/storeutils"
+	"github.com/blevesearch/bleve/v2"
+	blevequery "github.com/blevesearch/bleve/v2/search/query"
 	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -646,4 +655,576 @@ func TestSplitUnboundedRange(t *testing.T) {
 
 	// Clean up
 	require.NoError(t, srcDB.Close())
+}
+
+func TestSplitPrepareOnlyCheckpointedArchiveHasCleanMetadata(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	ctx := context.Background()
+
+	baseDir := t.TempDir()
+	srcDir := filepath.Join(baseDir, "src")
+	destDir1 := filepath.Join(baseDir, "dest1")
+	destDir2 := filepath.Join(baseDir, "dest2")
+
+	require.NoError(t, os.MkdirAll(srcDir, os.ModePerm))
+	require.NoError(t, os.MkdirAll(destDir1, os.ModePerm))
+	require.NoError(t, os.MkdirAll(destDir2, os.ModePerm))
+
+	schema := &schema.TableSchema{
+		DefaultType: "default",
+		DocumentSchemas: map[string]schema.DocumentSchema{
+			"default": {
+				Schema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":      map[string]any{"type": "string"},
+						"content": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+	}
+
+	fullRange := types.Range{[]byte("\x00"), []byte("\xFF")}
+	splitKey := []byte("key:00002")
+	range2 := types.Range{splitKey, fullRange[1]}
+
+	srcDB := &DBImpl{
+		logger:       logger,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+	require.NoError(t, srcDB.Open(srcDir, false, schema, fullRange))
+	defer srcDB.Close()
+
+	bleveIndexConfig := indexes.NewFullTextIndexConfig("full_text_index", false)
+	require.NoError(t, srcDB.AddIndex(*bleveIndexConfig))
+
+	writes := make([][2][]byte, 0, 4)
+	for i := range 4 {
+		key := fmt.Sprintf("key:%05d", i)
+		doc := testDocument{
+			ID:      key,
+			Content: fmt.Sprintf("doc %d", i),
+		}
+		docJSON, err := json.Marshal(doc)
+		require.NoError(t, err)
+		writes = append(writes, [2][]byte{[]byte(key), docJSON})
+	}
+	require.NoError(t, srcDB.Batch(ctx, writes, nil, Op_SyncLevelPropose))
+	require.NoError(t, srcDB.pdb.Flush())
+
+	require.NoError(t, srcDB.SetSplitState(SplitState_builder{
+		Phase:            SplitState_PHASE_PREPARE,
+		SplitKey:         splitKey,
+		OriginalRangeEnd: fullRange[1],
+	}.Build()))
+	require.NoError(t, srcDB.SetSplitDeltaFinalSeq(42))
+
+	require.NoError(t, srcDB.Split(fullRange, splitKey, destDir1, destDir2, true))
+
+	childDB := &DBImpl{
+		logger:       logger,
+		antflyConfig: &common.Config{},
+	}
+	require.NoError(t, childDB.Open(destDir2, false, nil, types.Range{}))
+	defer childDB.Close()
+
+	childRange, err := childDB.GetRange()
+	require.NoError(t, err)
+	require.Equal(t, range2, childRange)
+
+	doc, err := childDB.Get(ctx, []byte("key:00002"))
+	require.NoError(t, err)
+	require.Equal(t, "key:00002", doc["id"])
+
+	_, err = childDB.Get(ctx, []byte("key:00001"))
+	require.Error(t, err)
+
+	require.Nil(t, childDB.GetSplitState())
+	finalSeq, err := childDB.GetSplitDeltaFinalSeq()
+	require.NoError(t, err)
+	require.Zero(t, finalSeq)
+	seq, err := childDB.GetSplitDeltaSeq()
+	require.NoError(t, err)
+	require.Zero(t, seq)
+
+	childIndexes := childDB.GetIndexes()
+	require.Contains(t, childIndexes, "full_text_index")
+}
+
+func TestOptimizeSplitBleveDocIDRequest(t *testing.T) {
+	t.Run("PrimaryOnly", func(t *testing.T) {
+		req := bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"aaa", "bbb"}))
+		optimized, route, ok := optimizeSplitBleveDocIDRequest(req, []byte("m"))
+		require.True(t, ok)
+		require.Equal(t, "primary", route)
+		optimizedReq, ok := optimized.(*bleve.SearchRequest)
+		require.True(t, ok)
+		docQuery, ok := optimizedReq.Query.(*blevequery.DocIDQuery)
+		require.True(t, ok)
+		require.Equal(t, []string{"aaa", "bbb"}, docQuery.IDs)
+	})
+
+	t.Run("ShadowOnly", func(t *testing.T) {
+		req := bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"mmm", "zzz"}))
+		optimized, route, ok := optimizeSplitBleveDocIDRequest(req, []byte("m"))
+		require.True(t, ok)
+		require.Equal(t, "shadow", route)
+		optimizedReq, ok := optimized.(*bleve.SearchRequest)
+		require.True(t, ok)
+		docQuery, ok := optimizedReq.Query.(*blevequery.DocIDQuery)
+		require.True(t, ok)
+		require.Equal(t, []string{"mmm", "zzz"}, docQuery.IDs)
+	})
+
+	t.Run("MixedDocIDsUnchanged", func(t *testing.T) {
+		req := bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"aaa", "zzz"}))
+		optimized, route, ok := optimizeSplitBleveDocIDRequest(req, []byte("m"))
+		require.False(t, ok)
+		require.Empty(t, route)
+		require.Same(t, req, optimized)
+	})
+}
+
+func TestFinalizeSplitPrunesParentFullTextIndex(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	ctx := context.Background()
+
+	baseDir := t.TempDir()
+	srcDir := filepath.Join(baseDir, "src")
+	require.NoError(t, os.MkdirAll(srcDir, os.ModePerm))
+
+	tableSchema := &schema.TableSchema{
+		DefaultType: "default",
+		DocumentSchemas: map[string]schema.DocumentSchema{
+			"default": {
+				Schema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":      map[string]any{"type": "string"},
+						"content": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+	}
+
+	fullRange := types.Range{[]byte("\x00"), []byte("\xFF")}
+	splitKey := []byte("key:00002")
+	parentRange := types.Range{fullRange[0], splitKey}
+
+	db := &DBImpl{
+		logger:       logger,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+	require.NoError(t, db.Open(srcDir, false, tableSchema, fullRange))
+	defer db.Close()
+
+	bleveIndexConfig := indexes.NewFullTextIndexConfig("full_text_index", false)
+	require.NoError(t, db.AddIndex(*bleveIndexConfig))
+
+	writes := make([][2][]byte, 0, 2)
+	for key, content := range map[string]string{
+		"key:00001": "retained document",
+		"key:00003": "split document",
+	} {
+		docJSON, err := json.Marshal(testDocument{
+			ID:      key,
+			Content: content,
+		})
+		require.NoError(t, err)
+		writes = append(writes, [2][]byte{[]byte(key), docJSON})
+	}
+	err := db.Batch(ctx, writes, nil, Op_SyncLevelFullText)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+	require.NoError(t, db.pdb.Flush())
+
+	beforeFinalizeRaw, err := db.indexManager.Search(ctx, "full_text_index",
+		bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"key:00003"})))
+	require.NoError(t, err)
+	beforeFinalize, ok := beforeFinalizeRaw.(*bleve.SearchResult)
+	require.True(t, ok)
+	require.Len(t, beforeFinalize.Hits, 1)
+	require.Equal(t, "key:00003", beforeFinalize.Hits[0].ID)
+
+	require.NoError(t, db.SetSplitState(SplitState_builder{
+		Phase:            SplitState_PHASE_PREPARE,
+		SplitKey:         splitKey,
+		OriginalRangeEnd: fullRange[1],
+	}.Build()))
+	require.NoError(t, db.SetRange(parentRange))
+	require.NoError(t, db.FinalizeSplit(parentRange))
+
+	afterFinalizeRaw, err := db.indexManager.Search(ctx, "full_text_index",
+		bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"key:00003"})))
+	require.NoError(t, err)
+	afterFinalize, ok := afterFinalizeRaw.(*bleve.SearchResult)
+	require.True(t, ok)
+	require.Empty(t, afterFinalize.Hits)
+
+	retainedRaw, err := db.indexManager.Search(ctx, "full_text_index",
+		bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"key:00001"})))
+	require.NoError(t, err)
+	retained, ok := retainedRaw.(*bleve.SearchResult)
+	require.True(t, ok)
+	require.Len(t, retained.Hits, 1)
+	require.Equal(t, "key:00001", retained.Hits[0].ID)
+
+	_, err = db.Get(ctx, []byte("key:00003"))
+	require.Error(t, err)
+}
+
+func TestFinalizeSplitPrunesParentChunkedVectorIndex(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	ctx := context.Background()
+
+	baseDir := t.TempDir()
+	srcDir := filepath.Join(baseDir, "src")
+	require.NoError(t, os.MkdirAll(srcDir, os.ModePerm))
+
+	fullRange := types.Range{[]byte("\x00"), []byte("\xFF")}
+	splitKey := []byte("key:00002")
+	parentRange := types.Range{fullRange[0], splitKey}
+	indexName := "chunked_embedding_index"
+
+	db := &DBImpl{
+		logger:       logger,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+	require.NoError(t, db.Open(srcDir, false, nil, fullRange))
+	defer db.Close()
+
+	idxCfg := indexes.NewEmbeddingsConfig(indexName, indexes.EmbeddingsIndexConfig{
+		Dimension: 3,
+		Field:     "content",
+		Chunker: &chunking.ChunkerConfig{
+			Provider:    chunking.ChunkerProviderMock,
+			StoreChunks: true,
+		},
+	})
+	require.NoError(t, db.AddIndex(*idxCfg))
+
+	docWrites := make([][2][]byte, 0, 2)
+	for _, key := range []string{"key:00001", "key:00003"} {
+		docJSON, err := json.Marshal(map[string]any{"content": key})
+		require.NoError(t, err)
+		docWrites = append(docWrites, [2][]byte{[]byte(key), docJSON})
+	}
+	err := db.Batch(ctx, docWrites, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	buildChunkWrites := func(docKey []byte, chunkID uint32, emb vector.T, text string) [][2][]byte {
+		chunkKey := storeutils.MakeChunkKey(docKey, indexName, chunkID)
+		chunkJSON, err := json.Marshal(chunking.NewTextChunk(chunkID, text, 0, len(text)))
+		require.NoError(t, err)
+		chunkValue := make([]byte, 0, len(chunkJSON)+8)
+		chunkValue = encoding.EncodeUint64Ascending(chunkValue, xxhash.Sum64String(text))
+		chunkValue = append(chunkValue, chunkJSON...)
+
+		embKey := append(bytes.Clone(chunkKey), fmt.Appendf(nil, ":i:%s:e", indexName)...)
+		embValue, err := vectorindex.EncodeEmbeddingWithHashID(nil, emb, xxhash.Sum64(chunkKey))
+		require.NoError(t, err)
+
+		return [][2][]byte{
+			{chunkKey, chunkValue},
+			{embKey, embValue},
+		}
+	}
+
+	chunkWrites := append(
+		buildChunkWrites([]byte("key:00001"), 0, vector.T{0.0, 1.0, 0.0}, "retained chunk"),
+		buildChunkWrites([]byte("key:00003"), 0, vector.T{1.0, 0.0, 0.0}, "split chunk")...,
+	)
+	err = db.Batch(ctx, chunkWrites, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	searchReq := &vectorindex.SearchRequest{
+		K:         10,
+		Embedding: vector.T{1.0, 0.0, 0.0},
+	}
+	beforeRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	before := beforeRaw.(*vectorindex.SearchResult)
+	require.NotEmpty(t, before.Hits)
+	require.Contains(t, before.Hits[0].ID, "key:00003")
+
+	require.NoError(t, db.SetSplitState(SplitState_builder{
+		Phase:            SplitState_PHASE_PREPARE,
+		SplitKey:         splitKey,
+		OriginalRangeEnd: fullRange[1],
+	}.Build()))
+	require.NoError(t, db.SetRange(parentRange))
+	require.NoError(t, db.FinalizeSplit(parentRange))
+
+	afterSplitRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	afterSplit := afterSplitRaw.(*vectorindex.SearchResult)
+	for _, hit := range afterSplit.Hits {
+		require.NotContains(t, hit.ID, "key:00003")
+	}
+
+	retainedRaw, err := db.indexManager.Search(ctx, indexName, &vectorindex.SearchRequest{
+		K:         10,
+		Embedding: vector.T{0.0, 1.0, 0.0},
+	})
+	require.NoError(t, err)
+	retained := retainedRaw.(*vectorindex.SearchResult)
+	require.NotEmpty(t, retained.Hits)
+	require.Contains(t, retained.Hits[0].ID, "key:00001")
+}
+
+func TestFinalizeSplitPrunesParentChunkedVectorIndexWhenDocKeyContainsIndexMarker(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	ctx := context.Background()
+
+	baseDir := t.TempDir()
+	srcDir := filepath.Join(baseDir, "src")
+	require.NoError(t, os.MkdirAll(srcDir, os.ModePerm))
+
+	fullRange := types.Range{[]byte("\x00"), []byte("\xFF")}
+	splitKey := []byte("m")
+	parentRange := types.Range{fullRange[0], splitKey}
+	indexName := "chunked_embedding_index"
+
+	db := &DBImpl{
+		logger:       logger,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+	require.NoError(t, db.Open(srcDir, false, nil, fullRange))
+	defer db.Close()
+
+	idxCfg := indexes.NewEmbeddingsConfig(indexName, indexes.EmbeddingsIndexConfig{
+		Dimension: 3,
+		Field:     "content",
+		Chunker: &chunking.ChunkerConfig{
+			Provider:    chunking.ChunkerProviderMock,
+			StoreChunks: true,
+		},
+	})
+	require.NoError(t, db.AddIndex(*idxCfg))
+
+	retainedDocKey := []byte("alpha:i:1")
+	splitDocKey := []byte("zeta:i:42")
+
+	docWrites := make([][2][]byte, 0, 2)
+	for _, key := range [][]byte{retainedDocKey, splitDocKey} {
+		docJSON, err := json.Marshal(map[string]any{"content": string(key)})
+		require.NoError(t, err)
+		docWrites = append(docWrites, [2][]byte{key, docJSON})
+	}
+	err := db.Batch(ctx, docWrites, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	buildChunkWrites := func(docKey []byte, chunkID uint32, emb vector.T, text string) [][2][]byte {
+		chunkKey := storeutils.MakeChunkKey(docKey, indexName, chunkID)
+		chunkJSON, err := json.Marshal(chunking.NewTextChunk(chunkID, text, 0, len(text)))
+		require.NoError(t, err)
+		chunkValue := make([]byte, 0, len(chunkJSON)+8)
+		chunkValue = encoding.EncodeUint64Ascending(chunkValue, xxhash.Sum64String(text))
+		chunkValue = append(chunkValue, chunkJSON...)
+
+		embKey := append(bytes.Clone(chunkKey), fmt.Appendf(nil, ":i:%s:e", indexName)...)
+		embValue, err := vectorindex.EncodeEmbeddingWithHashID(nil, emb, xxhash.Sum64(chunkKey))
+		require.NoError(t, err)
+
+		return [][2][]byte{
+			{chunkKey, chunkValue},
+			{embKey, embValue},
+		}
+	}
+
+	chunkWrites := append(
+		buildChunkWrites(retainedDocKey, 0, vector.T{0.0, 1.0, 0.0}, "retained chunk"),
+		buildChunkWrites(splitDocKey, 0, vector.T{1.0, 0.0, 0.0}, "split chunk")...,
+	)
+	err = db.Batch(ctx, chunkWrites, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	searchReq := &vectorindex.SearchRequest{
+		K:         10,
+		Embedding: vector.T{1.0, 0.0, 0.0},
+	}
+	beforeRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	before := beforeRaw.(*vectorindex.SearchResult)
+	require.NotEmpty(t, before.Hits)
+	require.Contains(t, before.Hits[0].ID, string(splitDocKey))
+
+	require.NoError(t, db.SetSplitState(SplitState_builder{
+		Phase:            SplitState_PHASE_PREPARE,
+		SplitKey:         splitKey,
+		OriginalRangeEnd: fullRange[1],
+	}.Build()))
+	require.NoError(t, db.SetRange(parentRange))
+	require.NoError(t, db.FinalizeSplit(parentRange))
+
+	afterSplitRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	afterSplit := afterSplitRaw.(*vectorindex.SearchResult)
+	for _, hit := range afterSplit.Hits {
+		require.NotContains(t, hit.ID, string(splitDocKey))
+	}
+
+	retainedRaw, err := db.indexManager.Search(ctx, indexName, &vectorindex.SearchRequest{
+		K:         10,
+		Embedding: vector.T{0.0, 1.0, 0.0},
+	})
+	require.NoError(t, err)
+	retained := retainedRaw.(*vectorindex.SearchResult)
+	require.NotEmpty(t, retained.Hits)
+	require.Contains(t, retained.Hits[0].ID, string(retainedDocKey))
+}
+
+func TestFinalizeSplitPreservesParentVectorRecall(t *testing.T) {
+	ctx := context.Background()
+
+	const (
+		indexName     = "test_idx"
+		dataCount     = 900
+		retainedCount = 450
+		queryCount    = 100
+		topK          = 10
+		minAvgRecall  = 0.93
+		waitTimeout   = 30 * time.Second
+		waitFrequency = 200 * time.Millisecond
+	)
+
+	logger := zaptest.NewLogger(t)
+	baseDir := t.TempDir()
+	srcDir := filepath.Join(baseDir, "src")
+	require.NoError(t, os.MkdirAll(srcDir, os.ModePerm))
+
+	fullRange := types.Range{[]byte("\x00"), []byte("\xFF")}
+	db := &DBImpl{
+		logger:       logger,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+	require.NoError(t, db.Open(srcDir, false, nil, fullRange))
+	require.NoError(t, db.AddIndex(*indexes.NewEmbeddingsConfig(indexName, indexes.EmbeddingsIndexConfig{
+		Dimension: 20,
+		Field:     "content",
+	})))
+	dir := srcDir
+	defer db.Close()
+	defer os.RemoveAll(dir)
+
+	dataset := testutils.LoadDataset(t, testutils.RandomDataset20d)
+	dataVectors := dataset.Slice(0, dataCount)
+	retainedVectors := dataVectors.Slice(0, retainedCount)
+	queryVectors := dataset.Slice(dataCount, queryCount)
+
+	writes := make([][2][]byte, 0, dataCount)
+	retainedKeys := make([]string, 0, retainedCount)
+	for i := range dataCount {
+		key := []byte(fmt.Sprintf("key:%04d", i))
+		if i < retainedCount {
+			retainedKeys = append(retainedKeys, string(key))
+		}
+
+		docJSON, err := json.Marshal(map[string]any{
+			"content": fmt.Sprintf("split recall doc %d", i),
+			"_embeddings": map[string]any{
+				indexName: slices.Clone(dataVectors.At(i)),
+			},
+		})
+		require.NoError(t, err)
+		writes = append(writes, [2][]byte{key, docJSON})
+	}
+
+	err := db.Batch(ctx, writes, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	idx := db.indexManager.GetIndex(indexName)
+	require.NotNil(t, idx)
+	embIdx, ok := idx.(*indexes.EmbeddingIndex)
+	require.True(t, ok, "Index should be an EmbeddingIndex")
+	waitForEmbeddingIndexTotalIndexed(t, embIdx, dataCount, waitTimeout, waitFrequency)
+
+	splitKey := []byte(fmt.Sprintf("key:%04d", retainedCount))
+	parentRange := types.Range{fullRange[0], splitKey}
+
+	require.NoError(t, db.SetSplitState(SplitState_builder{
+		Phase:            SplitState_PHASE_PREPARE,
+		SplitKey:         splitKey,
+		OriginalRangeEnd: fullRange[1],
+	}.Build()))
+	require.NoError(t, db.SetRange(parentRange))
+	require.NoError(t, db.FinalizeSplit(parentRange))
+
+	avgRecall, err := calculateIndexManagerVectorRecall(
+		ctx,
+		db,
+		indexName,
+		queryVectors,
+		retainedVectors,
+		retainedKeys,
+		topK,
+	)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, avgRecall, minAvgRecall,
+		"expected post-split average recall >= %.2f, got %.4f", minAvgRecall, avgRecall)
+}
+
+func calculateIndexManagerVectorRecall(
+	ctx context.Context,
+	db *DBImpl,
+	indexName string,
+	queryVectors *vector.Set,
+	dataVectors *vector.Set,
+	dataKeys []string,
+	topK int,
+) (float64, error) {
+	var recallSum float64
+
+	for i := range int(queryVectors.GetCount()) {
+		queryVec := slices.Clone(queryVectors.At(i))
+		raw, err := db.indexManager.Search(ctx, indexName, &vectorindex.SearchRequest{
+			K:         topK,
+			Embedding: queryVec,
+		})
+		if err != nil {
+			return 0, fmt.Errorf("index manager search query %d: %w", i, err)
+		}
+
+		result, ok := raw.(*vectorindex.SearchResult)
+		if !ok {
+			return 0, fmt.Errorf("unexpected vector search result type %T", raw)
+		}
+		if len(result.Hits) < topK {
+			return 0, fmt.Errorf("vector search returned %d hits, expected at least %d", len(result.Hits), topK)
+		}
+
+		prediction := make([]string, 0, topK)
+		for _, hit := range result.Hits[:topK] {
+			prediction = append(prediction, hit.ID)
+		}
+
+		truth := testutils.CalculateTruth(
+			topK,
+			vector.DistanceMetric_L2Squared,
+			queryVec,
+			dataVectors,
+			dataKeys,
+		)
+		recallSum += testutils.CalculateRecall(prediction, truth)
+	}
+
+	return recallSum / float64(queryVectors.GetCount()), nil
 }

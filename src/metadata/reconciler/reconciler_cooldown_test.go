@@ -204,6 +204,8 @@ func TestComputeSplitTransitions_WithCooldown(t *testing.T) {
 		3, shards, 500*1024*1024, 100, shardCooldown,
 		func(ctx context.Context, id types.ID) ([]byte, error) { return []byte("median"), nil },
 		mockTime,
+		1,
+		1,
 	)
 
 	assert.Empty(t, splits, "Should not split during cooldown")
@@ -217,6 +219,8 @@ func TestComputeSplitTransitions_WithCooldown(t *testing.T) {
 		3, shards, 500*1024*1024, 100, shardCooldown,
 		func(ctx context.Context, id types.ID) ([]byte, error) { return []byte("median"), nil },
 		mockTime,
+		1,
+		1,
 	)
 
 	assert.NotEmpty(t, splits, "Should split after cooldown expires")
@@ -337,6 +341,8 @@ func TestCooldownPreventsRapidSplits(t *testing.T) {
 		reconciler.shardCooldown,
 		getMedianKey,
 		mockTime,
+		1,
+		1,
 	)
 	assert.Len(t, splits, 1, "First split should be planned")
 
@@ -353,6 +359,8 @@ func TestCooldownPreventsRapidSplits(t *testing.T) {
 		reconciler.shardCooldown,
 		getMedianKey,
 		mockTime,
+		1,
+		1,
 	)
 	assert.Empty(t, splits, "Split should be blocked by cooldown")
 
@@ -367,6 +375,8 @@ func TestCooldownPreventsRapidSplits(t *testing.T) {
 		reconciler.shardCooldown,
 		getMedianKey,
 		mockTime,
+		1,
+		1,
 	)
 	assert.Len(t, splits, 1, "Split should be allowed after cooldown")
 }

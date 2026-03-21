@@ -21,6 +21,7 @@ import (
 	"io"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
@@ -297,6 +298,66 @@ func (m *mockTransport) AddPeer(shardID, nodeID types.ID, us []string) {
 func (m *mockTransport) RemovePeer(_, _ types.ID)                          {}
 func (m *mockTransport) ServeRaft(_ types.ID, _ Raft, _ []raft.Peer) error { return nil }
 func (m *mockTransport) StopServeRaft(_ types.ID)                          {}
+
+type blockingProposeNode struct {
+	raft.Node
+	proposeStarted chan struct{}
+}
+
+func (m *blockingProposeNode) Propose(ctx context.Context, _ []byte) error {
+	close(m.proposeStarted)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (m *blockingProposeNode) Stop() {}
+
+func TestRaftNodeShutdownCancelsInflightProposal(t *testing.T) {
+	proposalCtx, cancel := context.WithCancel(context.Background())
+	errC := make(chan error)
+	node := &blockingProposeNode{proposeStarted: make(chan struct{})}
+	rc := &raftNode{
+		node:           node,
+		transport:      &mockTransport{},
+		errorC:         errC,
+		stopc:          make(chan struct{}),
+		logger:         zaptest.NewLogger(t),
+		serveCtxCancel: cancel,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- node.Propose(proposalCtx, []byte("blocked"))
+	}()
+
+	select {
+	case <-node.proposeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("proposal did not start")
+	}
+
+	rc.Shutdown()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("proposal did not exit after shutdown")
+	}
+
+	select {
+	case <-rc.stopc:
+	case <-time.After(time.Second):
+		t.Fatal("raft stop channel was not closed")
+	}
+
+	select {
+	case _, ok := <-errC:
+		require.False(t, ok, "error channel should be closed on shutdown")
+	case <-time.After(time.Second):
+		t.Fatal("error channel was not closed on shutdown")
+	}
+}
 
 // TestConfChangeAddNodeSelf verifies that ConfChangeAddNode for the local
 // node still calls ApplyConfChange to update the raft membership. This is a

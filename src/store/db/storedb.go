@@ -1163,6 +1163,7 @@ func (s *StoreDB) applyOpSplit(_ context.Context, split *SplitOp) error {
 		return fmt.Errorf("failed to split db: %w", err)
 	}
 	splitTime := time.Since(t)
+	splitPhaseDurationSeconds.WithLabelValues("apply_split_prepare").Observe(splitTime.Seconds())
 	s.logger.Info("SPLIT_ARCHIVE: Split completed, data staged for archive",
 		zap.Duration("splitDuration", splitTime))
 	t = time.Now()
@@ -1258,6 +1259,7 @@ func (s *StoreDB) applyOpSplit(_ context.Context, split *SplitOp) error {
 		}
 	}
 	archiveTime := time.Since(t)
+	splitPhaseDurationSeconds.WithLabelValues("apply_split_archive").Observe(archiveTime.Seconds())
 	s.logger.Info("SPLIT_ARCHIVE: Created snapshot archive for split-off shard",
 		zap.Int64("size", archiveInfo.Size()),
 		zap.String("archiveFile", archiveFile),
@@ -1363,6 +1365,10 @@ func (s *StoreDB) waitForLocalSplitChildReplay(newShardID types.ID, targetSeq ui
 }
 
 func (s *StoreDB) applyOpFinalizeSplit(_ context.Context, finalize *FinalizeSplitOp) error {
+	finalizeStart := time.Now()
+	defer func() {
+		splitPhaseDurationSeconds.WithLabelValues("apply_finalize_total").Observe(time.Since(finalizeStart).Seconds())
+	}()
 	if finalize == nil {
 		return errors.New("finalize split operation data is nil")
 	}
@@ -1437,9 +1443,11 @@ func (s *StoreDB) applyOpFinalizeSplit(_ context.Context, finalize *FinalizeSpli
 		zap.Stringer("newShardID", newShardID),
 		zap.Uint64("splitDeltaFinalSeq", finalSeq))
 
+	deleteStart := time.Now()
 	if err := s.coreDB.FinalizeSplit(currentRange); err != nil {
 		s.logger.Fatal("failed to finalize split", zap.Error(err))
 	}
+	splitPhaseDurationSeconds.WithLabelValues("apply_finalize_delete").Observe(time.Since(deleteStart).Seconds())
 
 	// Clear the Raft-replicated split state now that finalization is complete.
 	// This also clears pendingSplitKey (redundant since byteRange enforces boundary,

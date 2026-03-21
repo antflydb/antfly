@@ -23,6 +23,7 @@ import (
 	"github.com/antflydb/antfly/lib/ai/eval"
 	"github.com/antflydb/antfly/lib/query"
 	"github.com/antflydb/antfly/lib/schema"
+	generating "github.com/antflydb/antfly/pkg/generating"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/antflydb/antfly/src/usermgr"
 	"go.uber.org/zap"
@@ -261,7 +262,7 @@ func (t *TableApi) ExecuteQueryBuilder(ctx context.Context, req *QueryBuilderReq
 
 	// Get or create the generator config - use default chain if available
 	var generatorConfig ai.GeneratorConfig
-	defaultChain := ai.GetDefaultChain()
+	defaultChain := generating.GetDefaultChain()
 	if req.Generator.Provider != "" {
 		generatorConfig = req.Generator
 	} else if len(defaultChain) > 0 {

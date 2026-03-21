@@ -42,7 +42,7 @@ import (
 //	{{remoteMedia url=photoUrl}}
 //	{{/if}}
 //	{{#if pdfUrl}}
-//	PDF content: {{remotePDF url=pdfUrl output="text"}}
+//	PDF content: {{remotePDF url=pdfUrl}}
 //	{{/if}}
 //	Title: {{title}}
 //	Content: {{body}}

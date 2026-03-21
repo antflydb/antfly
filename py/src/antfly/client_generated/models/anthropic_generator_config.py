@@ -11,29 +11,17 @@ T = TypeVar("T", bound="AnthropicGeneratorConfig")
 
 @_attrs_define
 class AnthropicGeneratorConfig:
-    """Configuration for the Anthropic generative AI provider (Claude models).
+    """Configuration for the Anthropic generative AI provider.
 
-    API key via `api_key` field or `ANTHROPIC_API_KEY` environment variable.
-
-    **Example Models:** claude-sonnet-4-5-20250929 (default), claude-opus-4-5-20251101, claude-3-5-haiku-20241022
-
-    **Docs:** https://docs.anthropic.com/en/docs/about-claude/models/overview
-
-        Example:
-            {'provider': 'anthropic', 'model': 'claude-sonnet-4-5-20250929', 'temperature': 0.7, 'max_tokens': 4096}
-
-        Attributes:
-            model (str): The full model ID of the Anthropic model to use (e.g., 'claude-sonnet-4-5-20250929', 'claude-
-                opus-4-5-20251101'). Default: 'claude-sonnet-4-5-20250929'. Example: claude-sonnet-4-5-20250929.
-            api_key (Union[Unset, str]): The Anthropic API key. If not provided, falls back to ANTHROPIC_API_KEY environment
-                variable.
-            url (Union[Unset, str]): The URL of the Anthropic API endpoint (optional, uses default if not specified).
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-1.0). Higher values make output more
-                random.
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
-            top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-            top_k (Union[Unset, int]): Top-k sampling parameter. Only sample from the top K options for each subsequent
-                token.
+    Attributes:
+        model (str): The full model ID of the Anthropic model to use. Default: 'claude-sonnet-4-5-20250929'. Example:
+            claude-sonnet-4-5-20250929.
+        api_key (Union[Unset, str]): The Anthropic API key.
+        url (Union[Unset, str]): The URL of the Anthropic API endpoint.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-1.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
+        top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0).
+        top_k (Union[Unset, int]): Top-k sampling parameter.
     """
 
     model: str = "claude-sonnet-4-5-20250929"

@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/antflydb/antfly/lib/ai"
 	"github.com/antflydb/antfly/lib/embeddings"
 	"go.uber.org/zap"
 )
@@ -79,34 +78,29 @@ func (bc FullTextIndexConfig) Equal(oc FullTextIndexConfig) bool {
 	return bc.MemOnly == oc.MemOnly
 }
 
-// equalEmbedderConfig compares two EmbedderConfig pointers
-func equalEmbedderConfig(a, b *embeddings.EmbedderConfig) bool {
-	if a == nil && b == nil {
-		return true
+// normalizeDistanceMetric treats the zero value ("") as the default "l2_squared"
+// so that configs that omit the field compare equal to ones that set the default
+// explicitly. This prevents false mismatches from JSON omitempty round-trips.
+func normalizeDistanceMetric(dm DistanceMetric) DistanceMetric {
+	if dm == "" {
+		return DistanceMetricL2Squared
 	}
-	if a == nil || b == nil {
-		return false
-	}
-	return reflect.DeepEqual(a, b)
-}
-
-// equalGeneratorConfig compares two GeneratorConfig pointers using reflection
-func equalGeneratorConfig(a, b *ai.GeneratorConfig) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return reflect.DeepEqual(a, b)
+	return dm
 }
 
 func (ec EmbeddingsIndexConfig) Equal(oc EmbeddingsIndexConfig) bool {
-	if ec.MemOnly != oc.MemOnly || ec.Dimension != oc.Dimension ||
-		ec.Field != oc.Field || ec.Template != oc.Template || !equalEmbedderConfig(ec.Embedder, oc.Embedder) || !equalGeneratorConfig(ec.Summarizer, oc.Summarizer) {
-		return false
-	}
-	return true
+	return ec.MemOnly == oc.MemOnly &&
+		ec.Dimension == oc.Dimension &&
+		ec.Field == oc.Field &&
+		ec.Template == oc.Template &&
+		normalizeDistanceMetric(ec.DistanceMetric) == normalizeDistanceMetric(oc.DistanceMetric) &&
+		ec.Sparse == oc.Sparse &&
+		ec.ChunkSize == oc.ChunkSize &&
+		ec.MinWeight == oc.MinWeight &&
+		ec.TopK == oc.TopK &&
+		reflect.DeepEqual(ec.Embedder, oc.Embedder) &&
+		reflect.DeepEqual(ec.Summarizer, oc.Summarizer) &&
+		reflect.DeepEqual(ec.Chunker, oc.Chunker)
 }
 
 func (ic IndexConfig) Equal(oc IndexConfig) bool {
@@ -164,6 +158,8 @@ func (bc EmbeddingsIndexStats) Equal(oc EmbeddingsIndexStats) bool {
 	return bc.Error == oc.Error &&
 		bc.TotalIndexed == oc.TotalIndexed &&
 		bc.TotalNodes == oc.TotalNodes &&
+		bc.TotalTerms == oc.TotalTerms &&
+		bc.DiskUsage == oc.DiskUsage &&
 		bc.Rebuilding == oc.Rebuilding &&
 		bc.WalBacklog == oc.WalBacklog &&
 		bc.BackfillProgress == oc.BackfillProgress &&
@@ -174,7 +170,7 @@ func (gc GraphIndexConfig) Equal(oc GraphIndexConfig) bool {
 	return gc.MaxEdgesPerDocument == oc.MaxEdgesPerDocument &&
 		gc.Template == oc.Template &&
 		reflect.DeepEqual(gc.EdgeTypes, oc.EdgeTypes) &&
-		equalGeneratorConfig(gc.Summarizer, oc.Summarizer)
+		reflect.DeepEqual(gc.Summarizer, oc.Summarizer)
 }
 
 func (gc GraphIndexStats) Equal(oc GraphIndexStats) bool {

@@ -31,6 +31,18 @@ type SearchRequest struct {
 	DistanceOver  *float32 `json:"distance_over,omitempty"`
 	DistanceUnder *float32 `json:"distance_under,omitempty"`
 
+	// SearchEffort controls the recall vs latency tradeoff.
+	// Range: 0.0 (fastest) to 1.0 (highest recall). nil uses index defaults.
+	SearchEffort *float32 `json:"search_effort,omitempty"`
+
+	// SearchWidth, if set, overrides the index's configured SearchWidth
+	// (number of leaf clusters to explore).
+	SearchWidth *int `json:"search_width,omitempty"`
+
+	// Epsilon2, if set, overrides the index's configured Episilon2 for
+	// dynamic pruning.
+	Epsilon2 *float32 `json:"epsilon2,omitempty"`
+
 	FilterPrefix []byte   `json:"filter_prefix,omitempty"`
 	ExcludeIDs   []uint64 `json:"exclude_ids,omitempty"`
 	FilterIDs    []uint64 `json:"filter_ids,omitempty"`

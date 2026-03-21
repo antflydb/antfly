@@ -56,6 +56,43 @@ var (
 		},
 		[]string{},
 	)
+	splitPhaseDurationSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "antfly",
+			Subsystem: "storage",
+			Name:      "split_phase_duration_seconds",
+			Help:      "Shard split phase duration in seconds.",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"phase"},
+	)
+	splitSearchRoutesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "antfly",
+			Subsystem: "storage",
+			Name:      "split_search_routes_total",
+			Help:      "Split search routing decisions by route type.",
+		},
+		[]string{"route"},
+	)
+	splitPruneCandidateKeysTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "antfly",
+			Subsystem: "storage",
+			Name:      "split_prune_candidate_keys_total",
+			Help:      "Candidate delete keys discovered while scanning a split-off range, by key type.",
+		},
+		[]string{"key_type"},
+	)
+	splitPruneRoutedDeleteKeysTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "antfly",
+			Subsystem: "storage",
+			Name:      "split_prune_routed_delete_keys_total",
+			Help:      "Delete keys routed to indexes during synchronous split pruning, by index type and key type.",
+		},
+		[]string{"index_type", "key_type"},
+	)
 
 	// Transaction metrics
 	transactionOpsTotal = promauto.NewCounterVec(

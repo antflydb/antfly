@@ -1,0 +1,470 @@
+openapi: 3.0.3
+info:
+  title: Generator Provider Configuration
+  description: "An OpenAPI specification for configuring different generative AI providers in AntflyDB."
+  version: "0.0.1"
+components:
+  schemas:
+    GeneratorProvider:
+      type: string
+      enum:
+        - gemini
+        - vertex
+        - ollama
+        - openai
+        - openrouter
+        - bedrock
+        - anthropic
+        - cohere
+        - termite
+        - mock
+      description: "The generative AI provider to use."
+
+    GeneratorConfig:
+      description: |
+        A unified configuration for a generative AI provider.
+      allOf:
+        - oneOf:
+            - $ref: "#/components/schemas/GoogleGeneratorConfig"
+            - $ref: "#/components/schemas/VertexGeneratorConfig"
+            - $ref: "#/components/schemas/OllamaGeneratorConfig"
+            - $ref: "#/components/schemas/TermiteGeneratorConfig"
+            - $ref: "#/components/schemas/OpenAIGeneratorConfig"
+            - $ref: "#/components/schemas/OpenRouterGeneratorConfig"
+            - $ref: "#/components/schemas/BedrockGeneratorConfig"
+            - $ref: "#/components/schemas/AnthropicGeneratorConfig"
+            - $ref: "#/components/schemas/CohereGeneratorConfig"
+        - properties:
+            provider:
+              $ref: "#/components/schemas/GeneratorProvider"
+          required:
+            - provider
+      example:
+        provider: "openai"
+        model: "gpt-4.1"
+        temperature: 0.7
+        max_tokens: 2048
+
+    RetryConfig:
+      type: object
+      description: "Retry configuration for generator calls"
+      properties:
+        max_attempts:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 10
+          description: "Maximum number of retry attempts"
+        initial_backoff_ms:
+          type: integer
+          default: 1000
+          minimum: 100
+          description: "Initial backoff delay in milliseconds"
+        backoff_multiplier:
+          type: number
+          format: float
+          default: 2.0
+          minimum: 1.0
+          maximum: 5.0
+          description: "Multiplier for exponential backoff"
+        max_backoff_ms:
+          type: integer
+          default: 30000
+          description: "Maximum backoff delay in milliseconds"
+
+    ChainCondition:
+      type: string
+      enum: ["always", "on_error", "on_timeout", "on_rate_limit"]
+      default: "on_error"
+      description: |
+        Condition for trying the next generator in chain:
+        - always: Always try next regardless of outcome
+        - on_error: Try next on any error (default)
+        - on_timeout: Try next only on timeout errors
+        - on_rate_limit: Try next only on rate limit errors
+
+    ChainLink:
+      type: object
+      description: "A single link in a generator chain with optional retry and condition"
+      required:
+        - generator
+      properties:
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+        retry:
+          $ref: "#/components/schemas/RetryConfig"
+          description: "Retry configuration for this generator"
+        condition:
+          $ref: "#/components/schemas/ChainCondition"
+          description: "When to try the next generator in chain"
+
+    GoogleGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Google generative AI provider (Gemini).
+      properties:
+        project_id:
+          type: string
+          description: "The Google Cloud project ID."
+        location:
+          type: string
+          description: "The Google Cloud location (e.g., 'us-central1')."
+        model:
+          type: string
+          description: "The name of the generative model to use."
+          default: "gemini-2.5-flash"
+          example: "gemini-2.5-flash"
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+        api_key:
+          type: string
+          description: "The Google API key."
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Google API endpoint."
+      required:
+        - model
+
+    VertexGeneratorConfig:
+      type: object
+      description: |
+        Configuration for Google Cloud Vertex AI generative models.
+      properties:
+        model:
+          type: string
+          description: "The name of the Vertex AI model to use."
+          default: "gemini-2.5-flash"
+          example: "gemini-2.5-flash"
+        project_id:
+          type: string
+          description: "Google Cloud project ID."
+        location:
+          type: string
+          description: "Google Cloud region for Vertex AI API."
+          default: "us-central1"
+        credentials_path:
+          type: string
+          description: "Path to service account JSON key file."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+      required:
+        - model
+
+    OllamaGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Ollama generative AI provider.
+      properties:
+        model:
+          type: string
+          description: "The name of the Ollama model to use."
+          example: "llama3.3:70b"
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Ollama API endpoint."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+        timeout:
+          type: integer
+          description: "HTTP response timeout in seconds for Ollama API calls."
+          minimum: 1
+      required:
+        - model
+
+    TermiteGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Termite generative AI provider.
+      properties:
+        model:
+          type: string
+          description: "The name of the generator model."
+          example: "onnxruntime/Gemma-3-ONNX"
+        api_url:
+          type: string
+          format: uri
+          description: "The URL of the Termite API endpoint."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+        timeout:
+          type: integer
+          description: "HTTP response timeout in seconds for Termite API calls."
+          minimum: 1
+      required:
+        - model
+
+    OpenAIGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the OpenAI generative AI provider.
+      properties:
+        model:
+          type: string
+          description: "The name of the OpenAI model to use."
+          default: "gpt-4.1"
+          example: "gpt-4.1"
+        url:
+          type: string
+          format: uri
+          description: "The URL of the OpenAI API endpoint."
+        api_key:
+          type: string
+          description: "The OpenAI API key."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: "Penalty for token frequency (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: "Penalty for token presence (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0
+      required:
+        - model
+
+    BedrockGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the AWS Bedrock generative AI provider.
+      properties:
+        model:
+          type: string
+          description: "The Bedrock model ID to use."
+          example: "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        region:
+          type: string
+          description: "The AWS region for the Bedrock service."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+      required:
+        - model
+
+    AnthropicGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Anthropic generative AI provider.
+      properties:
+        model:
+          type: string
+          description: "The full model ID of the Anthropic model to use."
+          default: "claude-sonnet-4-5-20250929"
+          example: "claude-sonnet-4-5-20250929"
+        api_key:
+          type: string
+          description: "The Anthropic API key."
+        url:
+          type: string
+          format: uri
+          description: "The URL of the Anthropic API endpoint."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+      required:
+        - model
+
+    CohereGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the Cohere generative AI provider.
+      properties:
+        model:
+          type: string
+          description: "The name of the Cohere model to use."
+          default: "command-r-plus"
+          example: "command-r-plus"
+        api_key:
+          type: string
+          description: "The Cohere API key."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: "Top-k sampling parameter."
+        frequency_penalty:
+          type: number
+          format: float
+          description: "Penalty for token frequency (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        presence_penalty:
+          type: number
+          format: float
+          description: "Penalty for token presence (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+      required:
+        - model
+
+    OpenRouterGeneratorConfig:
+      type: object
+      description: |
+        Configuration for the OpenRouter generative AI provider.
+      properties:
+        model:
+          type: string
+          description: "Single model identifier. Either model or models must be provided."
+          example: "openai/gpt-4.1"
+        models:
+          type: array
+          items:
+            type: string
+          description: |
+            Array of model identifiers for fallback routing. Either model or models must be provided.
+        api_key:
+          type: string
+          description: "The OpenRouter API key."
+        temperature:
+          type: number
+          format: float
+          description: "Controls randomness in generation (0.0-2.0)."
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: "Maximum number of tokens to generate in the response."
+        top_p:
+          type: number
+          format: float
+          description: "Nucleus sampling parameter (0.0-1.0)."
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: "Penalty for token frequency (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: "Penalty for token presence (-2.0 to 2.0)."
+          minimum: -2.0
+          maximum: 2.0

@@ -509,6 +509,8 @@ func (idx *HBCIndex) saveMetadata(batch *pebble.Batch, meta *hbcIndexMetadata) e
 }
 
 var ErrIndexClosed = errors.New("index closed")
+var ErrIndexNotEmpty = errors.New("index not empty")
+var ErrDuplicateVectorID = errors.New("duplicate vector id")
 
 // getMetadata retrieves current metadata
 func (idx *HBCIndex) getMetadata(db pebble.Reader) (*hbcIndexMetadata, error) {
@@ -1160,6 +1162,286 @@ func (idx *HBCIndex) Batch(ctx context.Context, b *Batch) (err error) {
 	// Cleanup expired cache entries after batch insert
 	idx.nodeCache.DeleteExpired()
 	return nil
+}
+
+type hbcBulkBuildInput struct {
+	ID          uint64
+	Metadata    []byte
+	Transformed vector.T
+}
+
+// BulkBuild constructs an HBC tree recursively from an existing set of vectors.
+// Raw vectors must already exist in VectorDB under metadata+suffix keys.
+func (idx *HBCIndex) BulkBuild(ctx context.Context, b *Batch) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			idx.writerCache.Reset()
+			switch e := r.(type) {
+			case error:
+				if errors.Is(e, pebble.ErrClosed) {
+					err = e
+					return
+				}
+			}
+			panic(r)
+		}
+		if err != nil {
+			idx.writerCache.Reset()
+		}
+	}()
+
+	if b == nil || len(b.Vectors) == 0 {
+		return nil
+	}
+	if len(b.Deletes) > 0 {
+		return errors.New("bulk build does not support deletes")
+	}
+	if len(b.IDs) != len(b.Vectors) {
+		return errors.New("ids and vectors must have same length")
+	}
+	if len(b.MetadataList) != len(b.Vectors) {
+		return errors.New("metadata list must match vectors length")
+	}
+
+	inputs := make([]hbcBulkBuildInput, len(b.Vectors))
+	seen := make(map[uint64]struct{}, len(b.IDs))
+	for i, id := range b.IDs {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if _, ok := seen[id]; ok {
+			return ErrDuplicateVectorID
+		}
+		seen[id] = struct{}{}
+
+		vec := b.Vectors[i]
+		if uint32(len(vec)) != idx.config.Dimension { //nolint:gosec // G115: bounded value
+			return fmt.Errorf("vector dimension mismatch: expected %d, got %d", idx.config.Dimension, len(vec))
+		}
+		if len(b.MetadataList[i]) == 0 {
+			return fmt.Errorf("metadata required for bulk build id %d", id)
+		}
+
+		transformed := make(vector.T, idx.config.Dimension)
+		idx.TransformVector(vec, transformed)
+		inputs[i] = hbcBulkBuildInput{
+			ID:          id,
+			Metadata:    bytes.Clone(b.MetadataList[i]),
+			Transformed: transformed,
+		}
+	}
+
+	batch := idx.indexDB.NewIndexedBatchWithSize(32 << 20)
+	defer func() { _ = batch.Close() }()
+
+	idx.metaMu.RLock()
+	if idx.indexDB == nil {
+		idx.metaMu.RUnlock()
+		return ErrIndexClosed
+	}
+	meta, err := idx.getMetadata(batch)
+	if err != nil {
+		idx.metaMu.RUnlock()
+		return fmt.Errorf("failed to get metadata: %w", err)
+	}
+	metaCopy := *meta
+	meta = &metaCopy
+	idx.metaMu.RUnlock()
+
+	if meta.ActiveCount != 0 {
+		return ErrIndexNotEmpty
+	}
+	if meta.RootNode == 0 {
+		meta.RootNode = 1
+	}
+	if err := idx.deleteNode(batch, idx.writerCache, meta.RootNode); err != nil {
+		return fmt.Errorf("deleting empty root before bulk build: %w", err)
+	}
+
+	nextNodeID := meta.RootNode + 1
+	nodeCount, err := idx.buildBulkSubtreeRecursive(
+		ctx,
+		batch,
+		idx.writerCache,
+		inputs,
+		meta.RootNode,
+		0,
+		0,
+		&nextNodeID,
+	)
+	if err != nil {
+		return err
+	}
+
+	meta.ActiveCount = uint64(len(inputs))
+	meta.NodeCount = nodeCount
+
+	idx.commitMu.Lock()
+	defer idx.commitMu.Unlock()
+
+	idx.metaMu.Lock()
+	if err := idx.saveMetadata(batch, meta); err != nil {
+		idx.metaMu.Unlock()
+		return fmt.Errorf("saving metadata: %w", err)
+	}
+	idx.metaMu.Unlock()
+
+	if err := batch.Commit(idx.syncOpt); err != nil {
+		return fmt.Errorf("committing pebble batch: %w", err)
+	}
+	if err := idx.writerCache.Commit(); err != nil {
+		return fmt.Errorf("committing writer cache: %w", err)
+	}
+
+	idx.nodeCache.DeleteExpired()
+	return nil
+}
+
+func (idx *HBCIndex) buildBulkSubtreeRecursive(
+	ctx context.Context,
+	batch *pebble.Batch,
+	cacheBatch nodeCache,
+	inputs []hbcBulkBuildInput,
+	nodeID uint64,
+	parentID uint64,
+	level int,
+	nextNodeID *uint64,
+) (uint64, error) {
+	if len(inputs) == 0 {
+		return 0, errors.New("bulk build requires at least one input")
+	}
+	if len(inputs) <= idx.config.LeafSize {
+		if err := idx.buildBulkLeaf(batch, cacheBatch, inputs, nodeID, parentID, level); err != nil {
+			return 0, err
+		}
+		return nodeID, nil
+	}
+
+	leftInputs, rightInputs, leftCentroid, rightCentroid, err := idx.partitionBulkBuildInputs(inputs)
+	if err != nil {
+		return 0, err
+	}
+
+	leftID := *nextNodeID
+	*nextNodeID++
+	rightID := *nextNodeID
+	*nextNodeID++
+
+	leftMaxID, err := idx.buildBulkSubtreeRecursive(ctx, batch, cacheBatch, leftInputs, leftID, nodeID, level+1, nextNodeID)
+	if err != nil {
+		return 0, err
+	}
+	rightMaxID, err := idx.buildBulkSubtreeRecursive(ctx, batch, cacheBatch, rightInputs, rightID, nodeID, level+1, nextNodeID)
+	if err != nil {
+		return 0, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+
+	centroid := make(vector.T, idx.config.Dimension)
+	copy(centroid, leftCentroid)
+	vec.AddFloat32(centroid, rightCentroid)
+	vec.ScaleFloat32(0.5, centroid)
+
+	node := &HBCNode{
+		ID:       nodeID,
+		IsLeaf:   false,
+		Centroid: centroid,
+		Children: []uint64{leftID, rightID},
+		Parent:   parentID,
+		Level:    level,
+	}
+	if err := idx.saveNode(batch, cacheBatch, node); err != nil {
+		return 0, fmt.Errorf("saving bulk internal node %d: %w", nodeID, err)
+	}
+
+	return max(nodeID, max(leftMaxID, rightMaxID)), nil
+}
+
+func (idx *HBCIndex) buildBulkLeaf(
+	batch *pebble.Batch,
+	cacheBatch nodeCache,
+	inputs []hbcBulkBuildInput,
+	nodeID uint64,
+	parentID uint64,
+	level int,
+) error {
+	members := make([]uint64, len(inputs))
+	centroid := make(vector.T, idx.config.Dimension)
+	for i, input := range inputs {
+		metaKey := makeHBCMetadataKey(idx.prefix, input.ID)
+		if err := batch.Set(metaKey, input.Metadata, nil); err != nil {
+			return fmt.Errorf("saving metadata for vector %d: %w", input.ID, err)
+		}
+		members[i] = input.ID
+		vec.AddFloat32(centroid, input.Transformed)
+	}
+	vec.ScaleFloat32(1/float32(len(inputs)), centroid)
+
+	node := &HBCNode{
+		ID:       nodeID,
+		IsLeaf:   true,
+		Centroid: centroid,
+		Members:  members,
+		Parent:   parentID,
+		Level:    level,
+	}
+	if err := idx.saveNode(batch, cacheBatch, node); err != nil {
+		return fmt.Errorf("saving bulk leaf node %d: %w", nodeID, err)
+	}
+	return nil
+}
+
+func (idx *HBCIndex) partitionBulkBuildInputs(
+	inputs []hbcBulkBuildInput,
+) ([]hbcBulkBuildInput, []hbcBulkBuildInput, vector.T, vector.T, error) {
+	vectorSet := vector.MakeSet(int(idx.config.Dimension))
+	vectorSet.EnsureCapacity(len(inputs))
+	ids := make([]uint64, len(inputs))
+	for i, input := range inputs {
+		vectorSet.Add(input.Transformed)
+		ids[i] = uint64(i)
+	}
+
+	leftCentroid, leftIDs, rightCentroid, rightIDs, err := idx.splitVectorSet(vectorSet, ids)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("partitioning bulk build inputs: %w", err)
+	}
+	if len(leftIDs) == 0 || len(rightIDs) == 0 {
+		mid := len(inputs) / 2
+		if mid == 0 || mid == len(inputs) {
+			return nil, nil, nil, nil, errors.New("bulk build produced degenerate partition")
+		}
+		left := slices.Clone(inputs[:mid])
+		right := slices.Clone(inputs[mid:])
+		return left, right, centroidForBulkBuildInputs(left, idx.config.Dimension), centroidForBulkBuildInputs(right, idx.config.Dimension), nil
+	}
+
+	left := make([]hbcBulkBuildInput, 0, len(leftIDs))
+	for _, inputID := range leftIDs {
+		left = append(left, inputs[inputID])
+	}
+	right := make([]hbcBulkBuildInput, 0, len(rightIDs))
+	for _, inputID := range rightIDs {
+		right = append(right, inputs[inputID])
+	}
+	return left, right, leftCentroid, rightCentroid, nil
+}
+
+func centroidForBulkBuildInputs(inputs []hbcBulkBuildInput, dimension uint32) vector.T {
+	centroid := make(vector.T, dimension)
+	for _, input := range inputs {
+		vec.AddFloat32(centroid, input.Transformed)
+	}
+	vec.ScaleFloat32(1/float32(len(inputs)), centroid)
+	return centroid
 }
 
 // insertIntoTree inserts a vector into the hierarchical tree
@@ -1837,9 +2119,19 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 		return nil, nil
 	}
 
+	// Resolve per-query overrides for search width and dynamic pruning
+	searchWidth := idx.config.SearchWidth
+	if req.SearchWidth != nil {
+		searchWidth = *req.SearchWidth
+	}
+	epsilon2 := idx.config.Episilon2
+	if req.Epsilon2 != nil {
+		epsilon2 = *req.Epsilon2
+	}
+
 	// Use a priority queue to track best clusters to explore
-	candidates := NewPriorityQueue(false, idx.config.SearchWidth*2) // Min-heap with larger capacity
-	results := NewPriorityQueue(true, req.K)                        // Max-heap for results
+	candidates := NewPriorityQueue(false, searchWidth*2) // Min-heap with larger capacity
+	results := NewPriorityQueue(true, req.K)             // Max-heap for results
 
 	// Track collapse keys during traversal to handle duplicates
 	var collapseKeyToItem map[string]*PriorityItem
@@ -1856,13 +2148,13 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 	rootDist := vector.MeasureDistance(idx.config.DistanceMetric, q.Transformed(), root.Centroid)
 	heap.Push(candidates, &PriorityItem{ID: root.ID, Distance: rootDist})
 
-	visited := make(map[uint64]bool, idx.config.SearchWidth*2)
+	visited := make(map[uint64]bool, searchWidth*2)
 	nodesExplored := 0
 	leavesExplored := 0
 
 	var dynamicPruningMin float32 = math32.MaxFloat32
 	// Traverse tree
-	for candidates.Len() > 0 /* && nodesExplored < 16*idx.config.SearchWidth */ && leavesExplored < idx.config.SearchWidth {
+	for candidates.Len() > 0 /* && nodesExplored < 16*idx.config.SearchWidth */ && leavesExplored < searchWidth {
 		item := heap.Pop(candidates).(*PriorityItem)
 
 		if visited[item.ID] {
@@ -1883,7 +2175,7 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 		}
 
 		if !node.IsLeaf && results.Len() >= req.K && dynamicPruningMin < math32.MaxFloat32 {
-			if item.Distance > dynamicPruningMin*(idx.config.Episilon2+1) {
+			if item.Distance > dynamicPruningMin*(epsilon2+1) {
 				// Dynamic pruning: skip this node if it's too far
 				continue
 			}
@@ -1893,7 +2185,7 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 			if results.Len() >= req.K && item.Distance < dynamicPruningMin {
 				dynamicPruningMin = item.Distance
 			} else if results.Len() >= req.K &&
-				math32.Abs(item.Distance) > math32.Abs(dynamicPruningMin*(idx.config.Episilon2+1)) {
+				math32.Abs(item.Distance) > math32.Abs(dynamicPruningMin*(epsilon2+1)) {
 				// Dynamic pruning: skip this leaf if it's too far
 				continue
 			}
@@ -1968,7 +2260,7 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 					} else if pi.MaybeCloser(topCurrentResult) {
 						insertResultWithCollapse(results, pi, metadata, collapseKeyToItem, idx.config.CollapseKeysFunc)
 					}
-					if results.Len() > req.K*int(math32.Ceil(idx.config.Episilon2+1)) {
+					if results.Len() > req.K*int(math32.Ceil(epsilon2+1)) {
 						heap.Pop(results)
 					}
 				}

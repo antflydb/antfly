@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/antflydb/antfly/lib/template"
+	generating "github.com/antflydb/antfly/pkg/generating"
 	libscraping "github.com/antflydb/antfly/pkg/libaf/scraping"
 	"mvdan.cc/xurls/v2"
 )
@@ -130,33 +131,9 @@ func TextToParts(text string) ([]ContentPart, error) {
 }
 
 func NewGeneratorConfig(config any) (*GeneratorConfig, error) {
-	var provider GeneratorProvider
-	modelConfig := &GeneratorConfig{}
-	switch v := config.(type) {
-	case OllamaGeneratorConfig:
-		provider = GeneratorProviderOllama
-		if err := modelConfig.FromOllamaGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("failed to convert Ollama config: %w", err)
-		}
-	case OpenAIGeneratorConfig:
-		provider = GeneratorProviderOpenai
-		if err := modelConfig.FromOpenAIGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("failed to convert OpenAI config: %w", err)
-		}
-	case GoogleGeneratorConfig:
-		provider = GeneratorProviderGemini
-		if err := modelConfig.FromGoogleGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("failed to convert Google config: %w", err)
-		}
-	case BedrockGeneratorConfig:
-		provider = GeneratorProviderBedrock
-		if err := modelConfig.FromBedrockGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("failed to convert Bedrock config: %w", err)
-		}
-	default:
-		return nil, fmt.Errorf("unknown model config type: %T", v)
+	gcfg, err := generating.NewGeneratorConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("new generating config: %w", err)
 	}
-
-	modelConfig.Provider = provider
-	return modelConfig, nil
+	return (*GeneratorConfig)(gcfg), nil
 }

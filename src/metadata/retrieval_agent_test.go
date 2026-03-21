@@ -15,22 +15,24 @@
 package metadata
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/antflydb/antfly/lib/ai"
+	"github.com/antflydb/antfly/pkg/generating"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestResolveEffectiveGeneratorChain(t *testing.T) {
-	originalDefault := ai.GetDefaultChain()
+	originalDefault := generating.GetDefaultChain()
 	t.Cleanup(func() {
-		ai.SetDefaultChain(originalDefault)
+		generating.SetDefaultChain(originalDefault)
 	})
 
 	defaultChain := []ai.ChainLink{
 		{Generator: ai.GeneratorConfig{Provider: ai.GeneratorProviderGemini}},
 	}
-	ai.SetDefaultChain(defaultChain)
+	generating.SetDefaultChain(defaultChain)
 
 	t.Run("prefers explicit chain over single generator", func(t *testing.T) {
 		req := &RetrievalAgentRequest{
@@ -67,7 +69,7 @@ func TestResolveEffectiveGeneratorChain(t *testing.T) {
 	})
 
 	t.Run("returns nil when no explicit or default chain exists", func(t *testing.T) {
-		ai.SetDefaultChain(nil)
+		generating.SetDefaultChain(nil)
 
 		req := &RetrievalAgentRequest{}
 		assert.Nil(t, resolveEffectiveGeneratorChain(req))
@@ -75,13 +77,13 @@ func TestResolveEffectiveGeneratorChain(t *testing.T) {
 }
 
 func TestResolveProviderName(t *testing.T) {
-	originalDefault := ai.GetDefaultChain()
+	originalDefault := generating.GetDefaultChain()
 	t.Cleanup(func() {
-		ai.SetDefaultChain(originalDefault)
+		generating.SetDefaultChain(originalDefault)
 	})
 
 	t.Run("uses first provider from explicit chain", func(t *testing.T) {
-		ai.SetDefaultChain([]ai.ChainLink{
+		generating.SetDefaultChain([]ai.ChainLink{
 			{Generator: ai.GeneratorConfig{Provider: ai.GeneratorProviderGemini}},
 		})
 		req := &RetrievalAgentRequest{
@@ -96,7 +98,7 @@ func TestResolveProviderName(t *testing.T) {
 	})
 
 	t.Run("uses default chain provider when request does not specify one", func(t *testing.T) {
-		ai.SetDefaultChain([]ai.ChainLink{
+		generating.SetDefaultChain([]ai.ChainLink{
 			{Generator: ai.GeneratorConfig{Provider: ai.GeneratorProviderOllama}},
 		})
 
@@ -106,10 +108,29 @@ func TestResolveProviderName(t *testing.T) {
 	})
 
 	t.Run("returns unknown when no provider can be resolved", func(t *testing.T) {
-		ai.SetDefaultChain(nil)
+		generating.SetDefaultChain(nil)
 
 		req := &RetrievalAgentRequest{}
 		assert.Equal(t, "unknown", resolveProviderName(req))
 		assert.Equal(t, ai.GeneratorProvider(""), resolveProvider(req))
+	})
+}
+
+func TestAsGenerationErrorResponse(t *testing.T) {
+	t.Run("generic query failures are not classified as generation errors", func(t *testing.T) {
+		message, statusCode, ok := asGenerationErrorResponse(errors.New("query failed (table=test): bad filter"))
+		assert.False(t, ok)
+		assert.Empty(t, message)
+		assert.Zero(t, statusCode)
+	})
+
+	t.Run("preserves typed generation errors", func(t *testing.T) {
+		message, statusCode, ok := asGenerationErrorResponse(&ai.GenerationError{
+			Kind:        ai.GenerationErrorRateLimit,
+			UserMessage: "Rate limit reached for provider 'openrouter'. Please wait and try again.",
+		})
+		assert.True(t, ok)
+		assert.Equal(t, "Rate limit reached for provider 'openrouter'. Please wait and try again.", message)
+		assert.Equal(t, 429, statusCode)
 	})
 }

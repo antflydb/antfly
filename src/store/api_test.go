@@ -258,6 +258,10 @@ func (m *MockRaftNode) TransferLeadership(ctx context.Context, target types.ID) 
 	m.Called(ctx, target)
 }
 
+func (m *MockRaftNode) Shutdown() {
+	m.Called()
+}
+
 // Ensure MockShard has the raftNode field if methods like IsIDRemoved or TransferLeadership are called on shard.raftNode
 // If these methods are part of an interface that Shard implements, then MockShard should implement them.
 // For handleBackup, we don't directly need MockRaftNode, but it's good to have for other tests.

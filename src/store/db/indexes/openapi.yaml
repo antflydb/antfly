@@ -143,7 +143,7 @@ components:
           $ref: "../../../../lib/embeddings/openapi.yaml#/components/schemas/EmbedderConfig"
         summarizer:
           description: "Configuration for the summarizer plugin (dense only)"
-          $ref: "../../../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
         chunker:
           description: "Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense only)"
           $ref: "../../../../lib/chunking/openapi.yaml#/components/schemas/ChunkerConfig"
@@ -341,7 +341,7 @@ components:
       properties:
         summarizer:
           description: "Configuration for generating node summaries (enables tree navigation in AnswerAgent)"
-          $ref: "../../../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
         template:
           x-go-type-skip-optional-pointer: true
           type: string

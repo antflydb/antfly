@@ -11,29 +11,17 @@ T = TypeVar("T", bound="CohereGeneratorConfig")
 
 @_attrs_define
 class CohereGeneratorConfig:
-    """Configuration for the Cohere generative AI provider (Command models).
+    """Configuration for the Cohere generative AI provider.
 
-    API key via `api_key` field or `COHERE_API_KEY` environment variable.
-
-    **Example Models:** command-r-plus (default), command-r, command-a-03-2025
-
-    **Docs:** https://docs.cohere.com/reference/chat
-
-        Example:
-            {'provider': 'cohere', 'model': 'command-r-plus', 'temperature': 0.7, 'max_tokens': 4096}
-
-        Attributes:
-            model (str): The name of the Cohere model to use. Default: 'command-r-plus'. Example: command-r-plus.
-            api_key (Union[Unset, str]): The Cohere API key. If not provided, falls back to COHERE_API_KEY environment
-                variable.
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-1.0). Higher values make output more
-                random.
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
-            top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-            top_k (Union[Unset, int]): Top-k sampling parameter. Only sample from the top K options for each subsequent
-                token.
-            frequency_penalty (Union[Unset, float]): Penalty for token frequency (0.0-1.0).
-            presence_penalty (Union[Unset, float]): Penalty for token presence (0.0-1.0).
+    Attributes:
+        model (str): The name of the Cohere model to use. Default: 'command-r-plus'. Example: command-r-plus.
+        api_key (Union[Unset, str]): The Cohere API key.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-1.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
+        top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0).
+        top_k (Union[Unset, int]): Top-k sampling parameter.
+        frequency_penalty (Union[Unset, float]): Penalty for token frequency (0.0-1.0).
+        presence_penalty (Union[Unset, float]): Penalty for token presence (0.0-1.0).
     """
 
     model: str = "command-r-plus"

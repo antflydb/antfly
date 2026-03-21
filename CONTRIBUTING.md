@@ -146,13 +146,13 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 `make build` and `make generate` may auto-run `make tidy` as part of keeping the multi-module workspace buildable. CI separately runs `make tidy-check` so dependency drift is still surfaced explicitly.
 
-If you want the same check locally at commit time, install the repository hook path once:
+If you want the same check locally before pushing, install the repository hooks once:
 
 ```bash
 make install-git-hooks
 ```
 
-That enables `.githooks/pre-commit`, which runs `make tidy-check` when staged changes include Go sources or Go module files.
+That enables `.githooks/pre-push`, which runs `make tidy-check` when pushed changes include Go sources or Go module files.
 
 ## Testing
 

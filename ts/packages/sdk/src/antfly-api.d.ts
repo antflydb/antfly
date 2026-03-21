@@ -4256,20 +4256,14 @@ export interface components {
          * @enum {string}
          */
         EvaluatorName: "recall" | "precision" | "ndcg" | "mrr" | "map" | "relevance" | "faithfulness" | "completeness" | "coherence" | "safety" | "helpfulness" | "correctness" | "citation_quality";
-        /**
-         * @description Configuration for the Google generative AI provider (Gemini).
-         *
-         *     **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
-         *
-         *     **Docs:** https://ai.google.dev/gemini-api/docs/models
-         */
+        /** @description Configuration for the Google generative AI provider (Gemini). */
         GoogleGeneratorConfig: {
             /** @description The Google Cloud project ID. */
             project_id?: string;
             /** @description The Google Cloud location (e.g., 'us-central1'). */
             location?: string;
             /**
-             * @description The name of the generative model to use (e.g., 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.0-pro').
+             * @description The name of the generative model to use.
              * @default gemini-2.5-flash
              * @example gemini-2.5-flash
              */
@@ -4296,25 +4290,7 @@ export interface components {
              */
             url?: string;
         };
-        /**
-         * @description Configuration for Google Cloud Vertex AI generative models (enterprise-grade).
-         *
-         *     Uses Application Default Credentials (ADC) for authentication. In GCP environments
-         *     (Cloud Run, GKE, Compute Engine) this is automatic. For local dev, run
-         *     `gcloud auth application-default login`. Requires IAM role `roles/aiplatform.user`.
-         *
-         *     **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
-         *
-         *     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
-         * @example {
-         *       "provider": "vertex",
-         *       "model": "gemini-2.5-flash",
-         *       "project_id": "my-gcp-project",
-         *       "location": "us-central1",
-         *       "temperature": 0.7,
-         *       "max_tokens": 4096
-         *     }
-         */
+        /** @description Configuration for Google Cloud Vertex AI generative models. */
         VertexGeneratorConfig: {
             /**
              * @description The name of the Vertex AI model to use.
@@ -4322,42 +4298,34 @@ export interface components {
              * @example gemini-2.5-flash
              */
             model: string;
-            /** @description Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable. */
+            /** @description Google Cloud project ID. */
             project_id?: string;
             /**
-             * @description Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
+             * @description Google Cloud region for Vertex AI API.
              * @default us-central1
              */
             location?: string;
-            /** @description Path to service account JSON key file. Sets GOOGLE_APPLICATION_CREDENTIALS environment variable. Alternative to ADC for non-GCP environments. */
+            /** @description Path to service account JSON key file. */
             credentials_path?: string;
             /**
              * Format: float
-             * @description Controls randomness in generation (0.0-2.0). Higher values make output more random.
+             * @description Controls randomness in generation (0.0-2.0).
              */
             temperature?: number;
             /** @description Maximum number of tokens to generate in the response. */
             max_tokens?: number;
             /**
              * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
+             * @description Nucleus sampling parameter (0.0-1.0).
              */
             top_p?: number;
-            /** @description Top-k sampling parameter. Only sample from the top K options for each subsequent token. */
+            /** @description Top-k sampling parameter. */
             top_k?: number;
         };
-        /**
-         * @description Configuration for the Ollama generative AI provider.
-         *
-         *     Ollama provides local LLM inference for privacy and offline use.
-         *
-         *     **Example Models:** llama3.3:70b, qwen2.5:72b, deepseek-r1:70b, mistral:7b, llava:34b
-         *
-         *     **Docs:** https://ollama.com/library
-         */
+        /** @description Configuration for the Ollama generative AI provider. */
         OllamaGeneratorConfig: {
             /**
-             * @description The name of the Ollama model to use (e.g., 'llama3.3:70b', 'qwen2.5:72b', 'deepseek-coder:33b').
+             * @description The name of the Ollama model to use.
              * @example llama3.3:70b
              */
             model: string;
@@ -4380,27 +4348,13 @@ export interface components {
             top_p?: number;
             /** @description Top-k sampling parameter. */
             top_k?: number;
-            /** @description HTTP response timeout in seconds for Ollama API calls. Defaults to 540 (9 minutes). Increase for large models on slow hardware. */
+            /** @description HTTP response timeout in seconds for Ollama API calls. */
             timeout?: number;
         };
-        /**
-         * @description Configuration for the Termite generative AI provider.
-         *
-         *     Termite is Antfly's built-in ML service for local LLM inference using
-         *     ONNX Runtime GenAI models. It provides text generation with automatic
-         *     model discovery from the `models/generators/` directory.
-         *
-         *     **Example Models:** onnxruntime/Gemma-3-ONNX (from HuggingFace)
-         *
-         *     **Features:**
-         *     - Local inference with no external API dependencies
-         *     - ONNX Runtime GenAI for efficient CPU/GPU execution
-         *     - Auto-discovery of models from `models/generators/` directory
-         *     - OpenAI-compatible chat format
-         */
+        /** @description Configuration for the Termite generative AI provider. */
         TermiteGeneratorConfig: {
             /**
-             * @description The name of the generator model (maps to models/generators/{name}/ directory).
+             * @description The name of the generator model.
              * @example onnxruntime/Gemma-3-ONNX
              */
             model: string;
@@ -4423,19 +4377,13 @@ export interface components {
             top_p?: number;
             /** @description Top-k sampling parameter. */
             top_k?: number;
-            /** @description HTTP response timeout in seconds for Termite API calls. Defaults to 540 (9 minutes). Increase for large models on slow hardware. */
+            /** @description HTTP response timeout in seconds for Termite API calls. */
             timeout?: number;
         };
-        /**
-         * @description Configuration for the OpenAI generative AI provider.
-         *
-         *     **Example Models:** gpt-4.1 (default), gpt-4.1-mini, o3, o4-mini
-         *
-         *     **Docs:** https://platform.openai.com/docs/models
-         */
+        /** @description Configuration for the OpenAI generative AI provider. */
         OpenAIGeneratorConfig: {
             /**
-             * @description The name of the OpenAI model to use (e.g., 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini').
+             * @description The name of the OpenAI model to use.
              * @default gpt-4.1
              * @example gpt-4.1
              */
@@ -4470,55 +4418,27 @@ export interface components {
              */
             presence_penalty?: number;
         };
-        /**
-         * @description Configuration for the OpenRouter generative AI provider.
-         *
-         *     OpenRouter provides a unified API for multiple LLM providers with automatic fallback routing.
-         *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
-         *
-         *     **Model Selection:**
-         *     - Use `model` for a single model (e.g., "openai/gpt-4.1", "anthropic/claude-sonnet-4-5-20250929")
-         *     - Use `models` array for fallback routing - OpenRouter tries models in order until one succeeds
-         *
-         *     **Example Models:** openai/gpt-4.1, anthropic/claude-sonnet-4-5-20250929, google/gemini-2.5-flash,
-         *     meta-llama/llama-3.3-70b-instruct
-         *
-         *     **Docs:** https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request
-         * @example {
-         *       "provider": "openrouter",
-         *       "model": "openai/gpt-4.1",
-         *       "temperature": 0.7,
-         *       "max_tokens": 4096
-         *     }
-         */
+        /** @description Configuration for the OpenRouter generative AI provider. */
         OpenRouterGeneratorConfig: {
             /**
-             * @description Single model identifier (e.g., 'openai/gpt-4.1'). Either model or models must be provided.
+             * @description Single model identifier. Either model or models must be provided.
              * @example openai/gpt-4.1
              */
             model?: string;
-            /**
-             * @description Array of model identifiers for fallback routing. OpenRouter tries each model in order
-             *     until one succeeds. Either model or models must be provided.
-             * @example [
-             *       "openai/gpt-4.1",
-             *       "anthropic/claude-sonnet-4-5-20250929",
-             *       "google/gemini-2.5-flash"
-             *     ]
-             */
+            /** @description Array of model identifiers for fallback routing. Either model or models must be provided. */
             models?: string[];
-            /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
+            /** @description The OpenRouter API key. */
             api_key?: string;
             /**
              * Format: float
-             * @description Controls randomness in generation (0.0-2.0). Higher values make output more random.
+             * @description Controls randomness in generation (0.0-2.0).
              */
             temperature?: number;
             /** @description Maximum number of tokens to generate in the response. */
             max_tokens?: number;
             /**
              * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
+             * @description Nucleus sampling parameter (0.0-1.0).
              */
             top_p?: number;
             /**
@@ -4532,18 +4452,10 @@ export interface components {
              */
             presence_penalty?: number;
         };
-        /**
-         * @description Configuration for the AWS Bedrock generative AI provider.
-         *
-         *     Provides access to models from Anthropic, Meta, Amazon, Cohere, Mistral, and others.
-         *
-         *     **Example Models:** anthropic.claude-sonnet-4-5-20250929-v1:0, meta.llama3-3-70b-instruct-v1:0, amazon.nova-pro-v1:0
-         *
-         *     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-         */
+        /** @description Configuration for the AWS Bedrock generative AI provider. */
         BedrockGeneratorConfig: {
             /**
-             * @description The Bedrock model ID to use (e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0').
+             * @description The Bedrock model ID to use.
              * @example anthropic.claude-sonnet-4-5-20250929-v1:0
              */
             model: string;
@@ -4564,65 +4476,37 @@ export interface components {
             /** @description Top-k sampling parameter. */
             top_k?: number;
         };
-        /**
-         * @description Configuration for the Anthropic generative AI provider (Claude models).
-         *
-         *     API key via `api_key` field or `ANTHROPIC_API_KEY` environment variable.
-         *
-         *     **Example Models:** claude-sonnet-4-5-20250929 (default), claude-opus-4-5-20251101, claude-3-5-haiku-20241022
-         *
-         *     **Docs:** https://docs.anthropic.com/en/docs/about-claude/models/overview
-         * @example {
-         *       "provider": "anthropic",
-         *       "model": "claude-sonnet-4-5-20250929",
-         *       "temperature": 0.7,
-         *       "max_tokens": 4096
-         *     }
-         */
+        /** @description Configuration for the Anthropic generative AI provider. */
         AnthropicGeneratorConfig: {
             /**
-             * @description The full model ID of the Anthropic model to use (e.g., 'claude-sonnet-4-5-20250929', 'claude-opus-4-5-20251101').
+             * @description The full model ID of the Anthropic model to use.
              * @default claude-sonnet-4-5-20250929
              * @example claude-sonnet-4-5-20250929
              */
             model: string;
-            /** @description The Anthropic API key. If not provided, falls back to ANTHROPIC_API_KEY environment variable. */
+            /** @description The Anthropic API key. */
             api_key?: string;
             /**
              * Format: uri
-             * @description The URL of the Anthropic API endpoint (optional, uses default if not specified).
+             * @description The URL of the Anthropic API endpoint.
              */
             url?: string;
             /**
              * Format: float
-             * @description Controls randomness in generation (0.0-1.0). Higher values make output more random.
+             * @description Controls randomness in generation (0.0-1.0).
              */
             temperature?: number;
             /** @description Maximum number of tokens to generate in the response. */
             max_tokens?: number;
             /**
              * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
+             * @description Nucleus sampling parameter (0.0-1.0).
              */
             top_p?: number;
-            /** @description Top-k sampling parameter. Only sample from the top K options for each subsequent token. */
+            /** @description Top-k sampling parameter. */
             top_k?: number;
         };
-        /**
-         * @description Configuration for the Cohere generative AI provider (Command models).
-         *
-         *     API key via `api_key` field or `COHERE_API_KEY` environment variable.
-         *
-         *     **Example Models:** command-r-plus (default), command-r, command-a-03-2025
-         *
-         *     **Docs:** https://docs.cohere.com/reference/chat
-         * @example {
-         *       "provider": "cohere",
-         *       "model": "command-r-plus",
-         *       "temperature": 0.7,
-         *       "max_tokens": 4096
-         *     }
-         */
+        /** @description Configuration for the Cohere generative AI provider. */
         CohereGeneratorConfig: {
             /**
              * @description The name of the Cohere model to use.
@@ -4630,21 +4514,21 @@ export interface components {
              * @example command-r-plus
              */
             model: string;
-            /** @description The Cohere API key. If not provided, falls back to COHERE_API_KEY environment variable. */
+            /** @description The Cohere API key. */
             api_key?: string;
             /**
              * Format: float
-             * @description Controls randomness in generation (0.0-1.0). Higher values make output more random.
+             * @description Controls randomness in generation (0.0-1.0).
              */
             temperature?: number;
             /** @description Maximum number of tokens to generate in the response. */
             max_tokens?: number;
             /**
              * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
+             * @description Nucleus sampling parameter (0.0-1.0).
              */
             top_p?: number;
-            /** @description Top-k sampling parameter. Only sample from the top K options for each subsequent token. */
+            /** @description Top-k sampling parameter. */
             top_k?: number;
             /**
              * Format: float
@@ -4664,166 +4548,6 @@ export interface components {
         GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "anthropic" | "cohere" | "termite" | "mock";
         /**
          * @description A unified configuration for a generative AI provider.
-         *
-         *     Generators can be configured with custom prompts using templates. Templates use
-         *     Handlebars syntax and support various built-in helpers for formatting and data manipulation.
-         *
-         *     **Template System:**
-         *     - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-         *     - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-         *     - **Context**: Templates receive the full context data passed to the generator
-         *
-         *     **Built-in Helpers:**
-         *
-         *     1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-         *        ```handlebars
-         *        {{scrubHtml html_content}}
-         *        ```
-         *        - Removes `<script>` and `<style>` tags
-         *        - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-         *        - Returns plain text with preserved readability
-         *        - Useful for cleaning web content before summarization
-         *
-         *     2. **eq** - Equality comparison for conditionals
-         *        ```handlebars
-         *        {{#if (eq status "active")}}Active{{/if}}
-         *        {{#if (eq @key "special")}}Special field{{/if}}
-         *        ```
-         *        - Use in `{{#if}}` blocks for conditional logic
-         *        - Compares any two values for equality
-         *
-         *     3. **media** - GenKit dotprompt media directive for multimodal content
-         *        ```handlebars
-         *        {{media url=imageDataURI}}
-         *        {{media url=this.image_url}}
-         *        {{media url="https://example.com/image.jpg"}}
-         *        {{media url="s3://endpoint/bucket/image.png"}}
-         *        {{media url="file:///path/to/image.jpg"}}
-         *        ```
-         *
-         *        **Supported URL Schemes:**
-         *        - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-         *        - `http://` / `https://` - Web URLs with automatic content type detection
-         *        - `file://` - Local filesystem paths
-         *        - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-         *
-         *        **Automatic Content Processing:**
-         *        - **Images**: Downloaded, resized (if needed), converted to data URIs
-         *        - **PDFs**: Text extracted or first page rendered as image
-         *        - **HTML**: Readable text extracted using Mozilla Readability
-         *
-         *        **Security Controls:**
-         *        Downloads are protected by content security settings (see Configuration Reference):
-         *        - Allowed host whitelist
-         *        - Private IP blocking (prevents SSRF attacks)
-         *        - Download size limits (default: 100MB)
-         *        - Download timeouts (default: 30s)
-         *        - Image dimension limits (default: 2048px, auto-resized)
-         *
-         *        See: https://antfly.io/docs/configuration#security--cors
-         *
-         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         *        ```handlebars
-         *        {{encodeToon this.fields}}
-         *        {{encodeToon this.fields lengthMarker=false indent=4}}
-         *        {{encodeToon this.fields delimiter="\t"}}
-         *        ```
-         *
-         *        **What is TOON?**
-         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
-         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-         *        comprehension accuracy.
-         *
-         *        **Key Features:**
-         *        - Compact syntax using `:` for key-value pairs
-         *        - Array length markers: `tags[#3]: ai,search,ml`
-         *        - Tabular format for uniform data structures
-         *        - Optimized for LLM parsing and understanding
-         *        - Maintains human readability
-         *
-         *        **Benefits:**
-         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
-         *        - **Faster responses** - Less tokens to process
-         *        - **More context** - Fit more documents within token limits
-         *
-         *        **Options:**
-         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
-         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-         *
-         *        **Example output:**
-         *        ```
-         *        title: Introduction to Vector Search
-         *        author: Jane Doe
-         *        tags[#3]: ai,search,ml
-         *        metadata:
-         *          edition: 2
-         *          pages: 450
-         *        ```
-         *
-         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-         *
-         *        **References:**
-         *        - TOON Specification: https://github.com/toon-format/toon
-         *        - Go Implementation: https://github.com/alpkeskin/gotoon
-         *
-         *     **Template Examples:**
-         *
-         *     RAG summarization with document references:
-         *     ```handlebars
-         *     Based on these documents, provide a comprehensive summary:
-         *
-         *     {{#each documents}}
-         *     Document {{this.id}}:
-         *     {{scrubHtml this.content}}
-         *
-         *     {{/each}}
-         *
-         *     Valid document IDs: {{#each documents}}{{this.id}}{{#unless @last}}, {{/unless}}{{/each}}
-         *     ```
-         *
-         *     Conditional formatting:
-         *     ```handlebars
-         *     {{#if system_prompt}}System: {{system_prompt}}{{/if}}
-         *
-         *     User Query: {{query}}
-         *
-         *     {{#if context}}
-         *     Context:
-         *     {{#each context}}
-         *     - {{this}}
-         *     {{/each}}
-         *     {{/if}}
-         *     ```
-         *
-         *     Multimodal prompt with images:
-         *     ```handlebars
-         *     Analyze this image:
-         *     {{media url=image_url}}
-         *
-         *     Focus on: {{focus_area}}
-         *     ```
-         *
-         *     Structured data encoding:
-         *     ```handlebars
-         *     User Profile:
-         *     {{encodeToon user_data indent=2 lengthMarker=true}}
-         *
-         *     Please analyze this profile.
-         *     ```
-         *
-         *     **Common Use Cases:**
-         *     - **RAG (Retrieval-Augmented Generation)**: Format retrieved documents with citations
-         *     - **Summarization**: Clean HTML content and structure summaries
-         *     - **Query Classification**: Format queries with metadata for better classification
-         *     - **Multimodal**: Include images/audio/video in prompts
-         *     - **Data Formatting**: Convert structured data to readable text
-         *
-         *     **Best Practices:**
-         *     - Keep templates simple - complex logic belongs in application code
-         *     - Use clear, descriptive field names in context
-         *     - Handle missing fields gracefully (templates use "missingkey=zero" by default)
-         *     - Test templates with representative data before production use
          * @example {
          *       "provider": "openai",
          *       "model": "gpt-4.1",

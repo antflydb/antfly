@@ -29,6 +29,7 @@ import (
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/websearch"
 	"github.com/antflydb/antfly/lib/workerpool"
+	"github.com/antflydb/antfly/pkg/generating"
 	"github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/usermgr"
@@ -661,9 +662,7 @@ func (t *TableApi) runGenerationStep(
 			if !errors.Is(err, context.Canceled) {
 				t.logger.Error("Generation step failed", zap.Error(err))
 				if streamCallback != nil {
-					_ = streamCallback(ctx, SSEEventError, map[string]string{
-						"error": classifyGenerationError(req, err).UserMessage,
-					})
+					emitStreamError(ctx, streamCallback, classifyGenerationError(req, err).Error())
 				}
 			}
 			return
@@ -684,9 +683,8 @@ func (t *TableApi) runGenerationStep(
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				t.logger.Error("Generation step failed", zap.Error(err))
-				classified := classifyGenerationError(req, err)
 				result.Status = RetrievalAgentStatusFailed
-				result.Generation = classified.UserMessage
+				result.Generation = classifyGenerationError(req, err).Error()
 			}
 			return
 		}
@@ -814,8 +812,8 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 			var err error
 			generator, err = ai.NewGenKitGenerator(r.Context(), chain[0].Generator)
 			if err != nil {
-				classified := classifyGenerationError(&req, err)
-				errorResponse(w, classified.UserMessage, classified.HTTPStatusCode())
+				genErr := classifyGenerationError(&req, err)
+				errorResponse(w, genErr.Error(), genErr.HTTPStatusCode())
 				return
 			}
 		}
@@ -864,8 +862,11 @@ func (t *TableApi) streamRetrievalPipeline(
 
 	result, err := t.ExecutePipeline(ctx, req, generator, streamCb)
 	if err != nil {
-		classified := classifyGenerationError(req, err)
-		_ = streamEvent(w, rc, SSEEventError, map[string]string{"error": classified.UserMessage})
+		if message, _, ok := asGenerationErrorResponse(err); ok {
+			emitStreamError(ctx, streamCb, message)
+		} else {
+			emitStreamError(ctx, streamCb, err.Error())
+		}
 		return
 	}
 
@@ -883,8 +884,11 @@ func (t *TableApi) jsonRetrievalPipeline(
 ) {
 	result, err := t.ExecutePipeline(r.Context(), req, generator, nil)
 	if err != nil {
-		classified := classifyGenerationError(req, err)
-		errorResponse(w, classified.UserMessage, classified.HTTPStatusCode())
+		if message, statusCode, ok := asGenerationErrorResponse(err); ok {
+			errorResponse(w, message, statusCode)
+		} else {
+			errorResponse(w, err.Error(), http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -1109,8 +1113,7 @@ func (t *TableApi) RunAgenticRetrieval(
 			t.logger.Error("Classification step failed", zap.Error(err))
 		}
 		if streamCallback != nil {
-			classified := classifyGenerationError(req, err)
-			_ = streamCallback(ctx, SSEEventError, map[string]string{"error": classified.UserMessage})
+			emitStreamError(ctx, streamCallback, classifyGenerationError(req, err).Error())
 		}
 		// Continue without classification
 	}
@@ -1956,13 +1959,10 @@ func (e *retrievalToolExecutor) fallbackToSemanticSearch(
 // resolveEffectiveGeneratorChain returns the effective generator chain in precedence
 // order: explicit chain, explicit single generator, then the configured default chain.
 func resolveEffectiveGeneratorChain(req *RetrievalAgentRequest) []ai.ChainLink {
-	if len(req.Chain) > 0 {
-		return ai.ResolveGeneratorOrChain(req.Generator, req.Chain)
+	if chain := generating.ResolveGeneratorOrChain(req.Generator, req.Chain); len(chain) > 0 {
+		return chain
 	}
-	if req.Generator.Provider != "" {
-		return ai.ResolveGeneratorOrChain(req.Generator, nil)
-	}
-	return ai.GetDefaultChain()
+	return generating.GetDefaultChain()
 }
 
 // resolveProvider returns the first provider from the effective generator chain.
@@ -1984,8 +1984,24 @@ func resolveProviderName(req *RetrievalAgentRequest) string {
 	return string(provider)
 }
 
-func classifyGenerationError(req *RetrievalAgentRequest, err error) ai.GenerationError {
+func classifyGenerationError(req *RetrievalAgentRequest, err error) *ai.GenerationError {
 	return ai.AsGenerationError(resolveProviderName(req), err)
+}
+
+func asGenerationErrorResponse(err error) (string, int, bool) {
+	var generationErr *ai.GenerationError
+	if errors.As(err, &generationErr) {
+		return generationErr.UserMessage, generationErr.HTTPStatusCode(), true
+	}
+	return "", 0, false
+}
+
+func emitStreamError(
+	ctx context.Context,
+	streamCallback func(context.Context, SSEEvent, any) error,
+	message string,
+) {
+	_ = streamCallback(ctx, SSEEventError, map[string]string{"error": message})
 }
 
 func convertQueryHitsToDocuments(hits []QueryHit) []schema.Document {

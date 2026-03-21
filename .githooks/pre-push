@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+if ! command -v git >/dev/null 2>&1; then
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$repo_root" ]; then
+    exit 0
+fi
+
+cd "$repo_root"
+
+# pre-push receives lines on stdin: <local ref> <local sha> <remote ref> <remote sha>
+# Check whether any commits being pushed touch Go files.
+needs_tidy=false
+while read -r _ local_sha _ remote_sha; do
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        # New branch — diff against the merge base with the default branch
+        remote_sha=$(git merge-base HEAD origin/main 2>/dev/null || echo "")
+        if [ -z "$remote_sha" ]; then
+            # No merge base (e.g. first push ever) — check all files
+            needs_tidy=true
+            break
+        fi
+    fi
+
+    changed_files=$(git diff --name-only --diff-filter=ACMR "$remote_sha" "$local_sha" 2>/dev/null || true)
+    for path in $changed_files; do
+        case "$path" in
+            *.go|go.mod|go.sum|*/go.mod|*/go.sum)
+                needs_tidy=true
+                break 2
+                ;;
+        esac
+    done
+done
+
+if [ "$needs_tidy" != "true" ]; then
+    exit 0
+fi
+
+echo "Running make tidy-check..."
+if ! make tidy-check; then
+    cat <<'EOF'
+Go module files are out of sync.
+Run `make tidy` and commit the updated go.mod/go.sum files before pushing.
+EOF
+    exit 1
+fi

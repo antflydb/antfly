@@ -16,6 +16,7 @@ import-mapping:
   ../usermgr/api.yaml: "github.com/antflydb/antfly/src/usermgr"
   ../../lib/embeddings/openapi.yaml: github.com/antflydb/antfly/lib/embeddings
   ../../lib/ai/openapi.yaml: github.com/antflydb/antfly/lib/ai
+  ../../pkg/generating/openapi.yaml: github.com/antflydb/antfly/pkg/generating
   ../../lib/ai/eval/openapi.yaml: github.com/antflydb/antfly/lib/ai/eval
   ../../lib/chunking/openapi.yaml: github.com/antflydb/antfly/lib/chunking
   ../../lib/reranking/openapi.yaml: github.com/antflydb/antfly/lib/reranking

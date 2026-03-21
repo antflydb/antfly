@@ -17,9 +17,130 @@ package metadata
 import (
 	"testing"
 
+	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db/indexes"
+	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestValidateDocumentInsertKey(t *testing.T) {
+	plainTable := &store.Table{}
+	graphTable := &store.Table{
+		Indexes: map[string]indexes.IndexConfig{
+			"g": {Type: indexes.IndexTypeGraph},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		table   *store.Table
+		key     string
+		wantErr string
+	}{
+		{
+			name:  "plain key allowed",
+			table: plainTable,
+			key:   "doc:123",
+		},
+		{
+			name:    "db range start rejected",
+			table:   plainTable,
+			key:     "doc" + string(storeutils.DBRangeStart) + "123",
+			wantErr: "DBRangeStart",
+		},
+		{
+			name:    "db range end rejected",
+			table:   plainTable,
+			key:     "doc" + string(storeutils.DBRangeEnd) + "123",
+			wantErr: "DBRangeEnd",
+		},
+		{
+			name:    "metadata prefix rejected",
+			table:   plainTable,
+			key:     string(storeutils.MetadataPrefix) + "doc",
+			wantErr: "reserved metadata prefix",
+		},
+		{
+			name:    "embedding suffix rejected",
+			table:   plainTable,
+			key:     "doc:e",
+			wantErr: "reserved enrichment suffix",
+		},
+		{
+			name:    "summary suffix rejected",
+			table:   plainTable,
+			key:     "doc:s",
+			wantErr: "reserved enrichment suffix",
+		},
+		{
+			name:    "chunk suffix rejected",
+			table:   plainTable,
+			key:     "doc:0:c",
+			wantErr: "reserved chunk suffix",
+		},
+		{
+			name:    "sparse suffix rejected",
+			table:   plainTable,
+			key:     "doc:i:idx:sp",
+			wantErr: "reserved sparse index suffix",
+		},
+		{
+			name:    "graph field hash suffix rejected",
+			table:   plainTable,
+			key:     "doc:i:graph:edge:fh",
+			wantErr: "reserved graph field-hash suffix",
+		},
+		{
+			name:    "edge marker rejected",
+			table:   plainTable,
+			key:     "source:i:graph:out:links:target:o",
+			wantErr: "reserved graph edge markers",
+		},
+		{
+			name:  "index marker allowed on non-graph table",
+			table: plainTable,
+			key:   "tenant:i:42",
+		},
+		{
+			name:    "index marker rejected on graph table",
+			table:   graphTable,
+			key:     "tenant:i:42",
+			wantErr: `":i:"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDocumentInsertKey(tt.table, tt.key)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateDocumentMutationKey(t *testing.T) {
+	assert.NoError(t, validateDocumentMutationKey("tenant:i:42"))
+	assert.ErrorContains(t, validateDocumentMutationKey("doc"+string(storeutils.DBRangeStart)+"bad"), "DBRangeStart")
+	assert.ErrorContains(t, validateDocumentMutationKey(string(storeutils.MetadataPrefix)+"doc"), "reserved metadata prefix")
+	assert.ErrorContains(t, validateDocumentMutationKey("doc:0:c"), "reserved chunk suffix")
+	assert.ErrorContains(t, validateDocumentMutationKey("source:i:graph:out:links:target:o"), "reserved graph edge markers")
+	assert.ErrorContains(t, validateDocumentMutationKey(""), "nonempty key required")
+}
+
+func TestValidateDocumentTransformKey(t *testing.T) {
+	graphTable := &store.Table{
+		Indexes: map[string]indexes.IndexConfig{
+			"g": {Type: indexes.IndexTypeGraph},
+		},
+	}
+
+	assert.NoError(t, validateDocumentTransformKey(graphTable, "tenant:i:42", false))
+	assert.ErrorContains(t, validateDocumentTransformKey(graphTable, "doc:0:c", false), "reserved chunk suffix")
+	assert.ErrorContains(t, validateDocumentTransformKey(graphTable, "tenant:i:42", true), `":i:"`)
+}
 
 func TestValidateMergeConfig(t *testing.T) {
 	tests := []struct {

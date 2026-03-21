@@ -1044,8 +1044,8 @@ func (t *TableApi) BatchWrite(w http.ResponseWriter, r *http.Request, tableName 
 	// Validate all documents and collect keys
 	keys := make([]string, 0, len(kvs.Inserts))
 	for providedKey, doc := range kvs.Inserts {
-		if providedKey == "" {
-			errorResponse(w, "Nonempty key required for writes", http.StatusBadRequest)
+		if err := validateDocumentInsertKey(table, providedKey); err != nil {
+			errorResponse(w, fmt.Sprintf("invalid document id %q: %v", providedKey, err), http.StatusBadRequest)
 			return
 		}
 
@@ -1061,6 +1061,18 @@ func (t *TableApi) BatchWrite(w http.ResponseWriter, r *http.Request, tableName 
 		}
 
 		keys = append(keys, providedKey)
+	}
+	for _, key := range kvs.Deletes {
+		if err := validateDocumentMutationKey(key); err != nil {
+			errorResponse(w, fmt.Sprintf("invalid document id %q: %v", key, err), http.StatusBadRequest)
+			return
+		}
+	}
+	for _, transformReq := range kvs.Transforms {
+		if err := validateDocumentTransformKey(table, transformReq.Key, transformReq.Upsert); err != nil {
+			errorResponse(w, fmt.Sprintf("invalid document id %q: %v", transformReq.Key, err), http.StatusBadRequest)
+			return
+		}
 	}
 	if len(kvs.Inserts) == 1 {
 		// forwardInsertToShard handles routing and re-routes on each retry to pick up

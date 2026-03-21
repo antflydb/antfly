@@ -10,4 +10,4 @@ output-options:
   skip-prune: true
   prefer-skip-optional-pointer: true
 import-mapping:
-  ../openapi.yaml: github.com/antflydb/antfly/lib/ai
+  ../../../pkg/generating/openapi.yaml: github.com/antflydb/antfly/pkg/generating

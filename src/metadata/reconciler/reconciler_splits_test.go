@@ -40,6 +40,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 			map[types.ID]time.Time{},          // shardCooldown
 			nil,                               // getMedianKey not needed
 			RealTimeProvider{},                // timeProvider
+			1,                                 // autoSplitPerTableLimit
+			1,                                 // autoSplitClusterLimit
 		)
 
 		assert.Empty(t, splits)
@@ -81,6 +83,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.Empty(t, splits, "Shard in cooldown should be skipped")
@@ -116,6 +120,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.Empty(t, splits, "Shard without proper raft status should be skipped")
@@ -152,6 +158,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.Empty(t, splits, "Transitioning shard should be skipped")
@@ -196,6 +204,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.False(t, getMedianKeyCalled, "split child awaiting cutover should be skipped")
@@ -232,6 +242,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.Empty(t, splits, "Shard with stale stats should be skipped")
@@ -279,6 +291,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return medianKey, nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.True(t, getMedianKeyCalled, "getMedianKey should be called for large shard")
@@ -351,6 +365,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.Empty(t, splits)
@@ -399,6 +415,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
 		assert.Empty(t, splits, "Should not split when at max shards per table")
@@ -460,9 +478,79 @@ func TestComputeSplitTransitions(t *testing.T) {
 				return []byte("median-key"), nil
 			},
 			RealTimeProvider{},
+			1,
+			1,
 		)
 
-		assert.Len(t, splits, 2, "Both tables should be split independently")
+		assert.Len(t, splits, 1, "Automatic split planning should be throttled cluster-wide")
+		assert.Empty(t, merges)
+	})
+
+	t.Run("active split blocks new automatic split planning", func(t *testing.T) {
+		shards := map[types.ID]*store.ShardStatus{
+			1: {
+				ShardInfo: store.ShardInfo{
+					ShardConfig: store.ShardConfig{
+						ByteRange: [2][]byte{{0x00}, {0x80}},
+					},
+					RaftStatus: &common.RaftStatus{
+						Lead:   1,
+						Voters: common.NewPeerSet(1, 2, 3),
+					},
+					ShardStats: &store.ShardStats{
+						Updated: time.Now(),
+						Storage: &store.StorageStats{
+							DiskSize: 1024 * 1024 * 200,
+						},
+					},
+					SplitState: func() *db.SplitState {
+						state := &db.SplitState{}
+						state.SetPhase(db.SplitState_PHASE_SPLITTING)
+						return state
+					}(),
+				},
+				ID:    1,
+				Table: "table1",
+				State: store.ShardState_Splitting,
+			},
+			2: {
+				ShardInfo: store.ShardInfo{
+					ShardConfig: store.ShardConfig{
+						ByteRange: [2][]byte{{0x80}, {0xff}},
+					},
+					RaftStatus: &common.RaftStatus{
+						Lead:   1,
+						Voters: common.NewPeerSet(1, 2, 3),
+					},
+					ShardStats: &store.ShardStats{
+						Updated: time.Now(),
+						Storage: &store.StorageStats{
+							DiskSize: 1024 * 1024 * 200,
+						},
+					},
+				},
+				ID:    2,
+				Table: "table2",
+				State: store.ShardState_Default,
+			},
+		}
+
+		splits, merges := computeSplitTransitions(
+			t.Context(),
+			3,
+			shards,
+			1024*1024*100,
+			100,
+			map[types.ID]time.Time{},
+			func(ctx context.Context, id types.ID) ([]byte, error) {
+				return []byte("median-key"), nil
+			},
+			RealTimeProvider{},
+			1,
+			1,
+		)
+
+		assert.Empty(t, splits, "No new automatic splits should be planned while another split is active")
 		assert.Empty(t, merges)
 	})
 }

@@ -17,10 +17,10 @@ package common
 import (
 	"testing"
 
-	"github.com/antflydb/antfly/lib/ai"
 	"github.com/antflydb/antfly/lib/chunking"
 	"github.com/antflydb/antfly/lib/embeddings"
 	"github.com/antflydb/antfly/lib/reranking"
+	generating "github.com/antflydb/antfly/pkg/generating"
 )
 
 func TestRegistry_EmbedderConfig(t *testing.T) {
@@ -77,14 +77,14 @@ func TestRegistry_EmbedderConfig(t *testing.T) {
 
 func TestRegistry_GeneratorConfig(t *testing.T) {
 	reg := &Registry{
-		generatorConfigs: make(map[string]ai.GeneratorConfig),
+		generatorConfigs: make(map[string]generating.GeneratorConfig),
 	}
 
 	// Register generators
-	config1 := ai.GeneratorConfig{Provider: "gemini"}
+	config1 := generating.GeneratorConfig{Provider: "gemini"}
 	reg.RegisterGeneratorConfig("gemini-flash", config1)
 
-	config2 := ai.GeneratorConfig{Provider: "openai"}
+	config2 := generating.GeneratorConfig{Provider: "openai"}
 	reg.RegisterGeneratorConfig("openai-gpt4", config2)
 
 	if reg.DefaultGeneratorName() != "gemini-flash" {
@@ -144,16 +144,16 @@ func TestRegistry_ChunkerConfig(t *testing.T) {
 
 func TestRegistry_Chain(t *testing.T) {
 	reg := &Registry{
-		generatorConfigs: make(map[string]ai.GeneratorConfig),
+		generatorConfigs: make(map[string]generating.GeneratorConfig),
 		chains:           make(map[string][]ChainLinkConfig),
 	}
 
 	// Register generators first
-	reg.RegisterGeneratorConfig("gemini-flash", ai.GeneratorConfig{Provider: "gemini"})
-	reg.RegisterGeneratorConfig("openai-gpt4", ai.GeneratorConfig{Provider: "openai"})
+	reg.RegisterGeneratorConfig("gemini-flash", generating.GeneratorConfig{Provider: "gemini"})
+	reg.RegisterGeneratorConfig("openai-gpt4", generating.GeneratorConfig{Provider: "openai"})
 
 	// Register chain with named references
-	condition := ai.ChainConditionOnRateLimit
+	condition := generating.ChainConditionOnRateLimit
 	chainLinks := []ChainLinkConfig{
 		{GeneratorName: "gemini-flash"},
 		{GeneratorName: "openai-gpt4", Condition: &condition},
@@ -182,22 +182,22 @@ func TestRegistry_Chain(t *testing.T) {
 		t.Errorf("expected second link provider 'openai', got %q", resolved[1].Generator.Provider)
 	}
 
-	if resolved[1].Condition == nil || *resolved[1].Condition != ai.ChainConditionOnRateLimit {
+	if resolved[1].Condition == nil || *resolved[1].Condition != generating.ChainConditionOnRateLimit {
 		t.Error("expected second link condition to be 'on_rate_limit'")
 	}
 }
 
 func TestRegistry_ChainWithInlineConfig(t *testing.T) {
 	reg := &Registry{
-		generatorConfigs: make(map[string]ai.GeneratorConfig),
+		generatorConfigs: make(map[string]generating.GeneratorConfig),
 		chains:           make(map[string][]ChainLinkConfig),
 	}
 
 	// Register one named generator
-	reg.RegisterGeneratorConfig("gemini-flash", ai.GeneratorConfig{Provider: "gemini"})
+	reg.RegisterGeneratorConfig("gemini-flash", generating.GeneratorConfig{Provider: "gemini"})
 
 	// Register chain with mix of named and inline
-	inlineConfig := ai.GeneratorConfig{Provider: "anthropic"}
+	inlineConfig := generating.GeneratorConfig{Provider: "anthropic"}
 	chainLinks := []ChainLinkConfig{
 		{GeneratorName: "gemini-flash"},
 		{GeneratorConfig: &inlineConfig},
@@ -224,7 +224,7 @@ func TestRegistry_ChainWithInlineConfig(t *testing.T) {
 
 func TestRegistry_ChainMissingGenerator(t *testing.T) {
 	reg := &Registry{
-		generatorConfigs: make(map[string]ai.GeneratorConfig),
+		generatorConfigs: make(map[string]generating.GeneratorConfig),
 		chains:           make(map[string][]ChainLinkConfig),
 	}
 
@@ -243,7 +243,7 @@ func TestRegistry_ChainMissingGenerator(t *testing.T) {
 func TestRegistry_Clear(t *testing.T) {
 	reg := &Registry{
 		embedderConfigs:  make(map[string]embeddings.EmbedderConfig),
-		generatorConfigs: make(map[string]ai.GeneratorConfig),
+		generatorConfigs: make(map[string]generating.GeneratorConfig),
 		rerankerConfigs:  make(map[string]reranking.RerankerConfig),
 		chunkerConfigs:   make(map[string]chunking.ChunkerConfig),
 		chains:           make(map[string][]ChainLinkConfig),
@@ -251,7 +251,7 @@ func TestRegistry_Clear(t *testing.T) {
 
 	// Add some data
 	reg.RegisterEmbedderConfig("test", embeddings.EmbedderConfig{Provider: "test"})
-	reg.RegisterGeneratorConfig("test", ai.GeneratorConfig{Provider: "test"})
+	reg.RegisterGeneratorConfig("test", generating.GeneratorConfig{Provider: "test"})
 	reg.RegisterRerankerConfig("test", reranking.RerankerConfig{Provider: "cohere"})
 	reg.RegisterChunkerConfig("test", chunking.ChunkerConfig{Provider: "termite"})
 	reg.RegisterChain("test", []ChainLinkConfig{})
@@ -283,7 +283,7 @@ func TestRegistry_Clear(t *testing.T) {
 func TestRegistry_EmptyRegistryErrors(t *testing.T) {
 	reg := &Registry{
 		embedderConfigs:  make(map[string]embeddings.EmbedderConfig),
-		generatorConfigs: make(map[string]ai.GeneratorConfig),
+		generatorConfigs: make(map[string]generating.GeneratorConfig),
 		rerankerConfigs:  make(map[string]reranking.RerankerConfig),
 		chunkerConfigs:   make(map[string]chunking.ChunkerConfig),
 		chains:           make(map[string][]ChainLinkConfig),
