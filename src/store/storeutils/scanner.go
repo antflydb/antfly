@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 
@@ -418,14 +417,10 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 				return true, nil // Skip if we haven't seen a document yet
 			}
 
-			// Extract base document key
-			keyWithoutSuffix := key[:len(key)-len(SummarySuffix)]
-			// Find where the document key ends (before :i:)
-			idxPos := bytes.Index(keyWithoutSuffix, []byte(":i:"))
-			if idxPos == -1 {
+			docKey, indexName, ok := ParseSummaryKey(key)
+			if !ok {
 				return true, nil // Skip malformed key
 			}
-			docKey := keyWithoutSuffix[:idxPos]
 
 			// Check if this summary belongs to a different document
 			if !bytes.Equal(docKey, currentDoc.CurrentDocKey) {
@@ -441,15 +436,6 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 				currentDoc = nil
 				return true, nil
 			}
-
-			// Extract index name
-			indexPart := keyWithoutSuffix[idxPos:]
-			indexPartStr := string(indexPart)
-			lastIdx := strings.LastIndex(indexPartStr, ":i:")
-			if lastIdx == -1 {
-				return true, nil
-			}
-			indexName := indexPartStr[lastIdx+3:]
 
 			// Extract summary value (skip first 8 bytes which are hashID)
 			if len(value) < 8 {
@@ -476,12 +462,10 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 			// Extract base key (everything before :cft)
 			keyBeforeCft := before
 
-			// Find where the document key ends (before :i:)
-			before, after, ok := bytes.Cut(keyBeforeCft, []byte(":i:"))
+			docKey, indexName, ok := ParseChunkKey(append(bytes.Clone(keyBeforeCft), ChunkingFullTextSuffix...))
 			if !ok {
 				return true, nil // Skip malformed key
 			}
-			docKey := before
 
 			// Check if this chunk belongs to a different document
 			if !bytes.Equal(docKey, currentDoc.CurrentDocKey) {
@@ -497,16 +481,6 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 				currentDoc = nil
 				return true, nil
 			}
-
-			// Extract index name (between :i: and :<chunkID>)
-			// With format docKey:i:indexName:chunkID:cft, indexPart is "indexName:chunkID"
-			indexPart := after // Skip ":i:"
-			// Find the last colon which separates index name from chunk ID
-			lastColon := bytes.LastIndexByte([]byte(indexPart), ':')
-			if lastColon == -1 {
-				return true, nil // Malformed key
-			}
-			indexName := string(indexPart[:lastColon])
 
 			// Extract chunk JSON (skip first 8 bytes which are hashID)
 			if len(value) < 8 {

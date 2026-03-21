@@ -1159,11 +1159,12 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 	}
 }
 
-func (db *DBImpl) Open(
+func (db *DBImpl) openInternal(
 	dir string,
 	recovery bool,
 	schema *schema.TableSchema,
 	byteRange types.Range,
+	openIndexes bool,
 ) error {
 	pebbleDir := filepath.Join(dir, "pebble")
 	// Ensure the destination directory exists
@@ -1175,6 +1176,11 @@ func (db *DBImpl) Open(
 	pebbleOpts, err := db.getPebbleOpts()
 	if err != nil {
 		return err
+	}
+	if !openIndexes {
+		// Split staging DBs are short-lived. Disable async table stats so Pebble
+		// does not race a background stats job against DB shutdown.
+		pebbleOpts.DisableTableStats = true
 	}
 
 	pdb, err := pebble.Open(pebbleDir, pebbleOpts)
@@ -1235,8 +1241,10 @@ func (db *DBImpl) Open(
 	if err := db.saveMetadata(); err != nil {
 		return fmt.Errorf("saving metadata to pebble: %w", err)
 	}
-	if err := db.openIndex(dir, recovery); err != nil {
-		return fmt.Errorf("opening index: %w", err)
+	if openIndexes {
+		if err := db.openIndex(dir, recovery); err != nil {
+			return fmt.Errorf("opening index: %w", err)
+		}
 	}
 	db.logger.Debug(
 		"Completed opening local keyvalue store",
@@ -1245,6 +1253,15 @@ func (db *DBImpl) Open(
 		zap.Stringer("byteRange", db.byteRange),
 	)
 	return nil
+}
+
+func (db *DBImpl) Open(
+	dir string,
+	recovery bool,
+	schema *schema.TableSchema,
+	byteRange types.Range,
+) error {
+	return db.openInternal(dir, recovery, schema, byteRange, true)
 }
 
 func (s *DBImpl) Close() (err error) {
@@ -1359,7 +1376,14 @@ func (db *DBImpl) Split(
 	destDir1, destDir2 string,
 	prepareOnly bool,
 ) error {
-	ctx := context.Background()
+	splitStart := time.Now()
+	defer func() {
+		phase := "full"
+		if prepareOnly {
+			phase = "prepare_only"
+		}
+		splitPhaseDurationSeconds.WithLabelValues(phase).Observe(time.Since(splitStart).Seconds())
+	}()
 	if !currRange.Contains(splitKey) {
 		return fmt.Errorf("split key %s not in range %s", splitKey, currRange)
 	}
@@ -1372,40 +1396,23 @@ func (db *DBImpl) Split(
 		zap.String("destDir", destDir2),
 		zap.Stringer("range", range2))
 
-	newDB := &DBImpl{
-		logger:       db.logger.Named("split-shard"),
-		antflyConfig: db.antflyConfig,
-		indexes:      db.indexes,
-		schema:       db.schema,
-	}
-
-	if err := newDB.Open(destDir2, false, db.schema, range2); err != nil {
-		return fmt.Errorf("opening db for index rebuild: %w", err)
-	}
-
 	// When prepareOnly=true, we only need to stream data for the archive - the parent
-	// shard continues using its existing indexes. Skip the expensive index backfill
-	// that would otherwise be discarded. This significantly reduces split downtime.
+	// shard continues using its existing indexes. Build the split-off staging DB
+	// with a restricted Pebble checkpoint plus rewritten metadata, avoiding the
+	// previous row-by-row copy and discarded index work.
 	if prepareOnly {
-		// Stream data to new DB for the archive
-		count, err := db.streamRangeToDB(ctx, newDB, range2)
+		childPrepareStart := time.Now()
+		newDB, err := db.prepareSplitStagingDB(destDir2, range2)
 		if err != nil {
-			_ = newDB.Close()
-			return fmt.Errorf("streaming data: %w", err)
+			return fmt.Errorf("preparing split staging db: %w", err)
 		}
-		db.logger.Info("Streamed data to new shard",
+		splitPhaseDurationSeconds.WithLabelValues("prepare_child_checkpoint").Observe(time.Since(childPrepareStart).Seconds())
+		db.logger.Info("Prepared split staging db from checkpoint",
 			zap.String("destDir", destDir2),
-			zap.Int("recordCount", count),
-			zap.Duration("streamDuration", time.Since(startTime)))
-
-		// Flush to ensure all data is persisted before creating the archive
-		if err := newDB.pdb.Flush(); err != nil {
-			_ = newDB.Close()
-			return fmt.Errorf("flushing new db: %w", err)
-		}
-
+			zap.Stringer("range", range2),
+			zap.Duration("prepareDuration", time.Since(startTime)))
 		if err := newDB.Close(); err != nil {
-			return fmt.Errorf("closing new db: %w", err)
+			return fmt.Errorf("closing split staging db: %w", err)
 		}
 
 		db.logger.Info("Prepared split (data preserved for transition)",
@@ -1416,81 +1423,23 @@ func (db *DBImpl) Split(
 		return nil
 	}
 
-	// For non-prepareOnly splits, we need to rebuild indexes for the remaining range
-	splitPDB := db.getPDB()
-	if splitPDB == nil {
-		return pebble.ErrClosed
-	}
-	newIndexManager, err := NewIndexManager(
-		db.logger,
-		db.antflyConfig,
-		splitPDB,
-		filepath.Join(destDir1, "indexes"),
-		db.schema,
-		range1,
-		db.cache,
-	)
+	childPrepareStart := time.Now()
+	newDB, err := db.prepareSplitStagingDB(destDir2, range2)
 	if err != nil {
+		return fmt.Errorf("preparing split staging db: %w", err)
+	}
+	splitPhaseDurationSeconds.WithLabelValues("full_child_checkpoint").Observe(time.Since(childPrepareStart).Seconds())
+	db.logger.Info("Prepared split staging db from checkpoint",
+		zap.String("destDir", destDir2),
+		zap.Stringer("range", range2),
+		zap.Duration("prepareDuration", time.Since(childPrepareStart)))
+	defer func() {
 		_ = newDB.Close()
-		return fmt.Errorf("opening index manager: %w", err)
-	}
-	for idx, conf := range db.indexes {
-		db.logger.Debug("Opening index", zap.String("index", idx), zap.Any("index_config", conf))
-		if err := newIndexManager.Register(idx, false, conf); err != nil {
-			_ = newDB.Close()
-			_ = newIndexManager.Close(ctx)
-			return fmt.Errorf("registering preconfigured index: %w", err)
-		}
-	}
-	if err := newIndexManager.Start(false); err != nil {
-		_ = newDB.Close()
-		_ = newIndexManager.Close(ctx)
-		return fmt.Errorf("opening indexes: %w", err)
-	}
+	}()
 
-	// Run data streaming and index backfilling concurrently
-	eg, egCtx := errgroup.WithContext(ctx)
-	var count int
-
-	// Stream data to new DB
-	eg.Go(func() error {
-		var err error
-		count, err = db.streamRangeToDB(egCtx, newDB, range2)
-		if err != nil {
-			return fmt.Errorf("streaming data: %w", err)
-		}
-		db.logger.Info("Streamed data to new shard",
-			zap.String("destDir", destDir2),
-			zap.Int("recordCount", count),
-			zap.Duration("streamDuration", time.Since(startTime)))
-		return nil
-	})
-
-	// Wait for index backfills to complete
-	eg.Go(func() error {
-		db.logger.Info("Waiting for index backfills to complete", zap.String("destDir", destDir1))
-		newIndexManager.WaitForBackfills(egCtx)
-		db.logger.Info("Index backfills completed", zap.String("destDir", destDir1))
-		return nil
-	})
-
-	if err := eg.Wait(); err != nil {
-		_ = newDB.Close()
-		_ = newIndexManager.Close(ctx)
-		return err
-	}
-
-	if err := newDB.Close(); err != nil {
-		_ = newIndexManager.Close(ctx)
-		return fmt.Errorf("closing new db: %w", err)
-	}
-
-	if err := newIndexManager.Close(ctx); err != nil {
-		return fmt.Errorf("closing new index manager: %w", err)
-	}
-
-	// Finalize the split: delete split-off data and update byte range
-	if err := db.finalizeSplitInternal(range1, destDir1); err != nil {
+	// Finalize the split by pruning split-off keys from the parent indexes in place,
+	// then deleting the split-off range from Pebble and updating the byte range.
+	if err := db.finalizeSplitInternal(range1, ""); err != nil {
 		return fmt.Errorf("finalizing split: %w", err)
 	}
 
@@ -1501,14 +1450,243 @@ func (db *DBImpl) Split(
 	return nil
 }
 
+func (db *DBImpl) prepareSplitStagingDB(destDir string, byteRange types.Range) (*DBImpl, error) {
+	prepareStart := time.Now()
+	defer func() {
+		splitPhaseDurationSeconds.WithLabelValues("checkpoint_prepare_helper").Observe(time.Since(prepareStart).Seconds())
+	}()
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+
+	if err := os.MkdirAll(destDir, os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
+		return nil, fmt.Errorf("creating split staging directory: %w", err)
+	}
+
+	destPebbleDir := filepath.Join(destDir, "pebble")
+	_ = os.RemoveAll(destPebbleDir)
+
+	span := pebble.CheckpointSpan{
+		Start: byteRange[0],
+		End:   byteRange.EndForPebble(),
+	}
+	checkpointStart := time.Now()
+	if err := pdb.Checkpoint(destPebbleDir,
+		pebble.WithFlushedWAL(),
+		pebble.WithRestrictToSpans([]pebble.CheckpointSpan{span}),
+	); err != nil {
+		return nil, fmt.Errorf("creating restricted checkpoint: %w", err)
+	}
+	splitPhaseDurationSeconds.WithLabelValues("checkpoint_create").Observe(time.Since(checkpointStart).Seconds())
+
+	db.indexesMu.RLock()
+	indexConfigs := maps.Clone(db.indexes)
+	db.indexesMu.RUnlock()
+
+	newDB := &DBImpl{
+		logger:       db.logger.Named("split-shard"),
+		antflyConfig: db.antflyConfig,
+		indexes:      indexConfigs,
+		schema:       db.schema,
+	}
+	openStart := time.Now()
+	if err := newDB.openInternal(destDir, false, db.schema, byteRange, false); err != nil {
+		return nil, fmt.Errorf("opening checkpointed split staging db: %w", err)
+	}
+	splitPhaseDurationSeconds.WithLabelValues("checkpoint_open").Observe(time.Since(openStart).Seconds())
+
+	// Restricted checkpoints can still carry keys from overlapping SSTables.
+	// Trim the staged child DB down to the exact split-off range before archiving.
+	trimStart := time.Now()
+	if err := newDB.trimToRangeWithoutIndexes(byteRange); err != nil {
+		_ = newDB.Close()
+		return nil, fmt.Errorf("trimming checkpointed split staging db to range: %w", err)
+	}
+	splitPhaseDurationSeconds.WithLabelValues("checkpoint_trim").Observe(time.Since(trimStart).Seconds())
+
+	// Split staging archives should contain only child data plus core metadata.
+	// Clear any split bookkeeping inherited from the checkpointed parent state.
+	cleanupStart := time.Now()
+	if newDB.splitState != nil {
+		if err := newDB.ClearSplitState(); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+			_ = newDB.Close()
+			return nil, fmt.Errorf("clearing split state from split staging db: %w", err)
+		}
+	}
+	if err := newDB.ClearSplitDeltaEntries(); err != nil {
+		_ = newDB.Close()
+		return nil, fmt.Errorf("clearing split delta entries from split staging db: %w", err)
+	}
+	splitPhaseDurationSeconds.WithLabelValues("checkpoint_cleanup").Observe(time.Since(cleanupStart).Seconds())
+
+	return newDB, nil
+}
+
+func (db *DBImpl) trimToRangeWithoutIndexes(byteRange types.Range) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+
+	batch := pdb.NewBatch()
+	defer func() { _ = batch.Close() }()
+
+	if err := batch.DeleteRange(utils.PrefixSuccessor(MetadataPrefix), byteRange[0], nil); err != nil {
+		return fmt.Errorf("deleting range below split staging lower bound: %w", err)
+	}
+	if err := batch.DeleteRange(byteRange.EndForPebble(), types.RangeEndSentinel, nil); err != nil {
+		return fmt.Errorf("deleting range above split staging upper bound: %w", err)
+	}
+
+	data, err := json.Marshal(byteRange)
+	if err != nil {
+		return fmt.Errorf("marshaling split staging byte range: %w", err)
+	}
+	if err := batch.Set(byteRangeKey, data, nil); err != nil {
+		return fmt.Errorf("saving split staging byte range: %w", err)
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("committing split staging range trim: %w", err)
+	}
+
+	db.byteRange = byteRange
+	return nil
+}
+
+func splitOffRangeForNewRange(currentRange, newRange types.Range, splitState *SplitState) (types.Range, bool, error) {
+	splitOffEnd := currentRange[1]
+	if splitState != nil && len(splitState.GetOriginalRangeEnd()) > 0 {
+		splitOffEnd = splitState.GetOriginalRangeEnd()
+	}
+
+	if bytes.Equal(newRange[1], splitOffEnd) {
+		return types.Range{}, false, nil
+	}
+	if len(splitOffEnd) > 0 && bytes.Compare(newRange[1], splitOffEnd) > 0 {
+		return types.Range{}, false, fmt.Errorf(
+			"new range end %s exceeds original range end %s",
+			types.FormatKey(newRange[1]),
+			types.FormatKey(splitOffEnd),
+		)
+	}
+
+	return types.Range{newRange[1], splitOffEnd}, true, nil
+}
+
+func indexDeleteKeyForStoredKey(key []byte) ([]byte, bool) {
+	if len(key) == 0 || bytes.HasPrefix(key, MetadataPrefix) {
+		return nil, false
+	}
+	if storeutils.IsChunkKey(key) {
+		return bytes.Clone(key), true
+	}
+	if storeutils.IsEdgeKey(key) {
+		return bytes.Clone(key), true
+	}
+	if bytes.HasSuffix(key, storeutils.DBRangeStart) {
+		return bytes.Clone(key[:len(key)-len(storeutils.DBRangeStart)]), true
+	}
+	return nil, false
+}
+
+func (db *DBImpl) pruneIndexesForRange(ctx context.Context, byteRange types.Range) error {
+	if db.indexManager == nil {
+		return nil
+	}
+
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+
+	upperBound := byteRange[1]
+	if len(upperBound) == 0 {
+		upperBound = nil
+	}
+
+	iter, err := pdb.NewIter(&pebble.IterOptions{
+		LowerBound: byteRange[0],
+		UpperBound: upperBound,
+	})
+	if err != nil {
+		return fmt.Errorf("creating iterator for index prune: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	groupedDeletes := deleteKeyGroups{
+		all:       make([][]byte, 0, indexManagerPartitionSize),
+		documents: make([][]byte, 0, indexManagerPartitionSize),
+	}
+	pruned := 0
+	prunedDocuments := 0
+	prunedChunks := 0
+	prunedEdges := 0
+	flush := func() error {
+		if len(groupedDeletes.all) == 0 {
+			return nil
+		}
+		if err := db.indexManager.deleteGroupedKeys(ctx, groupedDeletes); err != nil {
+			return err
+		}
+		pruned += len(groupedDeletes.all)
+		groupedDeletes.all = groupedDeletes.all[:0]
+		groupedDeletes.documents = groupedDeletes.documents[:0]
+		clear(groupedDeletes.chunksByName)
+		clear(groupedDeletes.edgesByName)
+		return nil
+	}
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		deleteKey, ok := indexDeleteKeyForStoredKey(iter.Key())
+		if !ok {
+			continue
+		}
+		switch appendDeleteKeyGroup(&groupedDeletes, deleteKey) {
+		case "document":
+			prunedDocuments++
+		case "chunk":
+			prunedChunks++
+		case "edge":
+			prunedEdges++
+		}
+		if len(groupedDeletes.all) == indexManagerPartitionSize {
+			if err := flush(); err != nil {
+				return fmt.Errorf("pruning index batch for range %s: %w", byteRange, err)
+			}
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("iterating split-off range for index prune: %w", err)
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("pruning index batch for range %s: %w", byteRange, err)
+	}
+
+	if prunedDocuments > 0 {
+		splitPruneCandidateKeysTotal.WithLabelValues("document").Add(float64(prunedDocuments))
+	}
+	if prunedChunks > 0 {
+		splitPruneCandidateKeysTotal.WithLabelValues("chunk").Add(float64(prunedChunks))
+	}
+	if prunedEdges > 0 {
+		splitPruneCandidateKeysTotal.WithLabelValues("edge").Add(float64(prunedEdges))
+	}
+
+	db.logger.Info("Pruned split-off keys from parent indexes",
+		zap.Stringer("range", byteRange),
+		zap.Int("keys", pruned))
+	return nil
+}
+
 // FinalizeSplit completes a split that was prepared with prepareOnly=true.
 // It deletes the split-off data from the parent database and updates the byte range.
 // This should be called when the new shard is ready to serve traffic.
 func (db *DBImpl) FinalizeSplit(newRange types.Range) error {
 	db.logger.Info("Finalizing split", zap.Stringer("newRange", newRange))
 
-	// For finalize, we don't rebuild indexes since they already cover the full range
-	// and will naturally exclude split-off data after the range update
+	// Finalize by pruning split-off keys from the existing parent indexes before
+	// deleting the underlying Pebble data. This avoids a full remaining-range rebuild.
 	if err := db.finalizeSplitInternal(newRange, ""); err != nil {
 		return fmt.Errorf("finalizing split: %w", err)
 	}
@@ -1524,6 +1702,19 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 	if pdb == nil {
 		return pebble.ErrClosed
 	}
+
+	splitOffRange, hasSplitOffRange, err := splitOffRangeForNewRange(db.byteRange, newRange, db.splitState)
+	if err != nil {
+		return fmt.Errorf("computing split-off range: %w", err)
+	}
+	if hasSplitOffRange {
+		pruneStart := time.Now()
+		if err := db.pruneIndexesForRange(context.Background(), splitOffRange); err != nil {
+			return fmt.Errorf("pruning parent indexes for split-off range %s: %w", splitOffRange, err)
+		}
+		splitPhaseDurationSeconds.WithLabelValues("finalize_index_prune").Observe(time.Since(pruneStart).Seconds())
+	}
+
 	batch := pdb.NewBatch()
 	defer func() {
 		_ = batch.Close()
@@ -1557,8 +1748,8 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 		db.logger.Warn("Error closing db after range update", zap.Error(err))
 	}
 
-	// Move the new index manager's indexes to replace the current DB's indexes
-	// (only if destDir1 was provided, i.e., during full split, not standalone finalize)
+	// Move prebuilt indexes into place if a caller provided them. The current split
+	// path prunes the existing parent indexes in place, so this is legacy-only.
 	if destDir1 != "" {
 		oldIndexesPath := filepath.Join(db.dir, "indexes")
 		newIndexesPath := filepath.Join(destDir1, "indexes")
@@ -1632,7 +1823,6 @@ func (db *DBImpl) streamRangeToDB(
 		return 0, fmt.Errorf("destination database closed during split streaming")
 	}
 	batch := destPDB.NewBatch()
-	keyBatch := make([][2][]byte, 0, batchSize)
 	defer func() {
 		_ = batch.Close()
 	}()
@@ -1643,7 +1833,6 @@ func (db *DBImpl) streamRangeToDB(
 		key := slices.Clone(iter.Key())
 		value := slices.Clone(iter.Value())
 
-		keyBatch = append(keyBatch, [2][]byte{key, value})
 		// Write directly to Pebble, bypassing the Batch() method's range checks
 		if err := batch.Set(key, value, nil); err != nil {
 			return count, fmt.Errorf("setting key in batch: %w", err)
@@ -1651,17 +1840,10 @@ func (db *DBImpl) streamRangeToDB(
 		count++
 
 		if count%batchSize == 0 {
-			// Use FullText sync level for splits/backfills to ensure consistency
-			if err := db.indexManager.Batch(ctx, keyBatch, nil, Op_SyncLevelFullText); err != nil &&
-				!errors.Is(err, ErrPartialSuccess) {
-				// TODO (ajr) Decide if this should be a fatal error or just logged
-				return count, fmt.Errorf("indexing final batch: %w", err)
-			}
 			if err := batch.Commit(pebble.Sync); err != nil {
 				return count, fmt.Errorf("committing batch: %w", err)
 			}
 			batch.Reset()
-			keyBatch = keyBatch[:0]
 
 			// Log progress periodically
 			if count%10000 == 0 {
@@ -1677,12 +1859,6 @@ func (db *DBImpl) streamRangeToDB(
 
 	// Commit remaining records
 	if count%batchSize != 0 {
-		// Use FullText sync level for splits/backfills to ensure consistency
-		if err := db.indexManager.Batch(ctx, keyBatch, nil, Op_SyncLevelFullText); err != nil &&
-			!errors.Is(err, ErrPartialSuccess) {
-			// TODO (ajr) Decide if this should be a fatal error or just logged
-			return count, fmt.Errorf("indexing final batch: %w", err)
-		}
 		if err := batch.Commit(pebble.Sync); err != nil {
 			return count, fmt.Errorf("committing final batch: %w", err)
 		}
@@ -2352,6 +2528,7 @@ func (db *DBImpl) Batch(
 
 	// Track all writes to pass to index manager (including extracted embeddings)
 	allIndexWrites := make([][2][]byte, 0, len(writes)*2)
+	allChunkDeletes := make([][]byte, 0)
 	// Track all edge deletes for reconciliation
 	allEdgeDeletes := make([][]byte, 0)
 	splitDeltaWrites := make([][2][]byte, 0, len(writes))
@@ -2545,6 +2722,14 @@ func (db *DBImpl) Batch(
 		} else {
 			allEdgeDeletes = append(allEdgeDeletes, edgeKeys...)
 		}
+		chunkKeys, err := db.collectChunkKeysForDeletion(k)
+		if err != nil {
+			db.logger.Warn("Failed to collect chunk keys for deletion",
+				zap.String("key", types.FormatKey(k)),
+				zap.Error(err))
+		} else {
+			allChunkDeletes = append(allChunkDeletes, chunkKeys...)
+		}
 
 		if err := batch.DeleteRange(k, utils.PrefixSuccessor(storeutils.KeyRangeEnd(k)), nil); err != nil {
 			db.logger.Error(
@@ -2566,8 +2751,8 @@ func (db *DBImpl) Batch(
 		return fmt.Errorf("could not set key: %w", err)
 	}
 
-	// Combine document deletes and edge deletes for index manager
-	allDeletes := slices.Concat(deletes, allEdgeDeletes)
+	// Combine document deletes, chunk deletes, and edge deletes for index manager.
+	allDeletes := slices.Concat(deletes, allChunkDeletes, allEdgeDeletes)
 
 	// Route writes and deletes to appropriate IndexManager(s) based on split state.
 	// During a split, keys in [splitKey, originalRangeEnd) go to the shadow IndexManager,
@@ -2688,8 +2873,22 @@ func (db *DBImpl) routeSearch(ctx context.Context, indexName string, request any
 		}
 	}
 
+	if bleveReq, ok := request.(*bleve.SearchRequest); ok && len(filterPrefix) == 0 {
+		if optimizedReq, route, optimized := optimizeSplitBleveDocIDRequest(bleveReq, splitKey); optimized {
+			request = optimizedReq
+			switch route {
+			case "primary":
+				queryShadow = false
+			case "shadow":
+				queryPrimary = false
+			}
+			splitSearchRoutesTotal.WithLabelValues("docid_" + route).Inc()
+		}
+	}
+
 	// If we only need to query one index, do that
 	if !queryPrimary {
+		splitSearchRoutesTotal.WithLabelValues("shadow_only").Inc()
 		if !shadow.HasIndex(indexName) {
 			// Shadow doesn't have this index yet, fall back to primary
 			return db.indexManager.Search(ctx, indexName, request)
@@ -2697,8 +2896,10 @@ func (db *DBImpl) routeSearch(ctx context.Context, indexName string, request any
 		return shadow.Search(ctx, indexName, request)
 	}
 	if !queryShadow {
+		splitSearchRoutesTotal.WithLabelValues("primary_only").Inc()
 		return db.indexManager.Search(ctx, indexName, request)
 	}
+	splitSearchRoutesTotal.WithLabelValues("both").Inc()
 
 	// Query both indexes and merge results
 	primaryResult, primaryErr := db.indexManager.Search(ctx, indexName, request)
@@ -2731,6 +2932,40 @@ func (db *DBImpl) routeSearch(ctx context.Context, indexName string, request any
 
 	// Merge results based on type
 	return db.mergeSearchResults(primaryResult, shadowResult)
+}
+
+func optimizeSplitBleveDocIDRequest(req *bleve.SearchRequest, splitKey []byte) (any, string, bool) {
+	if req == nil || req.Query == nil {
+		return req, "", false
+	}
+
+	docIDQuery, ok := req.Query.(*query.DocIDQuery)
+	if !ok || len(docIDQuery.IDs) == 0 {
+		return req, "", false
+	}
+
+	allPrimary := true
+	allShadow := true
+	for _, id := range docIDQuery.IDs {
+		if bytes.Compare([]byte(id), splitKey) >= 0 {
+			allPrimary = false
+		} else {
+			allShadow = false
+		}
+		if !allPrimary && !allShadow {
+			return req, "", false
+		}
+	}
+
+	cloned := *req
+	cloned.Query = query.NewDocIDQuery(slices.Clone(docIDQuery.IDs))
+	if allPrimary {
+		return &cloned, "primary", true
+	}
+	if allShadow {
+		return &cloned, "shadow", true
+	}
+	return req, "", false
 }
 
 // mergeSearchResults merges results from primary and shadow IndexManagers.
@@ -3445,6 +3680,7 @@ func (s *DBImpl) Search(ctx context.Context, encodedReqest []byte) (resp []byte,
 					K:             searchRequest.Limit,
 					DistanceOver:  pagingOpts.DistanceOver,
 					DistanceUnder: pagingOpts.DistanceUnder,
+					SearchEffort:  pagingOpts.SearchEffort,
 					FilterIDs:     effectiveFilterIDs,
 					Embedding:     vectorReq,
 				}
@@ -5520,6 +5756,48 @@ func (db *DBImpl) collectOutgoingEdgeKeys(key []byte) ([][]byte, error) {
 	}
 
 	return edgeKeys, nil
+}
+
+func (db *DBImpl) collectChunkKeysForDeletion(key []byte) ([][]byte, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+
+	prefix := append(bytes.Clone(key), []byte(":i:")...)
+	iter, err := pdb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: utils.PrefixSuccessor(prefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating chunk iterator: %w", err)
+	}
+	defer func() {
+		if closeErr := iter.Close(); closeErr != nil {
+			db.logger.Warn("Error closing chunk iterator",
+				zap.String("key", types.FormatKey(key)),
+				zap.Error(closeErr))
+		}
+	}()
+
+	chunkKeys := make([][]byte, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		if !storeutils.IsChunkKey(iter.Key()) {
+			continue
+		}
+		chunkKeys = append(chunkKeys, bytes.Clone(iter.Key()))
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterating chunk keys: %w", err)
+	}
+
+	if len(chunkKeys) > 0 {
+		db.logger.Debug("Collected chunk keys for deletion",
+			zap.String("key", types.FormatKey(key)),
+			zap.Int("count", len(chunkKeys)))
+	}
+
+	return chunkKeys, nil
 }
 
 // GetNeighbors is a convenience method for single-hop graph traversal

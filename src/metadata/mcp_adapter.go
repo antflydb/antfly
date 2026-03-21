@@ -274,6 +274,9 @@ func (a *mcpAdapter) Batch(ctx context.Context, tableName string, inserts map[st
 		if !ok {
 			return nil, fmt.Errorf("invalid document format for key %s: expected object", k)
 		}
+		if err := validateDocumentInsertKey(table, k); err != nil {
+			return nil, fmt.Errorf("invalid document id %q: %w", k, err)
+		}
 		if _, exists := doc["_timestamp"]; !exists {
 			doc["_timestamp"] = timestamp
 		}
@@ -325,6 +328,11 @@ func (a *mcpAdapter) Batch(ctx context.Context, tableName string, inserts map[st
 
 	// Partition and forward deletes
 	if len(deletes) > 0 {
+		for _, key := range deletes {
+			if err := validateDocumentMutationKey(key); err != nil {
+				return nil, fmt.Errorf("invalid document id %q: %w", key, err)
+			}
+		}
 		deletePartitions, unfound, err := partitionWriteKeysByShard(a.t.tm, table, deletes)
 		if err != nil {
 			return nil, fmt.Errorf("partitioning delete keys: %w", err)

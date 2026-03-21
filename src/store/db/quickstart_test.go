@@ -15,6 +15,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/antflydb/antfly/lib/chunking"
+	"github.com/antflydb/antfly/lib/encoding"
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/vector"
@@ -225,6 +227,154 @@ func TestFilterQueryWithChunkedEmbeddings(t *testing.T) {
 		require.True(t, ok)
 		assert.NotEmpty(t, vResult.Hits)
 	})
+}
+
+func TestDeleteRemovesChunkedEmbeddings(t *testing.T) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+
+	db := &DBImpl{
+		logger:       lg,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+
+	require.NoError(t, db.Open(dir, false, nil, types.Range{nil, []byte{0xFF}}))
+	defer db.Close()
+
+	indexName := "test_emb_delete"
+	idxCfg := indexes.NewEmbeddingsConfig(indexName, indexes.EmbeddingsIndexConfig{
+		Dimension: 3,
+		Field:     "content",
+		Chunker: &chunking.ChunkerConfig{
+			Provider:    chunking.ChunkerProviderMock,
+			StoreChunks: true,
+		},
+	})
+	require.NoError(t, db.AddIndex(*idxCfg))
+
+	ctx := context.Background()
+	docKey := []byte("doc1")
+	docJSON, err := json.Marshal(map[string]any{"content": "chunked content"})
+	require.NoError(t, err)
+	err = db.Batch(ctx, [][2][]byte{{docKey, docJSON}}, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	chunkKey := storeutils.MakeChunkKey(docKey, indexName, 0)
+	chunk := chunking.NewTextChunk(0, "chunk body", 0, 10)
+	chunkJSON, err := json.Marshal(chunk)
+	require.NoError(t, err)
+	chunkValue := make([]byte, 0, len(chunkJSON)+8)
+	chunkValue = encoding.EncodeUint64Ascending(chunkValue, xxhash.Sum64String("chunk body"))
+	chunkValue = append(chunkValue, chunkJSON...)
+
+	chunkEmbKey := append(bytes.Clone(chunkKey), fmt.Appendf(nil, ":i:%s:e", indexName)...)
+	embeddingValue, err := vectorindex.EncodeEmbeddingWithHashID(nil, vector.T{1.0, 0.0, 0.0}, xxhash.Sum64(chunkKey))
+	require.NoError(t, err)
+
+	err = db.Batch(ctx, [][2][]byte{
+		{chunkKey, chunkValue},
+		{chunkEmbKey, embeddingValue},
+	}, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	searchReq := &vectorindex.SearchRequest{
+		K:         10,
+		Embedding: vector.T{1.0, 0.0, 0.0},
+	}
+	resp, err := db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	result := resp.(*vectorindex.SearchResult)
+	require.NotEmpty(t, result.Hits)
+	require.Equal(t, string(chunkKey), result.Hits[0].ID)
+
+	err = db.Batch(ctx, nil, [][]byte{docKey}, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	resp, err = db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	result = resp.(*vectorindex.SearchResult)
+	require.Empty(t, result.Hits)
+}
+
+func TestDeleteRemovesChunkedEmbeddingsWhenDocKeyContainsIndexMarker(t *testing.T) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+
+	db := &DBImpl{
+		logger:       lg,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+
+	require.NoError(t, db.Open(dir, false, nil, types.Range{nil, []byte{0xFF}}))
+	defer db.Close()
+
+	indexName := "test_emb_delete"
+	idxCfg := indexes.NewEmbeddingsConfig(indexName, indexes.EmbeddingsIndexConfig{
+		Dimension: 3,
+		Field:     "content",
+		Chunker: &chunking.ChunkerConfig{
+			Provider:    chunking.ChunkerProviderMock,
+			StoreChunks: true,
+		},
+	})
+	require.NoError(t, db.AddIndex(*idxCfg))
+
+	ctx := context.Background()
+	docKey := []byte("doc:i:1")
+	docJSON, err := json.Marshal(map[string]any{"content": "chunked content"})
+	require.NoError(t, err)
+	err = db.Batch(ctx, [][2][]byte{{docKey, docJSON}}, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	chunkKey := storeutils.MakeChunkKey(docKey, indexName, 0)
+	chunk := chunking.NewTextChunk(0, "chunk body", 0, 10)
+	chunkJSON, err := json.Marshal(chunk)
+	require.NoError(t, err)
+	chunkValue := make([]byte, 0, len(chunkJSON)+8)
+	chunkValue = encoding.EncodeUint64Ascending(chunkValue, xxhash.Sum64String("chunk body"))
+	chunkValue = append(chunkValue, chunkJSON...)
+
+	chunkEmbKey := append(bytes.Clone(chunkKey), fmt.Appendf(nil, ":i:%s:e", indexName)...)
+	embeddingValue, err := vectorindex.EncodeEmbeddingWithHashID(nil, vector.T{1.0, 0.0, 0.0}, xxhash.Sum64(chunkKey))
+	require.NoError(t, err)
+
+	err = db.Batch(ctx, [][2][]byte{
+		{chunkKey, chunkValue},
+		{chunkEmbKey, embeddingValue},
+	}, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	searchReq := &vectorindex.SearchRequest{
+		K:         10,
+		Embedding: vector.T{1.0, 0.0, 0.0},
+	}
+	resp, err := db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	result := resp.(*vectorindex.SearchResult)
+	require.NotEmpty(t, result.Hits)
+	require.Equal(t, string(chunkKey), result.Hits[0].ID)
+
+	err = db.Batch(ctx, nil, [][]byte{docKey}, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	resp, err = db.indexManager.Search(ctx, indexName, searchReq)
+	require.NoError(t, err)
+	result = resp.(*vectorindex.SearchResult)
+	require.Empty(t, result.Hits)
 }
 
 func init() {

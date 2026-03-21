@@ -26,6 +26,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"strings"
 	"time"
 
@@ -98,14 +99,36 @@ func SetDefaultS3Credentials(creds *S3Credentials) {
 	defaultS3Credentials = creds
 }
 
+// Format constants for ProcessResult.Format
+const (
+	FormatText  = "text"
+	FormatImage = "image"
+	FormatAudio = "audio"
+	FormatPDF   = "pdf"
+)
+
 // ProcessResult contains the result of processing content
 type ProcessResult struct {
 	// Data is the processed content
 	Data []byte
-	// Format describes the output type: "text", "image", or "data-url"
+	// Format describes the output type: "text", "image", "audio", or "pdf"
 	Format string
 	// Title is the page title (for HTML content)
 	Title string
+}
+
+// EncodeDataURI encodes raw bytes as a data URI (data:<mimeType>;base64,...),
+// streaming the base64 encoding to avoid intermediate string copies.
+func EncodeDataURI(mimeType string, data []byte) []byte {
+	prefix := "data:" + mimeType + ";base64,"
+	encodedLen := base64.StdEncoding.EncodedLen(len(data))
+	var buf bytes.Buffer
+	buf.Grow(len(prefix) + encodedLen)
+	buf.WriteString(prefix)
+	encoder := base64.NewEncoder(base64.StdEncoding, &buf)
+	_, _ = encoder.Write(data)
+	_ = encoder.Close()
+	return buf.Bytes()
 }
 
 // ContentProcessor handles processing of downloaded content based on type
@@ -192,7 +215,7 @@ func (p *DefaultContentProcessor) Process(
 		return processAudio(data, contentType)
 	case strings.HasPrefix(contentType, "text/"):
 		// Plain text, return as-is
-		return &ProcessResult{Data: data, Format: "text"}, nil
+		return &ProcessResult{Data: data, Format: FormatText}, nil
 	default:
 		return nil, fmt.Errorf("unsupported content type: %s", contentType)
 	}
@@ -226,7 +249,7 @@ func extractHTMLText(data []byte) (*ProcessResult, error) {
 
 	return &ProcessResult{
 		Data:   []byte(text),
-		Format: "text",
+		Format: FormatText,
 		Title:  article.Title(),
 	}, nil
 }
@@ -236,60 +259,54 @@ func processPDF(data []byte, config *ContentSecurityConfig) (*ProcessResult, err
 	// Try text extraction first
 	text, err := ExtractPDFText(data)
 	if err == nil && strings.TrimSpace(text) != "" {
-		return &ProcessResult{Data: []byte(text), Format: "text"}, nil
+		return &ProcessResult{Data: []byte(text), Format: FormatText}, nil
 	}
 
 	// Fallback to rendering first page as PNG
-	imageData, err := renderPDFFirstPage(data)
+	return RenderPDFAsImage(data, config)
+}
+
+// RenderPDFAsImage renders a PDF's first page as a base64-encoded PNG data URI.
+func RenderPDFAsImage(data []byte, config *ContentSecurityConfig) (*ProcessResult, error) {
+	imageData, err := RenderPDFFirstPage(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render PDF: %w", err)
 	}
 
-	// Resize if needed
 	if config != nil && config.MaxImageDimension > 0 {
-		imageData, err = resizeImageIfNeeded(imageData, "image/png", config.MaxImageDimension)
+		imageData, err = ResizeImageIfNeeded(imageData, "image/png", config.MaxImageDimension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resize PDF image: %w", err)
 		}
 	}
 
-	// Convert to data URI
-	dataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString(imageData)
-	return &ProcessResult{Data: []byte(dataURI), Format: "image"}, nil
+	return &ProcessResult{Data: EncodeDataURI("image/png", imageData), Format: FormatImage}, nil
 }
 
-// ExtractPDFText extracts text from PDF using ajroetker/pdf
+// ExtractPDFText extracts text from PDF using ajroetker/pdf.
+// Uses Reader.GetPlainText which caches fonts across pages for better performance.
 func ExtractPDFText(data []byte) (string, error) {
-	reader := bytes.NewReader(data)
-	pdfReader, err := pdf.NewReader(reader, int64(len(data)))
+	pdfReader, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("failed to open PDF: %w", err)
 	}
 
-	var textBuilder strings.Builder
-	numPages := pdfReader.NumPage()
-
-	for i := 1; i <= numPages; i++ {
-		page := pdfReader.Page(i)
-		if page.V.IsNull() {
-			continue
-		}
-
-		text, err := page.GetPlainText(nil)
-		if err != nil {
-			continue
-		}
-
-		textBuilder.WriteString(text)
-		textBuilder.WriteString("\n\n")
+	r, err := pdfReader.GetPlainText()
+	if err != nil {
+		return "", fmt.Errorf("failed to extract text: %w", err)
 	}
 
-	return textBuilder.String(), nil
+	var buf strings.Builder
+	if _, err := io.Copy(&buf, r); err != nil {
+		return "", fmt.Errorf("failed to read text: %w", err)
+	}
+
+	return buf.String(), nil
 }
 
-// renderPDFFirstPage renders the first page of a PDF as PNG at 150 DPI.
+// RenderPDFFirstPage renders the first page of a PDF as PNG at 150 DPI.
 // This is used for OCR fallback on pages with minimal or no extractable text.
-func renderPDFFirstPage(data []byte) ([]byte, error) {
+func RenderPDFFirstPage(data []byte) ([]byte, error) {
 	// Create renderer from PDF data
 	renderer, err := render.NewRenderer(data)
 	if err != nil {
@@ -314,13 +331,7 @@ func renderPDFFirstPage(data []byte) ([]byte, error) {
 
 // processAudio converts audio to data URI
 func processAudio(data []byte, contentType string) (*ProcessResult, error) {
-	// Convert to data URI - no processing needed for audio
-	dataURI := fmt.Sprintf(
-		"data:%s;base64,%s",
-		contentType,
-		base64.StdEncoding.EncodeToString(data),
-	)
-	return &ProcessResult{Data: []byte(dataURI), Format: "audio"}, nil
+	return &ProcessResult{Data: EncodeDataURI(contentType, data), Format: FormatAudio}, nil
 }
 
 // processImage converts image to data URI, resizing if needed
@@ -332,38 +343,39 @@ func processImage(
 	// Resize if needed
 	if config != nil && config.MaxImageDimension > 0 {
 		var err error
-		data, err = resizeImageIfNeeded(data, contentType, config.MaxImageDimension)
+		data, err = ResizeImageIfNeeded(data, contentType, config.MaxImageDimension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resize image: %w", err)
 		}
 	}
 
-	// Convert to data URI
-	dataURI := fmt.Sprintf(
-		"data:%s;base64,%s",
-		contentType,
-		base64.StdEncoding.EncodeToString(data),
-	)
-	return &ProcessResult{Data: []byte(dataURI), Format: "image"}, nil
+	return &ProcessResult{Data: EncodeDataURI(contentType, data), Format: FormatImage}, nil
 }
 
-// resizeImageIfNeeded resizes image if dimensions exceed maxDimension
-func resizeImageIfNeeded(data []byte, contentType string, maxDimension int) ([]byte, error) {
+// ResizeImageIfNeeded resizes image if dimensions exceed maxDimension.
+// Uses DecodeConfig to check dimensions from the header first, avoiding a
+// full decode when no resize is needed.
+func ResizeImageIfNeeded(data []byte, contentType string, maxDimension int) ([]byte, error) {
+	// Check dimensions from header only (no full pixel decode)
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image config: %w", err)
+	}
+
+	if cfg.Width <= maxDimension && cfg.Height <= maxDimension {
+		return data, nil // No resize needed
+	}
+
+	// Full decode only when we actually need to resize
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode image: %w", err)
 	}
 
+	// Calculate new dimensions maintaining aspect ratio
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
-
-	// Check if resize is needed
-	if width <= maxDimension && height <= maxDimension {
-		return data, nil // No resize needed
-	}
-
-	// Calculate new dimensions maintaining aspect ratio
 	var newWidth, newHeight int
 	if width > height {
 		newWidth = maxDimension
@@ -373,7 +385,7 @@ func resizeImageIfNeeded(data []byte, contentType string, maxDimension int) ([]b
 		newWidth = (width * maxDimension) / height
 	}
 
-	// Create new image
+	// Resize
 	dst := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
 	draw.BiLinear.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
 
@@ -384,7 +396,6 @@ func resizeImageIfNeeded(data []byte, contentType string, maxDimension int) ([]b
 	} else {
 		err = jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 85})
 	}
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode resized image: %w", err)
 	}

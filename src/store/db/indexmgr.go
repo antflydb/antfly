@@ -114,6 +114,13 @@ type indexOp struct {
 	im *IndexManager
 }
 
+type deleteKeyGroups struct {
+	all          [][]byte
+	documents    [][]byte
+	chunksByName map[string][][]byte
+	edgesByName  map[string][][]byte
+}
+
 func (io *indexOp) reset() {
 	// Clear slices but keep underlying capacity
 	io.Writes = io.Writes[:0]
@@ -144,6 +151,95 @@ func (io *indexOp) decode(data []byte) error {
 	return nil
 }
 
+func appendDeleteKeyGroup(groups *deleteKeyGroups, key []byte) string {
+	groups.all = append(groups.all, key)
+
+	switch {
+	case storeutils.IsEdgeKey(key):
+		_, _, indexName, _, err := storeutils.ParseEdgeKey(key)
+		if err != nil {
+			return "edge"
+		}
+		if groups.edgesByName == nil {
+			groups.edgesByName = make(map[string][][]byte)
+		}
+		groups.edgesByName[indexName] = append(groups.edgesByName[indexName], key)
+		return "edge"
+	case storeutils.IsChunkKey(key):
+		_, indexName, ok := storeutils.ParseChunkKey(key)
+		if !ok {
+			return "chunk"
+		}
+		if groups.chunksByName == nil {
+			groups.chunksByName = make(map[string][][]byte)
+		}
+		groups.chunksByName[indexName] = append(groups.chunksByName[indexName], key)
+		return "chunk"
+	default:
+		groups.documents = append(groups.documents, key)
+		return "document"
+	}
+}
+
+func groupDeleteKeys(deletes [][]byte) deleteKeyGroups {
+	groups := deleteKeyGroups{
+		all:       make([][]byte, 0, len(deletes)),
+		documents: make([][]byte, 0, len(deletes)),
+	}
+	seen := make(map[string]struct{}, len(deletes))
+
+	for _, key := range deletes {
+		if len(key) == 0 {
+			continue
+		}
+		sKey := string(key)
+		if _, ok := seen[sKey]; ok {
+			continue
+		}
+		seen[sKey] = struct{}{}
+
+		appendDeleteKeyGroup(&groups, key)
+	}
+
+	return groups
+}
+
+func deletesForIndex(indexName string, indexType IndexType, grouped deleteKeyGroups) [][]byte {
+	switch {
+	case indexes.IsGraphType(indexType):
+		return grouped.edgesByName[indexName]
+	case indexes.IsFullTextType(indexType):
+		return grouped.documents
+	case indexes.IsEmbeddingsType(indexType):
+		chunks := grouped.chunksByName[indexName]
+		if len(grouped.documents) == 0 {
+			return chunks
+		}
+		if len(chunks) == 0 {
+			return grouped.documents
+		}
+		deletes := make([][]byte, 0, len(grouped.documents)+len(chunks))
+		deletes = append(deletes, grouped.documents...)
+		deletes = append(deletes, chunks...)
+		return deletes
+	default:
+		return grouped.all
+	}
+}
+
+func indexTypeMetricLabel(indexType IndexType) string {
+	switch {
+	case indexes.IsFullTextType(indexType):
+		return "full_text"
+	case indexes.IsEmbeddingsType(indexType):
+		return "embeddings"
+	case indexes.IsGraphType(indexType):
+		return "graph"
+	default:
+		return "other"
+	}
+}
+
 func (io *indexOp) Execute(ctx context.Context) (err error) {
 	// startTime := time.Now()
 	defer func() {
@@ -169,6 +265,7 @@ func (io *indexOp) Execute(ctx context.Context) (err error) {
 	if len(io.Writes) == 0 && len(io.Deletes) == 0 {
 		return nil
 	}
+	groupedDeletes := groupDeleteKeys(io.Deletes)
 	io.im.indexes.Range(func(idxName string, value Index) bool {
 		select {
 		case <-ctx.Done():
@@ -179,6 +276,7 @@ func (io *indexOp) Execute(ctx context.Context) (err error) {
 		// Determine if this index should be synced based on type and syncLevel
 		syncThisIndex := false
 		indexType := value.Type()
+		selectedDeletes := deletesForIndex(idxName, indexType, groupedDeletes)
 		if io.SyncLevel == Op_SyncLevelFullText && indexes.IsFullTextType(indexType) {
 			syncThisIndex = true
 		} else if io.SyncLevel == Op_SyncLevelEmbeddings {
@@ -188,11 +286,11 @@ func (io *indexOp) Execute(ctx context.Context) (err error) {
 			}
 		}
 
-		if strings.HasPrefix(idxName, "full_text_index") {
+		if indexes.IsFullTextType(indexType) || strings.HasPrefix(idxName, "full_text_index") {
 			writes := slices.DeleteFunc(slices.Clone(io.Writes), func(w [2][]byte) bool {
 				return bytes.HasSuffix(w[0], EmbeddingSuffix)
 			})
-			if err := value.Batch(ctx, writes, io.Deletes, syncThisIndex); err != nil {
+			if err := value.Batch(ctx, writes, selectedDeletes, syncThisIndex); err != nil {
 				io.im.logger.Error(
 					"writing batch to full text index",
 					zap.String("index", idxName),
@@ -202,9 +300,9 @@ func (io *indexOp) Execute(ctx context.Context) (err error) {
 			}
 			return true
 		}
-		indexOps.WithLabelValues().Add(float64(len(io.Writes) + len(io.Deletes)))
+		indexOps.WithLabelValues().Add(float64(len(io.Writes) + len(selectedDeletes)))
 		// Other indexes (vector, etc.) - sync if syncThisIndex is true
-		if err := value.Batch(ctx, io.Writes, io.Deletes, syncThisIndex); err != nil {
+		if err := value.Batch(ctx, io.Writes, selectedDeletes, syncThisIndex); err != nil {
 			if errors.Is(err, pebble.ErrClosed) || errors.Is(err, inflight.ErrBufferClosed) {
 				return false
 			}
@@ -794,6 +892,70 @@ func (im *IndexManager) Search(ctx context.Context, name string, request any) (a
 		return nil, fmt.Errorf("index %s not registered", name)
 	}
 	return index.Search(ctx, request)
+}
+
+// DeleteKeys prunes existing documents from every registered index synchronously.
+// Unlike the normal WAL-backed batch path, this bypasses byte-range filtering so
+// split finalization can remove keys that were already moved out of the shard range.
+func (im *IndexManager) DeleteKeys(ctx context.Context, deletes [][]byte) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+
+	return im.deleteGroupedKeys(ctx, groupDeleteKeys(deletes))
+}
+
+func (im *IndexManager) deleteGroupedKeys(ctx context.Context, groupedDeletes deleteKeyGroups) error {
+	var batchErr error
+	im.indexes.Range(func(name string, idx Index) bool {
+		select {
+		case <-ctx.Done():
+			batchErr = ctx.Err()
+			return false
+		default:
+		}
+
+		indexType := idx.Type()
+		selectedDeletes := deletesForIndex(name, indexType, groupedDeletes)
+		switch {
+		case indexes.IsFullTextType(indexType):
+			if len(groupedDeletes.documents) > 0 {
+				splitPruneRoutedDeleteKeysTotal.WithLabelValues("full_text", "document").
+					Add(float64(len(groupedDeletes.documents)))
+			}
+		case indexes.IsEmbeddingsType(indexType):
+			if len(groupedDeletes.documents) > 0 {
+				splitPruneRoutedDeleteKeysTotal.WithLabelValues("embeddings", "document").
+					Add(float64(len(groupedDeletes.documents)))
+			}
+			if chunks := groupedDeletes.chunksByName[name]; len(chunks) > 0 {
+				splitPruneRoutedDeleteKeysTotal.WithLabelValues("embeddings", "chunk").
+					Add(float64(len(chunks)))
+			}
+		case indexes.IsGraphType(indexType):
+			if edges := groupedDeletes.edgesByName[name]; len(edges) > 0 {
+				splitPruneRoutedDeleteKeysTotal.WithLabelValues("graph", "edge").
+					Add(float64(len(edges)))
+			}
+		default:
+			if len(selectedDeletes) > 0 {
+				splitPruneRoutedDeleteKeysTotal.WithLabelValues(indexTypeMetricLabel(indexType), "all").
+					Add(float64(len(selectedDeletes)))
+			}
+		}
+		for start := 0; start < len(selectedDeletes); start += indexManagerPartitionSize {
+			end := min(start+indexManagerPartitionSize, len(selectedDeletes))
+			if err := idx.Batch(ctx, nil, selectedDeletes[start:end], true); err != nil {
+				batchErr = fmt.Errorf("deleting keys from index %s: %w", name, err)
+				return false
+			}
+		}
+		return true
+	})
+	if batchErr != nil {
+		return batchErr
+	}
+	return nil
 }
 
 func (im *IndexManager) Unregister(name string) error {

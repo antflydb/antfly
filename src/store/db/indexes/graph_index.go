@@ -708,28 +708,18 @@ func (g *GraphIndexV0) queryEdgeIndex(ctx context.Context, target []byte, edgeTy
 		// Parse the index key to extract source and edge type
 		// Format: <target>:i:<indexName>:in:<edgeType>:<source>:i
 		key := iter.Key()
-
-		// Find :i: marker to locate where target ends
-		indexMarker := []byte(":i:")
-		_, after, ok := bytes.Cut(key, indexMarker)
-		if !ok {
-			continue
+		remaining := key[len(prefix):]
+		parsedEdgeType := edgeType
+		sourceWithSuffix := remaining
+		if edgeType == "" {
+			typePart, sourcePart, ok := bytes.Cut(remaining, []byte{':'})
+			if !ok || len(typePart) == 0 {
+				continue
+			}
+			parsedEdgeType = string(typePart)
+			sourceWithSuffix = sourcePart
 		}
 
-		// Skip past target and ":i:<indexName>:in:"
-		remaining := after
-
-		// Parse: <indexName>:in:<edgeType>:<source>:i
-		parts := bytes.SplitN(remaining, []byte{':'}, 4)
-		if len(parts) < 4 {
-			continue
-		}
-
-		// parts[0] = indexName, parts[1] = "in", parts[2] = edgeType, parts[3] = source:i
-		parsedEdgeType := string(parts[2])
-
-		// Remove :i suffix from source
-		sourceWithSuffix := parts[3]
 		if len(sourceWithSuffix) < 2 || !bytes.HasSuffix(sourceWithSuffix, []byte(":i")) {
 			continue
 		}

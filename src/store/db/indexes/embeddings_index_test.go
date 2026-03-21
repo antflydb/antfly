@@ -17,6 +17,7 @@ package indexes
 import (
 	"bytes"
 	"context"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -1042,4 +1043,79 @@ func TestRenderPrompt_ErrorDirectives(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.errContains)
 		})
 	}
+}
+
+func TestResolveSearchEffort(t *testing.T) {
+	var idx EmbeddingIndex
+	f32 := func(v float32) *float32 { return &v }
+
+	t.Run("nil effort is no-op", func(t *testing.T) {
+		req := &vectorindex.SearchRequest{K: 10}
+		idx.resolveSearchEffort(req)
+		assert.Nil(t, req.SearchWidth)
+		assert.Nil(t, req.Epsilon2)
+	})
+
+	t.Run("NaN effort is no-op", func(t *testing.T) {
+		nan := float32(math.NaN())
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: &nan}
+		idx.resolveSearchEffort(req)
+		assert.Nil(t, req.SearchWidth)
+		assert.Nil(t, req.Epsilon2)
+	})
+
+	t.Run("effort 0.0 gives minimum values", func(t *testing.T) {
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(0.0)}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 64, *req.SearchWidth) // max(10, 64) = 64
+		assert.InDelta(t, 1.0, *req.Epsilon2, 0.01)
+	})
+
+	t.Run("effort 0.5 gives default epsilon", func(t *testing.T) {
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(0.5)}
+		idx.resolveSearchEffort(req)
+		assert.InDelta(t, 7.0, *req.Epsilon2, 0.01)
+	})
+
+	t.Run("effort 1.0 gives maximum values", func(t *testing.T) {
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(1.0)}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 4096, *req.SearchWidth) // max(64*20, 4096) = 4096
+		assert.InDelta(t, 100.0, *req.Epsilon2, 0.01)
+	})
+
+	t.Run("negative effort clamped to 0", func(t *testing.T) {
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(-0.5)}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 64, *req.SearchWidth)
+		assert.InDelta(t, 1.0, *req.Epsilon2, 0.01)
+	})
+
+	t.Run("effort > 1 clamped to 1", func(t *testing.T) {
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(5.0)}
+		idx.resolveSearchEffort(req)
+		assert.InDelta(t, 100.0, *req.Epsilon2, 0.01)
+	})
+
+	t.Run("explicit SearchWidth not overwritten", func(t *testing.T) {
+		w := 500
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(1.0), SearchWidth: &w}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 500, *req.SearchWidth)
+		assert.NotNil(t, req.Epsilon2) // epsilon2 still set
+	})
+
+	t.Run("explicit Epsilon2 not overwritten", func(t *testing.T) {
+		e := float32(3.0)
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(1.0), Epsilon2: &e}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, float32(3.0), *req.Epsilon2)
+		assert.NotNil(t, req.SearchWidth) // search width still set
+	})
+
+	t.Run("large K scales search width", func(t *testing.T) {
+		req := &vectorindex.SearchRequest{K: 500, SearchEffort: f32(0.0)}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 500, *req.SearchWidth) // max(500, 64) = 500
+	})
 }

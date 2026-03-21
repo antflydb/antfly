@@ -485,6 +485,7 @@ func (s *EmbeddingIndex) Search(ctx context.Context, query any) (any, error) {
 			len(searchRequest.Embedding),
 		)
 	}
+	s.resolveSearchEffort(searchRequest)
 	searchResult, err := vectorindex.SearchInContext(ctx, s.idx, searchRequest)
 	if err != nil {
 		return nil, fmt.Errorf("searching: %w", err)
@@ -494,6 +495,47 @@ func (s *EmbeddingIndex) Search(ctx context.Context, query any) (any, error) {
 		zap.Int("dimension", s.dimension),
 		zap.Int("results", len(searchResult.Hits)))
 	return searchResult, nil
+}
+
+// resolveSearchEffort translates the user-facing search_effort (0.0-1.0) into
+// concrete SearchWidth and Epsilon2 overrides on the SearchRequest.
+// Only applies when SearchEffort is set and SearchWidth/Epsilon2 are not
+// already explicitly provided.
+func (s *EmbeddingIndex) resolveSearchEffort(req *vectorindex.SearchRequest) {
+	if req.SearchEffort == nil {
+		return
+	}
+	effort := *req.SearchEffort
+	if math.IsNaN(float64(effort)) {
+		return
+	}
+	if effort < 0 {
+		effort = 0
+	} else if effort > 1 {
+		effort = 1
+	}
+
+	if req.SearchWidth == nil {
+		// Scale search width from a minimum of K up to a high upper bound.
+		minWidth := max(req.K, 64)
+		maxWidth := max(minWidth*20, 4096)
+		w := minWidth + int(float32(maxWidth-minWidth)*effort)
+		req.SearchWidth = &w
+	}
+
+	if req.Epsilon2 == nil {
+		// Piecewise linear pruning threshold:
+		//   effort 0.0 -> ε₂=1.0   (aggressive pruning)
+		//   effort 0.5 -> ε₂=7.0   (default)
+		//   effort 1.0 -> ε₂=100.0 (effectively no pruning)
+		var e float32
+		if effort < 0.5 {
+			e = 1.0 + (effort * 12.0)
+		} else {
+			e = 7.0 + ((effort - 0.5) * 186.0)
+		}
+		req.Epsilon2 = &e
+	}
 }
 
 func (ei *EmbeddingIndex) newVectorIndex(dimension int) (vectorindex.VectorIndex, error) {

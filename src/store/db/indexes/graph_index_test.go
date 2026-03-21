@@ -250,6 +250,36 @@ func TestGraphIndexV0_Search(t *testing.T) {
 	})
 }
 
+func TestGraphIndexV0_SearchIncomingWithIndexMarkerInTarget(t *testing.T) {
+	index, pdb, dir := setupTestGraphIndex(t)
+	defer pdb.Close()
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+
+	source := []byte("source_doc")
+	target := []byte("target:i:42")
+	edgeKey := storeutils.MakeEdgeKey(source, target, "test_graph", "cites")
+	edge := &Edge{
+		Source: source,
+		Target: target,
+		Type:   "cites",
+		Weight: 0.9,
+	}
+	edgeValue, err := EncodeEdgeValue(edge)
+	require.NoError(t, err)
+
+	err = index.Batch(ctx, [][2][]byte{{edgeKey, edgeValue}}, nil, true)
+	require.NoError(t, err)
+
+	edges, err := index.queryEdgeIndex(ctx, target, "")
+	require.NoError(t, err)
+	require.Len(t, edges, 1)
+	assert.Equal(t, source, edges[0].Source)
+	assert.Equal(t, target, edges[0].Target)
+	assert.Equal(t, "cites", edges[0].Type)
+}
+
 // TestGraphIndexV0_EdgeValidation tests edge type validation
 func TestGraphIndexV0_EdgeValidation(t *testing.T) {
 	index, pdb, dir := setupTestGraphIndex(t)

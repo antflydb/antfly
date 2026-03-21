@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { useEffect, useRef } from "react";
 import { useChatContext } from "./ChatContext";
 import type { ChatTurn } from "./hooks/useChatStream";
+import { SafeRender } from "./SafeRender";
 
 export interface ChatMessagesProps {
   /** Show search hits for each turn */
@@ -154,56 +155,83 @@ export default function ChatMessages({
         <div key={turn.id} className="react-af-chat-turn">
           {/* User message */}
           {renderUserMessage
-            ? renderUserMessage(turn.userMessage, turn)
+            ? <SafeRender render={renderUserMessage} args={[turn.userMessage, turn] as const} />
             : defaultRenderUserMessage(turn.userMessage)}
 
           {/* Error */}
           {turn.error &&
-            (renderError ? renderError(turn.error, turn) : defaultRenderError(turn.error))}
+            (renderError ? (
+              <SafeRender render={renderError} args={[turn.error, turn] as const} />
+            ) : (
+              defaultRenderError(turn.error)
+            ))}
 
           {/* Streaming indicator (before any content appears) */}
           {turn.isStreaming && !turn.assistantMessage && !turn.error && (
             <div role="status">
-              {renderStreamingIndicator
-                ? renderStreamingIndicator()
-                : defaultRenderStreamingIndicator()}
+              {renderStreamingIndicator ? (
+                <SafeRender render={renderStreamingIndicator} args={[] as const} />
+              ) : (
+                defaultRenderStreamingIndicator()
+              )}
             </div>
           )}
 
           {/* Assistant message */}
           {turn.assistantMessage &&
-            (renderAssistantMessage
-              ? renderAssistantMessage(turn.assistantMessage, turn.isStreaming, turn)
-              : defaultRenderAssistantMessage(turn.assistantMessage, turn.isStreaming))}
+            (renderAssistantMessage ? (
+              <SafeRender
+                render={renderAssistantMessage}
+                args={[turn.assistantMessage, turn.isStreaming, turn] as const}
+              />
+            ) : (
+              defaultRenderAssistantMessage(turn.assistantMessage, turn.isStreaming)
+            ))}
 
           {/* Confidence */}
           {showConfidence &&
             turn.confidence &&
             !turn.isStreaming &&
-            (renderConfidence
-              ? renderConfidence(turn.confidence, turn)
-              : defaultRenderConfidence(turn.confidence))}
+            (renderConfidence ? (
+              <SafeRender render={renderConfidence} args={[turn.confidence, turn] as const} />
+            ) : (
+              defaultRenderConfidence(turn.confidence)
+            ))}
 
           {/* Hits */}
           {showHits &&
             turn.hits.length > 0 &&
-            (renderHits ? renderHits(turn.hits, turn) : defaultRenderHits(turn.hits))}
+            (renderHits ? (
+              <SafeRender render={renderHits} args={[turn.hits, turn] as const} />
+            ) : (
+              defaultRenderHits(turn.hits)
+            ))}
 
           {/* Clarification */}
           {turn.clarification &&
             !turn.isStreaming &&
-            (renderClarification
-              ? renderClarification(turn.clarification, respondToClarification, turn)
-              : defaultRenderClarification(turn.clarification, respondToClarification))}
+            (renderClarification ? (
+              <SafeRender
+                render={renderClarification}
+                args={[turn.clarification, respondToClarification, turn] as const}
+              />
+            ) : (
+              defaultRenderClarification(turn.clarification, respondToClarification)
+            ))}
 
           {/* Follow-up questions (only on last turn) */}
           {showFollowUpQuestions &&
             index === lastTurnIndex &&
             turn.followUpQuestions.length > 0 &&
             !turn.isStreaming &&
-            (renderFollowUpQuestions
-              ? renderFollowUpQuestions(turn.followUpQuestions, sendFollowUp, turn)
-              : defaultRenderFollowUpQuestions(turn.followUpQuestions, sendFollowUp))}
+            (renderFollowUpQuestions ? (
+              <SafeRender
+                render={renderFollowUpQuestions}
+                args={[turn.followUpQuestions, sendFollowUp, turn] as const}
+              />
+            ) : (
+              defaultRenderFollowUpQuestions(turn.followUpQuestions, sendFollowUp)
+            ))}
         </div>
       ))}
       <div ref={messagesEndRef} />

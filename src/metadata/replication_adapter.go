@@ -19,15 +19,19 @@ import (
 	"fmt"
 
 	"github.com/antflydb/antfly/lib/types"
+	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 )
 
 // ForwardTransform implements foreign.MetadataTransformer.
 // It routes transform operations to the correct shard for the given document key.
 func (ms *MetadataStore) ForwardTransform(ctx context.Context, tableName, key string, ops []*db.TransformOp, upsert bool) error {
-	shardID, err := ms.findShardForKey(tableName, key)
+	table, shardID, err := ms.findShardForKey(tableName, key)
 	if err != nil {
 		return err
+	}
+	if err := validateDocumentTransformKey(table, key, upsert); err != nil {
+		return fmt.Errorf("invalid document id %q: %w", key, err)
 	}
 
 	transform := db.Transform_builder{
@@ -42,9 +46,12 @@ func (ms *MetadataStore) ForwardTransform(ctx context.Context, tableName, key st
 // ForwardDelete implements foreign.MetadataTransformer.
 // It routes a document deletion to the correct shard for the given document key.
 func (ms *MetadataStore) ForwardDelete(ctx context.Context, tableName, key string) error {
-	shardID, err := ms.findShardForKey(tableName, key)
+	_, shardID, err := ms.findShardForKey(tableName, key)
 	if err != nil {
 		return err
+	}
+	if err := validateDocumentMutationKey(key); err != nil {
+		return fmt.Errorf("invalid document id %q: %w", key, err)
 	}
 
 	deleteKey := []byte(key)
@@ -52,16 +59,16 @@ func (ms *MetadataStore) ForwardDelete(ctx context.Context, tableName, key strin
 }
 
 // findShardForKey looks up the table and finds the shard responsible for the given key.
-func (ms *MetadataStore) findShardForKey(tableName, key string) (types.ID, error) {
+func (ms *MetadataStore) findShardForKey(tableName, key string) (*store.Table, types.ID, error) {
 	table, err := ms.tm.GetTable(tableName)
 	if err != nil {
-		return 0, fmt.Errorf("getting table %s: %w", tableName, err)
+		return nil, 0, fmt.Errorf("getting table %s: %w", tableName, err)
 	}
 
 	shardID, err := findWriteShardForKey(ms.tm, table, key)
 	if err != nil {
-		return 0, fmt.Errorf("finding shard for key %q in table %s: %w", key, tableName, err)
+		return nil, 0, fmt.Errorf("finding shard for key %q in table %s: %w", key, tableName, err)
 	}
 
-	return shardID, nil
+	return table, shardID, nil
 }

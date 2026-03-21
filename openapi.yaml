@@ -6644,6 +6644,21 @@ components:
             Useful for excluding near-exact duplicates or finding dissimilar
             documents.
           example: 0.1
+        search_effort:
+          x-go-type-skip-optional-pointer: false
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            Controls the recall vs latency tradeoff for vector search.
+            Range from 0.0 (fastest, lower recall) to 1.0 (highest recall,
+            slower). When omitted, the index's built-in defaults are used.
+
+            At higher values, the search explores more of the index and
+            applies less aggressive pruning, which improves recall at the
+            cost of latency.
+          example: 0.9
         merge_config:
           $ref: '#/components/schemas/MergeConfig'
           description: >

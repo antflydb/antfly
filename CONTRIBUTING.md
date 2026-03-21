@@ -56,6 +56,8 @@ Run `make help` for the full list. Key targets:
 | `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
 | `make generate` | Regenerate all code: OpenAPI types, Go/TS/Python SDKs, Termite, docs |
 | `make lint` | Run linters across Go (root + all submodules), Termite, and TypeScript |
+| `make tidy` | Run `go mod tidy` across the root module and Go submodules |
+| `make tidy-check` | Verify `go.mod`/`go.sum` are already tidy across the root module and Go submodules |
 | `make e2e` | Run E2E tests with ONNX+XLA (downloads deps on first run) |
 | `make e2e E2E_TEST=TestName` | Run a specific E2E test |
 | `make build-omni` | Build with all ML backends (ONNX + XLA) |
@@ -138,6 +140,19 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Termite | `termite/` (submodule, has own Makefile) |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
+`make tidy` and `make tidy-check` do too.
+
+## Dependency Hygiene
+
+`make build` and `make generate` may auto-run `make tidy` as part of keeping the multi-module workspace buildable. CI separately runs `make tidy-check` so dependency drift is still surfaced explicitly.
+
+If you want the same check locally before pushing, install the repository hooks once:
+
+```bash
+make install-git-hooks
+```
+
+That enables `.githooks/pre-push`, which runs `make tidy-check` when pushed changes include Go sources or Go module files.
 
 ## Testing
 

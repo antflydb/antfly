@@ -1837,9 +1837,19 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 		return nil, nil
 	}
 
+	// Resolve per-query overrides for search width and dynamic pruning
+	searchWidth := idx.config.SearchWidth
+	if req.SearchWidth != nil {
+		searchWidth = *req.SearchWidth
+	}
+	epsilon2 := idx.config.Episilon2
+	if req.Epsilon2 != nil {
+		epsilon2 = *req.Epsilon2
+	}
+
 	// Use a priority queue to track best clusters to explore
-	candidates := NewPriorityQueue(false, idx.config.SearchWidth*2) // Min-heap with larger capacity
-	results := NewPriorityQueue(true, req.K)                        // Max-heap for results
+	candidates := NewPriorityQueue(false, searchWidth*2) // Min-heap with larger capacity
+	results := NewPriorityQueue(true, req.K)             // Max-heap for results
 
 	// Track collapse keys during traversal to handle duplicates
 	var collapseKeyToItem map[string]*PriorityItem
@@ -1856,13 +1866,13 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 	rootDist := vector.MeasureDistance(idx.config.DistanceMetric, q.Transformed(), root.Centroid)
 	heap.Push(candidates, &PriorityItem{ID: root.ID, Distance: rootDist})
 
-	visited := make(map[uint64]bool, idx.config.SearchWidth*2)
+	visited := make(map[uint64]bool, searchWidth*2)
 	nodesExplored := 0
 	leavesExplored := 0
 
 	var dynamicPruningMin float32 = math32.MaxFloat32
 	// Traverse tree
-	for candidates.Len() > 0 /* && nodesExplored < 16*idx.config.SearchWidth */ && leavesExplored < idx.config.SearchWidth {
+	for candidates.Len() > 0 /* && nodesExplored < 16*idx.config.SearchWidth */ && leavesExplored < searchWidth {
 		item := heap.Pop(candidates).(*PriorityItem)
 
 		if visited[item.ID] {
@@ -1883,7 +1893,7 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 		}
 
 		if !node.IsLeaf && results.Len() >= req.K && dynamicPruningMin < math32.MaxFloat32 {
-			if item.Distance > dynamicPruningMin*(idx.config.Episilon2+1) {
+			if item.Distance > dynamicPruningMin*(epsilon2+1) {
 				// Dynamic pruning: skip this node if it's too far
 				continue
 			}
@@ -1893,7 +1903,7 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 			if results.Len() >= req.K && item.Distance < dynamicPruningMin {
 				dynamicPruningMin = item.Distance
 			} else if results.Len() >= req.K &&
-				math32.Abs(item.Distance) > math32.Abs(dynamicPruningMin*(idx.config.Episilon2+1)) {
+				math32.Abs(item.Distance) > math32.Abs(dynamicPruningMin*(epsilon2+1)) {
 				// Dynamic pruning: skip this leaf if it's too far
 				continue
 			}
@@ -1968,7 +1978,7 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 					} else if pi.MaybeCloser(topCurrentResult) {
 						insertResultWithCollapse(results, pi, metadata, collapseKeyToItem, idx.config.CollapseKeysFunc)
 					}
-					if results.Len() > req.K*int(math32.Ceil(idx.config.Episilon2+1)) {
+					if results.Len() > req.K*int(math32.Ceil(epsilon2+1)) {
 						heap.Pop(results)
 					}
 				}

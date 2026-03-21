@@ -140,12 +140,8 @@ func (g *GraphIndexV0) GetRoots(ctx context.Context) ([][]byte, error) {
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
-		if bytes.Contains(key, inMarker) {
-			// Extract target (everything before :i:)
-			target, _, ok := bytes.Cut(key, []byte(":i:"))
-			if ok {
-				hasParent[string(target)] = true
-			}
+		if pos := bytes.Index(key, inMarker); pos != -1 {
+			hasParent[string(key[:pos])] = true
 		}
 	}
 	if err := iter.Error(); err != nil {

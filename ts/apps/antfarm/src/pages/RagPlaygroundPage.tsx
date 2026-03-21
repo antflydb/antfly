@@ -79,6 +79,29 @@ const DEFAULT_STEPS: StepsConfig = {
   confidence: { enabled: false },
 };
 
+const ERROR_TRUNCATE_LENGTH = 150;
+
+function ErrorDisplay({ message }: { message: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = message.length > ERROR_TRUNCATE_LENGTH;
+  const displayText = isLong && !expanded ? `${message.slice(0, ERROR_TRUNCATE_LENGTH)}...` : message;
+
+  return (
+    <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+      {displayText}
+      {isLong && (
+        <button
+          type="button"
+          onClick={() => setExpanded(!expanded)}
+          className="ml-2 underline opacity-70 hover:opacity-100"
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // Simple markdown-ish formatter for RAG answers
 function formatAnswer(text: string): React.ReactNode {
   if (!text) return null;
@@ -834,9 +857,7 @@ const RagPlaygroundPage: React.FC = () => {
             <CardContent className="flex-1 overflow-auto">
               {/* Error Display */}
               {error && (
-                <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
-                  {error}
-                </div>
+                <ErrorDisplay message={error} />
               )}
 
               <PipelineTrace

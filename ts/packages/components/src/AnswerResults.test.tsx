@@ -538,6 +538,66 @@ describe("AnswerResults", () => {
   });
 
   describe("renderAnswer with hooks (regression: React error #310)", () => {
+    it("should not throw when renderLoading itself uses hooks before the first answer chunk", async () => {
+      const mockStreamAnswer = vi.mocked(utils.streamAnswer);
+      let generateCallback: ((chunk: string) => void) | undefined;
+
+      mockStreamAnswer.mockImplementation(async (_url, _request, _headers, callbacks) => {
+        generateCallback = callbacks.onGeneration;
+        return new AbortController();
+      });
+
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const renderLoading = () => {
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        const loadingText = useMemo(() => "Custom loading", []);
+        return <div data-testid="custom-loading">{loadingText}</div>;
+      };
+
+      render(
+        <TestWrapper>
+          <QueryBox id="question" mode="submit" />
+          <AnswerResults
+            id="answer"
+            searchBoxId="question"
+            generator={mockGenerator}
+            fields={["content"]}
+            renderLoading={renderLoading}
+          />
+        </TestWrapper>
+      );
+
+      const input = screen.getByPlaceholderText(/ask a question/i);
+      const button = screen.getByRole("button", { name: /submit/i });
+
+      await act(async () => {
+        await userEvent.type(input, "test question");
+        await userEvent.click(button);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("custom-loading")).toBeTruthy();
+      });
+
+      await act(async () => {
+        generateCallback?.("Hello world");
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText("Hello world")).toBeTruthy();
+      });
+
+      const reactHookErrors = consoleErrorSpy.mock.calls.filter(
+        (call) =>
+          typeof call[0] === "string" &&
+          (call[0].includes("Rendered more hooks") || call[0].includes("error #310"))
+      );
+      expect(reactHookErrors).toHaveLength(0);
+
+      consoleErrorSpy.mockRestore();
+    });
+
     it("should not throw when renderAnswer itself uses hooks and answer streams progressively", async () => {
       const mockStreamAnswer = vi.mocked(utils.streamAnswer);
       let generateCallback: ((chunk: string) => void) | undefined;

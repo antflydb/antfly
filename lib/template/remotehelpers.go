@@ -37,12 +37,45 @@ func errorToDirective(err error) raymond.SafeString {
 	return raymond.SafeString(FormatErrorDirective(0, err.Error()))
 }
 
-// RemoteMediaFn is a Handlebars helper that downloads media (image or audio) from a URL
+// resolveCredentials resolves S3 credentials and security config for a URL,
+// falling back to defaults on error.
+func resolveCredentials(url, credentials string) (*scraping.S3Credentials, *scraping.ContentSecurityConfig) {
+	s3Creds, securityConfig, err := scraping.ResolveS3Credentials(url, credentials)
+	if err != nil {
+		log.Printf("credential resolution failed for %s: %v", url, err)
+		s3Creds = scraping.GetDefaultS3Credentials()
+		securityConfig = scraping.GetDefaultSecurityConfig()
+	}
+	if securityConfig == nil {
+		securityConfig = scraping.GetDefaultSecurityConfig()
+	}
+	return s3Creds, securityConfig
+}
+
+func validateRemoteMediaMode(mode string) error {
+	if mode == "" {
+		return nil
+	}
+	switch mode {
+	case "raw", "extract", "render":
+		return nil
+	default:
+		return fmt.Errorf("invalid mode %q, must be raw, extract, or render", mode)
+	}
+}
+
+// RemoteMediaFn is a Handlebars helper that downloads media (image, audio, or PDF) from a URL
 // and returns a Genkit dotprompt media directive with the content as a data URI.
 // Usage: {{remoteMedia url="https://example.com/image.jpg"}}
 // Usage: {{remoteMedia url="https://example.com/audio.mp3"}}
+// Usage: {{remoteMedia url="https://example.com/doc.pdf"}}
+// Usage: {{remoteMedia url="https://example.com/doc.pdf" mode="render"}}
 // Usage: {{remoteMedia url="s3://bucket/image.jpg" credentials="primary"}}
-// Returns: <<<dotprompt:media:url data:image/png;base64,...>>> or <<<dotprompt:media:url data:audio/mpeg;base64,...>>>
+//
+// The mode parameter controls PDF processing (ignored for non-PDF content):
+//   - "raw" (default): returns the PDF as-is via data:application/pdf;base64,... data URI
+//   - "extract": extracts text from the PDF and returns it as plain text (not a media directive)
+//   - "render": renders the first page as image/png
 func RemoteMediaFn(options *raymond.Options) raymond.SafeString {
 	url := options.HashStr("url")
 	if url == "" {
@@ -50,62 +83,100 @@ func RemoteMediaFn(options *raymond.Options) raymond.SafeString {
 		return raymond.SafeString("")
 	}
 
-	credentials := options.HashStr("credentials")
-
-	// Resolve credentials and security config based on URL and explicit credential name
-	s3Creds, securityConfig, err := scraping.ResolveS3Credentials(url, credentials)
-	if err != nil {
-		log.Printf("RemoteMediaFn: credential resolution failed: %v", err)
-		// Fall back to defaults
-		s3Creds = scraping.GetDefaultS3Credentials()
-		securityConfig = scraping.GetDefaultSecurityConfig()
+	mode := options.HashStr("mode")
+	if mode == "" {
+		mode = "raw"
 	}
-	if securityConfig == nil {
-		securityConfig = scraping.GetDefaultSecurityConfig()
+	if err := validateRemoteMediaMode(mode); err != nil {
+		log.Printf("RemoteMediaFn: %v", err)
+		return errorToDirective(err)
 	}
 
-	// Use background context with timeout from security config
-	ctx := context.Background()
-	if securityConfig.DownloadTimeoutSeconds > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(
-			ctx,
-			time.Duration(securityConfig.DownloadTimeoutSeconds)*time.Second,
-		)
-		defer cancel()
+	s3Creds, securityConfig := resolveCredentials(url, options.HashStr("credentials"))
+
+	processor := &pdfModeProcessor{
+		mode:           mode,
+		securityConfig: securityConfig,
 	}
 
-	// Download and process the media (image or audio)
+	// DownloadAndProcessLink handles timeout from securityConfig
 	result, err := scraping.DownloadAndProcessLink(
-		ctx,
+		context.Background(),
 		url,
 		securityConfig,
 		s3Creds,
-		nil,
+		processor,
 	)
 	if err != nil {
 		log.Printf("RemoteMediaFn: failed to download/process media from %s: %v", url, err)
 		return errorToDirective(err)
 	}
 
-	// Verify we got an image, audio, or data-url output
-	if result.Format != "image" && result.Format != "audio" && result.Format != "data-url" {
-		log.Printf("RemoteMediaFn: expected image/audio output format, got %s", result.Format)
+	// For extract mode on PDFs, return plain text (not a media directive)
+	if result.Format == scraping.FormatText {
+		return raymond.SafeString(string(result.Data))
+	}
+
+	// Verify we got a media output
+	if result.Format != scraping.FormatImage && result.Format != scraping.FormatAudio && result.Format != scraping.FormatPDF {
+		log.Printf("RemoteMediaFn: unexpected output format %q", result.Format)
 		return raymond.SafeString("")
 	}
 
-	// result.Data is already a data URI like "data:image/png;base64,..." or "data:audio/mpeg;base64,..."
-	dataURI := string(result.Data)
+	// Build media directive without intermediate string copies of the data URI
+	const prefix = "<<<dotprompt:media:url "
+	const suffix = ">>>"
+	var sb strings.Builder
+	sb.Grow(len(prefix) + len(result.Data) + len(suffix))
+	sb.WriteString(prefix)
+	sb.Write(result.Data)
+	sb.WriteString(suffix)
+	return raymond.SafeString(sb.String())
+}
 
-	// Return Genkit dotprompt media directive
-	return raymond.SafeString(fmt.Sprintf("<<<dotprompt:media:url %s>>>", dataURI))
+// pdfModeProcessor wraps the default content processor but overrides PDF handling
+// based on the configured mode (raw, extract, render).
+type pdfModeProcessor struct {
+	mode           string
+	securityConfig *scraping.ContentSecurityConfig
+}
+
+func (p *pdfModeProcessor) Process(
+	ctx context.Context,
+	contentType string,
+	data []byte,
+) (*scraping.ProcessResult, error) {
+	// For non-PDF content, delegate to the default processor
+	if contentType != "application/pdf" {
+		return scraping.NewDefaultContentProcessor(p.securityConfig).Process(ctx, contentType, data)
+	}
+
+	switch p.mode {
+	case "raw":
+		return &scraping.ProcessResult{Data: scraping.EncodeDataURI("application/pdf", data), Format: scraping.FormatPDF}, nil
+
+	case "extract":
+		text, err := scraping.ExtractPDFText(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract PDF text: %w", err)
+		}
+		if strings.TrimSpace(text) == "" {
+			return nil, fmt.Errorf("no extractable text found in PDF")
+		}
+		return &scraping.ProcessResult{Data: []byte(text), Format: scraping.FormatText}, nil
+
+	case "render":
+		return scraping.RenderPDFAsImage(data, p.securityConfig)
+
+	default:
+		return nil, fmt.Errorf("unsupported PDF mode: %s", p.mode)
+	}
 }
 
 // RemotePDFFn is a Handlebars helper that downloads a PDF from a URL and extracts text.
+// Equivalent to {{remoteMedia url="..." mode="extract"}} but kept for backward compatibility.
 // Usage: {{remotePDF url="https://example.com/doc.pdf"}}
-// Usage: {{remotePDF url="https://example.com/doc.pdf" output="markdown"}}
 // Usage: {{remotePDF url="s3://bucket/doc.pdf" credentials="primary"}}
-// The output parameter can be "text" (default) or "markdown"
 // Returns: Extracted text content (plain string, not a dotprompt directive)
 func RemotePDFFn(options *raymond.Options) raymond.SafeString {
 	url := options.HashStr("url")
@@ -114,72 +185,27 @@ func RemotePDFFn(options *raymond.Options) raymond.SafeString {
 		return raymond.SafeString("")
 	}
 
-	output := options.HashStr("output")
-	if output == "" {
-		output = "text" // default to text output
-	}
+	s3Creds, securityConfig := resolveCredentials(url, options.HashStr("credentials"))
 
-	credentials := options.HashStr("credentials")
-
-	// Resolve credentials and security config based on URL and explicit credential name
-	s3Creds, securityConfig, err := scraping.ResolveS3Credentials(url, credentials)
-	if err != nil {
-		log.Printf("RemotePDFFn: credential resolution failed: %v", err)
-		// Fall back to defaults
-		s3Creds = scraping.GetDefaultS3Credentials()
-		securityConfig = scraping.GetDefaultSecurityConfig()
-	}
-	if securityConfig == nil {
-		securityConfig = scraping.GetDefaultSecurityConfig()
-	}
-
-	// Use background context with timeout from security config
-	ctx := context.Background()
-	if securityConfig.DownloadTimeoutSeconds > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(
-			ctx,
-			time.Duration(securityConfig.DownloadTimeoutSeconds)*time.Second,
-		)
-		defer cancel()
-	}
-
-	// Create a custom processor for PDF that only extracts text
-	processor := &pdfTextProcessor{}
-
-	// Download and process the PDF
+	// DownloadAndProcessLink handles timeout from securityConfig
 	result, err := scraping.DownloadAndProcessLink(
-		ctx,
+		context.Background(),
 		url,
 		securityConfig,
 		s3Creds,
-		processor,
+		&pdfTextProcessor{},
 	)
 	if err != nil {
 		log.Printf("RemotePDFFn: failed to download/process PDF from %s: %v", url, err)
 		return errorToDirective(err)
 	}
 
-	// Verify we got text output
-	if result.Format != "text" {
+	if result.Format != scraping.FormatText {
 		log.Printf("RemotePDFFn: expected text output format, got %s", result.Format)
 		return raymond.SafeString("")
 	}
 
-	text := string(result.Data)
-
-	// Apply output formatting
-	switch output {
-	case "markdown":
-		// For markdown output, we could add some basic formatting
-		// For now, just return the text as-is since PDFs don't have inherent markdown structure
-		// In the future, could add header detection, list formatting, etc.
-		return raymond.SafeString(text)
-	case "text":
-		fallthrough
-	default:
-		return raymond.SafeString(text)
-	}
+	return raymond.SafeString(string(result.Data))
 }
 
 // RemoteTextFn is a Handlebars helper that downloads text content from a URL.
@@ -194,36 +220,16 @@ func RemoteTextFn(options *raymond.Options) raymond.SafeString {
 		return raymond.SafeString("")
 	}
 
-	credentials := options.HashStr("credentials")
+	s3Creds, securityConfig := resolveCredentials(url, options.HashStr("credentials"))
 
-	// Resolve credentials and security config based on URL and explicit credential name
-	s3Creds, securityConfig, err := scraping.ResolveS3Credentials(url, credentials)
-	if err != nil {
-		log.Printf("RemoteTextFn: credential resolution failed: %v", err)
-		// Fall back to defaults
-		s3Creds = scraping.GetDefaultS3Credentials()
-		securityConfig = scraping.GetDefaultSecurityConfig()
-	}
-	if securityConfig == nil {
-		securityConfig = scraping.GetDefaultSecurityConfig()
-	}
-
-	// Use background context with timeout from security config
-	ctx := context.Background()
-	if securityConfig.DownloadTimeoutSeconds > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(
-			ctx,
-			time.Duration(securityConfig.DownloadTimeoutSeconds)*time.Second,
-		)
-		defer cancel()
-	}
-
-	// Create a custom processor that preserves text as-is
-	processor := &preserveTextProcessor{}
-
-	// Download and process the content
-	result, err := scraping.DownloadAndProcessLink(ctx, url, securityConfig, s3Creds, processor)
+	// DownloadAndProcessLink handles timeout from securityConfig
+	result, err := scraping.DownloadAndProcessLink(
+		context.Background(),
+		url,
+		securityConfig,
+		s3Creds,
+		&preserveTextProcessor{},
+	)
 	if err != nil {
 		log.Printf("RemoteTextFn: failed to download/process text from %s: %v", url, err)
 		return errorToDirective(err)
@@ -250,7 +256,7 @@ func (p *pdfTextProcessor) Process(
 		return nil, fmt.Errorf("failed to extract PDF text: %w", err)
 	}
 
-	return &scraping.ProcessResult{Data: []byte(text), Format: "text"}, nil
+	return &scraping.ProcessResult{Data: []byte(text), Format: scraping.FormatText}, nil
 }
 
 // preserveTextProcessor is a custom ContentProcessor that preserves text content as-is
@@ -263,7 +269,7 @@ func (p *preserveTextProcessor) Process(
 ) (*scraping.ProcessResult, error) {
 	// For text content types, return as-is
 	if strings.HasPrefix(contentType, "text/") {
-		return &scraping.ProcessResult{Data: data, Format: "text"}, nil
+		return &scraping.ProcessResult{Data: data, Format: scraping.FormatText}, nil
 	}
 
 	return nil, fmt.Errorf("unsupported content type for text processing: %s", contentType)
@@ -282,28 +288,15 @@ func TranscribeAudioFn(options *raymond.Options) raymond.SafeString {
 		return raymond.SafeString("")
 	}
 
-	// Get default STT provider
 	stt := audio.GetDefaultSTT()
 	if stt == nil {
 		log.Printf("TranscribeAudioFn: no default STT provider configured")
 		return raymond.SafeString("")
 	}
 
-	credentials := options.HashStr("credentials")
-	language := options.HashStr("language")
+	s3Creds, securityConfig := resolveCredentials(url, options.HashStr("credentials"))
 
-	// Resolve S3 credentials if needed
-	s3Creds, securityConfig, err := scraping.ResolveS3Credentials(url, credentials)
-	if err != nil {
-		log.Printf("TranscribeAudioFn: credential resolution failed: %v", err)
-		s3Creds = scraping.GetDefaultS3Credentials()
-		securityConfig = scraping.GetDefaultSecurityConfig()
-	}
-	if securityConfig == nil {
-		securityConfig = scraping.GetDefaultSecurityConfig()
-	}
-
-	// Use background context with timeout from security config
+	// TranscribeAudioFn doesn't use DownloadAndProcessLink, so set timeout here
 	ctx := context.Background()
 	if securityConfig.DownloadTimeoutSeconds > 0 {
 		var cancel context.CancelFunc
@@ -314,18 +307,14 @@ func TranscribeAudioFn(options *raymond.Options) raymond.SafeString {
 		defer cancel()
 	}
 
-	// Build transcribe request - the STT provider handles URL downloading
 	req := audio.TranscribeRequest{
 		URL:      url,
-		Language: language,
+		Language: options.HashStr("language"),
 	}
-
-	// Add S3 credentials if we have them
 	if s3Creds != nil {
 		req.S3Credentials = s3Creds
 	}
 
-	// Transcribe the audio
 	resp, err := stt.Transcribe(ctx, req)
 	if err != nil {
 		log.Printf("TranscribeAudioFn: failed to transcribe audio from %s: %v", url, err)

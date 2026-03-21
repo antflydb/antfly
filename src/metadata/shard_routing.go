@@ -629,6 +629,14 @@ func (ms *MetadataStore) forwardInsertToShard(
 	value map[string]any,
 	syncLevel db.Op_SyncLevel,
 ) error {
+	table, err := ms.tm.GetTable(tableName)
+	if err != nil {
+		return fmt.Errorf("getting table %s: %w", tableName, err)
+	}
+	if err := validateDocumentInsertKey(table, key); err != nil {
+		return fmt.Errorf("invalid document id %q: %w", key, err)
+	}
+
 	// Marshal value outside retry loop - this won't change between retries
 	e, err := json.Marshal(value)
 	if err != nil {

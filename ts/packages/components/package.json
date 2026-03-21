@@ -1,6 +1,6 @@
 {
   "name": "@antfly/components",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "description": "React components for Antfly search",
   "type": "module",
   "main": "dist/main.js",

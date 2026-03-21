@@ -11,6 +11,7 @@ import type {
 } from "@antfly/sdk";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnswerResultsContext, type AnswerResultsContextValue } from "./AnswerResultsContext";
+import { SafeRender } from "./SafeRender";
 import { useSharedContext } from "./SharedContext";
 import { resolveTable, streamAnswer } from "./utils";
 
@@ -80,7 +81,7 @@ function CustomAnswerRenderer({
   hits,
   renderAnswer,
 }: CustomAnswerRendererProps) {
-  return <>{renderAnswer(answer, isStreaming, hits)}</>;
+  return <SafeRender render={renderAnswer} args={[answer, isStreaming, hits] as const} />;
 }
 
 export default function AnswerResults({
@@ -575,7 +576,7 @@ export default function AnswerResults({
           !reasoning &&
           isStreaming &&
           (renderLoading ? (
-            renderLoading()
+            <SafeRender render={renderLoading} args={[] as const} />
           ) : (
             <div className="react-af-answer-loading">Loading answer...</div>
           ))}
@@ -583,7 +584,7 @@ export default function AnswerResults({
           !answer &&
           !isStreaming &&
           (renderEmpty ? (
-            renderEmpty()
+            <SafeRender render={renderEmpty} args={[] as const} />
           ) : (
             <div className="react-af-answer-empty">
               No results yet. Submit a question to get started.
@@ -592,12 +593,12 @@ export default function AnswerResults({
         {showClassification &&
           classification &&
           (renderClassification
-            ? renderClassification(classification)
+            ? <SafeRender render={renderClassification} args={[classification] as const} />
             : defaultRenderClassification(classification))}
         {showReasoning &&
           reasoning &&
           (renderReasoning
-            ? renderReasoning(reasoning, isStreaming)
+            ? <SafeRender render={renderReasoning} args={[reasoning, isStreaming] as const} />
             : defaultRenderReasoning(reasoning, isStreaming))}
         {!error &&
           answer &&
@@ -614,18 +615,30 @@ export default function AnswerResults({
         {showConfidence &&
           confidence &&
           !isStreaming &&
-          (renderConfidence ? renderConfidence(confidence) : defaultRenderConfidence(confidence))}
+          (renderConfidence ? (
+            <SafeRender render={renderConfidence} args={[confidence] as const} />
+          ) : (
+            defaultRenderConfidence(confidence)
+          ))}
         {showFollowUpQuestions &&
           followUpQuestions.length > 0 &&
           !isStreaming &&
-          (renderFollowUpQuestions
-            ? renderFollowUpQuestions(followUpQuestions)
-            : defaultRenderFollowUpQuestions(followUpQuestions))}
-        {showHits && hits.length > 0 && (renderHits ? renderHits(hits) : defaultRenderHits(hits))}
+          (renderFollowUpQuestions ? (
+            <SafeRender render={renderFollowUpQuestions} args={[followUpQuestions] as const} />
+          ) : (
+            defaultRenderFollowUpQuestions(followUpQuestions)
+          ))}
+        {showHits &&
+          hits.length > 0 &&
+          (renderHits ? <SafeRender render={renderHits} args={[hits] as const} /> : defaultRenderHits(hits))}
         {evalConfig &&
           evalResult &&
           !isStreaming &&
-          (renderEvalResult ? renderEvalResult(evalResult) : defaultRenderEvalResult(evalResult))}
+          (renderEvalResult ? (
+            <SafeRender render={renderEvalResult} args={[evalResult] as const} />
+          ) : (
+            defaultRenderEvalResult(evalResult)
+          ))}
       </div>
       {children}
     </AnswerResultsContext.Provider>

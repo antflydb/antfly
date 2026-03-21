@@ -219,14 +219,11 @@ func (f *fullTextIndexOp) Execute(ctx context.Context) (err error) {
 		// If this is a summary suffix key, strip the suffix to get the main document key
 		docKey := currKey
 		if bytes.HasSuffix(currKey, storeutils.SummarySuffix) {
-			// Extract base document key (remove :i:<indexName>:s suffix)
-			keyWithoutSuffix := currKey[:len(currKey)-len(storeutils.SummarySuffix)]
-			// Find where the document key ends (before :i:)
-			before, _, ok := bytes.Cut(keyWithoutSuffix, []byte(":i:"))
+			parsedDocKey, _, ok := storeutils.ParseSummaryKey(currKey)
 			if !ok {
 				continue // Skip malformed key
 			}
-			docKey = before
+			docKey = parsedDocKey
 		}
 		// Fetch document with all summaries and chunks using GetDocument abstraction
 		result, err := storeutils.GetDocument(ctx, f.i.db, docKey, storeutils.QueryOptions{
