@@ -505,10 +505,11 @@ func applyFullTextPaging(req *bleve.SearchRequest, opts FullTextPagingOptions) {
 }
 
 type VectorPagingOptions struct {
-	OrderBy       []SortField
-	Limit         int
-	DistanceUnder *float32
-	DistanceOver  *float32
+	OrderBy        []SortField
+	Limit          int
+	DistanceUnder  *float32
+	DistanceOver   *float32
+	SearchEffort   *float32
 }
 
 // DateTimeRange represents a datetime range for aggregations
@@ -1404,9 +1405,10 @@ type Query struct {
 	Limit int `json:"limit,omitempty"`
 
 	// Mapping from index name to embedding
-	Embeddings    map[string]vector.T `json:"embeddings,omitempty,omitzero"`
-	DistanceUnder *float32            `json:"distance_under,omitempty"`
-	DistanceOver  *float32            `json:"distance_over,omitempty"`
+	Embeddings     map[string]vector.T `json:"embeddings,omitempty,omitzero"`
+	DistanceUnder  *float32            `json:"distance_under,omitempty"`
+	DistanceOver   *float32            `json:"distance_over,omitempty"`
+	SearchEffort   *float32            `json:"search_effort,omitempty"`
 
 	// Graph searches (executed after full-text/vector searches)
 	GraphSearches map[string]*GraphQuery `json:"graph_searches,omitempty"`
@@ -1514,10 +1516,11 @@ func (q *Query) VectorPagingOptions() VectorPagingOptions {
 		return VectorPagingOptions{}
 	}
 	return VectorPagingOptions{
-		OrderBy:       q.OrderBy,
-		Limit:         q.Limit,
-		DistanceUnder: q.DistanceUnder,
-		DistanceOver:  q.DistanceOver,
+		OrderBy:        q.OrderBy,
+		Limit:          q.Limit,
+		DistanceUnder:  q.DistanceUnder,
+		DistanceOver:   q.DistanceOver,
+		SearchEffort:   q.SearchEffort,
 	}
 }
 

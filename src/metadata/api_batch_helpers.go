@@ -104,9 +104,9 @@ func partitionBatchRequestsByTable(
 		// Validate docs and collect insert keys
 		insertKeys := make([]string, 0, len(batchReq.Inserts))
 		for key, doc := range batchReq.Inserts {
-			if key == "" {
+			if err := validateDocumentInsertKey(table, key); err != nil {
 				return nil, &batchPartitionError{
-					Message:    fmt.Sprintf("Table %s: nonempty key required for writes", tableName),
+					Message:    fmt.Sprintf("Table %s: invalid document id %q: %v", tableName, key, err),
 					StatusCode: http.StatusBadRequest,
 				}
 			}
@@ -117,6 +117,14 @@ func partitionBatchRequestsByTable(
 				}
 			}
 			insertKeys = append(insertKeys, key)
+		}
+		for _, key := range batchReq.Deletes {
+			if err := validateDocumentMutationKey(key); err != nil {
+				return nil, &batchPartitionError{
+					Message:    fmt.Sprintf("Table %s: invalid document id %q: %v", tableName, key, err),
+					StatusCode: http.StatusBadRequest,
+				}
+			}
 		}
 
 		// Partition insert keys by shard
@@ -182,6 +190,12 @@ func partitionBatchRequestsByTable(
 			transformKeys := make([]string, 0, len(batchReq.Transforms))
 
 			for _, transformReq := range batchReq.Transforms {
+				if err := validateDocumentTransformKey(table, transformReq.Key, transformReq.Upsert); err != nil {
+					return nil, &batchPartitionError{
+						Message:    fmt.Sprintf("Table %s: invalid document id %q: %v", tableName, transformReq.Key, err),
+						StatusCode: http.StatusBadRequest,
+					}
+				}
 				transform, err := TransformFromAPI(transformReq)
 				if err != nil {
 					return nil, &batchPartitionError{

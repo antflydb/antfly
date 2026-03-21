@@ -339,6 +339,39 @@ func TestSparseIndex_BatchDelete(t *testing.T) {
 	assert.Equal(t, "doc2", sr.Hits[0].ID)
 }
 
+func TestSparseIndex_BatchDeleteChunkKey(t *testing.T) {
+	si, db := setupSparseIndex(t)
+
+	chunkKey := storeutils.MakeChunkKey([]byte("doc1"), si.name, 0)
+	writeSparseEmbedding(t, db, chunkKey, si.sparseSuffix, vector.NewSparseVector(
+		[]uint32{10}, []float32{1.0},
+	))
+
+	writes := [][2][]byte{
+		{append(bytes.Clone(chunkKey), si.sparseSuffix...), nil},
+	}
+	require.NoError(t, si.Batch(t.Context(), writes, nil, false))
+
+	result, err := si.Search(t.Context(), &SparseSearchRequest{
+		QueryVec: vector.NewSparseVector([]uint32{10}, []float32{1.0}),
+		K:        10,
+	})
+	require.NoError(t, err)
+	sr := result.(*vectorindex.SearchResult)
+	require.Len(t, sr.Hits, 1)
+	assert.Equal(t, string(chunkKey), sr.Hits[0].ID)
+
+	require.NoError(t, si.Batch(t.Context(), nil, [][]byte{chunkKey}, false))
+
+	result, err = si.Search(t.Context(), &SparseSearchRequest{
+		QueryVec: vector.NewSparseVector([]uint32{10}, []float32{1.0}),
+		K:        10,
+	})
+	require.NoError(t, err)
+	sr = result.(*vectorindex.SearchResult)
+	require.Empty(t, sr.Hits)
+}
+
 func TestSparseIndex_RenderPrompt(t *testing.T) {
 	si, _ := setupSparseIndex(t)
 

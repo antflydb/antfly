@@ -6,6 +6,7 @@ replace (
 	github.com/antflydb/antfly/pkg/client => ./pkg/client
 	github.com/antflydb/antfly/pkg/evalaf => ./pkg/evalaf
 	github.com/antflydb/antfly/pkg/evalaf/plugins/antfly => ./pkg/evalaf/plugins/antfly
+	github.com/antflydb/antfly/pkg/generating => ./pkg/generating
 	github.com/antflydb/antfly/pkg/genkit/openrouter => ./pkg/genkit/openrouter
 	github.com/antflydb/antfly/pkg/libaf => ./pkg/libaf
 	github.com/antflydb/termite => ./termite
@@ -21,7 +22,17 @@ replace (
 
 replace github.com/tidwall/wal => github.com/ajroetker/wal v0.0.0-antfly000
 
-replace github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc => github.com/dprotaso/go-yit v0.0.0-20250513224043-18a80f8f6df4
+// Pin deps compatible with oapi-codegen v2.5.1.
+// kin-openapi v0.134.0 breaks oapi-codegen (MappingRef type change) and
+// panics in InternalizeRefs on schemas with empty refs.
+// oasdiff/yaml v0.0.1 breaks kin-openapi v0.133.0 (OriginOpt API change).
+// go-yit 20250909 pulls in go.yaml.in/yaml/v4 which breaks yaml-jsonpath.
+replace (
+	github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc => github.com/dprotaso/go-yit v0.0.0-20250513224043-18a80f8f6df4
+	github.com/getkin/kin-openapi v0.134.0 => github.com/getkin/kin-openapi v0.133.0
+	github.com/oasdiff/yaml v0.0.1 => github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037
+	github.com/oasdiff/yaml3 v0.0.1 => github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90
+)
 
 replace (
 	github.com/gomlx/gomlx => github.com/ajroetker/gomlx v0.0.0-antfly008
@@ -33,17 +44,17 @@ replace (
 require (
 	cloud.google.com/go/speech v1.30.0
 	codeberg.org/readeck/go-readability/v2 v2.1.1
-	github.com/a2aproject/a2a-go v0.3.9
+	github.com/a2aproject/a2a-go v0.3.12
 	github.com/ajroetker/go-highway v0.0.12
 	github.com/ajroetker/pdf v0.0.1-antfly001
 	github.com/ajroetker/pdf/render v0.0.1-antfly003
 	github.com/alpkeskin/gotoon v0.1.1
-	github.com/antflydb/antfly/pkg/client v0.0.0-00010101000000-000000000000
+	github.com/antflydb/antfly/pkg/client v0.0.1
 	github.com/antflydb/antfly/pkg/evalaf v0.0.0
-	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0-20260313151000-3c73f35767a3
+	github.com/antflydb/antfly/pkg/generating v0.0.0
 	github.com/antflydb/antfly/pkg/libaf v0.0.1
-	github.com/antflydb/termite v0.0.0-00010101000000-000000000000
-	github.com/antflydb/termite/pkg/client v0.0.0-00010101000000-000000000000
+	github.com/antflydb/termite v0.0.10
+	github.com/antflydb/termite/pkg/client v0.0.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.50.2
 	github.com/blevesearch/bleve/v2 v2.5.7
@@ -55,7 +66,7 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.1.4
 	github.com/cohere-ai/cohere-go/v2 v2.16.2
 	github.com/danaugrs/go-tsne v0.0.0-20200708172100-6b7d1d577fd3
-	github.com/firebase/genkit/go v1.4.0
+	github.com/firebase/genkit/go v1.5.0
 	github.com/getkin/kin-openapi v0.133.0
 	github.com/goccy/go-json v0.10.6
 	github.com/golang/snappy v1.0.0
@@ -64,11 +75,11 @@ require (
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/jellydator/ttlcache/v3 v3.4.0
 	github.com/johannesboyne/gofakes3 v0.0.0-20250916175020-ebf3e50324d3
-	github.com/kaptinlin/jsonschema v0.7.5
-	github.com/klauspost/compress v1.18.4
+	github.com/kaptinlin/jsonschema v0.7.6
+	github.com/klauspost/compress v1.18.5
 	github.com/minio/minio-go/v7 v7.0.99
 	github.com/modelcontextprotocol/go-sdk v1.4.1
-	github.com/oapi-codegen/runtime v1.2.0
+	github.com/oapi-codegen/runtime v1.3.0
 	github.com/openai/openai-go v1.12.0
 	github.com/puzpuzpuz/xsync/v4 v4.4.0
 	github.com/quic-go/quic-go v0.59.0
@@ -85,7 +96,7 @@ require (
 	golang.org/x/sync v0.20.0
 	gonum.org/v1/gonum v0.17.0
 	gonum.org/v1/plot v0.16.0
-	google.golang.org/genai v1.50.0
+	google.golang.org/genai v1.51.0
 	mvdan.cc/xurls/v2 v2.6.0
 )
 
@@ -95,6 +106,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/internal v1.2.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/ajroetker/go-jpeg2000 v0.0.2 // indirect
+	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0 // indirect
 	github.com/avast/retry-go/v4 v4.7.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.8 // indirect
 	github.com/axiomhq/hyperloglog v0.2.6 // indirect
@@ -116,7 +128,7 @@ require (
 	github.com/gomlx/go-coreml v0.0.0-20260301010621-8fdf6ad8655e // indirect
 	github.com/gomlx/go-coreml/gomlx v0.0.0-20260301010621-8fdf6ad8655e // indirect
 	github.com/gomlx/go-huggingface v0.3.3-0.20260316090437-1a6ca7ca09c4 // indirect
-	github.com/gomlx/go-xla v0.2.0 // indirect
+	github.com/gomlx/go-xla v0.2.1 // indirect
 	github.com/gomlx/gomlx v0.26.1-0.20260220075116-8da82ca8aaad // indirect
 	github.com/gomlx/onnx-gomlx v0.3.5-0.20260130173634-2497f2c7652f // indirect
 	github.com/google/go-github/v78 v78.0.0 // indirect
@@ -165,7 +177,7 @@ require (
 	codeberg.org/go-latex/latex v0.2.0 // indirect
 	codeberg.org/go-pdf/fpdf v0.11.1 // indirect
 	git.sr.ht/~sbinet/gg v0.7.0 // indirect
-	github.com/PuerkitoBio/goquery v1.11.0
+	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/RaduBerinde/axisds v0.1.0 // indirect
 	github.com/RaduBerinde/btreemap v0.0.0-20260105202824-d3184786f603 // indirect
 	github.com/ajstarks/svgo v0.0.0-20211024235047-1546f124cd8b // indirect
@@ -198,7 +210,7 @@ require (
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/minio/minlz v1.1.0 // indirect
 	github.com/moby/sys/user v0.4.0 // indirect
-	github.com/panjf2000/ants/v2 v2.11.6
+	github.com/panjf2000/ants/v2 v2.12.0
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/transparency-dev/formats v0.0.0-20251110090430-df1ffe27d819 // indirect
 	github.com/woodsbury/decimal128 v1.4.0 // indirect
@@ -279,7 +291,7 @@ require (
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/bluesky-social/indigo v0.0.0-20251112071842-bc4a2419e924 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
-	github.com/buger/jsonparser v1.1.1 // indirect
+	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/caarlos0/env/v11 v11.3.1 // indirect
 	github.com/caarlos0/go-reddit/v3 v3.0.1 // indirect
 	github.com/caarlos0/go-shellwords v1.0.12 // indirect
@@ -391,7 +403,7 @@ require (
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
-	github.com/mailru/easyjson v0.9.1 // indirect
+	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/mattn/go-localereader v0.0.2-0.20220822084749-2491eb6c1c75 // indirect
 	github.com/mattn/go-mastodon v0.0.10 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
@@ -418,7 +430,7 @@ require (
 	github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037 // indirect
 	github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
-	github.com/ollama/ollama v0.18.0
+	github.com/ollama/ollama v0.18.2
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
@@ -494,7 +506,7 @@ require (
 	github.com/BurntSushi/toml v1.5.0 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
-	github.com/RoaringBitmap/roaring/v2 v2.15.0 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.16.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/blevesearch/geo v0.2.5 // indirect
@@ -531,7 +543,7 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.14 // indirect
-	github.com/googleapis/gax-go/v2 v2.18.0 // indirect
+	github.com/googleapis/gax-go/v2 v2.19.0 // indirect
 	github.com/hashicorp/go-version v1.7.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
@@ -556,7 +568,7 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
-	github.com/sirupsen/logrus v1.9.4-0.20230606125235-dd1b4c2e81af // indirect
+	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/cobra v1.10.2
@@ -586,11 +598,11 @@ require (
 	golang.org/x/text v0.35.0 // indirect
 	golang.org/x/time v0.15.0
 	golang.org/x/tools v0.43.0 // indirect
-	google.golang.org/api v0.271.0
-	google.golang.org/genproto v0.0.0-20260311181403-84a4fc48630c // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260311181403-84a4fc48630c // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260311181403-84a4fc48630c // indirect
-	google.golang.org/grpc v1.79.2 // indirect
+	google.golang.org/api v0.272.0
+	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260319201613-d00831a3d3e7 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260319201613-d00831a3d3e7 // indirect
+	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

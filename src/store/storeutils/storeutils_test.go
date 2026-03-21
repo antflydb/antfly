@@ -290,6 +290,35 @@ func TestScanForEnrichment_SummariesNeedingEmbeddings(t *testing.T) {
 	require.Equal(t, "Summary 2", needsEnrichment[0].Enrichment.(string))
 }
 
+func TestScanForEnrichment_SummariesNeedingEmbeddings_WithIndexMarkerInDocKey(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := t.Context()
+
+	embSuffix := []byte(":i:myindex:e")
+	sumSuffix := []byte(":i:myindex:s")
+
+	insertDocument(t, db, []byte("tenant:i:1"), []byte(`{"id": 1}`),
+		nil,
+		map[string]string{"myindex": "Summary 1"})
+
+	var needsEnrichment []DocumentScanState
+	err := ScanForEnrichment(ctx, db, EnrichmentScanOptions{
+		ByteRange:        [2][]byte{[]byte("tenant"), []byte("tenanu")},
+		PrimarySuffix:    sumSuffix,
+		EnrichmentSuffix: embSuffix,
+		BatchSize:        10,
+		ProcessBatch: func(ctx context.Context, batch []DocumentScanState) error {
+			needsEnrichment = append(needsEnrichment, batch...)
+			return nil
+		},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, needsEnrichment, 1)
+	require.Equal(t, []byte("tenant:i:1"), needsEnrichment[0].CurrentDocKey)
+	require.Equal(t, "Summary 1", needsEnrichment[0].Enrichment.(string))
+}
+
 func TestScanForEnrichment_Batching(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := t.Context()
@@ -651,6 +680,95 @@ func TestIsChunkKey_IncludesMedia(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := IsChunkKey([]byte(tt.key))
 			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestParseChunkKey(t *testing.T) {
+	tests := []struct {
+		name          string
+		key           []byte
+		wantDocKey    []byte
+		wantIndexName string
+		wantOK        bool
+	}{
+		{
+			name:          "regular chunk key",
+			key:           []byte("doc:1:i:myindex:0:c"),
+			wantDocKey:    []byte("doc:1"),
+			wantIndexName: "myindex",
+			wantOK:        true,
+		},
+		{
+			name:          "full text chunk key",
+			key:           []byte("doc:1:i:myindex:0:cft"),
+			wantDocKey:    []byte("doc:1"),
+			wantIndexName: "myindex",
+			wantOK:        true,
+		},
+		{
+			name:          "doc key contains index marker",
+			key:           []byte("tenant:i:42:i:embeddings:7:c"),
+			wantDocKey:    []byte("tenant:i:42"),
+			wantIndexName: "embeddings",
+			wantOK:        true,
+		},
+		{
+			name:   "non chunk key",
+			key:    []byte("doc:1:i:myindex:e"),
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			docKey, indexName, ok := ParseChunkKey(tt.key)
+			require.Equal(t, tt.wantOK, ok)
+			require.Equal(t, tt.wantDocKey, docKey)
+			require.Equal(t, tt.wantIndexName, indexName)
+
+			extractedDocKey, extractedOK := ExtractDocKeyFromChunk(tt.key)
+			require.Equal(t, tt.wantOK, extractedOK)
+			require.Equal(t, tt.wantDocKey, extractedDocKey)
+		})
+	}
+}
+
+func TestParseSummaryKey(t *testing.T) {
+	tests := []struct {
+		name          string
+		key           []byte
+		wantDocKey    []byte
+		wantIndexName string
+		wantOK        bool
+	}{
+		{
+			name:          "regular summary key",
+			key:           []byte("doc:1:i:myindex:s"),
+			wantDocKey:    []byte("doc:1"),
+			wantIndexName: "myindex",
+			wantOK:        true,
+		},
+		{
+			name:          "doc key contains index marker",
+			key:           []byte("tenant:i:42:i:summary_idx:s"),
+			wantDocKey:    []byte("tenant:i:42"),
+			wantIndexName: "summary_idx",
+			wantOK:        true,
+		},
+		{
+			name:   "non summary key",
+			key:    []byte("doc:1:i:myindex:e"),
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			docKey, indexName, ok := ParseSummaryKey(tt.key)
+			require.Equal(t, tt.wantOK, ok)
+			require.Equal(t, tt.wantDocKey, docKey)
+			require.Equal(t, tt.wantIndexName, indexName)
 		})
 	}
 }

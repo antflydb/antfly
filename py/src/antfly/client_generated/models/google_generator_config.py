@@ -13,21 +13,16 @@ T = TypeVar("T", bound="GoogleGeneratorConfig")
 class GoogleGeneratorConfig:
     """Configuration for the Google generative AI provider (Gemini).
 
-    **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
-
-    **Docs:** https://ai.google.dev/gemini-api/docs/models
-
-        Attributes:
-            model (str): The name of the generative model to use (e.g., 'gemini-2.5-flash', 'gemini-2.5-pro',
-                'gemini-3.0-pro'). Default: 'gemini-2.5-flash'. Example: gemini-2.5-flash.
-            project_id (Union[Unset, str]): The Google Cloud project ID.
-            location (Union[Unset, str]): The Google Cloud location (e.g., 'us-central1').
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
-            top_p (Union[Unset, float]): Nucleus sampling parameter.
-            top_k (Union[Unset, int]): Top-k sampling parameter.
-            api_key (Union[Unset, str]): The Google API key.
-            url (Union[Unset, str]): The URL of the Google API endpoint.
+    Attributes:
+        model (str): The name of the generative model to use. Default: 'gemini-2.5-flash'. Example: gemini-2.5-flash.
+        project_id (Union[Unset, str]): The Google Cloud project ID.
+        location (Union[Unset, str]): The Google Cloud location (e.g., 'us-central1').
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
+        top_p (Union[Unset, float]): Nucleus sampling parameter.
+        top_k (Union[Unset, int]): Top-k sampling parameter.
+        api_key (Union[Unset, str]): The Google API key.
+        url (Union[Unset, str]): The URL of the Google API endpoint.
     """
 
     model: str = "gemini-2.5-flash"

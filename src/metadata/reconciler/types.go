@@ -230,6 +230,14 @@ type ReconciliationConfig struct {
 	MaxShardsPerTable   uint64
 	DisableShardAlloc   bool
 	ShardCooldownPeriod time.Duration
+	// AutoSplitPerTableLimit is the maximum number of new automatic split transitions
+	// that may be planned for a single table in one reconciliation cycle.
+	// If zero, defaults to 1.
+	AutoSplitPerTableLimit int
+	// AutoSplitClusterLimit is the maximum number of in-flight automatic splits
+	// allowed cluster-wide. If the cluster is already at or above this budget,
+	// no new automatic splits will be planned. If zero, defaults to 1.
+	AutoSplitClusterLimit int
 	// SplitTimeout is the maximum duration for a split operation before triggering rollback.
 	// If zero, defaults to 5 minutes.
 	SplitTimeout time.Duration

@@ -175,6 +175,99 @@ func TestHBCIndex_InsertAndSearch(t *testing.T) {
 	assert.Equal(t, []byte("meta_0"), results[0].Metadata)
 }
 
+func TestHBCIndex_BulkBuildRecursive(t *testing.T) {
+	vectors := []vector.T{
+		{0.00, 0.00},
+		{0.02, 0.01},
+		{0.04, 0.00},
+		{5.00, 5.00},
+		{5.02, 5.01},
+		{5.04, 5.00},
+	}
+	ids := []uint64{1, 2, 3, 4, 5, 6}
+	metadata := [][]byte{
+		[]byte("doc:1"),
+		[]byte("doc:2"),
+		[]byte("doc:3"),
+		[]byte("doc:4"),
+		[]byte("doc:5"),
+		[]byte("doc:6"),
+	}
+	batch := &Batch{
+		IDs:          ids,
+		Vectors:      vectors,
+		MetadataList: metadata,
+	}
+
+	db := setupPebbleWithVectors(t, "test_hbc_bulk", batch)
+	config := HBCConfig{
+		Dimension:       2,
+		Name:            "test_hbc_bulk",
+		BranchingFactor: 2,
+		LeafSize:        2,
+		SearchWidth:     8,
+		CacheSizeNodes:  100,
+		CacheTTL:        5 * time.Minute,
+		VectorDB:        db,
+		IndexDB:         db,
+	}
+
+	index, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+
+	require.NoError(t, index.BulkBuild(t.Context(), batch))
+	assert.EqualValues(t, len(ids), index.TotalVectors())
+
+	results, err := index.Search(&SearchRequest{
+		Embedding: []float32{0.0, 0.0},
+		K:         3,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, results)
+	assert.EqualValues(t, 1, results[0].ID)
+
+	require.NoError(t, index.Close())
+
+	reopened, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	results, err = reopened.Search(&SearchRequest{
+		Embedding: []float32{5.03, 5.01},
+		K:         3,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, results)
+	assert.Contains(t, []uint64{4, 5, 6}, results[0].ID)
+}
+
+func TestHBCIndex_BulkBuildRejectsDuplicateIDs(t *testing.T) {
+	batch := &Batch{
+		IDs:          []uint64{1, 1},
+		Vectors:      []vector.T{{0, 0}, {1, 1}},
+		MetadataList: [][]byte{[]byte("doc:1"), []byte("doc:1b")},
+	}
+	db := setupPebbleWithVectors(t, "test_hbc_bulk_dupe", batch)
+	config := HBCConfig{
+		Dimension:       2,
+		Name:            "test_hbc_bulk_dupe",
+		BranchingFactor: 2,
+		LeafSize:        2,
+		SearchWidth:     8,
+		CacheSizeNodes:  100,
+		CacheTTL:        5 * time.Minute,
+		VectorDB:        db,
+		IndexDB:         db,
+	}
+
+	index, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	err = index.BulkBuild(t.Context(), batch)
+	require.ErrorIs(t, err, ErrDuplicateVectorID)
+}
+
 func TestHBCIndex_TreeSplitting(t *testing.T) {
 	// Insert enough vectors to trigger splits
 	numVectors := 20

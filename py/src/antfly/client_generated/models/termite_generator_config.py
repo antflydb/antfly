@@ -13,28 +13,14 @@ T = TypeVar("T", bound="TermiteGeneratorConfig")
 class TermiteGeneratorConfig:
     """Configuration for the Termite generative AI provider.
 
-    Termite is Antfly's built-in ML service for local LLM inference using
-    ONNX Runtime GenAI models. It provides text generation with automatic
-    model discovery from the `models/generators/` directory.
-
-    **Example Models:** onnxruntime/Gemma-3-ONNX (from HuggingFace)
-
-    **Features:**
-    - Local inference with no external API dependencies
-    - ONNX Runtime GenAI for efficient CPU/GPU execution
-    - Auto-discovery of models from `models/generators/` directory
-    - OpenAI-compatible chat format
-
-        Attributes:
-            model (str): The name of the generator model (maps to models/generators/{name}/ directory). Example:
-                onnxruntime/Gemma-3-ONNX.
-            api_url (Union[Unset, str]): The URL of the Termite API endpoint.
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
-            top_p (Union[Unset, float]): Nucleus sampling parameter.
-            top_k (Union[Unset, int]): Top-k sampling parameter.
-            timeout (Union[Unset, int]): HTTP response timeout in seconds for Termite API calls. Defaults to 540 (9
-                minutes). Increase for large models on slow hardware.
+    Attributes:
+        model (str): The name of the generator model. Example: onnxruntime/Gemma-3-ONNX.
+        api_url (Union[Unset, str]): The URL of the Termite API endpoint.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate.
+        top_p (Union[Unset, float]): Nucleus sampling parameter.
+        top_k (Union[Unset, int]): Top-k sampling parameter.
+        timeout (Union[Unset, int]): HTTP response timeout in seconds for Termite API calls.
     """
 
     model: str

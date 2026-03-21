@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"embed"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -27,11 +26,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ajroetker/pdf"
 	antfly "github.com/antflydb/antfly/pkg/client"
 	"github.com/antflydb/antfly/pkg/docsaf"
-	"github.com/ajroetker/pdf/render"
-	"github.com/antflydb/termite/pkg/client/oapi"
-	"github.com/ajroetker/pdf"
+	generatingreading "github.com/antflydb/antfly/pkg/generating/reading"
+	libai "github.com/antflydb/antfly/pkg/libaf/ai"
+	libreading "github.com/antflydb/antfly/pkg/libaf/reading"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -65,25 +65,35 @@ type OCRConfig struct {
 
 // OCRClient wraps the Termite client for OCR operations.
 type OCRClient struct {
-	client        *oapi.ClientWithResponses
-	models        []string
+	readReader    *generatingreading.TermiteReadReader
+	visionReader  *generatingreading.TermiteGenerateReader
 	renderDPI     float64
 	lastUsedModel string
 }
 
 // NewOCRClient creates a new OCR client connected to Termite.
 func NewOCRClient(termiteURL string, models []string, renderDPI float64) (*OCRClient, error) {
-	client, err := oapi.NewClientWithResponses(termiteURL)
+	cfg := generatingreading.TermiteConfig{
+		BaseURL:          termiteURL,
+		Models:           models,
+		DefaultMaxTokens: 2048,
+		RenderDPI:        renderDPI,
+	}
+
+	readReader, err := generatingreading.NewTermiteReadReader(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create termite client: %w", err)
+		return nil, fmt.Errorf("create termite read reader: %w", err)
 	}
-	if renderDPI <= 0 {
-		renderDPI = 150
+
+	visionReader, err := generatingreading.NewTermiteGenerateReader(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create termite generate reader: %w", err)
 	}
+
 	return &OCRClient{
-		client:    client,
-		models:    models,
-		renderDPI: renderDPI,
+		readReader:   readReader,
+		visionReader: visionReader,
+		renderDPI:    cfg.RenderDPI,
 	}, nil
 }
 
@@ -95,38 +105,25 @@ func (o *OCRClient) ProcessPage(ctx context.Context, pdfData []byte, pageNum int
 		return extractedText, false, nil
 	}
 
-	// Render page to image using lib/pdf/render
-	renderer, err := render.NewRenderer(pdfData)
-	if err != nil {
-		return extractedText, false, fmt.Errorf("create renderer: %w", err)
-	}
-	defer renderer.Close()
-
-	pngBytes, err := renderer.RenderPageToPNG(pageNum, o.renderDPI)
+	page, err := generatingreading.RenderPDFPage(pdfData, pageNum, o.renderDPI)
 	if err != nil {
 		return extractedText, false, fmt.Errorf("render page: %w", err)
 	}
 
-	// Send to Termite for OCR
-	b64 := base64.StdEncoding.EncodeToString(pngBytes)
-	dataURI := "data:image/png;base64," + b64
+	results, err := o.readReader.ReadDetailed(ctx, []libai.BinaryContent{page}, &libreading.ReadOptions{
+		MaxTokens: 2048,
+	})
+	if err != nil {
+		return extractedText, false, err
+	}
+	if len(results) == 0 {
+		return extractedText, false, nil
+	}
 
-	for _, model := range o.models {
-		resp, err := o.client.ReadImagesWithResponse(ctx, oapi.ReadRequest{
-			Model:     model,
-			Images:    []oapi.ImageURL{{Url: dataURI}},
-			MaxTokens: 2048,
-		})
-		if err != nil {
-			continue // try next model
-		}
-		if resp.JSON200 != nil && len(resp.JSON200.Results) > 0 {
-			ocrText := resp.JSON200.Results[0].Text
-			if ocrText != "" && len(ocrText) > len(extractedText) {
-				o.lastUsedModel = model
-				return ocrText, true, nil
-			}
-		}
+	ocrText := results[0].Text
+	if ocrText != "" && len(ocrText) > len(extractedText) {
+		o.lastUsedModel = results[0].Model
+		return ocrText, true, nil
 	}
 
 	return extractedText, false, nil
@@ -141,36 +138,20 @@ func (o *OCRClient) LastUsedModel() string {
 // Returns (text, model_used, error). The page PDF is expected to be a single-page document
 // (as produced by split-pages mode).
 func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
-	renderer, err := render.NewRenderer(pdfData)
+	page, err := generatingreading.RenderPDFPage(pdfData, 1, o.renderDPI)
 	if err != nil {
 		return "", "", fmt.Errorf("create renderer: %w", err)
 	}
-	defer renderer.Close()
 
-	pngBytes, err := renderer.RenderPageToPNG(1, o.renderDPI)
+	results, err := o.readReader.ReadDetailed(ctx, []libai.BinaryContent{page}, &libreading.ReadOptions{
+		Prompt:    prompt,
+		MaxTokens: maxTokens,
+	})
 	if err != nil {
-		return "", "", fmt.Errorf("render page: %w", err)
+		return "", "", err
 	}
-
-	b64 := base64.StdEncoding.EncodeToString(pngBytes)
-	dataURI := "data:image/png;base64," + b64
-
-	for _, m := range o.models {
-		resp, err := o.client.ReadImagesWithResponse(ctx, oapi.ReadRequest{
-			Model:     m,
-			Prompt:    prompt,
-			Images:    []oapi.ImageURL{{Url: dataURI}},
-			MaxTokens: maxTokens,
-		})
-		if err != nil {
-			continue
-		}
-		if resp.JSON200 != nil && len(resp.JSON200.Results) > 0 {
-			text := resp.JSON200.Results[0].Text
-			if text != "" {
-				return text, m, nil
-			}
-		}
+	if len(results) > 0 && results[0].Text != "" {
+		return results[0].Text, results[0].Model, nil
 	}
 
 	return "", "", fmt.Errorf("all models failed to produce text")
@@ -180,62 +161,19 @@ func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prom
 // endpoint (e.g. Gemma 3 vision) instead of the reader endpoint. Used for vision captioning
 // of image pages. Returns (text, model_used, error).
 func (o *OCRClient) GeneratePageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
-	renderer, err := render.NewRenderer(pdfData)
+	page, err := generatingreading.RenderPDFPage(pdfData, 1, o.renderDPI)
 	if err != nil {
 		return "", "", fmt.Errorf("create renderer: %w", err)
 	}
-	defer renderer.Close()
-
-	pngBytes, err := renderer.RenderPageToPNG(1, o.renderDPI)
+	results, err := o.visionReader.ReadDetailed(ctx, []libai.BinaryContent{page}, &libreading.ReadOptions{
+		Prompt:    prompt,
+		MaxTokens: maxTokens,
+	})
 	if err != nil {
-		return "", "", fmt.Errorf("render page: %w", err)
+		return "", "", err
 	}
-
-	b64 := base64.StdEncoding.EncodeToString(pngBytes)
-	dataURI := "data:image/png;base64," + b64
-
-	// Build multimodal content parts: image + text prompt
-	var imgPart oapi.ContentPart
-	if err := imgPart.FromImageURLContentPart(oapi.ImageURLContentPart{
-		Type:     oapi.ImageURLContentPartTypeImageUrl,
-		ImageUrl: oapi.ImageURL{Url: dataURI},
-	}); err != nil {
-		return "", "", fmt.Errorf("build image content part: %w", err)
-	}
-
-	var txtPart oapi.ContentPart
-	if err := txtPart.FromTextContentPart(oapi.TextContentPart{
-		Type: oapi.TextContentPartTypeText,
-		Text: prompt,
-	}); err != nil {
-		return "", "", fmt.Errorf("build text content part: %w", err)
-	}
-
-	var content oapi.ChatMessageContent
-	if err := content.FromChatMessageContent1(oapi.ChatMessageContent1{imgPart, txtPart}); err != nil {
-		return "", "", fmt.Errorf("build chat message content: %w", err)
-	}
-
-	msg := oapi.ChatMessage{
-		Role:    oapi.RoleUser,
-		Content: content,
-	}
-
-	for _, m := range o.models {
-		resp, err := o.client.GenerateContentWithResponse(ctx, oapi.GenerateRequest{
-			Model:     m,
-			Messages:  []oapi.ChatMessage{msg},
-			MaxTokens: maxTokens,
-		})
-		if err != nil {
-			continue
-		}
-		if resp.JSON200 != nil && len(resp.JSON200.Choices) > 0 {
-			text := resp.JSON200.Choices[0].Message.Content
-			if text != "" {
-				return text, m, nil
-			}
-		}
+	if len(results) > 0 && results[0].Text != "" {
+		return results[0].Text, results[0].Model, nil
 	}
 
 	return "", "", fmt.Errorf("all models failed to produce text")
@@ -1884,9 +1822,11 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
-		Model:         chunkerModel,
-		TargetTokens:  targetTokens,
-		OverlapTokens: overlapTokens,
+		Model: chunkerModel,
+		Text: antfly.TextChunkOptions{
+			TargetTokens:  targetTokens,
+			OverlapTokens: overlapTokens,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure chunker: %w", err)
@@ -2926,14 +2866,14 @@ func enrichCmd(args []string) error {
 
 	// Process candidates concurrently
 	type enrichResult struct {
-		id         string
-		text       string
-		model      string
-		reasons    []string
-		category   string
-		origEmpty  bool // original content was empty
-		err        error
-		replaced   bool
+		id        string
+		text      string
+		model     string
+		reasons   []string
+		category  string
+		origEmpty bool // original content was empty
+		err       error
+		replaced  bool
 	}
 
 	candidateCh := make(chan enrichCandidate, len(candidates))

@@ -21,6 +21,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/vector"
+	"github.com/antflydb/antfly/lib/vector/testutils"
 	"github.com/antflydb/antfly/lib/vectorindex"
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store/db/indexes"
@@ -723,6 +725,10 @@ func TestBatch_CosineEmbeddingsIndexAcceptsNormalizedVectorsAcrossInternalSplits
 	})
 	require.NoError(t, indexManager.Register(indexName, false, *idxCfg))
 	require.NoError(t, indexManager.Start(false))
+	idx := db.indexManager.GetIndex(indexName)
+	require.NotNil(t, idx)
+	embIdx, ok := idx.(*indexes.EmbeddingIndex)
+	require.True(t, ok, "Index should be an EmbeddingIndex")
 
 	rng := rand.New(rand.NewPCG(42, 1024))
 	for start := 0; start < numVectors; start += batchSize {
@@ -754,34 +760,156 @@ func TestBatch_CosineEmbeddingsIndexAcceptsNormalizedVectorsAcrossInternalSplits
 		}
 	}
 
-	require.Eventually(t, func() bool {
-		_, _, indexStats, err := db.Stats()
-		if err != nil {
-			t.Logf("db.Stats error: %v", err)
-			return false
-		}
-		stats, ok := indexStats[indexName]
-		if !ok {
-			t.Logf("index stats for %s not available yet", indexName)
-			return false
-		}
-		embStats, err := stats.AsEmbeddingsIndexStats()
-		if err != nil {
-			t.Logf("embeddings stats decode error: %v", err)
-			return false
-		}
-		if embStats.TotalIndexed < uint64(numVectors) {
-			t.Logf("indexed %d/%d vectors", embStats.TotalIndexed, numVectors)
-			return false
-		}
-		return true
-	}, 60*time.Second, 100*time.Millisecond)
+	waitForEmbeddingIndexTotalIndexed(t, embIdx, numVectors, 60*time.Second, 100*time.Millisecond)
 
 	for _, key := range []string{"doc/00000", "doc/10000", "doc/19999"} {
 		doc, err := db.Get(context.Background(), []byte(key))
 		require.NoError(t, err)
 		require.NotNil(t, doc)
 	}
+}
+
+func TestVectorSearch_EndToEndRecall(t *testing.T) {
+	db, dir := setupTestDBWithFullTextAndEmbeddings(t, 20)
+	defer db.Close()
+	defer os.RemoveAll(dir)
+
+	const (
+		indexName     = "test_embedding_idx"
+		dataCount     = 900
+		queryCount    = 100
+		topK          = 10
+		minAvgRecall  = 0.95
+		waitTimeout   = 30 * time.Second
+		waitFrequency = 200 * time.Millisecond
+	)
+
+	ctx := context.Background()
+	dataset := testutils.LoadDataset(t, testutils.RandomDataset20d)
+	dataVectors := dataset.Slice(0, dataCount)
+	queryVectors := dataset.Slice(dataCount, queryCount)
+
+	writes := make([][2][]byte, 0, dataCount)
+	dataKeys := make([]string, 0, dataCount)
+	for i := range dataCount {
+		key := []byte(fmt.Sprintf("doc:%04d", i))
+		dataKeys = append(dataKeys, string(key))
+
+		docJSON, err := json.Marshal(map[string]any{
+			"content": fmt.Sprintf("document %d", i),
+			"_embeddings": map[string]any{
+				indexName: slices.Clone(dataVectors.At(i)),
+			},
+		})
+		require.NoError(t, err)
+		writes = append(writes, [2][]byte{key, docJSON})
+	}
+
+	err := db.Batch(ctx, writes, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	idx := db.indexManager.GetIndex(indexName)
+	require.NotNil(t, idx)
+	embIdx, ok := idx.(*indexes.EmbeddingIndex)
+	require.True(t, ok, "Index should be an EmbeddingIndex")
+
+	waitForEmbeddingIndexTotalIndexed(t, embIdx, dataCount, waitTimeout, waitFrequency)
+
+	avgRecall, err := calculateDBVectorRecall(
+		ctx,
+		db,
+		indexName,
+		queryVectors,
+		dataVectors,
+		dataKeys,
+		topK,
+	)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, avgRecall, minAvgRecall,
+		"expected average recall >= %.2f, got %.4f", minAvgRecall, avgRecall)
+}
+
+func calculateDBVectorRecall(
+	ctx context.Context,
+	db *DBImpl,
+	indexName string,
+	queryVectors *vector.Set,
+	dataVectors *vector.Set,
+	dataKeys []string,
+	topK int,
+) (float64, error) {
+	var recallSum float64
+
+	for i := range int(queryVectors.GetCount()) {
+		queryVec := slices.Clone(queryVectors.At(i))
+		reqBytes, err := json.Marshal(indexes.RemoteIndexSearchRequest{
+			Limit: topK,
+			VectorSearches: map[string]vector.T{
+				indexName: queryVec,
+			},
+		})
+		if err != nil {
+			return 0, fmt.Errorf("marshal vector search request %d: %w", i, err)
+		}
+
+		respBytes, err := db.Search(ctx, reqBytes)
+		if err != nil {
+			return 0, fmt.Errorf("search query %d: %w", i, err)
+		}
+
+		var result indexes.RemoteIndexSearchResult
+		if err := json.Unmarshal(respBytes, &result); err != nil {
+			return 0, fmt.Errorf("unmarshal vector search result %d: %w", i, err)
+		}
+
+		searchResult := result.VectorSearchResult[indexName]
+		if searchResult == nil {
+			return 0, fmt.Errorf("vector search result missing for index %q", indexName)
+		}
+		if len(searchResult.Hits) < topK {
+			return 0, fmt.Errorf("vector search returned %d hits, expected at least %d", len(searchResult.Hits), topK)
+		}
+
+		prediction := make([]string, 0, topK)
+		for _, hit := range searchResult.Hits[:topK] {
+			prediction = append(prediction, hit.ID)
+		}
+
+		truth := testutils.CalculateTruth(
+			topK,
+			vector.DistanceMetric_L2Squared,
+			queryVec,
+			dataVectors,
+			dataKeys,
+		)
+		recallSum += testutils.CalculateRecall(prediction, truth)
+	}
+
+	return recallSum / float64(queryVectors.GetCount()), nil
+}
+
+func waitForEmbeddingIndexTotalIndexed(
+	t *testing.T,
+	embIdx *indexes.EmbeddingIndex,
+	expected int,
+	timeout time.Duration,
+	frequency time.Duration,
+) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		stats, err := embIdx.Stats().AsEmbeddingsIndexStats()
+		if err != nil {
+			t.Logf("embedding stats error: %v", err)
+			return false
+		}
+		if stats.TotalIndexed < uint64(expected) {
+			t.Logf("waiting for vector index population: %d/%d", stats.TotalIndexed, expected)
+			return false
+		}
+		return true
+	}, timeout, frequency, "expected all vectors to be indexed before measuring recall")
 }
 
 func TestBatch_EmbeddingTypeConversions(t *testing.T) {

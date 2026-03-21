@@ -34,6 +34,13 @@ markdown_section:
       description: Document type (markdown_section)
       x-antfly-types:
         - keyword
+    entities:
+      type: array
+      description: Entity keys extracted by NER (when --ner-model is used)
+      items:
+        type: string
+      x-antfly-types:
+        - keyword
     metadata:
       type: object
       description: Additional metadata
@@ -85,6 +92,13 @@ mdx_section:
     _type:
       type: string
       description: Document type (mdx_section)
+      x-antfly-types:
+        - keyword
+    entities:
+      type: array
+      description: Entity keys extracted by NER (when --ner-model is used)
+      items:
+        type: string
       x-antfly-types:
         - keyword
     metadata:
@@ -235,6 +249,41 @@ openapi_path:
     - file_path
     - title
     - content
+    - _type
+
+# Schema for NER-extracted entities (used with knowledge graph index)
+entity:
+  type: object
+  x-antfly-include-in-all:
+    - name
+  properties:
+    id:
+      type: string
+      description: Normalized entity key (e.g., entity:technology:raft-consensus)
+      x-antfly-index: true
+    name:
+      type: string
+      description: Original entity text as extracted by NER
+      x-antfly-types:
+        - text
+        - keyword
+    label:
+      type: string
+      description: Entity type label (e.g., technology, concept, person)
+      x-antfly-types:
+        - keyword
+    _type:
+      type: string
+      description: Document type (entity)
+      x-antfly-types:
+        - keyword
+    mention_count:
+      type: integer
+      description: Number of document sections that mention this entity
+  required:
+    - id
+    - name
+    - label
     - _type
 
 # Schema for OpenAPI component schemas

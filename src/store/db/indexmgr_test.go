@@ -30,7 +30,9 @@ import (
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store/db/indexes"
+	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -40,6 +42,7 @@ import (
 // MockIndex implements the Index interface for testing
 type MockIndex struct {
 	name      string
+	indexType IndexType
 	batches   []batchCall
 	searches  []searchCall
 	closed    bool
@@ -56,6 +59,11 @@ type batchCall struct {
 type searchCall struct {
 	query any
 	err   error
+}
+
+type mockBackfillableIndex struct {
+	*MockIndex
+	backfillDone chan struct{}
 }
 
 func (m *MockIndex) Name() string {
@@ -109,6 +117,9 @@ func (m *MockIndex) Open(
 }
 
 func (m *MockIndex) Type() IndexType {
+	if m.indexType != "" {
+		return m.indexType
+	}
 	return indexes.IndexTypeFullTextV0
 }
 
@@ -127,6 +138,16 @@ func (m *MockIndex) Pause(ctx context.Context) error {
 func (m *MockIndex) Resume() {
 }
 
+func (m *mockBackfillableIndex) WaitForBackfill(ctx context.Context) {
+	if m.backfillDone == nil {
+		return
+	}
+	select {
+	case <-m.backfillDone:
+	case <-ctx.Done():
+	}
+}
+
 // Register a mock index type for testing
 func init() {
 	indexes.RegisterIndex(
@@ -135,6 +156,39 @@ func init() {
 			return &MockIndex{name: name}, nil
 		},
 	)
+}
+
+func TestIndexManagerWaitForNamedBackfills(t *testing.T) {
+	t.Parallel()
+
+	im := &IndexManager{
+		logger:  zaptest.NewLogger(t),
+		indexes: xsync.NewMapOf[string, Index](),
+	}
+
+	done := make(chan struct{})
+	im.indexes.Store("embedding_index", &mockBackfillableIndex{
+		MockIndex:    &MockIndex{name: "embedding_index"},
+		backfillDone: done,
+	})
+	im.indexes.Store("full_text_index", &mockBackfillableIndex{
+		MockIndex:    &MockIndex{name: "full_text_index"},
+		backfillDone: make(chan struct{}),
+	})
+
+	waitDone := make(chan struct{})
+	go func() {
+		im.WaitForNamedBackfills(context.Background(), []string{"embedding_index"})
+		close(waitDone)
+	}()
+
+	close(done)
+
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("WaitForNamedBackfills blocked on an unrelated index")
+	}
 }
 
 func TestNewIndexManager(t *testing.T) {
@@ -290,6 +344,75 @@ func TestIndexManager_Batch(t *testing.T) {
 
 	// Give some time for async processing
 	time.Sleep(100 * time.Millisecond)
+}
+
+func TestIndexManager_DeleteKeysRoutesByIndexType(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	tempDir := t.TempDir()
+
+	db, err := pebble.Open(filepath.Join(tempDir, "test.db"), pebbleutils.NewMemPebbleOpts())
+	require.NoError(t, err)
+	defer db.Close()
+
+	im, err := NewIndexManager(logger, nil, db, tempDir, &schema.TableSchema{}, types.Range{nil, nil}, nil)
+	require.NoError(t, err)
+
+	fullText := &MockIndex{name: "full_text_index", indexType: indexes.IndexTypeFullText}
+	embA := &MockIndex{name: "emb_a", indexType: indexes.IndexTypeEmbeddings}
+	embB := &MockIndex{name: "emb_b", indexType: indexes.IndexTypeEmbeddings}
+	graph := &MockIndex{name: "graph_idx", indexType: indexes.IndexTypeGraph}
+
+	im.indexes.Store(fullText.name, fullText)
+	im.indexes.Store(embA.name, embA)
+	im.indexes.Store(embB.name, embB)
+	im.indexes.Store(graph.name, graph)
+
+	docKey := []byte("doc1")
+	chunkA := storeutils.MakeChunkKey(docKey, embA.name, 0)
+	chunkB := storeutils.MakeChunkKey(docKey, embB.name, 1)
+	edge := storeutils.MakeEdgeKey([]byte("doc1"), []byte("doc2"), graph.name, "rel")
+
+	require.NoError(t, im.DeleteKeys(t.Context(), [][]byte{
+		docKey,
+		chunkA,
+		chunkB,
+		edge,
+		docKey, // duplicate should be deduped
+	}))
+
+	require.Len(t, fullText.batches, 1)
+	require.Equal(t, [][]byte{docKey}, fullText.batches[0].deletes)
+
+	require.Len(t, embA.batches, 1)
+	require.Equal(t, [][]byte{docKey, chunkA}, embA.batches[0].deletes)
+
+	require.Len(t, embB.batches, 1)
+	require.Equal(t, [][]byte{docKey, chunkB}, embB.batches[0].deletes)
+
+	require.Len(t, graph.batches, 1)
+	require.Equal(t, [][]byte{edge}, graph.batches[0].deletes)
+}
+
+func TestIndexManager_DeleteKeysRoutesChunkDeletesWithIndexMarkerInDocKey(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	tempDir := t.TempDir()
+
+	db, err := pebble.Open(filepath.Join(tempDir, "test.db"), pebbleutils.NewMemPebbleOpts())
+	require.NoError(t, err)
+	defer db.Close()
+
+	im, err := NewIndexManager(logger, nil, db, tempDir, &schema.TableSchema{}, types.Range{nil, nil}, nil)
+	require.NoError(t, err)
+
+	emb := &MockIndex{name: "emb_a", indexType: indexes.IndexTypeEmbeddings}
+	im.indexes.Store(emb.name, emb)
+
+	docKey := []byte("tenant:i:42")
+	chunkKey := storeutils.MakeChunkKey(docKey, emb.name, 0)
+
+	require.NoError(t, im.DeleteKeys(t.Context(), [][]byte{docKey, chunkKey}))
+	require.Len(t, emb.batches, 1)
+	require.Equal(t, [][]byte{docKey, chunkKey}, emb.batches[0].deletes)
 }
 
 func TestIndexManager_Search(t *testing.T) {

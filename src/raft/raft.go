@@ -126,6 +126,10 @@ type raftNode struct {
 	snapCount uint64
 	transport Transport
 	stopc     chan struct{} // signals proposal channel closed
+	stopOnce  sync.Once
+
+	serveCtxMu     sync.Mutex
+	serveCtxCancel context.CancelFunc
 
 	logger *zap.Logger
 }
@@ -146,6 +150,7 @@ type RaftNode interface {
 	TransferLeadership(ctx context.Context, target types.ID)
 	IsIDRemoved(id uint64) bool
 	SetLeaderFactory(f func(ctx context.Context) error)
+	Shutdown()
 	// GetConfChangeCallback returns the channel for a registered conf change callback.
 	// Returns nil if no callback is registered for the given ID.
 	GetConfChangeCallback(id uuid.UUID) <-chan struct{}
@@ -157,6 +162,10 @@ func (r *raftNode) SetLeaderFactory(f func(ctx context.Context) error) {
 	if r.isLeader {
 		r.startLeader()
 	}
+}
+
+func (r *raftNode) Shutdown() {
+	r.requestStop()
 }
 
 // GetConfChangeCallback returns the channel for a registered conf change callback.
@@ -753,6 +762,20 @@ func (rc *raftNode) stop() {
 	rc.logger.Info("Closed raft log storage")
 }
 
+func (rc *raftNode) requestStop() {
+	rc.stopOnce.Do(func() {
+		rc.serveCtxMu.Lock()
+		cancel := rc.serveCtxCancel
+		rc.serveCtxCancel = nil
+		rc.serveCtxMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		close(rc.stopc)
+		rc.stop()
+	})
+}
+
 func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	if raft.IsEmptySnap(snapshotToSave) {
 		return
@@ -962,6 +985,11 @@ func (rc *raftNode) TransferLeadership(ctx context.Context, target types.ID) {
 var ErrRemoved = errors.New("ID removed from Raft group")
 
 func (rc *raftNode) serveChannels(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	rc.serveCtxMu.Lock()
+	rc.serveCtxCancel = cancel
+	rc.serveCtxMu.Unlock()
+
 	// Load the latest snapshot metadata from storage
 	snap, err := rc.raftLogStorage.Snapshot()
 	if err != nil && !errors.Is(err, raft.ErrSnapshotTemporarilyUnavailable) &&
@@ -986,12 +1014,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 	rc.logger.Info("Initialized from snapshot", zap.Uint64("index", rc.snapshotIndex.Load()))
 	ticker := rc.clock.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-
-	stop := sync.OnceFunc(func() {
-		close(rc.stopc)
-		rc.stop()
-	})
-	defer stop()
+	defer rc.requestStop()
 	// send proposals over raft
 	go func() {
 		confChangeCount := uint64(0)
@@ -1074,7 +1097,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 		}
 		// client closed channel; shutdown raft if not already
 		rc.logger.Info("Closing stop channel for Raft")
-		stop()
+		rc.requestStop()
 	}()
 
 	defer close(rc.commitC)
@@ -1087,7 +1110,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			defer stop()
+			defer rc.requestStop()
 			for {
 				select {
 				case msg := <-toAppend:
@@ -1146,7 +1169,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 		// apply thread
 		go func() {
 			defer wg.Done()
-			defer stop()
+			defer rc.requestStop()
 			for {
 				select {
 				case msg := <-toApply:

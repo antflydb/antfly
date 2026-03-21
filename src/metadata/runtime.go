@@ -157,12 +157,13 @@ func NewRuntime(
 	storeOps := NewMetadataStoreOperations(node)
 
 	reconcilerConfig := reconciler.ReconciliationConfig{
-		ReplicationFactor:   config.ReplicationFactor,
-		MaxShardSizeBytes:   config.MaxShardSizeBytes,
-		MaxShardsPerTable:   config.MaxShardsPerTable,
-		DisableShardAlloc:   config.DisableShardAlloc,
-		ShardCooldownPeriod: config.ShardCooldownPeriod,
-		SplitTimeout:        config.SplitTimeout,
+		ReplicationFactor:        config.ReplicationFactor,
+		MaxShardSizeBytes:        config.MaxShardSizeBytes,
+		MaxShardsPerTable:        config.MaxShardsPerTable,
+		DisableShardAlloc:        config.DisableShardAlloc,
+		ShardCooldownPeriod:      config.ShardCooldownPeriod,
+		SplitTimeout:             config.SplitTimeout,
+		SplitFinalizeGracePeriod: config.SplitFinalizeGracePeriod,
 	}
 
 	node.reconciler = reconciler.NewReconciler(

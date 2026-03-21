@@ -8,6 +8,7 @@ replace (
 	github.com/antflydb/antfly/pkg/docsaf => ../pkg/docsaf
 	github.com/antflydb/antfly/pkg/evalaf => ../pkg/evalaf
 	github.com/antflydb/antfly/pkg/evalaf/plugins/antfly => ../pkg/evalaf/plugins/antfly
+	github.com/antflydb/antfly/pkg/generating => ../pkg/generating
 	github.com/antflydb/antfly/pkg/genkit/openrouter => ../pkg/genkit/openrouter
 	github.com/antflydb/antfly/pkg/libaf => ../pkg/libaf
 	github.com/antflydb/termite => ../termite
@@ -27,11 +28,11 @@ replace (
 )
 
 require (
-	github.com/antflydb/antfly v0.0.16
-	github.com/antflydb/antfly/pkg/client v0.0.0
+	github.com/antflydb/antfly v0.1.0
+	github.com/antflydb/antfly/pkg/client v0.0.1
 	github.com/antflydb/antfly/pkg/docsaf v0.0.0-00010101000000-000000000000
 	github.com/antflydb/antfly/pkg/libaf v0.0.1
-	github.com/antflydb/termite v0.0.7
+	github.com/antflydb/termite v0.0.10
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/johannesboyne/gofakes3 v0.0.0-20260208201424-4c385a1f6a73
 	github.com/minio/minio-go/v7 v7.0.99
@@ -57,11 +58,11 @@ require (
 	git.sr.ht/~sbinet/gg v0.7.0 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect
 	github.com/Masterminds/semver v1.5.0 // indirect
-	github.com/PuerkitoBio/goquery v1.11.0 // indirect
+	github.com/PuerkitoBio/goquery v1.12.0 // indirect
 	github.com/RaduBerinde/axisds v0.1.0 // indirect
 	github.com/RaduBerinde/btreemap v0.0.0-20260105202824-d3184786f603 // indirect
-	github.com/RoaringBitmap/roaring/v2 v2.15.0 // indirect
-	github.com/a2aproject/a2a-go v0.3.9 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.16.0 // indirect
+	github.com/a2aproject/a2a-go v0.3.12 // indirect
 	github.com/ajroetker/go-highway v0.0.12 // indirect
 	github.com/ajroetker/go-jpeg2000 v0.0.2 // indirect
 	github.com/ajroetker/pdf v0.0.1-antfly001 // indirect
@@ -73,8 +74,9 @@ require (
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
 	github.com/antflydb/antfly/pkg/evalaf v0.0.0 // indirect
-	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0-20260313151000-3c73f35767a3 // indirect
-	github.com/antflydb/termite/pkg/client v0.0.0-20260314031946-6e50e4c79451 // indirect
+	github.com/antflydb/antfly/pkg/generating v0.0.0 // indirect
+	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0 // indirect
+	github.com/antflydb/termite/pkg/client v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.4 // indirect
@@ -116,9 +118,9 @@ require (
 	github.com/blevesearch/zapx/v14 v14.4.3 // indirect
 	github.com/blevesearch/zapx/v15 v15.4.3 // indirect
 	github.com/blevesearch/zapx/v16 v16.3.1 // indirect
-	github.com/blevesearch/zapx/v17 v17.0.3-0.20260311100439-7e7434b4f844 // indirect
+	github.com/blevesearch/zapx/v17 v17.0.4 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
-	github.com/buger/jsonparser v1.1.1 // indirect
+	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/casbin/casbin/v3 v3.10.0 // indirect
 	github.com/casbin/govaluate v1.10.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -138,7 +140,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/eliben/go-sentencepiece v0.7.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/firebase/genkit/go v1.4.0 // indirect
+	github.com/firebase/genkit/go v1.5.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/getkin/kin-openapi v0.133.0 // indirect
 	github.com/getsentry/sentry-go v0.43.0 // indirect
@@ -165,7 +167,7 @@ require (
 	github.com/gomlx/go-coreml v0.0.0-20260301010621-8fdf6ad8655e // indirect
 	github.com/gomlx/go-coreml/gomlx v0.0.0-20260301010621-8fdf6ad8655e // indirect
 	github.com/gomlx/go-huggingface v0.3.3-0.20260316090437-1a6ca7ca09c4 // indirect
-	github.com/gomlx/go-xla v0.2.0 // indirect
+	github.com/gomlx/go-xla v0.2.1 // indirect
 	github.com/gomlx/gomlx v0.26.1-0.20260220075116-8da82ca8aaad // indirect
 	github.com/gomlx/onnx-gomlx v0.3.5-0.20260130173634-2497f2c7652f // indirect
 	github.com/google/dotprompt/go v0.0.0-20260227225921-0911cf9ecf0e // indirect
@@ -174,7 +176,7 @@ require (
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.14 // indirect
-	github.com/googleapis/gax-go/v2 v2.18.0 // indirect
+	github.com/googleapis/gax-go/v2 v2.19.0 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/hajimehoshi/go-mp3 v0.3.4 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
@@ -193,10 +195,10 @@ require (
 	github.com/kamstrup/intmap v0.5.2 // indirect
 	github.com/kaptinlin/go-i18n v0.2.12 // indirect
 	github.com/kaptinlin/jsonpointer v0.4.17 // indirect
-	github.com/kaptinlin/jsonschema v0.7.5 // indirect
+	github.com/kaptinlin/jsonschema v0.7.6 // indirect
 	github.com/kaptinlin/messageformat-go v0.4.18 // indirect
 	github.com/kennygrant/sanitize v1.2.4 // indirect
-	github.com/klauspost/compress v1.18.4 // indirect
+	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/knights-analytics/ortgenai v0.1.0 // indirect
@@ -204,7 +206,7 @@ require (
 	github.com/kovidgoyal/imaging v1.8.20 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
-	github.com/mailru/easyjson v0.9.1 // indirect
+	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/mbleigh/raymond v0.0.0-20250414171441-6b3a58ab9e0a // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
@@ -217,14 +219,14 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nikolalohinski/gonja/v2 v2.7.0 // indirect
 	github.com/nlnwa/whatwg-url v0.6.2 // indirect
-	github.com/oapi-codegen/runtime v1.2.0 // indirect
+	github.com/oapi-codegen/runtime v1.3.0 // indirect
 	github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037 // indirect
 	github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90 // indirect
-	github.com/ollama/ollama v0.18.0 // indirect
+	github.com/ollama/ollama v0.18.2 // indirect
 	github.com/openai/openai-go v1.12.0 // indirect
-	github.com/panjf2000/ants/v2 v2.11.6 // indirect
-	github.com/pb33f/jsonpath v0.8.1 // indirect
-	github.com/pb33f/libopenapi v0.34.2 // indirect
+	github.com/panjf2000/ants/v2 v2.12.0 // indirect
+	github.com/pb33f/jsonpath v0.8.2 // indirect
+	github.com/pb33f/libopenapi v0.34.3 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.0 // indirect
 	github.com/pdfcpu/pdfcpu v0.11.1 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
@@ -249,7 +251,7 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
-	github.com/sirupsen/logrus v1.9.4-0.20230606125235-dd1b4c2e81af // indirect
+	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
@@ -273,7 +275,7 @@ require (
 	github.com/xiang90/probing v0.0.0-20221125231312-a49e3df8f510 // indirect
 	github.com/yalue/onnxruntime_go v1.27.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	github.com/yuin/goldmark v1.7.16 // indirect
+	github.com/yuin/goldmark v1.7.17 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
 	go.etcd.io/raft/v3 v3.6.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
@@ -299,13 +301,13 @@ require (
 	golang.org/x/tools v0.43.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
 	gonum.org/v1/plot v0.16.0 // indirect
-	google.golang.org/api v0.271.0 // indirect
+	google.golang.org/api v0.272.0 // indirect
 	google.golang.org/appengine v1.6.8 // indirect
-	google.golang.org/genai v1.50.0 // indirect
-	google.golang.org/genproto v0.0.0-20260311181403-84a4fc48630c // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260311181403-84a4fc48630c // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260311181403-84a4fc48630c // indirect
-	google.golang.org/grpc v1.79.2 // indirect
+	google.golang.org/genai v1.51.0 // indirect
+	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260319201613-d00831a3d3e7 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260319201613-d00831a3d3e7 // indirect
+	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -17,16 +16,8 @@ import (
 	"strings"
 
 	externalRef0 "github.com/antflydb/antfly/lib/websearch"
+	externalRef1 "github.com/antflydb/antfly/pkg/generating"
 	"github.com/getkin/kin-openapi/openapi3"
-	"github.com/oapi-codegen/runtime"
-)
-
-// Defines values for ChainCondition.
-const (
-	ChainConditionAlways      ChainCondition = "always"
-	ChainConditionOnError     ChainCondition = "on_error"
-	ChainConditionOnRateLimit ChainCondition = "on_rate_limit"
-	ChainConditionOnTimeout   ChainCondition = "on_timeout"
 )
 
 // Defines values for ChatMessageRole.
@@ -64,20 +55,6 @@ const (
 	FilterSpecOperatorRange    FilterSpecOperator = "range"
 )
 
-// Defines values for GeneratorProvider.
-const (
-	GeneratorProviderAnthropic  GeneratorProvider = "anthropic"
-	GeneratorProviderBedrock    GeneratorProvider = "bedrock"
-	GeneratorProviderCohere     GeneratorProvider = "cohere"
-	GeneratorProviderGemini     GeneratorProvider = "gemini"
-	GeneratorProviderMock       GeneratorProvider = "mock"
-	GeneratorProviderOllama     GeneratorProvider = "ollama"
-	GeneratorProviderOpenai     GeneratorProvider = "openai"
-	GeneratorProviderOpenrouter GeneratorProvider = "openrouter"
-	GeneratorProviderTermite    GeneratorProvider = "termite"
-	GeneratorProviderVertex     GeneratorProvider = "vertex"
-)
-
 // Defines values for QueryStrategy.
 const (
 	QueryStrategyDecompose QueryStrategy = "decompose"
@@ -98,245 +75,15 @@ const (
 	SemanticQueryModeRewrite      SemanticQueryMode = "rewrite"
 )
 
-// AnthropicGeneratorConfig Configuration for the Anthropic generative AI provider (Claude models).
-//
-// API key via `api_key` field or `ANTHROPIC_API_KEY` environment variable.
-//
-// **Example Models:** claude-sonnet-4-5-20250929 (default), claude-opus-4-5-20251101, claude-3-5-haiku-20241022
-//
-// **Docs:** https://docs.anthropic.com/en/docs/about-claude/models/overview
-type AnthropicGeneratorConfig struct {
-	// ApiKey The Anthropic API key. If not provided, falls back to ANTHROPIC_API_KEY environment variable.
-	ApiKey *string `json:"api_key,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate in the response.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The full model ID of the Anthropic model to use (e.g., 'claude-sonnet-4-5-20250929', 'claude-opus-4-5-20251101').
-	Model string `json:"model"`
-
-	// Temperature Controls randomness in generation (0.0-1.0). Higher values make output more random.
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// TopK Top-k sampling parameter. Only sample from the top K options for each subsequent token.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-	TopP *float32 `json:"top_p,omitempty"`
-
-	// Url The URL of the Anthropic API endpoint (optional, uses default if not specified).
-	Url *string `json:"url,omitempty"`
-}
-
-// BedrockGeneratorConfig Configuration for the AWS Bedrock generative AI provider.
-//
-// Provides access to models from Anthropic, Meta, Amazon, Cohere, Mistral, and others.
-//
-// **Example Models:** anthropic.claude-sonnet-4-5-20250929-v1:0, meta.llama3-3-70b-instruct-v1:0, amazon.nova-pro-v1:0
-//
-// **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-type BedrockGeneratorConfig struct {
-	// MaxTokens Maximum number of tokens to generate.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The Bedrock model ID to use (e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0').
-	Model string `json:"model"`
-
-	// Region The AWS region for the Bedrock service.
-	Region *string `json:"region,omitempty"`
-
-	// Temperature Controls randomness in generation (0.0-1.0).
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// TopK Top-k sampling parameter.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter.
-	TopP *float32 `json:"top_p,omitempty"`
-}
-
 // ChainCondition Condition for trying the next generator in chain:
 // - always: Always try next regardless of outcome
 // - on_error: Try next on any error (default)
 // - on_timeout: Try next only on timeout errors
 // - on_rate_limit: Try next only on rate limit errors
-type ChainCondition string
+type ChainCondition = externalRef1.ChainCondition
 
 // ChainLink A single link in a generator chain with optional retry and condition
-type ChainLink struct {
-	// Condition Condition for trying the next generator in chain:
-	// - always: Always try next regardless of outcome
-	// - on_error: Try next on any error (default)
-	// - on_timeout: Try next only on timeout errors
-	// - on_rate_limit: Try next only on rate limit errors
-	Condition *ChainCondition `json:"condition,omitempty"`
-
-	// Generator A unified configuration for a generative AI provider.
-	//
-	// Generators can be configured with custom prompts using templates. Templates use
-	// Handlebars syntax and support various built-in helpers for formatting and data manipulation.
-	//
-	// **Template System:**
-	// - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-	// - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-	// - **Context**: Templates receive the full context data passed to the generator
-	//
-	// **Built-in Helpers:**
-	//
-	// 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-	//    ```handlebars
-	//    {{scrubHtml html_content}}
-	//    ```
-	//    - Removes `<script>` and `<style>` tags
-	//    - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-	//    - Returns plain text with preserved readability
-	//    - Useful for cleaning web content before summarization
-	//
-	// 2. **eq** - Equality comparison for conditionals
-	//    ```handlebars
-	//    {{#if (eq status "active")}}Active{{/if}}
-	//    {{#if (eq @key "special")}}Special field{{/if}}
-	//    ```
-	//    - Use in `{{#if}}` blocks for conditional logic
-	//    - Compares any two values for equality
-	//
-	// 3. **media** - GenKit dotprompt media directive for multimodal content
-	//    ```handlebars
-	//    {{media url=imageDataURI}}
-	//    {{media url=this.image_url}}
-	//    {{media url="https://example.com/image.jpg"}}
-	//    {{media url="s3://endpoint/bucket/image.png"}}
-	//    {{media url="file:///path/to/image.jpg"}}
-	//    ```
-	//
-	//    **Supported URL Schemes:**
-	//    - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-	//    - `http://` / `https://` - Web URLs with automatic content type detection
-	//    - `file://` - Local filesystem paths
-	//    - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-	//
-	//    **Automatic Content Processing:**
-	//    - **Images**: Downloaded, resized (if needed), converted to data URIs
-	//    - **PDFs**: Text extracted or first page rendered as image
-	//    - **HTML**: Readable text extracted using Mozilla Readability
-	//
-	//    **Security Controls:**
-	//    Downloads are protected by content security settings (see Configuration Reference):
-	//    - Allowed host whitelist
-	//    - Private IP blocking (prevents SSRF attacks)
-	//    - Download size limits (default: 100MB)
-	//    - Download timeouts (default: 30s)
-	//    - Image dimension limits (default: 2048px, auto-resized)
-	//
-	//    See: https://antfly.io/docs/configuration#security--cors
-	//
-	// 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-	//    ```handlebars
-	//    {{encodeToon this.fields}}
-	//    {{encodeToon this.fields lengthMarker=false indent=4}}
-	//    {{encodeToon this.fields delimiter="\t"}}
-	//    ```
-	//
-	//    **What is TOON?**
-	//    TOON is a compact, human-readable format designed for passing structured data to LLMs.
-	//    It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-	//    comprehension accuracy.
-	//
-	//    **Key Features:**
-	//    - Compact syntax using `:` for key-value pairs
-	//    - Array length markers: `tags[#3]: ai,search,ml`
-	//    - Tabular format for uniform data structures
-	//    - Optimized for LLM parsing and understanding
-	//    - Maintains human readability
-	//
-	//    **Benefits:**
-	//    - **Lower API costs** - Reduced token usage means lower LLM API costs
-	//    - **Faster responses** - Less tokens to process
-	//    - **More context** - Fit more documents within token limits
-	//
-	//    **Options:**
-	//    - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-	//    - `indent` (int): Indentation spacing for nested objects (default: 2)
-	//    - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-	//
-	//    **Example output:**
-	//    ```
-	//    title: Introduction to Vector Search
-	//    author: Jane Doe
-	//    tags[#3]: ai,search,ml
-	//    metadata:
-	//      edition: 2
-	//      pages: 450
-	//    ```
-	//
-	//    **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-	//
-	//    **References:**
-	//    - TOON Specification: https://github.com/toon-format/toon
-	//    - Go Implementation: https://github.com/alpkeskin/gotoon
-	//
-	// **Template Examples:**
-	//
-	// RAG summarization with document references:
-	// ```handlebars
-	// Based on these documents, provide a comprehensive summary:
-	//
-	// {{#each documents}}
-	// Document {{this.id}}:
-	// {{scrubHtml this.content}}
-	//
-	// {{/each}}
-	//
-	// Valid document IDs: {{#each documents}}{{this.id}}{{#unless @last}}, {{/unless}}{{/each}}
-	// ```
-	//
-	// Conditional formatting:
-	// ```handlebars
-	// {{#if system_prompt}}System: {{system_prompt}}{{/if}}
-	//
-	// User Query: {{query}}
-	//
-	// {{#if context}}
-	// Context:
-	// {{#each context}}
-	// - {{this}}
-	// {{/each}}
-	// {{/if}}
-	// ```
-	//
-	// Multimodal prompt with images:
-	// ```handlebars
-	// Analyze this image:
-	// {{media url=image_url}}
-	//
-	// Focus on: {{focus_area}}
-	// ```
-	//
-	// Structured data encoding:
-	// ```handlebars
-	// User Profile:
-	// {{encodeToon user_data indent=2 lengthMarker=true}}
-	//
-	// Please analyze this profile.
-	// ```
-	//
-	// **Common Use Cases:**
-	// - **RAG (Retrieval-Augmented Generation)**: Format retrieved documents with citations
-	// - **Summarization**: Clean HTML content and structure summaries
-	// - **Query Classification**: Format queries with metadata for better classification
-	// - **Multimodal**: Include images/audio/video in prompts
-	// - **Data Formatting**: Convert structured data to readable text
-	//
-	// **Best Practices:**
-	// - Keep templates simple - complex logic belongs in application code
-	// - Use clear, descriptive field names in context
-	// - Handle missing fields gracefully (templates use "missingkey=zero" by default)
-	// - Test templates with representative data before production use
-	Generator GeneratorConfig `json:"generator"`
-
-	// Retry Retry configuration for generator calls
-	Retry *RetryConfig `json:"retry,omitempty"`
-}
+type ChainLink = externalRef1.ChainLink
 
 // ChatMessage A message in the conversation history
 type ChatMessage struct {
@@ -471,166 +218,6 @@ type ClassificationStepConfig struct {
 	ForceStrategy *QueryStrategy `json:"force_strategy,omitempty"`
 
 	// Generator A unified configuration for a generative AI provider.
-	//
-	// Generators can be configured with custom prompts using templates. Templates use
-	// Handlebars syntax and support various built-in helpers for formatting and data manipulation.
-	//
-	// **Template System:**
-	// - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-	// - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-	// - **Context**: Templates receive the full context data passed to the generator
-	//
-	// **Built-in Helpers:**
-	//
-	// 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-	//    ```handlebars
-	//    {{scrubHtml html_content}}
-	//    ```
-	//    - Removes `<script>` and `<style>` tags
-	//    - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-	//    - Returns plain text with preserved readability
-	//    - Useful for cleaning web content before summarization
-	//
-	// 2. **eq** - Equality comparison for conditionals
-	//    ```handlebars
-	//    {{#if (eq status "active")}}Active{{/if}}
-	//    {{#if (eq @key "special")}}Special field{{/if}}
-	//    ```
-	//    - Use in `{{#if}}` blocks for conditional logic
-	//    - Compares any two values for equality
-	//
-	// 3. **media** - GenKit dotprompt media directive for multimodal content
-	//    ```handlebars
-	//    {{media url=imageDataURI}}
-	//    {{media url=this.image_url}}
-	//    {{media url="https://example.com/image.jpg"}}
-	//    {{media url="s3://endpoint/bucket/image.png"}}
-	//    {{media url="file:///path/to/image.jpg"}}
-	//    ```
-	//
-	//    **Supported URL Schemes:**
-	//    - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-	//    - `http://` / `https://` - Web URLs with automatic content type detection
-	//    - `file://` - Local filesystem paths
-	//    - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-	//
-	//    **Automatic Content Processing:**
-	//    - **Images**: Downloaded, resized (if needed), converted to data URIs
-	//    - **PDFs**: Text extracted or first page rendered as image
-	//    - **HTML**: Readable text extracted using Mozilla Readability
-	//
-	//    **Security Controls:**
-	//    Downloads are protected by content security settings (see Configuration Reference):
-	//    - Allowed host whitelist
-	//    - Private IP blocking (prevents SSRF attacks)
-	//    - Download size limits (default: 100MB)
-	//    - Download timeouts (default: 30s)
-	//    - Image dimension limits (default: 2048px, auto-resized)
-	//
-	//    See: https://antfly.io/docs/configuration#security--cors
-	//
-	// 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-	//    ```handlebars
-	//    {{encodeToon this.fields}}
-	//    {{encodeToon this.fields lengthMarker=false indent=4}}
-	//    {{encodeToon this.fields delimiter="\t"}}
-	//    ```
-	//
-	//    **What is TOON?**
-	//    TOON is a compact, human-readable format designed for passing structured data to LLMs.
-	//    It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-	//    comprehension accuracy.
-	//
-	//    **Key Features:**
-	//    - Compact syntax using `:` for key-value pairs
-	//    - Array length markers: `tags[#3]: ai,search,ml`
-	//    - Tabular format for uniform data structures
-	//    - Optimized for LLM parsing and understanding
-	//    - Maintains human readability
-	//
-	//    **Benefits:**
-	//    - **Lower API costs** - Reduced token usage means lower LLM API costs
-	//    - **Faster responses** - Less tokens to process
-	//    - **More context** - Fit more documents within token limits
-	//
-	//    **Options:**
-	//    - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-	//    - `indent` (int): Indentation spacing for nested objects (default: 2)
-	//    - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-	//
-	//    **Example output:**
-	//    ```
-	//    title: Introduction to Vector Search
-	//    author: Jane Doe
-	//    tags[#3]: ai,search,ml
-	//    metadata:
-	//      edition: 2
-	//      pages: 450
-	//    ```
-	//
-	//    **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-	//
-	//    **References:**
-	//    - TOON Specification: https://github.com/toon-format/toon
-	//    - Go Implementation: https://github.com/alpkeskin/gotoon
-	//
-	// **Template Examples:**
-	//
-	// RAG summarization with document references:
-	// ```handlebars
-	// Based on these documents, provide a comprehensive summary:
-	//
-	// {{#each documents}}
-	// Document {{this.id}}:
-	// {{scrubHtml this.content}}
-	//
-	// {{/each}}
-	//
-	// Valid document IDs: {{#each documents}}{{this.id}}{{#unless @last}}, {{/unless}}{{/each}}
-	// ```
-	//
-	// Conditional formatting:
-	// ```handlebars
-	// {{#if system_prompt}}System: {{system_prompt}}{{/if}}
-	//
-	// User Query: {{query}}
-	//
-	// {{#if context}}
-	// Context:
-	// {{#each context}}
-	// - {{this}}
-	// {{/each}}
-	// {{/if}}
-	// ```
-	//
-	// Multimodal prompt with images:
-	// ```handlebars
-	// Analyze this image:
-	// {{media url=image_url}}
-	//
-	// Focus on: {{focus_area}}
-	// ```
-	//
-	// Structured data encoding:
-	// ```handlebars
-	// User Profile:
-	// {{encodeToon user_data indent=2 lengthMarker=true}}
-	//
-	// Please analyze this profile.
-	// ```
-	//
-	// **Common Use Cases:**
-	// - **RAG (Retrieval-Augmented Generation)**: Format retrieved documents with citations
-	// - **Summarization**: Clean HTML content and structure summaries
-	// - **Query Classification**: Format queries with metadata for better classification
-	// - **Multimodal**: Include images/audio/video in prompts
-	// - **Data Formatting**: Convert structured data to readable text
-	//
-	// **Best Practices:**
-	// - Keep templates simple - complex logic belongs in application code
-	// - Use clear, descriptive field names in context
-	// - Handle missing fields gracefully (templates use "missingkey=zero" by default)
-	// - Test templates with representative data before production use
 	Generator *GeneratorConfig `json:"generator,omitempty"`
 
 	// MultiPhraseCount Number of alternative query phrasings to generate
@@ -679,39 +266,6 @@ type ClassificationTransformationResult struct {
 	SubQuestions []string `json:"sub_questions,omitempty"`
 }
 
-// CohereGeneratorConfig Configuration for the Cohere generative AI provider (Command models).
-//
-// API key via `api_key` field or `COHERE_API_KEY` environment variable.
-//
-// **Example Models:** command-r-plus (default), command-r, command-a-03-2025
-//
-// **Docs:** https://docs.cohere.com/reference/chat
-type CohereGeneratorConfig struct {
-	// ApiKey The Cohere API key. If not provided, falls back to COHERE_API_KEY environment variable.
-	ApiKey *string `json:"api_key,omitempty"`
-
-	// FrequencyPenalty Penalty for token frequency (0.0-1.0).
-	FrequencyPenalty *float32 `json:"frequency_penalty,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate in the response.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The name of the Cohere model to use.
-	Model string `json:"model"`
-
-	// PresencePenalty Penalty for token presence (0.0-1.0).
-	PresencePenalty *float32 `json:"presence_penalty,omitempty"`
-
-	// Temperature Controls randomness in generation (0.0-1.0). Higher values make output more random.
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// TopK Top-k sampling parameter. Only sample from the top K options for each subsequent token.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-	TopP *float32 `json:"top_p,omitempty"`
-}
-
 // ConfidenceStepConfig Configuration for confidence assessment. Evaluates answer quality and
 // resource relevance. Can use a model calibrated for scoring tasks.
 type ConfidenceStepConfig struct {
@@ -725,166 +279,6 @@ type ConfidenceStepConfig struct {
 	Enabled *bool `json:"enabled,omitempty"`
 
 	// Generator A unified configuration for a generative AI provider.
-	//
-	// Generators can be configured with custom prompts using templates. Templates use
-	// Handlebars syntax and support various built-in helpers for formatting and data manipulation.
-	//
-	// **Template System:**
-	// - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-	// - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-	// - **Context**: Templates receive the full context data passed to the generator
-	//
-	// **Built-in Helpers:**
-	//
-	// 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-	//    ```handlebars
-	//    {{scrubHtml html_content}}
-	//    ```
-	//    - Removes `<script>` and `<style>` tags
-	//    - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-	//    - Returns plain text with preserved readability
-	//    - Useful for cleaning web content before summarization
-	//
-	// 2. **eq** - Equality comparison for conditionals
-	//    ```handlebars
-	//    {{#if (eq status "active")}}Active{{/if}}
-	//    {{#if (eq @key "special")}}Special field{{/if}}
-	//    ```
-	//    - Use in `{{#if}}` blocks for conditional logic
-	//    - Compares any two values for equality
-	//
-	// 3. **media** - GenKit dotprompt media directive for multimodal content
-	//    ```handlebars
-	//    {{media url=imageDataURI}}
-	//    {{media url=this.image_url}}
-	//    {{media url="https://example.com/image.jpg"}}
-	//    {{media url="s3://endpoint/bucket/image.png"}}
-	//    {{media url="file:///path/to/image.jpg"}}
-	//    ```
-	//
-	//    **Supported URL Schemes:**
-	//    - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-	//    - `http://` / `https://` - Web URLs with automatic content type detection
-	//    - `file://` - Local filesystem paths
-	//    - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-	//
-	//    **Automatic Content Processing:**
-	//    - **Images**: Downloaded, resized (if needed), converted to data URIs
-	//    - **PDFs**: Text extracted or first page rendered as image
-	//    - **HTML**: Readable text extracted using Mozilla Readability
-	//
-	//    **Security Controls:**
-	//    Downloads are protected by content security settings (see Configuration Reference):
-	//    - Allowed host whitelist
-	//    - Private IP blocking (prevents SSRF attacks)
-	//    - Download size limits (default: 100MB)
-	//    - Download timeouts (default: 30s)
-	//    - Image dimension limits (default: 2048px, auto-resized)
-	//
-	//    See: https://antfly.io/docs/configuration#security--cors
-	//
-	// 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-	//    ```handlebars
-	//    {{encodeToon this.fields}}
-	//    {{encodeToon this.fields lengthMarker=false indent=4}}
-	//    {{encodeToon this.fields delimiter="\t"}}
-	//    ```
-	//
-	//    **What is TOON?**
-	//    TOON is a compact, human-readable format designed for passing structured data to LLMs.
-	//    It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-	//    comprehension accuracy.
-	//
-	//    **Key Features:**
-	//    - Compact syntax using `:` for key-value pairs
-	//    - Array length markers: `tags[#3]: ai,search,ml`
-	//    - Tabular format for uniform data structures
-	//    - Optimized for LLM parsing and understanding
-	//    - Maintains human readability
-	//
-	//    **Benefits:**
-	//    - **Lower API costs** - Reduced token usage means lower LLM API costs
-	//    - **Faster responses** - Less tokens to process
-	//    - **More context** - Fit more documents within token limits
-	//
-	//    **Options:**
-	//    - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-	//    - `indent` (int): Indentation spacing for nested objects (default: 2)
-	//    - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-	//
-	//    **Example output:**
-	//    ```
-	//    title: Introduction to Vector Search
-	//    author: Jane Doe
-	//    tags[#3]: ai,search,ml
-	//    metadata:
-	//      edition: 2
-	//      pages: 450
-	//    ```
-	//
-	//    **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-	//
-	//    **References:**
-	//    - TOON Specification: https://github.com/toon-format/toon
-	//    - Go Implementation: https://github.com/alpkeskin/gotoon
-	//
-	// **Template Examples:**
-	//
-	// RAG summarization with document references:
-	// ```handlebars
-	// Based on these documents, provide a comprehensive summary:
-	//
-	// {{#each documents}}
-	// Document {{this.id}}:
-	// {{scrubHtml this.content}}
-	//
-	// {{/each}}
-	//
-	// Valid document IDs: {{#each documents}}{{this.id}}{{#unless @last}}, {{/unless}}{{/each}}
-	// ```
-	//
-	// Conditional formatting:
-	// ```handlebars
-	// {{#if system_prompt}}System: {{system_prompt}}{{/if}}
-	//
-	// User Query: {{query}}
-	//
-	// {{#if context}}
-	// Context:
-	// {{#each context}}
-	// - {{this}}
-	// {{/each}}
-	// {{/if}}
-	// ```
-	//
-	// Multimodal prompt with images:
-	// ```handlebars
-	// Analyze this image:
-	// {{media url=image_url}}
-	//
-	// Focus on: {{focus_area}}
-	// ```
-	//
-	// Structured data encoding:
-	// ```handlebars
-	// User Profile:
-	// {{encodeToon user_data indent=2 lengthMarker=true}}
-	//
-	// Please analyze this profile.
-	// ```
-	//
-	// **Common Use Cases:**
-	// - **RAG (Retrieval-Augmented Generation)**: Format retrieved documents with citations
-	// - **Summarization**: Clean HTML content and structure summaries
-	// - **Query Classification**: Format queries with metadata for better classification
-	// - **Multimodal**: Include images/audio/video in prompts
-	// - **Data Formatting**: Convert structured data to readable text
-	//
-	// **Best Practices:**
-	// - Keep templates simple - complex logic belongs in application code
-	// - Use clear, descriptive field names in context
-	// - Handle missing fields gracefully (templates use "missingkey=zero" by default)
-	// - Test templates with representative data before production use
 	Generator *GeneratorConfig `json:"generator,omitempty"`
 }
 
@@ -935,166 +329,6 @@ type FollowupStepConfig struct {
 	Enabled *bool `json:"enabled,omitempty"`
 
 	// Generator A unified configuration for a generative AI provider.
-	//
-	// Generators can be configured with custom prompts using templates. Templates use
-	// Handlebars syntax and support various built-in helpers for formatting and data manipulation.
-	//
-	// **Template System:**
-	// - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-	// - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-	// - **Context**: Templates receive the full context data passed to the generator
-	//
-	// **Built-in Helpers:**
-	//
-	// 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-	//    ```handlebars
-	//    {{scrubHtml html_content}}
-	//    ```
-	//    - Removes `<script>` and `<style>` tags
-	//    - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-	//    - Returns plain text with preserved readability
-	//    - Useful for cleaning web content before summarization
-	//
-	// 2. **eq** - Equality comparison for conditionals
-	//    ```handlebars
-	//    {{#if (eq status "active")}}Active{{/if}}
-	//    {{#if (eq @key "special")}}Special field{{/if}}
-	//    ```
-	//    - Use in `{{#if}}` blocks for conditional logic
-	//    - Compares any two values for equality
-	//
-	// 3. **media** - GenKit dotprompt media directive for multimodal content
-	//    ```handlebars
-	//    {{media url=imageDataURI}}
-	//    {{media url=this.image_url}}
-	//    {{media url="https://example.com/image.jpg"}}
-	//    {{media url="s3://endpoint/bucket/image.png"}}
-	//    {{media url="file:///path/to/image.jpg"}}
-	//    ```
-	//
-	//    **Supported URL Schemes:**
-	//    - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-	//    - `http://` / `https://` - Web URLs with automatic content type detection
-	//    - `file://` - Local filesystem paths
-	//    - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-	//
-	//    **Automatic Content Processing:**
-	//    - **Images**: Downloaded, resized (if needed), converted to data URIs
-	//    - **PDFs**: Text extracted or first page rendered as image
-	//    - **HTML**: Readable text extracted using Mozilla Readability
-	//
-	//    **Security Controls:**
-	//    Downloads are protected by content security settings (see Configuration Reference):
-	//    - Allowed host whitelist
-	//    - Private IP blocking (prevents SSRF attacks)
-	//    - Download size limits (default: 100MB)
-	//    - Download timeouts (default: 30s)
-	//    - Image dimension limits (default: 2048px, auto-resized)
-	//
-	//    See: https://antfly.io/docs/configuration#security--cors
-	//
-	// 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-	//    ```handlebars
-	//    {{encodeToon this.fields}}
-	//    {{encodeToon this.fields lengthMarker=false indent=4}}
-	//    {{encodeToon this.fields delimiter="\t"}}
-	//    ```
-	//
-	//    **What is TOON?**
-	//    TOON is a compact, human-readable format designed for passing structured data to LLMs.
-	//    It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-	//    comprehension accuracy.
-	//
-	//    **Key Features:**
-	//    - Compact syntax using `:` for key-value pairs
-	//    - Array length markers: `tags[#3]: ai,search,ml`
-	//    - Tabular format for uniform data structures
-	//    - Optimized for LLM parsing and understanding
-	//    - Maintains human readability
-	//
-	//    **Benefits:**
-	//    - **Lower API costs** - Reduced token usage means lower LLM API costs
-	//    - **Faster responses** - Less tokens to process
-	//    - **More context** - Fit more documents within token limits
-	//
-	//    **Options:**
-	//    - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-	//    - `indent` (int): Indentation spacing for nested objects (default: 2)
-	//    - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-	//
-	//    **Example output:**
-	//    ```
-	//    title: Introduction to Vector Search
-	//    author: Jane Doe
-	//    tags[#3]: ai,search,ml
-	//    metadata:
-	//      edition: 2
-	//      pages: 450
-	//    ```
-	//
-	//    **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-	//
-	//    **References:**
-	//    - TOON Specification: https://github.com/toon-format/toon
-	//    - Go Implementation: https://github.com/alpkeskin/gotoon
-	//
-	// **Template Examples:**
-	//
-	// RAG summarization with document references:
-	// ```handlebars
-	// Based on these documents, provide a comprehensive summary:
-	//
-	// {{#each documents}}
-	// Document {{this.id}}:
-	// {{scrubHtml this.content}}
-	//
-	// {{/each}}
-	//
-	// Valid document IDs: {{#each documents}}{{this.id}}{{#unless @last}}, {{/unless}}{{/each}}
-	// ```
-	//
-	// Conditional formatting:
-	// ```handlebars
-	// {{#if system_prompt}}System: {{system_prompt}}{{/if}}
-	//
-	// User Query: {{query}}
-	//
-	// {{#if context}}
-	// Context:
-	// {{#each context}}
-	// - {{this}}
-	// {{/each}}
-	// {{/if}}
-	// ```
-	//
-	// Multimodal prompt with images:
-	// ```handlebars
-	// Analyze this image:
-	// {{media url=image_url}}
-	//
-	// Focus on: {{focus_area}}
-	// ```
-	//
-	// Structured data encoding:
-	// ```handlebars
-	// User Profile:
-	// {{encodeToon user_data indent=2 lengthMarker=true}}
-	//
-	// Please analyze this profile.
-	// ```
-	//
-	// **Common Use Cases:**
-	// - **RAG (Retrieval-Augmented Generation)**: Format retrieved documents with citations
-	// - **Summarization**: Clean HTML content and structure summaries
-	// - **Query Classification**: Format queries with metadata for better classification
-	// - **Multimodal**: Include images/audio/video in prompts
-	// - **Data Formatting**: Convert structured data to readable text
-	//
-	// **Best Practices:**
-	// - Keep templates simple - complex logic belongs in application code
-	// - Use clear, descriptive field names in context
-	// - Handle missing fields gracefully (templates use "missingkey=zero" by default)
-	// - Test templates with representative data before production use
 	Generator *GeneratorConfig `json:"generator,omitempty"`
 }
 
@@ -1141,316 +375,17 @@ type GenerationStepConfig struct {
 	GenerationContext *string `json:"generation_context,omitempty"`
 
 	// Generator A unified configuration for a generative AI provider.
-	//
-	// Generators can be configured with custom prompts using templates. Templates use
-	// Handlebars syntax and support various built-in helpers for formatting and data manipulation.
-	//
-	// **Template System:**
-	// - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-	// - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-	// - **Context**: Templates receive the full context data passed to the generator
-	//
-	// **Built-in Helpers:**
-	//
-	// 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-	//    ```handlebars
-	//    {{scrubHtml html_content}}
-	//    ```
-	//    - Removes `<script>` and `<style>` tags
-	//    - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-	//    - Returns plain text with preserved readability
-	//    - Useful for cleaning web content before summarization
-	//
-	// 2. **eq** - Equality comparison for conditionals
-	//    ```handlebars
-	//    {{#if (eq status "active")}}Active{{/if}}
-	//    {{#if (eq @key "special")}}Special field{{/if}}
-	//    ```
-	//    - Use in `{{#if}}` blocks for conditional logic
-	//    - Compares any two values for equality
-	//
-	// 3. **media** - GenKit dotprompt media directive for multimodal content
-	//    ```handlebars
-	//    {{media url=imageDataURI}}
-	//    {{media url=this.image_url}}
-	//    {{media url="https://example.com/image.jpg"}}
-	//    {{media url="s3://endpoint/bucket/image.png"}}
-	//    {{media url="file:///path/to/image.jpg"}}
-	//    ```
-	//
-	//    **Supported URL Schemes:**
-	//    - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-	//    - `http://` / `https://` - Web URLs with automatic content type detection
-	//    - `file://` - Local filesystem paths
-	//    - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-	//
-	//    **Automatic Content Processing:**
-	//    - **Images**: Downloaded, resized (if needed), converted to data URIs
-	//    - **PDFs**: Text extracted or first page rendered as image
-	//    - **HTML**: Readable text extracted using Mozilla Readability
-	//
-	//    **Security Controls:**
-	//    Downloads are protected by content security settings (see Configuration Reference):
-	//    - Allowed host whitelist
-	//    - Private IP blocking (prevents SSRF attacks)
-	//    - Download size limits (default: 100MB)
-	//    - Download timeouts (default: 30s)
-	//    - Image dimension limits (default: 2048px, auto-resized)
-	//
-	//    See: https://antfly.io/docs/configuration#security--cors
-	//
-	// 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-	//    ```handlebars
-	//    {{encodeToon this.fields}}
-	//    {{encodeToon this.fields lengthMarker=false indent=4}}
-	//    {{encodeToon this.fields delimiter="\t"}}
-	//    ```
-	//
-	//    **What is TOON?**
-	//    TOON is a compact, human-readable format designed for passing structured data to LLMs.
-	//    It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-	//    comprehension accuracy.
-	//
-	//    **Key Features:**
-	//    - Compact syntax using `:` for key-value pairs
-	//    - Array length markers: `tags[#3]: ai,search,ml`
-	//    - Tabular format for uniform data structures
-	//    - Optimized for LLM parsing and understanding
-	//    - Maintains human readability
-	//
-	//    **Benefits:**
-	//    - **Lower API costs** - Reduced token usage means lower LLM API costs
-	//    - **Faster responses** - Less tokens to process
-	//    - **More context** - Fit more documents within token limits
-	//
-	//    **Options:**
-	//    - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-	//    - `indent` (int): Indentation spacing for nested objects (default: 2)
-	//    - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-	//
-	//    **Example output:**
-	//    ```
-	//    title: Introduction to Vector Search
-	//    author: Jane Doe
-	//    tags[#3]: ai,search,ml
-	//    metadata:
-	//      edition: 2
-	//      pages: 450
-	//    ```
-	//
-	//    **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-	//
-	//    **References:**
-	//    - TOON Specification: https://github.com/toon-format/toon
-	//    - Go Implementation: https://github.com/alpkeskin/gotoon
-	//
-	// **Template Examples:**
-	//
-	// RAG summarization with document references:
-	// ```handlebars
-	// Based on these documents, provide a comprehensive summary:
-	//
-	// {{#each documents}}
-	// Document {{this.id}}:
-	// {{scrubHtml this.content}}
-	//
-	// {{/each}}
-	//
-	// Valid document IDs: {{#each documents}}{{this.id}}{{#unless @last}}, {{/unless}}{{/each}}
-	// ```
-	//
-	// Conditional formatting:
-	// ```handlebars
-	// {{#if system_prompt}}System: {{system_prompt}}{{/if}}
-	//
-	// User Query: {{query}}
-	//
-	// {{#if context}}
-	// Context:
-	// {{#each context}}
-	// - {{this}}
-	// {{/each}}
-	// {{/if}}
-	// ```
-	//
-	// Multimodal prompt with images:
-	// ```handlebars
-	// Analyze this image:
-	// {{media url=image_url}}
-	//
-	// Focus on: {{focus_area}}
-	// ```
-	//
-	// Structured data encoding:
-	// ```handlebars
-	// User Profile:
-	// {{encodeToon user_data indent=2 lengthMarker=true}}
-	//
-	// Please analyze this profile.
-	// ```
-	//
-	// **Common Use Cases:**
-	// - **RAG (Retrieval-Augmented Generation)**: Format retrieved documents with citations
-	// - **Summarization**: Clean HTML content and structure summaries
-	// - **Query Classification**: Format queries with metadata for better classification
-	// - **Multimodal**: Include images/audio/video in prompts
-	// - **Data Formatting**: Convert structured data to readable text
-	//
-	// **Best Practices:**
-	// - Keep templates simple - complex logic belongs in application code
-	// - Use clear, descriptive field names in context
-	// - Handle missing fields gracefully (templates use "missingkey=zero" by default)
-	// - Test templates with representative data before production use
 	Generator *GeneratorConfig `json:"generator,omitempty"`
 
 	// SystemPrompt Custom system prompt for answer generation
 	SystemPrompt *string `json:"system_prompt,omitempty"`
 }
 
-// GeneratorConfig defines model for GeneratorConfig.
-type GeneratorConfig struct {
-	// Provider The generative AI provider to use.
-	Provider GeneratorProvider `json:"provider"`
-	union    json.RawMessage
-}
+// GeneratorConfig A unified configuration for a generative AI provider.
+type GeneratorConfig = externalRef1.GeneratorConfig
 
 // GeneratorProvider The generative AI provider to use.
-type GeneratorProvider string
-
-// GoogleGeneratorConfig Configuration for the Google generative AI provider (Gemini).
-//
-// **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
-//
-// **Docs:** https://ai.google.dev/gemini-api/docs/models
-type GoogleGeneratorConfig struct {
-	// ApiKey The Google API key.
-	ApiKey *string `json:"api_key,omitempty"`
-
-	// Location The Google Cloud location (e.g., 'us-central1').
-	Location *string `json:"location,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The name of the generative model to use (e.g., 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.0-pro').
-	Model string `json:"model"`
-
-	// ProjectId The Google Cloud project ID.
-	ProjectId *string `json:"project_id,omitempty"`
-
-	// Temperature Controls randomness in generation (0.0-2.0).
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// TopK Top-k sampling parameter.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter.
-	TopP *float32 `json:"top_p,omitempty"`
-
-	// Url The URL of the Google API endpoint.
-	Url *string `json:"url,omitempty"`
-}
-
-// OllamaGeneratorConfig Configuration for the Ollama generative AI provider.
-//
-// Ollama provides local LLM inference for privacy and offline use.
-//
-// **Example Models:** llama3.3:70b, qwen2.5:72b, deepseek-r1:70b, mistral:7b, llava:34b
-//
-// **Docs:** https://ollama.com/library
-type OllamaGeneratorConfig struct {
-	// MaxTokens Maximum number of tokens to generate.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The name of the Ollama model to use (e.g., 'llama3.3:70b', 'qwen2.5:72b', 'deepseek-coder:33b').
-	Model string `json:"model"`
-
-	// Temperature Controls randomness in generation (0.0-2.0).
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// Timeout HTTP response timeout in seconds for Ollama API calls. Defaults to 540 (9 minutes). Increase for large models on slow hardware.
-	Timeout *int `json:"timeout,omitempty"`
-
-	// TopK Top-k sampling parameter.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter.
-	TopP *float32 `json:"top_p,omitempty"`
-
-	// Url The URL of the Ollama API endpoint.
-	Url *string `json:"url,omitempty"`
-}
-
-// OpenAIGeneratorConfig Configuration for the OpenAI generative AI provider.
-//
-// **Example Models:** gpt-4.1 (default), gpt-4.1-mini, o3, o4-mini
-//
-// **Docs:** https://platform.openai.com/docs/models
-type OpenAIGeneratorConfig struct {
-	// ApiKey The OpenAI API key.
-	ApiKey *string `json:"api_key,omitempty"`
-
-	// FrequencyPenalty Penalty for token frequency (-2.0 to 2.0).
-	FrequencyPenalty *float32 `json:"frequency_penalty,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The name of the OpenAI model to use (e.g., 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini').
-	Model string `json:"model"`
-
-	// PresencePenalty Penalty for token presence (-2.0 to 2.0).
-	PresencePenalty *float32 `json:"presence_penalty,omitempty"`
-
-	// Temperature Controls randomness in generation (0.0-2.0).
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// TopP Nucleus sampling parameter.
-	TopP *float32 `json:"top_p,omitempty"`
-
-	// Url The URL of the OpenAI API endpoint.
-	Url *string `json:"url,omitempty"`
-}
-
-// OpenRouterGeneratorConfig Configuration for the OpenRouter generative AI provider.
-//
-// OpenRouter provides a unified API for multiple LLM providers with automatic fallback routing.
-// API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
-//
-// **Model Selection:**
-// - Use `model` for a single model (e.g., "openai/gpt-4.1", "anthropic/claude-sonnet-4-5-20250929")
-// - Use `models` array for fallback routing - OpenRouter tries models in order until one succeeds
-//
-// **Example Models:** openai/gpt-4.1, anthropic/claude-sonnet-4-5-20250929, google/gemini-2.5-flash,
-// meta-llama/llama-3.3-70b-instruct
-//
-// **Docs:** https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request
-type OpenRouterGeneratorConfig struct {
-	// ApiKey The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
-	ApiKey *string `json:"api_key,omitempty"`
-
-	// FrequencyPenalty Penalty for token frequency (-2.0 to 2.0).
-	FrequencyPenalty *float32 `json:"frequency_penalty,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate in the response.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model Single model identifier (e.g., 'openai/gpt-4.1'). Either model or models must be provided.
-	Model *string `json:"model,omitempty"`
-
-	// Models Array of model identifiers for fallback routing. OpenRouter tries each model in order
-	// until one succeeds. Either model or models must be provided.
-	Models *[]string `json:"models,omitempty"`
-
-	// PresencePenalty Penalty for token presence (-2.0 to 2.0).
-	PresencePenalty *float32 `json:"presence_penalty,omitempty"`
-
-	// Temperature Controls randomness in generation (0.0-2.0). Higher values make output more random.
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// TopP Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-	TopP *float32 `json:"top_p,omitempty"`
-}
+type GeneratorProvider = externalRef1.GeneratorProvider
 
 // QueryStrategy Strategy for query transformation and retrieval:
 // - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
@@ -1460,19 +395,7 @@ type OpenRouterGeneratorConfig struct {
 type QueryStrategy string
 
 // RetryConfig Retry configuration for generator calls
-type RetryConfig struct {
-	// BackoffMultiplier Multiplier for exponential backoff
-	BackoffMultiplier *float32 `json:"backoff_multiplier,omitempty"`
-
-	// InitialBackoffMs Initial backoff delay in milliseconds
-	InitialBackoffMs *int `json:"initial_backoff_ms,omitempty"`
-
-	// MaxAttempts Maximum number of retry attempts
-	MaxAttempts *int `json:"max_attempts,omitempty"`
-
-	// MaxBackoffMs Maximum backoff delay in milliseconds
-	MaxBackoffMs *int `json:"max_backoff_ms,omitempty"`
-}
+type RetryConfig = externalRef1.RetryConfig
 
 // RouteType Classification of query type: question (specific factual query) or search (exploratory query)
 type RouteType string
@@ -1481,354 +404,6 @@ type RouteType string
 // - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization)
 // - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
 type SemanticQueryMode string
-
-// TermiteGeneratorConfig Configuration for the Termite generative AI provider.
-//
-// Termite is Antfly's built-in ML service for local LLM inference using
-// ONNX Runtime GenAI models. It provides text generation with automatic
-// model discovery from the `models/generators/` directory.
-//
-// **Example Models:** onnxruntime/Gemma-3-ONNX (from HuggingFace)
-//
-// **Features:**
-// - Local inference with no external API dependencies
-// - ONNX Runtime GenAI for efficient CPU/GPU execution
-// - Auto-discovery of models from `models/generators/` directory
-// - OpenAI-compatible chat format
-type TermiteGeneratorConfig struct {
-	// ApiUrl The URL of the Termite API endpoint.
-	ApiUrl *string `json:"api_url,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The name of the generator model (maps to models/generators/{name}/ directory).
-	Model string `json:"model"`
-
-	// Temperature Controls randomness in generation (0.0-2.0).
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// Timeout HTTP response timeout in seconds for Termite API calls. Defaults to 540 (9 minutes). Increase for large models on slow hardware.
-	Timeout *int `json:"timeout,omitempty"`
-
-	// TopK Top-k sampling parameter.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter.
-	TopP *float32 `json:"top_p,omitempty"`
-}
-
-// VertexGeneratorConfig Configuration for Google Cloud Vertex AI generative models (enterprise-grade).
-//
-// Uses Application Default Credentials (ADC) for authentication. In GCP environments
-// (Cloud Run, GKE, Compute Engine) this is automatic. For local dev, run
-// `gcloud auth application-default login`. Requires IAM role `roles/aiplatform.user`.
-//
-// **Example Models:** gemini-2.5-flash (default), gemini-2.5-pro, gemini-3.0-pro
-//
-// **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
-type VertexGeneratorConfig struct {
-	// CredentialsPath Path to service account JSON key file. Sets GOOGLE_APPLICATION_CREDENTIALS environment variable. Alternative to ADC for non-GCP environments.
-	CredentialsPath *string `json:"credentials_path,omitempty"`
-
-	// Location Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-	Location *string `json:"location,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate in the response.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The name of the Vertex AI model to use.
-	Model string `json:"model"`
-
-	// ProjectId Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
-	ProjectId *string `json:"project_id,omitempty"`
-
-	// Temperature Controls randomness in generation (0.0-2.0). Higher values make output more random.
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// TopK Top-k sampling parameter. Only sample from the top K options for each subsequent token.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-	TopP *float32 `json:"top_p,omitempty"`
-}
-
-// AsGoogleGeneratorConfig returns the union data inside the GeneratorConfig as a GoogleGeneratorConfig
-func (t GeneratorConfig) AsGoogleGeneratorConfig() (GoogleGeneratorConfig, error) {
-	var body GoogleGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromGoogleGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided GoogleGeneratorConfig
-func (t *GeneratorConfig) FromGoogleGeneratorConfig(v GoogleGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeGoogleGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided GoogleGeneratorConfig
-func (t *GeneratorConfig) MergeGoogleGeneratorConfig(v GoogleGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsVertexGeneratorConfig returns the union data inside the GeneratorConfig as a VertexGeneratorConfig
-func (t GeneratorConfig) AsVertexGeneratorConfig() (VertexGeneratorConfig, error) {
-	var body VertexGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromVertexGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided VertexGeneratorConfig
-func (t *GeneratorConfig) FromVertexGeneratorConfig(v VertexGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeVertexGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided VertexGeneratorConfig
-func (t *GeneratorConfig) MergeVertexGeneratorConfig(v VertexGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsOllamaGeneratorConfig returns the union data inside the GeneratorConfig as a OllamaGeneratorConfig
-func (t GeneratorConfig) AsOllamaGeneratorConfig() (OllamaGeneratorConfig, error) {
-	var body OllamaGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromOllamaGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided OllamaGeneratorConfig
-func (t *GeneratorConfig) FromOllamaGeneratorConfig(v OllamaGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeOllamaGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided OllamaGeneratorConfig
-func (t *GeneratorConfig) MergeOllamaGeneratorConfig(v OllamaGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsTermiteGeneratorConfig returns the union data inside the GeneratorConfig as a TermiteGeneratorConfig
-func (t GeneratorConfig) AsTermiteGeneratorConfig() (TermiteGeneratorConfig, error) {
-	var body TermiteGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromTermiteGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided TermiteGeneratorConfig
-func (t *GeneratorConfig) FromTermiteGeneratorConfig(v TermiteGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeTermiteGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided TermiteGeneratorConfig
-func (t *GeneratorConfig) MergeTermiteGeneratorConfig(v TermiteGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsOpenAIGeneratorConfig returns the union data inside the GeneratorConfig as a OpenAIGeneratorConfig
-func (t GeneratorConfig) AsOpenAIGeneratorConfig() (OpenAIGeneratorConfig, error) {
-	var body OpenAIGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromOpenAIGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided OpenAIGeneratorConfig
-func (t *GeneratorConfig) FromOpenAIGeneratorConfig(v OpenAIGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeOpenAIGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided OpenAIGeneratorConfig
-func (t *GeneratorConfig) MergeOpenAIGeneratorConfig(v OpenAIGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsOpenRouterGeneratorConfig returns the union data inside the GeneratorConfig as a OpenRouterGeneratorConfig
-func (t GeneratorConfig) AsOpenRouterGeneratorConfig() (OpenRouterGeneratorConfig, error) {
-	var body OpenRouterGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromOpenRouterGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided OpenRouterGeneratorConfig
-func (t *GeneratorConfig) FromOpenRouterGeneratorConfig(v OpenRouterGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeOpenRouterGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided OpenRouterGeneratorConfig
-func (t *GeneratorConfig) MergeOpenRouterGeneratorConfig(v OpenRouterGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsBedrockGeneratorConfig returns the union data inside the GeneratorConfig as a BedrockGeneratorConfig
-func (t GeneratorConfig) AsBedrockGeneratorConfig() (BedrockGeneratorConfig, error) {
-	var body BedrockGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromBedrockGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided BedrockGeneratorConfig
-func (t *GeneratorConfig) FromBedrockGeneratorConfig(v BedrockGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeBedrockGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided BedrockGeneratorConfig
-func (t *GeneratorConfig) MergeBedrockGeneratorConfig(v BedrockGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsAnthropicGeneratorConfig returns the union data inside the GeneratorConfig as a AnthropicGeneratorConfig
-func (t GeneratorConfig) AsAnthropicGeneratorConfig() (AnthropicGeneratorConfig, error) {
-	var body AnthropicGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromAnthropicGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided AnthropicGeneratorConfig
-func (t *GeneratorConfig) FromAnthropicGeneratorConfig(v AnthropicGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeAnthropicGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided AnthropicGeneratorConfig
-func (t *GeneratorConfig) MergeAnthropicGeneratorConfig(v AnthropicGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsCohereGeneratorConfig returns the union data inside the GeneratorConfig as a CohereGeneratorConfig
-func (t GeneratorConfig) AsCohereGeneratorConfig() (CohereGeneratorConfig, error) {
-	var body CohereGeneratorConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromCohereGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided CohereGeneratorConfig
-func (t *GeneratorConfig) FromCohereGeneratorConfig(v CohereGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeCohereGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided CohereGeneratorConfig
-func (t *GeneratorConfig) MergeCohereGeneratorConfig(v CohereGeneratorConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-func (t GeneratorConfig) MarshalJSON() ([]byte, error) {
-	b, err := t.union.MarshalJSON()
-	if err != nil {
-		return nil, err
-	}
-	object := make(map[string]json.RawMessage)
-	if t.union != nil {
-		err = json.Unmarshal(b, &object)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	object["provider"], err = json.Marshal(t.Provider)
-	if err != nil {
-		return nil, fmt.Errorf("error marshaling 'provider': %w", err)
-	}
-
-	b, err = json.Marshal(object)
-	return b, err
-}
-
-func (t *GeneratorConfig) UnmarshalJSON(b []byte) error {
-	err := t.union.UnmarshalJSON(b)
-	if err != nil {
-		return err
-	}
-	object := make(map[string]json.RawMessage)
-	err = json.Unmarshal(b, &object)
-	if err != nil {
-		return err
-	}
-
-	if raw, found := object["provider"]; found {
-		err = json.Unmarshal(raw, &t.Provider)
-		if err != nil {
-			return fmt.Errorf("error reading 'provider': %w", err)
-		}
-	}
-
-	return err
-}
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -1963,171 +538,112 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
+	"ArcLE41kmWUf/ycAAP//T8v/K196AAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
@@ -2167,6 +683,12 @@ func PathToRawSpec(pathToFile string) map[string]func() ([]byte, error) {
 		res[pathToFile] = rawSpec
 	}
 
+	for rawPath, rawFunc := range externalRef1.PathToRawSpec(path.Join(path.Dir(pathToFile), "../../pkg/generating/openapi.yaml")) {
+		if _, ok := res[rawPath]; ok {
+			// it is not possible to compare functions in golang, so always overwrite the old value
+		}
+		res[rawPath] = rawFunc
+	}
 	for rawPath, rawFunc := range externalRef0.PathToRawSpec(path.Join(path.Dir(pathToFile), "../websearch/openapi.yaml")) {
 		if _, ok := res[rawPath]; ok {
 			// it is not possible to compare functions in golang, so always overwrite the old value

@@ -502,6 +502,12 @@ func (si *SparseIndex) Batch(ctx context.Context, writes [][2][]byte, deletes []
 	}
 
 	for _, key := range deletes {
+		if storeutils.IsChunkKey(key) {
+			if bytes.Contains(key, si.suffix) {
+				sparseDeletes = append(sparseDeletes, key)
+			}
+			continue
+		}
 		if !bytes.Contains(key, []byte(":i:")) {
 			sparseDeletes = append(sparseDeletes, key)
 		}

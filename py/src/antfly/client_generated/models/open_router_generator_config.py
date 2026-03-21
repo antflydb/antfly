@@ -13,36 +13,17 @@ T = TypeVar("T", bound="OpenRouterGeneratorConfig")
 class OpenRouterGeneratorConfig:
     """Configuration for the OpenRouter generative AI provider.
 
-    OpenRouter provides a unified API for multiple LLM providers with automatic fallback routing.
-    API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
-
-    **Model Selection:**
-    - Use `model` for a single model (e.g., "openai/gpt-4.1", "anthropic/claude-sonnet-4-5-20250929")
-    - Use `models` array for fallback routing - OpenRouter tries models in order until one succeeds
-
-    **Example Models:** openai/gpt-4.1, anthropic/claude-sonnet-4-5-20250929, google/gemini-2.5-flash,
-    meta-llama/llama-3.3-70b-instruct
-
-    **Docs:** https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request
-
-        Example:
-            {'provider': 'openrouter', 'model': 'openai/gpt-4.1', 'temperature': 0.7, 'max_tokens': 4096}
-
-        Attributes:
-            model (Union[Unset, str]): Single model identifier (e.g., 'openai/gpt-4.1'). Either model or models must be
-                provided. Example: openai/gpt-4.1.
-            models (Union[Unset, list[str]]): Array of model identifiers for fallback routing. OpenRouter tries each model
-                in order
-                until one succeeds. Either model or models must be provided.
-                 Example: ['openai/gpt-4.1', 'anthropic/claude-sonnet-4-5-20250929', 'google/gemini-2.5-flash'].
-            api_key (Union[Unset, str]): The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment
-                variable.
-            temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0). Higher values make output more
-                random.
-            max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
-            top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0). Alternative to temperature.
-            frequency_penalty (Union[Unset, float]): Penalty for token frequency (-2.0 to 2.0).
-            presence_penalty (Union[Unset, float]): Penalty for token presence (-2.0 to 2.0).
+    Attributes:
+        model (Union[Unset, str]): Single model identifier. Either model or models must be provided. Example:
+            openai/gpt-4.1.
+        models (Union[Unset, list[str]]): Array of model identifiers for fallback routing. Either model or models must
+            be provided.
+        api_key (Union[Unset, str]): The OpenRouter API key.
+        temperature (Union[Unset, float]): Controls randomness in generation (0.0-2.0).
+        max_tokens (Union[Unset, int]): Maximum number of tokens to generate in the response.
+        top_p (Union[Unset, float]): Nucleus sampling parameter (0.0-1.0).
+        frequency_penalty (Union[Unset, float]): Penalty for token frequency (-2.0 to 2.0).
+        presence_penalty (Union[Unset, float]): Penalty for token presence (-2.0 to 2.0).
     """
 
     model: Union[Unset, str] = UNSET

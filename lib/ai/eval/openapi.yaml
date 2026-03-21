@@ -22,7 +22,7 @@ components:
             $ref: "#/components/schemas/EvaluatorName"
           description: List of evaluators to run
         judge:
-          $ref: "../openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: |
             LLM configuration for judge-based evaluators.
             Falls back to default if not specified.
@@ -193,7 +193,7 @@ components:
             $ref: "#/components/schemas/EvaluatorName"
           description: List of evaluators to run
         judge:
-          $ref: "../openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: LLM configuration for judge-based evaluators
         ground_truth:
           $ref: "#/components/schemas/GroundTruth"

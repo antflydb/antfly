@@ -3,13 +3,13 @@ module github.com/antflydb/antfly/pkg/genkit/openrouter
 go 1.26
 
 require (
-	github.com/firebase/genkit/go v1.4.0
+	github.com/firebase/genkit/go v1.5.0
 	github.com/revrost/go-openrouter v1.1.7
 )
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
-	github.com/buger/jsonparser v1.1.1 // indirect
+	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -17,7 +17,7 @@ require (
 	github.com/google/dotprompt/go v0.0.0-20260227225921-0911cf9ecf0e // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
-	github.com/mailru/easyjson v0.9.1 // indirect
+	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/mbleigh/raymond v0.0.0-20250414171441-6b3a58ab9e0a // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb // indirect

@@ -132,16 +132,70 @@ func IsChunkKey(key []byte) bool {
 	return bytes.HasSuffix(key, []byte(":c")) || bytes.HasSuffix(key, []byte(":cft")) || bytes.HasSuffix(key, []byte(":cm"))
 }
 
+// ParseChunkKey extracts the document key and index name from a chunk key.
+// Chunk keys have format: <docKey>:i:<indexName>:<chunkID>:c|cft|cm.
+// It uses the last :i: marker so document IDs may themselves contain :i:.
+func ParseChunkKey(chunkKey []byte) (docKey []byte, indexName string, ok bool) {
+	if !IsChunkKey(chunkKey) {
+		return nil, "", false
+	}
+
+	var keyWithoutSuffix []byte
+	switch {
+	case bytes.HasSuffix(chunkKey, []byte(":cft")):
+		keyWithoutSuffix = chunkKey[:len(chunkKey)-len(":cft")]
+	case bytes.HasSuffix(chunkKey, []byte(":cm")):
+		keyWithoutSuffix = chunkKey[:len(chunkKey)-len(":cm")]
+	case bytes.HasSuffix(chunkKey, []byte(":c")):
+		keyWithoutSuffix = chunkKey[:len(chunkKey)-len(":c")]
+	default:
+		return nil, "", false
+	}
+
+	chunkIDSep := bytes.LastIndexByte(keyWithoutSuffix, ':')
+	if chunkIDSep <= 0 || chunkIDSep == len(keyWithoutSuffix)-1 {
+		return nil, "", false
+	}
+
+	keyWithoutChunkID := keyWithoutSuffix[:chunkIDSep]
+	indexMarker := bytes.LastIndex(keyWithoutChunkID, []byte(":i:"))
+	if indexMarker <= 0 || indexMarker+len(":i:") >= len(keyWithoutChunkID) {
+		return nil, "", false
+	}
+
+	return bytes.Clone(keyWithoutChunkID[:indexMarker]),
+		string(keyWithoutChunkID[indexMarker+len(":i:"):]),
+		true
+}
+
+// ParseSummaryKey extracts the document key and index name from a summary key.
+// Summary keys have format: <docKey>:i:<indexName>:s.
+// It uses the last :i: marker so document IDs may themselves contain :i:.
+func ParseSummaryKey(summaryKey []byte) (docKey []byte, indexName string, ok bool) {
+	if !bytes.HasSuffix(summaryKey, SummarySuffix) {
+		return nil, "", false
+	}
+
+	keyWithoutSuffix := summaryKey[:len(summaryKey)-len(SummarySuffix)]
+	indexMarker := bytes.LastIndex(keyWithoutSuffix, []byte(":i:"))
+	if indexMarker <= 0 || indexMarker+len(":i:") >= len(keyWithoutSuffix) {
+		return nil, "", false
+	}
+
+	return bytes.Clone(keyWithoutSuffix[:indexMarker]),
+		string(keyWithoutSuffix[indexMarker+len(":i:"):]),
+		true
+}
+
 // ExtractDocKeyFromChunk extracts the document key from a chunk key.
 // Chunk keys have format: <docKey>:i:<indexName>:<chunkID>:c or <docKey>:i:<indexName>:<chunkID>:cft
 // Returns the document key and true if successful, or nil and false if not a chunk key.
 func ExtractDocKeyFromChunk(chunkKey []byte) ([]byte, bool) {
-	indexMarker := []byte(":i:")
-	before, _, ok := bytes.Cut(chunkKey, indexMarker)
+	docKey, _, ok := ParseChunkKey(chunkKey)
 	if !ok {
 		return nil, false
 	}
-	return before, true
+	return docKey, true
 }
 
 // MakeChunkKey creates a chunk key for a specific chunk ID

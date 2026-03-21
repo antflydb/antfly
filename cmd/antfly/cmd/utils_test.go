@@ -17,6 +17,7 @@ package cmd
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/lib/ai"
 	"github.com/antflydb/antfly/pkg/libaf/logging"
@@ -167,11 +168,32 @@ func TestParseConfigDefaults(t *testing.T) {
 	require.Equal(t, uint64(3), config.DefaultShardsPerTable)
 	require.Equal(t, 4200, config.HealthPort)
 	require.Equal(t, common.DefaultDataDir(), config.Storage.Local.BaseDir)
+	require.True(t, config.DisableShardAlloc)
 
 	// Viper-level defaults for storage backends (these keys don't map to struct
 	// fields via JSON tags, but are available via viper for other consumers).
 	require.Equal(t, "local", v.GetString("storage.keyvalue"))
 	require.Equal(t, "local", v.GetString("storage.metadatakv"))
+}
+
+func TestParseConfigSplitSettings(t *testing.T) {
+	configYAML := `
+metadata:
+  orchestration_urls:
+    "1": "http://localhost:5001"
+disable_shard_alloc: false
+split_finalize_grace_period: 27s
+`
+
+	v := viper.New()
+	v.SetConfigType("yaml")
+	require.NoError(t, v.ReadConfig(strings.NewReader(configYAML)))
+
+	config, err := parseConfig(v)
+	require.NoError(t, err)
+
+	require.False(t, config.DisableShardAlloc)
+	require.Equal(t, 27*time.Second, config.SplitFinalizeGracePeriod)
 }
 
 func TestParseConfigDefaultsOverridden(t *testing.T) {
