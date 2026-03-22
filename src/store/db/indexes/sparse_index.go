@@ -496,6 +496,10 @@ func (si *SparseIndex) Batch(ctx context.Context, writes [][2][]byte, deletes []
 	if len(writes) == 0 && len(deletes) == 0 {
 		return nil
 	}
+	si.WaitForBackfill(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	var sparseInserts []sparseindex.BatchInsert
 	var sparseDeletes [][]byte

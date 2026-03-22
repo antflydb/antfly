@@ -98,13 +98,17 @@ func findWriteShardForKey(
 	table *store.Table,
 	key string,
 ) (types.ID, error) {
-	shardStatuses, err := tm.GetShardStatuses()
-	if err != nil {
-		return 0, fmt.Errorf("loading shard statuses: %w", err)
-	}
 	shardID, err := table.FindShardForKey(key)
 	if err != nil {
 		return 0, err
+	}
+	return resolveWriteShardIDFromTableManager(tm, shardID)
+}
+
+func resolveWriteShardIDFromTableManager(tm *tablemgr.TableManager, shardID types.ID) (types.ID, error) {
+	shardStatuses, err := tm.GetShardStatuses()
+	if err != nil {
+		return 0, fmt.Errorf("loading shard statuses: %w", err)
 	}
 	return resolveWriteShardID(shardStatuses, shardID)
 }

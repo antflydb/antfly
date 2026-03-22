@@ -25,6 +25,7 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/antflydb/antfly/src/store"
+	"github.com/antflydb/antfly/src/store/client"
 	storedb "github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/cockroachdb/pebble/v2"
@@ -89,6 +90,30 @@ func writeStoreStatus(t *testing.T, db kv.DB, nodeID types.ID, healthy bool) {
 		nil,
 	)
 	require.NoError(t, err)
+}
+
+type stubStoreRPC struct {
+	client.StoreRPC
+	id       types.ID
+	batchFn  func(shardID types.ID, writes [][2][]byte) error
+	batchHit int
+}
+
+func (s *stubStoreRPC) ID() types.ID { return s.id }
+
+func (s *stubStoreRPC) Batch(
+	_ context.Context,
+	shardID types.ID,
+	writes [][2][]byte,
+	_ [][]byte,
+	_ []*storedb.Transform,
+	_ storedb.Op_SyncLevel,
+) error {
+	s.batchHit++
+	if s.batchFn != nil {
+		return s.batchFn(shardID, writes)
+	}
+	return nil
 }
 
 // newShardStatus builds a ShardStatus for routing tests.
@@ -330,6 +355,120 @@ func TestResolveWriteShardID_AdjacentShardNotReroutedDuringSplit(t *testing.T) {
 	resolved, err = resolveWriteShardID(statuses, splitChildID)
 	require.NoError(t, err)
 	assert.Equal(t, splittingParentID, resolved)
+}
+
+func TestForwardInsertToShard_ReroutesDirectlyToChildWhenParentRoutingIsStale(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	tableName := "test_table"
+	table, err := ms.tm.CreateTable(tableName, tablemgr.TableConfig{
+		NumShards: 1,
+		StartID:   100,
+	})
+	require.NoError(t, err)
+	require.Len(t, table.Shards, 1)
+
+	var parentShardID types.ID
+	for shardID := range table.Shards {
+		parentShardID = shardID
+	}
+	childShardID := types.ID(101)
+	parentNodeID := types.ID(1)
+	childNodeID := types.ID(2)
+	splitKey := []byte("m:\x00")
+	parentRPC := &stubStoreRPC{
+		id: parentNodeID,
+		batchFn: func(shardID types.ID, writes [][2][]byte) error {
+			assert.Equal(t, parentShardID, shardID)
+			require.Len(t, writes, 1)
+			return &client.ResponseError{
+				StatusCode: http.StatusBadRequest,
+				Body:       "key 6c617267652d303433 out of range [,6d3a00)",
+			}
+		},
+	}
+	childRPC := &stubStoreRPC{
+		id: childNodeID,
+		batchFn: func(shardID types.ID, writes [][2][]byte) error {
+			assert.Equal(t, childShardID, shardID)
+			require.Len(t, writes, 1)
+			assert.Equal(t, []byte("mango"), writes[0][0])
+			return nil
+		},
+	}
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case parentNodeID:
+			return parentRPC
+		case childNodeID:
+			return childRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+
+	parentStatus, err := ms.tm.GetShardStatus(parentShardID)
+	require.NoError(t, err)
+	parentStatus.Peers = common.NewPeerSet(parentNodeID)
+	parentStatus.ReportedBy = common.NewPeerSet(parentNodeID)
+	parentStatus.RaftStatus = &common.RaftStatus{
+		Lead:   parentNodeID,
+		Voters: common.NewPeerSet(parentNodeID),
+	}
+	writeShardStatus(t, db, parentStatus)
+
+	_, _, err = ms.tm.ReassignShardsForSplit(tablemgr.SplitTransition{
+		ShardID:      parentShardID,
+		SplitShardID: childShardID,
+		SplitKey:     splitKey,
+		TableName:    tableName,
+	})
+	require.NoError(t, err)
+
+	parentStatus, err = ms.tm.GetShardStatus(parentShardID)
+	require.NoError(t, err)
+	parentStatus.State = store.ShardState_Splitting
+	parentStatus.SplitState = &storedb.SplitState{}
+	parentStatus.SplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	parentStatus.SplitState.SetSplitKey(splitKey)
+	parentStatus.SplitState.SetNewShardId(uint64(childShardID))
+	parentStatus.SplitState.SetOriginalRangeEnd([]byte{0xff})
+	parentStatus.Peers = common.NewPeerSet(parentNodeID)
+	parentStatus.ReportedBy = common.NewPeerSet(parentNodeID)
+	parentStatus.RaftStatus = &common.RaftStatus{
+		Lead:   parentNodeID,
+		Voters: common.NewPeerSet(parentNodeID),
+	}
+	writeShardStatus(t, db, parentStatus)
+
+	childStatus, err := ms.tm.GetShardStatus(childShardID)
+	require.NoError(t, err)
+	childStatus.State = store.ShardState_SplitOffPreSnap
+	childStatus.HasSnapshot = true
+	childStatus.Initializing = false
+	childStatus.SplitReplayRequired = true
+	childStatus.SplitCutoverReady = false
+	childStatus.Peers = common.NewPeerSet(childNodeID)
+	childStatus.ReportedBy = common.NewPeerSet(childNodeID)
+	childStatus.RaftStatus = &common.RaftStatus{
+		Lead:   childNodeID,
+		Voters: common.NewPeerSet(childNodeID),
+	}
+	writeShardStatus(t, db, childStatus)
+
+	writeStoreStatus(t, db, parentNodeID, true)
+	writeStoreStatus(t, db, childNodeID, true)
+
+	err = ms.forwardInsertToShard(
+		context.Background(),
+		tableName,
+		"mango",
+		map[string]any{"content": "value"},
+		storedb.Op_SyncLevelWrite,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, parentRPC.batchHit)
+	assert.Equal(t, 1, childRPC.batchHit)
 }
 
 func TestResolveWriteShardID_FinalizingParentIsNotWriteOwner(t *testing.T) {

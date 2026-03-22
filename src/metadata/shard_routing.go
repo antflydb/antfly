@@ -375,6 +375,33 @@ func (ms *MetadataStore) leaderClientForShardNoFallback(
 	return shardID, c, nil
 }
 
+// directLeaderClientForShardBypassesSplitFallback returns the shard's own leader
+// without applying split-parent fallback or split-readiness checks.
+// This is only used as a recovery path when stale metadata routed a write to the
+// parent shard and that parent now rejects the key as out of range.
+func (ms *MetadataStore) directLeaderClientForShardBypassesSplitFallback(
+	ctx context.Context,
+	shardID types.ID,
+) (effectiveShardID types.ID, c client.StoreRPC, err error) {
+	status, err := ms.tm.GetShardStatus(shardID)
+	if err != nil || status == nil {
+		return 0, nil, fmt.Errorf("no status info available: %w", err)
+	}
+	if status.RaftStatus == nil {
+		return 0, nil, fmt.Errorf("no raft status available for shard: %w", client.ErrNoRaftStatus)
+	}
+	if status.RaftStatus.Lead == 0 {
+		return 0, nil, ErrShardInitializing
+	}
+
+	var reachable bool
+	c, reachable, err = ms.tm.GetStoreClient(ctx, status.RaftStatus.Lead)
+	if err == nil && reachable {
+		return shardID, c, nil
+	}
+	return 0, nil, ErrNoLeaderElected
+}
+
 // shouldFallbackToParentShard returns true if reads to this shard should be
 // redirected to its parent shard because the split-off shard is not fully ready.
 // Readiness is determined by ShardInfo.IsReadyForSplitReads(), the single source
@@ -682,7 +709,14 @@ func (ms *MetadataStore) forwardInsertToShard(
 		if err != nil {
 			return fmt.Errorf("getting table %s: %w", tableName, err)
 		}
-		shardID, err := findWriteShardForKey(ms.tm, table, key)
+		targetShardID, err := table.FindShardForKey(key)
+		if err != nil {
+			if isTransientShardError(err) {
+				return retry.RetryableError(err)
+			}
+			return fmt.Errorf("finding target shard for key %s: %w", key, err)
+		}
+		shardID, err := resolveWriteShardIDFromTableManager(ms.tm, targetShardID)
 		if err != nil {
 			if isTransientShardError(err) {
 				return retry.RetryableError(err)
@@ -700,6 +734,16 @@ func (ms *MetadataStore) forwardInsertToShard(
 			return err
 		}
 		err = targetClient.Batch(ctx, effectiveShardID, writes, nil, nil, syncLevel)
+		if errors.Is(err, client.ErrKeyOutOfRange) && shardID != targetShardID {
+			effectiveChildID, childClient, childErr := ms.directLeaderClientForShardBypassesSplitFallback(ctx, targetShardID)
+			if childErr != nil {
+				if isTransientShardError(childErr) {
+					return retry.RetryableError(childErr)
+				}
+				return childErr
+			}
+			err = childClient.Batch(ctx, effectiveChildID, writes, nil, nil, syncLevel)
+		}
 		if err != nil && isTransientShardError(err) {
 			return retry.RetryableError(err)
 		}
