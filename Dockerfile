@@ -1,16 +1,12 @@
-# Stage 1: Build the Go application
+# Stage 1: Build
 FROM golang:1.26-alpine AS builder
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB - Distributed document database with vector search for AI applications"
-# LABEL org.opencontainers.image.licenses=Apache-2.0
+LABEL org.opencontainers.image.licenses=Elastic-2.0
 
-# Set the working directory inside the container
 WORKDIR /app
 
-# Copy go.mod and go.sum to leverage Docker layer caching.
-# This assumes these files exist at the root of your project.
-# If they are in a subdirectory, adjust the paths accordingly.
 COPY go.mod go.sum ./
 COPY termite /app/termite
 COPY cmd/antfly /app/cmd/antfly
@@ -50,21 +46,9 @@ COPY --from=builder /app/antfly /antfly
 # COPY private.key /private.key
 
 # Set the entrypoint for the container.
-# The command and its arguments will be provided by the Kubernetes Pod spec.
 ENTRYPOINT ["/antfly"]
 
-# The CMD is intentionally left blank. You should specify the arguments
-# in your Kubernetes Pod or Deployment manifest to determine the role
-# of the container (metadata, store, or termite).
-#
-# For example, to run as a store node, your Kubernetes manifest would have:
-# spec:
-#   containers:
-#   - name: antfly-store
-#     image: your-repo/antfly:latest
-#     args: [
-#       "--config", "/config.json",
-#       "--id", "1",
-#       "--api", "https://antfly-store-1:12380",
-#       "--raft", "https://antfly-store-1:9021"
-#     ]
+# Default to single-node swarm mode for easy local usage.
+# Override with a different subcommand (e.g., "metadata", "store", "termite")
+# via Kubernetes Pod args or docker run arguments.
+CMD ["swarm"]

@@ -34,6 +34,10 @@ ARG LIBTPU_VERSION=1.12.0
 # =============================================================================
 FROM golang:${GO_VERSION} AS builder
 
+LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
+LABEL org.opencontainers.image.description="AntflyDB - Distributed document database with vector search for AI applications (ONNX + XLA)"
+LABEL org.opencontainers.image.licenses=Elastic-2.0
+
 ARG ONNXRUNTIME_VERSION
 ARG TOKENIZERS_VERSION
 ARG TARGETARCH
@@ -152,7 +156,6 @@ ENV ORTGENAI_DYLIB_PATH="/usr/local/onnxruntime/lib/libonnxruntime-genai.so"
 ENV PJRT_PLUGIN_LIBRARY_PATH="/usr/local/lib/go-xla"
 
 # Default backend priority: ONNX > XLA > Go
-# This image runs `antfly termite`, so termite settings must use the ANTFLY_ prefix.
 ENV ANTFLY_TERMITE_BACKEND_PRIORITY="onnx,xla,go"
 ENV ANTFLY_TERMITE_API_URL="http://0.0.0.0:8080"
 
@@ -173,3 +176,8 @@ USER antfly
 EXPOSE 8080
 
 ENTRYPOINT ["/antfly"]
+
+# Default to single-node swarm mode for easy local usage.
+# Override with a different subcommand (e.g., "metadata", "store", "termite")
+# via Kubernetes Pod args or docker run arguments.
+CMD ["swarm"]
