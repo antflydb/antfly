@@ -116,7 +116,7 @@ func runSoak(ctx context.Context, opts *options) error {
 func runValidate(ctx context.Context, opts *options) error {
 	commands := [][]string{
 		{"go", "test", "-timeout", "30m", "-run", "^$", "./src/metadata", "./src/sim"},
-		{"go", "test", "-v", "-timeout", "30m", "./src/sim"},
+		{"go", "test", "-json", "-count=1", "-timeout", "30m", "./src/sim"},
 	}
 	if opts.scope == "repo" {
 		commands = append(commands, []string{"go", "test", "-timeout", "30m", "./..."})
