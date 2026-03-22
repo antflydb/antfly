@@ -421,7 +421,7 @@ func (si *SparseIndex) runBackfill(ctx context.Context, backfillWait chan struct
 		if len(inserts) == 0 {
 			return nil
 		}
-		if err := si.sparseIdx.Batch(inserts, nil); err != nil {
+		if err := si.sparseIdx.Batch(inserts, sparseDeletesForInserts(inserts)); err != nil {
 			return fmt.Errorf("batch sparse index rebuild: %w", err)
 		}
 		inserts = inserts[:0]
@@ -556,6 +556,8 @@ func (si *SparseIndex) Batch(ctx context.Context, writes [][2][]byte, deletes []
 		}
 	}
 
+	sparseDeletes = append(sparseDeletes, sparseDeletesForInserts(sparseInserts)...)
+
 	for _, key := range deletes {
 		if storeutils.IsChunkKey(key) {
 			if bytes.Contains(key, si.suffix) {
@@ -617,6 +619,26 @@ func (si *SparseIndex) Batch(ctx context.Context, writes [][2][]byte, deletes []
 	}
 
 	return nil
+}
+
+func sparseDeletesForInserts(inserts []sparseindex.BatchInsert) [][]byte {
+	if len(inserts) == 0 {
+		return nil
+	}
+	deletes := make([][]byte, 0, len(inserts))
+	seen := make(map[string]struct{}, len(inserts))
+	for _, insert := range inserts {
+		if len(insert.DocID) == 0 {
+			continue
+		}
+		docID := string(insert.DocID)
+		if _, ok := seen[docID]; ok {
+			continue
+		}
+		seen[docID] = struct{}{}
+		deletes = append(deletes, bytes.Clone(insert.DocID))
+	}
+	return deletes
 }
 
 func (si *SparseIndex) Search(ctx context.Context, query any) (any, error) {
