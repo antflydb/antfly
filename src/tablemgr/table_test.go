@@ -874,6 +874,60 @@ func TestTableManager_ReassignShardsForSplit(t *testing.T) {
 	require.NoError(t, err, "New shard status not persisted")
 }
 
+func TestNeedsUpdates_PreMergeRetainsMergeStateWhenLeaderHeartbeatOmitsIt(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	mergeState := &storedb.MergeState{}
+	mergeState.SetPhase(storedb.MergeState_PHASE_FINALIZING)
+	mergeState.SetDonorShardId(401)
+	mergeState.SetReceiverShardId(400)
+	mergeState.SetReceiverRangeStart([]byte{0x00})
+	mergeState.SetReceiverRangeEnd([]byte{0x80})
+	mergeState.SetDonorRangeStart([]byte{0x80})
+	mergeState.SetDonorRangeEnd([]byte{0xff})
+	mergeState.SetFinalSeq(7)
+
+	oldStatus := &store.ShardStatus{
+		ID:    types.ID(400),
+		Table: "docs",
+		State: store.ShardState_PreMerge,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0x80}},
+			},
+			Peers:      common.NewPeerSet(42),
+			ReportedBy: common.NewPeerSet(42),
+			RaftStatus: &common.RaftStatus{
+				Lead:   42,
+				Voters: common.NewPeerSet(42),
+			},
+			MergeState: mergeState,
+		},
+	}
+
+	newInfo := &store.ShardInfo{
+		ShardConfig: oldStatus.ShardConfig,
+		Peers:       common.NewPeerSet(42),
+		ReportedBy:  common.NewPeerSet(42),
+		RaftStatus: &common.RaftStatus{
+			Lead:   42,
+			Voters: common.NewPeerSet(42),
+		},
+		MergeState: nil,
+	}
+
+	newStatus, needsUpdate := tm.needsUpdates(oldStatus, newInfo)
+	require.NotNil(t, newStatus)
+	assert.False(t, needsUpdate)
+	require.NotNil(t, newStatus.MergeState)
+	assert.Equal(t, storedb.MergeState_PHASE_FINALIZING, newStatus.MergeState.GetPhase())
+	assert.Equal(t, uint64(401), newStatus.MergeState.GetDonorShardId())
+	assert.Equal(t, store.ShardState_PreMerge, newStatus.State)
+}
+
 func TestTableManager_ReassignShardsForMerge(t *testing.T) {
 	db := setupTestDB(t)
 

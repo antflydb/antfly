@@ -299,6 +299,7 @@ func (tm *TableManager) needsUpdates(
 	}
 	leaderClearedMergeState := oldShardStatus.MergeState != nil &&
 		oldShardStatus.MergeState.GetPhase() != db.MergeState_PHASE_NONE &&
+		oldShardStatus.State != store.ShardState_PreMerge &&
 		newShardInfo.MergeState == nil &&
 		newShardInfo.RaftStatus != nil &&
 		newShardInfo.RaftStatus.Lead != 0
