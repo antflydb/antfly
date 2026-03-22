@@ -24,6 +24,14 @@ import (
 	"github.com/antflydb/antfly/lib/vector"
 )
 
+type RerankPolicy string
+
+const (
+	RerankPolicyNever  RerankPolicy = "never"
+	RerankPolicyAuto   RerankPolicy = "auto"
+	RerankPolicyAlways RerankPolicy = "always"
+)
+
 type SearchRequest struct {
 	Embedding vector.T
 	K         int
@@ -42,6 +50,11 @@ type SearchRequest struct {
 	// Epsilon2, if set, overrides the index's configured Episilon2 for
 	// dynamic pruning.
 	Epsilon2 *float32 `json:"epsilon2,omitempty"`
+
+	// RerankPolicy controls whether exact distances are computed for the final
+	// candidates after approximate search.
+	// nil uses the index default.
+	RerankPolicy *RerankPolicy `json:"rerank_policy,omitempty"`
 
 	FilterPrefix []byte   `json:"filter_prefix,omitempty"`
 	ExcludeIDs   []uint64 `json:"exclude_ids,omitempty"`
@@ -82,12 +95,13 @@ type SearchResult struct {
 }
 
 type SearchHit struct {
-	NodeID   uint64         `json:"node_id,omitempty"`
-	Index    string         `json:"index,omitempty"`
-	ID       string         `json:"id,omitempty"`
-	Distance float32        `json:"distance,omitempty"`
-	Score    float32        `json:"score,omitempty"`
-	Fields   map[string]any `json:"fields,omitempty"`
+	NodeID     uint64         `json:"node_id,omitempty"`
+	Index      string         `json:"index,omitempty"`
+	ID         string         `json:"id,omitempty"`
+	Distance   float32        `json:"distance,omitempty"`
+	ErrorBound float32        `json:"error_bound,omitempty"`
+	Score      float32        `json:"score,omitempty"`
+	Fields     map[string]any `json:"fields,omitempty"`
 }
 
 func (sr *SearchResult) Merge(other *SearchResult) {
@@ -114,10 +128,11 @@ func SearchInContext(
 	hits := make([]*SearchHit, len(results))
 	for i, result := range results {
 		hits[i] = &SearchHit{
-			Index:    idx.Name(),
-			ID:       string(result.Metadata),
-			Distance: result.Distance,
-			NodeID:   result.ID,
+			Index:      idx.Name(),
+			ID:         string(result.Metadata),
+			Distance:   result.Distance,
+			ErrorBound: result.ErrorBound,
+			NodeID:     result.ID,
 		}
 	}
 	return &SearchResult{

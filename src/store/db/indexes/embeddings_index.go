@@ -485,6 +485,10 @@ func (s *EmbeddingIndex) Search(ctx context.Context, query any) (any, error) {
 			len(searchRequest.Embedding),
 		)
 	}
+	if searchRequest.RerankPolicy == nil {
+		policy := vectorindex.RerankPolicyAuto
+		searchRequest.RerankPolicy = &policy
+	}
 	s.resolveSearchEffort(searchRequest)
 	searchResult, err := vectorindex.SearchInContext(ctx, s.idx, searchRequest)
 	if err != nil {

@@ -2032,6 +2032,84 @@ func insertResultWithCollapse(
 	return true
 }
 
+func (idx *HBCIndex) resolveRerankPolicy(req *SearchRequest) RerankPolicy {
+	if !idx.config.UseQuantization || idx.config.DisableReranking {
+		return RerankPolicyNever
+	}
+	if req != nil && req.RerankPolicy != nil {
+		switch *req.RerankPolicy {
+		case RerankPolicyNever, RerankPolicyAuto, RerankPolicyAlways:
+			return *req.RerankPolicy
+		}
+	}
+	return RerankPolicyAlways
+}
+
+func resultMaybeCloser(r1 *Result, r2 *Result) bool {
+	return r1.Distance-r1.ErrorBound <= r2.Distance+r2.ErrorBound
+}
+
+func resultDefinitelyCloser(r1 *Result, r2 *Result) bool {
+	return r1.Distance+r1.ErrorBound < r2.Distance-r2.ErrorBound
+}
+
+func resultMaybeOver(r *Result, dist float32) bool {
+	return r.Distance+r.ErrorBound >= dist
+}
+
+func resultDefinitelyOver(r *Result, dist float32) bool {
+	return r.Distance-r.ErrorBound > dist
+}
+
+func resultMaybeUnder(r *Result, dist float32) bool {
+	return r.Distance-r.ErrorBound <= dist
+}
+
+func resultDefinitelyUnder(r *Result, dist float32) bool {
+	return r.Distance+r.ErrorBound < dist
+}
+
+func shouldAutoRerank(
+	results []*Result,
+	k int,
+	distanceOver *float32,
+	distanceUnder *float32,
+) bool {
+	limit := min(k, len(results))
+	if limit == 0 {
+		return false
+	}
+
+	for i := range limit {
+		res := results[i]
+		if distanceOver != nil && resultMaybeOver(res, *distanceOver) && !resultDefinitelyOver(res, *distanceOver) {
+			return true
+		}
+		if distanceUnder != nil && resultMaybeUnder(res, *distanceUnder) && !resultDefinitelyUnder(res, *distanceUnder) {
+			return true
+		}
+	}
+
+	for i := range limit {
+		for j := i + 1; j < limit; j++ {
+			if !resultDefinitelyCloser(results[i], results[j]) &&
+				!resultDefinitelyCloser(results[j], results[i]) {
+				return true
+			}
+		}
+	}
+
+	for i := range limit {
+		for j := limit; j < len(results); j++ {
+			if resultMaybeCloser(results[j], results[i]) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // Search finds k nearest neighbors
 func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 	defer func() {
@@ -2400,24 +2478,36 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 			Metadata:   metadata,
 			ErrorBound: item.ErrorBounds,
 		}
-		if idx.config.UseQuantization && !idx.config.DisableReranking {
-			res.Vector = make(vector.T, int(idx.config.Dimension))
-			var err error
-			if res.Vector, err = idx.GetVector(idx.indexDB, item.ID, res.Vector); err != nil {
-				// FIXME (ajr) Handle error properly
-				continue
-			}
-			// childDist = vector.MeasureDistance(idx.config.DistanceMetric, req.Embedding, vec)
-		}
 		finalResults = append(finalResults, res)
-	}
-	// Reverse the results to have the closest first
-	if idx.config.UseQuantization && !idx.config.DisableReranking {
-		q.ComputeExactDistances(true, finalResults)
 	}
 	slices.SortFunc(finalResults, func(a, b *Result) int {
 		return cmp.Compare(a.Distance, b.Distance)
 	})
+	rerankPolicy := idx.resolveRerankPolicy(req)
+	exactRerank := rerankPolicy == RerankPolicyAlways
+	if rerankPolicy == RerankPolicyAuto {
+		exactRerank = shouldAutoRerank(finalResults, req.K, req.DistanceOver, req.DistanceUnder)
+	}
+	if exactRerank {
+		exactResults := finalResults[:0]
+		for _, res := range finalResults {
+			res.Vector = make(vector.T, int(idx.config.Dimension))
+			var err error
+			if res.Vector, err = idx.GetVector(idx.indexDB, res.ID, res.Vector); err != nil {
+				// FIXME (ajr) Handle error properly
+				continue
+			}
+			exactResults = append(exactResults, res)
+		}
+		finalResults = exactResults
+		q.ComputeExactDistances(true, finalResults)
+		for _, res := range finalResults {
+			res.Vector = nil
+		}
+		slices.SortFunc(finalResults, func(a, b *Result) int {
+			return cmp.Compare(a.Distance, b.Distance)
+		})
+	}
 	if req.DistanceOver != nil {
 		// Trim results that don't satisfy the DistanceOver condition.
 		// Results are sorted ascending by distance, so find the first
