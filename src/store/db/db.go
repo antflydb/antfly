@@ -79,6 +79,10 @@ var (
 	splitDeltaSeqKey      = slices.Concat(MetadataPrefix, []byte("splitdelta:seq"))
 	splitDeltaFinalSeqKey = slices.Concat(MetadataPrefix, []byte("splitdelta:finalseq"))
 	splitDeltaPrefix      = slices.Concat(MetadataPrefix, []byte("splitdelta:entry:"))
+	mergeStateKey         = slices.Concat(MetadataPrefix, []byte("mergestate"))
+	mergeDeltaSeqKey      = slices.Concat(MetadataPrefix, []byte("mergedelta:seq"))
+	mergeDeltaFinalSeqKey = slices.Concat(MetadataPrefix, []byte("mergedelta:finalseq"))
+	mergeDeltaPrefix      = slices.Concat(MetadataPrefix, []byte("mergedelta:entry:"))
 
 	// DefaultPebbleCacheSizeMB is the default Pebble cache size per shard in megabytes.
 	// Tests can override this to reduce memory usage.
@@ -87,6 +91,11 @@ var (
 
 // CurrentStorageVersion defines the current storage format version
 const CurrentStorageVersion = 1
+
+// Op_SyncLevelInternalMergeCopy is reserved for internal merge copy/catch-up
+// batches. It behaves like SyncLevelWrite after proposal, but bypasses receiver
+// range checks while online merge data is being imported.
+const Op_SyncLevelInternalMergeCopy Op_SyncLevel = 99
 
 // Transaction status constants
 const (
@@ -264,12 +273,21 @@ type DB interface {
 	GetSplitState() *SplitState
 	SetSplitState(*SplitState) error
 	ClearSplitState() error
+	GetMergeState() *MergeState
+	SetMergeState(*MergeState) error
+	ClearMergeState() error
 	GetSplitDeltaSeq() (uint64, error)
 	GetSplitDeltaFinalSeq() (uint64, error)
 	SetSplitDeltaFinalSeq(uint64) error
 	ClearSplitDeltaFinalSeq() error
 	ListSplitDeltaEntriesAfter(afterSeq uint64) ([]*SplitDeltaEntry, error)
 	ClearSplitDeltaEntries() error
+	GetMergeDeltaSeq() (uint64, error)
+	GetMergeDeltaFinalSeq() (uint64, error)
+	SetMergeDeltaFinalSeq(uint64) error
+	ClearMergeDeltaFinalSeq() error
+	ListMergeDeltaEntriesAfter(afterSeq uint64) ([]*MergeDeltaEntry, error)
+	ClearMergeDeltaEntries() error
 	// Shadow IndexManager operations for shard splits
 	CreateShadowIndexManager(splitKey, originalRangeEnd []byte) error
 	CloseShadowIndexManager() error
@@ -278,6 +296,8 @@ type DB interface {
 	UpdateSchema(*schema.TableSchema) error
 	Get(ctx context.Context, key []byte) (map[string]any, error)
 	Scan(ctx context.Context, startKey, endKey []byte, scanOpts ScanOptions) (*ScanResult, error)
+	ExportRangeChunk(ctx context.Context, startKey, endKey, afterKey []byte, limit int) ([][2][]byte, []byte, bool, error)
+	DeleteDataRange(byteRange types.Range) error
 	// Batch must validate all keys fall within the currently owned byte range as messages might be replayed
 	// after a split or merge, the caller can assume the batch doesn't contain overlapping updates
 	// syncLevel controls when to return: Propose (after raft proposal), Write (after KV write), FullText (after full-text index WAL)
@@ -348,6 +368,9 @@ type DBImpl struct {
 	splitState         *SplitState // Raft-replicated split state (replaces local pendingSplitKey)
 	splitDeltaSeq      uint64
 	splitDeltaFinalSeq uint64
+	mergeState         *MergeState
+	mergeDeltaSeq      uint64
+	mergeDeltaFinalSeq uint64
 	schema             *schema.TableSchema
 	cachedTTLDuration  time.Duration // Parsed from schema.TtlDuration; 0 means no TTL
 
@@ -593,6 +616,10 @@ func (db *DBImpl) GetSplitState() *SplitState {
 	return db.splitState
 }
 
+func (db *DBImpl) GetMergeState() *MergeState {
+	return db.mergeState
+}
+
 // SetSplitState persists the split state to Pebble and updates the in-memory state.
 // This is called after Raft commits a SetSplitStateOp.
 func (db *DBImpl) SetSplitState(state *SplitState) error {
@@ -628,6 +655,37 @@ func (db *DBImpl) ClearSplitState() error {
 	return nil
 }
 
+func (db *DBImpl) SetMergeState(state *MergeState) error {
+	if state == nil {
+		return db.ClearMergeState()
+	}
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	data, err := proto.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshaling merge state: %w", err)
+	}
+	if err := pdb.Set(mergeStateKey, data, pebble.Sync); err != nil {
+		return fmt.Errorf("saving merge state: %w", err)
+	}
+	db.mergeState = state
+	return nil
+}
+
+func (db *DBImpl) ClearMergeState() error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	if err := pdb.Delete(mergeStateKey, pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return fmt.Errorf("deleting merge state: %w", err)
+	}
+	db.mergeState = nil
+	return nil
+}
+
 // loadSplitState loads the split state from Pebble into memory.
 // This is called during Open() to restore split state across restarts.
 func (db *DBImpl) loadSplitState() error {
@@ -657,6 +715,21 @@ func isActiveSplitPhase(state *SplitState) bool {
 		(state.GetPhase() == SplitState_PHASE_PREPARE || state.GetPhase() == SplitState_PHASE_SPLITTING)
 }
 
+func isActiveMergePhase(state *MergeState) bool {
+	if state == nil {
+		return false
+	}
+	switch state.GetPhase() {
+	case MergeState_PHASE_PREPARE,
+		MergeState_PHASE_COPYING,
+		MergeState_PHASE_CATCHUP,
+		MergeState_PHASE_FINALIZING:
+		return true
+	default:
+		return false
+	}
+}
+
 func isKeyInSplitOffRangeForState(key []byte, state *SplitState) bool {
 	if !isActiveSplitPhase(state) {
 		return false
@@ -673,8 +746,43 @@ func isKeyOwnedDuringSplit(key []byte, byteRange types.Range, state *SplitState)
 	return byteRange.Contains(key) || isKeyInSplitOffRangeForState(key, state)
 }
 
+func isKeyInMergeDonorRangeForState(key []byte, state *MergeState) bool {
+	if !isActiveMergePhase(state) || !state.GetAcceptDonorRange() {
+		return false
+	}
+	start := state.GetDonorRangeStart()
+	end := state.GetDonorRangeEnd()
+	if bytes.Compare(key, start) < 0 {
+		return false
+	}
+	return len(end) == 0 || bytes.Compare(key, end) < 0
+}
+
+func shouldRejectDonorWriteDuringFinalize(key []byte, state *MergeState) bool {
+	if state == nil || !state.GetDenyDonorWrites() {
+		return false
+	}
+	start := state.GetDonorRangeStart()
+	end := state.GetDonorRangeEnd()
+	if bytes.Compare(key, start) < 0 {
+		return false
+	}
+	return len(end) == 0 || bytes.Compare(key, end) < 0
+}
+
+func isKeyOwnedDuringMerge(key []byte, byteRange types.Range, state *MergeState) bool {
+	if shouldRejectDonorWriteDuringFinalize(key, state) {
+		return false
+	}
+	return byteRange.Contains(key) || isKeyInMergeDonorRangeForState(key, state)
+}
+
 func splitDeltaEntryKey(seq uint64) []byte {
 	return slices.Concat(splitDeltaPrefix, encoding.EncodeUint64Ascending(nil, seq))
+}
+
+func mergeDeltaEntryKey(seq uint64) []byte {
+	return slices.Concat(mergeDeltaPrefix, encoding.EncodeUint64Ascending(nil, seq))
 }
 
 func decodeStoredUint64(data []byte) (uint64, error) {
@@ -694,6 +802,14 @@ func (db *DBImpl) GetSplitDeltaSeq() (uint64, error) {
 
 func (db *DBImpl) GetSplitDeltaFinalSeq() (uint64, error) {
 	return db.splitDeltaFinalSeq, nil
+}
+
+func (db *DBImpl) GetMergeDeltaSeq() (uint64, error) {
+	return db.mergeDeltaSeq, nil
+}
+
+func (db *DBImpl) GetMergeDeltaFinalSeq() (uint64, error) {
+	return db.mergeDeltaFinalSeq, nil
 }
 
 func (db *DBImpl) SetSplitDeltaFinalSeq(seq uint64) error {
@@ -718,6 +834,31 @@ func (db *DBImpl) ClearSplitDeltaFinalSeq() error {
 		return fmt.Errorf("deleting split delta final seq: %w", err)
 	}
 	db.splitDeltaFinalSeq = 0
+	return nil
+}
+
+func (db *DBImpl) SetMergeDeltaFinalSeq(seq uint64) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	encoded := encoding.EncodeUint64Ascending(nil, seq)
+	if err := pdb.Set(mergeDeltaFinalSeqKey, encoded, pebble.Sync); err != nil {
+		return fmt.Errorf("saving merge delta final seq: %w", err)
+	}
+	db.mergeDeltaFinalSeq = seq
+	return nil
+}
+
+func (db *DBImpl) ClearMergeDeltaFinalSeq() error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	if err := pdb.Delete(mergeDeltaFinalSeqKey, pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return fmt.Errorf("deleting merge delta final seq: %w", err)
+	}
+	db.mergeDeltaFinalSeq = 0
 	return nil
 }
 
@@ -775,6 +916,60 @@ func (db *DBImpl) ClearSplitDeltaEntries() error {
 	return nil
 }
 
+func (db *DBImpl) ListMergeDeltaEntriesAfter(afterSeq uint64) ([]*MergeDeltaEntry, error) {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, pebble.ErrClosed
+	}
+	lowerBound := mergeDeltaEntryKey(afterSeq + 1)
+	upperBound := utils.PrefixSuccessor(mergeDeltaPrefix)
+	iter, err := pdb.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating merge delta iterator: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	entries := make([]*MergeDeltaEntry, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		entry := &MergeDeltaEntry{}
+		if err := proto.Unmarshal(iter.Value(), entry); err != nil {
+			return nil, fmt.Errorf("unmarshaling merge delta entry: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterating merge delta entries: %w", err)
+	}
+	return entries, nil
+}
+
+func (db *DBImpl) ClearMergeDeltaEntries() error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	batch := pdb.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.DeleteRange(mergeDeltaPrefix, utils.PrefixSuccessor(mergeDeltaPrefix), nil); err != nil {
+		return fmt.Errorf("clearing merge delta entries: %w", err)
+	}
+	if err := batch.Delete(mergeDeltaSeqKey, nil); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return fmt.Errorf("clearing merge delta sequence: %w", err)
+	}
+	if err := batch.Delete(mergeDeltaFinalSeqKey, nil); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return fmt.Errorf("clearing merge delta final sequence: %w", err)
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("committing merge delta clear: %w", err)
+	}
+	db.mergeDeltaSeq = 0
+	db.mergeDeltaFinalSeq = 0
+	return nil
+}
+
 func (db *DBImpl) appendSplitDelta(batch *pebble.Batch, writes [][2][]byte, deletes [][]byte, timestamp uint64) error {
 	if len(writes) == 0 && len(deletes) == 0 {
 		return nil
@@ -796,6 +991,31 @@ func (db *DBImpl) appendSplitDelta(batch *pebble.Batch, writes [][2][]byte, dele
 	encodedSeq := encoding.EncodeUint64Ascending(nil, db.splitDeltaSeq)
 	if err := batch.Set(splitDeltaSeqKey, encodedSeq, nil); err != nil {
 		return fmt.Errorf("writing split delta sequence: %w", err)
+	}
+	return nil
+}
+
+func (db *DBImpl) appendMergeDelta(batch *pebble.Batch, writes [][2][]byte, deletes [][]byte, timestamp uint64) error {
+	if len(writes) == 0 && len(deletes) == 0 {
+		return nil
+	}
+	db.mergeDeltaSeq++
+	entry := MergeDeltaEntry_builder{
+		Sequence:  db.mergeDeltaSeq,
+		Timestamp: timestamp,
+		Writes:    WritesFromTuples(writes),
+		Deletes:   deletes,
+	}.Build()
+	data, err := proto.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("marshaling merge delta entry: %w", err)
+	}
+	if err := batch.Set(mergeDeltaEntryKey(db.mergeDeltaSeq), data, nil); err != nil {
+		return fmt.Errorf("writing merge delta entry: %w", err)
+	}
+	encodedSeq := encoding.EncodeUint64Ascending(nil, db.mergeDeltaSeq)
+	if err := batch.Set(mergeDeltaSeqKey, encodedSeq, nil); err != nil {
+		return fmt.Errorf("writing merge delta sequence: %w", err)
 	}
 	return nil
 }
@@ -2579,6 +2799,11 @@ func (db *DBImpl) Batch(
 ) (err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
 
+	internalMergeCopy := syncLevel == Op_SyncLevelInternalMergeCopy
+	if internalMergeCopy {
+		syncLevel = Op_SyncLevelWrite
+	}
+
 	pdb := db.getPDB()
 	if pdb == nil {
 		return pebble.ErrClosed
@@ -2587,6 +2812,7 @@ func (db *DBImpl) Batch(
 	// Get HLC timestamp from context (set by metadata layer for consistent timestamps)
 	timestamp := storeutils.GetTimestampFromContext(ctx)
 	splitState := db.splitState
+	mergeState := db.mergeState
 
 	// TODO (ajr) Add size hint for big batches?
 	batch := pdb.NewBatch()
@@ -2605,9 +2831,16 @@ func (db *DBImpl) Batch(
 	allEdgeDeletes := make([][]byte, 0)
 	splitDeltaWrites := make([][2][]byte, 0, len(writes))
 	splitDeltaDeletes := make([][]byte, 0, len(deletes))
+	mergeDeltaWrites := make([][2][]byte, 0, len(writes))
+	mergeDeltaDeletes := make([][]byte, 0, len(deletes))
 
 	for _, kv := range writes {
-		if !isKeyOwnedDuringSplit(kv[0], db.byteRange, splitState) {
+		ownedByApplyRange := isKeyOwnedDuringSplit(kv[0], db.byteRange, splitState)
+		if isKeyInMergeDonorRangeForState(kv[0], mergeState) {
+			ownedByApplyRange = true
+		}
+		if !internalMergeCopy &&
+			!(ownedByApplyRange && isKeyOwnedDuringMerge(kv[0], db.byteRange, mergeState)) {
 			// This can happen during a shard split when a write was committed to Raft
 			// just before the split operation was applied. The write is skipped because
 			// the key is now outside this shard's range.
@@ -2621,6 +2854,11 @@ func (db *DBImpl) Batch(
 		}
 		if isKeyInSplitOffRangeForState(kv[0], splitState) {
 			splitDeltaWrites = append(splitDeltaWrites, kv)
+		}
+		if mergeState != nil && mergeState.GetCaptureDeltas() &&
+			bytes.Compare(kv[0], mergeState.GetDonorRangeStart()) >= 0 &&
+			(len(mergeState.GetDonorRangeEnd()) == 0 || bytes.Compare(kv[0], mergeState.GetDonorRangeEnd()) < 0) {
+			mergeDeltaWrites = append(mergeDeltaWrites, kv)
 		}
 
 		if bytes.HasSuffix(kv[0], EmbeddingSuffix) {
@@ -2776,11 +3014,21 @@ func (db *DBImpl) Batch(
 	// Collect edge keys for deletion (so edge index can be updated)
 
 	for _, k := range deletes {
-		if !isKeyOwnedDuringSplit(k, db.byteRange, splitState) {
+		ownedByApplyRange := isKeyOwnedDuringSplit(k, db.byteRange, splitState)
+		if isKeyInMergeDonorRangeForState(k, mergeState) {
+			ownedByApplyRange = true
+		}
+		if !internalMergeCopy &&
+			!(ownedByApplyRange && isKeyOwnedDuringMerge(k, db.byteRange, mergeState)) {
 			continue
 		}
 		if isKeyInSplitOffRangeForState(k, splitState) {
 			splitDeltaDeletes = append(splitDeltaDeletes, k)
+		}
+		if mergeState != nil && mergeState.GetCaptureDeltas() &&
+			bytes.Compare(k, mergeState.GetDonorRangeStart()) >= 0 &&
+			(len(mergeState.GetDonorRangeEnd()) == 0 || bytes.Compare(k, mergeState.GetDonorRangeEnd()) < 0) {
+			mergeDeltaDeletes = append(mergeDeltaDeletes, k)
 		}
 
 		// Scan for outgoing edges before deleting the document
@@ -2818,6 +3066,9 @@ func (db *DBImpl) Batch(
 	deleteOps.WithLabelValues().Add(float64(numDeletes))
 	if err := db.appendSplitDelta(batch, splitDeltaWrites, splitDeltaDeletes, timestamp); err != nil {
 		return fmt.Errorf("appending split delta entry: %w", err)
+	}
+	if err := db.appendMergeDelta(batch, mergeDeltaWrites, mergeDeltaDeletes, timestamp); err != nil {
+		return fmt.Errorf("appending merge delta entry: %w", err)
 	}
 	if err := pdb.Apply(batch, pebble.Sync); err != nil {
 		return fmt.Errorf("could not set key: %w", err)
@@ -4364,6 +4615,13 @@ func (db *DBImpl) loadMetadata() error {
 			}
 			db.splitState = splitState
 
+		case bytes.Equal(key, mergeStateKey):
+			mergeState := &MergeState{}
+			if err := proto.Unmarshal(value, mergeState); err != nil {
+				return fmt.Errorf("unmarshaling merge state: %w", err)
+			}
+			db.mergeState = mergeState
+
 		case bytes.Equal(key, splitDeltaSeqKey):
 			seq, err := decodeStoredUint64(value)
 			if err != nil {
@@ -4377,6 +4635,20 @@ func (db *DBImpl) loadMetadata() error {
 				return fmt.Errorf("decoding split delta final seq: %w", err)
 			}
 			db.splitDeltaFinalSeq = seq
+
+		case bytes.Equal(key, mergeDeltaSeqKey):
+			seq, err := decodeStoredUint64(value)
+			if err != nil {
+				return fmt.Errorf("decoding merge delta seq: %w", err)
+			}
+			db.mergeDeltaSeq = seq
+
+		case bytes.Equal(key, mergeDeltaFinalSeqKey):
+			seq, err := decodeStoredUint64(value)
+			if err != nil {
+				return fmt.Errorf("decoding merge delta final seq: %w", err)
+			}
+			db.mergeDeltaFinalSeq = seq
 
 		case bytes.Equal(key, indexesKey):
 			var indexes map[string]indexes.IndexConfig
@@ -4666,6 +4938,93 @@ func (db *DBImpl) Scan(
 	}
 
 	return result, nil
+}
+
+func (db *DBImpl) ExportRangeChunk(
+	ctx context.Context,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	if limit <= 0 {
+		limit = 256
+	}
+	pdb := db.getPDB()
+	if pdb == nil {
+		return nil, nil, false, pebble.ErrClosed
+	}
+
+	var lowerBound []byte
+	if len(afterKey) > 0 {
+		lowerBound = storeutils.KeyRangeEnd(afterKey)
+	} else {
+		lowerBound = storeutils.KeyRangeStart(startKey)
+	}
+	upperBound := storeutils.KeyRangeStart(endKey)
+	iter, err := pdb.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("creating export iterator: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	writes := make([][2][]byte, 0, limit)
+	var nextKey []byte
+	done := true
+	for iter.First(); iter.Valid(); iter.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, nil, false, ctx.Err()
+		default:
+		}
+		key := iter.Key()
+		if bytes.HasPrefix(key, storeutils.MetadataPrefix) || !bytes.HasSuffix(key, storeutils.DBRangeStart) {
+			continue
+		}
+		userKey := bytes.Clone(key[:len(key)-len(storeutils.DBRangeStart)])
+		doc, err := storeutils.DecodeDocumentJSON(iter.Value())
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("decoding export document %s: %w", types.FormatKey(userKey), err)
+		}
+		docBytes, err := json.Marshal(doc)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("marshaling export document %s: %w", types.FormatKey(userKey), err)
+		}
+		writes = append(writes, [2][]byte{userKey, docBytes})
+		nextKey = userKey
+		if len(writes) == limit {
+			done = false
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, nil, false, fmt.Errorf("iterating export range: %w", err)
+	}
+	return writes, nextKey, done, nil
+}
+
+func (db *DBImpl) DeleteDataRange(byteRange types.Range) error {
+	pdb := db.getPDB()
+	if pdb == nil {
+		return pebble.ErrClosed
+	}
+	if err := db.pruneIndexesForRange(context.Background(), byteRange); err != nil {
+		return fmt.Errorf("pruning indexes for delete range %s: %w", byteRange, err)
+	}
+	batch := pdb.NewBatch()
+	defer func() { _ = batch.Close() }()
+	end := byteRange[1]
+	if len(end) == 0 {
+		end = types.RangeEndSentinel
+	}
+	if err := batch.DeleteRange(byteRange[0], end, nil); err != nil {
+		return fmt.Errorf("deleting range %s: %w", byteRange, err)
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("committing delete range %s: %w", byteRange, err)
+	}
+	return nil
 }
 
 // ComputeDocumentHash computes a deterministic hash of a document's content.

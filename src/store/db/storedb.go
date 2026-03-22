@@ -57,9 +57,10 @@ type StoreDB struct {
 	dbDir           string
 	coreDB          DB
 	byteRange       types.Range
-	byteRangeMu     sync.RWMutex // protects byteRange, pendingSplitKey, and splitState
+	byteRangeMu     sync.RWMutex // protects byteRange, pendingSplitKey, splitState, and mergeState
 	pendingSplitKey []byte       // set during split to reject writes in split-off range
 	splitState      *SplitState  // Raft-replicated split state (loaded from Pebble on startup)
+	mergeState      *MergeState  // Raft-replicated merge state (loaded from Pebble on startup)
 	schema          *schema.TableSchema
 	snapStore       snapstore.SnapStore
 	antflyConfig    *common.Config
@@ -170,6 +171,13 @@ func NewStoreDB(
 			zap.Binary("splitKey", s.splitState.GetSplitKey()),
 			zap.Uint64("newShardID", s.splitState.GetNewShardId()))
 	}
+	s.mergeState = s.coreDB.GetMergeState()
+	if s.mergeState != nil {
+		s.logger.Info("Loaded merge state from Pebble",
+			zap.Int32("phase", int32(s.mergeState.GetPhase())),
+			zap.Uint64("donorShardID", s.mergeState.GetDonorShardId()),
+			zap.Uint64("receiverShardID", s.mergeState.GetReceiverShardId()))
+	}
 	if err := s.startSplitReplayIfNeeded(); err != nil {
 		s.proposalQueue.Close()
 		return nil, fmt.Errorf("starting split replay: %w", err)
@@ -185,10 +193,12 @@ func (s *StoreDB) LeaderFactory(ctx context.Context) error {
 		s.byteRangeMu.RLock()
 		byteRange := s.byteRange
 		splitState := s.splitState
+		mergeState := s.mergeState
 		s.byteRangeMu.RUnlock()
 
 		for _, w := range writes {
-			if !isKeyOwnedDuringSplit(w[0], byteRange, splitState) {
+			if !isKeyOwnedDuringSplit(w[0], byteRange, splitState) ||
+				!isKeyOwnedDuringMerge(w[0], byteRange, mergeState) {
 				return common.NewErrKeyOutOfRange(w[0], byteRange)
 			}
 
@@ -258,6 +268,14 @@ func (s *StoreDB) DeleteIndex(ctx context.Context, name string) error {
 }
 
 func (s *StoreDB) Batch(ctx context.Context, batch *BatchOp) error {
+	return s.applyBatch(ctx, batch, false)
+}
+
+func (s *StoreDB) ApplyMergeChunk(ctx context.Context, batch *BatchOp) error {
+	return s.applyBatch(ctx, batch, true)
+}
+
+func (s *StoreDB) applyBatch(ctx context.Context, batch *BatchOp, skipRangeValidation bool) error {
 	// TODO (ajr) We have multiple levels of validation for keys in the range, how many do we need?
 	// Use sync_level from the BatchOp (clients set this)
 	syncLevel := batch.GetSyncLevel()
@@ -280,9 +298,15 @@ func (s *StoreDB) Batch(ctx context.Context, batch *BatchOp) error {
 	}
 
 	if syncLevel == Op_SyncLevelPropose {
+		if skipRangeValidation {
+			return s.syncWriteOpWithoutValidation(ctx, NewBatchOp(batch))
+		}
 		return s.proposalEnqueuer(ctx, batch)
 	}
 	// For Write, FullText, and Aknn levels, wait for commit
+	if skipRangeValidation {
+		return s.syncWriteOpWithoutValidation(ctx, NewBatchOp(batch))
+	}
 	return s.syncWriteOp(ctx, NewBatchOp(batch))
 }
 
@@ -440,6 +464,12 @@ func (s *StoreDB) GetSplitState() *SplitState {
 	s.byteRangeMu.RLock()
 	defer s.byteRangeMu.RUnlock()
 	return s.splitState
+}
+
+func (s *StoreDB) GetMergeState() *MergeState {
+	s.byteRangeMu.RLock()
+	defer s.byteRangeMu.RUnlock()
+	return s.mergeState
 }
 
 func (s *StoreDB) IsInitializing() bool {
@@ -647,6 +677,23 @@ func (s *StoreDB) setSplitState(state *SplitState) {
 	s.splitState = state
 }
 
+func (s *StoreDB) setMergeState(state *MergeState) {
+	s.mergeState = state
+}
+
+func (s *StoreDB) SetMergeState(ctx context.Context, state *MergeState) error {
+	return s.proposeMergeStateChange(ctx, state)
+}
+
+func (s *StoreDB) proposeMergeStateChange(ctx context.Context, state *MergeState) error {
+	kvOp := &Op{}
+	kvOp.SetOp(Op_OpSetMergeState)
+	kvOp.SetSetMergeState(SetMergeStateOp_builder{
+		State: state,
+	}.Build())
+	return s.syncWriteOp(ctx, kvOp)
+}
+
 func (s *StoreDB) Split(ctx context.Context, newShardID uint64, splitKey []byte) error {
 	s.byteRangeMu.RLock()
 	byteRange := s.byteRange
@@ -748,29 +795,44 @@ func isInSplitOffRange(key, splitKey []byte) bool {
 }
 
 // ValidateBatchKeys checks that all keys in the batch are within the current
-// shard ownership. During PREPARE/SPLITTING, the parent shard temporarily
-// continues to own writes in the split-off range until cutover/finalize.
-func ValidateBatchKeys(batch *BatchOp, byteRange types.Range, splitState *SplitState) error {
+// shard ownership. During active split or merge phases, the shard may
+// temporarily accept an additional range or reject a sealed donor range.
+func ValidateBatchKeys(
+	batch *BatchOp,
+	byteRange types.Range,
+	splitState *SplitState,
+	mergeStates ...*MergeState,
+) error {
+	var mergeState *MergeState
+	if len(mergeStates) > 0 {
+		mergeState = mergeStates[0]
+	}
 	for _, write := range batch.GetWrites() {
-		if err := validateKey(write.GetKey(), byteRange, splitState); err != nil {
+		if err := validateKey(write.GetKey(), byteRange, splitState, mergeState); err != nil {
 			return err
 		}
 	}
 	for _, del := range batch.GetDeletes() {
-		if err := validateKey(del, byteRange, splitState); err != nil {
+		if err := validateKey(del, byteRange, splitState, mergeState); err != nil {
 			return err
 		}
 	}
 	for _, transform := range batch.GetTransforms() {
-		if err := validateKey(transform.GetKey(), byteRange, splitState); err != nil {
+		if err := validateKey(transform.GetKey(), byteRange, splitState, mergeState); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateKey(key []byte, byteRange types.Range, splitState *SplitState) error {
-	if !isKeyOwnedDuringSplit(key, byteRange, splitState) {
+func validateKey(
+	key []byte,
+	byteRange types.Range,
+	splitState *SplitState,
+	mergeState *MergeState,
+) error {
+	if !isKeyOwnedDuringSplit(key, byteRange, splitState) ||
+		!isKeyOwnedDuringMerge(key, byteRange, mergeState) {
 		return common.NewErrKeyOutOfRange(key, byteRange)
 	}
 	return nil
@@ -792,6 +854,7 @@ func (s *StoreDB) proposalDequeuer(ctx context.Context) error {
 		s.byteRangeMu.RLock()
 		byteRange := s.byteRange
 		splitState := s.splitState
+		mergeState := s.mergeState
 
 		for _, op := range ops {
 			data, ok := op.Data.(*proposal)
@@ -806,7 +869,7 @@ func (s *StoreDB) proposalDequeuer(ctx context.Context) error {
 			default:
 			}
 
-			if err := ValidateBatchKeys(data.batch, byteRange, splitState); err != nil {
+			if err := ValidateBatchKeys(data.batch, byteRange, splitState, mergeState); err != nil {
 				data.done <- err
 				continue
 			}
@@ -852,7 +915,7 @@ func (s *StoreDB) syncWriteOp(ctx context.Context, data *Op) error {
 	s.byteRangeMu.RLock()
 
 	if batch := data.GetBatch(); batch != nil {
-		if err := ValidateBatchKeys(batch, s.byteRange, s.splitState); err != nil {
+		if err := ValidateBatchKeys(batch, s.byteRange, s.splitState, s.mergeState); err != nil {
 			s.byteRangeMu.RUnlock()
 			return err
 		}
@@ -863,6 +926,26 @@ func (s *StoreDB) syncWriteOp(ctx context.Context, data *Op) error {
 	s.byteRangeMu.RUnlock()
 
 	if err != nil {
+		return fmt.Errorf("proposing data to raft: %w", err)
+	}
+
+	return s.proposer.WaitForCommit(ctx, commitDoneC)
+}
+
+func (s *StoreDB) syncWriteOpWithoutValidation(ctx context.Context, data *Op) error {
+	id := uuid.New()
+	commitDoneC := s.proposer.RegisterCallback(id)
+	defer s.proposer.UnregisterCallback(id)
+
+	i := id.String()
+	data.SetUuid(i)
+	proposed, err := EncodeProto(data)
+	if err != nil {
+		s.logger.Error("Failed to encode data for proposal", zap.Error(err))
+		return fmt.Errorf("encoding data for proposal: %w", err)
+	}
+
+	if err := s.proposer.ProposeOnly(ctx, proposed); err != nil {
 		return fmt.Errorf("proposing data to raft: %w", err)
 	}
 
@@ -1350,6 +1433,20 @@ func newFinalizeSplitOp(newRangeEnd []byte) *Op {
 	return kvOp
 }
 
+func newFinalizeMergeOp(newRange types.Range) *Op {
+	kvOp := &Op{}
+	kvOp.SetOp(Op_OpFinalizeMerge)
+	kvOp.SetFinalizeMerge(FinalizeMergeOp_builder{
+		NewRangeStart: newRange[0],
+		NewRangeEnd:   newRange[1],
+	}.Build())
+	return kvOp
+}
+
+func (s *StoreDB) FinalizeMerge(ctx context.Context, newRange types.Range) error {
+	return s.syncWriteOp(ctx, newFinalizeMergeOp(newRange))
+}
+
 func (s *StoreDB) waitForLocalSplitChildReplay(newShardID types.ID, targetSeq uint64) error {
 	if targetSeq == 0 || s.localSplitSourceLookup == nil {
 		return nil
@@ -1585,6 +1682,71 @@ func (s *StoreDB) applyOpSetSplitState(_ context.Context, op *SetSplitStateOp) e
 			zap.Uint64("newShardId", state.GetNewShardId()))
 	}
 
+	return nil
+}
+
+func (s *StoreDB) applyOpSetMergeState(_ context.Context, op *SetMergeStateOp) error {
+	if op == nil {
+		return errors.New("set merge state operation data is nil")
+	}
+	state := op.GetState()
+	if err := s.coreDB.SetMergeState(state); err != nil {
+		return fmt.Errorf("persisting merge state: %w", err)
+	}
+
+	s.byteRangeMu.Lock()
+	s.setMergeState(state)
+	s.byteRangeMu.Unlock()
+
+	switch {
+	case state == nil:
+		if err := s.coreDB.ClearMergeDeltaFinalSeq(); err != nil {
+			s.logger.Warn("Failed to clear merge delta final seq on state clear", zap.Error(err))
+		}
+	case state.GetPhase() == MergeState_PHASE_PREPARE && state.GetCaptureDeltas():
+		if err := s.coreDB.ClearMergeDeltaEntries(); err != nil {
+			s.logger.Warn("Failed to clear merge delta entries on PREPARE", zap.Error(err))
+		}
+	case state.GetPhase() == MergeState_PHASE_ROLLING_BACK && state.GetAcceptDonorRange():
+		deleteRange := types.Range{state.GetDonorRangeStart(), state.GetDonorRangeEnd()}
+		if err := s.coreDB.DeleteDataRange(deleteRange); err != nil {
+			return fmt.Errorf("rolling back merge receiver range %s: %w", deleteRange, err)
+		}
+	}
+
+	if state == nil {
+		s.logger.Info("Merge state cleared via Raft")
+	} else {
+		s.logger.Info("Merge state updated via Raft",
+			zap.String("phase", state.GetPhase().String()),
+			zap.Uint64("donorShardId", state.GetDonorShardId()),
+			zap.Uint64("receiverShardId", state.GetReceiverShardId()),
+			zap.Bool("captureDeltas", state.GetCaptureDeltas()),
+			zap.Bool("acceptDonorRange", state.GetAcceptDonorRange()),
+			zap.Uint64("replaySeq", state.GetReplaySeq()),
+			zap.Uint64("finalSeq", state.GetFinalSeq()))
+	}
+	return nil
+}
+
+func (s *StoreDB) applyOpFinalizeMerge(_ context.Context, finalize *FinalizeMergeOp) error {
+	if finalize == nil {
+		return errors.New("finalize merge operation data is nil")
+	}
+	newRange := types.Range{finalize.GetNewRangeStart(), finalize.GetNewRangeEnd()}
+	if err := s.coreDB.SetRange(newRange); err != nil {
+		return fmt.Errorf("persisting merge receiver range: %w", err)
+	}
+	if err := s.coreDB.ClearMergeState(); err != nil {
+		return fmt.Errorf("clearing merge state after finalize: %w", err)
+	}
+	if err := s.coreDB.ClearMergeDeltaEntries(); err != nil {
+		s.logger.Warn("Failed to clear merge delta entries after finalize", zap.Error(err))
+	}
+	s.byteRangeMu.Lock()
+	s.byteRange = newRange
+	s.setMergeState(nil)
+	s.byteRangeMu.Unlock()
 	return nil
 }
 
@@ -1837,6 +1999,20 @@ func (s *StoreDB) readCommits(
 				)
 				flushBatch()
 				s.maybeCallback(id, s.applyOpSetSplitState(ctx, dataKv.GetSetSplitState()))
+			case Op_OpFinalizeMerge:
+				s.logger.Debug(
+					"Applying finalize merge operation",
+					zap.String("op", dataKv.GetOp().String()),
+				)
+				flushBatch()
+				s.maybeCallback(id, s.applyOpFinalizeMerge(ctx, dataKv.GetFinalizeMerge()))
+			case Op_OpSetMergeState:
+				s.logger.Debug(
+					"Applying set merge state operation",
+					zap.String("op", dataKv.GetOp().String()),
+				)
+				flushBatch()
+				s.maybeCallback(id, s.applyOpSetMergeState(ctx, dataKv.GetSetMergeState()))
 			default:
 				err := fmt.Errorf("unsupported operation: %v", dataKv.GetOp())
 				s.maybeCallback(id, err)
@@ -1995,6 +2171,26 @@ func (s *StoreDB) Scan(
 	opts ScanOptions,
 ) (*ScanResult, error) {
 	return s.coreDB.Scan(ctx, fromKey, toKey, opts)
+}
+
+func (s *StoreDB) ExportRangeChunk(
+	ctx context.Context,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	return s.coreDB.ExportRangeChunk(ctx, startKey, endKey, afterKey, limit)
+}
+
+func (s *StoreDB) GetMergeDeltaSeq() (uint64, error) {
+	return s.coreDB.GetMergeDeltaSeq()
+}
+
+func (s *StoreDB) GetMergeDeltaFinalSeq() (uint64, error) {
+	return s.coreDB.GetMergeDeltaFinalSeq()
+}
+
+func (s *StoreDB) ListMergeDeltaEntriesAfter(afterSeq uint64) ([]*MergeDeltaEntry, error) {
+	return s.coreDB.ListMergeDeltaEntriesAfter(afterSeq)
 }
 
 func (s *StoreDB) IsSplitting() bool {

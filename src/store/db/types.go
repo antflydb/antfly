@@ -110,6 +110,8 @@ type ShardInfo struct {
 	// SplitState contains the Raft-replicated split state for zero-downtime splits.
 	// This is populated from the shard's internal state during status reporting.
 	SplitState *SplitState `json:"split_state,omitempty"`
+	// MergeState contains the Raft-replicated merge state for online merges.
+	MergeState *MergeState `json:"merge_state,omitempty"`
 	// SplitReplayRequired indicates that this shard was created from a split archive and
 	// must catch up parent-side split deltas before it is considered ready.
 	SplitReplayRequired bool `json:"split_replay_required,omitempty,omitzero"`
@@ -123,6 +125,10 @@ type ShardInfo struct {
 	SplitReplaySeq uint64 `json:"split_replay_seq,omitempty,omitzero"`
 	// SplitParentShardID is the parent shard that produced this split child archive.
 	SplitParentShardID types.ID `json:"split_parent_shard_id,omitempty,omitzero"`
+	// MergeDeltaSeq is the latest donor-side merge delta sequence.
+	MergeDeltaSeq uint64 `json:"merge_delta_seq,omitempty,omitzero"`
+	// MergeDeltaFinalSeq is the donor-side cutover fence sequence, if one has been sealed.
+	MergeDeltaFinalSeq uint64 `json:"merge_delta_final_seq,omitempty,omitzero"`
 }
 
 // IsReadyForSplitReads returns true when a split-off shard can serve reads directly:
@@ -146,6 +152,15 @@ func (s *ShardInfo) CanInitiateSplitCutover() bool {
 		(!s.SplitReplayRequired || s.SplitReplayCaughtUp)
 }
 
+func (s *ShardInfo) IsReadyForMergeCutover() bool {
+	return s != nil &&
+		!s.Initializing &&
+		s.RaftStatus != nil && s.RaftStatus.Lead != 0 &&
+		s.MergeState != nil &&
+		s.MergeState.GetCopyCompleted() &&
+		s.MergeState.GetReplaySeq() >= s.MergeState.GetFinalSeq()
+}
+
 func (s *ShardInfo) Equal(o *ShardInfo) bool {
 	// We don't care about shard stats for equality checks.
 	if s == nil || o == nil {
@@ -158,7 +173,9 @@ func (s *ShardInfo) Equal(o *ShardInfo) bool {
 		s.SplitReplayCaughtUp == o.SplitReplayCaughtUp &&
 		s.SplitCutoverReady == o.SplitCutoverReady &&
 		s.SplitReplaySeq == o.SplitReplaySeq &&
-		s.SplitParentShardID == o.SplitParentShardID
+		s.SplitParentShardID == o.SplitParentShardID &&
+		s.MergeDeltaSeq == o.MergeDeltaSeq &&
+		s.MergeDeltaFinalSeq == o.MergeDeltaFinalSeq
 }
 
 func (s *ShardInfo) DeepCopy() *ShardInfo {
@@ -177,6 +194,8 @@ func (s *ShardInfo) DeepCopy() *ShardInfo {
 		SplitCutoverReady:   s.SplitCutoverReady,
 		SplitReplaySeq:      s.SplitReplaySeq,
 		SplitParentShardID:  s.SplitParentShardID,
+		MergeDeltaSeq:       s.MergeDeltaSeq,
+		MergeDeltaFinalSeq:  s.MergeDeltaFinalSeq,
 	}
 
 	if s.ShardStats != nil {
@@ -187,6 +206,9 @@ func (s *ShardInfo) DeepCopy() *ShardInfo {
 	}
 	if s.SplitState != nil {
 		newShardInfo.SplitState = proto.Clone(s.SplitState).(*SplitState)
+	}
+	if s.MergeState != nil {
+		newShardInfo.MergeState = proto.Clone(s.MergeState).(*MergeState)
 	}
 
 	return newShardInfo
@@ -214,6 +236,7 @@ func (s *ShardInfo) Merge(nodeID types.ID, o *ShardInfo) {
 			s.RaftStatus = o.RaftStatus
 			s.ShardStats = o.ShardStats
 			s.SplitState = o.SplitState
+			s.MergeState = o.MergeState
 		}
 	}
 	if o.RaftStatus != nil && o.RaftStatus.Lead != 0 {
@@ -221,7 +244,17 @@ func (s *ShardInfo) Merge(nodeID types.ID, o *ShardInfo) {
 			s.RaftStatus = o.RaftStatus
 			s.ShardStats = o.ShardStats
 			s.SplitState = o.SplitState
+			s.MergeState = o.MergeState
 		}
+	}
+	// SplitState and MergeState are Raft-replicated shard metadata. They should be
+	// visible from any replica report, even when the reporter's store/node ID is in
+	// a different namespace than the shard-local Raft leader ID surfaced in status.
+	if o.SplitState != nil {
+		s.SplitState = o.SplitState
+	}
+	if o.MergeState != nil {
+		s.MergeState = o.MergeState
 	}
 	if s.RaftStatus == nil || s.RaftStatus.Lead == 0 {
 		s.RaftStatus = o.RaftStatus
@@ -241,6 +274,12 @@ func (s *ShardInfo) Merge(nodeID types.ID, o *ShardInfo) {
 	if o.SplitParentShardID != 0 {
 		s.SplitParentShardID = o.SplitParentShardID
 	}
+	if o.MergeDeltaSeq > s.MergeDeltaSeq {
+		s.MergeDeltaSeq = o.MergeDeltaSeq
+	}
+	if o.MergeDeltaFinalSeq > s.MergeDeltaFinalSeq {
+		s.MergeDeltaFinalSeq = o.MergeDeltaFinalSeq
+	}
 }
 
 // shardInfoJSON is used for JSON marshaling/unmarshaling of ShardInfo.
@@ -255,11 +294,14 @@ type shardInfoJSON struct {
 	Initializing        bool               `json:"initializing,omitempty,omitzero"`
 	Splitting           bool               `json:"splitting,omitempty,omitzero"`
 	SplitState          json.RawMessage    `json:"split_state,omitempty"`
+	MergeState          json.RawMessage    `json:"merge_state,omitempty"`
 	SplitReplayRequired bool               `json:"split_replay_required,omitempty,omitzero"`
 	SplitReplayCaughtUp bool               `json:"split_replay_caught_up,omitempty,omitzero"`
 	SplitCutoverReady   bool               `json:"split_cutover_ready,omitempty,omitzero"`
 	SplitReplaySeq      uint64             `json:"split_replay_seq,omitempty,omitzero"`
 	SplitParentShardID  types.ID           `json:"split_parent_shard_id,omitempty,omitzero"`
+	MergeDeltaSeq       uint64             `json:"merge_delta_seq,omitempty,omitzero"`
+	MergeDeltaFinalSeq  uint64             `json:"merge_delta_final_seq,omitempty,omitzero"`
 }
 
 // MarshalJSON implements json.Marshaler for ShardInfo.
@@ -279,6 +321,8 @@ func (s ShardInfo) MarshalJSON() ([]byte, error) {
 		SplitCutoverReady:   s.SplitCutoverReady,
 		SplitReplaySeq:      s.SplitReplaySeq,
 		SplitParentShardID:  s.SplitParentShardID,
+		MergeDeltaSeq:       s.MergeDeltaSeq,
+		MergeDeltaFinalSeq:  s.MergeDeltaFinalSeq,
 	}
 	if s.SplitState != nil {
 		data, err := protojson.Marshal(s.SplitState)
@@ -286,6 +330,13 @@ func (s ShardInfo) MarshalJSON() ([]byte, error) {
 			return nil, fmt.Errorf("marshaling SplitState: %w", err)
 		}
 		j.SplitState = data
+	}
+	if s.MergeState != nil {
+		data, err := protojson.Marshal(s.MergeState)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling MergeState: %w", err)
+		}
+		j.MergeState = data
 	}
 	return json.Marshal(j)
 }
@@ -310,10 +361,18 @@ func (s *ShardInfo) UnmarshalJSON(data []byte) error {
 	s.SplitCutoverReady = j.SplitCutoverReady
 	s.SplitReplaySeq = j.SplitReplaySeq
 	s.SplitParentShardID = j.SplitParentShardID
+	s.MergeDeltaSeq = j.MergeDeltaSeq
+	s.MergeDeltaFinalSeq = j.MergeDeltaFinalSeq
 	if len(j.SplitState) > 0 {
 		s.SplitState = &SplitState{}
 		if err := protojson.Unmarshal(j.SplitState, s.SplitState); err != nil {
 			return fmt.Errorf("unmarshaling SplitState: %w", err)
+		}
+	}
+	if len(j.MergeState) > 0 {
+		s.MergeState = &MergeState{}
+		if err := protojson.Unmarshal(j.MergeState, s.MergeState); err != nil {
+			return fmt.Errorf("unmarshaling MergeState: %w", err)
 		}
 	}
 	return nil

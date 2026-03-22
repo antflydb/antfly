@@ -15,12 +15,16 @@ import (
 
 type CheckerConfig struct {
 	SplitLivenessTimeout time.Duration
+	MergeLivenessTimeout time.Duration
 }
 
 type Checker struct {
 	cfg               CheckerConfig
 	splitHealthySince map[types.ID]time.Time
+	mergeHealthySince map[types.ID]time.Time
 }
+
+const stableReplicaConsistencyTimeout = 10 * time.Second
 
 type ClusterSnapshot struct {
 	Now                     time.Time
@@ -36,9 +40,13 @@ func NewChecker(cfg CheckerConfig) *Checker {
 	if cfg.SplitLivenessTimeout <= 0 {
 		cfg.SplitLivenessTimeout = 45 * time.Second
 	}
+	if cfg.MergeLivenessTimeout <= 0 {
+		cfg.MergeLivenessTimeout = cfg.SplitLivenessTimeout
+	}
 	return &Checker{
 		cfg:               cfg,
 		splitHealthySince: make(map[types.ID]time.Time),
+		mergeHealthySince: make(map[types.ID]time.Time),
 	}
 }
 
@@ -86,10 +94,16 @@ func (c *Checker) Check(ctx context.Context, h *Harness) error {
 	if err := c.checkSplitConsistency(snapshot, false); err != nil {
 		return err
 	}
+	if err := c.checkMergeConsistency(snapshot, false); err != nil {
+		return err
+	}
 	if err := c.checkLeaderAgreement(snapshot); err != nil {
 		return err
 	}
 	if err := c.checkSplitLiveness(snapshot); err != nil {
+		return err
+	}
+	if err := c.checkMergeLiveness(snapshot); err != nil {
 		return err
 	}
 	if err := c.checkTransactionSafety(ctx, h, snapshot); err != nil {
@@ -112,10 +126,16 @@ func (c *Checker) CheckStable(ctx context.Context, h *Harness) error {
 	if err := c.checkSplitConsistency(snapshot, true); err != nil {
 		return err
 	}
+	if err := c.checkMergeConsistency(snapshot, true); err != nil {
+		return err
+	}
 	if err := c.requireAllStoresHealthy(snapshot, h.storeOrder); err != nil {
 		return err
 	}
 	if err := c.requireNoActiveSplits(snapshot); err != nil {
+		return err
+	}
+	if err := c.requireNoActiveMerges(snapshot); err != nil {
 		return err
 	}
 	if err := c.checkLeaderAgreement(snapshot); err != nil {
@@ -380,6 +400,106 @@ func (c *Checker) checkSplitConsistency(snapshot *ClusterSnapshot, requireChildP
 	return nil
 }
 
+func (c *Checker) checkMergeLiveness(snapshot *ClusterSnapshot) error {
+	activeNow := make(map[types.ID]struct{})
+	for shardID, status := range snapshot.Shards {
+		if status == nil || !mergeActive(status) {
+			delete(c.mergeHealthySince, shardID)
+			continue
+		}
+		if status.MergeState == nil || types.ID(status.MergeState.GetReceiverShardId()) != shardID {
+			delete(c.mergeHealthySince, shardID)
+			continue
+		}
+		activeNow[shardID] = struct{}{}
+		if snapshot.MetadataNodes > 1 && !snapshot.MetadataLeaderAvailable {
+			delete(c.mergeHealthySince, shardID)
+			continue
+		}
+		donorID := types.ID(status.MergeState.GetDonorShardId())
+		if donorID == 0 || !c.shardHasHealthyQuorum(snapshot, donorID) || !c.shardHasHealthyQuorum(snapshot, shardID) {
+			delete(c.mergeHealthySince, shardID)
+			continue
+		}
+		since, ok := c.mergeHealthySince[shardID]
+		if !ok {
+			c.mergeHealthySince[shardID] = snapshot.Now
+			continue
+		}
+		if snapshot.Now.Sub(since) > c.cfg.MergeLivenessTimeout {
+			return fmt.Errorf(
+				"shard %s merge state remained active for %s with healthy donor/receiver quorums",
+				shardID,
+				snapshot.Now.Sub(since),
+			)
+		}
+	}
+	for shardID := range c.mergeHealthySince {
+		if _, ok := activeNow[shardID]; !ok {
+			delete(c.mergeHealthySince, shardID)
+		}
+	}
+	return nil
+}
+
+func (c *Checker) checkMergeConsistency(snapshot *ClusterSnapshot, requirePeerPresence bool) error {
+	for shardID, status := range snapshot.Shards {
+		if status == nil || status.MergeState == nil {
+			continue
+		}
+		mergeState := status.MergeState
+		if mergeState.GetPhase() == storedb.MergeState_PHASE_NONE {
+			continue
+		}
+		donorID := types.ID(mergeState.GetDonorShardId())
+		receiverID := types.ID(mergeState.GetReceiverShardId())
+		if donorID == 0 || receiverID == 0 {
+			return fmt.Errorf("shard %s has active merge state without donor/receiver ids", shardID)
+		}
+		if shardID != donorID && shardID != receiverID {
+			return fmt.Errorf("shard %s merge state references donor=%s receiver=%s", shardID, donorID, receiverID)
+		}
+		if shardID == receiverID && !mergeState.GetAcceptDonorRange() {
+			return fmt.Errorf("receiver shard %s merge state is not marked accept_donor_range", shardID)
+		}
+		if shardID == donorID && mergeState.GetAcceptDonorRange() {
+			return fmt.Errorf("donor shard %s merge state incorrectly accepts donor range", shardID)
+		}
+		donorStatus := snapshot.Shards[donorID]
+		receiverStatus := snapshot.Shards[receiverID]
+		if donorStatus == nil || receiverStatus == nil {
+			if requirePeerPresence {
+				return fmt.Errorf("merge pair donor=%s receiver=%s missing from metadata", donorID, receiverID)
+			}
+			continue
+		}
+		if donorStatus.Table != receiverStatus.Table {
+			return fmt.Errorf(
+				"merge pair donor=%s receiver=%s span different tables %q/%q",
+				donorID,
+				receiverID,
+				donorStatus.Table,
+				receiverStatus.Table,
+			)
+		}
+		if receiverStatus.MergeState == nil || donorStatus.MergeState == nil {
+			if requirePeerPresence {
+				return fmt.Errorf("merge pair donor=%s receiver=%s missing mirrored merge state", donorID, receiverID)
+			}
+			continue
+		}
+		if types.ID(receiverStatus.MergeState.GetDonorShardId()) != donorID ||
+			types.ID(receiverStatus.MergeState.GetReceiverShardId()) != receiverID {
+			return fmt.Errorf("receiver shard %s merge state does not mirror donor=%s receiver=%s", receiverID, donorID, receiverID)
+		}
+		if types.ID(donorStatus.MergeState.GetDonorShardId()) != donorID ||
+			types.ID(donorStatus.MergeState.GetReceiverShardId()) != receiverID {
+			return fmt.Errorf("donor shard %s merge state does not mirror donor=%s receiver=%s", donorID, donorID, receiverID)
+		}
+	}
+	return nil
+}
+
 func (c *Checker) checkExpectedDocs(snapshot *ClusterSnapshot, h *Harness, requireReplicaConsistency bool) error {
 	tableNames := make([]string, 0, len(snapshot.Tables))
 	for tableName := range snapshot.Tables {
@@ -424,40 +544,56 @@ func (c *Checker) checkExpectedDocs(snapshot *ClusterSnapshot, h *Harness, requi
 		if !requireReplicaConsistency || !c.isTableStable(snapshot, table) {
 			continue
 		}
-		for storeID, storeStatus := range snapshot.Stores {
-			if storeStatus == nil || !storeStatus.IsReachable() {
+		if err := h.WaitFor(stableReplicaConsistencyTimeout, func() error {
+			return c.checkExpectedDocReplicas(snapshot, h, table, shardID, key, expected)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Checker) checkExpectedDocReplicas(
+	snapshot *ClusterSnapshot,
+	h *Harness,
+	table *store.Table,
+	shardID types.ID,
+	key string,
+	expected []byte,
+) error {
+	for storeID, storeStatus := range snapshot.Stores {
+		if storeStatus == nil || !storeStatus.IsReachable() {
+			continue
+		}
+		if storeStatus.Shards[shardID] == nil {
+			continue
+		}
+		results, err := h.LookupFromStore(storeID, shardID, []string{key})
+		if err != nil {
+			return fmt.Errorf("replica lookup for key %q on store %s shard %s: %w", key, storeID, shardID, err)
+		}
+		actualValue, ok := results[key]
+		if !ok {
+			return fmt.Errorf("replica store %s shard %s missing key %q", storeID, shardID, key)
+		}
+		if !bytes.Equal(actualValue, expected) {
+			return fmt.Errorf("replica store %s shard %s mismatch for key %q", storeID, shardID, key)
+		}
+		for otherShardID := range table.Shards {
+			if otherShardID == shardID || storeStatus.Shards[otherShardID] == nil {
 				continue
 			}
-			if storeStatus.Shards[shardID] == nil {
-				continue
-			}
-			results, err := h.LookupFromStore(storeID, shardID, []string{key})
+			results, err := h.LookupFromStore(storeID, otherShardID, []string{key})
 			if err != nil {
-				return fmt.Errorf("replica lookup for key %q on store %s shard %s: %w", key, storeID, shardID, err)
+				return fmt.Errorf("cross-shard lookup for key %q on store %s shard %s: %w", key, storeID, otherShardID, err)
 			}
-			actualValue, ok := results[key]
-			if !ok {
-				return fmt.Errorf("replica store %s shard %s missing key %q", storeID, shardID, key)
-			}
-			if !bytes.Equal(actualValue, expected) {
-				return fmt.Errorf("replica store %s shard %s mismatch for key %q", storeID, shardID, key)
-			}
-			for otherShardID := range table.Shards {
-				if otherShardID == shardID || storeStatus.Shards[otherShardID] == nil {
-					continue
-				}
-				results, err := h.LookupFromStore(storeID, otherShardID, []string{key})
-				if err != nil {
-					return fmt.Errorf("cross-shard lookup for key %q on store %s shard %s: %w", key, storeID, otherShardID, err)
-				}
-				if _, ok := results[key]; ok {
-					return fmt.Errorf(
-						"key %q appeared on non-owner shard %s for store %s",
-						key,
-						otherShardID,
-						storeID,
-					)
-				}
+			if _, ok := results[key]; ok {
+				return fmt.Errorf(
+					"key %q appeared on non-owner shard %s for store %s",
+					key,
+					otherShardID,
+					storeID,
+				)
 			}
 		}
 	}
@@ -481,6 +617,15 @@ func (c *Checker) requireNoActiveSplits(snapshot *ClusterSnapshot) error {
 	for shardID, status := range snapshot.Shards {
 		if status != nil && c.isSplitActive(status) {
 			return fmt.Errorf("shard %s still has active split state", shardID)
+		}
+	}
+	return nil
+}
+
+func (c *Checker) requireNoActiveMerges(snapshot *ClusterSnapshot) error {
+	for shardID, status := range snapshot.Shards {
+		if status != nil && mergeActive(status) {
+			return fmt.Errorf("shard %s still has active merge state", shardID)
 		}
 	}
 	return nil
@@ -579,7 +724,8 @@ func (c *Checker) isTableStable(snapshot *ClusterSnapshot, table *store.Table) b
 	}
 	for shardID := range table.Shards {
 		status := snapshot.Shards[shardID]
-		if status == nil || c.isSplitActive(status) || !c.allShardPeersHealthy(snapshot, status.Peers) {
+		if status == nil || c.isSplitActive(status) || mergeActive(status) ||
+			!c.allShardPeersHealthy(snapshot, status.Peers) {
 			return false
 		}
 	}
@@ -597,6 +743,16 @@ func (c *Checker) isSplitActive(status *store.ShardStatus) bool {
 		return true
 	}
 	return status.SplitReplayRequired && !status.SplitCutoverReady
+}
+
+func mergeActive(status *store.ShardStatus) bool {
+	if status == nil {
+		return false
+	}
+	if status.MergeState != nil && status.MergeState.GetPhase() != storedb.MergeState_PHASE_NONE {
+		return true
+	}
+	return status.State == store.ShardState_PreMerge
 }
 
 func (c *Checker) allShardPeersHealthy(snapshot *ClusterSnapshot, peers map[types.ID]struct{}) bool {

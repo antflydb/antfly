@@ -56,6 +56,19 @@ func (s *stubStoreRPC) Status(ctx context.Context) (*store.StoreStatus, error) {
 	return s.status, s.statusErr
 }
 
+func (s *stubStoreRPC) ApplyMergeChunk(
+	ctx context.Context,
+	shardID types.ID,
+	writes [][2][]byte,
+	deletes [][]byte,
+	syncLevel db.Op_SyncLevel,
+) error {
+	if s.StoreRPC != nil {
+		return s.StoreRPC.ApplyMergeChunk(ctx, shardID, writes, deletes, syncLevel)
+	}
+	return nil
+}
+
 func makeLiveMergeShardInfo(
 	shardID types.ID,
 	peers common.PeerSet,
@@ -1761,7 +1774,7 @@ func TestExecuteSplitAndMergeTransitions_MergeOperations(t *testing.T) {
 		mockShardOps.AssertExpectations(t)
 	})
 
-	t.Run("skips merge when donor is not empty in live status", func(t *testing.T) {
+	t.Run("starts online merge when donor is not empty in live status", func(t *testing.T) {
 		mockShardOps := &MockShardOperations{}
 		mockTableOps := &MockTableOperations{}
 		mockStoreOps := &MockStoreOperations{}
@@ -1807,6 +1820,36 @@ func TestExecuteSplitAndMergeTransitions_MergeOperations(t *testing.T) {
 			Return(donorLeaderClient, nil)
 		mockStoreOps.On("GetLeaderClientForShard", mock.Anything, shardID).
 			Return(targetLeaderClient, nil)
+		mockTableOps.On("PrepareShardsForMerge", mergeTransition).
+			Return(&store.ShardConfig{ByteRange: [2][]byte{{0x00}, {0x80}}}, nil)
+		mockShardOps.On(
+			"SetMergeState",
+			mock.Anything,
+			mergeShardID,
+			mock.MatchedBy(func(state *db.MergeState) bool {
+				return state != nil &&
+					state.GetPhase() == db.MergeState_PHASE_PREPARE &&
+					state.GetDonorShardId() == uint64(mergeShardID) &&
+					state.GetReceiverShardId() == uint64(shardID) &&
+					state.GetCaptureDeltas() &&
+					!state.GetAcceptDonorRange()
+			}),
+		).Return(nil)
+		mockShardOps.On(
+			"SetMergeState",
+			mock.Anything,
+			shardID,
+			mock.MatchedBy(func(state *db.MergeState) bool {
+				return state != nil &&
+					state.GetPhase() == db.MergeState_PHASE_PREPARE &&
+					state.GetDonorShardId() == uint64(mergeShardID) &&
+					state.GetReceiverShardId() == uint64(shardID) &&
+					!state.GetCaptureDeltas() &&
+					state.GetAcceptDonorRange()
+			}),
+		).Return(nil)
+		mockStoreOps.On("UpdateShardMergeState", mock.Anything, mergeShardID, mock.Anything).Return(nil)
+		mockStoreOps.On("UpdateShardMergeState", mock.Anything, shardID, mock.Anything).Return(nil)
 
 		reconciler := NewReconciler(
 			mockShardOps,
@@ -1827,10 +1870,84 @@ func TestExecuteSplitAndMergeTransitions_MergeOperations(t *testing.T) {
 		err := eg.Wait()
 
 		assert.NoError(t, err)
-		mockTableOps.AssertNotCalled(t, "ReassignShardsForMerge")
+		mockTableOps.AssertCalled(t, "PrepareShardsForMerge", mergeTransition)
 		mockShardOps.AssertNotCalled(t, "StopShard")
 		mockShardOps.AssertNotCalled(t, "MergeRange")
 	})
+}
+
+func TestExecuteMergeRollback_ResetsMetadata(t *testing.T) {
+	mockShardOps := &MockShardOperations{}
+	mockTableOps := &MockTableOperations{}
+	mockStoreOps := &MockStoreOperations{}
+
+	receiverID := types.ID(1)
+	donorID := types.ID(2)
+	transition := tablemgr.MergeTransition{
+		ShardID:      receiverID,
+		MergeShardID: donorID,
+		TableName:    "users",
+	}
+
+	receiverMergeState := &db.MergeState{}
+	receiverMergeState.SetPhase(db.MergeState_PHASE_CATCHUP)
+	receiverMergeState.SetDonorShardId(uint64(donorID))
+	receiverMergeState.SetReceiverShardId(uint64(receiverID))
+	receiverMergeState.SetAcceptDonorRange(true)
+
+	donorMergeState := &db.MergeState{}
+	donorMergeState.SetPhase(db.MergeState_PHASE_CATCHUP)
+	donorMergeState.SetDonorShardId(uint64(donorID))
+	donorMergeState.SetReceiverShardId(uint64(receiverID))
+
+	mockStoreOps.On("GetShardStatuses").Return(map[types.ID]*store.ShardStatus{
+		receiverID: {
+			ID:    receiverID,
+			Table: "users",
+			State: store.ShardState_PreMerge,
+			ShardInfo: store.ShardInfo{
+				MergeState: receiverMergeState,
+			},
+		},
+		donorID: {
+			ID:    donorID,
+			Table: "users",
+			ShardInfo: store.ShardInfo{
+				MergeState: donorMergeState,
+			},
+		},
+	}, nil)
+	mockShardOps.On(
+		"SetMergeState",
+		mock.Anything,
+		receiverID,
+		mock.MatchedBy(func(state *db.MergeState) bool {
+			return state != nil && state.GetPhase() == db.MergeState_PHASE_ROLLING_BACK
+		}),
+	).Return(nil)
+	mockShardOps.On("SetMergeState", mock.Anything, donorID, (*db.MergeState)(nil)).Return(nil)
+	mockShardOps.On("SetMergeState", mock.Anything, receiverID, (*db.MergeState)(nil)).Return(nil)
+	mockTableOps.On("RollbackShardsForMerge", transition).
+		Return(&store.ShardConfig{ByteRange: [2][]byte{{0x00}, {0x80}}}, nil)
+	mockStoreOps.On("UpdateShardMergeState", mock.Anything, donorID, (*db.MergeState)(nil)).Return(nil)
+	mockStoreOps.On("UpdateShardMergeState", mock.Anything, receiverID, (*db.MergeState)(nil)).Return(nil)
+
+	reconciler := NewReconciler(
+		mockShardOps,
+		mockTableOps,
+		mockStoreOps,
+		ReconciliationConfig{ReplicationFactor: 1},
+		zap.NewNop(),
+	)
+
+	err := reconciler.executeMergeRollback(context.Background(), receiverID, donorID)
+
+	assert.NoError(t, err)
+	mockStoreOps.AssertExpectations(t)
+	mockShardOps.AssertExpectations(t)
+	mockTableOps.AssertExpectations(t)
+	assert.True(t, reconciler.IsShardInCooldown(receiverID))
+	assert.True(t, reconciler.IsShardInCooldown(donorID))
 }
 
 func TestExecuteSplitAndMergeTransitions_SplitOperations(t *testing.T) {

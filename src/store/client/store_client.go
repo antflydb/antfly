@@ -122,6 +122,52 @@ func (sc *StoreClient) Batch(
 	return nil
 }
 
+func (sc *StoreClient) ApplyMergeChunk(
+	ctx context.Context,
+	shardID types.ID,
+	writes [][2][]byte,
+	deletes [][]byte,
+	_ db.Op_SyncLevel,
+) error {
+	timestamp := storeutils.GetTimestampFromContext(ctx)
+	internalSyncLevel := db.Op_SyncLevelInternalMergeCopy
+	batch := db.BatchOp_builder{
+		Deletes:   deletes,
+		Timestamp: timestamp,
+		SyncLevel: &internalSyncLevel,
+		Writes:    db.WritesFromTuples(writes),
+	}
+
+	body, err := proto.Marshal(batch.Build())
+	if err != nil {
+		return fmt.Errorf("error marshaling values: %w", err)
+	}
+
+	req, err := common.NewShardRequest(
+		shardID,
+		http.MethodPost,
+		sc.url+"/shard/merge-chunk",
+		bytes.NewBuffer(body),
+	)
+	if err != nil {
+		return fmt.Errorf("error creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req = req.WithContext(ctx)
+
+	resp, err := sc.client.Do(req) //nolint:gosec // G704: HTTP client calling configured endpoint
+	if err != nil {
+		return fmt.Errorf("sending request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusAccepted {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return &ResponseError{StatusCode: resp.StatusCode, Body: string(bodyBytes)}
+	}
+	return nil
+}
+
 func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string) error {
 	backupReq := common.BackupConfig{
 		BackupID: id,
@@ -313,6 +359,64 @@ func (sc *StoreClient) MergeRange(
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq = hreq.WithContext(ctx)
 
+	resp, err := sc.doRequest(hreq, http.StatusOK)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
+}
+
+func (sc *StoreClient) SetMergeState(
+	ctx context.Context,
+	shardID types.ID,
+	state *db.MergeState,
+) error {
+	req := &store.ShardMergeStateRequest{State: state}
+	b, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshalling request: %w", err)
+	}
+	hreq, err := common.NewShardRequest(
+		shardID,
+		http.MethodPost,
+		sc.url+"/shard/merge-state",
+		bytes.NewBuffer(b),
+	)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq = hreq.WithContext(ctx)
+	resp, err := sc.doRequest(hreq, http.StatusOK)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
+}
+
+func (sc *StoreClient) FinalizeMerge(
+	ctx context.Context,
+	shardID types.ID,
+	byteRange [2][]byte,
+) error {
+	req := &store.ShardFinalizeMergeRequest{ByteRange: byteRange}
+	b, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshalling request: %w", err)
+	}
+	hreq, err := common.NewShardRequest(
+		shardID,
+		http.MethodPost,
+		sc.url+"/shard/finalize-merge",
+		bytes.NewBuffer(b),
+	)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq = hreq.WithContext(ctx)
 	resp, err := sc.doRequest(hreq, http.StatusOK)
 	if err != nil {
 		return err
@@ -894,6 +998,91 @@ func (sc *StoreClient) Scan(
 		return nil, fmt.Errorf("decoding scan response: %w", err)
 	}
 	return &result, nil
+}
+
+func (sc *StoreClient) ExportRangeChunk(
+	ctx context.Context,
+	shardID types.ID,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	reqBody := &store.ShardExportRangeRequest{
+		StartKey: startKey,
+		EndKey:   endKey,
+		AfterKey: afterKey,
+		Limit:    limit,
+	}
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("marshalling request: %w", err)
+	}
+	hreq, err := common.NewShardRequest(
+		shardID,
+		http.MethodPost,
+		sc.url+"/shard/export-range",
+		bytes.NewBuffer(b),
+	)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("creating request: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq = hreq.WithContext(ctx)
+	resp, err := sc.doRequest(hreq, http.StatusOK)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var result struct {
+		Writes []struct {
+			Key   []byte `json:"key"`
+			Value []byte `json:"value"`
+		} `json:"writes"`
+		NextKey []byte `json:"next_key,omitempty"`
+		Done    bool   `json:"done"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, nil, false, fmt.Errorf("decoding export range response: %w", err)
+	}
+	writes := make([][2][]byte, 0, len(result.Writes))
+	for _, w := range result.Writes {
+		writes = append(writes, [2][]byte{w.Key, w.Value})
+	}
+	return writes, result.NextKey, result.Done, nil
+}
+
+func (sc *StoreClient) ListMergeDeltaEntriesAfter(
+	ctx context.Context,
+	shardID types.ID,
+	afterSeq uint64,
+) ([]*db.MergeDeltaEntry, error) {
+	reqBody := &store.ShardMergeDeltaRequest{AfterSeq: afterSeq}
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling request: %w", err)
+	}
+	hreq, err := common.NewShardRequest(
+		shardID,
+		http.MethodPost,
+		sc.url+"/shard/merge-deltas",
+		bytes.NewBuffer(b),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq = hreq.WithContext(ctx)
+	resp, err := sc.doRequest(hreq, http.StatusOK)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var result struct {
+		Entries []*db.MergeDeltaEntry `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding merge delta response: %w", err)
+	}
+	return result.Entries, nil
 }
 
 // Transaction RPC methods

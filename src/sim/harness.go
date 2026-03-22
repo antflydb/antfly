@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
 	"slices"
 	"strings"
@@ -67,6 +68,7 @@ type Harness struct {
 	tracer                   *TraceRecorder
 	lastLeaders              map[types.ID]types.ID
 	lastSplits               map[types.ID]string
+	lastMerges               map[types.ID]string
 	lastMetaLeader           types.ID
 	txnIDGenerator           func() uuid.UUID
 	splitFinalizeGracePeriod time.Duration
@@ -165,11 +167,16 @@ func NewHarness(cfg HarnessConfig) (*Harness, error) {
 		tracer:                   NewTraceRecorder(),
 		lastLeaders:              make(map[types.ID]types.ID),
 		lastSplits:               make(map[types.ID]string),
+		lastMerges:               make(map[types.ID]string),
 		txnIDGenerator:           cfg.TxnIDGenerator,
 		splitFinalizeGracePeriod: cfg.SplitFinalizeGracePeriod,
 	}
 	if h.logger == nil {
-		h.logger = zap.NewNop()
+		if os.Getenv("ANTFLY_SIM_DEBUG_LOG") == "1" {
+			h.logger = zap.Must(zap.NewDevelopment())
+		} else {
+			h.logger = zap.NewNop()
+		}
 	}
 	metadataProxy := &metadataDBProxy{
 		leader: h.metadataLeaderNode,
@@ -1250,6 +1257,7 @@ func (h *Harness) recordStatusTransitions() {
 	}
 	nextLeaders := make(map[types.ID]types.ID, len(shards))
 	nextSplits := make(map[types.ID]string, len(shards))
+	nextMerges := make(map[types.ID]string, len(shards))
 	shardIDs := make([]types.ID, 0, len(shards))
 	for shardID := range shards {
 		shardIDs = append(shardIDs, shardID)
@@ -1270,7 +1278,7 @@ func (h *Harness) recordStatusTransitions() {
 		if status.SplitState != nil {
 			splitSig += "|" + status.SplitState.GetPhase().String()
 		}
-		if flags := splitFlags(status); flags != "" {
+		if flags := transitionFlags(status); flags != "" {
 			splitSig += "|" + flags
 		}
 		nextSplits[shardID] = splitSig
@@ -1281,9 +1289,25 @@ func (h *Harness) recordStatusTransitions() {
 			prevSplit != "" && prevSplit != store.ShardState_Default.String()) {
 			h.recordEvent("split", "shard=%s state=%s prev=%s", shardID, splitSig, prevSplit)
 		}
+
+		mergeSig := status.State.String()
+		if status.MergeState != nil {
+			mergeSig += "|" + status.MergeState.GetPhase().String()
+		}
+		if flags := transitionFlags(status); flags != "" {
+			mergeSig += "|" + flags
+		}
+		nextMerges[shardID] = mergeSig
+		prevMerge := h.lastMerges[shardID]
+		if prevMerge != mergeSig && (status.MergeState != nil ||
+			status.State == store.ShardState_PreMerge ||
+			prevMerge != "" && prevMerge != store.ShardState_Default.String()) {
+			h.recordEvent("merge", "shard=%s state=%s prev=%s", shardID, mergeSig, prevMerge)
+		}
 	}
 	h.lastLeaders = nextLeaders
 	h.lastSplits = nextSplits
+	h.lastMerges = nextMerges
 }
 
 func (h *Harness) recordMetadataLeaderTransition() {

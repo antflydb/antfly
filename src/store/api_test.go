@@ -89,6 +89,16 @@ func (m *MockShard) RollbackSplit(ctx context.Context) error {
 	return args.Error(0)
 }
 
+func (m *MockShard) SetMergeState(ctx context.Context, state *db.MergeState) error {
+	args := m.Called(ctx, state)
+	return args.Error(0)
+}
+
+func (m *MockShard) FinalizeMerge(ctx context.Context, byteRange [2][]byte) error {
+	args := m.Called(ctx, byteRange)
+	return args.Error(0)
+}
+
 func (m *MockShard) AddIndex(
 	ctx context.Context,
 	config indexes.IndexConfig,
@@ -139,8 +149,30 @@ func (m *MockShard) GetTimestamp(key string) (uint64, error) {
 	return args.Get(0).(uint64), args.Error(1)
 }
 
+func (m *MockShard) ExportRangeChunk(
+	ctx context.Context,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	args := m.Called(ctx, startKey, endKey, afterKey, limit)
+	res, _ := args.Get(0).([][2][]byte)
+	nextKey, _ := args.Get(1).([]byte)
+	return res, nextKey, args.Bool(2), args.Error(3)
+}
+
+func (m *MockShard) ListMergeDeltaEntriesAfter(afterSeq uint64) ([]*db.MergeDeltaEntry, error) {
+	args := m.Called(afterSeq)
+	res, _ := args.Get(0).([]*db.MergeDeltaEntry)
+	return res, args.Error(1)
+}
+
 func (m *MockShard) Batch(ctx context.Context, batch *db.BatchOp, proposeOnly bool) error {
 	args := m.Called(ctx, batch, proposeOnly)
+	return args.Error(0)
+}
+
+func (m *MockShard) ApplyMergeChunk(ctx context.Context, batch *db.BatchOp) error {
+	args := m.Called(ctx, batch)
 	return args.Error(0)
 }
 

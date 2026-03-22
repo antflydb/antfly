@@ -16,7 +16,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v7.34.0
-// source: ops.proto
+// source: src/store/db/ops.proto
 
 package db
 
@@ -52,6 +52,8 @@ const (
 	Op_OpResolveIntents    Op_OpType = 11
 	Op_OpFinalizeSplit     Op_OpType = 12 // Complete a split by deleting split-off data
 	Op_OpSetSplitState     Op_OpType = 13 // Update split state (replaces local pendingSplitKey)
+	Op_OpFinalizeMerge     Op_OpType = 14 // Complete a merge by widening the receiver range
+	Op_OpSetMergeState     Op_OpType = 15 // Update merge state on donor/receiver shards
 )
 
 // Enum value maps for Op_OpType.
@@ -71,6 +73,8 @@ var (
 		11: "OpResolveIntents",
 		12: "OpFinalizeSplit",
 		13: "OpSetSplitState",
+		14: "OpFinalizeMerge",
+		15: "OpSetMergeState",
 	}
 	Op_OpType_value = map[string]int32{
 		"OpBatch":             0,
@@ -87,6 +91,8 @@ var (
 		"OpResolveIntents":    11,
 		"OpFinalizeSplit":     12,
 		"OpSetSplitState":     13,
+		"OpFinalizeMerge":     14,
+		"OpSetMergeState":     15,
 	}
 )
 
@@ -101,11 +107,11 @@ func (x Op_OpType) String() string {
 }
 
 func (Op_OpType) Descriptor() protoreflect.EnumDescriptor {
-	return file_ops_proto_enumTypes[0].Descriptor()
+	return file_src_store_db_ops_proto_enumTypes[0].Descriptor()
 }
 
 func (Op_OpType) Type() protoreflect.EnumType {
-	return &file_ops_proto_enumTypes[0]
+	return &file_src_store_db_ops_proto_enumTypes[0]
 }
 
 func (x Op_OpType) Number() protoreflect.EnumNumber {
@@ -151,11 +157,11 @@ func (x Op_SyncLevel) String() string {
 }
 
 func (Op_SyncLevel) Descriptor() protoreflect.EnumDescriptor {
-	return file_ops_proto_enumTypes[1].Descriptor()
+	return file_src_store_db_ops_proto_enumTypes[1].Descriptor()
 }
 
 func (Op_SyncLevel) Type() protoreflect.EnumType {
-	return &file_ops_proto_enumTypes[1]
+	return &file_src_store_db_ops_proto_enumTypes[1]
 }
 
 func (x Op_SyncLevel) Number() protoreflect.EnumNumber {
@@ -222,11 +228,11 @@ func (x TransformOp_OpType) String() string {
 }
 
 func (TransformOp_OpType) Descriptor() protoreflect.EnumDescriptor {
-	return file_ops_proto_enumTypes[2].Descriptor()
+	return file_src_store_db_ops_proto_enumTypes[2].Descriptor()
 }
 
 func (TransformOp_OpType) Type() protoreflect.EnumType {
-	return &file_ops_proto_enumTypes[2]
+	return &file_src_store_db_ops_proto_enumTypes[2]
 }
 
 func (x TransformOp_OpType) Number() protoreflect.EnumNumber {
@@ -273,14 +279,67 @@ func (x SplitState_Phase) String() string {
 }
 
 func (SplitState_Phase) Descriptor() protoreflect.EnumDescriptor {
-	return file_ops_proto_enumTypes[3].Descriptor()
+	return file_src_store_db_ops_proto_enumTypes[3].Descriptor()
 }
 
 func (SplitState_Phase) Type() protoreflect.EnumType {
-	return &file_ops_proto_enumTypes[3]
+	return &file_src_store_db_ops_proto_enumTypes[3]
 }
 
 func (x SplitState_Phase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+type MergeState_Phase int32
+
+const (
+	MergeState_PHASE_NONE         MergeState_Phase = 0
+	MergeState_PHASE_PREPARE      MergeState_Phase = 1
+	MergeState_PHASE_COPYING      MergeState_Phase = 2
+	MergeState_PHASE_CATCHUP      MergeState_Phase = 3
+	MergeState_PHASE_FINALIZING   MergeState_Phase = 4
+	MergeState_PHASE_ROLLING_BACK MergeState_Phase = 5
+)
+
+// Enum value maps for MergeState_Phase.
+var (
+	MergeState_Phase_name = map[int32]string{
+		0: "PHASE_NONE",
+		1: "PHASE_PREPARE",
+		2: "PHASE_COPYING",
+		3: "PHASE_CATCHUP",
+		4: "PHASE_FINALIZING",
+		5: "PHASE_ROLLING_BACK",
+	}
+	MergeState_Phase_value = map[string]int32{
+		"PHASE_NONE":         0,
+		"PHASE_PREPARE":      1,
+		"PHASE_COPYING":      2,
+		"PHASE_CATCHUP":      3,
+		"PHASE_FINALIZING":   4,
+		"PHASE_ROLLING_BACK": 5,
+	}
+)
+
+func (x MergeState_Phase) Enum() *MergeState_Phase {
+	p := new(MergeState_Phase)
+	*p = x
+	return p
+}
+
+func (x MergeState_Phase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MergeState_Phase) Descriptor() protoreflect.EnumDescriptor {
+	return file_src_store_db_ops_proto_enumTypes[4].Descriptor()
+}
+
+func (MergeState_Phase) Type() protoreflect.EnumType {
+	return &file_src_store_db_ops_proto_enumTypes[4]
+}
+
+func (x MergeState_Phase) Number() protoreflect.EnumNumber {
 	return protoreflect.EnumNumber(x)
 }
 
@@ -299,7 +358,7 @@ type Op struct {
 
 func (x *Op) Reset() {
 	*x = Op{}
-	mi := &file_ops_proto_msgTypes[0]
+	mi := &file_src_store_db_ops_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -311,7 +370,7 @@ func (x *Op) String() string {
 func (*Op) ProtoMessage() {}
 
 func (x *Op) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[0]
+	mi := &file_src_store_db_ops_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -465,6 +524,24 @@ func (x *Op) GetSetSplitState() *SetSplitStateOp {
 	return nil
 }
 
+func (x *Op) GetFinalizeMerge() *FinalizeMergeOp {
+	if x != nil {
+		if x, ok := x.xxx_hidden_Operation.(*op_FinalizeMerge); ok {
+			return x.FinalizeMerge
+		}
+	}
+	return nil
+}
+
+func (x *Op) GetSetMergeState() *SetMergeStateOp {
+	if x != nil {
+		if x, ok := x.xxx_hidden_Operation.(*op_SetMergeState); ok {
+			return x.SetMergeState
+		}
+	}
+	return nil
+}
+
 func (x *Op) SetOp(v Op_OpType) {
 	x.xxx_hidden_Op = v
 }
@@ -584,6 +661,22 @@ func (x *Op) SetSetSplitState(v *SetSplitStateOp) {
 		return
 	}
 	x.xxx_hidden_Operation = &op_SetSplitState{v}
+}
+
+func (x *Op) SetFinalizeMerge(v *FinalizeMergeOp) {
+	if v == nil {
+		x.xxx_hidden_Operation = nil
+		return
+	}
+	x.xxx_hidden_Operation = &op_FinalizeMerge{v}
+}
+
+func (x *Op) SetSetMergeState(v *SetMergeStateOp) {
+	if v == nil {
+		x.xxx_hidden_Operation = nil
+		return
+	}
+	x.xxx_hidden_Operation = &op_SetMergeState{v}
 }
 
 func (x *Op) HasUuid() bool {
@@ -712,6 +805,22 @@ func (x *Op) HasSetSplitState() bool {
 	return ok
 }
 
+func (x *Op) HasFinalizeMerge() bool {
+	if x == nil {
+		return false
+	}
+	_, ok := x.xxx_hidden_Operation.(*op_FinalizeMerge)
+	return ok
+}
+
+func (x *Op) HasSetMergeState() bool {
+	if x == nil {
+		return false
+	}
+	_, ok := x.xxx_hidden_Operation.(*op_SetMergeState)
+	return ok
+}
+
 func (x *Op) ClearUuid() {
 	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 1)
 	x.xxx_hidden_Uuid = nil
@@ -805,6 +914,18 @@ func (x *Op) ClearSetSplitState() {
 	}
 }
 
+func (x *Op) ClearFinalizeMerge() {
+	if _, ok := x.xxx_hidden_Operation.(*op_FinalizeMerge); ok {
+		x.xxx_hidden_Operation = nil
+	}
+}
+
+func (x *Op) ClearSetMergeState() {
+	if _, ok := x.xxx_hidden_Operation.(*op_SetMergeState); ok {
+		x.xxx_hidden_Operation = nil
+	}
+}
+
 const Op_Operation_not_set_case case_Op_Operation = 0
 const Op_Batch_case case_Op_Operation = 3
 const Op_Split_case case_Op_Operation = 4
@@ -820,6 +941,8 @@ const Op_WriteIntent_case case_Op_Operation = 13
 const Op_ResolveIntents_case case_Op_Operation = 14
 const Op_FinalizeSplit_case case_Op_Operation = 15
 const Op_SetSplitState_case case_Op_Operation = 16
+const Op_FinalizeMerge_case case_Op_Operation = 17
+const Op_SetMergeState_case case_Op_Operation = 18
 
 func (x *Op) WhichOperation() case_Op_Operation {
 	if x == nil {
@@ -854,6 +977,10 @@ func (x *Op) WhichOperation() case_Op_Operation {
 		return Op_FinalizeSplit_case
 	case *op_SetSplitState:
 		return Op_SetSplitState_case
+	case *op_FinalizeMerge:
+		return Op_FinalizeMerge_case
+	case *op_SetMergeState:
+		return Op_SetMergeState_case
 	default:
 		return Op_Operation_not_set_case
 	}
@@ -881,6 +1008,8 @@ type Op_builder struct {
 	ResolveIntents    *ResolveIntentsOp
 	FinalizeSplit     *FinalizeSplitOp
 	SetSplitState     *SetSplitStateOp
+	FinalizeMerge     *FinalizeMergeOp
+	SetMergeState     *SetMergeStateOp
 	// -- end of xxx_hidden_Operation
 }
 
@@ -935,13 +1064,19 @@ func (b0 Op_builder) Build() *Op {
 	if b.SetSplitState != nil {
 		x.xxx_hidden_Operation = &op_SetSplitState{b.SetSplitState}
 	}
+	if b.FinalizeMerge != nil {
+		x.xxx_hidden_Operation = &op_FinalizeMerge{b.FinalizeMerge}
+	}
+	if b.SetMergeState != nil {
+		x.xxx_hidden_Operation = &op_SetMergeState{b.SetMergeState}
+	}
 	return m0
 }
 
 type case_Op_Operation protoreflect.FieldNumber
 
 func (x case_Op_Operation) String() string {
-	md := file_ops_proto_msgTypes[0].Descriptor()
+	md := file_src_store_db_ops_proto_msgTypes[0].Descriptor()
 	if x == 0 {
 		return "not set"
 	}
@@ -1008,6 +1143,14 @@ type op_SetSplitState struct {
 	SetSplitState *SetSplitStateOp `protobuf:"bytes,16,opt,name=set_split_state,json=setSplitState,oneof"`
 }
 
+type op_FinalizeMerge struct {
+	FinalizeMerge *FinalizeMergeOp `protobuf:"bytes,17,opt,name=finalize_merge,json=finalizeMerge,oneof"`
+}
+
+type op_SetMergeState struct {
+	SetMergeState *SetMergeStateOp `protobuf:"bytes,18,opt,name=set_merge_state,json=setMergeState,oneof"`
+}
+
 func (*op_Batch) isOp_Operation() {}
 
 func (*op_Split) isOp_Operation() {}
@@ -1036,6 +1179,10 @@ func (*op_FinalizeSplit) isOp_Operation() {}
 
 func (*op_SetSplitState) isOp_Operation() {}
 
+func (*op_FinalizeMerge) isOp_Operation() {}
+
+func (*op_SetMergeState) isOp_Operation() {}
+
 type Write struct {
 	state            protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_Key   []byte                 `protobuf:"bytes,1,opt,name=key"`
@@ -1046,7 +1193,7 @@ type Write struct {
 
 func (x *Write) Reset() {
 	*x = Write{}
-	mi := &file_ops_proto_msgTypes[1]
+	mi := &file_src_store_db_ops_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1058,7 +1205,7 @@ func (x *Write) String() string {
 func (*Write) ProtoMessage() {}
 
 func (x *Write) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[1]
+	mi := &file_src_store_db_ops_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1126,7 +1273,7 @@ type TransformOp struct {
 
 func (x *TransformOp) Reset() {
 	*x = TransformOp{}
-	mi := &file_ops_proto_msgTypes[2]
+	mi := &file_src_store_db_ops_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1138,7 +1285,7 @@ func (x *TransformOp) String() string {
 func (*TransformOp) ProtoMessage() {}
 
 func (x *TransformOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[2]
+	mi := &file_src_store_db_ops_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1232,7 +1379,7 @@ type Transform struct {
 
 func (x *Transform) Reset() {
 	*x = Transform{}
-	mi := &file_ops_proto_msgTypes[3]
+	mi := &file_src_store_db_ops_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1244,7 +1391,7 @@ func (x *Transform) String() string {
 func (*Transform) ProtoMessage() {}
 
 func (x *Transform) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[3]
+	mi := &file_src_store_db_ops_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1342,7 +1489,7 @@ type BatchOp struct {
 
 func (x *BatchOp) Reset() {
 	*x = BatchOp{}
-	mi := &file_ops_proto_msgTypes[4]
+	mi := &file_src_store_db_ops_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1354,7 +1501,7 @@ func (x *BatchOp) String() string {
 func (*BatchOp) ProtoMessage() {}
 
 func (x *BatchOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[4]
+	mi := &file_src_store_db_ops_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1476,7 +1623,7 @@ type SplitDeltaEntry struct {
 
 func (x *SplitDeltaEntry) Reset() {
 	*x = SplitDeltaEntry{}
-	mi := &file_ops_proto_msgTypes[5]
+	mi := &file_src_store_db_ops_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1488,7 +1635,7 @@ func (x *SplitDeltaEntry) String() string {
 func (*SplitDeltaEntry) ProtoMessage() {}
 
 func (x *SplitDeltaEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[5]
+	mi := &file_src_store_db_ops_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1565,6 +1712,107 @@ func (b0 SplitDeltaEntry_builder) Build() *SplitDeltaEntry {
 	return m0
 }
 
+type MergeDeltaEntry struct {
+	state                protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_Sequence  uint64                 `protobuf:"varint,1,opt,name=sequence"`
+	xxx_hidden_Timestamp uint64                 `protobuf:"varint,2,opt,name=timestamp"`
+	xxx_hidden_Writes    *[]*Write              `protobuf:"bytes,3,rep,name=writes"`
+	xxx_hidden_Deletes   [][]byte               `protobuf:"bytes,4,rep,name=deletes"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *MergeDeltaEntry) Reset() {
+	*x = MergeDeltaEntry{}
+	mi := &file_src_store_db_ops_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MergeDeltaEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MergeDeltaEntry) ProtoMessage() {}
+
+func (x *MergeDeltaEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_src_store_db_ops_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+func (x *MergeDeltaEntry) GetSequence() uint64 {
+	if x != nil {
+		return x.xxx_hidden_Sequence
+	}
+	return 0
+}
+
+func (x *MergeDeltaEntry) GetTimestamp() uint64 {
+	if x != nil {
+		return x.xxx_hidden_Timestamp
+	}
+	return 0
+}
+
+func (x *MergeDeltaEntry) GetWrites() []*Write {
+	if x != nil {
+		if x.xxx_hidden_Writes != nil {
+			return *x.xxx_hidden_Writes
+		}
+	}
+	return nil
+}
+
+func (x *MergeDeltaEntry) GetDeletes() [][]byte {
+	if x != nil {
+		return x.xxx_hidden_Deletes
+	}
+	return nil
+}
+
+func (x *MergeDeltaEntry) SetSequence(v uint64) {
+	x.xxx_hidden_Sequence = v
+}
+
+func (x *MergeDeltaEntry) SetTimestamp(v uint64) {
+	x.xxx_hidden_Timestamp = v
+}
+
+func (x *MergeDeltaEntry) SetWrites(v []*Write) {
+	x.xxx_hidden_Writes = &v
+}
+
+func (x *MergeDeltaEntry) SetDeletes(v [][]byte) {
+	x.xxx_hidden_Deletes = v
+}
+
+type MergeDeltaEntry_builder struct {
+	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
+
+	Sequence  uint64
+	Timestamp uint64
+	Writes    []*Write
+	Deletes   [][]byte
+}
+
+func (b0 MergeDeltaEntry_builder) Build() *MergeDeltaEntry {
+	m0 := &MergeDeltaEntry{}
+	b, x := &b0, m0
+	_, _ = b, x
+	x.xxx_hidden_Sequence = b.Sequence
+	x.xxx_hidden_Timestamp = b.Timestamp
+	x.xxx_hidden_Writes = &b.Writes
+	x.xxx_hidden_Deletes = b.Deletes
+	return m0
+}
+
 type SplitOp struct {
 	state                 protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_NewShardId uint64                 `protobuf:"varint,1,opt,name=new_shard_id,json=newShardId"`
@@ -1575,7 +1823,7 @@ type SplitOp struct {
 
 func (x *SplitOp) Reset() {
 	*x = SplitOp{}
-	mi := &file_ops_proto_msgTypes[6]
+	mi := &file_src_store_db_ops_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1587,7 +1835,7 @@ func (x *SplitOp) String() string {
 func (*SplitOp) ProtoMessage() {}
 
 func (x *SplitOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[6]
+	mi := &file_src_store_db_ops_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1652,7 +1900,7 @@ type FinalizeSplitOp struct {
 
 func (x *FinalizeSplitOp) Reset() {
 	*x = FinalizeSplitOp{}
-	mi := &file_ops_proto_msgTypes[7]
+	mi := &file_src_store_db_ops_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1664,7 +1912,7 @@ func (x *FinalizeSplitOp) String() string {
 func (*FinalizeSplitOp) ProtoMessage() {}
 
 func (x *FinalizeSplitOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[7]
+	mi := &file_src_store_db_ops_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1704,6 +1952,83 @@ func (b0 FinalizeSplitOp_builder) Build() *FinalizeSplitOp {
 	return m0
 }
 
+type FinalizeMergeOp struct {
+	state                    protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_NewRangeStart []byte                 `protobuf:"bytes,1,opt,name=new_range_start,json=newRangeStart"`
+	xxx_hidden_NewRangeEnd   []byte                 `protobuf:"bytes,2,opt,name=new_range_end,json=newRangeEnd"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
+}
+
+func (x *FinalizeMergeOp) Reset() {
+	*x = FinalizeMergeOp{}
+	mi := &file_src_store_db_ops_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FinalizeMergeOp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FinalizeMergeOp) ProtoMessage() {}
+
+func (x *FinalizeMergeOp) ProtoReflect() protoreflect.Message {
+	mi := &file_src_store_db_ops_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+func (x *FinalizeMergeOp) GetNewRangeStart() []byte {
+	if x != nil {
+		return x.xxx_hidden_NewRangeStart
+	}
+	return nil
+}
+
+func (x *FinalizeMergeOp) GetNewRangeEnd() []byte {
+	if x != nil {
+		return x.xxx_hidden_NewRangeEnd
+	}
+	return nil
+}
+
+func (x *FinalizeMergeOp) SetNewRangeStart(v []byte) {
+	if v == nil {
+		v = []byte{}
+	}
+	x.xxx_hidden_NewRangeStart = v
+}
+
+func (x *FinalizeMergeOp) SetNewRangeEnd(v []byte) {
+	if v == nil {
+		v = []byte{}
+	}
+	x.xxx_hidden_NewRangeEnd = v
+}
+
+type FinalizeMergeOp_builder struct {
+	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
+
+	NewRangeStart []byte
+	NewRangeEnd   []byte
+}
+
+func (b0 FinalizeMergeOp_builder) Build() *FinalizeMergeOp {
+	m0 := &FinalizeMergeOp{}
+	b, x := &b0, m0
+	_, _ = b, x
+	x.xxx_hidden_NewRangeStart = b.NewRangeStart
+	x.xxx_hidden_NewRangeEnd = b.NewRangeEnd
+	return m0
+}
+
 type SetRangeOp struct {
 	state               protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_StartKey []byte                 `protobuf:"bytes,1,opt,name=start_key,json=startKey"`
@@ -1714,7 +2039,7 @@ type SetRangeOp struct {
 
 func (x *SetRangeOp) Reset() {
 	*x = SetRangeOp{}
-	mi := &file_ops_proto_msgTypes[8]
+	mi := &file_src_store_db_ops_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1726,7 +2051,7 @@ func (x *SetRangeOp) String() string {
 func (*SetRangeOp) ProtoMessage() {}
 
 func (x *SetRangeOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[8]
+	mi := &file_src_store_db_ops_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1790,7 +2115,7 @@ type UpdateSchemaOp struct {
 
 func (x *UpdateSchemaOp) Reset() {
 	*x = UpdateSchemaOp{}
-	mi := &file_ops_proto_msgTypes[9]
+	mi := &file_src_store_db_ops_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1802,7 +2127,7 @@ func (x *UpdateSchemaOp) String() string {
 func (*UpdateSchemaOp) ProtoMessage() {}
 
 func (x *UpdateSchemaOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[9]
+	mi := &file_src_store_db_ops_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1852,7 +2177,7 @@ type AddIndexOp struct {
 
 func (x *AddIndexOp) Reset() {
 	*x = AddIndexOp{}
-	mi := &file_ops_proto_msgTypes[10]
+	mi := &file_src_store_db_ops_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1864,7 +2189,7 @@ func (x *AddIndexOp) String() string {
 func (*AddIndexOp) ProtoMessage() {}
 
 func (x *AddIndexOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[10]
+	mi := &file_src_store_db_ops_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1938,7 +2263,7 @@ type DeleteIndexOp struct {
 
 func (x *DeleteIndexOp) Reset() {
 	*x = DeleteIndexOp{}
-	mi := &file_ops_proto_msgTypes[11]
+	mi := &file_src_store_db_ops_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1950,7 +2275,7 @@ func (x *DeleteIndexOp) String() string {
 func (*DeleteIndexOp) ProtoMessage() {}
 
 func (x *DeleteIndexOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[11]
+	mi := &file_src_store_db_ops_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1996,7 +2321,7 @@ type BackupOp struct {
 
 func (x *BackupOp) Reset() {
 	*x = BackupOp{}
-	mi := &file_ops_proto_msgTypes[12]
+	mi := &file_src_store_db_ops_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2008,7 +2333,7 @@ func (x *BackupOp) String() string {
 func (*BackupOp) ProtoMessage() {}
 
 func (x *BackupOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[12]
+	mi := &file_src_store_db_ops_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2068,7 +2393,7 @@ type InitTransactionOp struct {
 
 func (x *InitTransactionOp) Reset() {
 	*x = InitTransactionOp{}
-	mi := &file_ops_proto_msgTypes[13]
+	mi := &file_src_store_db_ops_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2080,7 +2405,7 @@ func (x *InitTransactionOp) String() string {
 func (*InitTransactionOp) ProtoMessage() {}
 
 func (x *InitTransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[13]
+	mi := &file_src_store_db_ops_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2154,7 +2479,7 @@ type CommitTransactionOp struct {
 
 func (x *CommitTransactionOp) Reset() {
 	*x = CommitTransactionOp{}
-	mi := &file_ops_proto_msgTypes[14]
+	mi := &file_src_store_db_ops_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2166,7 +2491,7 @@ func (x *CommitTransactionOp) String() string {
 func (*CommitTransactionOp) ProtoMessage() {}
 
 func (x *CommitTransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[14]
+	mi := &file_src_store_db_ops_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2214,7 +2539,7 @@ type AbortTransactionOp struct {
 
 func (x *AbortTransactionOp) Reset() {
 	*x = AbortTransactionOp{}
-	mi := &file_ops_proto_msgTypes[15]
+	mi := &file_src_store_db_ops_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2226,7 +2551,7 @@ func (x *AbortTransactionOp) String() string {
 func (*AbortTransactionOp) ProtoMessage() {}
 
 func (x *AbortTransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[15]
+	mi := &file_src_store_db_ops_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2275,7 +2600,7 @@ type VersionPredicate struct {
 
 func (x *VersionPredicate) Reset() {
 	*x = VersionPredicate{}
-	mi := &file_ops_proto_msgTypes[16]
+	mi := &file_src_store_db_ops_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2287,7 +2612,7 @@ func (x *VersionPredicate) String() string {
 func (*VersionPredicate) ProtoMessage() {}
 
 func (x *VersionPredicate) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[16]
+	mi := &file_src_store_db_ops_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2352,7 +2677,7 @@ type WriteIntentOp struct {
 
 func (x *WriteIntentOp) Reset() {
 	*x = WriteIntentOp{}
-	mi := &file_ops_proto_msgTypes[17]
+	mi := &file_src_store_db_ops_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2364,7 +2689,7 @@ func (x *WriteIntentOp) String() string {
 func (*WriteIntentOp) ProtoMessage() {}
 
 func (x *WriteIntentOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[17]
+	mi := &file_src_store_db_ops_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2482,7 +2807,7 @@ type ResolveIntentsOp struct {
 
 func (x *ResolveIntentsOp) Reset() {
 	*x = ResolveIntentsOp{}
-	mi := &file_ops_proto_msgTypes[18]
+	mi := &file_src_store_db_ops_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2494,7 +2819,7 @@ func (x *ResolveIntentsOp) String() string {
 func (*ResolveIntentsOp) ProtoMessage() {}
 
 func (x *ResolveIntentsOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[18]
+	mi := &file_src_store_db_ops_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2576,7 +2901,7 @@ type SplitState struct {
 
 func (x *SplitState) Reset() {
 	*x = SplitState{}
-	mi := &file_ops_proto_msgTypes[19]
+	mi := &file_src_store_db_ops_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2588,7 +2913,7 @@ func (x *SplitState) String() string {
 func (*SplitState) ProtoMessage() {}
 
 func (x *SplitState) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[19]
+	mi := &file_src_store_db_ops_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2693,7 +3018,7 @@ type SetSplitStateOp struct {
 
 func (x *SetSplitStateOp) Reset() {
 	*x = SetSplitStateOp{}
-	mi := &file_ops_proto_msgTypes[20]
+	mi := &file_src_store_db_ops_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2705,7 +3030,7 @@ func (x *SetSplitStateOp) String() string {
 func (*SetSplitStateOp) ProtoMessage() {}
 
 func (x *SetSplitStateOp) ProtoReflect() protoreflect.Message {
-	mi := &file_ops_proto_msgTypes[20]
+	mi := &file_src_store_db_ops_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2753,12 +3078,399 @@ func (b0 SetSplitStateOp_builder) Build() *SetSplitStateOp {
 	return m0
 }
 
-var File_ops_proto protoreflect.FileDescriptor
+// MergeState represents the current phase of an online shard merge operation.
+// Unlike MergeRange, this tracks donor/receiver coordination for non-empty merges.
+type MergeState struct {
+	state                         protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_Phase              MergeState_Phase       `protobuf:"varint,1,opt,name=phase,enum=db.MergeState_Phase"`
+	xxx_hidden_DonorShardId       uint64                 `protobuf:"varint,2,opt,name=donor_shard_id,json=donorShardId"`
+	xxx_hidden_ReceiverShardId    uint64                 `protobuf:"varint,3,opt,name=receiver_shard_id,json=receiverShardId"`
+	xxx_hidden_DonorRangeStart    []byte                 `protobuf:"bytes,4,opt,name=donor_range_start,json=donorRangeStart"`
+	xxx_hidden_DonorRangeEnd      []byte                 `protobuf:"bytes,5,opt,name=donor_range_end,json=donorRangeEnd"`
+	xxx_hidden_ReceiverRangeStart []byte                 `protobuf:"bytes,6,opt,name=receiver_range_start,json=receiverRangeStart"`
+	xxx_hidden_ReceiverRangeEnd   []byte                 `protobuf:"bytes,7,opt,name=receiver_range_end,json=receiverRangeEnd"`
+	xxx_hidden_StartedAtUnixNanos int64                  `protobuf:"varint,8,opt,name=started_at_unix_nanos,json=startedAtUnixNanos"`
+	xxx_hidden_ReplaySeq          uint64                 `protobuf:"varint,9,opt,name=replay_seq,json=replaySeq"`
+	xxx_hidden_FinalSeq           uint64                 `protobuf:"varint,10,opt,name=final_seq,json=finalSeq"`
+	xxx_hidden_CopyCompleted      bool                   `protobuf:"varint,11,opt,name=copy_completed,json=copyCompleted"`
+	xxx_hidden_CaptureDeltas      bool                   `protobuf:"varint,12,opt,name=capture_deltas,json=captureDeltas"`
+	xxx_hidden_AcceptDonorRange   bool                   `protobuf:"varint,13,opt,name=accept_donor_range,json=acceptDonorRange"`
+	xxx_hidden_DenyDonorWrites    bool                   `protobuf:"varint,14,opt,name=deny_donor_writes,json=denyDonorWrites"`
+	XXX_raceDetectHookData        protoimpl.RaceDetectHookData
+	XXX_presence                  [1]uint32
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
+}
 
-const file_ops_proto_rawDesc = "" +
+func (x *MergeState) Reset() {
+	*x = MergeState{}
+	mi := &file_src_store_db_ops_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MergeState) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MergeState) ProtoMessage() {}
+
+func (x *MergeState) ProtoReflect() protoreflect.Message {
+	mi := &file_src_store_db_ops_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+func (x *MergeState) GetPhase() MergeState_Phase {
+	if x != nil {
+		return x.xxx_hidden_Phase
+	}
+	return MergeState_PHASE_NONE
+}
+
+func (x *MergeState) GetDonorShardId() uint64 {
+	if x != nil {
+		return x.xxx_hidden_DonorShardId
+	}
+	return 0
+}
+
+func (x *MergeState) GetReceiverShardId() uint64 {
+	if x != nil {
+		return x.xxx_hidden_ReceiverShardId
+	}
+	return 0
+}
+
+func (x *MergeState) GetDonorRangeStart() []byte {
+	if x != nil {
+		return x.xxx_hidden_DonorRangeStart
+	}
+	return nil
+}
+
+func (x *MergeState) GetDonorRangeEnd() []byte {
+	if x != nil {
+		return x.xxx_hidden_DonorRangeEnd
+	}
+	return nil
+}
+
+func (x *MergeState) GetReceiverRangeStart() []byte {
+	if x != nil {
+		return x.xxx_hidden_ReceiverRangeStart
+	}
+	return nil
+}
+
+func (x *MergeState) GetReceiverRangeEnd() []byte {
+	if x != nil {
+		return x.xxx_hidden_ReceiverRangeEnd
+	}
+	return nil
+}
+
+func (x *MergeState) GetStartedAtUnixNanos() int64 {
+	if x != nil {
+		return x.xxx_hidden_StartedAtUnixNanos
+	}
+	return 0
+}
+
+func (x *MergeState) GetReplaySeq() uint64 {
+	if x != nil {
+		return x.xxx_hidden_ReplaySeq
+	}
+	return 0
+}
+
+func (x *MergeState) GetFinalSeq() uint64 {
+	if x != nil {
+		return x.xxx_hidden_FinalSeq
+	}
+	return 0
+}
+
+func (x *MergeState) GetCopyCompleted() bool {
+	if x != nil {
+		return x.xxx_hidden_CopyCompleted
+	}
+	return false
+}
+
+func (x *MergeState) GetCaptureDeltas() bool {
+	if x != nil {
+		return x.xxx_hidden_CaptureDeltas
+	}
+	return false
+}
+
+func (x *MergeState) GetAcceptDonorRange() bool {
+	if x != nil {
+		return x.xxx_hidden_AcceptDonorRange
+	}
+	return false
+}
+
+func (x *MergeState) GetDenyDonorWrites() bool {
+	if x != nil {
+		return x.xxx_hidden_DenyDonorWrites
+	}
+	return false
+}
+
+func (x *MergeState) SetPhase(v MergeState_Phase) {
+	x.xxx_hidden_Phase = v
+}
+
+func (x *MergeState) SetDonorShardId(v uint64) {
+	x.xxx_hidden_DonorShardId = v
+}
+
+func (x *MergeState) SetReceiverShardId(v uint64) {
+	x.xxx_hidden_ReceiverShardId = v
+}
+
+func (x *MergeState) SetDonorRangeStart(v []byte) {
+	if v == nil {
+		v = []byte{}
+	}
+	x.xxx_hidden_DonorRangeStart = v
+}
+
+func (x *MergeState) SetDonorRangeEnd(v []byte) {
+	if v == nil {
+		v = []byte{}
+	}
+	x.xxx_hidden_DonorRangeEnd = v
+}
+
+func (x *MergeState) SetReceiverRangeStart(v []byte) {
+	if v == nil {
+		v = []byte{}
+	}
+	x.xxx_hidden_ReceiverRangeStart = v
+}
+
+func (x *MergeState) SetReceiverRangeEnd(v []byte) {
+	if v == nil {
+		v = []byte{}
+	}
+	x.xxx_hidden_ReceiverRangeEnd = v
+}
+
+func (x *MergeState) SetStartedAtUnixNanos(v int64) {
+	x.xxx_hidden_StartedAtUnixNanos = v
+}
+
+func (x *MergeState) SetReplaySeq(v uint64) {
+	x.xxx_hidden_ReplaySeq = v
+}
+
+func (x *MergeState) SetFinalSeq(v uint64) {
+	x.xxx_hidden_FinalSeq = v
+}
+
+func (x *MergeState) SetCopyCompleted(v bool) {
+	x.xxx_hidden_CopyCompleted = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 10, 14)
+}
+
+func (x *MergeState) SetCaptureDeltas(v bool) {
+	x.xxx_hidden_CaptureDeltas = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 11, 14)
+}
+
+func (x *MergeState) SetAcceptDonorRange(v bool) {
+	x.xxx_hidden_AcceptDonorRange = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 12, 14)
+}
+
+func (x *MergeState) SetDenyDonorWrites(v bool) {
+	x.xxx_hidden_DenyDonorWrites = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 13, 14)
+}
+
+func (x *MergeState) HasCopyCompleted() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 10)
+}
+
+func (x *MergeState) HasCaptureDeltas() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 11)
+}
+
+func (x *MergeState) HasAcceptDonorRange() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 12)
+}
+
+func (x *MergeState) HasDenyDonorWrites() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 13)
+}
+
+func (x *MergeState) ClearCopyCompleted() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 10)
+	x.xxx_hidden_CopyCompleted = false
+}
+
+func (x *MergeState) ClearCaptureDeltas() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 11)
+	x.xxx_hidden_CaptureDeltas = false
+}
+
+func (x *MergeState) ClearAcceptDonorRange() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 12)
+	x.xxx_hidden_AcceptDonorRange = false
+}
+
+func (x *MergeState) ClearDenyDonorWrites() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 13)
+	x.xxx_hidden_DenyDonorWrites = false
+}
+
+type MergeState_builder struct {
+	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
+
+	Phase              MergeState_Phase
+	DonorShardId       uint64
+	ReceiverShardId    uint64
+	DonorRangeStart    []byte
+	DonorRangeEnd      []byte
+	ReceiverRangeStart []byte
+	ReceiverRangeEnd   []byte
+	StartedAtUnixNanos int64
+	ReplaySeq          uint64
+	FinalSeq           uint64
+	CopyCompleted      *bool
+	CaptureDeltas      *bool
+	AcceptDonorRange   *bool
+	DenyDonorWrites    *bool
+}
+
+func (b0 MergeState_builder) Build() *MergeState {
+	m0 := &MergeState{}
+	b, x := &b0, m0
+	_, _ = b, x
+	x.xxx_hidden_Phase = b.Phase
+	x.xxx_hidden_DonorShardId = b.DonorShardId
+	x.xxx_hidden_ReceiverShardId = b.ReceiverShardId
+	x.xxx_hidden_DonorRangeStart = b.DonorRangeStart
+	x.xxx_hidden_DonorRangeEnd = b.DonorRangeEnd
+	x.xxx_hidden_ReceiverRangeStart = b.ReceiverRangeStart
+	x.xxx_hidden_ReceiverRangeEnd = b.ReceiverRangeEnd
+	x.xxx_hidden_StartedAtUnixNanos = b.StartedAtUnixNanos
+	x.xxx_hidden_ReplaySeq = b.ReplaySeq
+	x.xxx_hidden_FinalSeq = b.FinalSeq
+	if b.CopyCompleted != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 10, 14)
+		x.xxx_hidden_CopyCompleted = *b.CopyCompleted
+	}
+	if b.CaptureDeltas != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 11, 14)
+		x.xxx_hidden_CaptureDeltas = *b.CaptureDeltas
+	}
+	if b.AcceptDonorRange != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 12, 14)
+		x.xxx_hidden_AcceptDonorRange = *b.AcceptDonorRange
+	}
+	if b.DenyDonorWrites != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 13, 14)
+		x.xxx_hidden_DenyDonorWrites = *b.DenyDonorWrites
+	}
+	return m0
+}
+
+type SetMergeStateOp struct {
+	state            protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_State *MergeState            `protobuf:"bytes,1,opt,name=state"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *SetMergeStateOp) Reset() {
+	*x = SetMergeStateOp{}
+	mi := &file_src_store_db_ops_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetMergeStateOp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetMergeStateOp) ProtoMessage() {}
+
+func (x *SetMergeStateOp) ProtoReflect() protoreflect.Message {
+	mi := &file_src_store_db_ops_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+func (x *SetMergeStateOp) GetState() *MergeState {
+	if x != nil {
+		return x.xxx_hidden_State
+	}
+	return nil
+}
+
+func (x *SetMergeStateOp) SetState(v *MergeState) {
+	x.xxx_hidden_State = v
+}
+
+func (x *SetMergeStateOp) HasState() bool {
+	if x == nil {
+		return false
+	}
+	return x.xxx_hidden_State != nil
+}
+
+func (x *SetMergeStateOp) ClearState() {
+	x.xxx_hidden_State = nil
+}
+
+type SetMergeStateOp_builder struct {
+	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
+
+	// The new merge state, or nil to clear the state (after finalize/rollback).
+	State *MergeState
+}
+
+func (b0 SetMergeStateOp_builder) Build() *SetMergeStateOp {
+	m0 := &SetMergeStateOp{}
+	b, x := &b0, m0
+	_, _ = b, x
+	x.xxx_hidden_State = b.State
+	return m0
+}
+
+var File_src_store_db_ops_proto protoreflect.FileDescriptor
+
+const file_src_store_db_ops_proto_rawDesc = "" +
 	"\n" +
-	"\tops.proto\x12\x02db\x1a!google/protobuf/go_features.proto\"\xa7\n" +
-	"\n" +
+	"\x16src/store/db/ops.proto\x12\x02db\x1a!google/protobuf/go_features.proto\"\xd6\v\n" +
 	"\x02Op\x12$\n" +
 	"\x02op\x18\x01 \x01(\x0e2\r.db.Op.OpTypeB\x05\xaa\x01\x02\b\x02R\x02op\x12\x12\n" +
 	"\x04uuid\x18\x02 \x01(\tR\x04uuid\x12'\n" +
@@ -2776,7 +3488,9 @@ const file_ops_proto_rawDesc = "" +
 	"\fwrite_intent\x18\r \x01(\v2\x11.db.WriteIntentOpB\x02(\x01H\x00R\vwriteIntent\x12C\n" +
 	"\x0fresolve_intents\x18\x0e \x01(\v2\x14.db.ResolveIntentsOpB\x02(\x01H\x00R\x0eresolveIntents\x12@\n" +
 	"\x0efinalize_split\x18\x0f \x01(\v2\x13.db.FinalizeSplitOpB\x02(\x01H\x00R\rfinalizeSplit\x12A\n" +
-	"\x0fset_split_state\x18\x10 \x01(\v2\x13.db.SetSplitStateOpB\x02(\x01H\x00R\rsetSplitState\"\x92\x02\n" +
+	"\x0fset_split_state\x18\x10 \x01(\v2\x13.db.SetSplitStateOpB\x02(\x01H\x00R\rsetSplitState\x12@\n" +
+	"\x0efinalize_merge\x18\x11 \x01(\v2\x13.db.FinalizeMergeOpB\x02(\x01H\x00R\rfinalizeMerge\x12A\n" +
+	"\x0fset_merge_state\x18\x12 \x01(\v2\x13.db.SetMergeStateOpB\x02(\x01H\x00R\rsetMergeState\"\xbc\x02\n" +
 	"\x06OpType\x12\v\n" +
 	"\aOpBatch\x10\x00\x12\v\n" +
 	"\aOpSplit\x10\x01\x12\x0e\n" +
@@ -2794,7 +3508,9 @@ const file_ops_proto_rawDesc = "" +
 	"\x12\x14\n" +
 	"\x10OpResolveIntents\x10\v\x12\x13\n" +
 	"\x0fOpFinalizeSplit\x10\f\x12\x13\n" +
-	"\x0fOpSetSplitState\x10\r\"\x7f\n" +
+	"\x0fOpSetSplitState\x10\r\x12\x13\n" +
+	"\x0fOpFinalizeMerge\x10\x0e\x12\x13\n" +
+	"\x0fOpSetMergeState\x10\x0f\"\x7f\n" +
 	"\tSyncLevel\x12\x14\n" +
 	"\x10SyncLevelPropose\x10\x00\x12\x12\n" +
 	"\x0eSyncLevelWrite\x10\x01\x12\x15\n" +
@@ -2844,13 +3560,21 @@ const file_ops_proto_rawDesc = "" +
 	"\bsequence\x18\x01 \x01(\x04B\x05\xaa\x01\x02\b\x02R\bsequence\x12#\n" +
 	"\ttimestamp\x18\x02 \x01(\x04B\x05\xaa\x01\x02\b\x02R\ttimestamp\x12!\n" +
 	"\x06writes\x18\x03 \x03(\v2\t.db.WriteR\x06writes\x12\x18\n" +
+	"\adeletes\x18\x04 \x03(\fR\adeletes\"\x96\x01\n" +
+	"\x0fMergeDeltaEntry\x12!\n" +
+	"\bsequence\x18\x01 \x01(\x04B\x05\xaa\x01\x02\b\x02R\bsequence\x12#\n" +
+	"\ttimestamp\x18\x02 \x01(\x04B\x05\xaa\x01\x02\b\x02R\ttimestamp\x12!\n" +
+	"\x06writes\x18\x03 \x03(\v2\t.db.WriteR\x06writes\x12\x18\n" +
 	"\adeletes\x18\x04 \x03(\fR\adeletes\"V\n" +
 	"\aSplitOp\x12'\n" +
 	"\fnew_shard_id\x18\x01 \x01(\x04B\x05\xaa\x01\x02\b\x02R\n" +
 	"newShardId\x12\"\n" +
 	"\tsplit_key\x18\x02 \x01(\fB\x05\xaa\x01\x02\b\x02R\bsplitKey\"<\n" +
 	"\x0fFinalizeSplitOp\x12)\n" +
-	"\rnew_range_end\x18\x01 \x01(\fB\x05\xaa\x01\x02\b\x02R\vnewRangeEnd\"P\n" +
+	"\rnew_range_end\x18\x01 \x01(\fB\x05\xaa\x01\x02\b\x02R\vnewRangeEnd\"k\n" +
+	"\x0fFinalizeMergeOp\x12-\n" +
+	"\x0fnew_range_start\x18\x01 \x01(\fB\x05\xaa\x01\x02\b\x02R\rnewRangeStart\x12)\n" +
+	"\rnew_range_end\x18\x02 \x01(\fB\x05\xaa\x01\x02\b\x02R\vnewRangeEnd\"P\n" +
 	"\n" +
 	"SetRangeOp\x12\"\n" +
 	"\tstart_key\x18\x01 \x01(\fB\x05\xaa\x01\x02\b\x02R\bstartKey\x12\x1e\n" +
@@ -2906,76 +3630,114 @@ const file_ops_proto_rawDesc = "" +
 	"\x10PHASE_FINALIZING\x10\x03\x12\x16\n" +
 	"\x12PHASE_ROLLING_BACK\x10\x04\"7\n" +
 	"\x0fSetSplitStateOp\x12$\n" +
-	"\x05state\x18\x01 \x01(\v2\x0e.db.SplitStateR\x05stateB1Z'github.com/antflydb/antfly/src/store/db\x92\x03\x05\xd2>\x02\x10\x03b\beditionsp\xe8\a"
+	"\x05state\x18\x01 \x01(\v2\x0e.db.SplitStateR\x05state\"\x9b\x06\n" +
+	"\n" +
+	"MergeState\x121\n" +
+	"\x05phase\x18\x01 \x01(\x0e2\x14.db.MergeState.PhaseB\x05\xaa\x01\x02\b\x02R\x05phase\x12+\n" +
+	"\x0edonor_shard_id\x18\x02 \x01(\x04B\x05\xaa\x01\x02\b\x02R\fdonorShardId\x121\n" +
+	"\x11receiver_shard_id\x18\x03 \x01(\x04B\x05\xaa\x01\x02\b\x02R\x0freceiverShardId\x121\n" +
+	"\x11donor_range_start\x18\x04 \x01(\fB\x05\xaa\x01\x02\b\x02R\x0fdonorRangeStart\x12-\n" +
+	"\x0fdonor_range_end\x18\x05 \x01(\fB\x05\xaa\x01\x02\b\x02R\rdonorRangeEnd\x127\n" +
+	"\x14receiver_range_start\x18\x06 \x01(\fB\x05\xaa\x01\x02\b\x02R\x12receiverRangeStart\x123\n" +
+	"\x12receiver_range_end\x18\a \x01(\fB\x05\xaa\x01\x02\b\x02R\x10receiverRangeEnd\x128\n" +
+	"\x15started_at_unix_nanos\x18\b \x01(\x03B\x05\xaa\x01\x02\b\x02R\x12startedAtUnixNanos\x12$\n" +
+	"\n" +
+	"replay_seq\x18\t \x01(\x04B\x05\xaa\x01\x02\b\x02R\treplaySeq\x12\"\n" +
+	"\tfinal_seq\x18\n" +
+	" \x01(\x04B\x05\xaa\x01\x02\b\x02R\bfinalSeq\x12%\n" +
+	"\x0ecopy_completed\x18\v \x01(\bR\rcopyCompleted\x12%\n" +
+	"\x0ecapture_deltas\x18\f \x01(\bR\rcaptureDeltas\x12,\n" +
+	"\x12accept_donor_range\x18\r \x01(\bR\x10acceptDonorRange\x12*\n" +
+	"\x11deny_donor_writes\x18\x0e \x01(\bR\x0fdenyDonorWrites\"~\n" +
+	"\x05Phase\x12\x0e\n" +
+	"\n" +
+	"PHASE_NONE\x10\x00\x12\x11\n" +
+	"\rPHASE_PREPARE\x10\x01\x12\x11\n" +
+	"\rPHASE_COPYING\x10\x02\x12\x11\n" +
+	"\rPHASE_CATCHUP\x10\x03\x12\x14\n" +
+	"\x10PHASE_FINALIZING\x10\x04\x12\x16\n" +
+	"\x12PHASE_ROLLING_BACK\x10\x05\"7\n" +
+	"\x0fSetMergeStateOp\x12$\n" +
+	"\x05state\x18\x01 \x01(\v2\x0e.db.MergeStateR\x05stateB1Z'github.com/antflydb/antfly/src/store/db\x92\x03\x05\xd2>\x02\x10\x03b\beditionsp\xe8\a"
 
-var file_ops_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_ops_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
-var file_ops_proto_goTypes = []any{
+var file_src_store_db_ops_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
+var file_src_store_db_ops_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
+var file_src_store_db_ops_proto_goTypes = []any{
 	(Op_OpType)(0),              // 0: db.Op.OpType
 	(Op_SyncLevel)(0),           // 1: db.Op.SyncLevel
 	(TransformOp_OpType)(0),     // 2: db.TransformOp.OpType
 	(SplitState_Phase)(0),       // 3: db.SplitState.Phase
-	(*Op)(nil),                  // 4: db.Op
-	(*Write)(nil),               // 5: db.Write
-	(*TransformOp)(nil),         // 6: db.TransformOp
-	(*Transform)(nil),           // 7: db.Transform
-	(*BatchOp)(nil),             // 8: db.BatchOp
-	(*SplitDeltaEntry)(nil),     // 9: db.SplitDeltaEntry
-	(*SplitOp)(nil),             // 10: db.SplitOp
-	(*FinalizeSplitOp)(nil),     // 11: db.FinalizeSplitOp
-	(*SetRangeOp)(nil),          // 12: db.SetRangeOp
-	(*UpdateSchemaOp)(nil),      // 13: db.UpdateSchemaOp
-	(*AddIndexOp)(nil),          // 14: db.AddIndexOp
-	(*DeleteIndexOp)(nil),       // 15: db.DeleteIndexOp
-	(*BackupOp)(nil),            // 16: db.BackupOp
-	(*InitTransactionOp)(nil),   // 17: db.InitTransactionOp
-	(*CommitTransactionOp)(nil), // 18: db.CommitTransactionOp
-	(*AbortTransactionOp)(nil),  // 19: db.AbortTransactionOp
-	(*VersionPredicate)(nil),    // 20: db.VersionPredicate
-	(*WriteIntentOp)(nil),       // 21: db.WriteIntentOp
-	(*ResolveIntentsOp)(nil),    // 22: db.ResolveIntentsOp
-	(*SplitState)(nil),          // 23: db.SplitState
-	(*SetSplitStateOp)(nil),     // 24: db.SetSplitStateOp
+	(MergeState_Phase)(0),       // 4: db.MergeState.Phase
+	(*Op)(nil),                  // 5: db.Op
+	(*Write)(nil),               // 6: db.Write
+	(*TransformOp)(nil),         // 7: db.TransformOp
+	(*Transform)(nil),           // 8: db.Transform
+	(*BatchOp)(nil),             // 9: db.BatchOp
+	(*SplitDeltaEntry)(nil),     // 10: db.SplitDeltaEntry
+	(*MergeDeltaEntry)(nil),     // 11: db.MergeDeltaEntry
+	(*SplitOp)(nil),             // 12: db.SplitOp
+	(*FinalizeSplitOp)(nil),     // 13: db.FinalizeSplitOp
+	(*FinalizeMergeOp)(nil),     // 14: db.FinalizeMergeOp
+	(*SetRangeOp)(nil),          // 15: db.SetRangeOp
+	(*UpdateSchemaOp)(nil),      // 16: db.UpdateSchemaOp
+	(*AddIndexOp)(nil),          // 17: db.AddIndexOp
+	(*DeleteIndexOp)(nil),       // 18: db.DeleteIndexOp
+	(*BackupOp)(nil),            // 19: db.BackupOp
+	(*InitTransactionOp)(nil),   // 20: db.InitTransactionOp
+	(*CommitTransactionOp)(nil), // 21: db.CommitTransactionOp
+	(*AbortTransactionOp)(nil),  // 22: db.AbortTransactionOp
+	(*VersionPredicate)(nil),    // 23: db.VersionPredicate
+	(*WriteIntentOp)(nil),       // 24: db.WriteIntentOp
+	(*ResolveIntentsOp)(nil),    // 25: db.ResolveIntentsOp
+	(*SplitState)(nil),          // 26: db.SplitState
+	(*SetSplitStateOp)(nil),     // 27: db.SetSplitStateOp
+	(*MergeState)(nil),          // 28: db.MergeState
+	(*SetMergeStateOp)(nil),     // 29: db.SetMergeStateOp
 }
-var file_ops_proto_depIdxs = []int32{
+var file_src_store_db_ops_proto_depIdxs = []int32{
 	0,  // 0: db.Op.op:type_name -> db.Op.OpType
-	8,  // 1: db.Op.batch:type_name -> db.BatchOp
-	10, // 2: db.Op.split:type_name -> db.SplitOp
-	12, // 3: db.Op.set_range:type_name -> db.SetRangeOp
-	13, // 4: db.Op.update_schema:type_name -> db.UpdateSchemaOp
-	14, // 5: db.Op.add_index:type_name -> db.AddIndexOp
-	15, // 6: db.Op.delete_index:type_name -> db.DeleteIndexOp
-	16, // 7: db.Op.backup:type_name -> db.BackupOp
-	17, // 8: db.Op.init_transaction:type_name -> db.InitTransactionOp
-	18, // 9: db.Op.commit_transaction:type_name -> db.CommitTransactionOp
-	19, // 10: db.Op.abort_transaction:type_name -> db.AbortTransactionOp
-	21, // 11: db.Op.write_intent:type_name -> db.WriteIntentOp
-	22, // 12: db.Op.resolve_intents:type_name -> db.ResolveIntentsOp
-	11, // 13: db.Op.finalize_split:type_name -> db.FinalizeSplitOp
-	24, // 14: db.Op.set_split_state:type_name -> db.SetSplitStateOp
-	2,  // 15: db.TransformOp.op:type_name -> db.TransformOp.OpType
-	6,  // 16: db.Transform.operations:type_name -> db.TransformOp
-	5,  // 17: db.BatchOp.writes:type_name -> db.Write
-	7,  // 18: db.BatchOp.transforms:type_name -> db.Transform
-	1,  // 19: db.BatchOp.sync_level:type_name -> db.Op.SyncLevel
-	5,  // 20: db.SplitDeltaEntry.writes:type_name -> db.Write
-	8,  // 21: db.WriteIntentOp.batch:type_name -> db.BatchOp
-	20, // 22: db.WriteIntentOp.predicates:type_name -> db.VersionPredicate
-	3,  // 23: db.SplitState.phase:type_name -> db.SplitState.Phase
-	23, // 24: db.SetSplitStateOp.state:type_name -> db.SplitState
-	25, // [25:25] is the sub-list for method output_type
-	25, // [25:25] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	9,  // 1: db.Op.batch:type_name -> db.BatchOp
+	12, // 2: db.Op.split:type_name -> db.SplitOp
+	15, // 3: db.Op.set_range:type_name -> db.SetRangeOp
+	16, // 4: db.Op.update_schema:type_name -> db.UpdateSchemaOp
+	17, // 5: db.Op.add_index:type_name -> db.AddIndexOp
+	18, // 6: db.Op.delete_index:type_name -> db.DeleteIndexOp
+	19, // 7: db.Op.backup:type_name -> db.BackupOp
+	20, // 8: db.Op.init_transaction:type_name -> db.InitTransactionOp
+	21, // 9: db.Op.commit_transaction:type_name -> db.CommitTransactionOp
+	22, // 10: db.Op.abort_transaction:type_name -> db.AbortTransactionOp
+	24, // 11: db.Op.write_intent:type_name -> db.WriteIntentOp
+	25, // 12: db.Op.resolve_intents:type_name -> db.ResolveIntentsOp
+	13, // 13: db.Op.finalize_split:type_name -> db.FinalizeSplitOp
+	27, // 14: db.Op.set_split_state:type_name -> db.SetSplitStateOp
+	14, // 15: db.Op.finalize_merge:type_name -> db.FinalizeMergeOp
+	29, // 16: db.Op.set_merge_state:type_name -> db.SetMergeStateOp
+	2,  // 17: db.TransformOp.op:type_name -> db.TransformOp.OpType
+	7,  // 18: db.Transform.operations:type_name -> db.TransformOp
+	6,  // 19: db.BatchOp.writes:type_name -> db.Write
+	8,  // 20: db.BatchOp.transforms:type_name -> db.Transform
+	1,  // 21: db.BatchOp.sync_level:type_name -> db.Op.SyncLevel
+	6,  // 22: db.SplitDeltaEntry.writes:type_name -> db.Write
+	6,  // 23: db.MergeDeltaEntry.writes:type_name -> db.Write
+	9,  // 24: db.WriteIntentOp.batch:type_name -> db.BatchOp
+	23, // 25: db.WriteIntentOp.predicates:type_name -> db.VersionPredicate
+	3,  // 26: db.SplitState.phase:type_name -> db.SplitState.Phase
+	26, // 27: db.SetSplitStateOp.state:type_name -> db.SplitState
+	4,  // 28: db.MergeState.phase:type_name -> db.MergeState.Phase
+	28, // 29: db.SetMergeStateOp.state:type_name -> db.MergeState
+	30, // [30:30] is the sub-list for method output_type
+	30, // [30:30] is the sub-list for method input_type
+	30, // [30:30] is the sub-list for extension type_name
+	30, // [30:30] is the sub-list for extension extendee
+	0,  // [0:30] is the sub-list for field type_name
 }
 
-func init() { file_ops_proto_init() }
-func file_ops_proto_init() {
-	if File_ops_proto != nil {
+func init() { file_src_store_db_ops_proto_init() }
+func file_src_store_db_ops_proto_init() {
+	if File_src_store_db_ops_proto != nil {
 		return
 	}
-	file_ops_proto_msgTypes[0].OneofWrappers = []any{
+	file_src_store_db_ops_proto_msgTypes[0].OneofWrappers = []any{
 		(*op_Batch)(nil),
 		(*op_Split)(nil),
 		(*op_SetRange)(nil),
@@ -2990,23 +3752,25 @@ func file_ops_proto_init() {
 		(*op_ResolveIntents)(nil),
 		(*op_FinalizeSplit)(nil),
 		(*op_SetSplitState)(nil),
+		(*op_FinalizeMerge)(nil),
+		(*op_SetMergeState)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_ops_proto_rawDesc), len(file_ops_proto_rawDesc)),
-			NumEnums:      4,
-			NumMessages:   21,
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_src_store_db_ops_proto_rawDesc), len(file_src_store_db_ops_proto_rawDesc)),
+			NumEnums:      5,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_ops_proto_goTypes,
-		DependencyIndexes: file_ops_proto_depIdxs,
-		EnumInfos:         file_ops_proto_enumTypes,
-		MessageInfos:      file_ops_proto_msgTypes,
+		GoTypes:           file_src_store_db_ops_proto_goTypes,
+		DependencyIndexes: file_src_store_db_ops_proto_depIdxs,
+		EnumInfos:         file_src_store_db_ops_proto_enumTypes,
+		MessageInfos:      file_src_store_db_ops_proto_msgTypes,
 	}.Build()
-	File_ops_proto = out.File
-	file_ops_proto_goTypes = nil
-	file_ops_proto_depIdxs = nil
+	File_src_store_db_ops_proto = out.File
+	file_src_store_db_ops_proto_goTypes = nil
+	file_src_store_db_ops_proto_depIdxs = nil
 }

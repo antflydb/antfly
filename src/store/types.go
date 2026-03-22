@@ -29,22 +29,28 @@ type IndexStatus struct {
 
 // Type aliases for backward compatibility - types have moved to db package
 type (
-	ShardConfig              = db.ShardConfig
-	ShardInfo                = db.ShardInfo
-	ShardStats               = db.DBStats
-	StorageStats             = db.DBStorageStats
-	ShardStatus              = db.ShardStatus
-	ShardIface               = db.ShardIface
-	Shard                    = db.Shard
-	ShardStartRequest        = db.ShardStartRequest
-	ShardSplitRequest        = db.ShardSplitRequest
-	ShardPrepareSplitRequest = db.ShardPrepareSplitRequest
-	ShardAddPeerRequest      = db.ShardAddPeerRequest
-	ShardRemovePeerRequest   = db.ShardRemovePeerRequest
-	ShardSetRangeRequest     = db.ShardSetRangeRequest
-	ShardUpdateSchemaRequest = db.ShardUpdateSchemaRequest
-	ShardDropIndexRequest    = db.ShardDropIndexRequest
-	ShardState               = db.ShardState
+	ShardConfig               = db.ShardConfig
+	ShardInfo                 = db.ShardInfo
+	ShardStats                = db.DBStats
+	StorageStats              = db.DBStorageStats
+	ShardStatus               = db.ShardStatus
+	ShardIface                = db.ShardIface
+	Shard                     = db.Shard
+	ShardStartRequest         = db.ShardStartRequest
+	ShardSplitRequest         = db.ShardSplitRequest
+	ShardPrepareSplitRequest  = db.ShardPrepareSplitRequest
+	ShardAddPeerRequest       = db.ShardAddPeerRequest
+	ShardRemovePeerRequest    = db.ShardRemovePeerRequest
+	ShardSetRangeRequest      = db.ShardSetRangeRequest
+	ShardUpdateSchemaRequest  = db.ShardUpdateSchemaRequest
+	ShardDropIndexRequest     = db.ShardDropIndexRequest
+	ShardMergeStateRequest    = db.ShardMergeStateRequest
+	ShardFinalizeMergeRequest = db.ShardFinalizeMergeRequest
+	ShardExportRangeRequest   = db.ShardExportRangeRequest
+	ShardMergeDeltaRequest    = db.ShardMergeDeltaRequest
+	ShardState                = db.ShardState
+	MergeState                = db.MergeState
+	MergeDeltaEntry           = db.MergeDeltaEntry
 )
 
 // ShardState constants for backward compatibility

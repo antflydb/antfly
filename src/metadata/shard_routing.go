@@ -54,6 +54,10 @@ func (ms *MetadataStore) leaderClientForShard(
 	if err != nil || status == nil {
 		return nil, fmt.Errorf("no status info available: %w", err)
 	}
+	if ms.shouldFallbackToMergeReceiver(status) {
+		receiverShardID := types.ID(status.MergeState.GetReceiverShardId())
+		return ms.leaderClientForShard(ctx, receiverShardID)
+	}
 	var nodeID types.ID
 	if !ms.config.SwarmMode {
 		// If this is a split-off shard that doesn't have data yet,
@@ -205,6 +209,10 @@ func (ms *MetadataStore) leaderClientForShardWithEffectiveID(
 	// During split, the new shard transitions: SplittingOff -> SplitOffPreSnap -> Default
 	// Until HasSnapshot is true (data has been transferred), reads should go to parent shard.
 	// The parent shard is in PreSplit or Splitting state and still has all the data.
+	if ms.shouldFallbackToMergeReceiver(status) {
+		receiverShardID := types.ID(status.MergeState.GetReceiverShardId())
+		return ms.leaderClientForShardWithEffectiveID(ctx, receiverShardID)
+	}
 	if ms.shouldFallbackToParentShard(status) {
 		parentShardID, err := ms.findParentShardForSplitOff(status)
 		if err == nil {
@@ -332,6 +340,10 @@ func (ms *MetadataStore) leaderClientForShardNoFallback(
 
 	// If shard is in split transition without data, return error to trigger retry
 	// Don't fall back to parent because parent's range has been narrowed and will reject
+	if ms.shouldFallbackToMergeReceiver(status) {
+		receiverShardID := types.ID(status.MergeState.GetReceiverShardId())
+		return ms.leaderClientForShardNoFallback(ctx, receiverShardID)
+	}
 	if ms.shouldFallbackToParentShard(status) {
 		ms.logger.Debug("SPLIT_ROUTING: Shard not ready for writes (no snapshot), returning retry error",
 			zap.Stringer("shardID", shardID),
@@ -384,6 +396,24 @@ func (ms *MetadataStore) shouldFallbackToParentShard(status *store.ShardStatus) 
 	default:
 		return false
 	}
+}
+
+func (ms *MetadataStore) shouldFallbackToMergeReceiver(status *store.ShardStatus) bool {
+	if status == nil || status.MergeState == nil {
+		return false
+	}
+	receiverShardID := types.ID(status.MergeState.GetReceiverShardId())
+	if status.MergeState.GetPhase() != db.MergeState_PHASE_FINALIZING ||
+		receiverShardID == 0 ||
+		receiverShardID == status.ID {
+		return false
+	}
+	allStatuses, err := ms.tm.GetShardStatuses()
+	if err != nil {
+		return false
+	}
+	receiverStatus := allStatuses[receiverShardID]
+	return receiverStatus != nil && receiverStatus.IsReadyForMergeCutover()
 }
 
 // findParentShardForSplitOff finds the parent shard for a shard in SplittingOff or SplitOffPreSnap state.

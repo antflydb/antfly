@@ -35,11 +35,20 @@ type StoreRPC interface {
 		transforms []*db.Transform,
 		syncLevel db.Op_SyncLevel,
 	) error
+	ApplyMergeChunk(
+		ctx context.Context,
+		shardID types.ID,
+		writes [][2][]byte,
+		deletes [][]byte,
+		syncLevel db.Op_SyncLevel,
+	) error
 	Backup(ctx context.Context, shardID types.ID, loc, id string) error
 	Lookup(ctx context.Context, shardID types.ID, keys []string) (map[string][]byte, error)
 	LookupWithVersion(ctx context.Context, shardID types.ID, key string) ([]byte, uint64, error)
 	AddIndex(ctx context.Context, shardID types.ID, name string, config *indexes.IndexConfig) error
 	MergeRange(ctx context.Context, shardID types.ID, byteRange [2][]byte) error
+	SetMergeState(ctx context.Context, shardID types.ID, state *db.MergeState) error
+	FinalizeMerge(ctx context.Context, shardID types.ID, byteRange [2][]byte) error
 	UpdateSchema(ctx context.Context, shardID types.ID, tableSchema *schema.TableSchema) error
 	PrepareSplit(ctx context.Context, shardID types.ID, splitKey []byte) error
 	SplitShard(ctx context.Context, shardID types.ID, newShardID types.ID, splitKey []byte) error
@@ -56,6 +65,8 @@ type StoreRPC interface {
 	MedianKeyForShard(ctx context.Context, shardID types.ID) ([]byte, error)
 	IsIDRemoved(ctx context.Context, shardID types.ID, nodeID types.ID) (bool, error)
 	Scan(ctx context.Context, shardID types.ID, fromKey []byte, toKey []byte, opts ScanOptions) (*db.ScanResult, error)
+	ExportRangeChunk(ctx context.Context, shardID types.ID, startKey, endKey, afterKey []byte, limit int) ([][2][]byte, []byte, bool, error)
+	ListMergeDeltaEntriesAfter(ctx context.Context, shardID types.ID, afterSeq uint64) ([]*db.MergeDeltaEntry, error)
 	InitTransaction(
 		ctx context.Context,
 		shardID types.ID,

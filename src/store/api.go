@@ -692,6 +692,128 @@ func (h *StoreAPI) handleRollbackSplit(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func (h *StoreAPI) handleSetMergeState(w http.ResponseWriter, r *http.Request) {
+	shardID, ok := h.getShardID(w, r)
+	if !ok || !h.validateShard(w, r, shardID) {
+		return
+	}
+
+	var req ShardMergeStateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Warn("Failed to read merge state request body", zap.Error(err))
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	shard, _ := h.store.Shard(shardID)
+	if err := shard.SetMergeState(r.Context(), req.State); err != nil {
+		h.logger.Error("Failed to set merge state on shard",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+		http.Error(w, fmt.Sprintf("Failed to set merge state: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *StoreAPI) handleFinalizeMerge(w http.ResponseWriter, r *http.Request) {
+	shardID, ok := h.getShardID(w, r)
+	if !ok || !h.validateShard(w, r, shardID) {
+		return
+	}
+
+	var req ShardFinalizeMergeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Warn("Failed to read finalize merge request body", zap.Error(err))
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	shard, _ := h.store.Shard(shardID)
+	if err := shard.FinalizeMerge(r.Context(), req.ByteRange); err != nil {
+		h.logger.Error("Failed to finalize merge on shard",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+		http.Error(w, fmt.Sprintf("Failed to finalize merge: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *StoreAPI) handleExportRange(w http.ResponseWriter, r *http.Request) {
+	shardID, ok := h.getShardID(w, r)
+	if !ok || !h.validateShard(w, r, shardID) {
+		return
+	}
+	var req ShardExportRangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Warn("Failed to read export range request body", zap.Error(err))
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	shard, _ := h.store.Shard(shardID)
+	writes, nextKey, done, err := shard.ExportRangeChunk(r.Context(), req.StartKey, req.EndKey, req.AfterKey, req.Limit)
+	if err != nil {
+		h.logger.Error("Failed to export range from shard",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+		http.Error(w, fmt.Sprintf("Failed to export range: %v", err), http.StatusInternalServerError)
+		return
+	}
+	resp := struct {
+		Writes []struct {
+			Key   []byte `json:"key"`
+			Value []byte `json:"value"`
+		} `json:"writes"`
+		NextKey []byte `json:"next_key,omitempty"`
+		Done    bool   `json:"done"`
+	}{
+		Writes: make([]struct {
+			Key   []byte `json:"key"`
+			Value []byte `json:"value"`
+		}, 0, len(writes)),
+		NextKey: nextKey,
+		Done:    done,
+	}
+	for _, wv := range writes {
+		resp.Writes = append(resp.Writes, struct {
+			Key   []byte `json:"key"`
+			Value []byte `json:"value"`
+		}{Key: wv[0], Value: wv[1]})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		h.logger.Error("Failed to encode export range response", zap.Error(err))
+	}
+}
+
+func (h *StoreAPI) handleMergeDeltas(w http.ResponseWriter, r *http.Request) {
+	shardID, ok := h.getShardID(w, r)
+	if !ok || !h.validateShard(w, r, shardID) {
+		return
+	}
+	var req ShardMergeDeltaRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Warn("Failed to read merge delta request body", zap.Error(err))
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	shard, _ := h.store.Shard(shardID)
+	entries, err := shard.ListMergeDeltaEntriesAfter(req.AfterSeq)
+	if err != nil {
+		h.logger.Error("Failed to list merge deltas from shard",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+		http.Error(w, fmt.Sprintf("Failed to list merge deltas: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(struct {
+		Entries []*MergeDeltaEntry `json:"entries"`
+	}{Entries: entries}); err != nil {
+		h.logger.Error("Failed to encode merge delta response", zap.Error(err))
+	}
+}
+
 func (h *StoreAPI) handleDropIndexShard(w http.ResponseWriter, r *http.Request) {
 	// Get the current shard ID from the header
 	shardID, ok := h.getShardID(w, r)
@@ -1123,6 +1245,57 @@ func (h *StoreAPI) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *StoreAPI) handleApplyMergeChunk(w http.ResponseWriter, r *http.Request) {
+	shardID, ok := h.getShardID(w, r)
+	if !ok || !h.validateShard(w, r, shardID) {
+		return
+	}
+
+	var b db.BatchOp
+	full, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.logger.Warn("Failed to read merge chunk request body for shard",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	if err := proto.Unmarshal(full, &b); err != nil {
+		h.logger.Warn("Failed to decode merge chunk request body for shard",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+		http.Error(w, "Failed to decode request body", http.StatusBadRequest)
+		return
+	}
+
+	shard, _ := h.store.Shard(shardID)
+
+	if err := shard.ApplyMergeChunk(r.Context(), &b); err != nil {
+		if errors.Is(err, db.ErrPartialSuccess) {
+			w.Header().Set("X-Antfly-Partial-Success", "full-text-queued")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if errors.Is(err, context.Canceled) {
+			h.logger.Warn("Merge chunk request was canceled",
+				zap.Stringer("shardID", shardID))
+			http.Error(w, "Merge chunk operation was canceled", http.StatusRequestTimeout)
+			return
+		}
+		h.logger.Warn("Failed to apply merge chunk on shard",
+			zap.Stringer("shardID", shardID),
+			zap.Error(err))
+		http.Error(
+			w,
+			fmt.Sprintf("Merge chunk operation failed: %v", err),
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // lookupResult is the per-key result returned by the batch lookup endpoint.
 type lookupResult struct {
 	Value   any    `json:"value"`
@@ -1462,6 +1635,10 @@ func (h *StoreAPI) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("POST /shard/split", h.handleSplitShard)
 	mux.HandleFunc("POST /shard/finalize-split", h.handleFinalizeSplitShard)
 	mux.HandleFunc("POST /shard/rollback-split", h.handleRollbackSplit)
+	mux.HandleFunc("POST /shard/merge-state", h.handleSetMergeState)
+	mux.HandleFunc("POST /shard/finalize-merge", h.handleFinalizeMerge)
+	mux.HandleFunc("POST /shard/export-range", h.handleExportRange)
+	mux.HandleFunc("POST /shard/merge-deltas", h.handleMergeDeltas)
 	mux.HandleFunc("POST /shard/backup", h.handleBackup)
 	mux.HandleFunc("POST /shard/setrange", h.handleSetRangeShard)
 	mux.HandleFunc("POST /shard/schema", h.handleUpdateSchemaShard)
@@ -1473,6 +1650,7 @@ func (h *StoreAPI) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /status", h.handleGetStoreStatus)
 	mux.HandleFunc("POST /search", h.handleSearch)
 	mux.HandleFunc("POST /batch", h.handleBatchWrite)
+	mux.HandleFunc("POST /shard/merge-chunk", h.handleApplyMergeChunk)
 	mux.HandleFunc("POST /scan", h.handleScan)
 
 	// Graph endpoints

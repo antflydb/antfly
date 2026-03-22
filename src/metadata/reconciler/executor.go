@@ -29,6 +29,7 @@ import (
 	"github.com/sethvargo/go-retry"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
 )
 
 // ExecutePlan executes a reconciliation plan
@@ -509,9 +510,285 @@ func (r *Reconciler) executeSplitStateActions(
 				continue
 			}
 			r.SetShardCooldown(action.ShardID, r.getCooldownDuration())
+
+		case SplitStateActionCopyMerge:
+			if err := r.executeMergeCopy(ctx, action.ShardID, action.MergeShardID); err != nil {
+				r.logger.Warn("Failed to copy merge donor data",
+					zap.Stringer("receiverShardID", action.ShardID),
+					zap.Stringer("donorShardID", action.MergeShardID),
+					zap.Error(err))
+			}
+		case SplitStateActionCatchUpMerge:
+			if err := r.executeMergeCatchUp(ctx, action.ShardID, action.MergeShardID); err != nil {
+				r.logger.Warn("Failed to replay merge donor deltas",
+					zap.Stringer("receiverShardID", action.ShardID),
+					zap.Stringer("donorShardID", action.MergeShardID),
+					zap.Error(err))
+			}
+		case SplitStateActionSealMerge:
+			if err := r.executeMergeSeal(ctx, action.ShardID, action.MergeShardID); err != nil {
+				r.logger.Warn("Failed to seal merge cutover",
+					zap.Stringer("receiverShardID", action.ShardID),
+					zap.Stringer("donorShardID", action.MergeShardID),
+					zap.Error(err))
+			}
+		case SplitStateActionFinalizeMerge:
+			if err := r.executeMergeFinalize(ctx, action.ShardID, action.MergeShardID, action.TargetRange); err != nil {
+				r.logger.Warn("Failed to finalize merge",
+					zap.Stringer("receiverShardID", action.ShardID),
+					zap.Stringer("donorShardID", action.MergeShardID),
+					zap.Error(err))
+			}
+		case SplitStateActionRollbackMerge:
+			if err := r.executeMergeRollback(ctx, action.ShardID, action.MergeShardID); err != nil {
+				r.logger.Warn("Failed to roll back merge",
+					zap.Stringer("receiverShardID", action.ShardID),
+					zap.Stringer("donorShardID", action.MergeShardID),
+					zap.Error(err))
+			}
 		}
 	}
 
+	return nil
+}
+
+func (r *Reconciler) loadMergeStatuses(
+	receiverShardID, donorShardID types.ID,
+) (map[types.ID]*store.ShardStatus, *store.ShardStatus, *store.ShardStatus, error) {
+	statuses, err := r.storeOps.GetShardStatuses()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("loading shard statuses: %w", err)
+	}
+	receiver := statuses[receiverShardID]
+	if receiver == nil {
+		return nil, nil, nil, fmt.Errorf("receiver shard %s status not found", receiverShardID)
+	}
+	donor := statuses[donorShardID]
+	if donor == nil {
+		return nil, nil, nil, fmt.Errorf("donor shard %s status not found", donorShardID)
+	}
+	return statuses, receiver, donor, nil
+}
+
+func (r *Reconciler) persistMergeStates(
+	ctx context.Context,
+	receiverShardID types.ID,
+	receiverState *db.MergeState,
+	donorShardID types.ID,
+	donorState *db.MergeState,
+) error {
+	if err := r.shardOps.SetMergeState(ctx, donorShardID, donorState); err != nil {
+		return fmt.Errorf("setting donor merge state: %w", err)
+	}
+	if err := r.shardOps.SetMergeState(ctx, receiverShardID, receiverState); err != nil {
+		return fmt.Errorf("setting receiver merge state: %w", err)
+	}
+	if err := r.storeOps.UpdateShardMergeState(ctx, donorShardID, donorState); err != nil {
+		r.logger.Warn("Failed to update donor merge state in metadata",
+			zap.Stringer("donorShardID", donorShardID),
+			zap.Error(err))
+	}
+	if err := r.storeOps.UpdateShardMergeState(ctx, receiverShardID, receiverState); err != nil {
+		r.logger.Warn("Failed to update receiver merge state in metadata",
+			zap.Stringer("receiverShardID", receiverShardID),
+			zap.Error(err))
+	}
+	return nil
+}
+
+func (r *Reconciler) executeMergeCopy(
+	ctx context.Context,
+	receiverShardID, donorShardID types.ID,
+) error {
+	_, receiverStatus, donorStatus, err := r.loadMergeStatuses(receiverShardID, donorShardID)
+	if err != nil {
+		return err
+	}
+	receiverClient, err := r.storeOps.GetLeaderClientForShard(ctx, receiverShardID)
+	if err != nil {
+		return fmt.Errorf("loading receiver leader client: %w", err)
+	}
+
+	var afterKey []byte
+	for {
+		writes, nextKey, done, err := r.shardOps.ExportRangeChunk(
+			ctx,
+			donorShardID,
+			donorStatus.ByteRange[0],
+			donorStatus.ByteRange[1],
+			afterKey,
+			256,
+		)
+		if err != nil {
+			return fmt.Errorf("exporting donor range chunk: %w", err)
+		}
+		if len(writes) > 0 {
+			if err := receiverClient.ApplyMergeChunk(
+				ctx,
+				receiverShardID,
+				writes,
+				nil,
+				db.Op_SyncLevelWrite,
+			); err != nil {
+				return fmt.Errorf("copying merge chunk into receiver: %w", err)
+			}
+		}
+		if done {
+			break
+		}
+		afterKey = nextKey
+	}
+
+	receiverState := proto.Clone(receiverStatus.MergeState).(*db.MergeState)
+	receiverState.SetPhase(db.MergeState_PHASE_CATCHUP)
+	receiverState.SetCopyCompleted(true)
+	donorState := proto.Clone(donorStatus.MergeState).(*db.MergeState)
+	donorState.SetPhase(db.MergeState_PHASE_CATCHUP)
+	return r.persistMergeStates(ctx, receiverShardID, receiverState, donorShardID, donorState)
+}
+
+func (r *Reconciler) executeMergeCatchUp(
+	ctx context.Context,
+	receiverShardID, donorShardID types.ID,
+) error {
+	_, receiverStatus, _, err := r.loadMergeStatuses(receiverShardID, donorShardID)
+	if err != nil {
+		return err
+	}
+	receiverState := receiverStatus.MergeState
+	if receiverState == nil {
+		return fmt.Errorf("receiver shard %s merge state not found", receiverShardID)
+	}
+	entries, err := r.shardOps.ListMergeDeltaEntriesAfter(ctx, donorShardID, receiverState.GetReplaySeq())
+	if err != nil {
+		return fmt.Errorf("listing donor merge deltas: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	receiverClient, err := r.storeOps.GetLeaderClientForShard(ctx, receiverShardID)
+	if err != nil {
+		return fmt.Errorf("loading receiver leader client: %w", err)
+	}
+	updatedReceiverState := proto.Clone(receiverState).(*db.MergeState)
+	for _, entry := range entries {
+		writes := make([][2][]byte, 0, len(entry.GetWrites()))
+		for _, write := range entry.GetWrites() {
+			writes = append(writes, [2][]byte{write.GetKey(), write.GetValue()})
+		}
+		if err := receiverClient.ApplyMergeChunk(
+			ctx,
+			receiverShardID,
+			writes,
+			entry.GetDeletes(),
+			db.Op_SyncLevelWrite,
+		); err != nil {
+			return fmt.Errorf("replaying donor delta seq %d: %w", entry.GetSequence(), err)
+		}
+		updatedReceiverState.SetReplaySeq(entry.GetSequence())
+	}
+	if err := r.shardOps.SetMergeState(ctx, receiverShardID, updatedReceiverState); err != nil {
+		return fmt.Errorf("persisting receiver replay seq: %w", err)
+	}
+	if err := r.storeOps.UpdateShardMergeState(ctx, receiverShardID, updatedReceiverState); err != nil {
+		r.logger.Warn("Failed to update receiver replay seq in metadata",
+			zap.Stringer("receiverShardID", receiverShardID),
+			zap.Error(err))
+	}
+	return nil
+}
+
+func (r *Reconciler) executeMergeSeal(
+	ctx context.Context,
+	receiverShardID, donorShardID types.ID,
+) error {
+	_, receiverStatus, donorStatus, err := r.loadMergeStatuses(receiverShardID, donorShardID)
+	if err != nil {
+		return err
+	}
+	receiverState := proto.Clone(receiverStatus.MergeState).(*db.MergeState)
+	donorState := proto.Clone(donorStatus.MergeState).(*db.MergeState)
+	finalSeq := donorStatus.MergeDeltaSeq
+	receiverState.SetPhase(db.MergeState_PHASE_FINALIZING)
+	receiverState.SetFinalSeq(finalSeq)
+	donorState.SetPhase(db.MergeState_PHASE_FINALIZING)
+	donorState.SetFinalSeq(finalSeq)
+	donorState.SetCaptureDeltas(false)
+	donorState.SetDenyDonorWrites(true)
+	return r.persistMergeStates(ctx, receiverShardID, receiverState, donorShardID, donorState)
+}
+
+func (r *Reconciler) executeMergeFinalize(
+	ctx context.Context,
+	receiverShardID, donorShardID types.ID,
+	targetRange [2][]byte,
+) error {
+	_, receiverStatus, donorStatus, err := r.loadMergeStatuses(receiverShardID, donorShardID)
+	if err != nil {
+		return err
+	}
+	if err := r.shardOps.FinalizeMerge(ctx, receiverShardID, targetRange); err != nil {
+		return fmt.Errorf("finalizing receiver merge range: %w", err)
+	}
+	if _, err := r.tableOps.FinalizeShardsForMerge(tablemgr.MergeTransition{
+		ShardID:      receiverShardID,
+		MergeShardID: donorShardID,
+		TableName:    receiverStatus.Table,
+	}); err != nil {
+		return fmt.Errorf("finalizing merge metadata: %w", err)
+	}
+	stopEg, _ := errgroup.WithContext(ctx)
+	for peer := range donorStatus.Peers {
+		peerID := peer
+		stopEg.Go(func() error {
+			if err := r.shardOps.StopShard(ctx, donorShardID, peerID); err != nil && !errors.Is(err, client.ErrNotFound) {
+				return err
+			}
+			return nil
+		})
+	}
+	if err := stopEg.Wait(); err != nil {
+		return fmt.Errorf("stopping donor peers: %w", err)
+	}
+	_ = r.storeOps.UpdateShardMergeState(ctx, receiverShardID, nil)
+	r.SetShardCooldown(receiverShardID, r.getCooldownDuration())
+	r.SetShardCooldown(donorShardID, r.getCooldownDuration())
+	return nil
+}
+
+func (r *Reconciler) executeMergeRollback(
+	ctx context.Context,
+	receiverShardID, donorShardID types.ID,
+) error {
+	_, receiverStatus, donorStatus, err := r.loadMergeStatuses(receiverShardID, donorShardID)
+	if err != nil {
+		return err
+	}
+	if receiverStatus.MergeState != nil {
+		rollbackState := proto.Clone(receiverStatus.MergeState).(*db.MergeState)
+		rollbackState.SetPhase(db.MergeState_PHASE_ROLLING_BACK)
+		if err := r.shardOps.SetMergeState(ctx, receiverShardID, rollbackState); err != nil {
+			return fmt.Errorf("setting receiver rollback state: %w", err)
+		}
+	}
+	if err := r.shardOps.SetMergeState(ctx, donorShardID, nil); err != nil {
+		return fmt.Errorf("clearing donor merge state: %w", err)
+	}
+	if err := r.shardOps.SetMergeState(ctx, receiverShardID, nil); err != nil {
+		return fmt.Errorf("clearing receiver merge state: %w", err)
+	}
+	if _, err := r.tableOps.RollbackShardsForMerge(tablemgr.MergeTransition{
+		ShardID:      receiverShardID,
+		MergeShardID: donorShardID,
+		TableName:    receiverStatus.Table,
+	}); err != nil {
+		return fmt.Errorf("rolling back merge metadata: %w", err)
+	}
+	_ = r.storeOps.UpdateShardMergeState(ctx, donorShardID, nil)
+	_ = r.storeOps.UpdateShardMergeState(ctx, receiverShardID, nil)
+	r.SetShardCooldown(receiverShardID, r.getCooldownDuration())
+	r.SetShardCooldown(donorShardID, r.getCooldownDuration())
+	_ = donorStatus
 	return nil
 }
 
@@ -552,50 +829,103 @@ func (r *Reconciler) executeSplitAndMergeTransitions(
 				return nil
 			}
 
-			newShardConfig, err := r.tableOps.ReassignShardsForMerge(transition)
+			if liveMergeInfo.ShardStats != nil &&
+				liveMergeInfo.ShardStats.Storage != nil &&
+				liveMergeInfo.ShardStats.Storage.Empty {
+				newShardConfig, err := r.tableOps.ReassignShardsForMerge(transition)
+				if err != nil {
+					r.logger.Warn(
+						"Failed to reassign shards for merge",
+						zap.Stringer("shardID", shardID),
+						zap.Error(err),
+					)
+					return nil
+				}
+
+				stopEg, _ := errgroup.WithContext(ctx)
+				for peer := range livePeers {
+					peerID := peer
+					stopEg.Go(func() error {
+						if err := r.shardOps.StopShard(ctx, transition.MergeShardID, peerID); err != nil {
+							if !errors.Is(err, client.ErrNotFound) {
+								return fmt.Errorf("stopping shard on node for merge: %w", err)
+							}
+						}
+						return nil
+					})
+				}
+				if err := stopEg.Wait(); err != nil {
+					r.logger.Warn(
+						"Failed to stop shard on node",
+						zap.Stringer("shardID", transition.MergeShardID),
+						zap.Error(err),
+					)
+					return nil
+				}
+
+				if err := r.shardOps.MergeRange(ctx, transition.ShardID, newShardConfig.ByteRange); err != nil {
+					r.logger.Warn(
+						"Failed to merge shard",
+						zap.Stringer("mergeShardID", transition.MergeShardID),
+						zap.Stringer("targetShardID", transition.ShardID),
+						zap.Error(err),
+					)
+					return nil
+				}
+				r.SetShardCooldown(shardID, r.getCooldownDuration())
+				r.SetShardCooldown(transition.ShardID, r.getCooldownDuration())
+				return nil
+			}
+
+			_, err = r.tableOps.PrepareShardsForMerge(transition)
 			if err != nil {
 				r.logger.Warn(
-					"Failed to reassign shards for merge",
+					"Failed to mark shards for online merge",
 					zap.Stringer("shardID", shardID),
 					zap.Error(err),
 				)
 				return nil
 			}
+			startedAt := r.timeProvider.Now().UnixNano()
+			donorState := &db.MergeState{}
+			donorState.SetPhase(db.MergeState_PHASE_PREPARE)
+			donorState.SetDonorShardId(uint64(transition.MergeShardID))
+			donorState.SetReceiverShardId(uint64(transition.ShardID))
+			donorState.SetDonorRangeStart(liveMergeInfo.ByteRange[0])
+			donorState.SetDonorRangeEnd(liveMergeInfo.ByteRange[1])
+			donorState.SetReceiverRangeStart(liveTargetInfo.ByteRange[0])
+			donorState.SetReceiverRangeEnd(liveTargetInfo.ByteRange[1])
+			donorState.SetStartedAtUnixNanos(startedAt)
+			donorState.SetCaptureDeltas(true)
 
-			// Stop the merge shard on all peers
-			stopEg, _ := errgroup.WithContext(ctx)
-			for peer := range livePeers {
-				stopEg.Go(func() error {
-					if err := r.shardOps.StopShard(ctx, transition.MergeShardID, peer); err != nil {
-						if !errors.Is(err, client.ErrNotFound) {
-							return fmt.Errorf("stopping shard on node for merge: %w", err)
-						}
-					}
-					return nil
-				})
-			}
-			if err := stopEg.Wait(); err != nil {
-				r.logger.Warn(
-					"Failed to stop shard on node",
-					zap.Stringer("shardID", transition.MergeShardID),
-					zap.Error(err),
-				)
-				return nil
-			}
+			receiverState := proto.Clone(donorState).(*db.MergeState)
+			receiverState.SetDonorShardId(uint64(transition.MergeShardID))
+			receiverState.SetReceiverShardId(uint64(transition.ShardID))
+			receiverState.SetAcceptDonorRange(true)
+			receiverState.SetCaptureDeltas(false)
 
-			// Merge the range into the target shard
-			if err := r.shardOps.MergeRange(ctx, transition.ShardID, newShardConfig.ByteRange); err != nil {
-				r.logger.Warn(
-					"Failed to merge shard",
+			if err := r.shardOps.SetMergeState(ctx, transition.MergeShardID, donorState); err != nil {
+				r.logger.Warn("Failed to set donor merge state",
 					zap.Stringer("mergeShardID", transition.MergeShardID),
-					zap.Stringer("targetShardID", transition.ShardID),
-					zap.Error(err),
-				)
+					zap.Error(err))
 				return nil
 			}
-
-			r.SetShardCooldown(shardID, r.getCooldownDuration())
-			r.SetShardCooldown(transition.ShardID, r.getCooldownDuration())
+			if err := r.shardOps.SetMergeState(ctx, transition.ShardID, receiverState); err != nil {
+				r.logger.Warn("Failed to set receiver merge state",
+					zap.Stringer("targetShardID", transition.ShardID),
+					zap.Error(err))
+				return nil
+			}
+			if err := r.storeOps.UpdateShardMergeState(ctx, transition.MergeShardID, donorState); err != nil {
+				r.logger.Warn("Failed to persist donor merge state in metadata",
+					zap.Stringer("mergeShardID", transition.MergeShardID),
+					zap.Error(err))
+			}
+			if err := r.storeOps.UpdateShardMergeState(ctx, transition.ShardID, receiverState); err != nil {
+				r.logger.Warn("Failed to persist receiver merge state in metadata",
+					zap.Stringer("targetShardID", transition.ShardID),
+					zap.Error(err))
+			}
 
 			// Keep live data referenced so validation stays coupled to the execution path.
 			_ = liveMergeInfo
@@ -727,8 +1057,8 @@ func (r *Reconciler) validateLiveMergeTransition(
 		return nil, nil, nil, fmt.Errorf("target shard %s missing from leader status", transition.ShardID)
 	}
 
-	if mergeInfo.ShardStats == nil || mergeInfo.ShardStats.Storage == nil || !mergeInfo.ShardStats.Storage.Empty {
-		return nil, nil, nil, fmt.Errorf("donor shard %s is not empty in live status", transition.MergeShardID)
+	if mergeInfo.ShardStats == nil || mergeInfo.ShardStats.Storage == nil {
+		return nil, nil, nil, fmt.Errorf("donor shard %s is missing live storage stats", transition.MergeShardID)
 	}
 	if targetInfo.ShardStats == nil || targetInfo.ShardStats.Storage == nil {
 		return nil, nil, nil, fmt.Errorf("target shard %s is missing live storage stats", transition.ShardID)

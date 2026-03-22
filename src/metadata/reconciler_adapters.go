@@ -240,6 +240,55 @@ func (m *MetadataShardOperations) MergeRange(
 	return nodeStatus.MergeRange(ctx, shardID, byteRange)
 }
 
+func (m *MetadataShardOperations) SetMergeState(
+	ctx context.Context,
+	shardID types.ID,
+	mergeState *db.MergeState,
+) error {
+	leaderClient, err := m.ms.leaderClientForShard(ctx, shardID)
+	if err != nil {
+		return fmt.Errorf("getting leader for shard %s: %w", shardID, err)
+	}
+	return leaderClient.SetMergeState(ctx, shardID, mergeState)
+}
+
+func (m *MetadataShardOperations) FinalizeMerge(
+	ctx context.Context,
+	shardID types.ID,
+	byteRange [2][]byte,
+) error {
+	leaderClient, err := m.ms.leaderClientForShard(ctx, shardID)
+	if err != nil {
+		return fmt.Errorf("getting leader for shard %s: %w", shardID, err)
+	}
+	return leaderClient.FinalizeMerge(ctx, shardID, byteRange)
+}
+
+func (m *MetadataShardOperations) ExportRangeChunk(
+	ctx context.Context,
+	shardID types.ID,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	leaderClient, err := m.ms.leaderClientForShard(ctx, shardID)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("getting leader for shard %s: %w", shardID, err)
+	}
+	return leaderClient.ExportRangeChunk(ctx, shardID, startKey, endKey, afterKey, limit)
+}
+
+func (m *MetadataShardOperations) ListMergeDeltaEntriesAfter(
+	ctx context.Context,
+	shardID types.ID,
+	afterSeq uint64,
+) ([]*db.MergeDeltaEntry, error) {
+	leaderClient, err := m.ms.leaderClientForShard(ctx, shardID)
+	if err != nil {
+		return nil, fmt.Errorf("getting leader for shard %s: %w", shardID, err)
+	}
+	return leaderClient.ListMergeDeltaEntriesAfter(ctx, shardID, afterSeq)
+}
+
 func (m *MetadataShardOperations) RollbackSplit(
 	ctx context.Context,
 	shardID types.ID,
@@ -363,6 +412,24 @@ func (m *MetadataTableOperations) ReassignShardsForMerge(
 	return m.ms.tm.ReassignShardsForMerge(transition)
 }
 
+func (m *MetadataTableOperations) PrepareShardsForMerge(
+	transition tablemgr.MergeTransition,
+) (*store.ShardConfig, error) {
+	return m.ms.tm.PrepareShardsForMerge(transition)
+}
+
+func (m *MetadataTableOperations) FinalizeShardsForMerge(
+	transition tablemgr.MergeTransition,
+) (*store.ShardConfig, error) {
+	return m.ms.tm.FinalizeShardsForMerge(transition)
+}
+
+func (m *MetadataTableOperations) RollbackShardsForMerge(
+	transition tablemgr.MergeTransition,
+) (*store.ShardConfig, error) {
+	return m.ms.tm.RollbackShardsForMerge(transition)
+}
+
 func (m *MetadataTableOperations) HasReallocationRequest(ctx context.Context) (bool, error) {
 	return m.ms.tm.HasReallocationRequest(ctx)
 }
@@ -424,6 +491,14 @@ func (m *MetadataStoreOperations) UpdateShardSplitState(
 	splitState *db.SplitState,
 ) error {
 	return m.ms.tm.UpdateShardSplitState(ctx, shardID, splitState)
+}
+
+func (m *MetadataStoreOperations) UpdateShardMergeState(
+	ctx context.Context,
+	shardID types.ID,
+	mergeState *db.MergeState,
+) error {
+	return m.ms.tm.UpdateShardMergeState(ctx, shardID, mergeState)
 }
 
 // GetTablesWithReadSchemas returns all tables that have a read schema defined

@@ -29,6 +29,7 @@ import (
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -107,6 +108,74 @@ func (m *MockShardOperations) MergeRange(
 ) error {
 	args := m.Called(ctx, shardID, byteRange)
 	return args.Error(0)
+}
+
+func (m *MockShardOperations) SetMergeState(
+	ctx context.Context,
+	shardID types.ID,
+	mergeState *db.MergeState,
+) error {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "SetMergeState" {
+			args := m.Called(ctx, shardID, mergeState)
+			return args.Error(0)
+		}
+	}
+	return nil
+}
+
+func (m *MockShardOperations) FinalizeMerge(
+	ctx context.Context,
+	shardID types.ID,
+	byteRange [2][]byte,
+) error {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "FinalizeMerge" {
+			args := m.Called(ctx, shardID, byteRange)
+			return args.Error(0)
+		}
+	}
+	return nil
+}
+
+func (m *MockShardOperations) ExportRangeChunk(
+	ctx context.Context,
+	shardID types.ID,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "ExportRangeChunk" {
+			args := m.Called(ctx, shardID, startKey, endKey, afterKey, limit)
+			var writes [][2][]byte
+			if args.Get(0) != nil {
+				writes = args.Get(0).([][2][]byte)
+			}
+			var nextKey []byte
+			if args.Get(1) != nil {
+				nextKey = args.Get(1).([]byte)
+			}
+			return writes, nextKey, args.Bool(2), args.Error(3)
+		}
+	}
+	return nil, nil, true, nil
+}
+
+func (m *MockShardOperations) ListMergeDeltaEntriesAfter(
+	ctx context.Context,
+	shardID types.ID,
+	afterSeq uint64,
+) ([]*db.MergeDeltaEntry, error) {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "ListMergeDeltaEntriesAfter" {
+			args := m.Called(ctx, shardID, afterSeq)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).([]*db.MergeDeltaEntry), args.Error(1)
+		}
+	}
+	return nil, nil
 }
 
 func (m *MockShardOperations) RollbackSplit(
@@ -202,6 +271,46 @@ func (m *MockTableOperations) ReassignShardsForMerge(
 	return args.Get(0).(*store.ShardConfig), args.Error(1)
 }
 
+func (m *MockTableOperations) PrepareShardsForMerge(
+	transition tablemgr.MergeTransition,
+) (*store.ShardConfig, error) {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "PrepareShardsForMerge" {
+			args := m.Called(transition)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).(*store.ShardConfig), args.Error(1)
+		}
+	}
+	return &store.ShardConfig{}, nil
+}
+
+func (m *MockTableOperations) FinalizeShardsForMerge(
+	transition tablemgr.MergeTransition,
+) (*store.ShardConfig, error) {
+	args := m.Called(transition)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*store.ShardConfig), args.Error(1)
+}
+
+func (m *MockTableOperations) RollbackShardsForMerge(
+	transition tablemgr.MergeTransition,
+) (*store.ShardConfig, error) {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "RollbackShardsForMerge" {
+			args := m.Called(transition)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).(*store.ShardConfig), args.Error(1)
+		}
+	}
+	return &store.ShardConfig{}, nil
+}
+
 func (m *MockTableOperations) HasReallocationRequest(ctx context.Context) (bool, error) {
 	args := m.Called(ctx)
 	return args.Bool(0), args.Error(1)
@@ -280,6 +389,20 @@ func (m *MockStoreOperations) UpdateShardSplitState(
 ) error {
 	args := m.Called(ctx, shardID, splitState)
 	return args.Error(0)
+}
+
+func (m *MockStoreOperations) UpdateShardMergeState(
+	ctx context.Context,
+	shardID types.ID,
+	mergeState *db.MergeState,
+) error {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "UpdateShardMergeState" {
+			args := m.Called(ctx, shardID, mergeState)
+			return args.Error(0)
+		}
+	}
+	return nil
 }
 
 // ============================================================================
@@ -522,9 +645,47 @@ func TestComputeSplitStateActions(t *testing.T) {
 		}
 
 		actions := reconciler.computeSplitStateActions(CurrentClusterState{}, desired)
-		assert.Len(t, actions, 1)
-		assert.Equal(t, SplitStateActionMerge, actions[0].Action)
-		assert.Equal(t, store.ShardState_PreMerge, actions[0].State)
+		assert.Empty(t, actions)
+	})
+
+	t.Run("online merge only advances from receiver", func(t *testing.T) {
+		receiverID := types.ID(1)
+		donorID := types.ID(2)
+		startedAt := time.Now().UnixNano()
+
+		donorMergeState := &db.MergeState{}
+		donorMergeState.SetPhase(db.MergeState_PHASE_PREPARE)
+		donorMergeState.SetDonorShardId(uint64(donorID))
+		donorMergeState.SetReceiverShardId(uint64(receiverID))
+		donorMergeState.SetCaptureDeltas(true)
+		donorMergeState.SetStartedAtUnixNanos(startedAt)
+
+		receiverMergeState := &db.MergeState{}
+		receiverMergeState.SetPhase(db.MergeState_PHASE_PREPARE)
+		receiverMergeState.SetDonorShardId(uint64(donorID))
+		receiverMergeState.SetReceiverShardId(uint64(receiverID))
+		receiverMergeState.SetAcceptDonorRange(true)
+		receiverMergeState.SetStartedAtUnixNanos(startedAt)
+
+		desired := DesiredClusterState{
+			Shards: map[types.ID]*store.ShardStatus{
+				receiverID: NewShardStatusBuilder().
+					WithID(receiverID).
+					WithState(store.ShardState_PreMerge).
+					Build(),
+				donorID: NewShardStatusBuilder().
+					WithID(donorID).
+					Build(),
+			},
+		}
+		desired.Shards[receiverID].MergeState = receiverMergeState
+		desired.Shards[donorID].MergeState = donorMergeState
+
+		actions := reconciler.computeSplitStateActions(CurrentClusterState{}, desired)
+		require.Len(t, actions, 1)
+		assert.Equal(t, receiverID, actions[0].ShardID)
+		assert.Equal(t, donorID, actions[0].MergeShardID)
+		assert.Equal(t, SplitStateActionCopyMerge, actions[0].Action)
 	})
 }
 

@@ -253,7 +253,13 @@ type Config struct {
 
 	// SplitFinalizeGracePeriod Minimum continuous readiness duration required before finalizing a split. Format: duration string like '15s', '1m'. Default: '15s'.
 	SplitFinalizeGracePeriod time.Duration `json:"split_finalize_grace_period,omitempty,omitzero"`
-	Storage                  StorageConfig `json:"storage"`
+
+	// AutoRangeTransitionPerTableLimit Maximum number of new automatic split/merge transitions a single table may start in one reconciliation cycle.
+	AutoRangeTransitionPerTableLimit int `json:"auto_range_transition_per_table_limit,omitempty,omitzero"`
+
+	// AutoRangeTransitionClusterLimit Maximum number of in-flight automatic split/merge transitions allowed cluster-wide.
+	AutoRangeTransitionClusterLimit int           `json:"auto_range_transition_cluster_limit,omitempty,omitzero"`
+	Storage                         StorageConfig `json:"storage"`
 
 	// SwarmMode Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node.
 	SwarmMode bool                `json:"swarm_mode,omitempty,omitzero"`

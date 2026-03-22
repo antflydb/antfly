@@ -40,6 +40,8 @@ type ShardIface interface {
 	Split(ctx context.Context, newShardID uint64, splitKey []byte) error
 	FinalizeSplit(ctx context.Context, newRangeEnd []byte) error
 	RollbackSplit(ctx context.Context) error
+	SetMergeState(ctx context.Context, state *MergeState) error
+	FinalizeMerge(ctx context.Context, byteRange [2][]byte) error
 	AddIndex(ctx context.Context, config indexes.IndexConfig) error
 	DropIndex(ctx context.Context, name string) error
 	SetRange(ctx context.Context, byteRange [2][]byte) error
@@ -49,7 +51,10 @@ type ShardIface interface {
 	Lookup(ctx context.Context, key string) (map[string]any, error)
 	GetTimestamp(key string) (uint64, error)
 	Batch(ctx context.Context, batchOp *BatchOp, proposeOnly bool) error
+	ApplyMergeChunk(ctx context.Context, batchOp *BatchOp) error
 	Scan(ctx context.Context, fromKey []byte, toKey []byte, opts ScanOptions) (*ScanResult, error)
+	ExportRangeChunk(ctx context.Context, startKey, endKey, afterKey []byte, limit int) ([][2][]byte, []byte, bool, error)
+	ListMergeDeltaEntriesAfter(afterSeq uint64) ([]*MergeDeltaEntry, error)
 	ProposeConfChange(cc raftpb.ConfChange) error // Using our minimal ConfChange
 	// ApplyConfChange proposes a conf change and waits for it to be applied to the Raft state machine.
 	ApplyConfChange(ctx context.Context, cc raftpb.ConfChange) error
@@ -112,6 +117,21 @@ type ShardUpdateSchemaRequest struct {
 }
 type ShardDropIndexRequest struct {
 	Name string `json:"name"`
+}
+type ShardMergeStateRequest struct {
+	State *MergeState `json:"state,omitempty"`
+}
+type ShardFinalizeMergeRequest struct {
+	ByteRange [2][]byte `json:"byte_range"`
+}
+type ShardExportRangeRequest struct {
+	StartKey []byte `json:"start_key"`
+	EndKey   []byte `json:"end_key"`
+	AfterKey []byte `json:"after_key,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
+}
+type ShardMergeDeltaRequest struct {
+	AfterSeq uint64 `json:"after_seq"`
 }
 
 type Shard struct {
@@ -242,6 +262,8 @@ func (s *Shard) Info() *ShardInfo {
 	}
 
 	splitReplayRequired, splitReplayCaughtUp, splitCutoverReady, splitReplaySeq, splitReplayParentShardID := s.storeDB.SplitReplayInfo()
+	mergeDeltaSeq, _ := s.storeDB.GetMergeDeltaSeq()
+	mergeDeltaFinalSeq, _ := s.storeDB.GetMergeDeltaFinalSeq()
 
 	return &ShardInfo{
 		ShardConfig: ShardConfig{
@@ -256,11 +278,14 @@ func (s *Shard) Info() *ShardInfo {
 		Initializing:        s.storeDB.IsInitializing(),
 		Splitting:           s.storeDB.IsSplitting(),
 		SplitState:          s.storeDB.GetSplitState(),
+		MergeState:          s.storeDB.GetMergeState(),
 		SplitReplayRequired: splitReplayRequired,
 		SplitReplayCaughtUp: splitReplayCaughtUp,
 		SplitCutoverReady:   splitCutoverReady,
 		SplitReplaySeq:      splitReplaySeq,
 		SplitParentShardID:  splitReplayParentShardID,
+		MergeDeltaSeq:       mergeDeltaSeq,
+		MergeDeltaFinalSeq:  mergeDeltaFinalSeq,
 	}
 }
 
@@ -374,6 +399,13 @@ func (s *Shard) Batch(ctx context.Context, batchOp *BatchOp, proposeOnly bool) e
 	return s.storeDB.Batch(ctx, batchOp)
 }
 
+func (s *Shard) ApplyMergeChunk(ctx context.Context, batchOp *BatchOp) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
+	return s.storeDB.ApplyMergeChunk(ctx, batchOp)
+}
+
 func (s *Shard) PrepareSplit(ctx context.Context, splitKey []byte) error {
 	if err := s.checkReady(); err != nil {
 		return err
@@ -400,6 +432,20 @@ func (s *Shard) RollbackSplit(ctx context.Context) error {
 		return err
 	}
 	return s.storeDB.RollbackSplit(ctx)
+}
+
+func (s *Shard) SetMergeState(ctx context.Context, state *MergeState) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
+	return s.storeDB.SetMergeState(ctx, state)
+}
+
+func (s *Shard) FinalizeMerge(ctx context.Context, byteRange [2][]byte) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
+	return s.storeDB.FinalizeMerge(ctx, byteRange)
 }
 
 func (s *Shard) Backup(ctx context.Context, loc, id string) error {
@@ -442,6 +488,24 @@ func (s *Shard) Scan(ctx context.Context, fromKey []byte, toKey []byte, opts Sca
 		return nil, err
 	}
 	return s.storeDB.Scan(ctx, fromKey, toKey, opts)
+}
+
+func (s *Shard) ExportRangeChunk(
+	ctx context.Context,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, nil, false, err
+	}
+	return s.storeDB.ExportRangeChunk(ctx, startKey, endKey, afterKey, limit)
+}
+
+func (s *Shard) ListMergeDeltaEntriesAfter(afterSeq uint64) ([]*MergeDeltaEntry, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
+	return s.storeDB.ListMergeDeltaEntriesAfter(afterSeq)
 }
 
 // SyncWriteOp synchronously proposes an Op through Raft and waits for commit

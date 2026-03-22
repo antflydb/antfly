@@ -223,6 +223,36 @@ func (c *faultingStoreClient) MergeRange(ctx context.Context, shardID types.ID, 
 	return err
 }
 
+func (c *faultingStoreClient) SetMergeState(
+	ctx context.Context,
+	shardID types.ID,
+	state *db.MergeState,
+) error {
+	if err := c.invokeBefore(ctx, "SetMergeState", shardID); err != nil {
+		return err
+	}
+	err := c.StoreRPC.SetMergeState(ctx, shardID, state)
+	if afterErr := c.invokeAfter(ctx, "SetMergeState", shardID); err == nil && afterErr != nil {
+		err = afterErr
+	}
+	return err
+}
+
+func (c *faultingStoreClient) FinalizeMerge(
+	ctx context.Context,
+	shardID types.ID,
+	byteRange [2][]byte,
+) error {
+	if err := c.invokeBefore(ctx, "FinalizeMerge", shardID); err != nil {
+		return err
+	}
+	err := c.StoreRPC.FinalizeMerge(ctx, shardID, byteRange)
+	if afterErr := c.invokeAfter(ctx, "FinalizeMerge", shardID); err == nil && afterErr != nil {
+		err = afterErr
+	}
+	return err
+}
+
 func (c *faultingStoreClient) UpdateSchema(ctx context.Context, shardID types.ID, tableSchema *schema.TableSchema) error {
 	if err := c.invokeBefore(ctx, "UpdateSchema", shardID); err != nil {
 		return err
@@ -403,6 +433,37 @@ func (c *faultingStoreClient) Scan(
 		err = afterErr
 	}
 	return result, err
+}
+
+func (c *faultingStoreClient) ExportRangeChunk(
+	ctx context.Context,
+	shardID types.ID,
+	startKey, endKey, afterKey []byte,
+	limit int,
+) ([][2][]byte, []byte, bool, error) {
+	if err := c.invokeBefore(ctx, "ExportRangeChunk", shardID); err != nil {
+		return nil, nil, false, err
+	}
+	writes, nextKey, done, err := c.StoreRPC.ExportRangeChunk(ctx, shardID, startKey, endKey, afterKey, limit)
+	if afterErr := c.invokeAfter(ctx, "ExportRangeChunk", shardID); err == nil && afterErr != nil {
+		err = afterErr
+	}
+	return writes, nextKey, done, err
+}
+
+func (c *faultingStoreClient) ListMergeDeltaEntriesAfter(
+	ctx context.Context,
+	shardID types.ID,
+	afterSeq uint64,
+) ([]*db.MergeDeltaEntry, error) {
+	if err := c.invokeBefore(ctx, "ListMergeDeltaEntriesAfter", shardID); err != nil {
+		return nil, err
+	}
+	entries, err := c.StoreRPC.ListMergeDeltaEntriesAfter(ctx, shardID, afterSeq)
+	if afterErr := c.invokeAfter(ctx, "ListMergeDeltaEntriesAfter", shardID); err == nil && afterErr != nil {
+		err = afterErr
+	}
+	return entries, err
 }
 
 func (c *faultingStoreClient) InitTransaction(

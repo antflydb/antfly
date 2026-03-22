@@ -387,9 +387,83 @@ func TestComputeSplitTransitions(t *testing.T) {
 
 		assert.Empty(t, splits)
 		if assert.Len(t, merges, 1, "Empty old shard should have merge transition") {
-			assert.Equal(t, shard2, merges[0].ShardID, "Neighbor shard should be target")
-			assert.Equal(t, shard1, merges[0].MergeShardID, "Empty shard should be merged")
+			assert.Equal(t, shard1, merges[0].ShardID, "Left shard should survive")
+			assert.Equal(t, shard2, merges[0].MergeShardID, "Right shard should be merged")
 			assert.Equal(t, "test", merges[0].TableName)
+		}
+	})
+
+	t.Run("non-empty underutilized adjacent pair is merged with left shard surviving", func(t *testing.T) {
+		now := time.Now()
+		leftShard := types.ID(1)
+		rightShard := types.ID(2)
+
+		shards := map[types.ID]*store.ShardStatus{
+			leftShard: {
+				ShardInfo: store.ShardInfo{
+					ShardConfig: store.ShardConfig{
+						ByteRange: [2][]byte{{0x00}, {0x80}},
+					},
+					RaftStatus: &common.RaftStatus{
+						Lead:   1,
+						Voters: common.NewPeerSet(1, 2, 3),
+					},
+					ShardStats: &store.ShardStats{
+						Created: now.Add(-10 * time.Minute),
+						Updated: now,
+						Storage: &store.StorageStats{
+							DiskSize: 1024 * 1024 * 8,
+						},
+					},
+				},
+				ID:    leftShard,
+				Table: "test",
+				State: store.ShardState_Default,
+			},
+			rightShard: {
+				ShardInfo: store.ShardInfo{
+					ShardConfig: store.ShardConfig{
+						ByteRange: [2][]byte{{0x80}, {0xff}},
+					},
+					RaftStatus: &common.RaftStatus{
+						Lead:   1,
+						Voters: common.NewPeerSet(1, 2, 3),
+					},
+					ShardStats: &store.ShardStats{
+						Created: now.Add(-10 * time.Minute),
+						Updated: now,
+						Storage: &store.StorageStats{
+							DiskSize: 1024 * 1024 * 12,
+						},
+					},
+				},
+				ID:    rightShard,
+				Table: "test",
+				State: store.ShardState_Default,
+			},
+		}
+
+		splits, merges := computeSplitTransitions(
+			t.Context(),
+			3,
+			shards,
+			1024*1024*100,
+			32*1024*1024,
+			1,
+			100,
+			map[types.ID]time.Time{},
+			func(ctx context.Context, id types.ID) ([]byte, error) {
+				return []byte("median-key"), nil
+			},
+			RealTimeProvider{},
+			1,
+			1,
+		)
+
+		assert.Empty(t, splits)
+		if assert.Len(t, merges, 1, "non-empty underutilized pair should merge") {
+			assert.Equal(t, leftShard, merges[0].ShardID, "left shard should survive")
+			assert.Equal(t, rightShard, merges[0].MergeShardID, "right shard should be donor")
 		}
 	})
 
@@ -535,8 +609,8 @@ func TestComputeSplitTransitions(t *testing.T) {
 
 		assert.Empty(t, splits)
 		if assert.Len(t, merges, 1, "Aged empty shard should be merge-eligible based on injected time") {
-			assert.Equal(t, shard2, merges[0].ShardID)
-			assert.Equal(t, shard1, merges[0].MergeShardID)
+			assert.Equal(t, shard1, merges[0].ShardID)
+			assert.Equal(t, shard2, merges[0].MergeShardID)
 		}
 	})
 
@@ -669,6 +743,83 @@ func TestComputeSplitTransitions(t *testing.T) {
 			shards,
 			1024*1024*100,
 			1024*1024,
+			1,
+			100,
+			map[types.ID]time.Time{},
+			func(ctx context.Context, id types.ID) ([]byte, error) {
+				return []byte("median-key"), nil
+			},
+			RealTimeProvider{},
+			1,
+			1,
+		)
+
+		assert.Empty(t, splits)
+		assert.Empty(t, merges)
+	})
+
+	t.Run("active merge state blocks automatic split and merge planning", func(t *testing.T) {
+		now := time.Now()
+		shard1 := types.ID(1)
+		shard2 := types.ID(2)
+
+		mergeState := &db.MergeState{}
+		mergeState.SetPhase(db.MergeState_PHASE_CATCHUP)
+		mergeState.SetDonorShardId(uint64(shard2))
+		mergeState.SetReceiverShardId(uint64(shard1))
+
+		shards := map[types.ID]*store.ShardStatus{
+			shard1: {
+				ShardInfo: store.ShardInfo{
+					ShardConfig: store.ShardConfig{
+						ByteRange: [2][]byte{{0x00}, {0x80}},
+					},
+					RaftStatus: &common.RaftStatus{
+						Lead:   1,
+						Voters: common.NewPeerSet(1, 2, 3),
+					},
+					ShardStats: &store.ShardStats{
+						Created: now.Add(-10 * time.Minute),
+						Updated: now,
+						Storage: &store.StorageStats{
+							DiskSize: 1024 * 1024 * 12,
+						},
+					},
+					MergeState: mergeState,
+				},
+				ID:    shard1,
+				Table: "test",
+				State: store.ShardState_PreMerge,
+			},
+			shard2: {
+				ShardInfo: store.ShardInfo{
+					ShardConfig: store.ShardConfig{
+						ByteRange: [2][]byte{{0x80}, {0xff}},
+					},
+					RaftStatus: &common.RaftStatus{
+						Lead:   1,
+						Voters: common.NewPeerSet(1, 2, 3),
+					},
+					ShardStats: &store.ShardStats{
+						Created: now.Add(-10 * time.Minute),
+						Updated: now,
+						Storage: &store.StorageStats{
+							DiskSize: 1024 * 1024 * 8,
+						},
+					},
+				},
+				ID:    shard2,
+				Table: "test",
+				State: store.ShardState_Default,
+			},
+		}
+
+		splits, merges := computeSplitTransitions(
+			t.Context(),
+			3,
+			shards,
+			1024*1024*100,
+			32*1024*1024,
 			1,
 			100,
 			map[types.ID]time.Time{},

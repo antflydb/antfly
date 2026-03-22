@@ -36,6 +36,8 @@ message Op {
     OpResolveIntents = 11;
     OpFinalizeSplit = 12;  // Complete a split by deleting split-off data
     OpSetSplitState = 13;  // Update split state (replaces local pendingSplitKey)
+    OpFinalizeMerge = 14;  // Complete a merge by widening the receiver range
+    OpSetMergeState = 15;  // Update merge state on donor/receiver shards
   }
 
   enum SyncLevel {
@@ -65,6 +67,8 @@ message Op {
     ResolveIntentsOp resolve_intents = 14 [ lazy = true ];
     FinalizeSplitOp finalize_split = 15 [ lazy = true ];
     SetSplitStateOp set_split_state = 16 [ lazy = true ];
+    FinalizeMergeOp finalize_merge = 17 [ lazy = true ];
+    SetMergeStateOp set_merge_state = 18 [ lazy = true ];
   }
 }
 
@@ -115,6 +119,13 @@ message SplitDeltaEntry {
   repeated bytes deletes = 4;
 }
 
+message MergeDeltaEntry {
+  uint64 sequence = 1 [ features.field_presence = IMPLICIT ];
+  uint64 timestamp = 2 [ features.field_presence = IMPLICIT ];
+  repeated Write writes = 3;
+  repeated bytes deletes = 4;
+}
+
 message SplitOp {
   uint64 new_shard_id = 1 [ features.field_presence = IMPLICIT ];
   bytes split_key = 2 [ features.field_presence = IMPLICIT ];
@@ -127,6 +138,11 @@ message SplitOp {
 message FinalizeSplitOp {
   // The new end of the byte range after the split (the split key)
   bytes new_range_end = 1 [ features.field_presence = IMPLICIT ];
+}
+
+message FinalizeMergeOp {
+  bytes new_range_start = 1 [ features.field_presence = IMPLICIT ];
+  bytes new_range_end = 2 [ features.field_presence = IMPLICIT ];
 }
 
 message SetRangeOp {
@@ -212,4 +228,37 @@ message SplitState {
 message SetSplitStateOp {
   // The new split state, or nil to clear the state (after finalize/rollback).
   SplitState state = 1;
+}
+
+// MergeState represents the current phase of an online shard merge operation.
+// Unlike MergeRange, this tracks donor/receiver coordination for non-empty merges.
+message MergeState {
+  enum Phase {
+    PHASE_NONE = 0;
+    PHASE_PREPARE = 1;
+    PHASE_COPYING = 2;
+    PHASE_CATCHUP = 3;
+    PHASE_FINALIZING = 4;
+    PHASE_ROLLING_BACK = 5;
+  }
+
+  Phase phase = 1 [ features.field_presence = IMPLICIT ];
+  uint64 donor_shard_id = 2 [ features.field_presence = IMPLICIT ];
+  uint64 receiver_shard_id = 3 [ features.field_presence = IMPLICIT ];
+  bytes donor_range_start = 4 [ features.field_presence = IMPLICIT ];
+  bytes donor_range_end = 5 [ features.field_presence = IMPLICIT ];
+  bytes receiver_range_start = 6 [ features.field_presence = IMPLICIT ];
+  bytes receiver_range_end = 7 [ features.field_presence = IMPLICIT ];
+  int64 started_at_unix_nanos = 8 [ features.field_presence = IMPLICIT ];
+  uint64 replay_seq = 9 [ features.field_presence = IMPLICIT ];
+  uint64 final_seq = 10 [ features.field_presence = IMPLICIT ];
+  bool copy_completed = 11;
+  bool capture_deltas = 12;
+  bool accept_donor_range = 13;
+  bool deny_donor_writes = 14;
+}
+
+message SetMergeStateOp {
+  // The new merge state, or nil to clear the state (after finalize/rollback).
+  MergeState state = 1;
 }

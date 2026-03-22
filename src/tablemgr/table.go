@@ -216,6 +216,8 @@ func (tm *TableManager) needsUpdates(
 			SplitCutoverReady:   oldShardStatus.SplitCutoverReady,
 			SplitReplaySeq:      oldShardStatus.SplitReplaySeq,
 			SplitParentShardID:  oldShardStatus.SplitParentShardID,
+			MergeDeltaSeq:       oldShardStatus.MergeDeltaSeq,
+			MergeDeltaFinalSeq:  oldShardStatus.MergeDeltaFinalSeq,
 		},
 	}
 	needsPersist := false
@@ -261,6 +263,14 @@ func (tm *TableManager) needsUpdates(
 		newShardStatus.SplitParentShardID = newShardInfo.SplitParentShardID
 		needsPersist = true
 	}
+	if oldShardStatus.MergeDeltaSeq != newShardInfo.MergeDeltaSeq {
+		newShardStatus.MergeDeltaSeq = newShardInfo.MergeDeltaSeq
+		needsPersist = true
+	}
+	if oldShardStatus.MergeDeltaFinalSeq != newShardInfo.MergeDeltaFinalSeq {
+		newShardStatus.MergeDeltaFinalSeq = newShardInfo.MergeDeltaFinalSeq
+		needsPersist = true
+	}
 	// Copy SplitState from storage node reports so reconciler can see it.
 	// SplitState is the Raft-replicated split phase from the shard leader.
 	// Preserve the richer version when heartbeats briefly report a partial state
@@ -268,6 +278,9 @@ func (tm *TableManager) needsUpdates(
 	// the child shard ID appearing after metadata already recorded PHASE_SPLITTING.
 	if oldShardStatus.SplitState != nil {
 		newShardStatus.SplitState = proto.Clone(oldShardStatus.SplitState).(*db.SplitState)
+	}
+	if oldShardStatus.MergeState != nil {
+		newShardStatus.MergeState = proto.Clone(oldShardStatus.MergeState).(*db.MergeState)
 	}
 	leaderClearedSplitState := oldShardStatus.SplitState != nil &&
 		oldShardStatus.SplitState.GetPhase() != db.SplitState_PHASE_NONE &&
@@ -283,6 +296,21 @@ func (tm *TableManager) needsUpdates(
 	); mergedSplitState != nil {
 		newShardStatus.SplitState = mergedSplitState
 		needsPersist = needsPersist || splitStateChanged
+	}
+	leaderClearedMergeState := oldShardStatus.MergeState != nil &&
+		oldShardStatus.MergeState.GetPhase() != db.MergeState_PHASE_NONE &&
+		newShardInfo.MergeState == nil &&
+		newShardInfo.RaftStatus != nil &&
+		newShardInfo.RaftStatus.Lead != 0
+	if leaderClearedMergeState {
+		newShardStatus.MergeState = nil
+		needsPersist = true
+	} else if mergedMergeState, mergeStateChanged := mergeMergeStates(
+		oldShardStatus.MergeState,
+		newShardInfo.MergeState,
+	); mergedMergeState != nil {
+		newShardStatus.MergeState = mergedMergeState
+		needsPersist = needsPersist || mergeStateChanged
 	}
 	if newShardInfo.RaftStatus != nil {
 		newShardStatus.RaftStatus = newShardInfo.RaftStatus
@@ -300,21 +328,13 @@ func (tm *TableManager) needsUpdates(
 		}
 		// Always persist if disk size is above the split threshold so the reconciler
 		// can trigger splits. The reconciler checks ShardStats.Updated and skips shards
-		// with stats older than 1 minute, so we need to keep persisting to keep stats fresh.
+		// with stats older than 1 minute, so we need to keep persisting heartbeat-time
+		// refreshes even when shard sizes remain stable. This keeps both split and merge
+		// planning working for quiet shards.
 		if tm.maxShardSizeBytes > 0 && newStorage != nil && newStorage.DiskSize >= tm.maxShardSizeBytes {
 			needsPersist = true
 		} else if statsRefreshElapsed(oldShardStatus.ShardStats, newShardInfo.ShardStats, 30*time.Second) {
-			// Force a periodic refresh for quiet empty shards so empty-only merge
-			// planning can still rely on fresh metadata.
-			if newStorage != nil && newStorage.Empty {
-				needsPersist = true
-			}
-			// Only force a refresh for shards approaching the split threshold.
-			// The reconciler skips shards with stats older than 1 minute, but that
-			// only matters for split decisions which require fresh size data.
-			if tm.maxShardSizeBytes > 0 && newStorage != nil && newStorage.DiskSize >= tm.maxShardSizeBytes/2 {
-				needsPersist = true
-			}
+			needsPersist = true
 		}
 		if oldShardStatus.ShardStats == nil {
 			needsPersist = true
@@ -388,12 +408,8 @@ func (tm *TableManager) needsUpdates(
 			needsPersist = true
 		}
 	case store.ShardState_PreMerge:
-		if newShardInfo.ByteRange.Equal(oldShardStatus.ByteRange) {
-			// If the byte range is correct, we can assume the merge is complete
-			log.Printf("SPLIT_STATE: Shard %s transitioning PreMerge -> Default", oldShardStatus.ID)
-			newShardStatus.State = store.ShardState_Default
-			needsPersist = true
-		}
+		// Online merge keeps metadata unchanged until finalize, so stay in PreMerge
+		// until table metadata is explicitly updated by the merge finalizer.
 	case store.ShardState_PreSplit:
 		if newShardInfo.ByteRange.Equal(oldShardStatus.ByteRange) {
 			splitStateActive := newShardInfo.SplitState != nil &&
@@ -503,6 +519,62 @@ func mergeSplitStates(oldState, newState *db.SplitState) (*db.SplitState, bool) 
 		}
 		if merged.GetStartedAtUnixNanos() == 0 && oldState.GetStartedAtUnixNanos() != 0 {
 			merged.SetStartedAtUnixNanos(oldState.GetStartedAtUnixNanos())
+		}
+	}
+
+	return merged, !proto.Equal(oldState, merged)
+}
+
+func mergeMergeStates(oldState, newState *db.MergeState) (*db.MergeState, bool) {
+	switch {
+	case oldState == nil && newState == nil:
+		return nil, false
+	case newState == nil:
+		return proto.Clone(oldState).(*db.MergeState), false
+	case oldState == nil:
+		return proto.Clone(newState).(*db.MergeState), true
+	}
+
+	merged := proto.Clone(newState).(*db.MergeState)
+	if oldState.GetPhase() == merged.GetPhase() {
+		if merged.GetDonorShardId() == 0 && oldState.GetDonorShardId() != 0 {
+			merged.SetDonorShardId(oldState.GetDonorShardId())
+		}
+		if merged.GetReceiverShardId() == 0 && oldState.GetReceiverShardId() != 0 {
+			merged.SetReceiverShardId(oldState.GetReceiverShardId())
+		}
+		if len(merged.GetDonorRangeStart()) == 0 && len(oldState.GetDonorRangeStart()) > 0 {
+			merged.SetDonorRangeStart(oldState.GetDonorRangeStart())
+		}
+		if len(merged.GetDonorRangeEnd()) == 0 && len(oldState.GetDonorRangeEnd()) > 0 {
+			merged.SetDonorRangeEnd(oldState.GetDonorRangeEnd())
+		}
+		if len(merged.GetReceiverRangeStart()) == 0 && len(oldState.GetReceiverRangeStart()) > 0 {
+			merged.SetReceiverRangeStart(oldState.GetReceiverRangeStart())
+		}
+		if len(merged.GetReceiverRangeEnd()) == 0 && len(oldState.GetReceiverRangeEnd()) > 0 {
+			merged.SetReceiverRangeEnd(oldState.GetReceiverRangeEnd())
+		}
+		if merged.GetStartedAtUnixNanos() == 0 && oldState.GetStartedAtUnixNanos() != 0 {
+			merged.SetStartedAtUnixNanos(oldState.GetStartedAtUnixNanos())
+		}
+		if merged.GetReplaySeq() == 0 && oldState.GetReplaySeq() != 0 {
+			merged.SetReplaySeq(oldState.GetReplaySeq())
+		}
+		if merged.GetFinalSeq() == 0 && oldState.GetFinalSeq() != 0 {
+			merged.SetFinalSeq(oldState.GetFinalSeq())
+		}
+		if !merged.GetCopyCompleted() && oldState.GetCopyCompleted() {
+			merged.SetCopyCompleted(true)
+		}
+		if !merged.GetCaptureDeltas() && oldState.GetCaptureDeltas() {
+			merged.SetCaptureDeltas(true)
+		}
+		if !merged.GetAcceptDonorRange() && oldState.GetAcceptDonorRange() {
+			merged.SetAcceptDonorRange(true)
+		}
+		if !merged.GetDenyDonorWrites() && oldState.GetDenyDonorWrites() {
+			merged.SetDenyDonorWrites(true)
 		}
 	}
 
@@ -686,6 +758,25 @@ func (tm *TableManager) UpdateShardSplitState(ctx context.Context, shardID types
 
 	status.SplitState = splitState
 
+	data, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("marshalling shard status for %s: %w", shardID, err)
+	}
+
+	writes := [][2][]byte{{[]byte(shardStatusPrefix + shardID.String()), data}}
+	return tm.db.Batch(ctx, writes, nil)
+}
+
+func (tm *TableManager) UpdateShardMergeState(ctx context.Context, shardID types.ID, mergeState *db.MergeState) error {
+	tm.Lock()
+	defer tm.Unlock()
+
+	status, err := tm.GetShardStatus(shardID)
+	if err != nil {
+		return fmt.Errorf("getting shard status for %s: %w", shardID, err)
+	}
+
+	status.MergeState = mergeState
 	data, err := json.Marshal(status)
 	if err != nil {
 		return fmt.Errorf("marshalling shard status for %s: %w", shardID, err)
@@ -1291,8 +1382,9 @@ func (tm *TableManager) ReassignShardsForMerge(merge MergeTransition) (*store.Sh
 		return nil, fmt.Errorf("cannot get shard %d from shard status: %w", merge.ShardID, err)
 	}
 	newShardStatus.ShardConfig = *newConfig
-	newShardStatus.State = store.ShardState_PreMerge
-	// Persist the updated table definition
+	// Empty-donor merges cut over synchronously, so the surviving shard can
+	// remain serving immediately after metadata reassignment.
+	newShardStatus.State = store.ShardState_Default
 	delete(table.Shards, merge.MergeShardID)
 	if err := tm.saveTableAndShardStatus(table, map[types.ID]*store.ShardStatus{
 		merge.ShardID: newShardStatus,
@@ -1300,6 +1392,121 @@ func (tm *TableManager) ReassignShardsForMerge(merge MergeTransition) (*store.Sh
 		return nil, fmt.Errorf("saving table: %w", err)
 	}
 	return newConfig, nil
+}
+
+func (tm *TableManager) PrepareShardsForMerge(merge MergeTransition) (*store.ShardConfig, error) {
+	tm.Lock()
+	defer tm.Unlock()
+	table, err := tm.GetTable(merge.TableName)
+	if err != nil {
+		return nil, err
+	}
+
+	conf, ok := table.Shards[merge.ShardID]
+	if !ok {
+		return nil, fmt.Errorf("shard %s does not exist", merge.ShardID)
+	}
+	if _, ok := table.Shards[merge.MergeShardID]; !ok {
+		return nil, fmt.Errorf("shard %s does not exist", merge.MergeShardID)
+	}
+	newShardStatus, err := tm.GetShardStatus(merge.ShardID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get shard %d from shard status: %w", merge.ShardID, err)
+	}
+	newShardStatus.State = store.ShardState_PreMerge
+	if err := tm.saveTableAndShardStatus(table, map[types.ID]*store.ShardStatus{
+		merge.ShardID: newShardStatus,
+	}); err != nil {
+		return nil, fmt.Errorf("saving table: %w", err)
+	}
+	return conf, nil
+}
+
+func (tm *TableManager) FinalizeShardsForMerge(merge MergeTransition) (*store.ShardConfig, error) {
+	tm.Lock()
+	defer tm.Unlock()
+
+	table, err := tm.GetTable(merge.TableName)
+	if err != nil {
+		return nil, err
+	}
+	receiverConf, ok := table.Shards[merge.ShardID]
+	if !ok {
+		return nil, fmt.Errorf("receiver shard %s does not exist", merge.ShardID)
+	}
+	donorConf, ok := table.Shards[merge.MergeShardID]
+	if !ok {
+		return nil, fmt.Errorf("donor shard %s does not exist", merge.MergeShardID)
+	}
+	if !bytes.Equal(receiverConf.ByteRange[1], donorConf.ByteRange[0]) &&
+		!bytes.Equal(donorConf.ByteRange[1], receiverConf.ByteRange[0]) {
+		return nil, fmt.Errorf("shards %s and %s are not adjacent", merge.ShardID, merge.MergeShardID)
+	}
+
+	newRange := [2][]byte{receiverConf.ByteRange[0], donorConf.ByteRange[1]}
+	if bytes.Equal(donorConf.ByteRange[1], receiverConf.ByteRange[0]) {
+		newRange = [2][]byte{donorConf.ByteRange[0], receiverConf.ByteRange[1]}
+	}
+	newConfig := &store.ShardConfig{
+		ByteRange: newRange,
+		Indexes:   receiverConf.Indexes,
+		Schema:    receiverConf.Schema,
+	}
+	table.Shards[merge.ShardID] = newConfig
+	delete(table.Shards, merge.MergeShardID)
+
+	receiverStatus, err := tm.GetShardStatus(merge.ShardID)
+	if err != nil {
+		return nil, fmt.Errorf("getting receiver shard status %s: %w", merge.ShardID, err)
+	}
+	receiverStatus.ShardConfig = *newConfig
+	receiverStatus.State = store.ShardState_Default
+	receiverStatus.MergeState = nil
+
+	if err := tm.saveTableAndShardStatus(table, map[types.ID]*store.ShardStatus{
+		merge.ShardID: receiverStatus,
+	}, merge.MergeShardID); err != nil {
+		return nil, fmt.Errorf("saving finalized merge metadata: %w", err)
+	}
+	return newConfig, nil
+}
+
+func (tm *TableManager) RollbackShardsForMerge(merge MergeTransition) (*store.ShardConfig, error) {
+	tm.Lock()
+	defer tm.Unlock()
+
+	table, err := tm.GetTable(merge.TableName)
+	if err != nil {
+		return nil, err
+	}
+	receiverConf, ok := table.Shards[merge.ShardID]
+	if !ok {
+		return nil, fmt.Errorf("receiver shard %s does not exist", merge.ShardID)
+	}
+	if _, ok := table.Shards[merge.MergeShardID]; !ok {
+		return nil, fmt.Errorf("donor shard %s does not exist", merge.MergeShardID)
+	}
+
+	receiverStatus, err := tm.GetShardStatus(merge.ShardID)
+	if err != nil {
+		return nil, fmt.Errorf("getting receiver shard status %s: %w", merge.ShardID, err)
+	}
+	receiverStatus.State = store.ShardState_Default
+	receiverStatus.MergeState = nil
+
+	donorStatus, err := tm.GetShardStatus(merge.MergeShardID)
+	if err != nil {
+		return nil, fmt.Errorf("getting donor shard status %s: %w", merge.MergeShardID, err)
+	}
+	donorStatus.MergeState = nil
+
+	if err := tm.saveTableAndShardStatus(table, map[types.ID]*store.ShardStatus{
+		merge.ShardID:      receiverStatus,
+		merge.MergeShardID: donorStatus,
+	}); err != nil {
+		return nil, fmt.Errorf("saving rolled back merge metadata: %w", err)
+	}
+	return receiverConf, nil
 }
 
 func (tm *TableManager) ReassignShardsForSplit(
