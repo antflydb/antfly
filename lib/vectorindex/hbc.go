@@ -1499,9 +1499,7 @@ func (idx *HBCIndex) insertIntoTree(
 				for i := range node.Centroid {
 					node.Centroid[i] = node.Centroid[i]*(nf-1)/nf + q.Transformed()[i]/nf
 				}
-				if idx.config.DistanceMetric == vector.DistanceMetric_Cosine {
-					vec.NormalizeFloat32(node.Centroid)
-				}
+				idx.maybeNormalizeForMetric(node.Centroid)
 			}
 			if err := idx.saveNode(batch, cacheBatch, node, q.Transformed()); err != nil {
 				return fmt.Errorf("saving node: %w", err)
@@ -1692,9 +1690,7 @@ func (idx *HBCIndex) splitLeaf(
 		}
 		vec.AddFloat32(newRoot.Centroid, node2.Centroid)
 		vec.ScaleFloat32(0.5, newRoot.Centroid)
-		if idx.config.DistanceMetric == vector.DistanceMetric_Cosine {
-			vec.NormalizeFloat32(newRoot.Centroid)
-		}
+		idx.maybeNormalizeForMetric(newRoot.Centroid)
 
 		node1.Parent = newRoot.ID
 		node1.Level = leaf.Level + 1
@@ -1869,9 +1865,7 @@ func (idx *HBCIndex) splitInternal(
 		}
 		vec.AddFloat32(newRoot.Centroid, node2.Centroid)
 		vec.ScaleFloat32(0.5, newRoot.Centroid)
-		if idx.config.DistanceMetric == vector.DistanceMetric_Cosine {
-			vec.NormalizeFloat32(newRoot.Centroid)
-		}
+		idx.maybeNormalizeForMetric(newRoot.Centroid)
 
 		node1.Parent = newRoot.ID
 		node2.Parent = newRoot.ID
@@ -1947,6 +1941,12 @@ func (idx *HBCIndex) splitInternal(
 //
 // Query and data vectors are assumed to be normalized when calculating Cosine
 // distances.
+func (idx *HBCIndex) maybeNormalizeForMetric(v vector.T) {
+	if idx.config.DistanceMetric == vector.DistanceMetric_Cosine {
+		vec.NormalizeFloat32(v)
+	}
+}
+
 func (idx *HBCIndex) TransformVector(original vector.T, randomized vector.T) vector.T {
 	idx.rot.Transform(original, randomized)
 	if idx.quantizer.GetDistanceMetric() == vector.DistanceMetric_Cosine {
@@ -2485,9 +2485,7 @@ func (idx *HBCIndex) recomputeLeafCentroid(batch pebble.Reader, leaf *HBCNode) e
 		vec.AddFloat32(leaf.Centroid, tempVec)
 	}
 	vec.ScaleFloat32(1/float32(len(leaf.Members)), leaf.Centroid)
-	if idx.config.DistanceMetric == vector.DistanceMetric_Cosine {
-		vec.NormalizeFloat32(leaf.Centroid)
-	}
+	idx.maybeNormalizeForMetric(leaf.Centroid)
 	return nil
 }
 
@@ -2509,9 +2507,7 @@ func (idx *HBCIndex) recomputeInternalCentroid(batch pebble.Reader, cacheBatch n
 		vec.AddFloat32(node.Centroid, child.Centroid)
 	}
 	vec.ScaleFloat32(1/float32(len(node.Children)), node.Centroid)
-	if idx.config.DistanceMetric == vector.DistanceMetric_Cosine {
-		vec.NormalizeFloat32(node.Centroid)
-	}
+	idx.maybeNormalizeForMetric(node.Centroid)
 	return nil
 }
 

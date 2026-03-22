@@ -763,7 +763,7 @@ func TestBatch_CosineEmbeddingsIndexAcceptsNormalizedVectorsAcrossInternalSplits
 	waitForEmbeddingIndexTotalIndexed(t, embIdx, numVectors, 60*time.Second, 100*time.Millisecond)
 
 	for _, key := range []string{"doc/00000", "doc/10000", "doc/19999"} {
-		doc, err := db.Get(context.Background(), []byte(key))
+		doc, err := db.Get(t.Context(), []byte(key))
 		require.NoError(t, err)
 		require.NotNil(t, doc)
 	}
