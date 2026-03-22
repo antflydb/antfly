@@ -87,8 +87,11 @@ func resolveWriteShardID(
 	if err == nil {
 		return parentShardID, nil
 	}
-	if shouldRouteWriteToParent(status) {
-		return 0, err
+	if status.State == store.ShardState_SplittingOff ||
+		status.State == store.ShardState_SplitOffPreSnap {
+		if !status.IsReadyForSplitReads() {
+			return 0, err
+		}
 	}
 	return shardID, nil
 }
