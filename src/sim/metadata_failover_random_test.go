@@ -50,6 +50,7 @@ func TestRandomScenario_MetadataFailoverSplitSeedsReplayable(t *testing.T) {
 
 	for _, seed := range seeds {
 		t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
+			t.Logf("seed=%d", seed)
 			cfg := RandomScenarioConfig{
 				Seed:                        seed,
 				BaseDir:                     filepath.Join(t.TempDir(), fmt.Sprintf("split-failover-seed-%d", seed)),

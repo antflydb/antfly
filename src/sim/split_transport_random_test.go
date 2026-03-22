@@ -56,6 +56,7 @@ func TestRandomScenario_PreferSplitSeedsReplayable(t *testing.T) {
 
 	for _, seed := range seeds {
 		t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
+			t.Logf("seed=%d", seed)
 			cfg := RandomScenarioConfig{
 				Seed:                     seed,
 				BaseDir:                  filepath.Join(t.TempDir(), fmt.Sprintf("split-seed-%d", seed)),
@@ -110,7 +111,7 @@ func TestRandomScenario_PreferSplitSeedsReplayable(t *testing.T) {
 				var secondErr *ScenarioRunError
 				require.True(t, errors.As(err, &firstErr))
 				require.True(t, errors.As(replayErr, &secondErr))
-				require.Equal(t, firstErr.Category, secondErr.Category)
+				require.Equal(t, firstErr.Actions, secondErr.Actions)
 			}
 		})
 	}

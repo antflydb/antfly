@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ajroetker/go-highway/hwy/contrib/vec"
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/vector"
 	"github.com/cockroachdb/pebble/v2"
@@ -346,6 +347,55 @@ func TestHBCIndex_TreeSplitting(t *testing.T) {
 	// The exact match should have distance very close to 0
 	assert.Equal(t, ids[0], results[0].ID)
 	assert.InDelta(t, 0.0, results[0].Distance, 0.001, "Exact match should have near-zero distance")
+}
+
+func TestHBCIndex_CosineInternalSplitKeepsCentroidsUnitNormalized(t *testing.T) {
+	const (
+		numVectors = 32
+		dims       = 32
+	)
+
+	r := rand.New(rand.NewPCG(42, 1024))
+	vectors := make([]vector.T, numVectors)
+	ids := make([]uint64, numVectors)
+	for i := range vectors {
+		ids[i] = uint64(i + 1)
+		vectors[i] = make(vector.T, dims)
+		for j := range vectors[i] {
+			vectors[i][j] = r.Float32()*2 - 1
+		}
+		vec.NormalizeFloat32(vectors[i])
+	}
+
+	batch := &Batch{
+		IDs:     ids,
+		Vectors: vectors,
+	}
+	db := setupPebbleWithVectors(t, "test_hbc_cosine_split", batch)
+
+	config := HBCConfig{
+		Dimension:       dims,
+		Name:            "test_hbc_cosine_split",
+		BranchingFactor: 2,
+		LeafSize:        2,
+		SearchWidth:     8,
+		CacheSizeNodes:  100,
+		CacheTTL:        5 * time.Minute,
+		DistanceMetric:  vector.DistanceMetric_Cosine,
+		VectorDB:        db,
+		IndexDB:         db,
+	}
+
+	index, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	require.NotPanics(t, func() {
+		require.NoError(t, index.Batch(t.Context(), batch))
+	})
+
+	stats := index.Stats()
+	assert.Greater(t, stats["total_nodes"].(uint64), uint64(1))
 }
 
 func TestHBCIndex_SearchReturnsKAcrossLeaves(t *testing.T) {
