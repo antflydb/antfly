@@ -79,8 +79,7 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 		q.FilterQuery = nil
 		hasFullText = true
 	}
-	// Translate simplified query format to native Bleve format if needed
-	// This supports both the new LLM-friendly query DSL and legacy native format
+	// Parse the native Bleve query JSON into a Bleve query object.
 	if hasFullText {
 		rq.FullTextSearch, err = query.ParseQuery(q.FullTextSearch)
 		if err != nil {

@@ -1261,6 +1261,11 @@ type PruneStats struct {
 
 // QueryBuilderRequest defines model for QueryBuilderRequest.
 type QueryBuilderRequest struct {
+	// ExampleDocuments Optional example documents to help the query builder infer field shapes
+	// and representative values. When omitted and the table has data but no schema,
+	// the server will automatically sample up to one document.
+	ExampleDocuments []map[string]interface{} `json:"example_documents,omitempty,omitzero"`
+
 	// Generator A unified configuration for a generative AI provider.
 	Generator externalRef6.GeneratorConfig `json:"generator,omitempty,omitzero"`
 
@@ -1282,7 +1287,7 @@ type QueryBuilderResult struct {
 	// Explanation Human-readable explanation of what the query does and why it was structured this way
 	Explanation string `json:"explanation,omitempty,omitzero"`
 
-	// Query Generated search query in simplified DSL format.
+	// Query Generated search query in native Bleve format.
 	// Can be used directly in QueryRequest.full_text_search or filter_query.
 	Query map[string]interface{} `json:"query"`
 

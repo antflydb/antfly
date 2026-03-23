@@ -18,7 +18,6 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/hooks/use-api-config";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
-import { normalizeSimplifiedDSL, usesSimplifiedDSL } from "@/utils/normalizeQuery";
 import { QueryDiffView } from "./QueryDiffView";
 
 interface AIQueryAssistantProps {
@@ -42,8 +41,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<QueryBuilderResult | null>(null);
-  const [normalizedQuery, setNormalizedQuery] = useState<object | null>(null);
-  const [wasNormalized, setWasNormalized] = useState(false);
+  const [proposedQuery, setProposedQuery] = useState<object | null>(null);
 
   // Generator configuration
   const [generatorOverride, setGeneratorOverride] = useState<GeneratorConfig | null>(null);
@@ -60,8 +58,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
     setIsLoading(true);
     setError(null);
     setResult(null);
-    setNormalizedQuery(null);
-    setWasNormalized(false);
+    setProposedQuery(null);
 
     try {
       const data = await client.queryBuilderAgent({
@@ -72,12 +69,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
       });
 
       setResult(data);
-
-      // Normalize if using simplified DSL
-      const needsNormalization = usesSimplifiedDSL(data.query);
-      const normalized = needsNormalization ? normalizeSimplifiedDSL(data.query) : data.query;
-      setNormalizedQuery(normalized);
-      setWasNormalized(needsNormalization);
+      setProposedQuery(data.query);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to generate query");
     } finally {
@@ -86,15 +78,15 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
   };
 
   const handleApply = () => {
-    if (normalizedQuery) {
-      onQueryApplied(normalizedQuery);
+    if (proposedQuery) {
+      onQueryApplied(proposedQuery);
       clearProposal();
     }
   };
 
   const handleApplyAndRun = () => {
-    if (normalizedQuery) {
-      onQueryAppliedAndRun(normalizedQuery);
+    if (proposedQuery) {
+      onQueryAppliedAndRun(proposedQuery);
       clearProposal();
     }
   };
@@ -105,8 +97,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
 
   const clearProposal = () => {
     setResult(null);
-    setNormalizedQuery(null);
-    setWasNormalized(false);
+    setProposedQuery(null);
   };
 
   const getConfidenceColor = (confidence: number | undefined) => {
@@ -190,16 +181,11 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
           </Alert>
         )}
 
-        {result && normalizedQuery && (
+        {result && proposedQuery && (
           <div className="rounded-lg border p-3 space-y-3 bg-muted/30">
             <div className="flex items-center justify-between">
               <span className="text-sm font-medium truncate flex-1 mr-2">"{intent}"</span>
               <div className="flex items-center gap-2">
-                {wasNormalized && (
-                  <Badge variant="outline" className="text-[10px]">
-                    Normalized
-                  </Badge>
-                )}
                 {result.confidence !== undefined && (
                   <Badge variant={getConfidenceColor(result.confidence)}>
                     {getConfidenceLabel(result.confidence)} ({Math.round(result.confidence * 100)}%)
@@ -212,7 +198,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
               <p className="text-xs text-muted-foreground">{result.explanation}</p>
             )}
 
-            <QueryDiffView currentQuery={currentQuery} proposedQuery={normalizedQuery} />
+            <QueryDiffView currentQuery={currentQuery} proposedQuery={proposedQuery} />
 
             {result.warnings && result.warnings.length > 0 && (
               <Alert>

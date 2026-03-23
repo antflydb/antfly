@@ -18,7 +18,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"sort"
 
+	"github.com/alpkeskin/gotoon"
 	"github.com/antflydb/antfly/lib/ai"
 	"github.com/antflydb/antfly/lib/ai/eval"
 	"github.com/antflydb/antfly/lib/query"
@@ -32,6 +35,8 @@ import (
 // DefaultReserveTokens is the default number of tokens reserved for system prompt,
 // answer generation, and other overhead when max_context_tokens is set.
 const DefaultReserveTokens = 4000
+
+const defaultQueryBuilderExampleDocumentLimit = 1
 
 // cachedPruner returns a Pruner for the given document renderer template,
 // creating and caching one if it doesn't already exist. The Pruner is safe
@@ -247,6 +252,7 @@ func (t *TableApi) ExecuteQueryBuilder(ctx context.Context, req *QueryBuilderReq
 
 	// Build schema description - from table schema or provided fields
 	var schemaDesc query.SchemaDescription
+	exampleDocs := append([]map[string]any(nil), req.ExampleDocuments...)
 
 	if req.Table != "" {
 		tableData, err := t.tm.GetTable(req.Table)
@@ -254,6 +260,20 @@ func (t *TableApi) ExecuteQueryBuilder(ctx context.Context, req *QueryBuilderReq
 			return nil, fmt.Errorf("table not found: %w", err)
 		}
 		schemaDesc = t.buildSchemaDescription(tableData.Schema, req.SchemaFields)
+		if len(exampleDocs) == 0 && !hasDocumentSchema(tableData.Schema) {
+			exampleDocs, err = t.loadQueryBuilderExampleDocuments(
+				ctx,
+				req.Table,
+				req.SchemaFields,
+				defaultQueryBuilderExampleDocumentLimit,
+			)
+			if err != nil {
+				t.logger.Warn("Failed to load query builder example documents",
+					zap.Error(err),
+					zap.String("table", req.Table),
+				)
+			}
+		}
 	} else if len(req.SchemaFields) > 0 {
 		schemaDesc = t.buildSchemaDescription(nil, req.SchemaFields)
 	} else {
@@ -276,7 +296,15 @@ func (t *TableApi) ExecuteQueryBuilder(ctx context.Context, req *QueryBuilderReq
 		return nil, fmt.Errorf("failed to create generator: %w", err)
 	}
 
-	result, err := generator.BuildQueryBleve(ctx, req.Intent, schemaDesc)
+	generationOpts := make([]ai.QueryBuilderOption, 0, 1)
+	if len(exampleDocs) > 0 {
+		rendered := renderQueryBuilderExampleDocuments(exampleDocs)
+		if len(rendered) > 0 {
+			generationOpts = append(generationOpts, ai.WithQueryBuilderExampleDocuments(rendered))
+		}
+	}
+
+	result, err := generator.BuildQueryBleve(ctx, req.Intent, schemaDesc, generationOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
@@ -296,110 +324,176 @@ func (t *TableApi) buildSchemaDescription(tableSchema *schema.TableSchema, schem
 		Fields: []query.FieldInfo{},
 	}
 
-	// If specific fields are requested, use those
-	if len(schemaFields) > 0 {
+	if tableSchema == nil || len(tableSchema.DocumentSchemas) == 0 {
 		for _, name := range schemaFields {
 			desc.Fields = append(desc.Fields, query.FieldInfo{
 				Name:       name,
-				Type:       "text", // Default assumption
+				Type:       "text",
 				Searchable: true,
 			})
 		}
 		return desc
 	}
 
-	// Extract fields from table schema
-	if tableSchema == nil {
-		return desc
+	fieldFilter := make(map[string]struct{}, len(schemaFields))
+	for _, field := range schemaFields {
+		fieldFilter[field] = struct{}{}
 	}
 
-	for _, docSchema := range tableSchema.DocumentSchemas {
-		if docSchema.Description != "" && desc.Description == "" {
-			desc.Description = docSchema.Description
+	docTypeNames := make([]string, 0, len(tableSchema.DocumentSchemas))
+	for docType := range tableSchema.DocumentSchemas {
+		docTypeNames = append(docTypeNames, docType)
+	}
+	sort.Strings(docTypeNames)
+
+	fieldByName := make(map[string]query.FieldInfo)
+	for _, docType := range docTypeNames {
+		docSchema := tableSchema.DocumentSchemas[docType]
+		extracted := query.ExtractSchemaDescription(docSchema.Schema)
+		if desc.Description == "" {
+			switch {
+			case docType == tableSchema.DefaultType && docSchema.Description != "":
+				desc.Description = docSchema.Description
+			case extracted.Description != "":
+				desc.Description = extracted.Description
+			case docSchema.Description != "":
+				desc.Description = docSchema.Description
+			}
 		}
 
-		properties, ok := docSchema.Schema["properties"].(map[string]any)
-		if !ok {
-			continue
-		}
-
-		for fieldName, fieldSchemaI := range properties {
-			fieldSchema, ok := fieldSchemaI.(map[string]any)
-			if !ok {
-				continue
-			}
-
-			field := query.FieldInfo{
-				Name:       fieldName,
-				Searchable: true,
-			}
-
-			// Get description
-			if fieldDesc, ok := fieldSchema["description"].(string); ok {
-				field.Description = fieldDesc
-			}
-
-			// Check if indexing is disabled
-			if indexVal, ok := fieldSchema["x-antfly-index"].(bool); ok && !indexVal {
-				field.Searchable = false
-			}
-
-			// Get x-antfly-types
-			if typesI, ok := fieldSchema["x-antfly-types"]; ok {
-				switch v := typesI.(type) {
-				case []any:
-					for _, typ := range v {
-						if typeStr, ok := typ.(string); ok {
-							field.Types = append(field.Types, typeStr)
-						}
-					}
-				case []string:
-					field.Types = v
+		for _, field := range extracted.Fields {
+			if len(fieldFilter) > 0 {
+				if _, ok := fieldFilter[field.Name]; !ok {
+					continue
 				}
 			}
-
-			// Map to field type
-			jsonType, _ := fieldSchema["type"].(string)
-			field.Type = mapJSONTypeToFieldType(jsonType, field.Types)
-
-			desc.Fields = append(desc.Fields, field)
+			existing, ok := fieldByName[field.Name]
+			if !ok {
+				fieldByName[field.Name] = field
+				continue
+			}
+			fieldByName[field.Name] = mergeQueryBuilderFieldInfo(existing, field)
 		}
+	}
+
+	fieldNames := make([]string, 0, len(fieldByName))
+	for fieldName := range fieldByName {
+		fieldNames = append(fieldNames, fieldName)
+	}
+	sort.Strings(fieldNames)
+	for _, fieldName := range fieldNames {
+		desc.Fields = append(desc.Fields, fieldByName[fieldName])
 	}
 
 	return desc
 }
 
-// mapJSONTypeToFieldType maps JSON Schema type + x-antfly-types to a field type.
-func mapJSONTypeToFieldType(jsonType string, antflyTypes []string) string {
-	if len(antflyTypes) > 0 {
-		for _, t := range antflyTypes {
-			switch t {
-			case "text", "html":
-				return "text"
-			case "keyword", "link":
-				return "keyword"
-			case "numeric":
-				return "numeric"
-			case "datetime":
-				return "datetime"
-			case "boolean":
-				return "boolean"
-			case "geopoint":
-				return "geopoint"
-			}
+func mergeQueryBuilderFieldInfo(existing, incoming query.FieldInfo) query.FieldInfo {
+	if existing.Description == "" {
+		existing.Description = incoming.Description
+	}
+	if existing.Type == "" {
+		existing.Type = incoming.Type
+	}
+	existing.Searchable = existing.Searchable || incoming.Searchable
+	existing.Nested = existing.Nested || incoming.Nested
+	if existing.ArrayOf == "" {
+		existing.ArrayOf = incoming.ArrayOf
+	}
+	if existing.Format == "" {
+		existing.Format = incoming.Format
+	}
+	existing.Nullable = existing.Nullable || incoming.Nullable
+	if existing.ValueRange == nil {
+		existing.ValueRange = incoming.ValueRange
+	}
+	if len(existing.Children) == 0 {
+		existing.Children = incoming.Children
+	}
+	existing.Types = appendUniqueStrings(existing.Types, incoming.Types...)
+	existing.ExampleValues = appendUniqueStrings(existing.ExampleValues, incoming.ExampleValues...)
+	existing.CommonQueries = appendUniqueStrings(existing.CommonQueries, incoming.CommonQueries...)
+	return existing
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	for _, value := range values {
+		if value == "" || slices.Contains(dst, value) {
+			continue
 		}
+		dst = append(dst, value)
+	}
+	return dst
+}
+
+func hasDocumentSchema(tableSchema *schema.TableSchema) bool {
+	return tableSchema != nil && len(tableSchema.DocumentSchemas) > 0
+}
+
+func (t *TableApi) loadQueryBuilderExampleDocuments(
+	ctx context.Context,
+	tableName string,
+	schemaFields []string,
+	limit int,
+) ([]map[string]any, error) {
+	if tableName == "" || limit <= 0 {
+		return nil, nil
 	}
 
-	switch jsonType {
-	case "string":
-		return "text"
-	case "number", "integer":
-		return "numeric"
-	case "boolean":
-		return "boolean"
-	default:
-		return jsonType
+	queryReq := &QueryRequest{
+		Table: tableName,
+		Limit: limit,
 	}
+	if len(schemaFields) > 0 {
+		queryReq.Fields = append([]string(nil), schemaFields...)
+	}
+
+	result := t.runQuery(ctx, queryReq)
+	if result.Status != http.StatusOK {
+		return nil, fmt.Errorf("query failed with status %d: %s", result.Status, result.Error)
+	}
+
+	exampleDocs := make([]map[string]any, 0, len(result.Hits.Hits))
+	for _, hit := range result.Hits.Hits {
+		if len(hit.Source) == 0 {
+			continue
+		}
+		exampleDocs = append(exampleDocs, filterQueryBuilderExampleDocument(hit.Source, schemaFields))
+	}
+
+	return exampleDocs, nil
+}
+
+func filterQueryBuilderExampleDocument(doc map[string]any, schemaFields []string) map[string]any {
+	filtered := make(map[string]any)
+	if len(schemaFields) == 0 {
+		for key, value := range doc {
+			filtered[key] = value
+		}
+		return filtered
+	}
+
+	for _, field := range schemaFields {
+		if value, ok := doc[field]; ok {
+			filtered[field] = value
+		}
+	}
+	return filtered
+}
+
+func renderQueryBuilderExampleDocuments(exampleDocs []map[string]any) []string {
+	rendered := make([]string, 0, len(exampleDocs))
+	for _, doc := range exampleDocs {
+		if len(doc) == 0 {
+			continue
+		}
+		encoded, err := gotoon.Encode(doc, gotoon.WithLengthMarker(), gotoon.WithIndent(2))
+		if err != nil {
+			continue
+		}
+		rendered = append(rendered, encoded)
+	}
+	return rendered
 }
 
 // Evaluate handles standalone evaluation requests (POST /eval).
