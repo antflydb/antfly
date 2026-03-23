@@ -6,8 +6,32 @@ name: Go
 on:
   push:
     branches: ["main"]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "Dockerfile*"
+      - "ts/**"
+      - "py/**"
+      - "pkg/operator/**"
+      - ".github/workflows/ts-*.yml"
+      - ".github/workflows/py-*.yml"
+      - ".github/workflows/antfly-operator-*.yml"
+      - ".github/workflows/antfly-container.yml"
+      - ".github/workflows/trigger-docs-build.yml"
   pull_request:
     branches: ["main"]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "Dockerfile*"
+      - "ts/**"
+      - "py/**"
+      - "pkg/operator/**"
+      - ".github/workflows/ts-*.yml"
+      - ".github/workflows/py-*.yml"
+      - ".github/workflows/antfly-operator-*.yml"
+      - ".github/workflows/antfly-container.yml"
+      - ".github/workflows/trigger-docs-build.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
