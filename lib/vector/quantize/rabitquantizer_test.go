@@ -107,6 +107,44 @@ func TestRaBitQuantizerSimple(t *testing.T) {
 		require.Equal(t, []float32{0, 0}, quantizedSet.GetCentroid())
 	})
 
+	t.Run("estimate distances on empty quantized set", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			metric      vector.DistanceMetric
+			queryVector vector.T
+			centroid    vector.T
+		}{
+			{
+				name:        "inner product",
+				metric:      vector.DistanceMetric_InnerProduct,
+				queryVector: vector.T{1, 2},
+				centroid:    vector.T{0, 0},
+			},
+			{
+				name:        "cosine",
+				metric:      vector.DistanceMetric_Cosine,
+				queryVector: vector.T{1, 0},
+				centroid:    vector.T{1, 0},
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				quantizer := NewRaBitQuantizer(2, 42, tc.metric)
+				vectors := vector.MakeSet(2)
+				quantizedSet := quantizer.Quantize(&workspace, tc.centroid, vectors).(*RaBitQuantizedVectorSet)
+				require.Zero(t, quantizedSet.GetCount())
+
+				distances := []float32{}
+				errorBounds := []float32{}
+				require.NotPanics(t, func() {
+					quantizer.EstimateDistances(
+						&workspace, quantizedSet, tc.queryVector, distances, errorBounds)
+				})
+			})
+		}
+	})
+
 	t.Run("empty quantized set with capacity", func(t *testing.T) {
 		quantizer := NewRaBitQuantizer(65, 42, vector.DistanceMetric_InnerProduct)
 		centroid := make([]float32, 65)

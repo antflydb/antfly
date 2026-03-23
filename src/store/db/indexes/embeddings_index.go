@@ -1156,6 +1156,41 @@ func (ei *EmbeddingIndex) ComputeEnrichments(
 	allEnrichmentWrites = append(allEnrichmentWrites, embeddingWrites...)
 	allEnrichmentWrites = append(allEnrichmentWrites, chunkWrites...)
 
+	if ei.conf.Chunker != nil {
+		failedSet := make(map[string]struct{}, len(failed))
+		for _, key := range failed {
+			failedSet[string(key)] = struct{}{}
+		}
+
+		desiredByDoc := make(map[string][][]byte, len(filteredKeys))
+		for _, chunkWrite := range chunkWrites {
+			docKey, _, ok := storeutils.ParseChunkKey(chunkWrite[0])
+			if !ok {
+				continue
+			}
+			sKey := string(docKey)
+			desiredByDoc[sKey] = append(desiredByDoc[sKey], chunkWrite[0])
+		}
+
+		for _, docKey := range filteredKeys {
+			if _, failed := failedSet[string(docKey)]; failed {
+				continue
+			}
+			deleteWrites, err := collectChunkReplacementDeletes(
+				ei.db,
+				docKey,
+				ei.name,
+				desiredByDoc[string(docKey)],
+				ei.embedderSuffix,
+				ei.summarizerSuffix,
+			)
+			if err != nil {
+				return nil, nil, fmt.Errorf("collecting stale chunk deletes: %w", err)
+			}
+			allEnrichmentWrites = append(allEnrichmentWrites, deleteWrites...)
+		}
+	}
+
 	ei.logger.Debug("ComputeEnrichments completed",
 		zap.String("index", ei.name),
 		zap.Int("totalKeys", len(filteredKeys)),
@@ -1242,6 +1277,7 @@ func (i *EmbeddingIndex) LeaderFactory(
 						if !i.byteRange.Contains(k) {
 							return common.NewErrKeyOutOfRange(k, i.byteRange)
 						}
+						desiredChunkKeys := make([][]byte, 0, len(chunks[j]))
 						// Persist each chunk
 						for _, chunk := range chunks[j] {
 							// Skip chunks with empty text (no point storing/indexing them)
@@ -1259,6 +1295,7 @@ func (i *EmbeddingIndex) LeaderFactory(
 							} else {
 								chunkKey = storeutils.MakeChunkKey(k, i.name, chunk.Id)
 							}
+							desiredChunkKeys = append(desiredChunkKeys, chunkKey)
 							// Marshal chunk JSON
 							chunkJSON, err := json.Marshal(chunk)
 							if err != nil {
@@ -1270,6 +1307,19 @@ func (i *EmbeddingIndex) LeaderFactory(
 							b = append(b, chunkJSON...)
 							writes = append(writes, [2][]byte{chunkKey, b})
 						}
+
+						deleteWrites, err := collectChunkReplacementDeletes(
+							i.db,
+							k,
+							i.name,
+							desiredChunkKeys,
+							i.embedderSuffix,
+							i.summarizerSuffix,
+						)
+						if err != nil {
+							return fmt.Errorf("collecting stale chunk deletes: %w", err)
+						}
+						writes = append(writes, deleteWrites...)
 					}
 					return persistFunc(ctx, writes)
 				}
