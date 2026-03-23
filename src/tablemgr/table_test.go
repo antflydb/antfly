@@ -1577,6 +1577,78 @@ func TestPreSplitStateTransitionsToSplittingWhenSplitStateActive(t *testing.T) {
 		"Parent shard should transition to Splitting when an active split state is reported")
 }
 
+func TestUpdateStatuses_RefreshesShardConfigFromCurrentTableDefinition(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	tableName := "splitStatusConfigRefresh"
+	parentShardID := types.ID(10)
+	childShardID := types.ID(11)
+	splitKey := []byte("M")
+	fullRange := [2][]byte{{0x00}, {0xFF}}
+	parentRange := [2][]byte{{0x00}, splitKey}
+	childRange := [2][]byte{splitKey, {0xFF}}
+
+	table := &store.Table{
+		Name: tableName,
+		Shards: map[types.ID]*store.ShardConfig{
+			parentShardID: {ByteRange: parentRange},
+			childShardID:  {ByteRange: childRange},
+		},
+	}
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: tableName,
+		State: store.ShardState_Default,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{ByteRange: fullRange},
+			Peers:       common.NewPeerSet(1),
+			RaftStatus:  &common.RaftStatus{Lead: 1},
+		},
+	}
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: tableName,
+		State: store.ShardState_Default,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{ByteRange: childRange},
+			Peers:       common.NewPeerSet(1),
+			RaftStatus:  &common.RaftStatus{Lead: 1},
+		},
+	}
+	err = tm.saveTableAndShardStatus(table, map[types.ID]*store.ShardStatus{
+		parentShardID: parentStatus,
+		childShardID:  childStatus,
+	})
+	require.NoError(t, err)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(1): {
+			StoreInfo: store.StoreInfo{ID: types.ID(1)},
+			Shards: map[types.ID]*store.ShardInfo{
+				parentShardID: {
+					ShardConfig: store.ShardConfig{ByteRange: parentRange},
+					Peers:       common.NewPeerSet(1),
+					RaftStatus:  &common.RaftStatus{Lead: 1},
+				},
+				childShardID: {
+					ShardConfig: store.ShardConfig{ByteRange: childRange},
+					Peers:       common.NewPeerSet(1),
+					RaftStatus:  &common.RaftStatus{Lead: 1},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	updatedParent, err := tm.GetShardStatus(parentShardID)
+	require.NoError(t, err)
+	assert.Equal(t, types.Range(parentRange), updatedParent.ByteRange,
+		"UpdateStatuses should preserve the table's narrowed parent range instead of re-persisting stale shard status config")
+}
+
 func TestUpdateStatuses_PreservesAndUpgradesSplitStateFieldsWithinPhase(t *testing.T) {
 	db := setupTestDB(t)
 

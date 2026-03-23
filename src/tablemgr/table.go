@@ -162,6 +162,10 @@ func (tm *TableManager) UpdateStatuses(
 		}
 	}
 	updatedShards := make(map[types.ID]*store.ShardStatus, len(currentShards))
+	tables, err := tm.loadTables(nil, nil)
+	if err != nil {
+		return fmt.Errorf("loading tables for status reconciliation: %w", err)
+	}
 	for shardID := range currentShards {
 		shardStatus, err := tm.GetShardStatus(shardID)
 		if err != nil && !errors.Is(err, ErrNotFound) {
@@ -171,7 +175,24 @@ func (tm *TableManager) UpdateStatuses(
 			log.Printf("shard status on peer but not in metadata: %s", shardID)
 			continue
 		}
+
+		statusConfigCorrected := false
+		if table := tables[shardStatus.Table]; table != nil {
+			if conf := table.Shards[shardID]; conf != nil &&
+				!shardStatus.ShardConfig.Equal(conf) {
+				shardStatus = shardStatus.DeepCopy()
+				shardStatus.ShardConfig = *conf
+				statusConfigCorrected = true
+			}
+		}
+
 		newStatus, needsUpdate := tm.needsUpdates(shardStatus, currentShards[shardID])
+		if statusConfigCorrected {
+			if newStatus == nil {
+				newStatus = shardStatus
+			}
+			needsUpdate = true
+		}
 		if needsUpdate {
 			updatedShards[shardID] = newStatus
 		}
