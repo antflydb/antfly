@@ -34,10 +34,6 @@ ARG LIBTPU_VERSION=1.12.0
 # =============================================================================
 FROM golang:${GO_VERSION} AS builder
 
-LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
-LABEL org.opencontainers.image.description="AntflyDB - Distributed document database with vector search for AI applications (ONNX + XLA)"
-LABEL org.opencontainers.image.licenses=Elastic-2.0
-
 ARG ONNXRUNTIME_VERSION
 ARG TOKENIZERS_VERSION
 ARG TARGETARCH
@@ -94,6 +90,10 @@ RUN GOEXPERIMENT=simd CGO_ENABLED=1 \
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
+LABEL org.opencontainers.image.description="AntflyDB - Distributed document database with vector search for AI applications (ONNX + XLA)"
+LABEL org.opencontainers.image.licenses=Elastic-2.0
+
 ARG ONNXRUNTIME_VERSION
 ARG LIBTPU_VERSION
 ARG TARGETARCH
@@ -143,8 +143,8 @@ RUN curl -fsSL "https://storage.googleapis.com/cloud-tpu-tpuvm-artifacts/libtpu/
     ln -s /usr/local/lib/go-xla/libtpu.so /usr/local/lib/go-xla/pjrt_plugin_tpu.so || \
     echo "Warning: Could not download libtpu.so. TPU support requires GKE TPU nodes."
 
-# Create non-root user
-RUN groupadd -r antfly && useradd -r -g antfly antfly
+# Create non-root user with home directory (needed for default ~/.antfly storage)
+RUN groupadd -r antfly && useradd -r -g antfly -m antfly
 
 # Copy binary from builder
 COPY --from=builder /antfly /antfly
@@ -155,10 +155,6 @@ ENV ORT_DYLIB_PATH="/usr/local/onnxruntime/lib/libonnxruntime.so"
 ENV ORTGENAI_DYLIB_PATH="/usr/local/onnxruntime/lib/libonnxruntime-genai.so"
 ENV PJRT_PLUGIN_LIBRARY_PATH="/usr/local/lib/go-xla"
 
-# Default backend priority: ONNX > XLA > Go
-ENV ANTFLY_TERMITE_BACKEND_PRIORITY="onnx,xla,go"
-ENV ANTFLY_TERMITE_API_URL="http://0.0.0.0:8080"
-
 # Model directory (mounted at runtime, contains embedders/, chunkers/, rerankers/ subdirs)
 ENV ANTFLY_TERMITE_MODELS_DIR="/models"
 
@@ -168,12 +164,12 @@ RUN mkdir -p /models/embedders /models/chunkers /models/rerankers && \
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8080/api/models || exit 1
+    CMD curl -f http://localhost:4200/readyz || exit 1
 
 # Run as non-root
 USER antfly
 
-EXPOSE 8080
+EXPOSE 8080 11433 4200
 
 ENTRYPOINT ["/antfly"]
 
