@@ -189,6 +189,24 @@ func shardRetryBackoff() retry.Backoff {
 	return retry.WithCappedDuration(1*time.Second, b)
 }
 
+// writeShardRetryBackoff gives write paths more time than reads to ride out split
+// cutover churn (parent out-of-range, child leader startup, transient proposal drops)
+// without surfacing a 500 to the client.
+func writeShardRetryBackoff() retry.Backoff {
+	b := retry.WithMaxRetries(20, retry.NewExponential(100*time.Millisecond))
+	return retry.WithCappedDuration(1*time.Second, b)
+}
+
+func (ms *MetadataStore) retryableWriteShardError(ctx context.Context, err error) error {
+	if !isTransientShardError(err) {
+		return err
+	}
+	if ms.pool != nil {
+		ms.runHealthCheck(ctx)
+	}
+	return retry.RetryableError(err)
+}
+
 // leaderClientForShardWithEffectiveID returns the leader client and the effective shard ID
 // to use for requests. For SplittingOff shards with no Raft status yet, this falls back
 // to the parent PreSplit shard and returns the parent's shard ID. The effective shard ID
@@ -325,6 +343,14 @@ func (ms *MetadataStore) strictLeaderClientForShardWithEffectiveID(
 // The caller should retry after a delay.
 var ErrShardInitializing = errors.New("shard is initializing, retry later")
 
+func splitChildCanServeWrites(info *store.ShardInfo) bool {
+	return info != nil && info.CanInitiateSplitCutover()
+}
+
+func splitChildIsFullyCutOver(info *store.ShardInfo) bool {
+	return info != nil && info.IsReadyForSplitReads()
+}
+
 // leaderClientForShardNoFallback returns the leader client for write operations.
 // Unlike leaderClientForShardWithEffectiveID, this does NOT fall back to the parent shard
 // during splits. Instead, it returns ErrShardInitializing if the shard isn't ready.
@@ -344,27 +370,41 @@ func (ms *MetadataStore) leaderClientForShardNoFallback(
 		receiverShardID := types.ID(status.MergeState.GetReceiverShardId())
 		return ms.leaderClientForShardNoFallback(ctx, receiverShardID)
 	}
-	if shouldRouteWriteToParent(status) {
-		ms.logger.Debug("SPLIT_ROUTING: Split child not ready for writes yet, returning retry error",
-			zap.Stringer("shardID", shardID),
-			zap.String("state", status.State.String()),
-			zap.Bool("hasSnapshot", status.HasSnapshot))
-		return 0, nil, ErrShardInitializing
+	isSplitChild := status.State == store.ShardState_SplittingOff ||
+		status.State == store.ShardState_SplitOffPreSnap
+	if isSplitChild {
+		if !status.CanInitiateSplitCutover() {
+			ms.logger.Debug("SPLIT_ROUTING: Split child not ready for writes yet, returning retry error",
+				zap.Stringer("shardID", shardID),
+				zap.String("state", status.State.String()),
+				zap.Bool("hasSnapshot", status.HasSnapshot))
+			return 0, nil, ErrShardInitializing
+		}
 	}
 
 	// For shards in split-related states, also check if leader is elected.
 	// A shard may have snapshot but no leader yet during the window between
 	// snapshot transfer and leader election. For non-split shards, let
 	// leaderClientForShard handle the leader lookup (it has fallback logic).
-	isSplitRelatedState := status.State == store.ShardState_SplittingOff ||
-		status.State == store.ShardState_SplitOffPreSnap
-	if isSplitRelatedState && (status.RaftStatus == nil || status.RaftStatus.Lead == 0) {
+	if isSplitChild && (status.RaftStatus == nil || status.RaftStatus.Lead == 0) {
 		ms.logger.Debug("SPLIT_ROUTING: Split shard not ready for writes (no leader), returning retry error",
 			zap.Stringer("shardID", shardID),
 			zap.String("state", status.State.String()),
 			zap.Bool("hasSnapshot", status.HasSnapshot),
 			zap.Bool("hasRaftStatus", status.RaftStatus != nil))
 		return 0, nil, ErrShardInitializing
+	}
+	if isSplitChild {
+		if leaderClient, leaderErr := ms.selfReportedLeaderClientForShard(ctx, shardID, splitChildCanServeWrites); leaderErr == nil {
+			return shardID, leaderClient, nil
+		}
+
+		var reachable bool
+		c, reachable, err = ms.tm.GetStoreClient(ctx, status.RaftStatus.Lead)
+		if err == nil && reachable {
+			return shardID, c, nil
+		}
+		return 0, nil, ErrNoLeaderElected
 	}
 
 	// Get client using regular logic
@@ -394,7 +434,7 @@ func (ms *MetadataStore) directLeaderClientForShardBypassesSplitFallback(
 	}
 	isSplitChild := status.State == store.ShardState_SplittingOff ||
 		status.State == store.ShardState_SplitOffPreSnap
-	if isSplitChild && shouldRouteWriteToParent(status) {
+	if isSplitChild && !status.IsReadyForSplitReads() {
 		return 0, nil, ErrShardInitializing
 	}
 	if status.RaftStatus == nil {
@@ -403,6 +443,13 @@ func (ms *MetadataStore) directLeaderClientForShardBypassesSplitFallback(
 	if status.RaftStatus.Lead == 0 {
 		return 0, nil, ErrShardInitializing
 	}
+	readinessFilter := splitChildIsFullyCutOver
+	if !isSplitChild {
+		readinessFilter = nil
+	}
+	if leaderClient, leaderErr := ms.selfReportedLeaderClientForShard(ctx, shardID, readinessFilter); leaderErr == nil {
+		return shardID, leaderClient, nil
+	}
 
 	var reachable bool
 	c, reachable, err = ms.tm.GetStoreClient(ctx, status.RaftStatus.Lead)
@@ -410,6 +457,40 @@ func (ms *MetadataStore) directLeaderClientForShardBypassesSplitFallback(
 		return shardID, c, nil
 	}
 	return 0, nil, ErrNoLeaderElected
+}
+
+func (ms *MetadataStore) selfReportedLeaderClientForShard(
+	ctx context.Context,
+	shardID types.ID,
+	readinessFilter func(*store.ShardInfo) bool,
+) (client.StoreRPC, error) {
+	status, err := ms.tm.GetShardStatus(shardID)
+	if err != nil || status == nil {
+		return nil, fmt.Errorf("no status info available: %w", err)
+	}
+
+	candidates := status.ReportedBy
+	if len(candidates) == 0 {
+		candidates = status.Peers
+	}
+	for peerID := range candidates {
+		storeStatus, err := ms.tm.GetStoreStatus(ctx, peerID)
+		if err != nil || storeStatus == nil || !storeStatus.IsReachable() {
+			continue
+		}
+		shardInfo := storeStatus.Shards[shardID]
+		if shardInfo == nil || shardInfo.RaftStatus == nil || shardInfo.RaftStatus.Lead != peerID {
+			continue
+		}
+		if readinessFilter != nil && !readinessFilter(shardInfo) {
+			continue
+		}
+		c, reachable, err := ms.tm.GetStoreClient(ctx, peerID)
+		if err == nil && reachable {
+			return c, nil
+		}
+	}
+	return nil, ErrNoLeaderElected
 }
 
 // shouldFallbackToParentShard returns true if reads to this shard should be
@@ -498,23 +579,17 @@ func (ms *MetadataStore) forwardBatchToShard(
 	transforms []*db.Transform,
 	syncLevel db.Op_SyncLevel,
 ) error {
-	backoff := shardRetryBackoff()
+	backoff := writeShardRetryBackoff()
 
 	return retry.Do(ctx, backoff, func(ctx context.Context) error {
 		// Use leaderClientForShardNoFallback for writes - don't fall back to parent
 		// during splits since parent's byteRange has been narrowed
 		effectiveShardID, leader, err := ms.leaderClientForShardNoFallback(ctx, shardID)
 		if err != nil {
-			if isTransientShardError(err) {
-				return retry.RetryableError(err)
-			}
-			return err
+			return ms.retryableWriteShardError(ctx, err)
 		}
 		err = leader.Batch(ctx, effectiveShardID, writes, deletes, transforms, syncLevel)
-		if err != nil && isTransientShardError(err) {
-			return retry.RetryableError(err)
-		}
-		return err
+		return ms.retryableWriteShardError(ctx, err)
 	})
 }
 
@@ -667,23 +742,18 @@ func (ms *MetadataStore) forwardResolveIntentToShard(
 	status int32,
 	commitVersion uint64,
 ) error {
-	backoff := shardRetryBackoff()
+	backoff := writeShardRetryBackoff()
 
 	return retry.Do(ctx, backoff, func(ctx context.Context) error {
 		// Use leaderClientForShardNoFallback for writes - don't fall back to parent
 		// during splits since parent's byteRange has been narrowed
 		effectiveShardID, targetClient, err := ms.leaderClientForShardNoFallback(ctx, shardID)
 		if err != nil {
-			if isTransientShardError(err) {
-				return retry.RetryableError(err)
-			}
-			return fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
+			err = fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
+			return ms.retryableWriteShardError(ctx, err)
 		}
 		err = targetClient.ResolveIntent(ctx, effectiveShardID, txnID, status, commitVersion)
-		if err != nil && isTransientShardError(err) {
-			return retry.RetryableError(err)
-		}
-		return err
+		return ms.retryableWriteShardError(ctx, err)
 	})
 }
 
@@ -711,7 +781,7 @@ func (ms *MetadataStore) forwardInsertToShard(
 	}
 	writes := [][2][]byte{{[]byte(key), e}}
 
-	backoff := shardRetryBackoff()
+	backoff := writeShardRetryBackoff()
 
 	return retry.Do(ctx, backoff, func(ctx context.Context) error {
 		// Re-fetch table and route on each retry to pick up routing table changes during splits
@@ -738,26 +808,17 @@ func (ms *MetadataStore) forwardInsertToShard(
 		// during splits since parent's byteRange has been narrowed
 		effectiveShardID, targetClient, err := ms.leaderClientForShardNoFallback(ctx, shardID)
 		if err != nil {
-			if isTransientShardError(err) {
-				return retry.RetryableError(err)
-			}
-			return err
+			return ms.retryableWriteShardError(ctx, err)
 		}
 		err = targetClient.Batch(ctx, effectiveShardID, writes, nil, nil, syncLevel)
 		if errors.Is(err, client.ErrKeyOutOfRange) && shardID != targetShardID {
 			effectiveChildID, childClient, childErr := ms.directLeaderClientForShardBypassesSplitFallback(ctx, targetShardID)
 			if childErr != nil {
-				if isTransientShardError(childErr) {
-					return retry.RetryableError(childErr)
-				}
-				return childErr
+				return ms.retryableWriteShardError(ctx, childErr)
 			}
 			err = childClient.Batch(ctx, effectiveChildID, writes, nil, nil, syncLevel)
 		}
-		if err != nil && isTransientShardError(err) {
-			return retry.RetryableError(err)
-		}
-		return err
+		return ms.retryableWriteShardError(ctx, err)
 	})
 }
 

@@ -93,6 +93,35 @@ func writeStoreStatus(t *testing.T, db kv.DB, nodeID types.ID, healthy bool) {
 	require.NoError(t, err)
 }
 
+func writeStoreStatusWithShards(
+	t *testing.T,
+	db kv.DB,
+	nodeID types.ID,
+	healthy bool,
+	shards map[types.ID]*store.ShardInfo,
+) {
+	t.Helper()
+	state := store.StoreState_Healthy
+	if !healthy {
+		state = store.StoreState_Unhealthy
+	}
+	status := &tablemgr.StoreStatus{
+		StoreInfo: store.StoreInfo{
+			ID:     nodeID,
+			ApiURL: "http://127.0.0.1:0",
+		},
+		State:  state,
+		Shards: shards,
+	}
+	data, err := json.Marshal(status)
+	require.NoError(t, err)
+	err = db.Batch(context.Background(),
+		[][2][]byte{{[]byte("tm:sts:" + nodeID.String()), data}},
+		nil,
+	)
+	require.NoError(t, err)
+}
+
 type stubStoreRPC struct {
 	client.StoreRPC
 	id       types.ID
@@ -662,6 +691,154 @@ func TestForwardInsertToShard_DoesNotBypassToChildBeforeCutover(t *testing.T) {
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.GreaterOrEqual(t, parentRPC.batchHit, 1)
 	assert.Equal(t, 0, childRPC.batchHit)
+}
+
+func TestDirectLeaderClientForShardBypassesSplitFallback_PrefersSelfReportedLeader(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	shardID := types.ID(101)
+	leaderNodeID := types.ID(1)
+	followerNodeID := types.ID(2)
+
+	leaderRPC := &stubStoreRPC{id: leaderNodeID}
+	followerRPC := &stubStoreRPC{id: followerNodeID}
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case leaderNodeID:
+			return leaderRPC
+		case followerNodeID:
+			return followerRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+
+	childStatus := splitShardStatus(
+		shardID,
+		store.ShardState_SplitOffPreSnap,
+		[2][]byte{[]byte("m:\x00"), {0xff}},
+		true,
+		false,
+		followerNodeID, // stale merged leader
+	)
+	childStatus.SplitReplayRequired = true
+	childStatus.SplitReplayCaughtUp = true
+	childStatus.SplitCutoverReady = true
+	childStatus.Peers = common.NewPeerSet(leaderNodeID, followerNodeID)
+	childStatus.ReportedBy = common.NewPeerSet(leaderNodeID, followerNodeID)
+	writeShardStatus(t, db, childStatus)
+	reloadedShardStatus, err := ms.tm.GetShardStatus(shardID)
+	require.NoError(t, err)
+	assert.True(t, reloadedShardStatus.ReportedBy.Contains(leaderNodeID))
+	assert.True(t, reloadedShardStatus.ReportedBy.Contains(followerNodeID))
+
+	leaderLocalInfo := childStatus.ShardInfo.DeepCopy()
+	leaderLocalInfo.HasSnapshot = true
+	leaderLocalInfo.Initializing = false
+	leaderLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+	followerLocalInfo := childStatus.ShardInfo.DeepCopy()
+	followerLocalInfo.HasSnapshot = true
+	followerLocalInfo.Initializing = false
+	followerLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+
+	writeStoreStatusWithShards(t, db, leaderNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: leaderLocalInfo,
+	})
+	writeStoreStatusWithShards(t, db, followerNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: followerLocalInfo,
+	})
+	leaderStoreStatus, err := ms.tm.GetStoreStatus(context.Background(), leaderNodeID)
+	require.NoError(t, err)
+	require.NotNil(t, leaderStoreStatus.Shards[shardID])
+	assert.Equal(t, leaderNodeID, leaderStoreStatus.Shards[shardID].RaftStatus.Lead)
+	assert.True(t, leaderStoreStatus.Shards[shardID].CanInitiateSplitCutover())
+	followerStoreStatus, err := ms.tm.GetStoreStatus(context.Background(), followerNodeID)
+	require.NoError(t, err)
+	require.NotNil(t, followerStoreStatus.Shards[shardID])
+	assert.Equal(t, leaderNodeID, followerStoreStatus.Shards[shardID].RaftStatus.Lead)
+	leaderClient, leaderReachable, err := ms.tm.GetStoreClient(context.Background(), leaderNodeID)
+	require.NoError(t, err)
+	require.True(t, leaderReachable)
+	require.NotNil(t, leaderClient)
+	assert.Equal(t, leaderNodeID, leaderClient.ID())
+	liveLeaderClient, err := ms.selfReportedLeaderClientForShard(context.Background(), shardID, splitChildIsFullyCutOver)
+	require.NoError(t, err)
+	require.NotNil(t, liveLeaderClient)
+	assert.Equal(t, leaderNodeID, liveLeaderClient.ID())
+
+	_, gotClient, err := ms.directLeaderClientForShardBypassesSplitFallback(context.Background(), shardID)
+	require.NoError(t, err)
+	require.NotNil(t, gotClient)
+	assert.Equal(t, leaderNodeID, gotClient.ID())
+}
+
+func TestLeaderClientForShardNoFallback_SplitChildUsesLiveLeaderOnceCaughtUp(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	shardID := types.ID(101)
+	leaderNodeID := types.ID(1)
+	followerNodeID := types.ID(2)
+
+	leaderRPC := &stubStoreRPC{id: leaderNodeID}
+	followerRPC := &stubStoreRPC{id: followerNodeID}
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case leaderNodeID:
+			return leaderRPC
+		case followerNodeID:
+			return followerRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+
+	childStatus := splitShardStatus(
+		shardID,
+		store.ShardState_SplitOffPreSnap,
+		[2][]byte{[]byte("m:\x00"), {0xff}},
+		true,
+		false,
+		followerNodeID, // stale merged leader
+	)
+	childStatus.SplitReplayRequired = true
+	childStatus.SplitReplayCaughtUp = true
+	childStatus.SplitCutoverReady = false
+	childStatus.Peers = common.NewPeerSet(leaderNodeID, followerNodeID)
+	childStatus.ReportedBy = common.NewPeerSet(leaderNodeID, followerNodeID)
+	writeShardStatus(t, db, childStatus)
+
+	leaderLocalInfo := childStatus.ShardInfo.DeepCopy()
+	leaderLocalInfo.HasSnapshot = true
+	leaderLocalInfo.Initializing = false
+	leaderLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+	followerLocalInfo := childStatus.ShardInfo.DeepCopy()
+	followerLocalInfo.HasSnapshot = true
+	followerLocalInfo.Initializing = false
+	followerLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+
+	writeStoreStatusWithShards(t, db, leaderNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: leaderLocalInfo,
+	})
+	writeStoreStatusWithShards(t, db, followerNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: followerLocalInfo,
+	})
+
+	_, gotClient, err := ms.leaderClientForShardNoFallback(context.Background(), shardID)
+	require.NoError(t, err)
+	require.NotNil(t, gotClient)
+	assert.Equal(t, leaderNodeID, gotClient.ID())
 }
 
 func TestResolveWriteShardID_FinalizingParentRoutesToChild(t *testing.T) {
