@@ -28,6 +28,7 @@ import (
 	"github.com/ajroetker/go-highway/hwy/contrib/vec"
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/vector"
+	"github.com/antflydb/antfly/lib/vector/quantize"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -398,34 +399,15 @@ func TestHBCIndex_CosineInternalSplitKeepsCentroidsUnitNormalized(t *testing.T) 
 	assert.Greater(t, stats["total_nodes"].(uint64), uint64(1))
 }
 
-func TestHBCIndex_CosineQuantization1536DDoesNotPanicDuringInsert(t *testing.T) {
-	const (
-		numVectors = 256
-		dims       = 1536
-	)
-
-	r := rand.New(rand.NewPCG(42, 1024))
-	vectors := make([]vector.T, numVectors)
-	ids := make([]uint64, numVectors)
-	metadata := make([][]byte, numVectors)
-	for i := range vectors {
-		ids[i] = uint64(i + 1)
-		metadata[i] = []byte(fmt.Sprintf("doc:%d", i+1))
-		vectors[i] = make(vector.T, dims)
-		for j := range vectors[i] {
-			vectors[i][j] = r.Float32()*2 - 1
-		}
-		vec.NormalizeFloat32(vectors[i])
-	}
-
-	db := setupPebbleWithVectors(t, "test_hbc_cosine_quant_1536", &Batch{IDs: ids, Vectors: vectors, MetadataList: metadata})
+func TestHBCIndex_WriterCacheCloneOwnsQuantizedCentroid(t *testing.T) {
+	db := setupPebbleWithVectors(t, "test_hbc_cached_quantized_centroid_clone", &Batch{})
 
 	config := HBCConfig{
-		Dimension:       dims,
-		Name:            "test_hbc_cosine_quant_1536",
-		BranchingFactor: 4,
-		LeafSize:        8,
-		SearchWidth:     16,
+		Dimension:       3,
+		Name:            "test_hbc_cached_quantized_centroid_clone",
+		BranchingFactor: 2,
+		LeafSize:        2,
+		SearchWidth:     4,
 		CacheSizeNodes:  100,
 		CacheTTL:        5 * time.Minute,
 		DistanceMetric:  vector.DistanceMetric_Cosine,
@@ -439,17 +421,64 @@ func TestHBCIndex_CosineQuantization1536DDoesNotPanicDuringInsert(t *testing.T) 
 	require.NoError(t, err)
 	defer index.Close()
 
-	for start := 0; start < numVectors; start += 32 {
-		end := min(start+32, numVectors)
-		batch := &Batch{IDs: ids[start:end], Vectors: vectors[start:end], MetadataList: metadata[start:end]}
-		require.NotPanics(t, func() {
-			require.NoError(t, index.Batch(t.Context(), batch))
-		}, "batch %d:%d should not panic", start, end)
-	}
+	expectedCentroid := vector.T{0.70710677, 0.70710677, 0}
+	dataVectors := vector.MakeSetFromRawData([]float32{
+		1, 0, 0,
+		0, 1, 0,
+	}, 3)
+	query := vector.T{1, 0, 0}
 
-	assert.EqualValues(t, numVectors, index.TotalVectors())
-	stats := index.Stats()
-	assert.Greater(t, stats["total_nodes"].(uint64), uint64(1))
+	node := &HBCNode{
+		ID:       99,
+		IsLeaf:   true,
+		Centroid: slices.Clone(expectedCentroid),
+		Members:  []uint64{101, 102},
+		Parent:   1,
+		Level:    1,
+	}
+	node.QuantizedVectors = index.quantizer.NewSet(int(dataVectors.GetCount()), node.Centroid)
+	index.quantizer.QuantizeWithSet(index.writerAllocator, node.QuantizedVectors, dataVectors)
+
+	sourceQuantized := node.QuantizedVectors.(*quantize.RaBitQuantizedVectorSet)
+	require.Same(t, &node.Centroid[0], &sourceQuantized.GetCentroid()[0])
+
+	baselineDistances := make([]float32, len(node.Members))
+	baselineErrorBounds := make([]float32, len(node.Members))
+	index.quantizer.EstimateDistances(
+		index.writerAllocator,
+		node.QuantizedVectors,
+		query,
+		baselineDistances,
+		baselineErrorBounds,
+	)
+
+	index.writerCache.Set(node)
+	require.NoError(t, index.writerCache.Commit())
+
+	nodeID := node.ID
+	node.reset()
+
+	cached, err := index.loadNode(index.indexDB, index.readerCache, nodeID)
+	require.NoError(t, err)
+	require.NotNil(t, cached.QuantizedVectors)
+
+	cachedQuantized := cached.QuantizedVectors.(*quantize.RaBitQuantizedVectorSet)
+	require.EqualValues(t, expectedCentroid, cached.Centroid)
+	require.EqualValues(t, expectedCentroid, cachedQuantized.GetCentroid())
+	require.NotSame(t, &node.Centroid[0], &cachedQuantized.GetCentroid()[0])
+
+	cachedDistances := make([]float32, len(cached.Members))
+	cachedErrorBounds := make([]float32, len(cached.Members))
+	index.quantizer.EstimateDistances(
+		index.writerAllocator,
+		cached.QuantizedVectors,
+		query,
+		cachedDistances,
+		cachedErrorBounds,
+	)
+
+	assert.InDeltaSlice(t, toFloat64s(baselineDistances), toFloat64s(cachedDistances), 1e-6)
+	assert.InDeltaSlice(t, toFloat64s(baselineErrorBounds), toFloat64s(cachedErrorBounds), 1e-6)
 }
 
 func TestHBCIndex_SearchReturnsKAcrossLeaves(t *testing.T) {
