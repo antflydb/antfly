@@ -111,6 +111,9 @@ func TestRaBitQuantizedVectorSet(t *testing.T) {
 
 	// Check that clone is unaffected.
 	require.Equal(t, []float32{1, 2, 3}, cloned.GetCentroid())
+	quantizedSet.GetCentroid()[0] = 99
+	require.Equal(t, []float32{1, 2, 3}, cloned.GetCentroid(), "clone should own its centroid storage")
+
 	require.Equal(
 		t,
 		RaBitQCodeSet_builder{Count: 1, Width: 3, Data: []uint64{10, 20, 30}}.Build(),

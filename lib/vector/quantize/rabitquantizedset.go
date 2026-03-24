@@ -159,7 +159,7 @@ func (vs *RaBitQuantizedVectorSet) Clone() QuantizedVectorSet {
 	codes := vs.GetCodes().Clone()
 	return RaBitQuantizedVectorSet_builder{
 		Metric:               vs.GetMetric(),
-		Centroid:             vs.GetCentroid(), // Centroid is immutable
+		Centroid:             slices.Clone(vs.GetCentroid()),
 		Codes:                codes,
 		CodeCounts:           slices.Clone(vs.GetCodeCounts()),
 		CentroidDistances:    slices.Clone(vs.GetCentroidDistances()),

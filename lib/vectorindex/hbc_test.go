@@ -398,6 +398,60 @@ func TestHBCIndex_CosineInternalSplitKeepsCentroidsUnitNormalized(t *testing.T) 
 	assert.Greater(t, stats["total_nodes"].(uint64), uint64(1))
 }
 
+func TestHBCIndex_CosineQuantization1536DDoesNotPanicDuringInsert(t *testing.T) {
+	const (
+		numVectors = 256
+		dims       = 1536
+	)
+
+	r := rand.New(rand.NewPCG(42, 1024))
+	vectors := make([]vector.T, numVectors)
+	ids := make([]uint64, numVectors)
+	metadata := make([][]byte, numVectors)
+	for i := range vectors {
+		ids[i] = uint64(i + 1)
+		metadata[i] = []byte(fmt.Sprintf("doc:%d", i+1))
+		vectors[i] = make(vector.T, dims)
+		for j := range vectors[i] {
+			vectors[i][j] = r.Float32()*2 - 1
+		}
+		vec.NormalizeFloat32(vectors[i])
+	}
+
+	db := setupPebbleWithVectors(t, "test_hbc_cosine_quant_1536", &Batch{IDs: ids, Vectors: vectors, MetadataList: metadata})
+
+	config := HBCConfig{
+		Dimension:       dims,
+		Name:            "test_hbc_cosine_quant_1536",
+		BranchingFactor: 4,
+		LeafSize:        8,
+		SearchWidth:     16,
+		CacheSizeNodes:  100,
+		CacheTTL:        5 * time.Minute,
+		DistanceMetric:  vector.DistanceMetric_Cosine,
+		UseQuantization: true,
+		QuantizerSeed:   42,
+		VectorDB:        db,
+		IndexDB:         db,
+	}
+
+	index, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	for start := 0; start < numVectors; start += 32 {
+		end := min(start+32, numVectors)
+		batch := &Batch{IDs: ids[start:end], Vectors: vectors[start:end], MetadataList: metadata[start:end]}
+		require.NotPanics(t, func() {
+			require.NoError(t, index.Batch(t.Context(), batch))
+		}, "batch %d:%d should not panic", start, end)
+	}
+
+	assert.EqualValues(t, numVectors, index.TotalVectors())
+	stats := index.Stats()
+	assert.Greater(t, stats["total_nodes"].(uint64), uint64(1))
+}
+
 func TestHBCIndex_SearchReturnsKAcrossLeaves(t *testing.T) {
 	vectors := []vector.T{
 		{1.0, 0.0},
