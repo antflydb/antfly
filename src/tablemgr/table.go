@@ -430,7 +430,6 @@ func (tm *TableManager) needsUpdates(
 					needsPersist = true
 				}
 			}
-		} else {
 		}
 	case store.ShardState_Splitting:
 		if !newShardInfo.Splitting {

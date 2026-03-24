@@ -112,6 +112,7 @@ type BleveIndexV2 struct {
 	walBuf   *inflight.WALBuffer
 
 	enqueueChan chan int
+	flushTime   time.Duration
 
 	zstdWriter *zstd.Encoder
 	zstdReader *zstd.Decoder
@@ -308,6 +309,7 @@ func NewBleveIndexV2(
 		rebuildState: NewRebuildState(indexPath),
 
 		conf:       c,
+		flushTime:  DefaultFlushTime,
 		pauseAckCh: make(chan struct{}, 1), // Buffered to prevent blocking plexer
 	}
 	bi.pauseCond = sync.NewCond(&bi.pauseMu)
@@ -460,7 +462,7 @@ func (bi *BleveIndexV2) Open(
 		}
 		const maxJitter = time.Millisecond * 200
 		jitter := maxJitter - rand.N(maxJitter) //nolint:gosec // G404: non-security randomness for ML/jitter
-		t := time.NewTimer(DefaultFlushTime + jitter)
+		t := time.NewTimer(bi.flushTime + jitter)
 		enqueueCounter := 0
 		dequeue := func() error {
 			enqueueCounter = 0
@@ -479,7 +481,7 @@ func (bi *BleveIndexV2) Open(
 				bi.logger.Error("Failed to dequeue from WAL buffer", zap.Error(err))
 			}
 			if len(ops.Writes) == 0 && len(ops.Deletes) == 0 {
-				t.Reset(DefaultFlushTime + jitter)
+				t.Reset(bi.flushTime + jitter)
 			} else {
 				t.Reset(100*time.Millisecond + jitter)
 			}

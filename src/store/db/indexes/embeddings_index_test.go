@@ -223,6 +223,7 @@ func TestEmbeddingIndex_Batch(t *testing.T) {
 	byteRange := types.Range{nil, nil}
 	err = ei.Open(true, schema, byteRange)
 	require.NoError(t, err)
+	defer ei.Close()
 
 	// Store test documents with string content field for prompt extraction
 	testDocs := []struct {

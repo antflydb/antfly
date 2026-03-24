@@ -427,7 +427,8 @@ func (g *GraphIndexV0) Open(rebuild bool, schema *schema.TableSchema, byteRange 
 }
 
 // backfillReverseIndex scans outgoing edges and rebuilds the reverse index
-func (g *GraphIndexV0) backfillReverseIndex(startKey []byte) error {
+func (g *GraphIndexV0) backfillReverseIndex(startKey []byte) (err error) {
+	defer pebbleutils.RecoverPebbleClosed(&err)
 	defer close(g.backfillDone)
 	g.startBackfill()
 	defer g.finishBackfill()

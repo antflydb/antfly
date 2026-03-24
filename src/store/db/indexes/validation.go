@@ -98,17 +98,31 @@ func (c *EmbeddingsIndexConfig) Validate() error {
 	if c == nil {
 		return fmt.Errorf("embeddings index config cannot be nil")
 	}
+	if c.IsExternal() {
+		if c.HasPromptSource() {
+			return fmt.Errorf("external embeddings index config cannot specify field or template")
+		}
+		if c.Embedder != nil {
+			return fmt.Errorf("external embeddings index config cannot specify embedder")
+		}
+		if c.Summarizer != nil {
+			return fmt.Errorf("external embeddings index config cannot specify summarizer")
+		}
+		if c.Chunker != nil {
+			return fmt.Errorf("external embeddings index config cannot specify chunker")
+		}
+		return nil
+	}
 	if c.Sparse {
-		// Sparse embeddings need field or template
-		if c.Field == "" && c.Template == "" {
+		if !c.HasPromptSource() {
 			return fmt.Errorf("sparse embeddings index config must specify either field or template")
 		}
-	} else {
-		// Dense embeddings need field or template
-		// Dimension can be 0 here — it will be auto-detected later by the API via embedder probe
-		if c.Field == "" && c.Template == "" {
-			return fmt.Errorf("dense embeddings index config must specify either field or template")
-		}
+		return nil
+	}
+	// Dense embeddings need field or template.
+	// Dimension can be 0 here — it will be auto-detected later by the API via embedder probe.
+	if !c.HasPromptSource() {
+		return fmt.Errorf("dense embeddings index config must specify either field or template")
 	}
 	return nil
 }

@@ -142,7 +142,18 @@ func TestNewSparseIndex(t *testing.T) {
 			name:    "missing field and template",
 			config:  EmbeddingsIndexConfig{},
 			wantErr: true,
-			errMsg:  "field or template must be specified",
+			errMsg:  "must specify either field or template",
+		},
+		{
+			name:    "external config without prompt source",
+			config:  EmbeddingsIndexConfig{Sparse: true, External: true},
+			wantErr: false,
+		},
+		{
+			name:    "external config rejects field",
+			config:  EmbeddingsIndexConfig{Sparse: true, External: true, Field: "content"},
+			wantErr: true,
+			errMsg:  "cannot specify field or template",
 		},
 	}
 

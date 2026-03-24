@@ -318,7 +318,7 @@ type DB interface {
 	LeaderFactory(ctx context.Context, persistEmbeddings PersistFunc) error
 
 	// Enrichment operations
-	ExtractEnrichments(ctx context.Context, writes [][2][]byte) (embeddingWrites, summaryWrites, edgeWrites [][2][]byte, edgeDeletes [][]byte, err error)
+	ExtractEnrichments(ctx context.Context, writes [][2][]byte) (embeddingWrites, summaryWrites, edgeWrites [][2][]byte, indexDeletes [][]byte, err error)
 	ComputeEnrichments(ctx context.Context, writes [][2][]byte) (enrichmentWrites [][2][]byte, failedKeys [][]byte, err error)
 
 	// Transaction operations
@@ -352,7 +352,7 @@ type DBImpl struct {
 	pdb          *pebble.DB
 	pdbMu        sync.RWMutex // Protects pdb during close/reopen cycles (e.g., during splits)
 
-	indexManager *IndexManager
+	indexManager atomic.Pointer[IndexManager]
 
 	// Shadow IndexManager for split-off range during shard splits.
 	// Created in PHASE_PREPARE, receives dual-writes during split,
@@ -364,13 +364,13 @@ type DBImpl struct {
 	indexesMu sync.RWMutex
 	indexes   map[string]indexes.IndexConfig
 
-	byteRange          types.Range
+	byteRange          atomic.Pointer[types.Range]
 	splitState         *SplitState // Raft-replicated split state (replaces local pendingSplitKey)
-	splitDeltaSeq      uint64
-	splitDeltaFinalSeq uint64
+	splitDeltaSeq      atomic.Uint64
+	splitDeltaFinalSeq atomic.Uint64
 	mergeState         *MergeState
-	mergeDeltaSeq      uint64
-	mergeDeltaFinalSeq uint64
+	mergeDeltaSeq      atomic.Uint64
+	mergeDeltaFinalSeq atomic.Uint64
 	schema             *schema.TableSchema
 	cachedTTLDuration  time.Duration // Parsed from schema.TtlDuration; 0 means no TTL
 
@@ -460,9 +460,61 @@ func (db *DBImpl) getPDB() *pebble.DB {
 	return pdb
 }
 
+// getIndexManager returns the current IndexManager, safe for concurrent access.
+func (db *DBImpl) getIndexManager() *IndexManager {
+	return db.indexManager.Load()
+}
+
+// GetIndex returns the named index from the current IndexManager, or nil.
+func (db *DBImpl) GetIndex(name string) Index {
+	if im := db.getIndexManager(); im != nil {
+		return im.GetIndex(name)
+	}
+	return nil
+}
+
+// BatchIndex forwards a batch of writes/deletes to the current IndexManager.
+func (db *DBImpl) BatchIndex(ctx context.Context, writes [][2][]byte, deletes [][]byte, syncLevel Op_SyncLevel) error {
+	im := db.getIndexManager()
+	if im == nil {
+		return fmt.Errorf("index manager not initialized")
+	}
+	return im.Batch(ctx, writes, deletes, syncLevel)
+}
+
+// SearchIndex forwards a search request to the named index via the current IndexManager.
+func (db *DBImpl) SearchIndex(ctx context.Context, name string, request any) (any, error) {
+	im := db.getIndexManager()
+	if im == nil {
+		return nil, fmt.Errorf("index manager not initialized")
+	}
+	return im.Search(ctx, name, request)
+}
+
+// HasIndex returns true if the named index is registered in the current IndexManager.
+func (db *DBImpl) HasIndex(name string) bool {
+	if im := db.getIndexManager(); im != nil {
+		return im.HasIndex(name)
+	}
+	return false
+}
+
+// getByteRange returns the current byte range, safe for concurrent access.
+func (db *DBImpl) getByteRange() types.Range {
+	if p := db.byteRange.Load(); p != nil {
+		return *p
+	}
+	return types.Range{}
+}
+
+// setByteRange atomically updates the byte range.
+func (db *DBImpl) setByteRange(r types.Range) {
+	db.byteRange.Store(&r)
+}
+
 func (db *DBImpl) AddIndex(config indexes.IndexConfig) error {
 	db.logger.Debug("Adding index", zap.Any("indexConfig", config))
-	if err := db.indexManager.Register(config.Name, true, config); err != nil {
+	if err := db.getIndexManager().Register(config.Name, true, config); err != nil {
 		return fmt.Errorf("registering index %s: %w", config.Name, err)
 	}
 	// Save updated indexes to Pebble
@@ -476,15 +528,11 @@ func (db *DBImpl) AddIndex(config indexes.IndexConfig) error {
 	return nil
 }
 
-func (db *DBImpl) HasIndex(name string) bool {
-	return db.indexManager.HasIndex(name)
-}
-
 func (db *DBImpl) DeleteIndex(name string) error {
 	db.indexesMu.Lock()
 	savedConfig, hadConfig := db.indexes[name]
 	delete(db.indexes, name)
-	if err := db.indexManager.Unregister(name); err != nil {
+	if err := db.getIndexManager().Unregister(name); err != nil {
 		if hadConfig {
 			db.indexes[name] = savedConfig
 		}
@@ -534,7 +582,7 @@ func (db *DBImpl) UpdateSchema(schema *schema.TableSchema) error {
 		return fmt.Errorf("saving schema to pebble: %w", err)
 	}
 	db.updateCachedTTL()
-	if err := db.indexManager.UpdateSchema(schema); err != nil {
+	if err := db.getIndexManager().UpdateSchema(schema); err != nil {
 		return fmt.Errorf("updating schema in index manager: %w", err)
 	}
 	return nil
@@ -545,7 +593,7 @@ func (db *DBImpl) SetRange(byteRange types.Range) error {
 	if pdb == nil {
 		return pebble.ErrClosed
 	}
-	// Marshal the NEW byteRange parameter, not the old db.byteRange
+	// Marshal the NEW byteRange parameter, not the old db.getByteRange()
 	data, err := json.Marshal(byteRange)
 	if err != nil {
 		return fmt.Errorf("marshaling byte range: %w", err)
@@ -553,8 +601,8 @@ func (db *DBImpl) SetRange(byteRange types.Range) error {
 	if err := pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving byte range: %w", err)
 	}
-	db.byteRange = byteRange
-	if err := db.indexManager.UpdateRange(byteRange); err != nil {
+	db.setByteRange(byteRange)
+	if err := db.getIndexManager().UpdateRange(byteRange); err != nil {
 		return fmt.Errorf("updating range in index manager: %w", err)
 	}
 	return nil
@@ -581,7 +629,7 @@ func (db *DBImpl) UpdateRange(byteRange types.Range) error {
 	if err := batch.DeleteRange(rangeEnd, types.RangeEndSentinel, nil); err != nil {
 		return fmt.Errorf("deleting range > %s: %w", byteRange, err)
 	}
-	// Important: marshal the new byteRange parameter, not the old db.byteRange
+	// Important: marshal the new byteRange parameter, not the old db.getByteRange()
 	data, err := json.Marshal(byteRange)
 	if err != nil {
 		return fmt.Errorf("marshaling byte range: %w", err)
@@ -589,7 +637,7 @@ func (db *DBImpl) UpdateRange(byteRange types.Range) error {
 	if err := pdb.Set(byteRangeKey, data, pebble.Sync); err != nil {
 		return fmt.Errorf("saving byte range: %w", err)
 	}
-	db.byteRange = byteRange
+	db.setByteRange(byteRange)
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("committing range update: %w", err)
 	}
@@ -601,14 +649,14 @@ func (db *DBImpl) UpdateRange(byteRange types.Range) error {
 		db.logger.Warn("Error closing db after range update", zap.Error(err))
 	}
 	// Re-open the DB to ensure everything is in a clean state
-	if err := db.Open(db.dir, false, db.schema, db.byteRange); err != nil {
+	if err := db.Open(db.dir, false, db.schema, db.getByteRange()); err != nil {
 		return fmt.Errorf("re-opening db after range update: %w", err)
 	}
 	return nil
 }
 
 func (db *DBImpl) GetRange() (types.Range, error) {
-	return db.byteRange, nil
+	return db.getByteRange(), nil
 }
 
 // GetSplitState returns the current split state, or nil if no split is in progress.
@@ -797,19 +845,19 @@ func decodeStoredUint64(data []byte) (uint64, error) {
 }
 
 func (db *DBImpl) GetSplitDeltaSeq() (uint64, error) {
-	return db.splitDeltaSeq, nil
+	return db.splitDeltaSeq.Load(), nil
 }
 
 func (db *DBImpl) GetSplitDeltaFinalSeq() (uint64, error) {
-	return db.splitDeltaFinalSeq, nil
+	return db.splitDeltaFinalSeq.Load(), nil
 }
 
 func (db *DBImpl) GetMergeDeltaSeq() (uint64, error) {
-	return db.mergeDeltaSeq, nil
+	return db.mergeDeltaSeq.Load(), nil
 }
 
 func (db *DBImpl) GetMergeDeltaFinalSeq() (uint64, error) {
-	return db.mergeDeltaFinalSeq, nil
+	return db.mergeDeltaFinalSeq.Load(), nil
 }
 
 func (db *DBImpl) SetSplitDeltaFinalSeq(seq uint64) error {
@@ -821,7 +869,7 @@ func (db *DBImpl) SetSplitDeltaFinalSeq(seq uint64) error {
 	if err := pdb.Set(splitDeltaFinalSeqKey, encoded, pebble.Sync); err != nil {
 		return fmt.Errorf("saving split delta final seq: %w", err)
 	}
-	db.splitDeltaFinalSeq = seq
+	db.splitDeltaFinalSeq.Store(seq)
 	return nil
 }
 
@@ -833,7 +881,7 @@ func (db *DBImpl) ClearSplitDeltaFinalSeq() error {
 	if err := pdb.Delete(splitDeltaFinalSeqKey, pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
 		return fmt.Errorf("deleting split delta final seq: %w", err)
 	}
-	db.splitDeltaFinalSeq = 0
+	db.splitDeltaFinalSeq.Store(0)
 	return nil
 }
 
@@ -846,7 +894,7 @@ func (db *DBImpl) SetMergeDeltaFinalSeq(seq uint64) error {
 	if err := pdb.Set(mergeDeltaFinalSeqKey, encoded, pebble.Sync); err != nil {
 		return fmt.Errorf("saving merge delta final seq: %w", err)
 	}
-	db.mergeDeltaFinalSeq = seq
+	db.mergeDeltaFinalSeq.Store(seq)
 	return nil
 }
 
@@ -858,7 +906,7 @@ func (db *DBImpl) ClearMergeDeltaFinalSeq() error {
 	if err := pdb.Delete(mergeDeltaFinalSeqKey, pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
 		return fmt.Errorf("deleting merge delta final seq: %w", err)
 	}
-	db.mergeDeltaFinalSeq = 0
+	db.mergeDeltaFinalSeq.Store(0)
 	return nil
 }
 
@@ -911,8 +959,8 @@ func (db *DBImpl) ClearSplitDeltaEntries() error {
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("committing split delta clear: %w", err)
 	}
-	db.splitDeltaSeq = 0
-	db.splitDeltaFinalSeq = 0
+	db.splitDeltaSeq.Store(0)
+	db.splitDeltaFinalSeq.Store(0)
 	return nil
 }
 
@@ -965,8 +1013,8 @@ func (db *DBImpl) ClearMergeDeltaEntries() error {
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("committing merge delta clear: %w", err)
 	}
-	db.mergeDeltaSeq = 0
-	db.mergeDeltaFinalSeq = 0
+	db.mergeDeltaSeq.Store(0)
+	db.mergeDeltaFinalSeq.Store(0)
 	return nil
 }
 
@@ -974,9 +1022,9 @@ func (db *DBImpl) appendSplitDelta(batch *pebble.Batch, writes [][2][]byte, dele
 	if len(writes) == 0 && len(deletes) == 0 {
 		return nil
 	}
-	db.splitDeltaSeq++
+	seq := db.splitDeltaSeq.Add(1)
 	entry := SplitDeltaEntry_builder{
-		Sequence:  db.splitDeltaSeq,
+		Sequence:  seq,
 		Timestamp: timestamp,
 		Writes:    WritesFromTuples(writes),
 		Deletes:   deletes,
@@ -985,10 +1033,10 @@ func (db *DBImpl) appendSplitDelta(batch *pebble.Batch, writes [][2][]byte, dele
 	if err != nil {
 		return fmt.Errorf("marshaling split delta entry: %w", err)
 	}
-	if err := batch.Set(splitDeltaEntryKey(db.splitDeltaSeq), data, nil); err != nil {
+	if err := batch.Set(splitDeltaEntryKey(seq), data, nil); err != nil {
 		return fmt.Errorf("writing split delta entry: %w", err)
 	}
-	encodedSeq := encoding.EncodeUint64Ascending(nil, db.splitDeltaSeq)
+	encodedSeq := encoding.EncodeUint64Ascending(nil, seq)
 	if err := batch.Set(splitDeltaSeqKey, encodedSeq, nil); err != nil {
 		return fmt.Errorf("writing split delta sequence: %w", err)
 	}
@@ -999,9 +1047,9 @@ func (db *DBImpl) appendMergeDelta(batch *pebble.Batch, writes [][2][]byte, dele
 	if len(writes) == 0 && len(deletes) == 0 {
 		return nil
 	}
-	db.mergeDeltaSeq++
+	seq := db.mergeDeltaSeq.Add(1)
 	entry := MergeDeltaEntry_builder{
-		Sequence:  db.mergeDeltaSeq,
+		Sequence:  seq,
 		Timestamp: timestamp,
 		Writes:    WritesFromTuples(writes),
 		Deletes:   deletes,
@@ -1010,10 +1058,10 @@ func (db *DBImpl) appendMergeDelta(batch *pebble.Batch, writes [][2][]byte, dele
 	if err != nil {
 		return fmt.Errorf("marshaling merge delta entry: %w", err)
 	}
-	if err := batch.Set(mergeDeltaEntryKey(db.mergeDeltaSeq), data, nil); err != nil {
+	if err := batch.Set(mergeDeltaEntryKey(seq), data, nil); err != nil {
 		return fmt.Errorf("writing merge delta entry: %w", err)
 	}
-	encodedSeq := encoding.EncodeUint64Ascending(nil, db.mergeDeltaSeq)
+	encodedSeq := encoding.EncodeUint64Ascending(nil, seq)
 	if err := batch.Set(mergeDeltaSeqKey, encodedSeq, nil); err != nil {
 		return fmt.Errorf("writing merge delta sequence: %w", err)
 	}
@@ -1038,7 +1086,7 @@ func (db *DBImpl) CreateShadowIndexManager(splitKey, originalRangeEnd []byte) er
 	shadowRange := types.Range{splitKey, originalRangeEnd}
 
 	// Create shadow using the parent's CreateShadow method
-	shadow, err := db.indexManager.CreateShadow(shadowDir, shadowRange)
+	shadow, err := db.getIndexManager().CreateShadow(shadowDir, shadowRange)
 	if err != nil {
 		return fmt.Errorf("creating shadow IndexManager: %w", err)
 	}
@@ -1149,7 +1197,7 @@ func (db *DBImpl) LeaderFactory(
 	}()
 
 	for {
-		if err := db.indexManager.StartLeaderFactory(ctx, persistFunc); err != nil &&
+		if err := db.getIndexManager().StartLeaderFactory(ctx, persistFunc); err != nil &&
 			!errors.Is(err, context.Canceled) {
 			db.logger.Error("Failed to start index manager leader factory", zap.Error(err))
 		}
@@ -1448,7 +1496,7 @@ func (db *DBImpl) openInternal(
 	}
 	// Use provided byteRange if available, otherwise keep what was loaded
 	if len(byteRange[0]) != 0 || len(byteRange[1]) != 0 {
-		db.byteRange = byteRange
+		db.setByteRange(byteRange)
 	}
 
 	// Always load splitState from Pebble - it's Raft-replicated state that
@@ -1470,7 +1518,7 @@ func (db *DBImpl) openInternal(
 		"Completed opening local keyvalue store",
 		zap.Any("indexes", db.indexes),
 		zap.Any("schema", db.schema),
-		zap.Stringer("byteRange", db.byteRange),
+		zap.Stringer("byteRange", db.getByteRange()),
 	)
 	return nil
 }
@@ -1486,8 +1534,8 @@ func (db *DBImpl) Open(
 
 func (s *DBImpl) Close() (err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
-	if s.indexManager != nil {
-		if err := s.indexManager.Close(context.Background()); err != nil {
+	if im := s.getIndexManager(); im != nil {
+		if err := im.Close(context.Background()); err != nil {
 			return fmt.Errorf("closing indexes: %w", err)
 		}
 	}
@@ -1770,7 +1818,7 @@ func (db *DBImpl) trimToRangeWithoutIndexes(byteRange types.Range) error {
 		return fmt.Errorf("committing split staging range trim: %w", err)
 	}
 
-	db.byteRange = byteRange
+	db.setByteRange(byteRange)
 	return nil
 }
 
@@ -1857,7 +1905,7 @@ func indexDeleteKeyForStoredKey(key []byte) ([]byte, bool) {
 }
 
 func (db *DBImpl) pruneIndexesForRange(ctx context.Context, byteRange types.Range) error {
-	if db.indexManager == nil {
+	if db.getIndexManager() == nil {
 		return nil
 	}
 
@@ -1892,7 +1940,7 @@ func (db *DBImpl) pruneIndexesForRange(ctx context.Context, byteRange types.Rang
 		if len(groupedDeletes.all) == 0 {
 			return nil
 		}
-		if err := db.indexManager.deleteGroupedKeys(ctx, groupedDeletes); err != nil {
+		if err := db.getIndexManager().deleteGroupedKeys(ctx, groupedDeletes); err != nil {
 			return err
 		}
 		pruned += len(groupedDeletes.all)
@@ -1969,7 +2017,7 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 		return pebble.ErrClosed
 	}
 
-	splitOffRange, hasSplitOffRange, err := splitOffRangeForNewRange(db.byteRange, newRange, db.splitState)
+	splitOffRange, hasSplitOffRange, err := splitOffRangeForNewRange(db.getByteRange(), newRange, db.splitState)
 	if err != nil {
 		return fmt.Errorf("computing split-off range: %w", err)
 	}
@@ -2006,7 +2054,7 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 	if err := batch.DeleteRange(newRange[1], types.RangeEndSentinel, nil); err != nil {
 		return fmt.Errorf("deleting range > %s: %w", newRange, err)
 	}
-	// Important: marshal newRange (the new range), not the old db.byteRange
+	// Important: marshal newRange (the new range), not the old db.getByteRange()
 	data, err := json.Marshal(newRange)
 	if err != nil {
 		return fmt.Errorf("marshaling byte range: %w", err)
@@ -2019,7 +2067,7 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 			return fmt.Errorf("invalidating dense embeddings indexes for split rebuild: %w", err)
 		}
 	}
-	db.byteRange = newRange
+	db.setByteRange(newRange)
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("committing range update: %w", err)
 	}
@@ -2059,115 +2107,25 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 	}
 
 	// Re-open the DB to ensure everything is in a clean state
-	if err := db.Open(db.dir, true, db.schema, db.byteRange); err != nil {
+	if err := db.Open(db.dir, true, db.schema, db.getByteRange()); err != nil {
 		return fmt.Errorf("re-opening db after range update: %w", err)
 	}
 	if len(rebuildIndexDirs) > 0 {
-		db.indexManager.WaitForNamedBackfills(context.Background(), rebuildIndexDirs)
+		db.getIndexManager().WaitForNamedBackfills(context.Background(), rebuildIndexDirs)
 	}
 
 	return nil
 }
 
-// streamRangeToPebble streams all key-value pairs in the given range from the source
-// Pebble DB to the destination Pebble DB. Returns the count of records streamed.
-func (db *DBImpl) streamRangeToDB(
-	ctx context.Context,
-	destDB *DBImpl,
-	byteRange [2][]byte,
-) (count int, err error) {
-	defer pebbleutils.RecoverPebbleClosed(&err)
-
-	// Guard against nil pdb: the shard may be shutting down concurrently
-	// (Close sets pdb=nil) while the Raft commit loop is still applying entries.
-	pdb := db.getPDB()
-	if pdb == nil {
-		return 0, fmt.Errorf("source database closed during split streaming")
-	}
-
-	// Convert empty End to nil for Pebble - empty byte slice sorts BEFORE all keys,
-	// but nil means unbounded (iterate to the end). This is critical for unbounded ranges.
-	upperBound := byteRange[1]
-	if len(upperBound) == 0 {
-		upperBound = nil
-	}
-	iterOpts := &pebble.IterOptions{
-		LowerBound: byteRange[0],
-		UpperBound: upperBound,
-	}
-
-	// Flush memtable to ensure all data is visible to the iterator
-	if err := pdb.Flush(); err != nil {
-		return 0, fmt.Errorf("flushing memtable before streaming: %w", err)
-	}
-
-	iter, err := pdb.NewIterWithContext(ctx, iterOpts)
-	if err != nil {
-		return 0, fmt.Errorf("creating iterator: %w", err)
-	}
-	defer func() {
-		_ = iter.Close()
-	}()
-
-	const batchSize = 1000
-	destPDB := destDB.getPDB()
-	if destPDB == nil {
-		return 0, fmt.Errorf("destination database closed during split streaming")
-	}
-	batch := destPDB.NewBatch()
-	defer func() {
-		_ = batch.Close()
-	}()
-
-	count = 0
-	for iter.First(); iter.Valid(); iter.Next() {
-		// Clone key and value since Pebble reuses buffers
-		key := slices.Clone(iter.Key())
-		value := slices.Clone(iter.Value())
-
-		// Write directly to Pebble, bypassing the Batch() method's range checks
-		if err := batch.Set(key, value, nil); err != nil {
-			return count, fmt.Errorf("setting key in batch: %w", err)
-		}
-		count++
-
-		if count%batchSize == 0 {
-			if err := batch.Commit(pebble.Sync); err != nil {
-				return count, fmt.Errorf("committing batch: %w", err)
-			}
-			batch.Reset()
-
-			// Log progress periodically
-			if count%10000 == 0 {
-				db.logger.Debug("Streaming progress",
-					zap.Int("recordsStreamed", count))
-			}
-		}
-	}
-
-	if err := iter.Error(); err != nil {
-		return count, fmt.Errorf("iterator error: %w", err)
-	}
-
-	// Commit remaining records
-	if count%batchSize != 0 {
-		if err := batch.Commit(pebble.Sync); err != nil {
-			return count, fmt.Errorf("committing final batch: %w", err)
-		}
-	}
-
-	return count, nil
-}
-
 // SetIndexManager replaces the current IndexManager, closing the old one first if it exists
 func (db *DBImpl) SetIndexManager(im *IndexManager) error {
-	if db.indexManager != nil {
-		if err := db.indexManager.Close(context.Background()); err != nil {
+	if old := db.getIndexManager(); old != nil {
+		if err := old.Close(context.Background()); err != nil {
 			db.logger.Warn("failed to close previous index manager", zap.Error(err))
 			return err
 		}
 	}
-	db.indexManager = im
+	db.indexManager.Store(im)
 	return nil
 }
 
@@ -2183,7 +2141,7 @@ func (db *DBImpl) openIndex(dir string, recoverIndex bool) error {
 		pdb,
 		filepath.Join(dir, "indexes"),
 		db.schema,
-		db.byteRange,
+		db.getByteRange(),
 		db.cache,
 	)
 	if err != nil {
@@ -2195,12 +2153,12 @@ func (db *DBImpl) openIndex(dir string, recoverIndex bool) error {
 	}
 	for idx, conf := range db.indexes {
 		db.logger.Debug("Opening index", zap.String("index", idx), zap.Any("index_config", conf))
-		if err := db.indexManager.Register(idx, !recoverIndex, conf); err != nil {
+		if err := db.getIndexManager().Register(idx, !recoverIndex, conf); err != nil {
 			return fmt.Errorf("registering preconfigured index: %w", err)
 		}
 	}
 
-	if err := db.indexManager.Start(!recoverIndex); err != nil {
+	if err := db.getIndexManager().Start(!recoverIndex); err != nil {
 		return fmt.Errorf("opening indexes: %w", err)
 	}
 	db.indexesMu.Lock()
@@ -2280,11 +2238,16 @@ func (db *DBImpl) FindMedianKey() ([]byte, error) {
 	skipMetadataKey := func(key []byte) bool {
 		return bytes.HasPrefix(key, storeutils.MetadataPrefix)
 	}
-	pdb := db.getPDB()
+	// Hold read lock for the entire operation to prevent Close() from closing the
+	// underlying pebble.DB while FindSplitKeyByFileSize is iterating.
+	db.pdbMu.RLock()
+	pdb := db.pdb
 	if pdb == nil {
+		db.pdbMu.RUnlock()
 		return nil, pebble.ErrClosed
 	}
-	key, err := common.FindSplitKeyByFileSize(db.logger, pdb, db.byteRange, skipMetadataKey)
+	key, err := common.FindSplitKeyByFileSize(db.logger, pdb, db.getByteRange(), skipMetadataKey)
+	db.pdbMu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
@@ -2303,11 +2266,11 @@ func (db *DBImpl) FindMedianKey() ([]byte, error) {
 	// Revalidate after suffix normalization: the transformation above can push
 	// the key onto the range boundary. For example, a raw key "doc-029:t" normalized
 	// to "doc-029:\x00" may equal the range end, producing an invalid split key.
-	if bytes.Compare(key, db.byteRange[0]) <= 0 {
-		return nil, fmt.Errorf("normalized split key %x is not greater than range start %x", key, db.byteRange[0])
+	if bytes.Compare(key, db.getByteRange()[0]) <= 0 {
+		return nil, fmt.Errorf("normalized split key %x is not greater than range start %x", key, db.getByteRange()[0])
 	}
-	if len(db.byteRange[1]) > 0 && bytes.Compare(key, db.byteRange[1]) >= 0 {
-		return nil, fmt.Errorf("normalized split key %x equals or exceeds range end %x", key, db.byteRange[1])
+	if len(db.getByteRange()[1]) > 0 && bytes.Compare(key, db.getByteRange()[1]) >= 0 {
+		return nil, fmt.Errorf("normalized split key %x equals or exceeds range end %x", key, db.getByteRange()[1])
 	}
 	return key, nil
 }
@@ -2318,11 +2281,11 @@ func (db *DBImpl) FindMedianKey() ([]byte, error) {
 func (db *DBImpl) ExtractEnrichments(
 	ctx context.Context,
 	writes [][2][]byte,
-) (embeddingWrites, summaryWrites, edgeWrites [][2][]byte, edgeDeletes [][]byte, err error) {
+) (embeddingWrites, summaryWrites, edgeWrites [][2][]byte, indexDeletes [][]byte, err error) {
 	embeddingWrites = make([][2][]byte, 0)
 	summaryWrites = make([][2][]byte, 0)
 	edgeWrites = make([][2][]byte, 0)
-	edgeDeletes = make([][]byte, 0)
+	indexDeletes = make([][]byte, 0)
 
 	for _, write := range writes {
 		key := write[0]
@@ -2343,7 +2306,7 @@ func (db *DBImpl) ExtractEnrichments(
 		}
 
 		// Extract special fields using internal method
-		embWrites, sumWrites, edgWrites, edgDeletes, _, _, err := db.extractSpecialFields(docJSON, key)
+		embWrites, sumWrites, edgWrites, specialDeletes, _, _, err := db.extractSpecialFields(docJSON, key)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("extracting special fields for key %s: %w", key, err)
 		}
@@ -2351,10 +2314,10 @@ func (db *DBImpl) ExtractEnrichments(
 		embeddingWrites = append(embeddingWrites, embWrites...)
 		summaryWrites = append(summaryWrites, sumWrites...)
 		edgeWrites = append(edgeWrites, edgWrites...)
-		edgeDeletes = append(edgeDeletes, edgDeletes...)
+		indexDeletes = append(indexDeletes, specialDeletes...)
 	}
 
-	return embeddingWrites, summaryWrites, edgeWrites, edgeDeletes, nil
+	return embeddingWrites, summaryWrites, edgeWrites, indexDeletes, nil
 }
 
 // ComputeEnrichments generates embeddings/summaries/chunks via enrichers
@@ -2365,17 +2328,17 @@ func (db *DBImpl) ComputeEnrichments(
 	ctx context.Context,
 	writes [][2][]byte,
 ) (enrichmentWrites [][2][]byte, failedKeys [][]byte, err error) {
-	if db.indexManager == nil {
+	if db.getIndexManager() == nil {
 		return nil, nil, nil
 	}
-	return db.indexManager.ComputeEnrichments(ctx, writes)
+	return db.getIndexManager().ComputeEnrichments(ctx, writes)
 }
 
 func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 	embeddingWrites [][2][]byte,
 	summaryWrites [][2][]byte,
 	edgeWrites [][2][]byte,
-	edgeDeletes [][]byte,
+	indexDeletes [][]byte,
 	cleanedJSON []byte,
 	hasNonSpecialFields bool,
 	err error,
@@ -2383,7 +2346,7 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 	embeddingWrites = make([][2][]byte, 0)
 	summaryWrites = make([][2][]byte, 0)
 	edgeWrites = make([][2][]byte, 0)
-	edgeDeletes = make([][]byte, 0)
+	indexDeletes = make([][]byte, 0)
 
 	// Unmarshal document once
 	var doc map[string]any
@@ -2400,9 +2363,20 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 
 		for indexName := range embeddingsObj {
 			// Get index from IndexManager
-			idx := db.indexManager.GetIndex(indexName)
+			idx := db.GetIndex(indexName)
 			if idx == nil {
 				return nil, nil, nil, nil, nil, false, fmt.Errorf("index not found: %s", indexName)
+			}
+
+			db.indexesMu.RLock()
+			indexConfig, exists := db.indexes[indexName]
+			db.indexesMu.RUnlock()
+			if !exists {
+				return nil, nil, nil, nil, nil, false, fmt.Errorf("index config not found: %s", indexName)
+			}
+			embCfg, cfgErr := indexConfig.AsEmbeddingsIndexConfig()
+			if cfgErr != nil {
+				return nil, nil, nil, nil, nil, false, fmt.Errorf("reading embeddings config for index %s: %w", indexName, cfgErr)
 			}
 
 			// Check if index implements EmbeddingsPreProcessor interface
@@ -2417,11 +2391,43 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 				continue
 			}
 
-			// Detect sparse vs dense by value type:
-			// - map[string]any → sparse vector (term_id string keys → float weights)
-			// - []any → dense vector (float array)
-			switch embValue := embValueAny.(type) {
-			case map[string]any:
+			if embValueAny == nil {
+				if !embCfg.IsExternal() {
+					return nil, nil, nil, nil, nil, false, fmt.Errorf(
+						"index %s manages embeddings from field/template; manual _embeddings deletes are not allowed",
+						indexName,
+					)
+				}
+
+				var deleteKey []byte
+				if embCfg.Sparse {
+					deleteKey = storeutils.MakeSparseKey(key, indexName)
+				} else {
+					deleteKey = storeutils.MakeEmbeddingKey(key, indexName)
+				}
+				indexDeletes = append(indexDeletes, deleteKey)
+				db.logger.Debug("Extracted external embedding delete",
+					zap.String("key", types.FormatKey(key)),
+					zap.String("indexName", indexName))
+				continue
+			}
+
+			if !embCfg.IsExternal() {
+				return nil, nil, nil, nil, nil, false, fmt.Errorf(
+					"index %s manages embeddings from field/template; manual _embeddings are not allowed",
+					indexName,
+				)
+			}
+
+			if embCfg.Sparse {
+				embValue, ok := embValueAny.(map[string]any)
+				if !ok {
+					return nil, nil, nil, nil, nil, false, fmt.Errorf(
+						"embedding for sparse index %s must be an object, got %T",
+						indexName, embValueAny,
+					)
+				}
+
 				// Sparse vector path: {"42": 0.8, "1337": 1.2, ...}
 				indices := make([]uint32, 0, len(embValue))
 				values := make([]float32, 0, len(embValue))
@@ -2444,21 +2450,11 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 					values = append(values, float32(weight))
 				}
 
-				// Get hashID from the index's prompt renderer
-				_, hashID, err := embPreProcessor.RenderPrompt(doc)
-				if err != nil {
-					db.logger.Warn("Failed to render prompt for sparse hashID",
-						zap.String("key", types.FormatKey(key)),
-						zap.String("indexName", indexName),
-						zap.Error(err))
-					hashID = 0
-				}
-
-				// Encode sparse vector with hashID prefix
+				// External embeddings are user-owned, so there is no prompt-derived hash.
 				sv := vector.NewSparseVector(indices, values)
 				sparseBytes := indexes.EncodeSparseVec(sv)
 				value := make([]byte, 8+len(sparseBytes))
-				binary.LittleEndian.PutUint64(value[:8], hashID)
+				binary.LittleEndian.PutUint64(value[:8], 0)
 				copy(value[8:], sparseBytes)
 
 				// Build sparse key: key:i:<indexName>:sp
@@ -2468,55 +2464,45 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 				db.logger.Debug("Extracted user-provided sparse embedding",
 					zap.String("key", types.FormatKey(key)),
 					zap.String("indexName", indexName),
-					zap.Int("numTerms", len(indices)),
-					zap.Uint64("hashID", hashID))
+					zap.Int("numTerms", len(indices)))
+				continue
+			}
 
-			case []any:
-				// Dense vector path (existing behavior)
-				expectedDim := embPreProcessor.GetDimension()
-
-				embedding, err := embeddings.ConvertToFloat32Slice(embValue)
-				if err != nil {
-					return nil, nil, nil, nil, nil, false, fmt.Errorf(
-						"converting embedding for index %s: %w",
-						indexName, err,
-					)
-				}
-
-				if len(embedding) != expectedDim {
-					return nil, nil, nil, nil, nil, false, fmt.Errorf(
-						"dimension mismatch for index %s: expected %d, got %d",
-						indexName, expectedDim, len(embedding),
-					)
-				}
-
-				_, hashID, err := embPreProcessor.RenderPrompt(doc)
-				if err != nil {
-					db.logger.Warn("Failed to render prompt for hashID",
-						zap.String("key", types.FormatKey(key)),
-						zap.String("indexName", indexName),
-						zap.Error(err))
-					hashID = 0
-				}
-
-				vecBuf := make([]byte, 0, 8+4*len(embedding)+4)
-				vecBuf, _ = vectorindex.EncodeEmbeddingWithHashID(vecBuf, embedding, hashID)
-
-				embKey := storeutils.MakeEmbeddingKey(key, indexName)
-				embeddingWrites = append(embeddingWrites, [2][]byte{embKey, vecBuf})
-
-				db.logger.Debug("Extracted user-provided embedding",
-					zap.String("key", types.FormatKey(key)),
-					zap.String("indexName", indexName),
-					zap.Int("dimension", len(embedding)),
-					zap.Uint64("hashID", hashID))
-
-			default:
+			embValue, ok := embValueAny.([]any)
+			if !ok {
 				return nil, nil, nil, nil, nil, false, fmt.Errorf(
-					"embedding for index %s must be an array (dense) or object (sparse), got %T",
+					"embedding for dense index %s must be an array, got %T",
 					indexName, embValueAny,
 				)
 			}
+
+			expectedDim := embPreProcessor.GetDimension()
+
+			embedding, err := embeddings.ConvertToFloat32Slice(embValue)
+			if err != nil {
+				return nil, nil, nil, nil, nil, false, fmt.Errorf(
+					"converting embedding for index %s: %w",
+					indexName, err,
+				)
+			}
+
+			if len(embedding) != expectedDim {
+				return nil, nil, nil, nil, nil, false, fmt.Errorf(
+					"dimension mismatch for index %s: expected %d, got %d",
+					indexName, expectedDim, len(embedding),
+				)
+			}
+
+			vecBuf := make([]byte, 0, 8+4*len(embedding)+4)
+			vecBuf, _ = vectorindex.EncodeEmbeddingWithHashID(vecBuf, embedding, 0)
+
+			embKey := storeutils.MakeEmbeddingKey(key, indexName)
+			embeddingWrites = append(embeddingWrites, [2][]byte{embKey, vecBuf})
+
+			db.logger.Debug("Extracted user-provided embedding",
+				zap.String("key", types.FormatKey(key)),
+				zap.String("indexName", indexName),
+				zap.Int("dimension", len(embedding)))
 		}
 	}
 
@@ -2529,7 +2515,7 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 
 		for indexName, summaryAny := range summariesObj {
 			// Verify index exists
-			idx := db.indexManager.GetIndex(indexName)
+			idx := db.GetIndex(indexName)
 			if idx == nil {
 				db.logger.Warn("Summary provided for non-existent index",
 					zap.String("key", types.FormatKey(key)),
@@ -2573,7 +2559,7 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 		// Iterate through each graph index
 		for indexName, edgeTypesAny := range edgesObj {
 			// Verify the index exists and is a graph index
-			idx := db.indexManager.GetIndex(indexName)
+			idx := db.GetIndex(indexName)
 			if idx == nil {
 				return nil, nil, nil, nil, nil, false, fmt.Errorf("graph index not found: %s", indexName)
 			}
@@ -2717,7 +2703,7 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 				for iter.First(); iter.Valid(); iter.Next() {
 					// If this edge isn't in the desired set, mark for deletion
 					if !desiredEdges[string(iter.Key())] {
-						edgeDeletes = append(edgeDeletes, bytes.Clone(iter.Key()))
+						indexDeletes = append(indexDeletes, bytes.Clone(iter.Key()))
 
 						db.logger.Debug("Marking edge for deletion (not in _edges)",
 							zap.String("key", types.FormatKey(key)),
@@ -2746,7 +2732,7 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 	}
 
 	// Remove special fields and re-marshal if any were found
-	if len(embeddingWrites) > 0 || len(summaryWrites) > 0 || len(edgeWrites) > 0 || len(edgeDeletes) > 0 {
+	if len(embeddingWrites) > 0 || len(summaryWrites) > 0 || len(edgeWrites) > 0 || len(indexDeletes) > 0 {
 		delete(doc, "_embeddings")
 		delete(doc, "_summaries")
 		delete(doc, "_edges")
@@ -2755,11 +2741,11 @@ func (db *DBImpl) extractSpecialFields(docJSON []byte, key []byte) (
 		if err != nil {
 			return nil, nil, nil, nil, nil, false, fmt.Errorf("marshaling cleaned document: %w", err)
 		}
-		return embeddingWrites, summaryWrites, edgeWrites, edgeDeletes, cleanedJSON, hasNonSpecialFields, nil
+		return embeddingWrites, summaryWrites, edgeWrites, indexDeletes, cleanedJSON, hasNonSpecialFields, nil
 	}
 
 	// No special fields found, return original JSON
-	return embeddingWrites, summaryWrites, edgeWrites, edgeDeletes, docJSON, hasNonSpecialFields, nil
+	return embeddingWrites, summaryWrites, edgeWrites, indexDeletes, docJSON, hasNonSpecialFields, nil
 }
 
 // shouldWriteTimestamp determines if a key should have a :t timestamp key written
@@ -2828,19 +2814,19 @@ func (db *DBImpl) Batch(
 	allIndexWrites := make([][2][]byte, 0, len(writes)*2)
 	allChunkDeletes := make([][]byte, 0)
 	// Track all edge deletes for reconciliation
-	allEdgeDeletes := make([][]byte, 0)
+	allIndexDeletes := make([][]byte, 0)
 	splitDeltaWrites := make([][2][]byte, 0, len(writes))
 	splitDeltaDeletes := make([][]byte, 0, len(deletes))
 	mergeDeltaWrites := make([][2][]byte, 0, len(writes))
 	mergeDeltaDeletes := make([][]byte, 0, len(deletes))
 
 	for _, kv := range writes {
-		ownedByApplyRange := isKeyOwnedDuringSplit(kv[0], db.byteRange, splitState)
+		ownedByApplyRange := isKeyOwnedDuringSplit(kv[0], db.getByteRange(), splitState)
 		if isKeyInMergeDonorRangeForState(kv[0], mergeState) {
 			ownedByApplyRange = true
 		}
 		if !internalMergeCopy &&
-			!(ownedByApplyRange && isKeyOwnedDuringMerge(kv[0], db.byteRange, mergeState)) {
+			(!ownedByApplyRange || !isKeyOwnedDuringMerge(kv[0], db.getByteRange(), mergeState)) {
 			// This can happen during a shard split when a write was committed to Raft
 			// just before the split operation was applied. The write is skipped because
 			// the key is now outside this shard's range.
@@ -2848,7 +2834,7 @@ func (db *DBImpl) Batch(
 			// This should be rare if pendingSplitKey mechanism is working correctly.
 			db.logger.Warn("SPLIT_DATA_LOSS: Skipping write outside byte range - data will be lost",
 				zap.String("key", types.FormatKey(kv[0])),
-				zap.Stringer("range", db.byteRange),
+				zap.Stringer("range", db.getByteRange()),
 				zap.String("dir", db.dir))
 			continue
 		}
@@ -2976,7 +2962,7 @@ func (db *DBImpl) Batch(
 		if sfResult != nil {
 			numWrites += sfResult.NumWrites
 			allIndexWrites = append(allIndexWrites, sfResult.IndexWrites...)
-			allEdgeDeletes = append(allEdgeDeletes, sfResult.EdgeDeletes...)
+			allIndexDeletes = append(allIndexDeletes, sfResult.IndexDeletes...)
 			valueToCompress = sfResult.CleanedJSON
 
 			if !sfResult.HasNonSpecialFields {
@@ -3014,12 +3000,12 @@ func (db *DBImpl) Batch(
 	// Collect edge keys for deletion (so edge index can be updated)
 
 	for _, k := range deletes {
-		ownedByApplyRange := isKeyOwnedDuringSplit(k, db.byteRange, splitState)
+		ownedByApplyRange := isKeyOwnedDuringSplit(k, db.getByteRange(), splitState)
 		if isKeyInMergeDonorRangeForState(k, mergeState) {
 			ownedByApplyRange = true
 		}
 		if !internalMergeCopy &&
-			!(ownedByApplyRange && isKeyOwnedDuringMerge(k, db.byteRange, mergeState)) {
+			(!ownedByApplyRange || !isKeyOwnedDuringMerge(k, db.getByteRange(), mergeState)) {
 			continue
 		}
 		if isKeyInSplitOffRangeForState(k, splitState) {
@@ -3040,7 +3026,7 @@ func (db *DBImpl) Batch(
 				zap.Error(err))
 			// Continue with deletion even if edge collection fails
 		} else {
-			allEdgeDeletes = append(allEdgeDeletes, edgeKeys...)
+			allIndexDeletes = append(allIndexDeletes, edgeKeys...)
 		}
 		chunkKeys, err := db.collectChunkKeysForDeletion(k)
 		if err != nil {
@@ -3074,8 +3060,8 @@ func (db *DBImpl) Batch(
 		return fmt.Errorf("could not set key: %w", err)
 	}
 
-	// Combine document deletes, chunk deletes, and edge deletes for index manager.
-	allDeletes := slices.Concat(deletes, allChunkDeletes, allEdgeDeletes)
+	// Combine document deletes, chunk deletes, and special-field deletes for index manager.
+	allDeletes := slices.Concat(deletes, allChunkDeletes, allIndexDeletes)
 
 	// Route writes and deletes to appropriate IndexManager(s) based on split state.
 	// During a split, keys in [splitKey, originalRangeEnd) go to the shadow IndexManager,
@@ -3099,7 +3085,7 @@ func (db *DBImpl) routeToIndexManagers(ctx context.Context, writes [][2][]byte, 
 	// No split in progress or shadow not yet created - send all to primary
 	if splitState == nil || shadow == nil ||
 		(splitState.GetPhase() != SplitState_PHASE_PREPARE && splitState.GetPhase() != SplitState_PHASE_SPLITTING) {
-		return db.sendToIndexManager(ctx, db.indexManager, writes, deletes, syncLevel)
+		return db.sendToIndexManager(ctx, db.getIndexManager(), writes, deletes, syncLevel)
 	}
 
 	// Partition writes and deletes by range
@@ -3127,7 +3113,7 @@ func (db *DBImpl) routeToIndexManagers(ctx context.Context, writes [][2][]byte, 
 
 	// Send to primary IndexManager
 	if len(primaryWrites) > 0 || len(primaryDeletes) > 0 {
-		if err := db.sendToIndexManager(ctx, db.indexManager, primaryWrites, primaryDeletes, syncLevel); err != nil {
+		if err := db.sendToIndexManager(ctx, db.getIndexManager(), primaryWrites, primaryDeletes, syncLevel); err != nil {
 			return fmt.Errorf("indexing primary batch: %w", err)
 		}
 	}
@@ -3177,7 +3163,7 @@ func (db *DBImpl) routeSearch(ctx context.Context, indexName string, request any
 	// No split in progress or shadow not yet created - query primary only
 	if splitState == nil || shadow == nil ||
 		(splitState.GetPhase() != SplitState_PHASE_PREPARE && splitState.GetPhase() != SplitState_PHASE_SPLITTING) {
-		return db.indexManager.Search(ctx, indexName, request)
+		return db.SearchIndex(ctx, indexName, request)
 	}
 
 	splitKey := splitState.GetSplitKey()
@@ -3214,18 +3200,18 @@ func (db *DBImpl) routeSearch(ctx context.Context, indexName string, request any
 		splitSearchRoutesTotal.WithLabelValues("shadow_only").Inc()
 		if !shadow.HasIndex(indexName) {
 			// Shadow doesn't have this index yet, fall back to primary
-			return db.indexManager.Search(ctx, indexName, request)
+			return db.SearchIndex(ctx, indexName, request)
 		}
 		return shadow.Search(ctx, indexName, request)
 	}
 	if !queryShadow {
 		splitSearchRoutesTotal.WithLabelValues("primary_only").Inc()
-		return db.indexManager.Search(ctx, indexName, request)
+		return db.SearchIndex(ctx, indexName, request)
 	}
 	splitSearchRoutesTotal.WithLabelValues("both").Inc()
 
 	// Query both indexes and merge results
-	primaryResult, primaryErr := db.indexManager.Search(ctx, indexName, request)
+	primaryResult, primaryErr := db.SearchIndex(ctx, indexName, request)
 	if primaryErr != nil {
 		db.logger.Warn("Primary index search failed during split",
 			zap.String("index", indexName),
@@ -3410,21 +3396,21 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 
 	// Pause IndexManager (and all indexes) before checkpoint
 	indexesPaused := false
-	if s.indexManager != nil {
+	if im := s.getIndexManager(); im != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := s.indexManager.Pause(ctx); err != nil {
+		if err := im.Pause(ctx); err != nil {
 			s.logger.Warn("Failed to pause IndexManager, snapshot without indexes", zap.Error(err))
 		} else {
 			indexesPaused = true
-			defer s.indexManager.Resume()
+			defer im.Resume()
 		}
 	}
 
 	// Create the pebble checkpoint into pebble/ subdirectory
 	span := pebble.CheckpointSpan{
-		Start: s.byteRange[0],             // Start of the original range
-		End:   s.byteRange.EndForPebble(), // Use helper for Pebble-compatible End
+		Start: s.getByteRange()[0],             // Start of the original range
+		End:   s.getByteRange().EndForPebble(), // Use helper for Pebble-compatible End
 	}
 	pdb := s.getPDB()
 	if pdb == nil {
@@ -3440,7 +3426,7 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 
 	// Copy indexes directory (only if paused successfully)
 	if indexesPaused {
-		indexDir := s.indexManager.GetDir()
+		indexDir := s.getIndexManager().GetDir()
 		if indexDir != "" {
 			indexStagingDir := filepath.Join(stagingDir, "indexes")
 			if err := common.CopyDir(indexDir, indexStagingDir); err != nil {
@@ -3464,7 +3450,7 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 	snapOpts := &snapstore.SnapshotOptions{
 		ShardID: shardID,
 		NodeID:  nodeID,
-		Range:   s.byteRange,
+		Range:   s.getByteRange(),
 	}
 
 	// Use SnapStore to create and store the archive with metadata
@@ -3874,15 +3860,15 @@ func (s *DBImpl) Search(ctx context.Context, encodedReqest []byte) (resp []byte,
 		return nil, fmt.Errorf("decoding search: %w", err)
 	}
 	fullTextIndexName := fmt.Sprintf("full_text_index_v%d", searchRequest.FullTextIndexVersion)
-	if !s.indexManager.HasIndex(fullTextIndexName) {
+	if !s.HasIndex(fullTextIndexName) {
 		// Fallback: try v0
 		fullTextIndexName = "full_text_index_v0"
 	}
-	if !s.indexManager.HasIndex(fullTextIndexName) {
+	if !s.HasIndex(fullTextIndexName) {
 		// Legacy fallback
 		fullTextIndexName = "full_text_index"
 	}
-	if !s.indexManager.HasIndex(fullTextIndexName) {
+	if !s.HasIndex(fullTextIndexName) {
 		return nil, fmt.Errorf(
 			"full_text_index_v%d does not exist",
 			searchRequest.FullTextIndexVersion,
@@ -3984,7 +3970,7 @@ func (s *DBImpl) Search(ctx context.Context, encodedReqest []byte) (resp []byte,
 		// Dense vector searches
 		if !skipVectorSearch {
 			for indexToSearch, vectorReq := range searchRequest.VectorSearches {
-				idx := s.indexManager.GetIndex(indexToSearch)
+				idx := s.GetIndex(indexToSearch)
 
 				effectiveFilterIDs := filterIDs
 				if len(filterIDs) > 0 {
@@ -4533,7 +4519,11 @@ func applyGraphFusion(res *indexes.RemoteIndexSearchResult, fusionMode string, l
 // Stats returns statistics for the Bleve index and Pebble database.
 func (s *DBImpl) Stats() (diskSize uint64, empty bool, indexStats map[string]indexes.IndexStats, err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
-	empty, err = pebbleutils.IsPebbleEmpty(s.pdb, MetadataPrefix)
+	pdb := s.getPDB()
+	if pdb == nil {
+		return 0, false, nil, pebble.ErrClosed
+	}
+	empty, err = pebbleutils.IsPebbleEmpty(pdb, MetadataPrefix)
 	if err != nil {
 		if !errors.Is(err, pebble.ErrClosed) {
 			s.logger.Warn("Failed to check if Pebble database is empty", zap.Error(err))
@@ -4548,7 +4538,7 @@ func (s *DBImpl) Stats() (diskSize uint64, empty bool, indexStats map[string]ind
 			diskSize = storageMets.DiskSpaceUsage()
 		}
 	}
-	indexStats = s.indexManager.Stats()
+	indexStats = s.getIndexManager().Stats()
 	return
 }
 
@@ -4610,7 +4600,7 @@ func (db *DBImpl) loadMetadata() error {
 			if err := json.Unmarshal(value, &byteRange); err != nil {
 				return fmt.Errorf("unmarshaling byte range: %w", err)
 			}
-			db.byteRange = byteRange
+			db.setByteRange(byteRange)
 
 		case bytes.Equal(key, splitStateKey):
 			splitState := &SplitState{}
@@ -4631,28 +4621,28 @@ func (db *DBImpl) loadMetadata() error {
 			if err != nil {
 				return fmt.Errorf("decoding split delta seq: %w", err)
 			}
-			db.splitDeltaSeq = seq
+			db.splitDeltaSeq.Store(seq)
 
 		case bytes.Equal(key, splitDeltaFinalSeqKey):
 			seq, err := decodeStoredUint64(value)
 			if err != nil {
 				return fmt.Errorf("decoding split delta final seq: %w", err)
 			}
-			db.splitDeltaFinalSeq = seq
+			db.splitDeltaFinalSeq.Store(seq)
 
 		case bytes.Equal(key, mergeDeltaSeqKey):
 			seq, err := decodeStoredUint64(value)
 			if err != nil {
 				return fmt.Errorf("decoding merge delta seq: %w", err)
 			}
-			db.mergeDeltaSeq = seq
+			db.mergeDeltaSeq.Store(seq)
 
 		case bytes.Equal(key, mergeDeltaFinalSeqKey):
 			seq, err := decodeStoredUint64(value)
 			if err != nil {
 				return fmt.Errorf("decoding merge delta final seq: %w", err)
 			}
-			db.mergeDeltaFinalSeq = seq
+			db.mergeDeltaFinalSeq.Store(seq)
 
 		case bytes.Equal(key, indexesKey):
 			var indexes map[string]indexes.IndexConfig
@@ -4702,7 +4692,7 @@ func (db *DBImpl) saveMetadata() error {
 			return fmt.Errorf("saving schema: %w", err)
 		}
 	}
-	data, err := json.Marshal(db.byteRange)
+	data, err := json.Marshal(db.getByteRange())
 	if err != nil {
 		return fmt.Errorf("marshaling byte range: %w", err)
 	}
@@ -5391,7 +5381,7 @@ func (db *DBImpl) ResolveIntents(ctx context.Context, op *ResolveIntentsOp) erro
 							db.logger.Debug("Extracted special fields during intent resolution",
 								zap.String("key", types.FormatKey(actualKey)),
 								zap.Int("indexWrites", len(sfResult.IndexWrites)),
-								zap.Int("edgeDeletes", len(sfResult.EdgeDeletes)))
+								zap.Int("indexDeletes", len(sfResult.IndexDeletes)))
 						}
 
 						// Compress and write the document value
@@ -5911,7 +5901,7 @@ func (db *DBImpl) AddEdge(
 	}
 
 	// Update indexes (including graph index which maintains edge index)
-	if err := db.indexManager.Batch(ctx, [][2][]byte{{outKey, edgeValue}}, nil, Op_SyncLevelWrite); err != nil {
+	if err := db.BatchIndex(ctx, [][2][]byte{{outKey, edgeValue}}, nil, Op_SyncLevelWrite); err != nil {
 		return fmt.Errorf("updating edge index: %w", err)
 	}
 
@@ -5934,7 +5924,7 @@ func (db *DBImpl) GetEdges(
 	direction indexes.EdgeDirection,
 ) ([]indexes.Edge, error) {
 	// Check if the index exists
-	if db.indexManager.GetIndex(indexName) == nil {
+	if db.GetIndex(indexName) == nil {
 		return nil, fmt.Errorf("index not found: %s", indexName)
 	}
 
@@ -6059,7 +6049,7 @@ func (db *DBImpl) DeleteEdge(
 	}
 
 	// Update indexes (including graph index which maintains edge index)
-	if err := db.indexManager.Batch(ctx, nil, [][]byte{outKey}, Op_SyncLevelWrite); err != nil {
+	if err := db.BatchIndex(ctx, nil, [][]byte{outKey}, Op_SyncLevelWrite); err != nil {
 		return fmt.Errorf("updating edge index after delete: %w", err)
 	}
 
@@ -6117,7 +6107,7 @@ func (db *DBImpl) UpdateEdgeWeight(
 	}
 
 	// Update indexes (including graph index which maintains edge index)
-	if err := db.indexManager.Batch(ctx, [][2][]byte{{outKey, updatedValue}}, nil, Op_SyncLevelWrite); err != nil {
+	if err := db.BatchIndex(ctx, [][2][]byte{{outKey, updatedValue}}, nil, Op_SyncLevelWrite); err != nil {
 		return fmt.Errorf("updating edge index: %w", err)
 	}
 
@@ -6261,7 +6251,7 @@ func (db *DBImpl) TraverseEdges(
 	rules indexes.TraversalRules,
 ) ([]*indexes.TraversalResult, error) {
 	// Check if the index exists
-	if db.indexManager.GetIndex(indexName) == nil {
+	if db.GetIndex(indexName) == nil {
 		return nil, fmt.Errorf("index not found: %s", indexName)
 	}
 

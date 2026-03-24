@@ -42,7 +42,7 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
-// setupTestDBWithIndex creates a test DB with an embedding index configured
+// setupTestDBWithIndex creates a test DB with a managed embedding index configured.
 func setupTestDBWithIndex(
 	t *testing.T,
 	dimension int,
@@ -99,13 +99,71 @@ func setupTestDBWithIndex(
 
 	// Create the index
 	require.NoError(t, indexManager.Register("test_idx", false, *idxCfg))
+	storeIndexConfig(db, idxCfg)
 	require.NoError(t, indexManager.Start(false))
 
 	return db, dir
 }
 
+func setupTestDBWithExternalIndex(t *testing.T, dimension int, sparse bool) (*DBImpl, string) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+
+	db := &DBImpl{
+		logger: lg,
+	}
+
+	require.NoError(t, db.Open(dir, false, nil, types.Range{nil, []byte{0xFF}}))
+
+	tableSchema := &schema.TableSchema{
+		DefaultType: "default",
+		DocumentSchemas: map[string]schema.DocumentSchema{
+			"default": {
+				Schema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"content": map[string]any{"type": "string"},
+						"title":   map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+	}
+
+	indexConfig := indexes.EmbeddingsIndexConfig{
+		Dimension: dimension,
+		Sparse:    sparse,
+		External:  true,
+	}
+	idxCfg := indexes.NewEmbeddingsConfig("test_idx", indexConfig)
+
+	indexManager, err := NewIndexManager(
+		lg,
+		&common.Config{},
+		db.pdb,
+		dir,
+		tableSchema,
+		types.Range{nil, []byte{0xFF}},
+		nil,
+	)
+	require.NoError(t, err)
+	require.NoError(t, db.SetIndexManager(indexManager))
+
+	require.NoError(t, indexManager.Register("test_idx", false, *idxCfg))
+	storeIndexConfig(db, idxCfg)
+	require.NoError(t, indexManager.Start(false))
+
+	return db, dir
+}
+
+func storeIndexConfig(db *DBImpl, cfg *indexes.IndexConfig) {
+	db.indexesMu.Lock()
+	db.indexes[cfg.Name] = *cfg
+	db.indexesMu.Unlock()
+}
+
 func TestBatch_UserProvidedEmbeddings(t *testing.T) {
-	db, dir := setupTestDBWithIndex(t, 3, "content", "")
+	db, dir := setupTestDBWithExternalIndex(t, 3, false)
 	defer db.Close()
 	defer os.RemoveAll(dir)
 
@@ -146,8 +204,7 @@ func TestBatch_UserProvidedEmbeddings(t *testing.T) {
 	assert.InDelta(t, 3.0, storedEmbedding[2], 0.001)
 
 	// Calculate expected hashID
-	expectedHashID := xxhash.Sum64String("test content")
-	assert.Equal(t, expectedHashID, storedHashID)
+	assert.Zero(t, storedHashID)
 
 	// Verify document content (Get adds _embeddings back from Pebble)
 	storedDoc, err := db.Get(ctx, key)
@@ -158,7 +215,7 @@ func TestBatch_UserProvidedEmbeddings(t *testing.T) {
 }
 
 func TestBatch_EmbeddingDimensionMismatch(t *testing.T) {
-	db, dir := setupTestDBWithIndex(t, 3, "content", "")
+	db, dir := setupTestDBWithExternalIndex(t, 3, false)
 	defer db.Close()
 	defer os.RemoveAll(dir)
 
@@ -182,7 +239,7 @@ func TestBatch_EmbeddingDimensionMismatch(t *testing.T) {
 }
 
 func TestBatch_EmbeddingNonExistentIndex(t *testing.T) {
-	db, dir := setupTestDBWithIndex(t, 3, "content", "")
+	db, dir := setupTestDBWithExternalIndex(t, 3, false)
 	defer db.Close()
 	defer os.RemoveAll(dir)
 
@@ -206,7 +263,7 @@ func TestBatch_EmbeddingNonExistentIndex(t *testing.T) {
 }
 
 func TestBatch_EmbeddingsRemovedFromDocument(t *testing.T) {
-	db, dir := setupTestDBWithIndex(t, 3, "content", "")
+	db, dir := setupTestDBWithExternalIndex(t, 3, false)
 	defer db.Close()
 	defer os.RemoveAll(dir)
 
@@ -240,6 +297,181 @@ func TestBatch_EmbeddingsRemovedFromDocument(t *testing.T) {
 	assert.Equal(t, "test title", storedDoc["title"])
 	// Get() adds _embeddings back from Pebble storage
 	assert.Contains(t, storedDoc, "_embeddings")
+}
+
+func TestBatch_ExternalEmbeddingsOmissionIsNoOp(t *testing.T) {
+	db, dir := setupTestDBWithExternalIndex(t, 3, false)
+	defer db.Close()
+	defer os.RemoveAll(dir)
+
+	key := []byte("test_key")
+	initialDoc := map[string]any{
+		"content": "test content",
+		"_embeddings": map[string]any{
+			"test_idx": []any{1.0, 2.0, 3.0},
+		},
+	}
+	initialJSON, err := json.Marshal(initialDoc)
+	require.NoError(t, err)
+	err = db.Batch(t.Context(), [][2][]byte{{key, initialJSON}}, nil, Op_SyncLevelFullText)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	updatedDoc := map[string]any{
+		"content": "updated content",
+	}
+	updatedJSON, err := json.Marshal(updatedDoc)
+	require.NoError(t, err)
+	err = db.Batch(t.Context(), [][2][]byte{{key, updatedJSON}}, nil, Op_SyncLevelFullText)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	embKey := append(key, []byte(":i:test_idx:e")...)
+	embData, closer, err := db.pdb.Get(embKey)
+	require.NoError(t, err)
+	defer closer.Close()
+
+	storedHashID, storedEmbedding, _, err := vectorindex.DecodeEmbeddingWithHashID(embData)
+	require.NoError(t, err)
+	assert.Zero(t, storedHashID)
+	assert.Equal(t, vector.T{1, 2, 3}, storedEmbedding)
+}
+
+func TestBatch_ExternalEmbeddingsNullDeletesStoredVector(t *testing.T) {
+	db, dir := setupTestDBWithExternalIndex(t, 3, false)
+	defer db.Close()
+	defer os.RemoveAll(dir)
+
+	key := []byte("test_key")
+	initialDoc := map[string]any{
+		"content": "test content",
+		"_embeddings": map[string]any{
+			"test_idx": []any{1.0, 2.0, 3.0},
+		},
+	}
+	initialJSON, err := json.Marshal(initialDoc)
+	require.NoError(t, err)
+	err = db.Batch(t.Context(), [][2][]byte{{key, initialJSON}}, nil, Op_SyncLevelFullText)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	deleteDoc := map[string]any{
+		"content": "test content",
+		"_embeddings": map[string]any{
+			"test_idx": nil,
+		},
+	}
+	deleteJSON, err := json.Marshal(deleteDoc)
+	require.NoError(t, err)
+	err = db.Batch(t.Context(), [][2][]byte{{key, deleteJSON}}, nil, Op_SyncLevelFullText)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	embKey := append(key, []byte(":i:test_idx:e")...)
+	_, closer, err := db.pdb.Get(embKey)
+	require.ErrorIs(t, err, pebble.ErrNotFound)
+	if closer != nil {
+		closer.Close()
+	}
+
+	idx := db.GetIndex("test_idx")
+	require.NotNil(t, idx)
+	embIdx, ok := idx.(*indexes.EmbeddingIndex)
+	require.True(t, ok)
+
+	require.Eventually(t, func() bool {
+		result, searchErr := embIdx.Search(t.Context(), &vectorindex.SearchRequest{
+			Embedding: []float32{1, 2, 3},
+			K:         10,
+		})
+		if searchErr != nil {
+			return false
+		}
+		searchResp, ok := result.(*vectorindex.SearchResult)
+		return ok && len(searchResp.Hits) == 0
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
+func TestBatch_UserProvidedSparseEmbeddings(t *testing.T) {
+	db, dir := setupTestDBWithExternalIndex(t, 0, true)
+	defer db.Close()
+	defer os.RemoveAll(dir)
+
+	key := []byte("test_key")
+	doc := map[string]any{
+		"content": "test content",
+		"_embeddings": map[string]any{
+			"test_idx": map[string]any{
+				"7":  1.5,
+				"42": 2.0,
+			},
+		},
+	}
+	docJSON, err := json.Marshal(doc)
+	require.NoError(t, err)
+
+	err = db.Batch(t.Context(), [][2][]byte{{key, docJSON}}, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	sparseKey := append(key, []byte(":i:test_idx:sp")...)
+	sparseData, closer, err := db.pdb.Get(sparseKey)
+	require.NoError(t, err)
+	defer closer.Close()
+	require.Greater(t, len(sparseData), 8)
+
+	idx := db.GetIndex("test_idx")
+	require.NotNil(t, idx)
+	sparseIdx, ok := idx.(*indexes.SparseIndex)
+	require.True(t, ok)
+
+	require.Eventually(t, func() bool {
+		result, searchErr := sparseIdx.Search(t.Context(), &indexes.SparseSearchRequest{
+			QueryVec: vector.NewSparseVector([]uint32{7, 42}, []float32{1, 1}),
+			K:        10,
+		})
+		if searchErr != nil {
+			return false
+		}
+		searchResp, ok := result.(*vectorindex.SearchResult)
+		return ok && len(searchResp.Hits) == 1 && searchResp.Hits[0].ID == string(key)
+	}, 10*time.Second, 100*time.Millisecond)
+
+	deleteDoc := map[string]any{
+		"content": "test content",
+		"_embeddings": map[string]any{
+			"test_idx": nil,
+		},
+	}
+	deleteJSON, err := json.Marshal(deleteDoc)
+	require.NoError(t, err)
+	err = db.Batch(t.Context(), [][2][]byte{{key, deleteJSON}}, nil, Op_SyncLevelEmbeddings)
+	if err != nil && !errors.Is(err, ErrPartialSuccess) {
+		require.NoError(t, err)
+	}
+
+	_, deleteCloser, err := db.pdb.Get(sparseKey)
+	require.ErrorIs(t, err, pebble.ErrNotFound)
+	if deleteCloser != nil {
+		deleteCloser.Close()
+	}
+
+	require.Eventually(t, func() bool {
+		result, searchErr := sparseIdx.Search(t.Context(), &indexes.SparseSearchRequest{
+			QueryVec: vector.NewSparseVector([]uint32{7, 42}, []float32{1, 1}),
+			K:        10,
+		})
+		if searchErr != nil {
+			return false
+		}
+		searchResp, ok := result.(*vectorindex.SearchResult)
+		return ok && len(searchResp.Hits) == 0
+	}, 10*time.Second, 100*time.Millisecond)
 }
 
 func TestBatch_MultipleEmbeddingsOneDocument(t *testing.T) {
@@ -287,15 +519,17 @@ func TestBatch_MultipleEmbeddingsOneDocument(t *testing.T) {
 
 	idxCfg1 := indexes.NewEmbeddingsConfig("idx1", indexes.EmbeddingsIndexConfig{
 		Dimension: 3,
-		Field:     "content",
+		External:  true,
 	})
 	idxCfg2 := indexes.NewEmbeddingsConfig("idx2", indexes.EmbeddingsIndexConfig{
 		Dimension: 4,
-		Field:     "title",
+		External:  true,
 	})
 
 	require.NoError(t, indexManager.Register("idx1", false, *idxCfg1))
 	require.NoError(t, indexManager.Register("idx2", false, *idxCfg2))
+	storeIndexConfig(db, idxCfg1)
+	storeIndexConfig(db, idxCfg2)
 	require.NoError(t, indexManager.Start(false))
 
 	// Prepare document with embeddings for both indexes
@@ -378,7 +612,7 @@ func TestBatch_NoPerformanceRegressionWithoutSpecialFields(t *testing.T) {
 	assert.Equal(t, "test title", storedDoc["title"])
 }
 
-func TestBatch_HashIDGenerationFromTemplate(t *testing.T) {
+func TestBatch_ManagedIndexRejectsManualEmbeddingsFromTemplate(t *testing.T) {
 	db, dir := setupTestDBWithIndex(t, 3, "", "Title: {{title}}, Content: {{content}}")
 	defer db.Close()
 	defer os.RemoveAll(dir)
@@ -397,30 +631,12 @@ func TestBatch_HashIDGenerationFromTemplate(t *testing.T) {
 
 	key := []byte("test_key")
 
-	// Write the document
 	err = db.Batch(t.Context(), [][2][]byte{{key, docJSON}}, nil, Op_SyncLevelFullText)
-	// FullText sync level returns ErrPartialSuccess indicating KV write succeeded
-	if err != nil && !errors.Is(err, ErrPartialSuccess) {
-		require.NoError(t, err)
-	}
-
-	// Verify hashID was generated from template
-	embKey := append(key, []byte(":i:test_idx:e")...)
-	embData, closer, err := db.pdb.Get(embKey)
-	require.NoError(t, err)
-	defer closer.Close()
-
-	// Decode the stored embedding (format: [hashID][vector])
-	storedHashID, _, _, err := vectorindex.DecodeEmbeddingWithHashID(embData)
-	require.NoError(t, err)
-
-	// Calculate expected hashID from rendered template
-	expectedPrompt := "Title: test title, Content: test content"
-	expectedHashID := xxhash.Sum64String(expectedPrompt)
-	assert.Equal(t, expectedHashID, storedHashID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "manual _embeddings are not allowed")
 }
 
-func TestBatch_HashIDGenerationFromField(t *testing.T) {
+func TestBatch_ManagedIndexRejectsManualEmbeddingsFromField(t *testing.T) {
 	db, dir := setupTestDBWithIndex(t, 3, "content", "")
 	defer db.Close()
 	defer os.RemoveAll(dir)
@@ -439,26 +655,9 @@ func TestBatch_HashIDGenerationFromField(t *testing.T) {
 
 	key := []byte("test_key")
 
-	// Write the document
 	err = db.Batch(t.Context(), [][2][]byte{{key, docJSON}}, nil, Op_SyncLevelFullText)
-	// FullText sync level returns ErrPartialSuccess indicating KV write succeeded
-	if err != nil && !errors.Is(err, ErrPartialSuccess) {
-		require.NoError(t, err)
-	}
-
-	// Verify hashID was generated from field
-	embKey := append(key, []byte(":i:test_idx:e")...)
-	embData, closer, err := db.pdb.Get(embKey)
-	require.NoError(t, err)
-	defer closer.Close()
-
-	// Decode the stored embedding (format: [hashID][vector])
-	storedHashID, _, _, err := vectorindex.DecodeEmbeddingWithHashID(embData)
-	require.NoError(t, err)
-
-	// Calculate expected hashID from field
-	expectedHashID := xxhash.Sum64String("test content")
-	assert.Equal(t, expectedHashID, storedHashID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "manual _embeddings are not allowed")
 }
 
 func TestBatch_NonEmbeddingIndexRejectsEmbeddings(t *testing.T) {
@@ -503,6 +702,7 @@ func TestBatch_NonEmbeddingIndexRejectsEmbeddings(t *testing.T) {
 
 	idxCfg := indexes.NewFullTextIndexConfig("fulltext_idx", true)
 	require.NoError(t, indexManager.Register("fulltext_idx", false, *idxCfg))
+	storeIndexConfig(db, idxCfg)
 	require.NoError(t, indexManager.Start(false))
 
 	// Try to send embeddings for the full-text index
@@ -559,8 +759,7 @@ func TestEmbeddingsPreProcessor_Interface(t *testing.T) {
 	assert.Equal(t, xxhash.Sum64String("test content"), hashID)
 }
 
-func TestBatch_HashIDGenerationFromNestedField(t *testing.T) {
-	// Test JSONPath support for nested fields
+func TestBatch_ManagedIndexRejectsManualEmbeddingsFromNestedField(t *testing.T) {
 	db, dir := setupTestDBWithIndex(t, 3, "metadata.title", "")
 	defer db.Close()
 	defer os.RemoveAll(dir)
@@ -582,30 +781,13 @@ func TestBatch_HashIDGenerationFromNestedField(t *testing.T) {
 
 	key := []byte("test_key")
 
-	// Write the document
 	err = db.Batch(t.Context(), [][2][]byte{{key, docJSON}}, nil, Op_SyncLevelFullText)
-	// FullText sync level returns ErrPartialSuccess indicating KV write succeeded
-	if err != nil && !errors.Is(err, ErrPartialSuccess) {
-		require.NoError(t, err)
-	}
-
-	// Verify hashID was generated from nested field
-	embKey := append(key, []byte(":i:test_idx:e")...)
-	embData, closer, err := db.pdb.Get(embKey)
-	require.NoError(t, err)
-	defer closer.Close()
-
-	// Decode the stored embedding (format: [hashID][vector])
-	storedHashID, _, _, err := vectorindex.DecodeEmbeddingWithHashID(embData)
-	require.NoError(t, err)
-
-	// Calculate expected hashID from nested field
-	expectedHashID := xxhash.Sum64String("nested title")
-	assert.Equal(t, expectedHashID, storedHashID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "manual _embeddings are not allowed")
 }
 
 func TestBatch_EmbeddingIndexedInVectorIndex(t *testing.T) {
-	db, dir := setupTestDBWithIndex(t, 3, "content", "")
+	db, dir := setupTestDBWithExternalIndex(t, 3, false)
 	defer os.RemoveAll(dir)
 	defer db.Close()
 
@@ -634,7 +816,7 @@ func TestBatch_EmbeddingIndexedInVectorIndex(t *testing.T) {
 	}
 
 	// Get the index
-	idx := db.indexManager.GetIndex("test_idx")
+	idx := db.GetIndex("test_idx")
 	require.NotNil(t, idx)
 
 	embIdx, ok := idx.(*indexes.EmbeddingIndex)
@@ -720,12 +902,13 @@ func TestBatch_CosineEmbeddingsIndexAcceptsNormalizedVectorsAcrossInternalSplits
 
 	idxCfg := indexes.NewEmbeddingsConfig(indexName, indexes.EmbeddingsIndexConfig{
 		Dimension:      dims,
-		Field:          "content",
+		External:       true,
 		DistanceMetric: indexes.DistanceMetricCosine,
 	})
 	require.NoError(t, indexManager.Register(indexName, false, *idxCfg))
+	storeIndexConfig(db, idxCfg)
 	require.NoError(t, indexManager.Start(false))
-	idx := db.indexManager.GetIndex(indexName)
+	idx := db.GetIndex(indexName)
 	require.NotNil(t, idx)
 	embIdx, ok := idx.(*indexes.EmbeddingIndex)
 	require.True(t, ok, "Index should be an EmbeddingIndex")
@@ -749,7 +932,7 @@ func TestBatch_CosineEmbeddingsIndexAcceptsNormalizedVectorsAcrossInternalSplits
 			})
 			require.NoError(t, err)
 			writes = append(writes, [2][]byte{
-				[]byte(fmt.Sprintf("doc/%05d", i)),
+				fmt.Appendf(nil, "doc/%05d", i),
 				docBytes,
 			})
 		}
@@ -792,7 +975,7 @@ func TestVectorSearch_EndToEndRecall(t *testing.T) {
 	writes := make([][2][]byte, 0, dataCount)
 	dataKeys := make([]string, 0, dataCount)
 	for i := range dataCount {
-		key := []byte(fmt.Sprintf("doc:%04d", i))
+		key := fmt.Appendf(nil, "doc:%04d", i)
 		dataKeys = append(dataKeys, string(key))
 
 		docJSON, err := json.Marshal(map[string]any{
@@ -810,7 +993,7 @@ func TestVectorSearch_EndToEndRecall(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	idx := db.indexManager.GetIndex(indexName)
+	idx := db.GetIndex(indexName)
 	require.NotNil(t, idx)
 	embIdx, ok := idx.(*indexes.EmbeddingIndex)
 	require.True(t, ok, "Index should be an EmbeddingIndex")
@@ -913,7 +1096,7 @@ func waitForEmbeddingIndexTotalIndexed(
 }
 
 func TestBatch_EmbeddingTypeConversions(t *testing.T) {
-	db, dir := setupTestDBWithIndex(t, 4, "content", "")
+	db, dir := setupTestDBWithExternalIndex(t, 4, false)
 	defer db.Close()
 	defer os.RemoveAll(dir)
 
@@ -998,13 +1181,15 @@ func setupTestDBWithFullTextAndEmbeddings(t *testing.T, dimension int) (*DBImpl,
 	// Register full-text index
 	fullTextConfig := indexes.NewFullTextIndexConfig("full_text_index_v0", false)
 	require.NoError(t, indexManager.Register("full_text_index_v0", false, *fullTextConfig))
+	storeIndexConfig(db, fullTextConfig)
 
 	// Register embedding index
 	embeddingConfig := indexes.NewEmbeddingsConfig("test_embedding_idx", indexes.EmbeddingsIndexConfig{
 		Dimension: dimension,
-		Field:     "content",
+		External:  true,
 	})
 	require.NoError(t, indexManager.Register("test_embedding_idx", false, *embeddingConfig))
+	storeIndexConfig(db, embeddingConfig)
 
 	require.NoError(t, indexManager.Start(false))
 
@@ -1121,13 +1306,15 @@ func TestVectorSearch_WithAggregations(t *testing.T) {
 	// Register full-text index
 	fullTextConfig := indexes.NewFullTextIndexConfig("full_text_index_v0", false)
 	require.NoError(t, indexManager.Register("full_text_index_v0", false, *fullTextConfig))
+	storeIndexConfig(db, fullTextConfig)
 
 	// Register embedding index
 	embeddingConfig := indexes.NewEmbeddingsConfig("test_embedding_idx", indexes.EmbeddingsIndexConfig{
 		Dimension: 3,
-		Field:     "content",
+		External:  true,
 	})
 	require.NoError(t, indexManager.Register("test_embedding_idx", false, *embeddingConfig))
+	storeIndexConfig(db, embeddingConfig)
 
 	require.NoError(t, indexManager.Start(false))
 

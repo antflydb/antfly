@@ -227,6 +227,23 @@ func TestEmbeddingsIndexConfigValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "dense external config without prompt source",
+			config: &EmbeddingsIndexConfig{
+				Dimension: 768,
+				External:  true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "external config rejects field",
+			config: &EmbeddingsIndexConfig{
+				Dimension: 768,
+				External:  true,
+				Field:     "content",
+			},
+			wantErr: true,
+		},
+		{
 			name: "sparse with field",
 			config: &EmbeddingsIndexConfig{
 				Sparse: true,
@@ -248,6 +265,14 @@ func TestEmbeddingsIndexConfigValidate(t *testing.T) {
 				Sparse: true,
 			},
 			wantErr: true,
+		},
+		{
+			name: "sparse external config without prompt source",
+			config: &EmbeddingsIndexConfig{
+				Sparse:   true,
+				External: true,
+			},
+			wantErr: false,
 		},
 	}
 

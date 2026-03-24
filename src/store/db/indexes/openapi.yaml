@@ -111,6 +111,11 @@ components:
         When sparse is false (default), creates a dense vector index (HNSW).
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
       properties:
+        external:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: "When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template."
         sparse:
           x-go-type-skip-optional-pointer: true
           type: boolean

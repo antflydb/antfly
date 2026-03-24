@@ -16,7 +16,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v7.34.0
-// source: src/store/db/ops.proto
+// source: ops.proto
 
 package db
 
@@ -107,11 +107,11 @@ func (x Op_OpType) String() string {
 }
 
 func (Op_OpType) Descriptor() protoreflect.EnumDescriptor {
-	return file_src_store_db_ops_proto_enumTypes[0].Descriptor()
+	return file_ops_proto_enumTypes[0].Descriptor()
 }
 
 func (Op_OpType) Type() protoreflect.EnumType {
-	return &file_src_store_db_ops_proto_enumTypes[0]
+	return &file_ops_proto_enumTypes[0]
 }
 
 func (x Op_OpType) Number() protoreflect.EnumNumber {
@@ -157,11 +157,11 @@ func (x Op_SyncLevel) String() string {
 }
 
 func (Op_SyncLevel) Descriptor() protoreflect.EnumDescriptor {
-	return file_src_store_db_ops_proto_enumTypes[1].Descriptor()
+	return file_ops_proto_enumTypes[1].Descriptor()
 }
 
 func (Op_SyncLevel) Type() protoreflect.EnumType {
-	return &file_src_store_db_ops_proto_enumTypes[1]
+	return &file_ops_proto_enumTypes[1]
 }
 
 func (x Op_SyncLevel) Number() protoreflect.EnumNumber {
@@ -228,11 +228,11 @@ func (x TransformOp_OpType) String() string {
 }
 
 func (TransformOp_OpType) Descriptor() protoreflect.EnumDescriptor {
-	return file_src_store_db_ops_proto_enumTypes[2].Descriptor()
+	return file_ops_proto_enumTypes[2].Descriptor()
 }
 
 func (TransformOp_OpType) Type() protoreflect.EnumType {
-	return &file_src_store_db_ops_proto_enumTypes[2]
+	return &file_ops_proto_enumTypes[2]
 }
 
 func (x TransformOp_OpType) Number() protoreflect.EnumNumber {
@@ -279,11 +279,11 @@ func (x SplitState_Phase) String() string {
 }
 
 func (SplitState_Phase) Descriptor() protoreflect.EnumDescriptor {
-	return file_src_store_db_ops_proto_enumTypes[3].Descriptor()
+	return file_ops_proto_enumTypes[3].Descriptor()
 }
 
 func (SplitState_Phase) Type() protoreflect.EnumType {
-	return &file_src_store_db_ops_proto_enumTypes[3]
+	return &file_ops_proto_enumTypes[3]
 }
 
 func (x SplitState_Phase) Number() protoreflect.EnumNumber {
@@ -332,11 +332,11 @@ func (x MergeState_Phase) String() string {
 }
 
 func (MergeState_Phase) Descriptor() protoreflect.EnumDescriptor {
-	return file_src_store_db_ops_proto_enumTypes[4].Descriptor()
+	return file_ops_proto_enumTypes[4].Descriptor()
 }
 
 func (MergeState_Phase) Type() protoreflect.EnumType {
-	return &file_src_store_db_ops_proto_enumTypes[4]
+	return &file_ops_proto_enumTypes[4]
 }
 
 func (x MergeState_Phase) Number() protoreflect.EnumNumber {
@@ -358,7 +358,7 @@ type Op struct {
 
 func (x *Op) Reset() {
 	*x = Op{}
-	mi := &file_src_store_db_ops_proto_msgTypes[0]
+	mi := &file_ops_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -370,7 +370,7 @@ func (x *Op) String() string {
 func (*Op) ProtoMessage() {}
 
 func (x *Op) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[0]
+	mi := &file_ops_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1076,7 +1076,7 @@ func (b0 Op_builder) Build() *Op {
 type case_Op_Operation protoreflect.FieldNumber
 
 func (x case_Op_Operation) String() string {
-	md := file_src_store_db_ops_proto_msgTypes[0].Descriptor()
+	md := file_ops_proto_msgTypes[0].Descriptor()
 	if x == 0 {
 		return "not set"
 	}
@@ -1193,7 +1193,7 @@ type Write struct {
 
 func (x *Write) Reset() {
 	*x = Write{}
-	mi := &file_src_store_db_ops_proto_msgTypes[1]
+	mi := &file_ops_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1205,7 +1205,7 @@ func (x *Write) String() string {
 func (*Write) ProtoMessage() {}
 
 func (x *Write) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[1]
+	mi := &file_ops_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1273,7 +1273,7 @@ type TransformOp struct {
 
 func (x *TransformOp) Reset() {
 	*x = TransformOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[2]
+	mi := &file_ops_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1285,7 +1285,7 @@ func (x *TransformOp) String() string {
 func (*TransformOp) ProtoMessage() {}
 
 func (x *TransformOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[2]
+	mi := &file_ops_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1379,7 +1379,7 @@ type Transform struct {
 
 func (x *Transform) Reset() {
 	*x = Transform{}
-	mi := &file_src_store_db_ops_proto_msgTypes[3]
+	mi := &file_ops_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1391,7 +1391,7 @@ func (x *Transform) String() string {
 func (*Transform) ProtoMessage() {}
 
 func (x *Transform) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[3]
+	mi := &file_ops_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1489,7 +1489,7 @@ type BatchOp struct {
 
 func (x *BatchOp) Reset() {
 	*x = BatchOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[4]
+	mi := &file_ops_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1501,7 +1501,7 @@ func (x *BatchOp) String() string {
 func (*BatchOp) ProtoMessage() {}
 
 func (x *BatchOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[4]
+	mi := &file_ops_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1623,7 +1623,7 @@ type SplitDeltaEntry struct {
 
 func (x *SplitDeltaEntry) Reset() {
 	*x = SplitDeltaEntry{}
-	mi := &file_src_store_db_ops_proto_msgTypes[5]
+	mi := &file_ops_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1635,7 +1635,7 @@ func (x *SplitDeltaEntry) String() string {
 func (*SplitDeltaEntry) ProtoMessage() {}
 
 func (x *SplitDeltaEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[5]
+	mi := &file_ops_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1724,7 +1724,7 @@ type MergeDeltaEntry struct {
 
 func (x *MergeDeltaEntry) Reset() {
 	*x = MergeDeltaEntry{}
-	mi := &file_src_store_db_ops_proto_msgTypes[6]
+	mi := &file_ops_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1736,7 +1736,7 @@ func (x *MergeDeltaEntry) String() string {
 func (*MergeDeltaEntry) ProtoMessage() {}
 
 func (x *MergeDeltaEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[6]
+	mi := &file_ops_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1823,7 +1823,7 @@ type SplitOp struct {
 
 func (x *SplitOp) Reset() {
 	*x = SplitOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[7]
+	mi := &file_ops_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1835,7 +1835,7 @@ func (x *SplitOp) String() string {
 func (*SplitOp) ProtoMessage() {}
 
 func (x *SplitOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[7]
+	mi := &file_ops_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1900,7 +1900,7 @@ type FinalizeSplitOp struct {
 
 func (x *FinalizeSplitOp) Reset() {
 	*x = FinalizeSplitOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[8]
+	mi := &file_ops_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1912,7 +1912,7 @@ func (x *FinalizeSplitOp) String() string {
 func (*FinalizeSplitOp) ProtoMessage() {}
 
 func (x *FinalizeSplitOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[8]
+	mi := &file_ops_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1962,7 +1962,7 @@ type FinalizeMergeOp struct {
 
 func (x *FinalizeMergeOp) Reset() {
 	*x = FinalizeMergeOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[9]
+	mi := &file_ops_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1974,7 +1974,7 @@ func (x *FinalizeMergeOp) String() string {
 func (*FinalizeMergeOp) ProtoMessage() {}
 
 func (x *FinalizeMergeOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[9]
+	mi := &file_ops_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2039,7 +2039,7 @@ type SetRangeOp struct {
 
 func (x *SetRangeOp) Reset() {
 	*x = SetRangeOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[10]
+	mi := &file_ops_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2051,7 +2051,7 @@ func (x *SetRangeOp) String() string {
 func (*SetRangeOp) ProtoMessage() {}
 
 func (x *SetRangeOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[10]
+	mi := &file_ops_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2115,7 +2115,7 @@ type UpdateSchemaOp struct {
 
 func (x *UpdateSchemaOp) Reset() {
 	*x = UpdateSchemaOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[11]
+	mi := &file_ops_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2127,7 +2127,7 @@ func (x *UpdateSchemaOp) String() string {
 func (*UpdateSchemaOp) ProtoMessage() {}
 
 func (x *UpdateSchemaOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[11]
+	mi := &file_ops_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2177,7 +2177,7 @@ type AddIndexOp struct {
 
 func (x *AddIndexOp) Reset() {
 	*x = AddIndexOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[12]
+	mi := &file_ops_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2189,7 +2189,7 @@ func (x *AddIndexOp) String() string {
 func (*AddIndexOp) ProtoMessage() {}
 
 func (x *AddIndexOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[12]
+	mi := &file_ops_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2263,7 +2263,7 @@ type DeleteIndexOp struct {
 
 func (x *DeleteIndexOp) Reset() {
 	*x = DeleteIndexOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[13]
+	mi := &file_ops_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2275,7 +2275,7 @@ func (x *DeleteIndexOp) String() string {
 func (*DeleteIndexOp) ProtoMessage() {}
 
 func (x *DeleteIndexOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[13]
+	mi := &file_ops_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2321,7 +2321,7 @@ type BackupOp struct {
 
 func (x *BackupOp) Reset() {
 	*x = BackupOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[14]
+	mi := &file_ops_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2333,7 +2333,7 @@ func (x *BackupOp) String() string {
 func (*BackupOp) ProtoMessage() {}
 
 func (x *BackupOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[14]
+	mi := &file_ops_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2393,7 +2393,7 @@ type InitTransactionOp struct {
 
 func (x *InitTransactionOp) Reset() {
 	*x = InitTransactionOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[15]
+	mi := &file_ops_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2405,7 +2405,7 @@ func (x *InitTransactionOp) String() string {
 func (*InitTransactionOp) ProtoMessage() {}
 
 func (x *InitTransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[15]
+	mi := &file_ops_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2479,7 +2479,7 @@ type CommitTransactionOp struct {
 
 func (x *CommitTransactionOp) Reset() {
 	*x = CommitTransactionOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[16]
+	mi := &file_ops_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2491,7 +2491,7 @@ func (x *CommitTransactionOp) String() string {
 func (*CommitTransactionOp) ProtoMessage() {}
 
 func (x *CommitTransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[16]
+	mi := &file_ops_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2539,7 +2539,7 @@ type AbortTransactionOp struct {
 
 func (x *AbortTransactionOp) Reset() {
 	*x = AbortTransactionOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[17]
+	mi := &file_ops_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2551,7 +2551,7 @@ func (x *AbortTransactionOp) String() string {
 func (*AbortTransactionOp) ProtoMessage() {}
 
 func (x *AbortTransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[17]
+	mi := &file_ops_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2600,7 +2600,7 @@ type VersionPredicate struct {
 
 func (x *VersionPredicate) Reset() {
 	*x = VersionPredicate{}
-	mi := &file_src_store_db_ops_proto_msgTypes[18]
+	mi := &file_ops_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2612,7 +2612,7 @@ func (x *VersionPredicate) String() string {
 func (*VersionPredicate) ProtoMessage() {}
 
 func (x *VersionPredicate) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[18]
+	mi := &file_ops_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2677,7 +2677,7 @@ type WriteIntentOp struct {
 
 func (x *WriteIntentOp) Reset() {
 	*x = WriteIntentOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[19]
+	mi := &file_ops_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2689,7 +2689,7 @@ func (x *WriteIntentOp) String() string {
 func (*WriteIntentOp) ProtoMessage() {}
 
 func (x *WriteIntentOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[19]
+	mi := &file_ops_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2807,7 +2807,7 @@ type ResolveIntentsOp struct {
 
 func (x *ResolveIntentsOp) Reset() {
 	*x = ResolveIntentsOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[20]
+	mi := &file_ops_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2819,7 +2819,7 @@ func (x *ResolveIntentsOp) String() string {
 func (*ResolveIntentsOp) ProtoMessage() {}
 
 func (x *ResolveIntentsOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[20]
+	mi := &file_ops_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2901,7 +2901,7 @@ type SplitState struct {
 
 func (x *SplitState) Reset() {
 	*x = SplitState{}
-	mi := &file_src_store_db_ops_proto_msgTypes[21]
+	mi := &file_ops_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2913,7 +2913,7 @@ func (x *SplitState) String() string {
 func (*SplitState) ProtoMessage() {}
 
 func (x *SplitState) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[21]
+	mi := &file_ops_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3018,7 +3018,7 @@ type SetSplitStateOp struct {
 
 func (x *SetSplitStateOp) Reset() {
 	*x = SetSplitStateOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[22]
+	mi := &file_ops_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3030,7 +3030,7 @@ func (x *SetSplitStateOp) String() string {
 func (*SetSplitStateOp) ProtoMessage() {}
 
 func (x *SetSplitStateOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[22]
+	mi := &file_ops_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3104,7 +3104,7 @@ type MergeState struct {
 
 func (x *MergeState) Reset() {
 	*x = MergeState{}
-	mi := &file_src_store_db_ops_proto_msgTypes[23]
+	mi := &file_ops_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3116,7 +3116,7 @@ func (x *MergeState) String() string {
 func (*MergeState) ProtoMessage() {}
 
 func (x *MergeState) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[23]
+	mi := &file_ops_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3406,7 +3406,7 @@ type SetMergeStateOp struct {
 
 func (x *SetMergeStateOp) Reset() {
 	*x = SetMergeStateOp{}
-	mi := &file_src_store_db_ops_proto_msgTypes[24]
+	mi := &file_ops_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3418,7 +3418,7 @@ func (x *SetMergeStateOp) String() string {
 func (*SetMergeStateOp) ProtoMessage() {}
 
 func (x *SetMergeStateOp) ProtoReflect() protoreflect.Message {
-	mi := &file_src_store_db_ops_proto_msgTypes[24]
+	mi := &file_ops_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3466,11 +3466,11 @@ func (b0 SetMergeStateOp_builder) Build() *SetMergeStateOp {
 	return m0
 }
 
-var File_src_store_db_ops_proto protoreflect.FileDescriptor
+var File_ops_proto protoreflect.FileDescriptor
 
-const file_src_store_db_ops_proto_rawDesc = "" +
+const file_ops_proto_rawDesc = "" +
 	"\n" +
-	"\x16src/store/db/ops.proto\x12\x02db\x1a!google/protobuf/go_features.proto\"\xd6\v\n" +
+	"\tops.proto\x12\x02db\x1a!google/protobuf/go_features.proto\"\xd6\v\n" +
 	"\x02Op\x12$\n" +
 	"\x02op\x18\x01 \x01(\x0e2\r.db.Op.OpTypeB\x05\xaa\x01\x02\b\x02R\x02op\x12\x12\n" +
 	"\x04uuid\x18\x02 \x01(\tR\x04uuid\x12'\n" +
@@ -3660,9 +3660,9 @@ const file_src_store_db_ops_proto_rawDesc = "" +
 	"\x0fSetMergeStateOp\x12$\n" +
 	"\x05state\x18\x01 \x01(\v2\x0e.db.MergeStateR\x05stateB1Z'github.com/antflydb/antfly/src/store/db\x92\x03\x05\xd2>\x02\x10\x03b\beditionsp\xe8\a"
 
-var file_src_store_db_ops_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_src_store_db_ops_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
-var file_src_store_db_ops_proto_goTypes = []any{
+var file_ops_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
+var file_ops_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
+var file_ops_proto_goTypes = []any{
 	(Op_OpType)(0),              // 0: db.Op.OpType
 	(Op_SyncLevel)(0),           // 1: db.Op.SyncLevel
 	(TransformOp_OpType)(0),     // 2: db.TransformOp.OpType
@@ -3694,7 +3694,7 @@ var file_src_store_db_ops_proto_goTypes = []any{
 	(*MergeState)(nil),          // 28: db.MergeState
 	(*SetMergeStateOp)(nil),     // 29: db.SetMergeStateOp
 }
-var file_src_store_db_ops_proto_depIdxs = []int32{
+var file_ops_proto_depIdxs = []int32{
 	0,  // 0: db.Op.op:type_name -> db.Op.OpType
 	9,  // 1: db.Op.batch:type_name -> db.BatchOp
 	12, // 2: db.Op.split:type_name -> db.SplitOp
@@ -3732,12 +3732,12 @@ var file_src_store_db_ops_proto_depIdxs = []int32{
 	0,  // [0:30] is the sub-list for field type_name
 }
 
-func init() { file_src_store_db_ops_proto_init() }
-func file_src_store_db_ops_proto_init() {
-	if File_src_store_db_ops_proto != nil {
+func init() { file_ops_proto_init() }
+func file_ops_proto_init() {
+	if File_ops_proto != nil {
 		return
 	}
-	file_src_store_db_ops_proto_msgTypes[0].OneofWrappers = []any{
+	file_ops_proto_msgTypes[0].OneofWrappers = []any{
 		(*op_Batch)(nil),
 		(*op_Split)(nil),
 		(*op_SetRange)(nil),
@@ -3759,18 +3759,18 @@ func file_src_store_db_ops_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_src_store_db_ops_proto_rawDesc), len(file_src_store_db_ops_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_ops_proto_rawDesc), len(file_ops_proto_rawDesc)),
 			NumEnums:      5,
 			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_src_store_db_ops_proto_goTypes,
-		DependencyIndexes: file_src_store_db_ops_proto_depIdxs,
-		EnumInfos:         file_src_store_db_ops_proto_enumTypes,
-		MessageInfos:      file_src_store_db_ops_proto_msgTypes,
+		GoTypes:           file_ops_proto_goTypes,
+		DependencyIndexes: file_ops_proto_depIdxs,
+		EnumInfos:         file_ops_proto_enumTypes,
+		MessageInfos:      file_ops_proto_msgTypes,
 	}.Build()
-	File_src_store_db_ops_proto = out.File
-	file_src_store_db_ops_proto_goTypes = nil
-	file_src_store_db_ops_proto_depIdxs = nil
+	File_ops_proto = out.File
+	file_ops_proto_goTypes = nil
+	file_ops_proto_depIdxs = nil
 }

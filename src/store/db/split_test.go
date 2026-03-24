@@ -964,7 +964,7 @@ func TestFinalizeSplitPrunesParentFullTextIndex(t *testing.T) {
 	}
 	require.NoError(t, db.pdb.Flush())
 
-	beforeFinalizeRaw, err := db.indexManager.Search(ctx, "full_text_index",
+	beforeFinalizeRaw, err := db.SearchIndex(ctx, "full_text_index",
 		bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"key:00003"})))
 	require.NoError(t, err)
 	beforeFinalize, ok := beforeFinalizeRaw.(*bleve.SearchResult)
@@ -980,14 +980,14 @@ func TestFinalizeSplitPrunesParentFullTextIndex(t *testing.T) {
 	require.NoError(t, db.SetRange(parentRange))
 	require.NoError(t, db.FinalizeSplit(parentRange))
 
-	afterFinalizeRaw, err := db.indexManager.Search(ctx, "full_text_index",
+	afterFinalizeRaw, err := db.SearchIndex(ctx, "full_text_index",
 		bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"key:00003"})))
 	require.NoError(t, err)
 	afterFinalize, ok := afterFinalizeRaw.(*bleve.SearchResult)
 	require.True(t, ok)
 	require.Empty(t, afterFinalize.Hits)
 
-	retainedRaw, err := db.indexManager.Search(ctx, "full_text_index",
+	retainedRaw, err := db.SearchIndex(ctx, "full_text_index",
 		bleve.NewSearchRequest(blevequery.NewDocIDQuery([]string{"key:00001"})))
 	require.NoError(t, err)
 	retained, ok := retainedRaw.(*bleve.SearchResult)
@@ -1072,7 +1072,7 @@ func TestFinalizeSplitPrunesParentChunkedVectorIndex(t *testing.T) {
 		K:         10,
 		Embedding: vector.T{1.0, 0.0, 0.0},
 	}
-	beforeRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	beforeRaw, err := db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	before := beforeRaw.(*vectorindex.SearchResult)
 	require.NotEmpty(t, before.Hits)
@@ -1086,14 +1086,14 @@ func TestFinalizeSplitPrunesParentChunkedVectorIndex(t *testing.T) {
 	require.NoError(t, db.SetRange(parentRange))
 	require.NoError(t, db.FinalizeSplit(parentRange))
 
-	afterSplitRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	afterSplitRaw, err := db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	afterSplit := afterSplitRaw.(*vectorindex.SearchResult)
 	for _, hit := range afterSplit.Hits {
 		require.NotContains(t, hit.ID, "key:00003")
 	}
 
-	retainedRaw, err := db.indexManager.Search(ctx, indexName, &vectorindex.SearchRequest{
+	retainedRaw, err := db.SearchIndex(ctx, indexName, &vectorindex.SearchRequest{
 		K:         10,
 		Embedding: vector.T{0.0, 1.0, 0.0},
 	})
@@ -1179,7 +1179,7 @@ func TestFinalizeSplitPrunesParentChunkedVectorIndexWhenDocKeyContainsIndexMarke
 		K:         10,
 		Embedding: vector.T{1.0, 0.0, 0.0},
 	}
-	beforeRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	beforeRaw, err := db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	before := beforeRaw.(*vectorindex.SearchResult)
 	require.NotEmpty(t, before.Hits)
@@ -1193,14 +1193,14 @@ func TestFinalizeSplitPrunesParentChunkedVectorIndexWhenDocKeyContainsIndexMarke
 	require.NoError(t, db.SetRange(parentRange))
 	require.NoError(t, db.FinalizeSplit(parentRange))
 
-	afterSplitRaw, err := db.indexManager.Search(ctx, indexName, searchReq)
+	afterSplitRaw, err := db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	afterSplit := afterSplitRaw.(*vectorindex.SearchResult)
 	for _, hit := range afterSplit.Hits {
 		require.NotContains(t, hit.ID, string(splitDocKey))
 	}
 
-	retainedRaw, err := db.indexManager.Search(ctx, indexName, &vectorindex.SearchRequest{
+	retainedRaw, err := db.SearchIndex(ctx, indexName, &vectorindex.SearchRequest{
 		K:         10,
 		Embedding: vector.T{0.0, 1.0, 0.0},
 	})
@@ -1238,7 +1238,7 @@ func TestFinalizeSplitPreservesParentVectorRecall(t *testing.T) {
 	require.NoError(t, db.Open(srcDir, false, nil, fullRange))
 	require.NoError(t, db.AddIndex(*indexes.NewEmbeddingsConfig(indexName, indexes.EmbeddingsIndexConfig{
 		Dimension: 20,
-		Field:     "content",
+		External:  true,
 	})))
 	dir := srcDir
 	defer db.Close()
@@ -1252,7 +1252,7 @@ func TestFinalizeSplitPreservesParentVectorRecall(t *testing.T) {
 	writes := make([][2][]byte, 0, dataCount)
 	retainedKeys := make([]string, 0, retainedCount)
 	for i := range dataCount {
-		key := []byte(fmt.Sprintf("key:%04d", i))
+		key := fmt.Appendf(nil, "key:%04d", i)
 		if i < retainedCount {
 			retainedKeys = append(retainedKeys, string(key))
 		}
@@ -1272,13 +1272,13 @@ func TestFinalizeSplitPreservesParentVectorRecall(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	idx := db.indexManager.GetIndex(indexName)
+	idx := db.GetIndex(indexName)
 	require.NotNil(t, idx)
 	embIdx, ok := idx.(*indexes.EmbeddingIndex)
 	require.True(t, ok, "Index should be an EmbeddingIndex")
 	waitForEmbeddingIndexTotalIndexed(t, embIdx, dataCount, waitTimeout, waitFrequency)
 
-	splitKey := []byte(fmt.Sprintf("key:%04d", retainedCount))
+	splitKey := fmt.Appendf(nil, "key:%04d", retainedCount)
 	parentRange := types.Range{fullRange[0], splitKey}
 
 	require.NoError(t, db.SetSplitState(SplitState_builder{
@@ -1316,7 +1316,7 @@ func calculateIndexManagerVectorRecall(
 
 	for i := range int(queryVectors.GetCount()) {
 		queryVec := slices.Clone(queryVectors.At(i))
-		raw, err := db.indexManager.Search(ctx, indexName, &vectorindex.SearchRequest{
+		raw, err := db.SearchIndex(ctx, indexName, &vectorindex.SearchRequest{
 			K:         topK,
 			Embedding: queryVec,
 		})

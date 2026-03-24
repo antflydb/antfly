@@ -310,8 +310,8 @@ func createTestDB(t *testing.T, dir string) *DBImpl {
 		logger:       zap.NewNop(),
 		antflyConfig: &common.Config{},
 		indexes:      make(map[string]indexes.IndexConfig),
-		byteRange:    types.Range{[]byte(""), []byte("")},
 	}
+	db.setByteRange(types.Range{[]byte(""), []byte("")})
 
 	testSchema := &schema.TableSchema{
 		DefaultType: "default",

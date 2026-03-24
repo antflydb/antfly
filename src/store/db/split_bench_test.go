@@ -232,13 +232,12 @@ func setupSplitBenchDB(
 	require.NoError(b, db.pdb.Flush())
 	time.Sleep(200 * time.Millisecond)
 
-	splitKey := []byte(fmt.Sprintf("key:%07d", cfg.docs/2))
+	splitKey := fmt.Appendf(nil, "key:%07d", cfg.docs/2)
 	return db, splitKey, destDir1, destDir2, fullRange
 }
 
 func BenchmarkSplitPrepareOnlyCheckpoint(b *testing.B) {
 	for _, cfg := range splitBenchConfigs() {
-		cfg := cfg
 		b.Run(cfg.name(), func(b *testing.B) {
 			b.ReportAllocs()
 			b.ReportMetric(float64(cfg.docs), "docs")
@@ -268,7 +267,6 @@ func BenchmarkSplitPrepareOnlyCheckpoint(b *testing.B) {
 
 func BenchmarkFinalizeSplitPrune(b *testing.B) {
 	for _, cfg := range splitBenchConfigs() {
-		cfg := cfg
 		b.Run(cfg.name(), func(b *testing.B) {
 			b.ReportAllocs()
 			b.ReportMetric(float64(cfg.docs), "docs")
