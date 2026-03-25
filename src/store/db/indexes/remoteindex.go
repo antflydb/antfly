@@ -48,6 +48,30 @@ type FieldFilter struct {
 	CountStar bool     `json:"count_star,omitempty"`
 	Star      bool     `json:"star,omitempty"`
 }
+
+// ShardIndex is the interface for querying a shard, whether local (in-process)
+// or remote (over HTTP). Both RemoteIndex and LocalIndex implement this.
+type ShardIndex interface {
+	bleve.Index // SearchInContext for FullTextSearch via bleve IndexAlias
+	RemoteSearch(ctx context.Context, req *RemoteIndexSearchRequest) (*RemoteIndexSearchResult, error)
+	BatchRemoteSearch(ctx context.Context, reqs []*RemoteIndexSearchRequest) ([]*RemoteIndexSearchResult, []error)
+	Name() string
+	ShardID() types.ID
+	IndexMapping() mapping.IndexMapping
+	SchemaVersion() uint32
+}
+
+// ShardIndexes is a collection of ShardIndex, one per shard.
+type ShardIndexes []ShardIndex
+
+// ShardSearcher provides direct (in-process) shard search, bypassing HTTP.
+// Implemented by a thin adapter over store.StoreIface in swarm mode.
+type ShardSearcher interface {
+	SearchShard(ctx context.Context, shardID types.ID, query []byte) ([]byte, error)
+}
+
+var _ ShardIndex = (*RemoteIndex)(nil)
+
 type RemoteIndex struct {
 	client *http.Client
 	urls   []string
@@ -452,22 +476,33 @@ func MakeIndexesForShards(
 	tableSchema *schema.TableSchema,
 	peers map[types.ID][]string,
 	ff *FieldFilter,
-) (RemoteIndexes, error) {
-	indexes := []*RemoteIndex{}
+	localSearcher ShardSearcher,
+) (ShardIndexes, error) {
+	indexes := make(ShardIndexes, 0, len(peers))
+	idxMapping := schema.NewIndexMapFromSchema(tableSchema)
 
-	// For each shard, use the provided peer URLs to create remote indexes
 	for shardID, peerURLs := range peers {
+		if localSearcher != nil {
+			indexes = append(indexes, &LocalIndex{
+				shard:      shardID,
+				searcher:   localSearcher,
+				idxMapping: idxMapping,
+				schema:     tableSchema,
+				q:          ff,
+			})
+			continue
+		}
+
 		if len(peerURLs) == 0 {
 			return nil, fmt.Errorf("no peer URLs found for shard %s", shardID)
 		}
 		slices.Sort(peerURLs)
-		// Create a remote index
 		remoteIndex, err := NewRemoteIndex(client, peerURLs, shardID)
 		if err != nil {
 			return nil, fmt.Errorf("creating remote index: %v", err)
 		}
 		remoteIndex.q = ff
-		remoteIndex.mapping = schema.NewIndexMapFromSchema(tableSchema)
+		remoteIndex.mapping = idxMapping
 		remoteIndex.schema = tableSchema
 		indexes = append(indexes, remoteIndex)
 	}
@@ -475,7 +510,8 @@ func MakeIndexesForShards(
 	return indexes, nil
 }
 
-type RemoteIndexes []*RemoteIndex
+// RemoteIndexes is kept as an alias for backward compatibility.
+type RemoteIndexes = ShardIndexes
 
 type FullTextPagingOptions struct {
 	OrderBy      []SortField
@@ -561,7 +597,7 @@ type AggregationRequest struct {
 	Aggregations          AggregationRequests `json:"aggregations,omitempty"`
 }
 
-func (r RemoteIndexes) FullTextSearch(
+func (r ShardIndexes) FullTextSearch(
 	ctx context.Context,
 	q query.Query,
 	facetOptions AggregationRequests,
@@ -589,7 +625,7 @@ func (r RemoteIndexes) FullTextSearch(
 	}
 	applyFullTextPaging(searchReq, pagingOpts)
 	index := bleve.NewIndexAlias()
-	if err := index.SetIndexMapping(r[0].mapping); err != nil {
+	if err := index.SetIndexMapping(r[0].IndexMapping()); err != nil {
 		return nil, fmt.Errorf("setting index mapping: %w", err)
 	}
 	for _, i := range r {
@@ -612,9 +648,9 @@ func (r RemoteIndexes) FullTextSearch(
 // GlobalScoring requires the _all field to have content; without it, bleve
 // cannot compute cross-shard BM25 stats and every search fails with
 // "field stat for bm25 not present _all".
-func (r RemoteIndexes) withGlobalScoringCtx(ctx context.Context) context.Context {
+func (r ShardIndexes) withGlobalScoringCtx(ctx context.Context) context.Context {
 	if len(r) > 1 {
-		if m, ok := r[0].mapping.(*mapping.IndexMappingImpl); ok && m.ScoringModel == bleveindex.BM25Scoring {
+		if m, ok := r[0].IndexMapping().(*mapping.IndexMappingImpl); ok && m.ScoringModel == bleveindex.BM25Scoring {
 			// Only enable GlobalScoring when the _all document mapping is
 			// enabled (i.e., at least one field has IncludeInAll=true).
 			if allMapping, ok := m.TypeMapping["_all"]; ok && allMapping.Enabled {
@@ -756,7 +792,7 @@ func (r *RemoteIndex) BatchRemoteSearch(
 func BatchMultiSearch(
 	ctx context.Context,
 	reqs []*RemoteIndexSearchRequest,
-	indexes []*RemoteIndex,
+	indexes []ShardIndex,
 ) ([]*RemoteIndexSearchResult, error) {
 	if len(reqs) != len(indexes) {
 		return nil, fmt.Errorf("mismatched requests and indexes: %d vs %d", len(reqs), len(indexes))
@@ -771,7 +807,7 @@ func BatchMultiSearch(
 		req         *RemoteIndexSearchRequest
 	}
 	shardRequests := make(map[string][]indexedReq)
-	shardIndex := make(map[string]*RemoteIndex)
+	shardIndex := make(map[string]ShardIndex)
 
 	for i, idx := range indexes {
 		shardName := idx.Name()
@@ -944,7 +980,15 @@ func (r *RemoteIndex) SetInternal(key, val []byte) error {
 func (r *RemoteIndex) DeleteInternal(key []byte) error {
 	return errors.New("operation not implemented remotely")
 }
-func (r *RemoteIndex) Name() string        { return r.shard.String() }
+func (r *RemoteIndex) Name() string            { return r.shard.String() }
+func (r *RemoteIndex) ShardID() types.ID       { return r.shard }
+func (r *RemoteIndex) IndexMapping() mapping.IndexMapping { return r.mapping }
+func (r *RemoteIndex) SchemaVersion() uint32 {
+	if r.schema != nil {
+		return r.schema.Version
+	}
+	return 0
+}
 func (r *RemoteIndex) Type() IndexType     { return IndexTypeFullText }
 func (r *RemoteIndex) SetName(name string) {}
 func (r *RemoteIndex) Advanced() (bleveindex.Index, error) {
@@ -956,7 +1000,7 @@ func (r *RemoteIndex) Advanced() (bleveindex.Index, error) {
 func MultiSearch(
 	ctx context.Context,
 	req *RemoteIndexSearchRequest,
-	indexes ...*RemoteIndex,
+	indexes ...ShardIndex,
 ) (*RemoteIndexSearchResult, error) {
 	searchStart := time.Now()
 	asyncResults := make(chan *asyncSearchResult, len(indexes))
@@ -964,7 +1008,7 @@ func MultiSearch(
 	// run search on each index in separate go routine
 	var waitGroup sync.WaitGroup
 
-	searchChildIndex := func(in *RemoteIndex, childReq *RemoteIndexSearchRequest) {
+	searchChildIndex := func(in ShardIndex, childReq *RemoteIndexSearchRequest) {
 		rv := asyncSearchResult{Name: in.Name()}
 		rv.Result, rv.Err = in.RemoteSearch(ctx, childReq)
 		asyncResults <- &rv
@@ -1624,7 +1668,7 @@ func (q *Query) VectorPagingOptions() VectorPagingOptions {
 // FusedSearch combines results from Bleve and Vector searches using fusion strategies.
 // Supports both RRF (Reciprocal Rank Fusion) and RSF (Relative Score Fusion).
 // The fusion strategy and parameters are determined by the MergeConfig in the query.
-func (r RemoteIndexes) FusedSearch(ctx context.Context, jsonQuery *Query) (*FusionResult, error) {
+func (r ShardIndexes) FusedSearch(ctx context.Context, jsonQuery *Query) (*FusionResult, error) {
 	searchStart := time.Now()
 	risr, err := jsonQuery.RemoteIndexSearchRequest()
 	if err != nil {

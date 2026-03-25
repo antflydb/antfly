@@ -17,10 +17,15 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
@@ -31,6 +36,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 var swarmCmd = &cobra.Command{
@@ -120,17 +126,53 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	}()
 	healthserver.Start(logger, config.HealthPort, ready.Load)
 
-	go metadata.RunAsMetadataServer(ctx, logger, config,
-		&store.StoreInfo{
-			ID:      tid,
-			RaftURL: viper.GetString("swarm.metadata-raft"),
-			ApiURL:  viper.GetString("swarm.metadata-api"),
-		},
-		peers,
-		false, // join
-		metadataReadyC,
-		cache,
+	metaConf := &store.StoreInfo{
+		ID:      tid,
+		RaftURL: viper.GetString("swarm.metadata-raft"),
+		ApiURL:  viper.GetString("swarm.metadata-api"),
+	}
+
+	// Create metadata runtime inline so we can wire the local store bypass.
+	metaRuntime, err := metadata.NewRuntime(
+		logger.Named("metadataServer"), config, metaConf, peers, false, cache,
 	)
+	if err != nil {
+		return fmt.Errorf("creating metadata runtime: %w", err)
+	}
+	metaRuntime.StartRaft()
+	defer func() {
+		if err := metaRuntime.Close(); err != nil {
+			logger.Error("failed to close metadata runtime", zap.Error(err))
+		}
+	}()
+
+	// Start metadata HTTP server.
+	go func() {
+		u, err := url.Parse(metaConf.ApiURL)
+		if err != nil {
+			logger.Fatal("Error parsing metadata API URL", zap.Error(err))
+		}
+		srv := http.Server{
+			Addr:        u.Host,
+			Handler:     metaRuntime.HTTPHandler(),
+			ReadTimeout: 10 * time.Second,
+		}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+		listener, listenErr := net.Listen("tcp", u.Host)
+		if listenErr != nil {
+			logger.Fatal("Failed to create metadata listener", zap.Error(listenErr))
+		}
+		close(metadataReadyC)
+		logger.Info("Metadata API server is ready", zap.String("address", u.Host))
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Fatal("Metadata HTTP server error", zap.Error(err))
+		}
+	}()
 
 	// Wait for metadata to finish Pebble initialization before starting other services
 	<-metadataReadyC
@@ -146,6 +188,66 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		ApiURL:  viper.GetString("swarm.store-api"),
 		RaftURL: viper.GetString("swarm.store-raft"),
 	}
-	store.RunAsStore(ctx, logger, config, storeConf, "", storeReadyC, cache)
+
+	// Create store runtime inline so we can wire the local bypass.
+	storeRuntime, err := store.NewRuntime(logger.Named("store"), config, storeConf, cache)
+	if err != nil {
+		return fmt.Errorf("creating store runtime: %w", err)
+	}
+	storeRuntime.StartRaft()
+	defer func() {
+		if err := storeRuntime.Close(); err != nil {
+			logger.Error("failed to close store runtime", zap.Error(err))
+		}
+	}()
+
+	// Wire local bypass: metadata calls store directly in-process.
+	metaRuntime.SetLocalStore(tid, storeRuntime.Store())
+	logger.Info("Local shard bypass enabled for swarm mode")
+
+	eg, egCtx := errgroup.WithContext(ctx)
+
+	// Start store HTTP server (still needed for raft transport and registration).
+	eg.Go(func() error {
+		u, err := url.Parse(storeConf.ApiURL)
+		if err != nil {
+			return fmt.Errorf("parsing store API URL: %w", err)
+		}
+		srv := &http.Server{
+			Addr:        u.Host,
+			Handler:     storeRuntime.HTTPHandler(),
+			ReadTimeout: time.Minute,
+		}
+		go func() {
+			<-egCtx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+		listener, listenErr := net.Listen("tcp", u.Host)
+		if listenErr != nil {
+			return fmt.Errorf("creating store listener: %w", listenErr)
+		}
+		close(storeReadyC)
+		logger.Info("Store HTTP server is ready", zap.String("address", u.Host))
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("store HTTP server: %w", err)
+		}
+		return nil
+	})
+
+	// Register store with metadata (still via HTTP for cluster bookkeeping).
+	eg.Go(func() error {
+		orchURLs, _ := config.Metadata.GetOrchestrationURLs()
+		return store.RegisterWithLeaderWithRetry(egCtx, logger, storeRuntime.Store(), storeConf, orchURLs)
+	})
+
+	if err := eg.Wait(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			logger.Info("Swarm shut down")
+			return nil
+		}
+		return fmt.Errorf("swarm failure: %w", err)
+	}
 	return nil
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/antflydb/antfly/src/metadata/reconciler"
+	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/tablemgr"
@@ -69,6 +70,10 @@ type MetadataStore struct {
 	clock clock.Clock
 
 	txnIDGenerator func() uuid.UUID
+
+	// shardSearcher enables in-process shard search, bypassing HTTP.
+	// Set in swarm mode via Runtime.SetLocalStore.
+	shardSearcher indexes.ShardSearcher
 }
 
 func (ms *MetadataStore) clockOrReal() clock.Clock {

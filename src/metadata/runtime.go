@@ -36,6 +36,7 @@ import (
 	"github.com/antflydb/antfly/src/metadata/reconciler"
 	"github.com/antflydb/antfly/src/raft"
 	"github.com/antflydb/antfly/src/store"
+	storeclient "github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/antflydb/antfly/src/usermgr"
 	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
@@ -197,6 +198,17 @@ func NewRuntime(
 	return runtime, nil
 }
 
+// SetLocalStore configures in-process bypass for store communication.
+// When set, queries call shards directly instead of going over HTTP,
+// and the StoreClientFactory returns a LocalStoreClient.
+// Call after both metadata and store runtimes are created in swarm mode.
+func (r *Runtime) SetLocalStore(nodeID types.ID, s store.StoreIface) {
+	r.node.shardSearcher = &storeShardSearcher{store: s}
+	r.tableManager.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) storeclient.StoreRPC {
+		return storeclient.NewLocalStoreClient(id, s)
+	})
+}
+
 func (r *Runtime) StartRaft() {
 	go r.raft.Start()
 }
@@ -235,6 +247,19 @@ func (r *Runtime) Close() error {
 		}
 	})
 	return r.closeErr
+}
+
+// storeShardSearcher adapts store.StoreIface to indexes.ShardSearcher.
+type storeShardSearcher struct {
+	store store.StoreIface
+}
+
+func (s *storeShardSearcher) SearchShard(ctx context.Context, shardID types.ID, query []byte) ([]byte, error) {
+	shard, ok := s.store.Shard(shardID)
+	if !ok {
+		return nil, fmt.Errorf("shard %s not found", shardID)
+	}
+	return shard.Search(ctx, query)
 }
 
 func newStoreHTTPClient(config *common.Config) (*http.Client, io.Closer, error) {

@@ -406,6 +406,7 @@ func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryRe
 			Star:      len(q.Fields) == 0,
 			CountStar: q.Count && len(q.Fields) == 0 && queryReq.FullTextSearch != nil,
 		},
+		t.ln.shardSearcher,
 	)
 	if err != nil {
 		return QueryResult{
@@ -863,9 +864,9 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 	// For each valid query, we need to send to ALL shards
 	// Structure: [query0_shard0, query0_shard1, ..., query1_shard0, query1_shard1, ...]
 	var shardReqs []*indexes.RemoteIndexSearchRequest
-	var shardIdxs []*indexes.RemoteIndex
+	var shardIdxs []indexes.ShardIndex
 	validQueryIndices := []int{}
-	queryShardIndexes := make(map[int]indexes.RemoteIndexes)
+	queryShardIndexes := make(map[int]indexes.ShardIndexes)
 
 	for i, pq := range prepared {
 		if pq.err != "" {
@@ -883,6 +884,7 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 				Star:      len(pq.query.Fields) == 0,
 				CountStar: pq.query.Count && len(pq.query.Fields) == 0 && pq.queryReq.FullTextSearch != nil,
 			},
+			t.ln.shardSearcher,
 		)
 		if err != nil {
 			results[i] = QueryResult{

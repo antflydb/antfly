@@ -79,6 +79,19 @@ func registerWithLeader(
 	return nil
 }
 
+// RegisterWithLeaderWithRetry registers a store with the metadata cluster using
+// a default HTTP client. Suitable for swarm mode where the caller manages runtimes.
+func RegisterWithLeaderWithRetry(
+	ctx context.Context,
+	lg *zap.Logger,
+	store *Store,
+	conf *StoreInfo,
+	registrationsURLsMap map[types.ID]string,
+) error {
+	client := &http.Client{Timeout: 30 * time.Second}
+	return registerWithLeaderWithRetry(ctx, lg, client, store, conf, registrationsURLsMap)
+}
+
 // registerWithLeaderWithRetry attempts to register with the leader with exponential backoff
 // It retries until successful or until the context is canceled
 func registerWithLeaderWithRetry(
