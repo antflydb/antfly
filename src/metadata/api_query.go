@@ -16,6 +16,7 @@ package metadata
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -23,13 +24,15 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
-	json "github.com/antflydb/antfly/pkg/libaf/json"
+	"github.com/antflydb/antfly/pkg/libaf/json"
 
 	"github.com/antflydb/antfly/lib/embeddings"
 	"github.com/antflydb/antfly/lib/schema"
+	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/vector"
 	"github.com/antflydb/antfly/lib/vector/stats"
 	"github.com/antflydb/antfly/lib/workerpool"
@@ -341,6 +344,47 @@ func (q *QueryRequest) mergeConfigToInternal() *indexes.MergeConfig {
 	}
 }
 
+// getOrCreateBaseIndexes returns cached base RemoteIndexes for the given schema
+// and shard topology, creating them if the cache misses or topology changed.
+// The cache avoids rebuilding bleve index mappings on every query.
+func (t *TableApi) getOrCreateBaseIndexes(
+	tableSchema *schema.TableSchema,
+	peers map[types.ID][]string,
+) (indexes.RemoteIndexes, error) {
+	// Build a deterministic cache key from schema version + sorted shard peers.
+	h := xxhash.New()
+	if tableSchema != nil {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(tableSchema.Version))
+		h.Write(buf[:])
+	}
+	shardIDs := make([]types.ID, 0, len(peers))
+	for id := range peers {
+		shardIDs = append(shardIDs, id)
+	}
+	slices.SortFunc(shardIDs, func(a, b types.ID) int { return cmp.Compare(a, b) })
+	for _, id := range shardIDs {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(id))
+		h.Write(buf[:])
+		for _, u := range peers[id] {
+			h.WriteString(u)
+		}
+	}
+	key := h.Sum64()
+
+	if cached, ok := t.baseIndexCache.Load(key); ok {
+		return cached.(indexes.RemoteIndexes), nil
+	}
+
+	base, err := indexes.MakeBaseIndexesForShards(t.tm.HttpClient(), tableSchema, peers)
+	if err != nil {
+		return nil, err
+	}
+	t.baseIndexCache.Store(key, base)
+	return base, nil
+}
+
 func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryResult {
 	// Validate request configuration first
 	if err := queryReq.Validate(); err != nil {
@@ -397,22 +441,18 @@ func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryRe
 	if table.ReadSchema != nil {
 		querySchema = table.ReadSchema
 	}
-	shardIndexes, err := indexes.MakeIndexesForShards(
-		t.tm.HttpClient(),
-		querySchema,
-		shardPeers,
-		&indexes.FieldFilter{
-			Fields:    q.Fields,
-			Star:      len(q.Fields) == 0,
-			CountStar: q.Count && len(q.Fields) == 0 && queryReq.FullTextSearch != nil,
-		},
-	)
+	baseIndexes, err := t.getOrCreateBaseIndexes(querySchema, shardPeers)
 	if err != nil {
 		return QueryResult{
 			Status: http.StatusInternalServerError,
 			Error:  fmt.Sprintf("creating search indexes: %v", err),
 		}
 	}
+	shardIndexes := baseIndexes.WithFieldFilter(&indexes.FieldFilter{
+		Fields:    q.Fields,
+		Star:      len(q.Fields) == 0,
+		CountStar: q.Count && len(q.Fields) == 0 && queryReq.FullTextSearch != nil,
+	})
 	t.logger.Debug("Received JSON query",
 		zap.Any("remoteindex.Query", q),
 		zap.Any("QueryRequest", queryReq))
@@ -873,17 +913,8 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 			continue
 		}
 
-		// Create shard indexes for this query
-		shardIndexes, err := indexes.MakeIndexesForShards(
-			t.tm.HttpClient(),
-			querySchema,
-			shardPeers,
-			&indexes.FieldFilter{
-				Fields:    pq.query.Fields,
-				Star:      len(pq.query.Fields) == 0,
-				CountStar: pq.query.Count && len(pq.query.Fields) == 0 && pq.queryReq.FullTextSearch != nil,
-			},
-		)
+		// Create shard indexes for this query (reuses cached base indexes).
+		baseIndexes, err := t.getOrCreateBaseIndexes(querySchema, shardPeers)
 		if err != nil {
 			results[i] = QueryResult{
 				Status: http.StatusInternalServerError,
@@ -891,6 +922,11 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 			}
 			continue
 		}
+		shardIndexes := baseIndexes.WithFieldFilter(&indexes.FieldFilter{
+			Fields:    pq.query.Fields,
+			Star:      len(pq.query.Fields) == 0,
+			CountStar: pq.query.Count && len(pq.query.Fields) == 0 && pq.queryReq.FullTextSearch != nil,
+		})
 
 		// Convert query to search request
 		searchReq, err := pq.query.RemoteIndexSearchRequest()

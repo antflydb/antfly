@@ -81,7 +81,8 @@ type TableApi struct {
 	joinService *JoinService
 	joinInitErr error
 	foreignPool *foreign.PoolManager
-	prunerCache sync.Map // documentRenderer string → *ai.Pruner
+	prunerCache     sync.Map // documentRenderer string → *ai.Pruner
+	baseIndexCache  sync.Map // shardTopologyKey (uint64) → indexes.RemoteIndexes
 }
 type ClusterApi struct {
 	ln     *MetadataStore

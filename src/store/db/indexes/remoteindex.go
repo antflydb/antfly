@@ -447,32 +447,59 @@ func (ss *RemoteIndexSearchStatus) Merge(other *RemoteIndexSearchStatus) {
 	}
 }
 
+// MakeBaseIndexesForShards creates RemoteIndex objects for each shard without
+// a per-query FieldFilter. The returned indexes can be reused across queries
+// by calling WithFieldFilter to set query-specific field projections.
+func MakeBaseIndexesForShards(
+	client *http.Client,
+	tableSchema *schema.TableSchema,
+	peers map[types.ID][]string,
+) (RemoteIndexes, error) {
+	idxMapping := schema.NewIndexMapFromSchema(tableSchema)
+	indexes := make([]*RemoteIndex, 0, len(peers))
+
+	for shardID, peerURLs := range peers {
+		if len(peerURLs) == 0 {
+			return nil, fmt.Errorf("no peer URLs found for shard %s", shardID)
+		}
+		slices.Sort(peerURLs)
+		remoteIndex, err := NewRemoteIndex(client, peerURLs, shardID)
+		if err != nil {
+			return nil, fmt.Errorf("creating remote index: %v", err)
+		}
+		remoteIndex.mapping = idxMapping
+		remoteIndex.schema = tableSchema
+		indexes = append(indexes, remoteIndex)
+	}
+
+	return indexes, nil
+}
+
+// MakeIndexesForShards creates RemoteIndex objects for each shard with a
+// per-query FieldFilter applied.
 func MakeIndexesForShards(
 	client *http.Client,
 	tableSchema *schema.TableSchema,
 	peers map[types.ID][]string,
 	ff *FieldFilter,
 ) (RemoteIndexes, error) {
-	indexes := []*RemoteIndex{}
-
-	// For each shard, use the provided peer URLs to create remote indexes
-	for shardID, peerURLs := range peers {
-		if len(peerURLs) == 0 {
-			return nil, fmt.Errorf("no peer URLs found for shard %s", shardID)
-		}
-		slices.Sort(peerURLs)
-		// Create a remote index
-		remoteIndex, err := NewRemoteIndex(client, peerURLs, shardID)
-		if err != nil {
-			return nil, fmt.Errorf("creating remote index: %v", err)
-		}
-		remoteIndex.q = ff
-		remoteIndex.mapping = schema.NewIndexMapFromSchema(tableSchema)
-		remoteIndex.schema = tableSchema
-		indexes = append(indexes, remoteIndex)
+	base, err := MakeBaseIndexesForShards(client, tableSchema, peers)
+	if err != nil {
+		return nil, err
 	}
+	return base.WithFieldFilter(ff), nil
+}
 
-	return indexes, nil
+// WithFieldFilter returns a copy of each RemoteIndex with the given FieldFilter
+// applied. The underlying client, mapping, and schema are shared (not copied).
+func (r RemoteIndexes) WithFieldFilter(ff *FieldFilter) RemoteIndexes {
+	out := make(RemoteIndexes, len(r))
+	for i, ri := range r {
+		clone := *ri
+		clone.q = ff
+		out[i] = &clone
+	}
+	return out
 }
 
 type RemoteIndexes []*RemoteIndex
@@ -959,6 +986,26 @@ func MultiSearch(
 	indexes ...*RemoteIndex,
 ) (*RemoteIndexSearchResult, error) {
 	searchStart := time.Now()
+
+	// Fast path: single shard avoids goroutine/channel overhead.
+	if len(indexes) == 1 {
+		sr, err := indexes[0].RemoteSearch(ctx, req)
+		if err != nil {
+			sr = &RemoteIndexSearchResult{
+				Status: &RemoteIndexSearchStatus{
+					Total:  1,
+					Failed: 1,
+					Errors: map[string]error{indexes[0].Name(): err},
+				},
+			}
+		}
+		if sr == nil {
+			sr = &RemoteIndexSearchResult{}
+		}
+		sr.Took = time.Since(searchStart)
+		return sr, nil
+	}
+
 	asyncResults := make(chan *asyncSearchResult, len(indexes))
 
 	// run search on each index in separate go routine
@@ -1631,14 +1678,7 @@ func (r RemoteIndexes) FusedSearch(ctx context.Context, jsonQuery *Query) (*Fusi
 		return nil, fmt.Errorf("creating remote index search request: %w", err)
 	}
 
-	var remoteRes *RemoteIndexSearchResult
-	var remoteErr error
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		remoteRes, remoteErr = MultiSearch(ctx, risr, r...)
-	})
-
-	wg.Wait()
+	remoteRes, remoteErr := MultiSearch(ctx, risr, r...)
 
 	var fusedResults *FusionResult
 
