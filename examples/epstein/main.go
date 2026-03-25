@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"iter"
 	"log"
 	"net/http"
 	"os"
@@ -179,33 +180,8 @@ func (o *OCRClient) GeneratePageWithPrompt(ctx context.Context, pdfData []byte, 
 	return "", "", fmt.Errorf("all models failed to produce text")
 }
 
-// needsOCRFallback determines if OCR should be attempted based on extracted text quality.
-func needsOCRFallback(content string, minContentLen int) bool {
-	content = strings.TrimSpace(content)
-
-	// Check minimum content length
-	if len(content) < minContentLen {
-		return true
-	}
-
-	// Check for garbled text patterns
-	if hasGarbledPatterns(content) {
-		return true
-	}
-
-	// Check for font encoding corruption
-	if hasFontEncodingCorruption(content) {
-		return true
-	}
-
-	// Check replacement character ratio (encoding issues)
-	replacementCount := countReplacementChars(content)
-	if len(content) > 0 && float64(replacementCount)/float64(len(content)) > 0.05 {
-		return true
-	}
-
-	return false
-}
+// needsOCRFallback delegates to docsaf.NeedsOCRFallback.
+var needsOCRFallback = docsaf.NeedsOCRFallback
 
 //go:embed templates/*
 var templatesFS embed.FS
@@ -1340,15 +1316,9 @@ func prepareCmd(args []string) error {
 		records[section.ID] = section.ToDocument()
 	}
 
-	// Write to JSON file
+	// Stream records to JSON file with sorted keys (avoids holding marshaled JSON in memory)
 	fmt.Printf("Writing %d records to %s...\n", len(records), *outputFile)
-	jsonData, err := json.MarshalIndent(records, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-
-	err = os.WriteFile(*outputFile, jsonData, 0644)
-	if err != nil {
+	if err := writeJSONSorted(*outputFile, records); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -1410,49 +1380,35 @@ func loadCmd(args []string) error {
 			fmt.Printf("Table created with BM25 and embedding indexes\n\n")
 		}
 
-		if err := waitForShardsReady(ctx, client, *tableName, 30*time.Second); err != nil {
+		if err := client.WaitForTable(ctx, *tableName, 30*time.Second); err != nil {
 			return fmt.Errorf("error waiting for shards: %w", err)
 		}
+		fmt.Printf("Shards ready\n\n")
 	}
 
-	// Read JSON file
-	fmt.Printf("Reading records from %s...\n", *inputFile)
-	jsonData, err := os.ReadFile(*inputFile)
+	// Stream pages from JSON file directly into ExecuteLinearMerge
+	fmt.Printf("Streaming records from %s...\n", *inputFile)
+	f, err := os.Open(*inputFile)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("failed to open file: %w", err)
 	}
+	defer f.Close()
 
-	var records map[string]any
-	err = json.Unmarshal(jsonData, &records)
+	pages := streamJSONPages(f, *batchSize)
+
+	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
+		DryRun:    *dryRun,
+		SyncLevel: antfly.SyncLevelAknn,
+		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
+			fmt.Printf("[batch %d] upserted: %d, took: %s\n", batch, result.Upserted, result.Took)
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal JSON: %w", err)
+		return fmt.Errorf("linear merge failed: %w", err)
 	}
 
-	fmt.Printf("Loaded %d records\n\n", len(records))
-
-	// Perform batched linear merge
-	finalCursor, err := performBatchedLinearMerge(ctx, client, *tableName, records, *batchSize, *dryRun)
-	if err != nil {
-		return fmt.Errorf("batched linear merge failed: %w", err)
-	}
-
-	// Final cleanup
-	if finalCursor != "" && !*dryRun {
-		fmt.Printf("\nPerforming final cleanup...\n")
-		cleanupResult, err := client.LinearMerge(ctx, *tableName, antfly.LinearMergeRequest{
-			Records:      map[string]any{},
-			LastMergedId: finalCursor,
-			DryRun:       false,
-			SyncLevel:    antfly.SyncLevelAknn,
-		})
-		if err != nil {
-			return fmt.Errorf("final cleanup failed: %w", err)
-		}
-		fmt.Printf("Final cleanup completed in %s\n", cleanupResult.Took)
-		fmt.Printf("  Deleted: %d orphaned documents\n", cleanupResult.Deleted)
-	}
-
-	fmt.Printf("\nLoad completed successfully\n")
+	fmt.Printf("\nLoad completed: %d upserted, %d deleted, %d batches\n",
+		mergeResult.Upserted, mergeResult.Deleted, mergeResult.Batches)
 	return nil
 }
 
@@ -1518,9 +1474,10 @@ func syncCmd(args []string) error {
 			log.Printf("Warning: %v\n", err)
 		}
 
-		if err := waitForShardsReady(ctx, client, *tableName, 30*time.Second); err != nil {
+		if err := client.WaitForTable(ctx, *tableName, 30*time.Second); err != nil {
 			return fmt.Errorf("error waiting for shards: %w", err)
 		}
+		fmt.Printf("Shards ready\n\n")
 	}
 
 	// Determine available sources
@@ -1532,8 +1489,9 @@ func syncCmd(args []string) error {
 		return fmt.Errorf("no sources: --dir %s does not exist and no --zip provided", *dirPath)
 	}
 
-	// Process PDFs from directory
-	var sections []docsaf.DocumentSection
+	// Build records map directly from processing (no intermediate sections slice)
+	records := make(map[string]any)
+
 	if dirExists {
 		source := docsaf.NewFilesystemSource(docsaf.FilesystemSourceConfig{
 			BaseDir:         *dirPath,
@@ -1558,14 +1516,17 @@ func syncCmd(args []string) error {
 		processor := docsaf.NewProcessor(source, registry)
 
 		fmt.Printf("Processing PDF files...\n")
-		var err error
-		sections, err = processor.Process(ctx)
-		if err != nil {
+		if err := processor.ProcessWithCallback(ctx, func(sections []docsaf.DocumentSection) error {
+			for _, section := range sections {
+				records[section.ID] = section.ToDocument()
+			}
+			return nil
+		}); err != nil {
 			return fmt.Errorf("failed to process: %w", err)
 		}
 	}
 
-	// Process ZIP sources
+	// Process ZIP sources directly into records
 	if len(zipPaths) > 0 {
 		pdfProcessor := &docsaf.PDFProcessor{
 			EnableHeaderFooterDetection: !*noHeaderFooter,
@@ -1574,12 +1535,14 @@ func syncCmd(args []string) error {
 		for _, zipPath := range zipPaths {
 			fmt.Printf("Processing ZIP: %s\n", zipPath)
 			if err := iterateZipPDFs(zipPath, func(name string, data []byte) error {
-				zipSections, err := pdfProcessor.Process(name, "", *baseURL, data)
+				sections, err := pdfProcessor.Process(name, "", *baseURL, data)
 				if err != nil {
 					fmt.Printf("  Warning: failed to process %s: %v\n", name, err)
 					return nil
 				}
-				sections = append(sections, zipSections...)
+				for _, section := range sections {
+					records[section.ID] = section.ToDocument()
+				}
 				return nil
 			}); err != nil {
 				return fmt.Errorf("failed to process zip %s: %w", zipPath, err)
@@ -1587,34 +1550,48 @@ func syncCmd(args []string) error {
 		}
 	}
 
-	fmt.Printf("Found %d pages\n\n", len(sections))
+	fmt.Printf("Found %d records\n\n", len(records))
 
-	if len(sections) == 0 {
+	if len(records) == 0 {
 		return fmt.Errorf("no PDF files found")
 	}
 
-	// Convert to records
-	records := make(map[string]any)
-	for _, section := range sections {
-		records[section.ID] = section.ToDocument()
+	// Write sorted JSON to temp file so records can be GC'd before merge
+	tmpFile, err := os.CreateTemp("", "epstein-sync-*.json")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
 
-	// Load
-	finalCursor, err := performBatchedLinearMerge(ctx, client, *tableName, records, *batchSize, *dryRun)
+	fmt.Printf("Writing sorted records to temp file...\n")
+	if err := writeJSONSorted(tmpPath, records); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+	records = nil // allow GC
+
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to open temp file: %w", err)
+	}
+	defer f.Close()
+
+	pages := streamJSONPages(f, *batchSize)
+
+	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
+		DryRun:    *dryRun,
+		SyncLevel: antfly.SyncLevelAknn,
+		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
+			fmt.Printf("[batch %d] upserted: %d, took: %s\n", batch, result.Upserted, result.Took)
+		},
+	})
 	if err != nil {
 		return fmt.Errorf("merge failed: %w", err)
 	}
 
-	// Cleanup
-	if finalCursor != "" && !*dryRun {
-		client.LinearMerge(ctx, *tableName, antfly.LinearMergeRequest{
-			Records:      map[string]any{},
-			LastMergedId: finalCursor,
-			SyncLevel:    antfly.SyncLevelAknn,
-		})
-	}
-
-	fmt.Printf("\nSync completed\n")
+	fmt.Printf("\nSync completed: %d upserted, %d deleted, %d batches\n",
+		mergeResult.Upserted, mergeResult.Deleted, mergeResult.Batches)
 	return nil
 }
 
@@ -1844,62 +1821,6 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 	return &embeddingIndexConfig, nil
 }
 
-func performBatchedLinearMerge(
-	ctx context.Context,
-	client *antfly.AntflyClient,
-	tableName string,
-	records map[string]any,
-	batchSize int,
-	dryRun bool,
-) (string, error) {
-	ids := make([]string, 0, len(records))
-	for id := range records {
-		ids = append(ids, id)
-	}
-	slices.Sort(ids)
-
-	totalBatches := (len(ids) + batchSize - 1) / batchSize
-	fmt.Printf("Loading %d documents in %d batches\n", len(ids), totalBatches)
-
-	cursor := ""
-	totalUpserted := 0
-
-	for batchNum := range totalBatches {
-		start := batchNum * batchSize
-		end := min(start+batchSize, len(ids))
-
-		batchIDs := ids[start:end]
-		batchRecords := make(map[string]any, len(batchIDs))
-		for _, id := range batchIDs {
-			batchRecords[id] = records[id]
-		}
-
-		fmt.Printf("[%d/%d] Merging %d-%d...\n", batchNum+1, totalBatches, start+1, end)
-
-		result, err := client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
-			Records:      batchRecords,
-			LastMergedId: cursor,
-			DryRun:       dryRun,
-			SyncLevel:    antfly.SyncLevelAknn,
-		})
-		if err != nil {
-			return "", fmt.Errorf("batch %d failed: %w", batchNum+1, err)
-		}
-
-		if result.NextCursor != "" {
-			cursor = result.NextCursor
-		} else {
-			cursor = batchIDs[len(batchIDs)-1]
-		}
-
-		totalUpserted += result.Upserted
-		fmt.Printf("  Upserted: %d, Took: %s\n", result.Upserted, result.Took)
-	}
-
-	fmt.Printf("\nTotal upserted: %d\n", totalUpserted)
-	return cursor, nil
-}
-
 // truncateContent truncates content at a natural boundary (paragraph or sentence)
 func truncateContent(content string, maxLen int) string {
 	if len(content) <= maxLen {
@@ -1930,37 +1851,132 @@ func truncateContent(content string, maxLen int) string {
 	return truncated + "..."
 }
 
-func waitForShardsReady(ctx context.Context, client *antfly.AntflyClient, tableName string, timeout time.Duration) error {
-	fmt.Printf("Waiting for shards...\n")
+// streamJSONPages reads a JSON object {"id": record, ...} from r and yields
+// pages of batchSize entries. The input file must have keys in sorted order
+// (as produced by writeJSONSorted) so that sequential pages form valid
+// non-overlapping ranges for linear merge.
+func streamJSONPages(r io.Reader, batchSize int) iter.Seq[map[string]any] {
+	return func(yield func(map[string]any) bool) {
+		dec := json.NewDecoder(bufio.NewReaderSize(r, 256*1024))
+		dec.UseNumber()
 
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+		// Read opening {
+		tok, err := dec.Token()
+		if err != nil || tok != json.Delim('{') {
+			return
+		}
 
-	pollCount := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			pollCount++
-
-			if time.Now().After(deadline) {
-				return fmt.Errorf("timeout waiting for shards")
-			}
-
-			status, err := client.GetTable(ctx, tableName)
+		page := make(map[string]any, batchSize)
+		for dec.More() {
+			// Read key
+			tok, err := dec.Token()
 			if err != nil {
-				continue
+				return
+			}
+			key, ok := tok.(string)
+			if !ok {
+				return
 			}
 
-			if len(status.Shards) > 0 && pollCount >= 6 {
-				fmt.Printf("Shards ready\n\n")
-				return nil
+			// Read value
+			var value any
+			if err := dec.Decode(&value); err != nil {
+				return
+			}
+
+			page[key] = value
+			if len(page) >= batchSize {
+				if !yield(page) {
+					return
+				}
+				page = make(map[string]any, batchSize)
+			}
+		}
+
+		if len(page) > 0 {
+			yield(page)
+		}
+	}
+}
+
+// writeJSONSorted writes a map as a JSON object with keys in sorted order,
+// streaming entries one at a time to avoid holding the entire marshaled
+// output in memory.
+func writeJSONSorted[V any](path string, records map[string]V) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriterSize(f, 256*1024)
+
+	ids := make([]string, 0, len(records))
+	for id := range records {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	if _, err := w.WriteString("{\n"); err != nil {
+		return err
+	}
+
+	for i, id := range ids {
+		keyJSON, err := json.Marshal(id)
+		if err != nil {
+			return err
+		}
+		valJSON, err := json.MarshalIndent(records[id], "  ", "  ")
+		if err != nil {
+			return err
+		}
+
+		if _, err := w.WriteString("  "); err != nil {
+			return err
+		}
+		if _, err := w.Write(keyJSON); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(": "); err != nil {
+			return err
+		}
+		if _, err := w.Write(valJSON); err != nil {
+			return err
+		}
+
+		if i < len(ids)-1 {
+			if _, err := w.WriteString(",\n"); err != nil {
+				return err
+			}
+		} else {
+			if _, err := w.WriteString("\n"); err != nil {
+				return err
 			}
 		}
 	}
+
+	if _, err := w.WriteString("}\n"); err != nil {
+		return err
+	}
+
+	return w.Flush()
+}
+
+// readJSONFile reads an entire JSON file into the given type, streaming from
+// disk to avoid holding the raw file bytes and parsed result simultaneously.
+func readJSONFile[T any](path string) (T, error) {
+	var zero T
+	f, err := os.Open(path)
+	if err != nil {
+		return zero, err
+	}
+	defer f.Close()
+
+	var result T
+	if err := json.NewDecoder(bufio.NewReaderSize(f, 256*1024)).Decode(&result); err != nil {
+		return zero, err
+	}
+	return result, nil
 }
 
 // auditCmd audits parsed documents for errors and quality issues
@@ -1988,30 +2004,26 @@ func auditCmd(args []string) error {
 		})
 		processor := docsaf.NewProcessor(source, docsaf.DefaultRegistry())
 
-		docSections, err := processor.Process(context.Background())
-		if err != nil {
+		if err := processor.ProcessWithCallback(context.Background(), func(docSections []docsaf.DocumentSection) error {
+			for _, s := range docSections {
+				sections = append(sections, auditSection{
+					ID:       s.ID,
+					Title:    s.Title,
+					Content:  s.Content,
+					FilePath: s.FilePath,
+					PageNum:  getPageNum(s.Metadata),
+				})
+			}
+			return nil
+		}); err != nil {
 			return fmt.Errorf("failed to process: %w", err)
-		}
-		for _, s := range docSections {
-			sections = append(sections, auditSection{
-				ID:       s.ID,
-				Title:    s.Title,
-				Content:  s.Content,
-				FilePath: s.FilePath,
-				PageNum:  getPageNum(s.Metadata),
-			})
 		}
 	} else {
 		// Audit from JSON file
 		fmt.Printf("Auditing JSON file: %s\n\n", *inputFile)
-		jsonData, err := os.ReadFile(*inputFile)
+		records, err := readJSONFile[map[string]map[string]any](*inputFile)
 		if err != nil {
 			return fmt.Errorf("failed to read file: %w", err)
-		}
-
-		var records map[string]map[string]any
-		if err := json.Unmarshal(jsonData, &records); err != nil {
-			return fmt.Errorf("failed to unmarshal JSON: %w", err)
 		}
 
 		for id, rec := range records {
@@ -2219,60 +2231,26 @@ func isFragmentedLayout(content string) bool {
 	return float64(shortLines)/float64(len(lines)) > 0.6
 }
 
-func hasGarbledPatterns(content string) bool {
-	// Check for sequences of single-character "words"
-	// Excludes common legal punctuation that appears as standalone characters
-	words := strings.Fields(content)
-	if len(words) < 20 {
-		return false
-	}
-
-	singleCharWords := 0
-	for _, w := range words[:min(50, len(words))] {
-		if len(w) == 1 {
-			// Exclude common legal formatting characters that often appear as single "words"
-			// e.g., "." spacers in court case headers, "-" separators, "X" markers, "v" (versus)
-			r := rune(w[0])
-			if r != '.' && r != '-' && r != 'X' && r != 'x' && r != 'v' && r != ':' {
-				singleCharWords++
-			}
-		}
-	}
-
-	// Many single-char words in first 50 suggests garbled headers
-	return float64(singleCharWords)/float64(min(50, len(words))) > 0.4
-}
+var hasGarbledPatterns = docsaf.HasGarbledPatterns
 
 func countReplacementChars(content string) int {
-	count := 0
-	for _, r := range content {
-		if r == '\uFFFD' || r == '�' {
-			count++
-		}
+	if len(content) == 0 {
+		return 0
 	}
-	return count
+	return int(docsaf.ReplacementCharRatio(content) * float64(len([]rune(content))))
 }
 
-func hasMirroredPatterns(content string) bool {
-	// Use bigram-based detection from docsaf
-	tr := docsaf.NewTextRepair()
-	confidence := tr.DetectMirroredText(content)
+// sharedTextRepair is reused across audit calls to avoid repeated allocation.
+var sharedTextRepair = docsaf.NewTextRepair()
 
-	// Consider mirrored if confidence >= 0.3
-	if confidence >= 0.3 {
+func hasMirroredPatterns(content string) bool {
+	if sharedTextRepair.DetectMirroredText(content) >= 0.3 {
 		return true
 	}
 
-	// Also check for common hardcoded patterns as fallback
-	mirroredPatterns := []string{
-		"HCAEB MLAP", // PALM BEACH reversed
-		"ECILOP",     // POLICE reversed
-		"TROPER",     // REPORT reversed
-	}
-
-	upper := strings.ToUpper(content)
-	for _, pattern := range mirroredPatterns {
-		if strings.Contains(upper, strings.ToUpper(pattern)) {
+	// Hardcoded fallback patterns (already uppercase)
+	for _, pattern := range []string{"HCAEB MLAP", "ECILOP", "TROPER"} {
+		if strings.Contains(strings.ToUpper(content), pattern) {
 			return true
 		}
 	}
@@ -2313,43 +2291,16 @@ func isCommonPunctuation(r rune) bool {
 	return false
 }
 
-func hasFontEncodingCorruption(content string) bool {
-	tr := docsaf.NewTextRepair()
-
-	// Check each line for font encoding issues
-	lines := strings.Split(content, "\n")
-	corruptedLines := 0
-	totalLines := 0
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if len(trimmed) < 15 {
-			continue
-		}
-		totalLines++
-
-		if tr.IsFontEncodingCorrupted(trimmed) {
-			corruptedLines++
-		}
-	}
-
-	// If more than 20% of substantial lines are corrupted
-	if totalLines > 0 && float64(corruptedLines)/float64(totalLines) > 0.2 {
-		return true
-	}
-
-	return false
-}
+var hasFontEncodingCorruption = docsaf.HasFontEncodingCorruption
 
 func isAlphanumeric(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
-// countWordFragments detects text with spaces inserted within words
-// e.g., "Virg In Ia" instead of "Virginia", "do cu me nt" instead of "document"
-func countWordFragments(content string) int {
-	// Known fragment patterns that indicate text extraction issues
-	fragmentPatterns := []string{
+// fragmentRegexps are pre-compiled patterns for detecting text with spaces
+// inserted within words (e.g., "Virg In Ia" instead of "Virginia").
+var fragmentRegexps = func() []*regexp.Regexp {
+	patterns := []string{
 		`\bdo cu me nt\b`,     // document
 		`\bVirg In Ia\b`,      // Virginia
 		`\bGh Is La In E\b`,   // Ghislaine
@@ -2370,12 +2321,19 @@ func countWordFragments(content string) int {
 		`\bSo Ught\b`,         // Sought
 		`\bHe Nder So N\b`,    // Henderson
 	}
+	res := make([]*regexp.Regexp, len(patterns))
+	for i, p := range patterns {
+		res[i] = regexp.MustCompile(p)
+	}
+	return res
+}()
 
+// countWordFragments detects text with spaces inserted within words
+// e.g., "Virg In Ia" instead of "Virginia", "do cu me nt" instead of "document"
+func countWordFragments(content string) int {
 	count := 0
-	for _, pattern := range fragmentPatterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindAllString(content, -1)
-		count += len(matches)
+	for _, re := range fragmentRegexps {
+		count += len(re.FindAllString(content, -1))
 	}
 	return count
 }
@@ -2533,22 +2491,24 @@ func smartJoinLines(content string) string {
 	return strings.TrimSpace(result.String())
 }
 
+var (
+	courtNumberedLineRe = regexp.MustCompile(`^\d{1,2}\s+`)
+	courtQAPatternRe    = regexp.MustCompile(`^\s*[QA]\.\s`)
+)
+
 // isCourtTranscriptLayout detects if content is a court transcript format
 func isCourtTranscriptLayout(content string) bool {
 	lines := strings.Split(content, "\n")
 
-	// Check for line numbers at start of lines
 	numberedLines := 0
 	qaPatterns := 0
 
 	for _, line := range lines[:min(30, len(lines))] {
 		trimmed := strings.TrimSpace(line)
-		// Line starts with 1-2 digit number followed by space
-		if regexp.MustCompile(`^\d{1,2}\s+`).MatchString(trimmed) {
+		if courtNumberedLineRe.MatchString(trimmed) {
 			numberedLines++
 		}
-		// Q. or A. patterns
-		if regexp.MustCompile(`^\s*[QA]\.\s`).MatchString(trimmed) {
+		if courtQAPatternRe.MatchString(trimmed) {
 			qaPatterns++
 		}
 	}
@@ -2671,9 +2631,9 @@ func buildZipIndex(zipPaths []string) (map[string]*zip.File, []*zip.ReadCloser, 
 			if f.FileInfo().IsDir() {
 				continue
 			}
-			name := strings.ToLower(filepath.Base(f.Name))
-			if strings.HasSuffix(name, ".pdf") {
-				index[filepath.Base(f.Name)] = f
+			base := filepath.Base(f.Name)
+			if strings.HasSuffix(strings.ToLower(base), ".pdf") {
+				index[base] = f
 			}
 		}
 	}
@@ -2756,14 +2716,9 @@ func enrichCmd(args []string) error {
 	fmt.Println()
 
 	// Load input JSON
-	jsonData, err := os.ReadFile(*inputFile)
+	records, err := readJSONFile[map[string]map[string]any](*inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to read input: %w", err)
-	}
-
-	var records map[string]map[string]any
-	if err := json.Unmarshal(jsonData, &records); err != nil {
-		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
 	fmt.Printf("Total records: %d\n", len(records))
@@ -2834,11 +2789,7 @@ func enrichCmd(args []string) error {
 
 	if len(candidates) == 0 {
 		fmt.Printf("No candidates to enrich. Writing unchanged output.\n")
-		out, err := json.MarshalIndent(records, "", "  ")
-		if err != nil {
-			return fmt.Errorf("marshal output: %w", err)
-		}
-		return os.WriteFile(outPath, out, 0644)
+		return writeJSONSorted(outPath, records)
 	}
 
 	// Build zip index if zip sources provided
@@ -2876,28 +2827,32 @@ func enrichCmd(args []string) error {
 		replaced  bool
 	}
 
-	candidateCh := make(chan enrichCandidate, len(candidates))
-	resultCh := make(chan enrichResult, len(candidates))
+	candidateCh := make(chan enrichCandidate, *workers*4)
+	resultCh := make(chan enrichResult, *workers*4)
 
-	for _, c := range candidates {
-		candidateCh <- c
-	}
-	close(candidateCh)
+	go func() {
+		for _, c := range candidates {
+			candidateCh <- c
+		}
+		close(candidateCh)
+	}()
 
 	var processed atomic.Int64
 	total := len(candidates)
 
 	var wg sync.WaitGroup
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range *workers {
+		wg.Go(func() {
 			for c := range candidateCh {
 				var pageData []byte
 
 				// Try disk first, fall back to zip extraction
 				if c.pdfPath != "" {
-					pageData, _ = os.ReadFile(c.pdfPath)
+					var readErr error
+					pageData, readErr = os.ReadFile(c.pdfPath)
+					if readErr != nil {
+						log.Printf("Warning: failed to read %s: %v", c.pdfPath, readErr)
+					}
 				}
 				if pageData == nil && zipIndex != nil && c.sourceFile != "" && c.pageNum > 0 {
 					var err error
@@ -2964,7 +2919,7 @@ func enrichCmd(args []string) error {
 					replaced:  replaced,
 				}
 			}
-		}()
+		})
 	}
 
 	// Close results when workers done
@@ -3026,12 +2981,7 @@ func enrichCmd(args []string) error {
 	fmt.Printf("  Errors: %d\n", errors)
 
 	// Write output
-	out, err := json.MarshalIndent(records, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal output: %w", err)
-	}
-
-	if err := os.WriteFile(outPath, out, 0644); err != nil {
+	if err := writeJSONSorted(outPath, records); err != nil {
 		return fmt.Errorf("write output: %w", err)
 	}
 

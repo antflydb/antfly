@@ -24,8 +24,10 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/antflydb/antfly/pkg/client/oapi"
 	"github.com/antflydb/antfly/pkg/libaf/json"
@@ -176,6 +178,143 @@ func (c *AntflyClient) LinearMerge(ctx context.Context, tableName string, reques
 	}
 
 	return &result, nil
+}
+
+// ExecuteLinearMergeOptions configures ExecuteLinearMerge behavior.
+type ExecuteLinearMergeOptions struct {
+	// DryRun previews changes without applying them.
+	DryRun bool
+	// SyncLevel controls how long the server waits for indexes before responding.
+	SyncLevel SyncLevel
+	// OnBatch is called after each batch completes. If nil, progress is silent.
+	OnBatch func(batch int, result *LinearMergeResult)
+}
+
+// ExecuteLinearMergeResult holds the accumulated result of all batches.
+type ExecuteLinearMergeResult struct {
+	Upserted int
+	Skipped  int
+	Deleted  int
+	Batches  int
+}
+
+// ExecuteLinearMerge performs a full linear merge by iterating over pages of
+// records, chaining cursors between pages, and running a final cleanup pass
+// to delete orphaned records beyond the last page.
+//
+// Each page yielded by the iterator is a map of {docID: record}. Pages must
+// be yielded in ascending document ID order. The caller controls page size
+// and can stream pages from any source (JSON decoder, database cursor, etc.)
+// without loading the entire dataset into memory.
+func (c *AntflyClient) ExecuteLinearMerge(ctx context.Context, tableName string, pages iter.Seq[map[string]any], opts ExecuteLinearMergeOptions) (*ExecuteLinearMergeResult, error) {
+	result := &ExecuteLinearMergeResult{}
+	cursor := ""
+
+	for page := range pages {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		if len(page) == 0 {
+			continue
+		}
+
+		batchResult, err := c.LinearMerge(ctx, tableName, LinearMergeRequest{
+			Records:      page,
+			LastMergedId: cursor,
+			DryRun:       opts.DryRun,
+			SyncLevel:    opts.SyncLevel,
+		})
+		if err != nil {
+			return result, fmt.Errorf("batch %d failed: %w", result.Batches+1, err)
+		}
+
+		if batchResult.NextCursor != "" {
+			cursor = batchResult.NextCursor
+		}
+
+		result.Upserted += batchResult.Upserted
+		result.Skipped += batchResult.Skipped
+		result.Deleted += batchResult.Deleted
+		result.Batches++
+
+		if opts.OnBatch != nil {
+			opts.OnBatch(result.Batches, batchResult)
+		}
+	}
+
+	// Final cleanup: delete orphaned records beyond the last cursor
+	if cursor != "" && !opts.DryRun {
+		cleanupResult, err := c.LinearMerge(ctx, tableName, LinearMergeRequest{
+			Records:      map[string]any{},
+			LastMergedId: cursor,
+			SyncLevel:    opts.SyncLevel,
+		})
+		if err != nil {
+			return result, fmt.Errorf("final cleanup failed: %w", err)
+		}
+		result.Deleted += cleanupResult.Deleted
+	}
+
+	return result, nil
+}
+
+// WaitForTable polls the table status until at least one shard is ready
+// to accept writes. This is typically called after CreateTable to wait
+// for Raft leader election to complete.
+func (c *AntflyClient) WaitForTable(ctx context.Context, tableName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	pollCount := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			pollCount++
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout waiting for table %q shards to be ready", tableName)
+			}
+
+			status, err := c.GetTable(ctx, tableName)
+			if err != nil {
+				continue
+			}
+
+			// Wait for shards to appear and leader election to propagate
+			if len(status.Shards) > 0 && pollCount >= 6 {
+				return nil
+			}
+		}
+	}
+}
+
+// SortedPages yields pages of batchSize from an in-memory map, with keys in
+// ascending sorted order. This is useful for feeding ExecuteLinearMerge when
+// the full dataset fits in memory.
+func SortedPages(records map[string]any, batchSize int) iter.Seq[map[string]any] {
+	return func(yield func(map[string]any) bool) {
+		ids := make([]string, 0, len(records))
+		for id := range records {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+
+		page := make(map[string]any, batchSize)
+		for _, id := range ids {
+			page[id] = records[id]
+			if len(page) >= batchSize {
+				if !yield(page) {
+					return
+				}
+				page = make(map[string]any, batchSize)
+			}
+		}
+		if len(page) > 0 {
+			yield(page)
+		}
+	}
 }
 
 // LookupKey looks up a document by its key.

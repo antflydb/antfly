@@ -90,9 +90,10 @@ func main() {
 	// ANCHOR_END: create_table
 
 	// Wait for shards to be ready before inserting
-	if err := waitForShardsReady(ctx, client, "images", 30*time.Second); err != nil {
+	if err := client.WaitForTable(ctx, "images", 30*time.Second); err != nil {
 		log.Fatalf("Error waiting for shards: %v", err)
 	}
+	fmt.Println("Shards ready")
 
 	// ANCHOR: add_image
 	// Step 3: Add a sample image (Utah teapot)
@@ -244,45 +245,3 @@ func batchImport(ctx context.Context, client *antfly.AntflyClient) {
 
 // ANCHOR_END: batch_import
 
-// waitForShardsReady polls the table status until shards are ready to accept writes
-func waitForShardsReady(ctx context.Context, client *antfly.AntflyClient, tableName string, timeout time.Duration) error {
-	fmt.Println("Waiting for shards to be ready...")
-
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	pollCount := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("context cancelled while waiting for shards")
-		case <-ticker.C:
-			pollCount++
-
-			if time.Now().After(deadline) {
-				return fmt.Errorf("timeout waiting for shards after %d polls", pollCount)
-			}
-
-			// Get table status
-			status, err := client.GetTable(ctx, tableName)
-			if err != nil {
-				fmt.Printf("  [Poll %d] Error getting table status: %v\n", pollCount, err)
-				continue
-			}
-
-			// Check if we have at least one shard
-			if len(status.Shards) > 0 {
-				// Wait longer to ensure leader election completes and propagates
-				if pollCount >= 6 {
-					fmt.Printf("Shards ready after %d polls (~%dms)\n", pollCount, pollCount*500)
-					return nil
-				}
-				fmt.Printf("  [Poll %d] Found %d shard(s), waiting for leader status to propagate\n", pollCount, len(status.Shards))
-			} else {
-				fmt.Printf("  [Poll %d] No shards found yet\n", pollCount)
-			}
-		}
-	}
-}

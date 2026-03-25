@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -222,29 +221,22 @@ func loadCmd(args []string) error {
 		}
 	}
 
-	// Perform batched linear merge
-	finalCursor, err := performBatchedLinearMerge(ctx, client, *tableName, records, *batchSize, *dryRun)
+	// Perform linear merge with sorted pages
+	pages := sortedPages(records, *batchSize)
+	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
+		DryRun:    *dryRun,
+		SyncLevel: antfly.SyncLevelAknn,
+		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
+			fmt.Printf("[batch %d] upserted: %d, skipped: %d, deleted: %d, took: %s\n",
+				batch, result.Upserted, result.Skipped, result.Deleted, result.Took)
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("batched linear merge failed: %w", err)
+		return fmt.Errorf("linear merge failed: %w", err)
 	}
 
-	// Final cleanup: delete any remaining documents beyond the last cursor
-	if finalCursor != "" && !*dryRun {
-		fmt.Printf("\nPerforming final cleanup to remove orphaned documents...\n")
-		cleanupResult, err := client.LinearMerge(ctx, *tableName, antfly.LinearMergeRequest{
-			Records:      map[string]any{}, // Empty records
-			LastMergedId: finalCursor,      // Start from last cursor
-			DryRun:       false,
-			SyncLevel:    antfly.SyncLevelAknn,
-		})
-		if err != nil {
-			return fmt.Errorf("final cleanup failed: %w", err)
-		}
-		fmt.Printf("Final cleanup completed in %s\n", cleanupResult.Took)
-		fmt.Printf("  Deleted: %d orphaned documents\n", cleanupResult.Deleted)
-	}
-
-	fmt.Printf("\nLoad completed successfully\n")
+	fmt.Printf("\nLoad completed: %d upserted, %d deleted, %d batches\n",
+		mergeResult.Upserted, mergeResult.Deleted, mergeResult.Batches)
 	return nil
 }
 
@@ -395,29 +387,22 @@ func syncCmd(args []string) error {
 	// Convert sections to records map, enriching sections with extraction results when configured.
 	records := exampleentity.BuildRecords(sections, entityResult)
 
-	// Perform batched linear merge
-	finalCursor, err := performBatchedLinearMerge(ctx, client, *tableName, records, *batchSize, *dryRun)
+	// Perform linear merge with sorted pages
+	pages := sortedPages(records, *batchSize)
+	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
+		DryRun:    *dryRun,
+		SyncLevel: antfly.SyncLevelAknn,
+		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
+			fmt.Printf("[batch %d] upserted: %d, skipped: %d, deleted: %d, took: %s\n",
+				batch, result.Upserted, result.Skipped, result.Deleted, result.Took)
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("batched linear merge failed: %w", err)
+		return fmt.Errorf("linear merge failed: %w", err)
 	}
 
-	// Final cleanup: delete any remaining documents beyond the last cursor
-	if finalCursor != "" && !*dryRun {
-		fmt.Printf("\nPerforming final cleanup to remove orphaned documents...\n")
-		cleanupResult, err := client.LinearMerge(ctx, *tableName, antfly.LinearMergeRequest{
-			Records:      map[string]any{}, // Empty records
-			LastMergedId: finalCursor,      // Start from last cursor
-			DryRun:       false,
-			SyncLevel:    antfly.SyncLevelAknn,
-		})
-		if err != nil {
-			return fmt.Errorf("final cleanup failed: %w", err)
-		}
-		fmt.Printf("Final cleanup completed in %s\n", cleanupResult.Took)
-		fmt.Printf("  Deleted: %d orphaned documents\n", cleanupResult.Deleted)
-	}
-
-	fmt.Printf("\nSync completed successfully\n")
+	fmt.Printf("\nSync completed: %d upserted, %d deleted, %d batches\n",
+		mergeResult.Upserted, mergeResult.Deleted, mergeResult.Batches)
 	return nil
 }
 
@@ -519,150 +504,15 @@ func createTableWithIndexes(ctx context.Context, client *antfly.AntflyClient, ta
 		fmt.Printf("Table created with indexes: %s\n\n", strings.Join(indexNames, ", "))
 	}
 
-	return waitForShardsReady(ctx, client, tableName, 30*time.Second)
+	if err := client.WaitForTable(ctx, tableName, 30*time.Second); err != nil {
+		return err
+	}
+	fmt.Printf("Shards ready\n\n")
+	return nil
 }
 
-// ANCHOR: batched_linear_merge
-// performBatchedLinearMerge performs LinearMerge in batches with progress logging
-// Returns the final cursor position after processing all batches
-func performBatchedLinearMerge(
-	ctx context.Context,
-	client *antfly.AntflyClient,
-	tableName string,
-	records map[string]any,
-	batchSize int,
-	dryRun bool,
-) (string, error) {
-	// Sort IDs for deterministic pagination (REQUIRED for linear merge!)
-	ids := make([]string, 0, len(records))
-	for id := range records {
-		ids = append(ids, id)
-	}
-	// CRITICAL: Must sort IDs for linear merge cursor logic to work correctly
-	sortedIDs := make([]string, len(ids))
-	copy(sortedIDs, ids)
-	// Use slices.Sort from Go 1.21+
-	// If on older Go, use: sort.Strings(sortedIDs)
-	slices.Sort(sortedIDs)
-
-	totalBatches := (len(sortedIDs) + batchSize - 1) / batchSize
-	fmt.Printf("Loading %d documents in %d batches of %d records\n", len(sortedIDs), totalBatches, batchSize)
-
-	cursor := ""
-	totalUpserted := 0
-	totalSkipped := 0
-	totalDeleted := 0
-
-	for batchNum := range totalBatches {
-		// Calculate batch range
-		start := batchNum * batchSize
-		end := min(start+batchSize, len(sortedIDs))
-
-		// Build batch records map
-		batchIDs := sortedIDs[start:end]
-		batchRecords := make(map[string]any, len(batchIDs))
-		for _, id := range batchIDs {
-			batchRecords[id] = records[id]
-		}
-
-		fmt.Printf("[Batch %d/%d] Merging records %d-%d\n",
-			batchNum+1, totalBatches, start+1, end)
-
-		// Execute LinearMerge with aknn sync level
-		result, err := client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
-			Records:      batchRecords,
-			LastMergedId: cursor,
-			DryRun:       dryRun,
-			SyncLevel:    antfly.SyncLevelAknn, // Wait for vector index writes
-		})
-		if err != nil {
-			return "", fmt.Errorf("failed to perform linear merge for batch %d: %w", batchNum+1, err)
-		}
-
-		// Update cursor for next batch
-		if result.NextCursor != "" {
-			cursor = result.NextCursor
-		} else {
-			// Fallback: use last ID in batch
-			cursor = batchIDs[len(batchIDs)-1]
-		}
-
-		// Accumulate totals
-		totalUpserted += result.Upserted
-		totalSkipped += result.Skipped
-		totalDeleted += result.Deleted
-
-		// Log batch progress
-		fmt.Printf("  Completed in %s - Status: %s\n", result.Took, result.Status)
-		fmt.Printf("  Upserted: %d, Skipped: %d, Deleted: %d, Keys scanned: %d\n",
-			result.Upserted, result.Skipped, result.Deleted, result.KeysScanned)
-
-		if len(result.Failed) > 0 {
-			fmt.Printf("  Failed operations: %d\n", len(result.Failed))
-			for i, fail := range result.Failed {
-				if i >= 5 {
-					fmt.Printf("    ... and %d more\n", len(result.Failed)-i)
-					break
-				}
-				fmt.Printf("    [%d] ID=%s, Error=%s\n", i, fail.Id, fail.Error)
-			}
-		}
-	}
-
-	// Log final totals
-	fmt.Printf("\n=== Linear Merge Complete ===\n")
-	fmt.Printf("Total batches: %d\n", totalBatches)
-	fmt.Printf("Total upserted: %d\n", totalUpserted)
-	fmt.Printf("Total skipped: %d\n", totalSkipped)
-	fmt.Printf("Total deleted: %d\n", totalDeleted)
-
-	return cursor, nil
-}
-
-// ANCHOR_END: batched_linear_merge
-
-// waitForShardsReady polls the table status until shards are ready to accept writes
-func waitForShardsReady(ctx context.Context, client *antfly.AntflyClient, tableName string, timeout time.Duration) error {
-	fmt.Printf("Waiting for shards to be ready...\n")
-
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	pollCount := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("context cancelled while waiting for shards")
-		case <-ticker.C:
-			pollCount++
-
-			if time.Now().After(deadline) {
-				return fmt.Errorf("timeout waiting for shards after %d polls", pollCount)
-			}
-
-			// Get table status
-			status, err := client.GetTable(ctx, tableName)
-			if err != nil {
-				fmt.Printf("  [Poll %d] Error getting table status: %v\n", pollCount, err)
-				continue
-			}
-
-			// Check if we have at least one shard
-			if len(status.Shards) > 0 {
-				// Wait longer to ensure leader election completes and propagates
-				if pollCount >= 6 {
-					fmt.Printf("Shards ready after %d polls (~%dms)\n\n", pollCount, pollCount*500)
-					return nil
-				}
-				fmt.Printf("  [Poll %d] Found %d shard(s), waiting for leader status to propagate\n", pollCount, len(status.Shards))
-			} else {
-				fmt.Printf("  [Poll %d] No shards found yet\n", pollCount)
-			}
-		}
-	}
-}
+// sortedPages is a convenience alias for antfly.SortedPages.
+var sortedPages = antfly.SortedPages
 
 func main() {
 	if len(os.Args) < 2 {
