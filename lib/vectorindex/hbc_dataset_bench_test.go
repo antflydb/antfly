@@ -43,7 +43,6 @@ func BenchmarkHBCBuildFromDataset(b *testing.B) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		dataset := testutils.LoadDataset(b, tc.dataset)
 		dataCount := int(dataset.GetCount()) * 98 / 100
 		queryCount := min(100, int(dataset.GetCount())-dataCount)
@@ -79,7 +78,6 @@ func BenchmarkHBCBuildFromDataset(b *testing.B) {
 			}
 
 			for _, mode := range buildModes {
-				mode := mode
 				b.Run(mode.name, func(b *testing.B) {
 					b.ReportAllocs()
 

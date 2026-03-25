@@ -23,6 +23,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antflydb/antfly/lib/clock"
@@ -56,7 +57,7 @@ type MetadataStore struct {
 	pool   *workerpool.Pool
 
 	reconciler          *reconciler.Reconciler
-	prevDebugShardsHash uint64
+	prevDebugShardsHash atomic.Uint64
 
 	embeddingCache *ttlcache.Cache[string, []float32]
 

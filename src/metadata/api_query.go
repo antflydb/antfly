@@ -17,9 +17,11 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -42,6 +44,43 @@ import (
 	"go.uber.org/zap"
 )
 
+func (t *TableApi) executeHybridFullTextFallback(
+	ctx context.Context,
+	shardIndexes indexes.RemoteIndexes,
+	queryReq *QueryRequest,
+	q *indexes.Query,
+	graphSearches map[string]*indexes.GraphQuery,
+	table *store.Table,
+	profile *QueryProfile,
+	hybridFullTextFallback query.Query,
+) QueryResult {
+	searchResults, err := shardIndexes.FullTextSearch(
+		ctx,
+		q.HybridFullTextFallbackQuery(hybridFullTextFallback),
+		q.AggregationRequests,
+		q.FullTextPagingOptions(),
+	)
+	if err != nil {
+		return QueryResult{
+			Status: http.StatusInternalServerError,
+			Error:  fmt.Sprintf("performing full text fallback: %v", err),
+		}
+	}
+
+	queryResult := t.bleveResultToQueryResult(ctx, searchResults, queryReq, q, graphSearches, table, profile)
+	if queryReq.Analyses != nil {
+		queryResult.Analyses = t.computeAnalyses(queryReq, queryResult.Hits.Hits)
+		if queryResult.Analyses == nil {
+			return QueryResult{
+				Status: http.StatusInternalServerError,
+				Error:  "failed to compute analyses",
+			}
+		}
+	}
+
+	return queryResult
+}
+
 func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 	rq := indexes.Query{}
 	rq.Embeddings = make(map[string]vector.T, len(q.Embeddings))
@@ -56,6 +95,32 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 				Indices: sparse.Indices,
 				Values:  sparse.Values,
 			}
+		} else if packedSparse, err := v.AsEmbedding3(); err == nil {
+			// Packed sparse: base64-encoded little-endian uint32 indices and float32 values
+			indices, values, err := decodePackedSparse(packedSparse.PackedIndices, packedSparse.PackedValues)
+			if err != nil {
+				return nil, fmt.Errorf("embedding %q: %w", k, err)
+			}
+			if rq.SparseEmbeddings == nil {
+				rq.SparseEmbeddings = make(map[string]indexes.SparseVec)
+			}
+			rq.SparseEmbeddings[k] = indexes.SparseVec{
+				Indices: indices,
+				Values:  values,
+			}
+		} else if packedDense, err := v.AsEmbedding2(); err == nil {
+			// Packed dense: base64-encoded little-endian float32 bytes.
+			// AsEmbedding2 already base64-decoded, so we just reinterpret the raw bytes.
+			if len(packedDense)%4 != 0 {
+				return nil, fmt.Errorf("embedding %q: packed dense byte length %d is not a multiple of 4", k, len(packedDense))
+			}
+			vec := make(vector.T, len(packedDense)/4)
+			for i := range vec {
+				vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(packedDense[i*4:]))
+			}
+			rq.Embeddings[k] = vec
+		} else {
+			return nil, fmt.Errorf("embedding %q: unsupported format (expected float array, sparse object, packed dense base64, or packed sparse base64)", k)
 		}
 	}
 	rq.Fields = q.Fields
@@ -79,8 +144,7 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 		q.FilterQuery = nil
 		hasFullText = true
 	}
-	// Translate simplified query format to native Bleve format if needed
-	// This supports both the new LLM-friendly query DSL and legacy native format
+	// Parse the native Bleve query JSON into a Bleve query object.
 	if hasFullText {
 		rq.FullTextSearch, err = query.ParseQuery(q.FullTextSearch)
 		if err != nil {
@@ -92,8 +156,11 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Preserve raw JSON to avoid re-serialization when passing to shards
+		rq.FilterQueryRaw = q.FilterQuery
 	}
-	if len(q.ExclusionQuery) > 0 && !bytes.Equal(q.ExclusionQuery, []byte("null")) {
+	hasExclusion := len(q.ExclusionQuery) > 0 && !bytes.Equal(q.ExclusionQuery, []byte("null"))
+	if hasExclusion {
 		rq.ExclusionQuery, err = query.ParseQuery(q.ExclusionQuery)
 		if err != nil {
 			return nil, err
@@ -228,6 +295,27 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 	return &rq, nil
 }
 
+// decodePackedSparse decodes base64-decoded little-endian bytes into sparse vector components.
+func decodePackedSparse(rawIndices, rawValues []byte) ([]uint32, []float32, error) {
+	if len(rawIndices)%4 != 0 {
+		return nil, nil, fmt.Errorf("packed_indices byte length %d is not a multiple of 4", len(rawIndices))
+	}
+	if len(rawValues)%4 != 0 {
+		return nil, nil, fmt.Errorf("packed_values byte length %d is not a multiple of 4", len(rawValues))
+	}
+	n := len(rawIndices) / 4
+	if len(rawValues)/4 != n {
+		return nil, nil, fmt.Errorf("packed_indices has %d elements but packed_values has %d", n, len(rawValues)/4)
+	}
+	indices := make([]uint32, n)
+	values := make([]float32, n)
+	for i := range n {
+		indices[i] = binary.LittleEndian.Uint32(rawIndices[i*4:])
+		values[i] = math.Float32frombits(binary.LittleEndian.Uint32(rawValues[i*4:]))
+	}
+	return indices, values, nil
+}
+
 var ErrBadRequest = errors.New("bad request")
 
 // mergeStrategy returns the merge strategy from MergeConfig, defaulting to empty.
@@ -339,6 +427,7 @@ func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryRe
 
 	hasAnyEmbeddings := len(q.Embeddings) > 0 || len(q.SparseEmbeddings) > 0
 	if hasAnyEmbeddings {
+		hybridFullTextFallback := q.PrepareHybridFullTextForSemanticSearch()
 		results, err := shardIndexes.FusedSearch(ctx, q)
 		if err != nil {
 			return QueryResult{
@@ -358,6 +447,21 @@ func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryRe
 		if queryReq.Profile {
 			profile = buildShardsProfile(results.Status)
 		}
+
+		hadSemanticHits := len(results.Hits) > 0
+		if indexes.ShouldUseHybridFullTextFallback(q.HybridFullTextMode, hybridFullTextFallback, hadSemanticHits) {
+			return t.executeHybridFullTextFallback(
+				ctx,
+				shardIndexes,
+				queryReq,
+				q,
+				graphSearches,
+				table,
+				profile,
+				hybridFullTextFallback,
+			)
+		}
+		indexes.ApplyPrunerToFusionResult(results, q.Pruner)
 		queryResult = t.fusionResultToQueryResult(ctx, results, graphSearches, table, profile)
 		if queryReq.Analyses != nil {
 			queryResult.Analyses = t.computeAnalyses(queryReq, queryResult.Hits.Hits)
@@ -627,12 +731,13 @@ func (t *TableApi) generateQueryEmbeddings(
 
 // preparedQuery holds a query that has been validated and had embeddings generated
 type preparedQuery struct {
-	originalIdx   int
-	queryReq      *QueryRequest
-	query         *indexes.Query
-	graphSearches map[string]*indexes.GraphQuery
-	err           string
-	errStatus     int
+	originalIdx    int
+	queryReq       *QueryRequest
+	query          *indexes.Query
+	graphSearches  map[string]*indexes.GraphQuery
+	hybridFallback query.Query
+	err            string
+	errStatus      int
 }
 
 // prepareQueryForBatch validates a query and generates embeddings.
@@ -641,10 +746,10 @@ func (t *TableApi) prepareQueryForBatch(
 	ctx context.Context,
 	queryReq *QueryRequest,
 	table *store.Table,
-) (*indexes.Query, map[string]*indexes.GraphQuery, int, string) {
+) (*indexes.Query, map[string]*indexes.GraphQuery, query.Query, int, string) {
 	// Validate request configuration first
 	if err := queryReq.Validate(); err != nil {
-		return nil, nil, http.StatusBadRequest, err.Error()
+		return nil, nil, nil, http.StatusBadRequest, err.Error()
 	}
 
 	// Set default merge strategy
@@ -655,7 +760,7 @@ func (t *TableApi) prepareQueryForBatch(
 
 	q, err := queryReq.ToRemoteIndexQuery()
 	if err != nil {
-		return nil, nil, http.StatusBadRequest, fmt.Sprintf("parsing query: %v", err)
+		return nil, nil, nil, http.StatusBadRequest, fmt.Sprintf("parsing query: %v", err)
 	}
 
 	// Extract GraphSearches to execute at metadata level
@@ -665,16 +770,20 @@ func (t *TableApi) prepareQueryForBatch(
 
 	// Generate embeddings for semantic search indexes
 	if status, errMsg := t.generateQueryEmbeddings(ctx, queryReq, table, q); errMsg != "" {
-		return nil, nil, status, errMsg
+		return nil, nil, nil, status, errMsg
 	}
 
 	// Validate limit for semantic search
 	hasAnyEmbeddings := len(q.Embeddings) > 0 || len(q.SparseEmbeddings) > 0
+	var hybridFallback query.Query
+	if hasAnyEmbeddings {
+		hybridFallback = q.PrepareHybridFullTextForSemanticSearch()
+	}
 	if hasAnyEmbeddings && q.Limit == 0 {
-		return nil, nil, http.StatusBadRequest, "limit is required for semantic search"
+		return nil, nil, nil, http.StatusBadRequest, "limit is required for semantic search"
 	}
 
-	return q, graphSearches, 0, ""
+	return q, graphSearches, hybridFallback, 0, ""
 }
 
 // runBatchQueriesForTable executes multiple queries for the same table,
@@ -729,13 +838,14 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 	for i := range queryReqs {
 		rg.Go(func(ctx context.Context) (preparedQuery, error) {
 			pq := preparedQuery{originalIdx: i, queryReq: &queryReqs[i]}
-			q, graphSearches, status, errStr := t.prepareQueryForBatch(ctx, &queryReqs[i], table)
+			q, graphSearches, hybridFallback, status, errStr := t.prepareQueryForBatch(ctx, &queryReqs[i], table)
 			if errStr != "" {
 				pq.err = errStr
 				pq.errStatus = status
 			} else {
 				pq.query = q
 				pq.graphSearches = graphSearches
+				pq.hybridFallback = hybridFallback
 			}
 			return pq, nil // errors stored in pq.err, never returned
 		})
@@ -755,6 +865,7 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 	var shardReqs []*indexes.RemoteIndexSearchRequest
 	var shardIdxs []*indexes.RemoteIndex
 	validQueryIndices := []int{}
+	queryShardIndexes := make(map[int]indexes.RemoteIndexes)
 
 	for i, pq := range prepared {
 		if pq.err != "" {
@@ -792,6 +903,7 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 		}
 
 		validQueryIndices = append(validQueryIndices, i)
+		queryShardIndexes[i] = shardIndexes
 
 		// Add request for each shard
 		for _, shardIdx := range shardIndexes {
@@ -924,12 +1036,27 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 				profile.Merge = buildMergeProfile(mc, merged, time.Since(mergeStart))
 			}
 
-			// Apply pruning if configured
-			if pq.query.Pruner != nil && !pq.query.Pruner.IsEmpty() {
-				fusionResult.Hits = pq.query.Pruner.PruneResults(fusionResult.Hits)
-			}
-
 			fusionResult.Aggregations = merged.AggregationResults
+
+			hadSemanticHits := len(fusionResult.Hits) > 0
+			if indexes.ShouldUseHybridFullTextFallback(
+				pq.query.HybridFullTextMode,
+				pq.hybridFallback,
+				hadSemanticHits,
+			) {
+				results[origIdx] = t.executeHybridFullTextFallback(
+					ctx,
+					queryShardIndexes[origIdx],
+					pq.queryReq,
+					pq.query,
+					pq.graphSearches,
+					table,
+					profile,
+					pq.hybridFallback,
+				)
+				continue
+			}
+			indexes.ApplyPrunerToFusionResult(fusionResult, pq.query.Pruner)
 
 			// Convert to QueryResult
 			results[origIdx] = t.fusionResultToQueryResult(ctx, fusionResult, pq.graphSearches, table, profile)

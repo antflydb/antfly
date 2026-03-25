@@ -163,7 +163,7 @@ func TestIndexManagerWaitForNamedBackfills(t *testing.T) {
 
 	im := &IndexManager{
 		logger:  zaptest.NewLogger(t),
-		indexes: xsync.NewMapOf[string, Index](),
+		indexes: xsync.NewMap[string, Index](),
 	}
 
 	done := make(chan struct{})

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/lib/encoding"
+	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/cockroachdb/pebble/v2"
@@ -104,19 +105,8 @@ func (etc *EdgeTTLCleaner) Start(ctx context.Context, persistFunc PersistFunc) e
 func (etc *EdgeTTLCleaner) cleanupExpiredEdges(
 	ctx context.Context,
 	persistFunc PersistFunc,
-) (int, error) {
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case error:
-				if errors.Is(e, pebble.ErrClosed) {
-					etc.logger.Debug("Skipping edge TTL cleanup, database closed")
-					return
-				}
-			}
-			panic(r)
-		}
-	}()
+) (_ int, err error) {
+	defer pebbleutils.RecoverPebbleClosed(&err)
 
 	// Check if context is already cancelled before proceeding
 	select {
@@ -133,11 +123,12 @@ func (etc *EdgeTTLCleaner) cleanupExpiredEdges(
 	iterOpts := &pebble.IterOptions{}
 
 	// Only set bounds if they're not empty (test DBs may have empty ranges)
-	if len(etc.db.byteRange[0]) > 0 {
-		iterOpts.LowerBound = etc.db.byteRange[0]
+	byteRange := etc.db.getByteRange()
+	if len(byteRange[0]) > 0 {
+		iterOpts.LowerBound = byteRange[0]
 	}
-	if len(etc.db.byteRange[1]) > 0 {
-		iterOpts.UpperBound = etc.db.byteRange[1]
+	if len(byteRange[1]) > 0 {
+		iterOpts.UpperBound = byteRange[1]
 	}
 
 	pdb := etc.db.getPDB()
@@ -285,7 +276,7 @@ func (etc *EdgeTTLCleaner) deleteExpiredBatch(
 			return fmt.Errorf("committing delete batch: %w", err)
 		}
 
-		if err := etc.db.indexManager.Batch(ctx, nil, keys, Op_SyncLevelFullText); err != nil {
+		if err := etc.db.BatchIndex(ctx, nil, keys, Op_SyncLevelFullText); err != nil {
 			etc.logger.Error("Failed to update graph indexes after edge deletion", zap.Error(err))
 		}
 		return nil

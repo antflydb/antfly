@@ -25,9 +25,9 @@ func TestBuildRetrievalRequestBasic(t *testing.T) {
 	adapter := &a2aAdapter{}
 
 	req := &a2afacade.RetrievalRequest{
-		Query:         "test query",
-		Table:         "docs",
-		MaxIterations: 3,
+		Query:                 "test query",
+		Table:                 "docs",
+		MaxInternalIterations: 3,
 	}
 
 	antflyReq := adapter.buildRetrievalRequest(req)
@@ -35,8 +35,8 @@ func TestBuildRetrievalRequestBasic(t *testing.T) {
 	if antflyReq.Query != "test query" {
 		t.Errorf("expected query 'test query', got %q", antflyReq.Query)
 	}
-	if antflyReq.MaxIterations != 3 {
-		t.Errorf("expected max_iterations 3, got %d", antflyReq.MaxIterations)
+	if antflyReq.MaxInternalIterations != 3 {
+		t.Errorf("expected max_internal_iterations 3, got %d", antflyReq.MaxInternalIterations)
 	}
 	if len(antflyReq.Queries) != 1 {
 		t.Fatalf("expected 1 query config, got %d", len(antflyReq.Queries))
@@ -120,7 +120,7 @@ func TestMapRetrievalResultComplete(t *testing.T) {
 		Generation:           "The answer is 42",
 		GenerationConfidence: 0.95,
 		FollowupQuestions:    []string{"Why 42?"},
-		Status:               "complete",
+		Status:               AgentStatusCompleted,
 		StrategyUsed:         "hybrid",
 		ToolCallsMade:        5,
 		Hits: []QueryHit{
@@ -137,8 +137,8 @@ func TestMapRetrievalResultComplete(t *testing.T) {
 	if mapped.GenerationConfidence != 0.95 {
 		t.Errorf("expected confidence 0.95, got %f", mapped.GenerationConfidence)
 	}
-	if mapped.State != "complete" {
-		t.Errorf("expected state 'complete', got %q", mapped.State)
+	if mapped.State != a2afacade.RetrievalStateComplete {
+		t.Errorf("expected state %q, got %q", a2afacade.RetrievalStateComplete, mapped.State)
 	}
 	if mapped.StrategyUsed != "hybrid" {
 		t.Errorf("expected strategy 'hybrid', got %q", mapped.StrategyUsed)
@@ -161,17 +161,19 @@ func TestMapRetrievalResultClarification(t *testing.T) {
 	adapter := &a2aAdapter{}
 
 	result := &RetrievalAgentResult{
-		Status: "awaiting_clarification",
-		ClarificationRequest: ClarificationRequest{
+		Status: AgentStatusClarificationRequired,
+		Questions: []AgentQuestion{{
+			Id:       "clarification",
+			Kind:     AgentQuestionKindSingleChoice,
 			Question: "Which table?",
 			Options:  []string{"users", "docs"},
-		},
+		}},
 	}
 
 	mapped := adapter.mapRetrievalResult(result)
 
-	if mapped.State != "awaiting_clarification" {
-		t.Errorf("expected state 'awaiting_clarification', got %q", mapped.State)
+	if mapped.State != a2afacade.RetrievalStateAwaitingClarification {
+		t.Errorf("expected state %q, got %q", a2afacade.RetrievalStateAwaitingClarification, mapped.State)
 	}
 	if mapped.ClarificationQuestion != "Which table?" {
 		t.Errorf("expected clarification question, got %q", mapped.ClarificationQuestion)
@@ -182,13 +184,13 @@ func TestMapRetrievalResultEmpty(t *testing.T) {
 	adapter := &a2aAdapter{}
 
 	result := &RetrievalAgentResult{
-		Status: "complete",
+		Status: AgentStatusCompleted,
 	}
 
 	mapped := adapter.mapRetrievalResult(result)
 
-	if mapped.State != "complete" {
-		t.Errorf("expected state 'complete', got %q", mapped.State)
+	if mapped.State != a2afacade.RetrievalStateComplete {
+		t.Errorf("expected state %q, got %q", a2afacade.RetrievalStateComplete, mapped.State)
 	}
 	if len(mapped.Hits) != 0 {
 		t.Errorf("expected 0 hits, got %d", len(mapped.Hits))
@@ -201,10 +203,8 @@ func TestMapRetrievalResultEmpty(t *testing.T) {
 func TestMapRetrievalResultNoClarificationQuestion(t *testing.T) {
 	adapter := &a2aAdapter{}
 
-	// ClarificationRequest with empty question should not set ClarificationQuestion
 	result := &RetrievalAgentResult{
-		Status:               "complete",
-		ClarificationRequest: ClarificationRequest{},
+		Status: AgentStatusCompleted,
 	}
 
 	mapped := adapter.mapRetrievalResult(result)

@@ -134,3 +134,91 @@ func TestAsGenerationErrorResponse(t *testing.T) {
 		assert.Equal(t, 429, statusCode)
 	})
 }
+
+func TestNormalizeRetrievalAgentSessionRequest(t *testing.T) {
+	req := &RetrievalAgentRequest{
+		MaxInternalIterations: 3,
+		MaxUserClarifications: 2,
+		Decisions:             []AgentDecision{{QuestionId: "q1", Answer: "OAuth 2.0"}},
+		Messages:              []ai.ChatMessage{{Role: ai.ChatMessageRoleUser, Content: "prior"}},
+	}
+
+	normalizeRetrievalAgentSessionRequest(req)
+
+	assert.Equal(t, 3, req.MaxInternalIterations)
+	assert.NotEmpty(t, req.SessionId)
+	if assert.Len(t, req.Messages, 1) {
+		assert.Equal(t, "prior", req.Messages[0].Content)
+	}
+}
+
+func TestBuildEffectiveRetrievalQueryIncludesDecisions(t *testing.T) {
+	req := &RetrievalAgentRequest{
+		Query: "find recent OAuth docs",
+		Decisions: []AgentDecision{
+			{QuestionId: "oauth_version", Answer: "OAuth 2.0"},
+			{QuestionId: "confirm_scope", Approved: true},
+		},
+	}
+
+	query := buildEffectiveRetrievalQuery(req)
+
+	assert.Contains(t, query, "find recent OAuth docs")
+	assert.Contains(t, query, "Resolved user decisions:")
+	assert.Contains(t, query, "oauth_version: OAuth 2.0")
+	assert.Contains(t, query, "confirm_scope: approved")
+}
+
+func TestApplyPendingClarificationPopulatesSharedQuestions(t *testing.T) {
+	executor := &retrievalToolExecutor{
+		pendingQuestion: &ai.ClarificationRequest{
+			Question: "Which OAuth version?",
+			Options:  &[]string{"1.0", "2.0"},
+		},
+	}
+	result := &RetrievalAgentResult{Status: AgentStatusCompleted}
+
+	applyPendingQuestion(executor, result)
+
+	assert.Equal(t, AgentStatusClarificationRequired, result.Status)
+	if assert.Len(t, result.Questions, 1) {
+		assert.Equal(t, AgentQuestionKindSingleChoice, result.Questions[0].Kind)
+		assert.Equal(t, "Which OAuth version?", result.Questions[0].Question)
+		assert.Equal(t, []string{"1.0", "2.0"}, result.Questions[0].Options)
+	}
+	if assert.Len(t, result.Steps, 1) {
+		assert.Equal(t, AgentStepKindClarification, result.Steps[0].Kind)
+		assert.Equal(t, "clarification", result.Steps[0].Name)
+	}
+}
+
+func TestFinalizeRetrievalAgentSession(t *testing.T) {
+	req := &RetrievalAgentRequest{
+		SessionId:             "rags_test",
+		MaxInternalIterations: 4,
+		MaxUserClarifications: 2,
+		Decisions:             []AgentDecision{{QuestionId: "q1"}, {QuestionId: "q2"}},
+	}
+	result := &RetrievalAgentResult{
+		ToolCallsMade: 3,
+		Steps: []AgentStep{{
+			Name:   "semantic_search",
+			Kind:   AgentStepKindToolCall,
+			Action: "Search docs",
+			Status: AgentStepStatusSuccess,
+		}},
+	}
+
+	finalizeRetrievalAgentSession(req, result)
+
+	assert.Equal(t, "rags_test", result.SessionId)
+	assert.Equal(t, 3, result.Iteration)
+	assert.Equal(t, 1, result.RemainingInternalIterations)
+	assert.Equal(t, 2, result.ClarificationCount)
+	assert.Equal(t, 0, result.RemainingUserClarifications)
+	if assert.Len(t, result.Steps, 1) {
+		assert.Equal(t, AgentStepKindToolCall, result.Steps[0].Kind)
+		assert.Equal(t, "semantic_search", result.Steps[0].Name)
+		assert.Equal(t, AgentStepStatusSuccess, result.Steps[0].Status)
+	}
+}

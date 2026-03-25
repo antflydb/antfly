@@ -88,12 +88,21 @@ func normalizeDistanceMetric(dm DistanceMetric) DistanceMetric {
 	return dm
 }
 
+func (ec EmbeddingsIndexConfig) HasPromptSource() bool {
+	return ec.Field != "" || ec.Template != ""
+}
+
+func (ec EmbeddingsIndexConfig) IsExternal() bool {
+	return ec.External
+}
+
 func (ec EmbeddingsIndexConfig) Equal(oc EmbeddingsIndexConfig) bool {
 	return ec.MemOnly == oc.MemOnly &&
 		ec.Dimension == oc.Dimension &&
 		ec.Field == oc.Field &&
 		ec.Template == oc.Template &&
 		normalizeDistanceMetric(ec.DistanceMetric) == normalizeDistanceMetric(oc.DistanceMetric) &&
+		ec.External == oc.External &&
 		ec.Sparse == oc.Sparse &&
 		ec.ChunkSize == oc.ChunkSize &&
 		ec.MinWeight == oc.MinWeight &&

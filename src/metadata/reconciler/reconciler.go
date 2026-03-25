@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antflydb/antfly/lib/types"
@@ -1086,7 +1087,7 @@ func (r *Reconciler) findCorrespondingSplittingShard(
 func (r *Reconciler) LogDebugState(
 	current CurrentClusterState,
 	desired DesiredClusterState,
-	prevHashPtr *uint64,
+	prevHash *atomic.Uint64,
 ) {
 	// Build debug representation of current shards
 	type ShardDebugItem struct {
@@ -1132,14 +1133,14 @@ func (r *Reconciler) LogDebugState(
 	}
 
 	newHash := xxhash.Sum64(s)
-	if prevHashPtr != nil && *prevHashPtr != 0 && newHash == *prevHashPtr {
+	if prevHash != nil && prevHash.Load() != 0 && newHash == prevHash.Load() {
 		// State hasn't changed, skip logging
 		return
 	}
 
 	// Update the hash and log
-	if prevHashPtr != nil {
-		*prevHashPtr = newHash
+	if prevHash != nil {
+		prevHash.Store(newHash)
 	}
 
 	r.logger.Debug("Checking shard assignments...",
@@ -1370,52 +1371,6 @@ func computeSplitTransitions(
 	}
 
 	return splits, merges
-}
-
-func findAdjacentShardCandidates(
-	shardID types.ID,
-	status *store.ShardStatus,
-	shards map[types.ID]*store.ShardStatus,
-	planned map[types.ID]struct{},
-	replicationFactor uint64,
-) (leftNeighborID, rightNeighborID types.ID) {
-	for candidateID, candidateStatus := range shards {
-		if candidateStatus == nil || candidateID == shardID || candidateStatus.Table != status.Table {
-			continue
-		}
-		if _, alreadyPlanned := planned[candidateID]; alreadyPlanned {
-			continue
-		}
-		if candidateStatus.State.Transitioning() {
-			continue
-		}
-		if candidateStatus.MergeState != nil &&
-			candidateStatus.MergeState.GetPhase() != db.MergeState_PHASE_NONE {
-			continue
-		}
-		if candidateStatus.SplitState != nil &&
-			candidateStatus.SplitState.GetPhase() != db.SplitState_PHASE_NONE {
-			continue
-		}
-		if candidateStatus.SplitReplayRequired && !candidateStatus.SplitCutoverReady {
-			continue
-		}
-		if candidateStatus.RaftStatus == nil || candidateStatus.RaftStatus.Voters == nil ||
-			uint64(len(candidateStatus.RaftStatus.Voters)) != replicationFactor ||
-			candidateStatus.RaftStatus.Lead == 0 {
-			continue
-		}
-		if candidateStatus.ShardStats == nil || candidateStatus.ShardStats.Storage == nil {
-			continue
-		}
-		if bytes.Equal(candidateStatus.ByteRange[1], status.ByteRange[0]) {
-			leftNeighborID = candidateID
-		}
-		if bytes.Equal(candidateStatus.ByteRange[0], status.ByteRange[1]) {
-			rightNeighborID = candidateID
-		}
-	}
-	return leftNeighborID, rightNeighborID
 }
 
 func countActiveRangeTransitionWork(shards map[types.ID]*store.ShardStatus) int {

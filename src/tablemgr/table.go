@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"reflect"
 	"regexp"
@@ -451,7 +452,6 @@ func (tm *TableManager) needsUpdates(
 					needsPersist = true
 				}
 			}
-		} else {
 		}
 	case store.ShardState_Splitting:
 		if !newShardInfo.Splitting {
@@ -948,7 +948,9 @@ var (
 // CreateTable creates a new table with the given name and schema
 func (tm *TableManager) CreateTable(name string, tc TableConfig) (*store.Table, error) {
 	if tc.StartID == 0 {
-		tc.StartID = types.ID(xxhash.Sum64String(name))
+		// High 32 bits: hash of table name (debuggable — identifies which table).
+		// Low 32 bits: random (unique across delete/recreate cycles).
+		tc.StartID = types.ID(xxhash.Sum64String(name)&0xFFFFFFFF_00000000 | uint64(rand.Uint32()))
 	}
 
 	if table, err := tm.GetTable(name); err == nil {

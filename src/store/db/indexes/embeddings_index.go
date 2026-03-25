@@ -130,6 +130,7 @@ type EmbeddingIndex struct {
 	walBuf   *inflight.WALBuffer
 
 	enqueueChan chan int
+	flushTime   time.Duration
 
 	idx  vectorindex.VectorIndex
 	name string
@@ -177,7 +178,17 @@ func (vo *vectorOp) Execute(ctx context.Context) (err error) {
 		vo.ei.logger.Error("Inserting vectors failed", zap.ByteStrings("keys", vo.Keys), zap.Error(err))
 		return fmt.Errorf("inserting vectors: %w", err)
 	}
-	if err := batch.Delete(vo.Deletes); err != nil {
+	normalizedDeletes := make([][]byte, 0, len(vo.Deletes))
+	for _, key := range vo.Deletes {
+		if bytes.HasSuffix(key, vo.ei.embedderSuffix) {
+			if docKey := extractDocKey(key, vo.ei.embedderSuffix); docKey != nil {
+				normalizedDeletes = append(normalizedDeletes, docKey)
+				continue
+			}
+		}
+		normalizedDeletes = append(normalizedDeletes, key)
+	}
+	if err := batch.Delete(normalizedDeletes); err != nil {
 		return fmt.Errorf("deleting vectors: %w", err)
 	}
 	if err := batch.Commit(ctx); err != nil {
@@ -259,9 +270,8 @@ func NewEmbeddingIndex(
 		return nil, fmt.Errorf("dimension must be positive: got %d", c.Dimension)
 	}
 
-	// Additional validation
-	if c.Template == "" && c.Field == "" {
-		return nil, errors.New("field or template must be specified")
+	if err := c.Validate(); err != nil {
+		return nil, err
 	}
 
 	reader, err := zstd.NewReader(nil)
@@ -300,6 +310,7 @@ func NewEmbeddingIndex(
 		conf:             c,
 		rebuildState:     NewRebuildState(indexPath),
 		zstdReader:       reader,
+		flushTime:        DefaultFlushTime,
 		pauseAckCh:       make(chan struct{}, 1), // Buffered to prevent blocking plexer
 	}
 
@@ -1487,15 +1498,17 @@ func (ei *EmbeddingIndex) Open(
 		}
 		const maxJitter = time.Millisecond * 200
 		jitter := maxJitter - rand.N(maxJitter) //nolint:gosec // G404: non-security randomness for ML/jitter
-		t := time.NewTimer(DefaultFlushTime + jitter)
+		t := time.NewTimer(ei.flushTime + jitter)
 		enqueueCounter := 0
 		dequeue := func() error {
 			enqueueCounter = 0
 			ops := vectorOpPool.Get().(*vectorOp)
 			ops.ei = ei
-			if err := ei.walBuf.Dequeue(ei.egCtx, ops, embeddingsMaxBatches); err != nil {
+			defer func() {
 				ops.reset()
 				vectorOpPool.Put(ops)
+			}()
+			if err := ei.walBuf.Dequeue(ei.egCtx, ops, embeddingsMaxBatches); err != nil {
 				if errors.Is(err, inflight.ErrBufferClosed) ||
 					errors.Is(err, pebble.ErrClosed) {
 					return err
@@ -1503,10 +1516,8 @@ func (ei *EmbeddingIndex) Open(
 				ei.logger.Error("Failed to dequeue from WAL buffer", zap.Error(err))
 			}
 			empty := len(ops.Vectors) == 0 && len(ops.Deletes) == 0
-			ops.reset()
-			vectorOpPool.Put(ops)
 			if empty {
-				t.Reset(DefaultFlushTime + jitter)
+				t.Reset(ei.flushTime + jitter)
 			} else {
 				t.Reset(100*time.Millisecond + jitter)
 			}

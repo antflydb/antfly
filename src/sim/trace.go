@@ -376,22 +376,3 @@ func transitionFlags(status *store.ShardStatus) string {
 	return strings.Join(flags, ",")
 }
 
-func splitFlags(status *store.ShardStatus) string {
-	if status == nil {
-		return ""
-	}
-	flags := make([]string, 0, 4)
-	if status.HasSnapshot {
-		flags = append(flags, "snapshot")
-	}
-	if status.Initializing {
-		flags = append(flags, "initializing")
-	}
-	if status.SplitReplayRequired {
-		flags = append(flags, "replay_required")
-	}
-	if status.SplitCutoverReady {
-		flags = append(flags, "cutover_ready")
-	}
-	return strings.Join(flags, ",")
-}

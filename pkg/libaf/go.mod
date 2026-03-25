@@ -2,6 +2,15 @@ module github.com/antflydb/antfly/pkg/libaf
 
 go 1.26
 
+// Pin deps compatible with oapi-codegen v2.5.1.
+// kin-openapi v0.134.0 breaks oapi-codegen (MappingRef type change) and
+// oasdiff/yaml v0.0.1 breaks kin-openapi v0.133.0 (OriginOpt API change).
+replace (
+	github.com/getkin/kin-openapi v0.134.0 => github.com/getkin/kin-openapi v0.133.0
+	github.com/oasdiff/yaml v0.0.1 => github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037
+	github.com/oasdiff/yaml3 v0.0.1 => github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90
+)
+
 require (
 	github.com/minio/minio-go/v7 v7.0.99
 	github.com/oapi-codegen/runtime v1.3.0

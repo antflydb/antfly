@@ -2,7 +2,6 @@ package sim
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 )
@@ -116,20 +115,6 @@ func ReduceRandomTransactionScenarioFailure(
 		})
 		return err
 	})
-}
-
-func reduceActionsForError[T any](
-	ctx context.Context,
-	reducer func(context.Context) ([]ScenarioAction, error),
-	err error,
-) ([]ScenarioAction, error) {
-	if err == nil {
-		return nil, nil
-	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		return nil, ctx.Err()
-	}
-	return reducer(ctx)
 }
 
 func runFailureReduction(reducer func(context.Context) ([]ScenarioAction, error)) ([]ScenarioAction, error) {

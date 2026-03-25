@@ -9,11 +9,11 @@ T = TypeVar("T", bound="QueryBuilderResultQuery")
 
 @_attrs_define
 class QueryBuilderResultQuery:
-    """Generated search query in simplified DSL format.
+    """Generated search query in native Bleve format.
     Can be used directly in QueryRequest.full_text_search or filter_query.
 
         Example:
-            {'and': [{'match': 'machine learning', 'field': 'content'}, {'term': 'published', 'field': 'status'}]}
+            {'conjuncts': [{'match': 'machine learning', 'field': 'content'}, {'term': 'published', 'field': 'status'}]}
 
     """
 

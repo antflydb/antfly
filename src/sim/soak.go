@@ -76,10 +76,10 @@ func runSoakWithRunner(ctx context.Context, cfg SoakConfig, runner soakRunner) (
 	if len(cfg.Scenarios) == 0 {
 		cfg.Scenarios = DefaultSoakScenarios()
 	}
-	if err := os.MkdirAll(cfg.BaseDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.BaseDir, 0o750); err != nil {
 		return nil, fmt.Errorf("creating soak base dir: %w", err)
 	}
-	if err := os.MkdirAll(cfg.ArtifactDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.ArtifactDir, 0o750); err != nil {
 		return nil, fmt.Errorf("creating soak artifact dir: %w", err)
 	}
 
@@ -97,7 +97,7 @@ func runSoakWithRunner(ctx context.Context, cfg SoakConfig, runner soakRunner) (
 			if err := os.RemoveAll(runDir); err != nil {
 				return nil, fmt.Errorf("resetting soak run dir %s: %w", runDir, err)
 			}
-			if err := os.MkdirAll(runDir, 0o755); err != nil {
+			if err := os.MkdirAll(runDir, 0o750); err != nil {
 				return nil, fmt.Errorf("creating soak run dir %s: %w", runDir, err)
 			}
 			if err := runner(ctx, scenario, seed, runDir); err != nil {
@@ -254,7 +254,7 @@ func writeSoakFailureArtifact(dir string, artifact SoakFailureArtifact) (string,
 	if err != nil {
 		return "", fmt.Errorf("marshaling soak artifact: %w", err)
 	}
-	if err := os.WriteFile(path, append(payload, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(path, append(payload, '\n'), 0o600); err != nil {
 		return "", fmt.Errorf("writing soak artifact %s: %w", path, err)
 	}
 	return path, nil

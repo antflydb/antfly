@@ -4,20 +4,20 @@ from typing import TYPE_CHECKING, Any, TypeVar, Union, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.retrieval_agent_status import RetrievalAgentStatus
+from ..models.agent_status import AgentStatus
 from ..models.retrieval_strategy import RetrievalStrategy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.agent_question import AgentQuestion
+    from ..models.agent_step import AgentStep
     from ..models.chat_message import ChatMessage
-    from ..models.clarification_request import ClarificationRequest
     from ..models.classification_transformation_result import ClassificationTransformationResult
     from ..models.eval_result import EvalResult
     from ..models.filter_spec import FilterSpec
     from ..models.incomplete_details import IncompleteDetails
     from ..models.query_hit import QueryHit
     from ..models.retrieval_agent_usage import RetrievalAgentUsage
-    from ..models.retrieval_reasoning_step import RetrievalReasoningStep
 
 
 T = TypeVar("T", bound="RetrievalAgentResult")
@@ -28,11 +28,7 @@ class RetrievalAgentResult:
     """Result from the retrieval agent
 
     Attributes:
-        status (RetrievalAgentStatus): Current status of the retrieval agent execution:
-            - completed: Agent finished successfully
-            - in_progress: Agent is still executing (streaming context)
-            - incomplete: Agent stopped before completion (see incomplete_details)
-            - failed: Error occurred during execution
+        status (AgentStatus): Shared bounded-agent execution status
         hits (list['QueryHit']): Retrieved query hits
         id (Union[Unset, str]): Unique response ID for logging and tracing Example: ragr_cr3ig20h5tbs73e3ahrg.
         model (Union[Unset, str]): LLM model used for generation Example: gemini-2.0-flash.
@@ -41,8 +37,7 @@ class RetrievalAgentResult:
             when status is "incomplete".
         usage (Union[Unset, RetrievalAgentUsage]): Token usage and resource statistics from the retrieval agent
             execution
-        reasoning_chain (Union[Unset, list['RetrievalReasoningStep']]): Steps taken during retrieval (tool calls,
-            actions)
+        steps (Union[Unset, list['AgentStep']]): Shared bounded-agent execution trace for this retrieval run.
         strategy_used (Union[Unset, RetrievalStrategy]): Strategy for document retrieval:
             - semantic: Vector similarity search using embeddings
             - bm25: Full-text search using BM25 scoring
@@ -50,11 +45,19 @@ class RetrievalAgentResult:
             - tree: Iterative tree navigation with summarization
             - graph: Relationship-based traversal
             - hybrid: Combine multiple strategies with RRF or rerank
-        clarification_request (Union[Unset, ClarificationRequest]): Request for clarification from the user
+        session_id (Union[Unset, str]): Correlation identifier for client-carried continuation.
+        iteration (Union[Unset, int]): Current internal iteration count for this bounded session.
+        clarification_count (Union[Unset, int]): Number of user clarification turns already consumed in this session.
+        remaining_internal_iterations (Union[Unset, int]): Remaining internal reasoning/tool-use iterations for this
+            session.
+        remaining_user_clarifications (Union[Unset, int]): Remaining clarification turns allowed for this session.
+        questions (Union[Unset, list['AgentQuestion']]): Clarification questions exposed in the shared bounded-agent
+            envelope.
         applied_filters (Union[Unset, list['FilterSpec']]): Filters that were applied during retrieval
         tool_calls_made (Union[Unset, int]): Total number of tool calls made during retrieval
-        messages (Union[Unset, list['ChatMessage']]): Conversation messages including tool calls and responses.
-            Can be passed back in subsequent requests for multi-turn interaction.
+        messages (Union[Unset, list['ChatMessage']]): Optional conversational context including tool calls and
+            responses.
+            Decisions remain the authoritative continuation input for bounded agent interactions.
         classification (Union[Unset, ClassificationTransformationResult]): Query classification and transformation
             result combining all query enhancements including strategy selection and semantic optimization
         generation (Union[Unset, str]): Generated response in markdown format. Present when steps.generation
@@ -66,16 +69,21 @@ class RetrievalAgentResult:
         eval_result (Union[Unset, EvalResult]): Complete evaluation result
     """
 
-    status: RetrievalAgentStatus
+    status: AgentStatus
     hits: list["QueryHit"]
     id: Union[Unset, str] = UNSET
     model: Union[Unset, str] = UNSET
     created_at: Union[Unset, int] = UNSET
     incomplete_details: Union[Unset, "IncompleteDetails"] = UNSET
     usage: Union[Unset, "RetrievalAgentUsage"] = UNSET
-    reasoning_chain: Union[Unset, list["RetrievalReasoningStep"]] = UNSET
+    steps: Union[Unset, list["AgentStep"]] = UNSET
     strategy_used: Union[Unset, RetrievalStrategy] = UNSET
-    clarification_request: Union[Unset, "ClarificationRequest"] = UNSET
+    session_id: Union[Unset, str] = UNSET
+    iteration: Union[Unset, int] = UNSET
+    clarification_count: Union[Unset, int] = UNSET
+    remaining_internal_iterations: Union[Unset, int] = UNSET
+    remaining_user_clarifications: Union[Unset, int] = UNSET
+    questions: Union[Unset, list["AgentQuestion"]] = UNSET
     applied_filters: Union[Unset, list["FilterSpec"]] = UNSET
     tool_calls_made: Union[Unset, int] = UNSET
     messages: Union[Unset, list["ChatMessage"]] = UNSET
@@ -109,20 +117,33 @@ class RetrievalAgentResult:
         if not isinstance(self.usage, Unset):
             usage = self.usage.to_dict()
 
-        reasoning_chain: Union[Unset, list[dict[str, Any]]] = UNSET
-        if not isinstance(self.reasoning_chain, Unset):
-            reasoning_chain = []
-            for reasoning_chain_item_data in self.reasoning_chain:
-                reasoning_chain_item = reasoning_chain_item_data.to_dict()
-                reasoning_chain.append(reasoning_chain_item)
+        steps: Union[Unset, list[dict[str, Any]]] = UNSET
+        if not isinstance(self.steps, Unset):
+            steps = []
+            for steps_item_data in self.steps:
+                steps_item = steps_item_data.to_dict()
+                steps.append(steps_item)
 
         strategy_used: Union[Unset, str] = UNSET
         if not isinstance(self.strategy_used, Unset):
             strategy_used = self.strategy_used.value
 
-        clarification_request: Union[Unset, dict[str, Any]] = UNSET
-        if not isinstance(self.clarification_request, Unset):
-            clarification_request = self.clarification_request.to_dict()
+        session_id = self.session_id
+
+        iteration = self.iteration
+
+        clarification_count = self.clarification_count
+
+        remaining_internal_iterations = self.remaining_internal_iterations
+
+        remaining_user_clarifications = self.remaining_user_clarifications
+
+        questions: Union[Unset, list[dict[str, Any]]] = UNSET
+        if not isinstance(self.questions, Unset):
+            questions = []
+            for questions_item_data in self.questions:
+                questions_item = questions_item_data.to_dict()
+                questions.append(questions_item)
 
         applied_filters: Union[Unset, list[dict[str, Any]]] = UNSET
         if not isinstance(self.applied_filters, Unset):
@@ -176,12 +197,22 @@ class RetrievalAgentResult:
             field_dict["incomplete_details"] = incomplete_details
         if usage is not UNSET:
             field_dict["usage"] = usage
-        if reasoning_chain is not UNSET:
-            field_dict["reasoning_chain"] = reasoning_chain
+        if steps is not UNSET:
+            field_dict["steps"] = steps
         if strategy_used is not UNSET:
             field_dict["strategy_used"] = strategy_used
-        if clarification_request is not UNSET:
-            field_dict["clarification_request"] = clarification_request
+        if session_id is not UNSET:
+            field_dict["session_id"] = session_id
+        if iteration is not UNSET:
+            field_dict["iteration"] = iteration
+        if clarification_count is not UNSET:
+            field_dict["clarification_count"] = clarification_count
+        if remaining_internal_iterations is not UNSET:
+            field_dict["remaining_internal_iterations"] = remaining_internal_iterations
+        if remaining_user_clarifications is not UNSET:
+            field_dict["remaining_user_clarifications"] = remaining_user_clarifications
+        if questions is not UNSET:
+            field_dict["questions"] = questions
         if applied_filters is not UNSET:
             field_dict["applied_filters"] = applied_filters
         if tool_calls_made is not UNSET:
@@ -205,18 +236,18 @@ class RetrievalAgentResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.agent_question import AgentQuestion
+        from ..models.agent_step import AgentStep
         from ..models.chat_message import ChatMessage
-        from ..models.clarification_request import ClarificationRequest
         from ..models.classification_transformation_result import ClassificationTransformationResult
         from ..models.eval_result import EvalResult
         from ..models.filter_spec import FilterSpec
         from ..models.incomplete_details import IncompleteDetails
         from ..models.query_hit import QueryHit
         from ..models.retrieval_agent_usage import RetrievalAgentUsage
-        from ..models.retrieval_reasoning_step import RetrievalReasoningStep
 
         d = dict(src_dict)
-        status = RetrievalAgentStatus(d.pop("status"))
+        status = AgentStatus(d.pop("status"))
 
         hits = []
         _hits = d.pop("hits")
@@ -245,12 +276,12 @@ class RetrievalAgentResult:
         else:
             usage = RetrievalAgentUsage.from_dict(_usage)
 
-        reasoning_chain = []
-        _reasoning_chain = d.pop("reasoning_chain", UNSET)
-        for reasoning_chain_item_data in _reasoning_chain or []:
-            reasoning_chain_item = RetrievalReasoningStep.from_dict(reasoning_chain_item_data)
+        steps = []
+        _steps = d.pop("steps", UNSET)
+        for steps_item_data in _steps or []:
+            steps_item = AgentStep.from_dict(steps_item_data)
 
-            reasoning_chain.append(reasoning_chain_item)
+            steps.append(steps_item)
 
         _strategy_used = d.pop("strategy_used", UNSET)
         strategy_used: Union[Unset, RetrievalStrategy]
@@ -259,12 +290,22 @@ class RetrievalAgentResult:
         else:
             strategy_used = RetrievalStrategy(_strategy_used)
 
-        _clarification_request = d.pop("clarification_request", UNSET)
-        clarification_request: Union[Unset, ClarificationRequest]
-        if isinstance(_clarification_request, Unset):
-            clarification_request = UNSET
-        else:
-            clarification_request = ClarificationRequest.from_dict(_clarification_request)
+        session_id = d.pop("session_id", UNSET)
+
+        iteration = d.pop("iteration", UNSET)
+
+        clarification_count = d.pop("clarification_count", UNSET)
+
+        remaining_internal_iterations = d.pop("remaining_internal_iterations", UNSET)
+
+        remaining_user_clarifications = d.pop("remaining_user_clarifications", UNSET)
+
+        questions = []
+        _questions = d.pop("questions", UNSET)
+        for questions_item_data in _questions or []:
+            questions_item = AgentQuestion.from_dict(questions_item_data)
+
+            questions.append(questions_item)
 
         applied_filters = []
         _applied_filters = d.pop("applied_filters", UNSET)
@@ -312,9 +353,14 @@ class RetrievalAgentResult:
             created_at=created_at,
             incomplete_details=incomplete_details,
             usage=usage,
-            reasoning_chain=reasoning_chain,
+            steps=steps,
             strategy_used=strategy_used,
-            clarification_request=clarification_request,
+            session_id=session_id,
+            iteration=iteration,
+            clarification_count=clarification_count,
+            remaining_internal_iterations=remaining_internal_iterations,
+            remaining_user_clarifications=remaining_user_clarifications,
+            questions=questions,
             applied_filters=applied_filters,
             tool_calls_made=tool_calls_made,
             messages=messages,

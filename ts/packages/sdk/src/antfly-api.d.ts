@@ -395,6 +395,7 @@ export interface paths {
          *     - `tool_mode`: Tool calling mode selected (see SSEToolMode)
          *     - `eval`: Evaluation metrics (see EvalResult)
          *     - `done`: Retrieval complete (see RetrievalAgentResult)
+         *     - `done` is the authoritative final bounded-agent envelope for both JSON and SSE consumers
          *     - `error`: Error occurred (see SSEError)
          */
         post: operations["retrievalAgent"];
@@ -1895,6 +1896,25 @@ export interface components {
             backups: components["schemas"]["BackupInfo"][];
         };
         QueryBuilderRequest: {
+            /** @description Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence. */
+            session_id?: string;
+            /** @description Structured answers provided by the user as part of client-carried continuation. */
+            decisions?: components["schemas"]["AgentDecision"][];
+            /**
+             * @description If true, the agent may return clarification questions when needed.
+             * @default true
+             */
+            interactive?: boolean;
+            /** @description Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting. */
+            max_internal_iterations?: number;
+            /** @description Maximum number of clarification turns the agent may request from the user. */
+            max_user_clarifications?: number;
+            /** @description Force a user-facing decision after this many unresolved internal passes. */
+            require_decision_after?: number;
+            /** @description Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically. */
+            example_documents?: {
+                [key: string]: unknown;
+            }[];
             /**
              * @description Name of the table to build query for. If provided, uses table schema for field context.
              * @example articles
@@ -1918,11 +1938,27 @@ export interface components {
             generator?: components["schemas"]["GeneratorConfig"];
         };
         QueryBuilderResult: {
+            /** @description Correlation identifier for client-carried continuation. */
+            session_id?: string;
+            /** @description Number of internal passes consumed while producing this result. */
+            iteration?: number;
+            /** @description Number of user clarification turns already consumed in this interaction. */
+            clarification_count?: number;
+            /** @description Current status of the bounded query-builder execution. */
+            status?: components["schemas"]["AgentStatus"];
+            /** @description Shared bounded-agent execution trace for this query-builder run. */
+            steps?: components["schemas"]["AgentStep"][];
+            /** @description Remaining internal reasoning passes for this interaction. */
+            remaining_internal_iterations?: number;
+            /** @description Remaining clarification turns allowed for this interaction. */
+            remaining_user_clarifications?: number;
+            /** @description Clarification questions exposed in the shared bounded-agent envelope. */
+            questions?: components["schemas"]["AgentQuestion"][];
             /**
-             * @description Generated search query in simplified DSL format.
+             * @description Generated search query in native Bleve format.
              *     Can be used directly in QueryRequest.full_text_search or filter_query.
              * @example {
-             *       "and": [
+             *       "conjuncts": [
              *         {
              *           "match": "machine learning",
              *           "field": "content"
@@ -1956,26 +1992,17 @@ export interface components {
              */
             warnings?: string[];
         };
-        /**
-         * @description Current status of the retrieval agent execution:
-         *     - completed: Agent finished successfully
-         *     - in_progress: Agent is still executing (streaming context)
-         *     - incomplete: Agent stopped before completion (see incomplete_details)
-         *     - failed: Error occurred during execution
-         * @enum {string}
-         */
-        RetrievalAgentStatus: "completed" | "in_progress" | "incomplete" | "failed";
         /** @description Explains why the agent stopped before completion. Present when status is "incomplete". */
         IncompleteDetails: {
             /**
              * @description Why the agent stopped:
-             *     - max_iterations: Hit the configured max_iterations limit
+             *     - max_internal_iterations: Hit the configured max_internal_iterations limit
              *     - max_tokens: LLM output was truncated
              *     - no_tools: No tools were available for agentic mode
-             *     - clarification_needed: Agent needs user input to proceed
+             *     - clarification_required: The agent needs a user decision before it can continue
              * @enum {string}
              */
-            reason: "max_iterations" | "max_tokens" | "no_tools" | "clarification_needed";
+            reason: "max_internal_iterations" | "max_tokens" | "no_tools" | "clarification_required";
         };
         /**
          * @description Strategy for document retrieval:
@@ -2029,55 +2056,67 @@ export interface components {
             /** @description Optional tree search configuration */
             tree_search?: components["schemas"]["TreeSearchConfig"];
         };
-        /** @description Request for clarification from the user */
-        ClarificationRequest: {
+        /**
+         * @description UI rendering/answer handling hint for a bounded agent question
+         * @enum {string}
+         */
+        AgentQuestionKind: "confirm" | "single_choice" | "multi_choice" | "free_text" | "field_policy";
+        AgentQuestion: {
             /**
-             * @description The clarifying question to ask the user
-             * @example Did you mean OAuth 1.0 or OAuth 2.0?
+             * @description Stable question identifier for client-carried continuation
+             * @example clarify_oauth_version
              */
+            id: string;
+            kind: components["schemas"]["AgentQuestionKind"];
+            /** @description The clarifying question to ask the user */
             question: string;
-            /**
-             * @description Optional list of choices for the user
-             * @example [
-             *       "OAuth 1.0",
-             *       "OAuth 2.0",
-             *       "Both"
-             *     ]
-             */
-            options?: string[];
-            /**
-             * @description Why clarification is needed
-             * @example The query mentions OAuth but doesn't specify which version
-             */
+            /** @description Why clarification is needed */
             reason?: string;
+            /** @description Optional list of choices for the user */
+            options?: string[];
+            /** @description Suggested default answer when the server has a preferred choice */
+            default_answer?: string;
+            /** @description High-level result areas affected by this decision */
+            affects?: string[];
         };
-        /** @description A step in the retrieval reasoning chain */
-        RetrievalReasoningStep: {
-            /**
-             * @description Unique step ID for correlation and tracing
-             * @example step_cr3ig20h5tbs73e3ahrg
-             */
+        AgentDecision: {
+            /** @description The question being answered */
+            question_id: string;
+            /** @description User answer, scalar or structured depending on the question kind */
+            answer?: unknown;
+            /** @description Used for confirm/review steps where the draft may be accepted as-is */
+            approved?: boolean;
+        };
+        /**
+         * @description Shared bounded-agent execution status
+         * @enum {string}
+         */
+        AgentStatus: "clarification_required" | "completed" | "in_progress" | "incomplete" | "failed";
+        /**
+         * @description Shared bounded-agent step category
+         * @enum {string}
+         */
+        AgentStepKind: "tool_call" | "planning" | "classification" | "generation" | "validation" | "clarification";
+        /**
+         * @description Outcome of a shared agent step
+         * @enum {string}
+         */
+        AgentStepStatus: "success" | "error" | "skipped";
+        /** @description A step in the shared bounded-agent execution trace */
+        AgentStep: {
+            /** @description Unique step ID for correlation and tracing */
             id?: string;
-            /**
-             * @description Name of the tool call or action taken
-             * @example semantic_search
-             */
-            step: string;
-            /**
-             * @description What action was taken
-             * @example Searched for OAuth configuration in doc_embeddings index
-             */
+            kind?: components["schemas"]["AgentStepKind"];
+            /** @description Stable step name used for correlation across JSON and SSE surfaces */
+            name: string;
+            /** @description What action was taken */
             action: string;
-            /**
-             * @description Outcome of this step
-             * @enum {string}
-             */
-            status?: "success" | "error" | "skipped";
+            status?: components["schemas"]["AgentStepStatus"];
             /** @description Error details when status is "error" */
             error_message?: string;
             /** @description Server-side execution time in milliseconds */
             duration_ms?: number;
-            /** @description Additional details about the step (e.g., tool arguments, result count) */
+            /** @description Additional details about the step */
             details?: {
                 [key: string]: unknown;
             };
@@ -2094,11 +2133,9 @@ export interface components {
              * @example step_cr3ig20h5tbs73e3ahrg
              */
             id: string;
-            /**
-             * @description Name of the step (e.g., "semantic_search", "tree_search")
-             * @example semantic_search
-             */
-            step: string;
+            kind?: components["schemas"]["AgentStepKind"];
+            /** @description Stable step name used for correlation across JSON and SSE surfaces */
+            name: string;
             /**
              * @description Human-readable description of the action being taken
              * @example Searching for OAuth configuration in doc_embeddings index
@@ -2106,7 +2143,7 @@ export interface components {
             action: string;
         };
         /**
-         * @description Emitted to report progress within a running step. The `step` field
+         * @description Emitted to report progress within a running step. The `name` field
          *     identifies which step this progress belongs to. Additional properties
          *     vary by step type (e.g., tree_search includes depth, num_nodes, sufficient, etc.).
          */
@@ -2115,11 +2152,11 @@ export interface components {
              * @description Name of the step this progress belongs to
              * @example tree_search
              */
-            step: string;
+            name: string;
         } & {
             [key: string]: unknown;
         };
-        SSEStepCompleted: components["schemas"]["RetrievalReasoningStep"];
+        SSEStepCompleted: components["schemas"]["AgentStep"];
         /** @description Emitted when the agent selects a tool-calling mode */
         SSEToolMode: {
             /**
@@ -2207,10 +2244,10 @@ export interface components {
          * @description Request for the retrieval agent. Queries define which tables and indexes
          *     to search, each as a QueryRequest with optional tree search configuration.
          *
-         *     **Pipeline mode** (default, max_iterations=0): Queries are executed
+         *     **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
          *     directly without an LLM tool-calling loop.
          *
-         *     **Agentic mode** (max_iterations > 0): The LLM decides which tools to
+         *     **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
          *     call, using the queries to determine available tables and indexes.
          */
         RetrievalAgentRequest: {
@@ -2223,7 +2260,7 @@ export interface components {
              * @description Queries to execute. Each query carries its own table via the
              *     QueryRequest table field.
              *
-             *     In pipeline mode (max_iterations=0), these are executed directly.
+             *     In pipeline mode (max_internal_iterations=0), these are executed directly.
              *     In agentic mode, these declare which table and indexes are available.
              * @example [
              *       {
@@ -2237,14 +2274,8 @@ export interface components {
              *     ]
              */
             queries: components["schemas"]["RetrievalQueryRequest"][];
-            /** @description Conversation messages for multi-turn interaction */
+            /** @description Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions. */
             messages?: components["schemas"]["ChatMessage"][];
-            /**
-             * @deprecated
-             * @description Prior messages for multi-turn clarification.
-             *     Deprecated: use `messages` instead.
-             */
-            context?: components["schemas"]["ChatMessage"][];
             /**
              * @description Domain-specific knowledge to include in the agent's system prompt.
              *     Useful for providing context about the document collection.
@@ -2256,15 +2287,27 @@ export interface components {
              *     all search tool invocations.
              */
             accumulated_filters?: components["schemas"]["FilterSpec"][];
+            /** @description Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence. */
+            session_id?: string;
+            /** @description Structured answers provided by the user as part of client-carried continuation. */
+            decisions?: components["schemas"]["AgentDecision"][];
             /**
-             * @description Maximum number of tool-calling rounds. Controls how many times the
-             *     LLM can invoke tools before being forced to return results.
+             * @description If true, the agent may return clarification questions when needed.
+             * @default true
+             */
+            interactive?: boolean;
+            /**
+             * @description Maximum number of internal tool-calling rounds.
              *
              *     - 0: Pipeline mode — execute provided queries directly, no LLM loop
              *     - 1+: Agentic mode — LLM decides which tools to call
              * @default 0
              */
-            max_iterations?: number;
+            max_internal_iterations?: number;
+            /** @description Maximum number of clarification turns the agent may request from the user. */
+            max_user_clarifications?: number;
+            /** @description Force a user-facing decision after this many unresolved internal passes. */
+            require_decision_after?: number;
             /**
              * @description Maximum tokens for document context in tool responses. Documents
              *     exceeding this limit are pruned to fit.
@@ -2314,27 +2357,37 @@ export interface components {
              * @description Unix timestamp (seconds) when the response was created
              */
             created_at?: number;
-            /** @description Current status of the agent execution */
-            status: components["schemas"]["RetrievalAgentStatus"];
+            /** @description Current status of the bounded agent execution */
+            status: components["schemas"]["AgentStatus"];
             /** @description Present when status is "incomplete" — explains why */
             incomplete_details?: components["schemas"]["IncompleteDetails"];
             /** @description Token usage and resource statistics from this execution */
             usage?: components["schemas"]["RetrievalAgentUsage"];
             /** @description Retrieved query hits */
             hits: components["schemas"]["QueryHit"][];
-            /** @description Steps taken during retrieval (tool calls, actions) */
-            reasoning_chain?: components["schemas"]["RetrievalReasoningStep"][];
+            /** @description Shared bounded-agent execution trace for this retrieval run. */
+            steps?: components["schemas"]["AgentStep"][];
             /** @description Primary strategy that was used (optional in agentic mode) */
             strategy_used?: components["schemas"]["RetrievalStrategy"];
-            /** @description Present when status is "incomplete" with reason "clarification_needed" */
-            clarification_request?: components["schemas"]["ClarificationRequest"];
+            /** @description Correlation identifier for client-carried continuation. */
+            session_id?: string;
+            /** @description Current internal iteration count for this bounded session. */
+            iteration?: number;
+            /** @description Number of user clarification turns already consumed in this session. */
+            clarification_count?: number;
+            /** @description Remaining internal reasoning/tool-use iterations for this session. */
+            remaining_internal_iterations?: number;
+            /** @description Remaining clarification turns allowed for this session. */
+            remaining_user_clarifications?: number;
+            /** @description Clarification questions exposed in the shared bounded-agent envelope. */
+            questions?: components["schemas"]["AgentQuestion"][];
             /** @description Filters that were applied during retrieval */
             applied_filters?: components["schemas"]["FilterSpec"][];
             /** @description Total number of tool calls made during retrieval */
             tool_calls_made?: number;
             /**
-             * @description Conversation messages including tool calls and responses.
-             *     Can be passed back in subsequent requests for multi-turn interaction.
+             * @description Optional conversational context including tool calls and responses.
+             *     Decisions remain the authoritative continuation input for bounded agent interactions.
              */
             messages?: components["schemas"]["ChatMessage"][];
             /**
@@ -2465,6 +2518,17 @@ export interface components {
         Embedding: number[] | {
             indices: number[];
             values: number[];
+        } | string | {
+            /**
+             * Format: byte
+             * @description Base64-encoded little-endian uint32 bytes for sparse indices
+             */
+            packed_indices: string;
+            /**
+             * Format: byte
+             * @description Base64-encoded little-endian float32 bytes for sparse values
+             */
+            packed_values: string;
         };
         QueryRequest: {
             /**
@@ -2602,9 +2666,11 @@ export interface components {
             /**
              * @description Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string.
              *     The keys are the index names. Values can be either:
-             *     - **Dense**: an array of floats, e.g. `[0.1, 0.2, 0.3]`
+             *     - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]`
+             *     - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact)
              *     - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats),
              *       e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}`
+             *     - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE)
              *
              *     Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
              */
@@ -5750,13 +5816,15 @@ export interface components {
          *
          *     **Importing Pre-computed Embeddings:**
          *
-         *     You can import existing embeddings (from OpenAI, Cohere, or any provider) by including
-         *     them directly in your documents using the `_embeddings` field. This bypasses the
-         *     embedding generation step and writes vectors directly to the index.
+         *     You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
+         *     for indexes configured with `external: true`. External indexes accept vectors written
+         *     directly through the document `_embeddings` field and do not generate prompts from
+         *     `field` or `template`.
          *
          *     **Steps:**
-         *     1. Create the index first with the appropriate dimension
-         *     2. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+         *     1. Create an embeddings index with `external: true`
+         *     2. For dense indexes, set the index `dimension`
+         *     3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
          *
          *     **Example:**
          *     ```json
@@ -5768,6 +5836,10 @@ export interface components {
          *       }
          *     }
          *     ```
+         *
+         *     **Delete Behavior:**
+         *     - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
+         *     - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
          *
          *     **Use Cases:**
          *     - Migrating from another vector database with existing embeddings
@@ -5934,27 +6006,32 @@ export interface components {
         /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
             /**
+             * @description When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+             * @default false
+             */
+            external?: boolean;
+            /**
              * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
              * @default false
              */
             sparse?: boolean;
-            /** @description Vector dimension for dense indexes. Can be omitted when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
+            /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
-            /** @description Field to extract embeddings from */
+            /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
             /**
-             * @description Handlebars template for generating prompts. See https://handlebarsjs.com/guide/ for more information.
+             * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
              * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
              */
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
-            /** @description Configuration for the embeddings plugin */
+            /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
             embedder?: components["schemas"]["EmbedderConfig"];
-            /** @description Configuration for the summarizer plugin (dense only) */
+            /** @description Configuration for the summarizer plugin (dense managed indexes only) */
             summarizer?: components["schemas"]["GeneratorConfig"];
-            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense only) */
+            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only) */
             chunker?: components["schemas"]["ChunkerConfig"];
             /**
              * @description Default number of results to return from search (sparse only)

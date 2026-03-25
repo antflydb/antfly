@@ -23,6 +23,7 @@ import (
 
 	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/encoding"
+	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/cockroachdb/pebble/v2"
@@ -128,19 +129,8 @@ func (tc *TTLCleaner) cleanupExpiredDocuments(
 	ctx context.Context,
 	ttlDuration time.Duration,
 	persistFunc PersistFunc,
-) (int, error) {
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case error:
-				if errors.Is(e, pebble.ErrClosed) {
-					tc.logger.Debug("Skipping TTL cleanup, database closed")
-					return
-				}
-			}
-			panic(r)
-		}
-	}()
+) (_ int, err error) {
+	defer pebbleutils.RecoverPebbleClosed(&err)
 
 	// Check if context is already cancelled before proceeding
 	select {
@@ -150,9 +140,10 @@ func (tc *TTLCleaner) cleanupExpiredDocuments(
 	}
 
 	// Create iterator to scan all keys in the shard's range
+	byteRange := tc.db.getByteRange()
 	iterOpts := &pebble.IterOptions{
-		LowerBound: tc.db.byteRange[0],
-		UpperBound: tc.db.byteRange[1],
+		LowerBound: byteRange[0],
+		UpperBound: byteRange[1],
 	}
 
 	pdb := tc.db.getPDB()
@@ -286,7 +277,7 @@ func (tc *TTLCleaner) deleteExpiredBatch(
 			return fmt.Errorf("committing delete batch: %w", err)
 		}
 
-		if err := tc.db.indexManager.Batch(ctx, nil, keys, Op_SyncLevelFullText); err != nil {
+		if err := tc.db.BatchIndex(ctx, nil, keys, Op_SyncLevelFullText); err != nil {
 			tc.logger.Error("Failed to delete from indexes", zap.Error(err))
 		}
 		return nil

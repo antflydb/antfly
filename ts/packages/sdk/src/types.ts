@@ -115,6 +115,13 @@ export type DocumentSchema = components["schemas"]["DocumentSchema"];
 export type Embedding = components["schemas"]["Embedding"];
 export type DenseEmbedding = number[];
 export type SparseEmbedding = { indices: number[]; values: number[] };
+/** Base64-encoded string of little-endian float32 bytes (~4x more compact than DenseEmbedding). */
+export type PackedDenseEmbedding = string;
+/** Packed sparse embedding with base64-encoded little-endian uint32 indices and float32 values. */
+export type PackedSparseEmbedding = {
+  packed_indices: string;
+  packed_values: string;
+};
 
 // Search and aggregation types
 export type AggregationType = components["schemas"]["AggregationType"];
@@ -183,7 +190,13 @@ export type ChatToolResult = components["schemas"]["ChatToolResult"];
 export type ChatToolName = components["schemas"]["ChatToolName"];
 export type ChatToolsConfig = components["schemas"]["ChatToolsConfig"];
 export type FilterSpec = components["schemas"]["FilterSpec"];
-export type ClarificationRequest = components["schemas"]["ClarificationRequest"];
+export type AgentDecision = components["schemas"]["AgentDecision"];
+export type AgentQuestion = components["schemas"]["AgentQuestion"];
+export type AgentQuestionKind = components["schemas"]["AgentQuestionKind"];
+export type AgentStatus = components["schemas"]["AgentStatus"];
+export type AgentStep = components["schemas"]["AgentStep"];
+export type AgentStepKind = components["schemas"]["AgentStepKind"];
+export type AgentStepStatus = components["schemas"]["AgentStepStatus"];
 export type WebSearchConfig = components["schemas"]["WebSearchConfig"];
 export type FetchConfig = components["schemas"]["FetchConfig"];
 
@@ -241,7 +254,7 @@ export interface AntflyConfig {
 export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest"];
 export type RetrievalAgentResult = components["schemas"]["RetrievalAgentResult"];
 export type RetrievalAgentSteps = components["schemas"]["RetrievalAgentSteps"];
-export type RetrievalReasoningStep = components["schemas"]["RetrievalReasoningStep"];
+export type SSEStepStarted = components["schemas"]["SSEStepStarted"];
 
 // Retrieval Agent streaming callbacks for structured SSE events
 export interface RetrievalAgentStreamCallbacks {
@@ -252,13 +265,12 @@ export interface RetrievalAgentStreamCallbacks {
   onConfidence?: (data: GenerationConfidence) => void;
   onFollowup?: (question: string) => void;
   onEvalResult?: (data: EvalResult) => void;
-  onClarificationRequired?: (data: ClarificationRequest) => void;
   onFilterApplied?: (filter: FilterSpec) => void;
   onSearchExecuted?: (data: { query: string }) => void;
-  onStepStarted?: (step: { id: string; step: string; action: string }) => void;
+  onStepStarted?: (step: SSEStepStarted) => void;
   onStepProgress?: (data: Record<string, unknown>) => void;
-  onStepCompleted?: (step: RetrievalReasoningStep) => void;
-  onDone?: (data?: { complete: boolean }) => void;
+  onStepCompleted?: (step: AgentStep) => void;
+  onDone?: (data: RetrievalAgentResult) => void;
   onError?: (error: string) => void;
 }
 
@@ -275,7 +287,7 @@ export interface ChatAgentConfig {
   /** System prompt override */
   systemPrompt?: string;
   /** Maximum tool iterations per turn */
-  maxIterations?: number;
+  maxInternalIterations?: number;
   /** Number of follow-up questions to generate */
   followUpCount?: number;
   /** Results limit per search */

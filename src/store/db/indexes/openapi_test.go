@@ -85,6 +85,12 @@ func TestEmbeddingsIndexConfig_Equal(t *testing.T) {
 		assert.False(t, base.Equal(other))
 	})
 
+	t.Run("different external", func(t *testing.T) {
+		other := base
+		other.External = true
+		assert.False(t, base.Equal(other))
+	})
+
 	t.Run("different chunk_size", func(t *testing.T) {
 		other := base
 		other.ChunkSize = 512

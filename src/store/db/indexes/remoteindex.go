@@ -505,11 +505,11 @@ func applyFullTextPaging(req *bleve.SearchRequest, opts FullTextPagingOptions) {
 }
 
 type VectorPagingOptions struct {
-	OrderBy        []SortField
-	Limit          int
-	DistanceUnder  *float32
-	DistanceOver   *float32
-	SearchEffort   *float32
+	OrderBy       []SortField
+	Limit         int
+	DistanceUnder *float32
+	DistanceOver  *float32
+	SearchEffort  *float32
 }
 
 // DateTimeRange represents a datetime range for aggregations
@@ -1393,6 +1393,10 @@ type Query struct {
 	FilterQuery    query.Query `json:"filter_query,omitempty"`    // Query for filtering
 	ExclusionQuery query.Query `json:"exclusion_query,omitempty"` // Query for exclusion
 
+	// Raw JSON of FilterQuery, preserved from the API request to avoid
+	// re-serialization when passing to shards.
+	FilterQueryRaw json.RawMessage `json:"-"`
+
 	// Full text search
 	OrderBy             []SortField         `json:"order_by,omitempty"`
 	Offset              int                 `json:"offset,omitempty,omitzero"`
@@ -1400,15 +1404,16 @@ type Query struct {
 	SearchBefore        []string            `json:"search_before,omitempty"`
 	FullTextSearch      query.Query         `json:"full_text_search,omitempty"`
 	AggregationRequests AggregationRequests `json:"aggregations,omitempty"`
+	HybridFullTextMode  HybridFullTextMode  `json:"-"`
 
 	// For topk or for Full text paging
 	Limit int `json:"limit,omitempty"`
 
 	// Mapping from index name to embedding
-	Embeddings     map[string]vector.T `json:"embeddings,omitempty,omitzero"`
-	DistanceUnder  *float32            `json:"distance_under,omitempty"`
-	DistanceOver   *float32            `json:"distance_over,omitempty"`
-	SearchEffort   *float32            `json:"search_effort,omitempty"`
+	Embeddings    map[string]vector.T `json:"embeddings,omitempty,omitzero"`
+	DistanceUnder *float32            `json:"distance_under,omitempty"`
+	DistanceOver  *float32            `json:"distance_over,omitempty"`
+	SearchEffort  *float32            `json:"search_effort,omitempty"`
 
 	// Graph searches (executed after full-text/vector searches)
 	GraphSearches map[string]*GraphQuery `json:"graph_searches,omitempty"`
@@ -1427,6 +1432,82 @@ type Query struct {
 
 	// Pruner configures score-based filtering to remove low-relevance results
 	Pruner *Pruner `json:"pruner,omitempty"`
+}
+
+type HybridFullTextMode string
+
+const (
+	HybridFullTextModeNone      HybridFullTextMode = ""
+	HybridFullTextModeMatchAll  HybridFullTextMode = "match_all"
+	HybridFullTextModeMatchNone HybridFullTextMode = "match_none"
+)
+
+// PrepareHybridFullTextForSemanticSearch removes broad lexical branches from
+// hybrid execution while preserving an optional full-text fallback query.
+//
+// Explicit match_all behaves like a lexical no-op when semantic results exist,
+// but we keep the original query around so callers can fall back to full-text
+// if semantic retrieval returns nothing globally.
+//
+// Explicit match_none should never contribute lexical hits in hybrid mode.
+func (q *Query) PrepareHybridFullTextForSemanticSearch() query.Query {
+	if q == nil {
+		return nil
+	}
+
+	originalFullText := q.FullTextSearch
+	if q.FullTextSearch != nil {
+		q.FullTextSearch, q.HybridFullTextMode = normalizeHybridFullTextQueryWithMode(q.FullTextSearch)
+	} else {
+		q.HybridFullTextMode = HybridFullTextModeNone
+	}
+
+	if len(q.Embeddings) == 0 && len(q.SparseEmbeddings) == 0 {
+		return nil
+	}
+
+	switch q.HybridFullTextMode {
+	case HybridFullTextModeMatchAll:
+		q.FullTextSearch = nil
+		return originalFullText
+	case HybridFullTextModeMatchNone:
+		q.FullTextSearch = nil
+	}
+
+	return nil
+}
+
+func ShouldUseHybridFullTextFallback(
+	mode HybridFullTextMode,
+	fallback query.Query,
+	hadSemanticHits bool,
+) bool {
+	return mode == HybridFullTextModeMatchAll &&
+		fallback != nil &&
+		!hadSemanticHits
+}
+
+func ApplyPrunerToFusionResult(fusionResult *FusionResult, pruner *Pruner) {
+	if fusionResult == nil || pruner == nil || pruner.IsEmpty() {
+		return
+	}
+
+	originalCount := len(fusionResult.Hits)
+	fusionResult.Hits = pruner.PruneResults(fusionResult.Hits)
+
+	if len(fusionResult.Hits) == 0 {
+		fusionResult.MaxScore = 0
+		return
+	}
+
+	if len(fusionResult.Hits) < originalCount {
+		fusionResult.MaxScore = getEffectiveScore(fusionResult.Hits[0])
+		for _, hit := range fusionResult.Hits[1:] {
+			if s := getEffectiveScore(hit); s > fusionResult.MaxScore {
+				fusionResult.MaxScore = s
+			}
+		}
+	}
 }
 
 func (q *Query) RemoteIndexSearchRequest() (*RemoteIndexSearchRequest, error) {
@@ -1449,24 +1530,40 @@ func (q *Query) RemoteIndexSearchRequest() (*RemoteIndexSearchRequest, error) {
 			return nil, errors.New("offset is not supported with vector searches")
 		}
 	}
+	// Build the combined filter query for the wire format.
+	// When possible, use preserved raw JSON bytes to avoid re-serialization.
 	var filterQuery query.Query
+	var fqBytes json.RawMessage
 	if q.FilterQuery != nil && q.ExclusionQuery != nil {
+		// Must compose a new boolean query — need to marshal
 		filterQuery = query.NewBooleanQuery([]query.Query{
 			q.FilterQuery,
 		}, nil /* should */, []query.Query{
 			q.ExclusionQuery,
 		})
-	} else if q.FilterQuery != nil {
-		filterQuery = q.FilterQuery
-	} else if q.ExclusionQuery != nil {
-		filterQuery = query.NewBooleanQuery(nil /* must */, nil /* should */, []query.Query{q.ExclusionQuery})
-	}
-	var fqBytes json.RawMessage
-	if filterQuery != nil {
 		var err error
 		fqBytes, err = json.Marshal(filterQuery)
 		if err != nil {
 			return nil, fmt.Errorf("marshalling filter query: %w", err)
+		}
+	} else if q.FilterQuery != nil {
+		filterQuery = q.FilterQuery
+		if len(q.FilterQueryRaw) > 0 {
+			fqBytes = q.FilterQueryRaw // pass through original bytes
+		} else {
+			var err error
+			fqBytes, err = json.Marshal(filterQuery)
+			if err != nil {
+				return nil, fmt.Errorf("marshalling filter query: %w", err)
+			}
+		}
+	} else if q.ExclusionQuery != nil {
+		// Must wrap in boolean query — always needs marshaling
+		filterQuery = query.NewBooleanQuery(nil /* must */, nil /* should */, []query.Query{q.ExclusionQuery})
+		var err error
+		fqBytes, err = json.Marshal(filterQuery)
+		if err != nil {
+			return nil, fmt.Errorf("marshalling exclusion query: %w", err)
 		}
 	}
 	risr := &RemoteIndexSearchRequest{
@@ -1516,11 +1613,11 @@ func (q *Query) VectorPagingOptions() VectorPagingOptions {
 		return VectorPagingOptions{}
 	}
 	return VectorPagingOptions{
-		OrderBy:        q.OrderBy,
-		Limit:          q.Limit,
-		DistanceUnder:  q.DistanceUnder,
-		DistanceOver:   q.DistanceOver,
-		SearchEffort:   q.SearchEffort,
+		OrderBy:       q.OrderBy,
+		Limit:         q.Limit,
+		DistanceUnder: q.DistanceUnder,
+		DistanceOver:  q.DistanceOver,
+		SearchEffort:  q.SearchEffort,
 	}
 }
 
@@ -1571,24 +1668,6 @@ func (r RemoteIndexes) FusedSearch(ctx context.Context, jsonQuery *Query) (*Fusi
 			weights = *mc.Weights
 		}
 		fusedResults = remoteRes.RRFResults(jsonQuery.Limit, rankConstant, weights)
-	}
-
-	// Apply result pruning if configured
-	if jsonQuery.Pruner != nil && !jsonQuery.Pruner.IsEmpty() {
-		originalCount := len(fusedResults.Hits)
-		fusedResults.Hits = jsonQuery.Pruner.PruneResults(fusedResults.Hits)
-
-		// Update MaxScore if hits were pruned
-		if len(fusedResults.Hits) > 0 && len(fusedResults.Hits) < originalCount {
-			fusedResults.MaxScore = getEffectiveScore(fusedResults.Hits[0])
-			for _, hit := range fusedResults.Hits[1:] {
-				if s := getEffectiveScore(hit); s > fusedResults.MaxScore {
-					fusedResults.MaxScore = s
-				}
-			}
-		} else if len(fusedResults.Hits) == 0 {
-			fusedResults.MaxScore = 0
-		}
 	}
 
 	fusedResults.Status = remoteRes.Status

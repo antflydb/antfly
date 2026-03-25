@@ -48,12 +48,13 @@ type retrievalToolExecutor struct {
 	logger            *zap.Logger
 
 	// Accumulated state
-	collectedDocuments   []QueryHit
-	collectedIDs         map[string]bool // dedup guard for collectedDocuments
-	reasoningChain       []RetrievalReasoningStep
-	pendingClarification *ai.ClarificationRequest
-	appliedFilters       []ai.FilterSpec
-	queryResults         map[string][]QueryHit
+	collectedDocuments []QueryHit
+	collectedIDs       map[string]bool // dedup guard for collectedDocuments
+	steps              []AgentStep
+	// The tool interface still surfaces clarification in ai.ClarificationRequest form.
+	pendingQuestion *ai.ClarificationRequest
+	appliedFilters  []ai.FilterSpec
+	queryResults    map[string][]QueryHit
 
 	// Streaming
 	streamCallback func(ctx context.Context, eventType SSEEvent, data any) error
@@ -86,33 +87,34 @@ func (e *retrievalToolExecutor) collectHits(ctx context.Context, hits []QueryHit
 
 // emitStep wraps a tool execution with step_started/step_completed lifecycle events.
 // The fn callback performs the actual work and returns details for the completed step.
-func (e *retrievalToolExecutor) emitStep(ctx context.Context, stepName, action string, fn func() (map[string]any, error)) (RetrievalReasoningStep, error) {
+func (e *retrievalToolExecutor) emitStep(ctx context.Context, stepName, action string, fn func() (map[string]any, error)) (AgentStep, error) {
 	stepID := "step_" + xid.New().String()
 	if e.streamCallback != nil {
 		if err := e.streamCallback(ctx, SSEEventStepStarted, map[string]any{
-			"id": stepID, "step": stepName, "action": action,
+			"id": stepID, "kind": AgentStepKindToolCall, "name": stepName, "action": action,
 		}); err != nil {
 			e.logger.Debug("Failed to stream step_started", zap.String("step", stepName), zap.Error(err))
 		}
 	}
 	start := time.Now()
 	details, err := fn()
-	status := RetrievalReasoningStepStatusSuccess
+	status := AgentStepStatusSuccess
 	var errMsg string
 	if err != nil {
-		status = RetrievalReasoningStepStatusError
+		status = AgentStepStatusError
 		errMsg = err.Error()
 	}
-	step := RetrievalReasoningStep{
+	step := AgentStep{
 		Id:           stepID,
-		Step:         stepName,
+		Kind:         AgentStepKindToolCall,
+		Name:         stepName,
 		Action:       action,
 		Status:       status,
 		ErrorMessage: errMsg,
 		DurationMs:   int(time.Since(start).Milliseconds()),
 		Details:      details,
 	}
-	e.reasoningChain = append(e.reasoningChain, step)
+	e.steps = append(e.steps, step)
 	if e.streamCallback != nil {
 		if err := e.streamCallback(ctx, SSEEventStepCompleted, step); err != nil {
 			e.logger.Debug("Failed to stream step_completed", zap.String("step", stepName), zap.Error(err))
@@ -140,6 +142,42 @@ func accumulateUsage(usage *RetrievalAgentUsage, gen *ai.GenerationUsage) {
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	usage.CachedInputTokens += gen.CachedTokens
 	usage.LlmCalls++
+}
+
+func normalizeRetrievalAgentSessionRequest(req *RetrievalAgentRequest) {
+	req.SessionId = ensureAgentSessionID(req.SessionId, "rags_")
+}
+
+func buildEffectiveRetrievalQuery(req *RetrievalAgentRequest) string {
+	return appendDecisionContext(req.Query, req.Decisions)
+}
+
+func initRetrievalAgentResult(sessionID string, generator *ai.GenKitModelImpl) *RetrievalAgentResult {
+	result := &RetrievalAgentResult{
+		Id:        "ragr_" + xid.New().String(),
+		CreatedAt: time.Now().Unix(),
+		Hits:      []QueryHit{},
+		Steps:     []AgentStep{},
+		Status:    AgentStatusCompleted,
+		SessionId: sessionID,
+	}
+	if generator != nil {
+		result.Model = generator.Model.Name()
+	}
+	return result
+}
+
+func finalizeRetrievalAgentSession(req *RetrievalAgentRequest, result *RetrievalAgentResult) {
+	result.SessionId = req.SessionId
+	result.ClarificationCount = len(req.Decisions)
+	result.Iteration = result.ToolCallsMade
+	result.Steps = normalizeAgentSteps(result.Steps)
+	if req.MaxInternalIterations > 0 {
+		result.RemainingInternalIterations = max(req.MaxInternalIterations-result.Iteration, 0)
+	}
+	if req.MaxUserClarifications > 0 {
+		result.RemainingUserClarifications = max(req.MaxUserClarifications-result.ClarificationCount, 0)
+	}
 }
 
 // ExecuteSearch runs a semantic search (legacy ToolExecutor interface)
@@ -451,34 +489,50 @@ func (e *retrievalToolExecutor) ExecuteFetch(ctx context.Context, url string) (m
 	return fetchResult, nil
 }
 
-// SetClarification captures a clarification request.
+// SetClarification captures a pending user question from the tool interface.
 func (e *retrievalToolExecutor) SetClarification(_ context.Context, clarification ai.ClarificationRequest) {
-	e.pendingClarification = &clarification
+	e.pendingQuestion = &clarification
 }
 
 // collectExecutorResults copies accumulated results from the executor into the agent result.
 func collectExecutorResults(executor *retrievalToolExecutor, result *RetrievalAgentResult) {
 	result.Hits = executor.collectedDocuments
-	result.ReasoningChain = append(result.ReasoningChain, executor.reasoningChain...)
+	result.Steps = append(result.Steps, executor.steps...)
 	result.AppliedFilters = executor.appliedFilters
-	result.ToolCallsMade = len(executor.reasoningChain)
+	result.ToolCallsMade = len(executor.steps)
 }
 
-// applyPendingClarification sets the result status to incomplete with clarification details if the executor
-// has a pending clarification request.
-func applyPendingClarification(executor *retrievalToolExecutor, result *RetrievalAgentResult) {
-	if executor.pendingClarification == nil {
+// applyPendingQuestion sets the result status to clarification_required if the executor
+// has a pending user question.
+func applyPendingQuestion(executor *retrievalToolExecutor, result *RetrievalAgentResult) {
+	if executor.pendingQuestion == nil {
 		return
 	}
-	result.Status = RetrievalAgentStatusIncomplete
-	result.IncompleteDetails = IncompleteDetails{Reason: IncompleteDetailsReasonClarificationNeeded}
-	cr := executor.pendingClarification
-	result.ClarificationRequest = ClarificationRequest{
-		Question: cr.Question,
-	}
+	result.Status = AgentStatusClarificationRequired
+	cr := executor.pendingQuestion
+	reason := "agent clarification required"
+	options := []string(nil)
 	if cr.Options != nil {
-		result.ClarificationRequest.Options = *cr.Options
+		options = *cr.Options
 	}
+	result.Questions = []AgentQuestion{{
+		Id:       "clarification",
+		Kind:     clarificationQuestionKind(options),
+		Question: cr.Question,
+		Reason:   reason,
+		Options:  options,
+		Affects:  []string{"retrieval"},
+	}}
+	result.Steps = append(result.Steps, normalizeAgentStep(AgentStep{
+		Kind:   AgentStepKindClarification,
+		Name:   "clarification",
+		Action: "Requested user clarification before continuing retrieval",
+		Status: AgentStepStatusSuccess,
+		Details: map[string]any{
+			"question": cr.Question,
+			"options":  options,
+		},
+	}))
 }
 
 // AddFilter adds a filter to the accumulated filters.
@@ -555,6 +609,7 @@ func (t *TableApi) runClassificationStep(
 	if req.Steps.Classification.Enabled == nil || !*req.Steps.Classification.Enabled {
 		return nil, nil
 	}
+	effectiveQuery := buildEffectiveRetrievalQuery(req)
 
 	classOpts := buildRetrievalClassificationOptions(req.Steps, req.AgentKnowledge)
 
@@ -567,7 +622,7 @@ func (t *TableApi) runClassificationStep(
 		}))
 	}
 
-	enhanced, err := generator.ClassifyImproveAndTransformQuery(ctx, req.Query, classOpts...)
+	enhanced, err := generator.ClassifyImproveAndTransformQuery(ctx, effectiveQuery, classOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("classification failed: %w", err)
 	}
@@ -595,6 +650,7 @@ func (t *TableApi) runGenerationStep(
 	if req.Steps.Generation.Enabled == nil || !*req.Steps.Generation.Enabled {
 		return
 	}
+	effectiveQuery := buildEffectiveRetrievalQuery(req)
 
 	// Convert retrieved documents to schema.Document
 	docs := convertQueryHitsToDocuments(result.Hits)
@@ -648,7 +704,7 @@ func (t *TableApi) runGenerationStep(
 
 			var err error
 			generationOutput, err = generator.GenerateQueryResponse(
-				egCtx, req.Query, prunedDocs, classification,
+				egCtx, effectiveQuery, prunedDocs, classification,
 				append(generationOpts, streamOpt)...)
 			return err
 		})
@@ -679,11 +735,11 @@ func (t *TableApi) runGenerationStep(
 	} else {
 		// JSON mode: synchronous generation
 		generationOutput, err := generator.GenerateQueryResponse(
-			ctx, req.Query, prunedDocs, classification, generationOpts...)
+			ctx, effectiveQuery, prunedDocs, classification, generationOpts...)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				t.logger.Error("Generation step failed", zap.Error(err))
-				result.Status = RetrievalAgentStatusFailed
+				result.Status = AgentStatusFailed
 				result.Generation = classifyGenerationError(req, err).Error()
 			}
 			return
@@ -729,7 +785,7 @@ func (t *TableApi) runEvalStep(
 
 	evalInput := eval.EvaluateInput{
 		Config:       req.Steps.Eval,
-		Query:        req.Query,
+		Query:        buildEffectiveRetrievalQuery(req),
 		Output:       answer,
 		RetrievedIDs: retrievedIDs,
 		Context:      contextAny,
@@ -762,11 +818,15 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, fmt.Sprintf("Error decoding request: %v", err), http.StatusBadRequest)
 		return
 	}
+	normalizeRetrievalAgentSessionRequest(&req)
 
 	t.logger.Debug("RetrievalAgent request received",
 		zap.String("query", req.Query),
 		zap.Int("num_queries", len(req.Queries)),
-		zap.Int("max_iterations", req.MaxIterations),
+		zap.Int("max_internal_iterations", req.MaxInternalIterations),
+		zap.Int("max_internal_iterations", req.MaxInternalIterations),
+		zap.Int("max_user_clarifications", req.MaxUserClarifications),
+		zap.String("session_id", req.SessionId),
 		zap.Bool("stream", req.Stream),
 		zap.String("generator.provider", string(req.Generator.Provider)),
 		zap.Int("chain_len", len(req.Chain)),
@@ -791,7 +851,7 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve generator chain (needed for agentic mode, when a generator is
 	// explicitly provided, or when classification/generation steps are configured)
-	needsGenerator := req.MaxIterations > 0 ||
+	needsGenerator := req.MaxInternalIterations > 0 ||
 		req.Generator.Provider != "" ||
 		len(req.Chain) > 0 ||
 		(req.Steps.Classification.Enabled != nil && *req.Steps.Classification.Enabled) ||
@@ -801,7 +861,7 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 	if needsGenerator {
 		chain := resolveEffectiveGeneratorChain(&req)
 		if len(chain) == 0 {
-			if req.MaxIterations != 0 {
+			if req.MaxInternalIterations != 0 {
 				errorResponse(w, "either 'generator' or 'chain' must be provided (no default chain configured)", http.StatusBadRequest)
 				return
 			}
@@ -819,8 +879,8 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Pipeline mode: max_iterations=0 (default)
-	if req.MaxIterations == 0 {
+	// Pipeline mode: max_internal_iterations=0 (default)
+	if req.MaxInternalIterations == 0 {
 		if req.Stream {
 			t.streamRetrievalPipeline(w, r, &req, generator)
 		} else {
@@ -829,7 +889,7 @@ func (t *TableApi) RetrievalAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Agentic mode: LLM-driven tool calling (max_iterations > 0)
+	// Agentic mode: LLM-driven tool calling (max_internal_iterations > 0)
 
 	if generator == nil {
 		errorResponse(w, "generator is required for agentic mode", http.StatusBadRequest)
@@ -943,7 +1003,7 @@ func queryRequestFromRetrieval(qr *RetrievalQueryRequest) *QueryRequest {
 	}
 }
 
-// ExecutePipeline runs queries in order (pipeline mode: max_iterations=0).
+// ExecutePipeline runs queries in order (pipeline mode: max_internal_iterations=0).
 // It executes classification, retrieval queries, and generation steps sequentially.
 func (t *TableApi) ExecutePipeline(
 	ctx context.Context,
@@ -951,16 +1011,8 @@ func (t *TableApi) ExecutePipeline(
 	generator *ai.GenKitModelImpl,
 	streamCallback func(ctx context.Context, eventType SSEEvent, data any) error,
 ) (*RetrievalAgentResult, error) {
-	result := &RetrievalAgentResult{
-		Id:             "ragr_" + xid.New().String(),
-		CreatedAt:      time.Now().Unix(),
-		Hits:           []QueryHit{},
-		ReasoningChain: []RetrievalReasoningStep{},
-		Status:         RetrievalAgentStatusCompleted,
-	}
-	if generator != nil {
-		result.Model = generator.Model.Name()
-	}
+	result := initRetrievalAgentResult(req.SessionId, generator)
+	effectiveQuery := buildEffectiveRetrievalQuery(req)
 
 	// Classification pre-step (optional, requires generator)
 	var classification *ai.ClassificationTransformationResult
@@ -1028,24 +1080,28 @@ func (t *TableApi) ExecutePipeline(
 				streamCallback: streamCallback,
 			}
 			_, _ = executor.emitStep(ctx, "tree_search", fmt.Sprintf("Tree search in '%s'", treeConfig.Index), func() (map[string]any, error) {
-				hits := executor.executeTreeSearchInternal(ctx, &treeConfig, req.Query, nil)
+				hits := executor.executeTreeSearchInternal(ctx, &treeConfig, effectiveQuery, nil)
 				allHits = append(allHits, hits...)
 				return map[string]any{"collected": len(hits)}, nil
 			})
-			result.ReasoningChain = append(result.ReasoningChain, executor.reasoningChain...)
+			result.Steps = append(result.Steps, executor.steps...)
 		}
 	}
 
 	result.Hits = allHits
-	result.ReasoningChain = append(result.ReasoningChain, RetrievalReasoningStep{
-		Step:   "pipeline",
+	result.Steps = append(result.Steps, normalizeAgentStep(AgentStep{
+		Kind:   AgentStepKindPlanning,
+		Name:   "pipeline",
 		Action: fmt.Sprintf("Pipeline executed: %d queries, %d documents", len(req.Queries), len(allHits)),
-	})
+		Status: AgentStepStatusSuccess,
+	}))
 
 	// Generation post-step (optional, requires generator)
 	if generator != nil {
 		t.runGenerationStep(ctx, req, generator, result, classification, streamCallback)
 	}
+
+	finalizeRetrievalAgentSession(req, result)
 
 	return result, nil
 }
@@ -1089,7 +1145,7 @@ func (t *TableApi) jsonRetrievalAgentic(
 	}
 }
 
-// RunAgenticRetrieval executes the LLM-driven tool-calling loop (agentic mode: max_iterations > 0).
+// RunAgenticRetrieval executes the LLM-driven tool-calling loop (agentic mode: max_internal_iterations > 0).
 // It uses tool-calling to iteratively search and refine results.
 func (t *TableApi) RunAgenticRetrieval(
 	ctx context.Context,
@@ -1097,14 +1153,7 @@ func (t *TableApi) RunAgenticRetrieval(
 	generator *ai.GenKitModelImpl,
 	streamCallback func(ctx context.Context, eventType SSEEvent, data any) error,
 ) *RetrievalAgentResult {
-	result := &RetrievalAgentResult{
-		Id:             "ragr_" + xid.New().String(),
-		CreatedAt:      time.Now().Unix(),
-		Model:          generator.Model.Name(),
-		Hits:           []QueryHit{},
-		ReasoningChain: []RetrievalReasoningStep{},
-		Status:         RetrievalAgentStatusCompleted,
-	}
+	result := initRetrievalAgentResult(req.SessionId, generator)
 
 	// Classification pre-step (optional)
 	classification, err := t.runClassificationStep(ctx, req, generator, streamCallback)
@@ -1186,6 +1235,8 @@ func (t *TableApi) RunAgenticRetrieval(
 		})
 	}
 
+	finalizeRetrievalAgentSession(req, result)
+
 	return result
 }
 
@@ -1199,12 +1250,14 @@ func (t *TableApi) runAgenticWithTools(
 	toolsConfig ai.ChatToolsConfig,
 	result *RetrievalAgentResult,
 ) {
+	effectiveQuery := buildEffectiveRetrievalQuery(req)
+
 	// Create native genkit tools from available indexes
 	tools := ai.CreateRetrievalTools(generator.Genkit, toolsConfig, executor, availableIndexes)
 
 	if len(tools) == 0 {
 		t.logger.Warn("No tools created for retrieval agent")
-		result.Status = RetrievalAgentStatusIncomplete
+		result.Status = AgentStatusIncomplete
 		result.IncompleteDetails = IncompleteDetails{Reason: IncompleteDetailsReasonNoTools}
 		return
 	}
@@ -1226,15 +1279,12 @@ func (t *TableApi) runAgenticWithTools(
 
 	// Build conversation messages
 	messages := req.Messages
-	if len(messages) == 0 {
-		messages = req.Context // backward compat
-	}
 
 	// Generate with tools
 	generationOpts := []ai.GenerationOption{
 		ai.WithGenerationSystemPrompt(systemPrompt),
 		ai.WithTools(tools),
-		ai.WithMaxToolIterations(req.MaxIterations),
+		ai.WithMaxToolIterations(req.MaxInternalIterations),
 	}
 
 	// Pass conversation history for multi-turn chat
@@ -1252,16 +1302,19 @@ func (t *TableApi) runAgenticWithTools(
 	defaultClassification := &ai.ClassificationTransformationResult{
 		RouteType: ai.RouteTypeSearch,
 	}
-	genOutput, err := generator.GenerateQueryResponse(ctx, req.Query, nil, defaultClassification, generationOpts...)
+	genOutput, err := generator.GenerateQueryResponse(ctx, effectiveQuery, nil, defaultClassification, generationOpts...)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
 			t.logger.Error("Agentic retrieval failed", zap.Error(err))
 		}
-		result.Status = RetrievalAgentStatusFailed
-		result.ReasoningChain = append(result.ReasoningChain, RetrievalReasoningStep{
-			Step:   "error",
-			Action: fmt.Sprintf("Agentic retrieval failed: %v", err),
-		})
+		result.Status = AgentStatusFailed
+		result.Steps = append(result.Steps, normalizeAgentStep(AgentStep{
+			Kind:         AgentStepKindGeneration,
+			Name:         "error",
+			Action:       fmt.Sprintf("Agentic retrieval failed: %v", err),
+			Status:       AgentStepStatusError,
+			ErrorMessage: err.Error(),
+		}))
 	}
 	if genOutput != nil {
 		accumulateUsage(&result.Usage, genOutput.Usage)
@@ -1269,7 +1322,7 @@ func (t *TableApi) runAgenticWithTools(
 
 	// Collect results from executor
 	collectExecutorResults(executor, result)
-	applyPendingClarification(executor, result)
+	applyPendingQuestion(executor, result)
 
 	// Populate response messages for multi-turn chat.
 	// Include the input messages plus a new user message with the current query
@@ -1291,6 +1344,8 @@ func (t *TableApi) runAgenticWithStructuredOutput(
 	availableIndexes []ai.IndexInfo,
 	result *RetrievalAgentResult,
 ) {
+	effectiveQuery := buildEffectiveRetrievalQuery(req)
+
 	// Stream tool mode event
 	if executor.streamCallback != nil {
 		_ = executor.streamCallback(ctx, SSEEventToolMode, map[string]any{
@@ -1302,11 +1357,11 @@ func (t *TableApi) runAgenticWithStructuredOutput(
 	systemPrompt := ai.RetrievalAgentSystemPromptWithoutTools(availableIndexes, "", req.AgentKnowledge)
 
 	// Run iterative structured output loop
-	hitMaxIterations := true
-	for iteration := 0; iteration < req.MaxIterations; iteration++ {
+	exhaustedInternalIterations := true
+	for iteration := 0; iteration < req.MaxInternalIterations; iteration++ {
 		// Call LLM
 		response, usage, err := generator.RAG(ctx, nil,
-			ai.WithPromptTemplate(req.Query),
+			ai.WithPromptTemplate(effectiveQuery),
 			ai.WithSystemPrompt(systemPrompt),
 		)
 		accumulateUsage(&result.Usage, usage)
@@ -1314,8 +1369,8 @@ func (t *TableApi) runAgenticWithStructuredOutput(
 			if !errors.Is(err, context.Canceled) {
 				t.logger.Error("Structured output LLM call failed", zap.Error(err))
 			}
-			result.Status = RetrievalAgentStatusFailed
-			hitMaxIterations = false
+			result.Status = AgentStatusFailed
+			exhaustedInternalIterations = false
 			break
 		}
 
@@ -1323,7 +1378,7 @@ func (t *TableApi) runAgenticWithStructuredOutput(
 		actions, _, err := ai.ParseStructuredOutput(response)
 		if err != nil || len(actions) == 0 {
 			// No more actions — LLM is done
-			hitMaxIterations = false
+			exhaustedInternalIterations = false
 			break
 		}
 
@@ -1385,18 +1440,18 @@ func (t *TableApi) runAgenticWithStructuredOutput(
 		}
 
 		// If clarification was requested, stop
-		if executor.pendingClarification != nil {
-			hitMaxIterations = false
+		if executor.pendingQuestion != nil {
+			exhaustedInternalIterations = false
 			break
 		}
 	}
 
 	// Collect results
 	collectExecutorResults(executor, result)
-	applyPendingClarification(executor, result)
-	if executor.pendingClarification == nil && hitMaxIterations {
-		result.Status = RetrievalAgentStatusIncomplete
-		result.IncompleteDetails = IncompleteDetails{Reason: IncompleteDetailsReasonMaxIterations}
+	applyPendingQuestion(executor, result)
+	if executor.pendingQuestion == nil && exhaustedInternalIterations {
+		result.Status = AgentStatusIncomplete
+		result.IncompleteDetails = IncompleteDetails{Reason: IncompleteDetailsReasonMaxInternalIterations}
 	}
 }
 
@@ -1477,7 +1532,7 @@ func (e *retrievalToolExecutor) executeTreeSearchInternal(
 	// Stream tree search progress
 	if e.streamCallback != nil {
 		_ = e.streamCallback(ctx, SSEEventStepProgress, map[string]any{
-			"step":       "tree_search",
+			"name":       "tree_search",
 			"index":      treeConfig.Index,
 			"max_depth":  maxDepth,
 			"beam_width": beamWidth,
@@ -1488,20 +1543,25 @@ func (e *retrievalToolExecutor) executeTreeSearchInternal(
 	startNodes, err := e.resolveTreeStartNodesWithPipeline(ctx, treeConfig, queryResults)
 	if err != nil {
 		e.logger.Error("Failed to resolve start nodes", zap.Error(err))
-		e.reasoningChain = append(e.reasoningChain, RetrievalReasoningStep{
-			Step:    "tree_search",
-			Action:  "Failed to resolve start nodes, falling back to semantic",
-			Details: map[string]any{"error": err.Error()},
-		})
+		e.steps = append(e.steps, normalizeAgentStep(AgentStep{
+			Kind:         AgentStepKindToolCall,
+			Name:         "tree_search",
+			Action:       "Failed to resolve start nodes, falling back to semantic",
+			Status:       AgentStepStatusError,
+			ErrorMessage: err.Error(),
+			Details:      map[string]any{"error": err.Error()},
+		}))
 		return e.fallbackToSemanticSearch(ctx, query)
 	}
 
 	if len(startNodes) == 0 {
 		e.logger.Warn("No start nodes found for tree search")
-		e.reasoningChain = append(e.reasoningChain, RetrievalReasoningStep{
-			Step:   "tree_search",
+		e.steps = append(e.steps, normalizeAgentStep(AgentStep{
+			Kind:   AgentStepKindToolCall,
+			Name:   "tree_search",
 			Action: "No start nodes found, falling back to semantic",
-		})
+			Status: AgentStepStatusSkipped,
+		}))
 		return e.fallbackToSemanticSearch(ctx, query)
 	}
 
@@ -1520,7 +1580,7 @@ func (e *retrievalToolExecutor) executeTreeSearchInternal(
 
 		if e.streamCallback != nil {
 			_ = e.streamCallback(ctx, SSEEventStepProgress, map[string]any{
-				"step":      "tree_search",
+				"name":      "tree_search",
 				"depth":     depth,
 				"num_nodes": len(currentNodes),
 			})
@@ -1563,20 +1623,22 @@ func (e *retrievalToolExecutor) executeTreeSearchInternal(
 			sufficient, reason := e.checkTreeSearchSufficiency(query, collected)
 			if e.streamCallback != nil {
 				_ = e.streamCallback(ctx, SSEEventStepProgress, map[string]any{
-					"step":       "tree_search",
+					"name":       "tree_search",
 					"sufficient": sufficient,
 					"reason":     reason,
 					"collected":  len(collected),
 				})
 			}
 			if sufficient {
-				e.reasoningChain = append(e.reasoningChain, RetrievalReasoningStep{
-					Step:   "tree_search",
+				e.steps = append(e.steps, normalizeAgentStep(AgentStep{
+					Kind:   AgentStepKindValidation,
+					Name:   "tree_search",
 					Action: "Sufficiency reached",
+					Status: AgentStepStatusSuccess,
 					Details: map[string]any{
 						"depth": depth, "collected": len(collected), "reason": reason,
 					},
-				})
+				}))
 				break
 			}
 		}
@@ -1615,7 +1677,7 @@ func (e *retrievalToolExecutor) executeTreeSearchInternal(
 	// Stream completion
 	if e.streamCallback != nil {
 		_ = e.streamCallback(ctx, SSEEventStepProgress, map[string]any{
-			"step":      "tree_search",
+			"name":      "tree_search",
 			"collected": len(collected),
 			"depth":     depth,
 			"complete":  true,

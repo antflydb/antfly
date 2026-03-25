@@ -120,7 +120,7 @@ function makeTurn(overrides: Partial<ChatTurn> = {}): ChatTurn {
     clarification: null,
     appliedFilters: [],
     reasoningText: "",
-    reasoningChain: [],
+    steps: [],
     activeSteps: [],
     toolCallsMade: 0,
     error: null,

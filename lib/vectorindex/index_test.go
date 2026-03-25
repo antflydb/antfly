@@ -166,29 +166,29 @@ func TestCalculateRecall(t *testing.T) {
 				"Cosine":       98.00,
 			},
 		},
-			{
-				dataset:   testutils.LaionDatasetGemini10k,
-				topK:      10,
-				count:     10_000,
-				tolerance: 1.5, // Higher tolerance due to platform precision differences
-				expected: map[string]float64{
-					"Euclidean":    86.50,
-					"InnerProduct": 69.00,
-					"Cosine":       80.00,
-				},
+		{
+			dataset:   testutils.LaionDatasetGemini10k,
+			topK:      10,
+			count:     10_000,
+			tolerance: 1.5, // Higher tolerance due to platform precision differences
+			expected: map[string]float64{
+				"Euclidean":    86.50,
+				"InnerProduct": 69.00,
+				"Cosine":       80.00,
 			},
-			{
-				dataset:   testutils.LaionDatasetGemini10k,
-				topK:      10,
-				randomize: true,
-				count:     10_000,
-				tolerance: 1.5, // Higher tolerance due to platform precision differences
-				expected: map[string]float64{
-					"Euclidean":    88.50,
-					"InnerProduct": 83.00,
-					"Cosine":       87.50,
-				},
+		},
+		{
+			dataset:   testutils.LaionDatasetGemini10k,
+			topK:      10,
+			randomize: true,
+			count:     10_000,
+			tolerance: 1.5, // Higher tolerance due to platform precision differences
+			expected: map[string]float64{
+				"Euclidean":    88.50,
+				"InnerProduct": 83.00,
+				"Cosine":       87.50,
 			},
+		},
 		{
 			dataset: testutils.WikiDataset,
 			topK:    10,
@@ -199,17 +199,17 @@ func TestCalculateRecall(t *testing.T) {
 				"Cosine":       98.50,
 			},
 		},
-			{
-				dataset:   testutils.WikiDataset,
-				randomize: true,
-				topK:      10,
-				count:     1000,
-				expected: map[string]float64{
-					"Euclidean":    100.00,
-					"InnerProduct": 97.00,
-					"Cosine":       97.00,
-				},
+		{
+			dataset:   testutils.WikiDataset,
+			randomize: true,
+			topK:      10,
+			count:     1000,
+			expected: map[string]float64{
+				"Euclidean":    100.00,
+				"InnerProduct": 97.00,
+				"Cosine":       97.00,
 			},
+		},
 		{
 			dataset: testutils.DbpediaDataset,
 			topK:    10,

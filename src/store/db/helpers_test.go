@@ -142,7 +142,7 @@ func TestExtractAndWriteSpecialFields(t *testing.T) {
 	})
 
 	t.Run("embeddings extracted and written", func(t *testing.T) {
-		db, dir := setupTestDBWithIndex(t, 3, "content", "")
+		db, dir := setupTestDBWithExternalIndex(t, 3, false)
 		defer db.Close()
 		defer os.RemoveAll(dir)
 
@@ -169,7 +169,7 @@ func TestExtractAndWriteSpecialFields(t *testing.T) {
 	})
 
 	t.Run("only special fields sets HasNonSpecialFields false", func(t *testing.T) {
-		db, dir := setupTestDBWithIndex(t, 3, "content", "")
+		db, dir := setupTestDBWithExternalIndex(t, 3, false)
 		defer db.Close()
 		defer os.RemoveAll(dir)
 
@@ -458,7 +458,7 @@ func TestSetRange_PersistsCorrectly(t *testing.T) {
 	var persisted types.Range
 	require.NoError(t, json.Unmarshal(data, &persisted))
 	assert.Equal(t, newRange, persisted)
-	assert.Equal(t, newRange, db.byteRange)
+	assert.Equal(t, newRange, db.getByteRange())
 }
 
 // TestBatch_SyncLevelPreservesCallerData verifies that a Batch call at

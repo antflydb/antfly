@@ -182,6 +182,7 @@ func TestDBBatch_AllowsReceiverMergeDonorRangeOnApply(t *testing.T) {
 
 	coreDB := NewDBImplForTest(lg, snapStore)
 	require.NoError(t, coreDB.Open(filepath.Join(dir, "receiver"), false, nil, types.Range{nil, []byte{0x80}}))
+	defer coreDB.Close()
 
 	mergeState := MergeState_builder{
 		Phase:              MergeState_PHASE_PREPARE,
@@ -293,11 +294,9 @@ func TestStoreDBCloseDB_WaitsForBackgroundGoroutines(t *testing.T) {
 	}
 
 	backgroundDone := make(chan struct{})
-	storeDB.backgroundWG.Add(1)
-	go func() {
-		defer storeDB.backgroundWG.Done()
+	storeDB.backgroundWG.Go(func() {
 		<-backgroundDone
-	}()
+	})
 
 	closeDone := make(chan error, 1)
 	go func() {
@@ -475,7 +474,9 @@ func TestStartSplitReplayIfNeeded_ZeroDeltaSplitMarksCutoverReadyWhenParentStops
 		return required && caughtUp && !cutoverReady && seq == 0 && replayParentID == parentID
 	}, 5*time.Second, 100*time.Millisecond)
 
+	parent.byteRangeMu.Lock()
 	parent.splitState = nil
+	parent.byteRangeMu.Unlock()
 	require.NoError(t, parent.coreDB.SetSplitState(nil))
 
 	require.Eventually(t, func() bool {

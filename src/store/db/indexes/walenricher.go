@@ -136,6 +136,10 @@ type walEnricherBase struct {
 	eg          *errgroup.Group
 	enqueueChan chan int
 
+	// flushTime is captured from DefaultFlushTime at init time so background
+	// goroutines don't race with test code that mutates the package var.
+	flushTime time.Duration
+
 	// Cached Prometheus gauge to avoid WithLabelValues map lookup per batch.
 	walBacklogGauge prometheus.Gauge
 
@@ -163,6 +167,7 @@ func (b *walEnricherBase) init(
 	ctx, b.egCancel = context.WithCancel(ctx)
 	b.eg, b.egCtx = errgroup.WithContext(ctx)
 	b.enqueueChan = make(chan int, 5)
+	b.flushTime = DefaultFlushTime
 	b.walBacklogGauge = enricherWALBacklog.WithLabelValues(metricsLabel)
 	b.backfillProgressGauge = backfillProgress.WithLabelValues(metricsLabel)
 	b.backfillItemsCounter = backfillItemsProcessed.WithLabelValues(metricsLabel)
@@ -239,7 +244,7 @@ func (b *walEnricherBase) runDequeueLoop(
 	}
 	const maxJitter = time.Millisecond * 200
 	jitter := maxJitter - rand.N(maxJitter) //nolint:gosec // G404: non-security randomness for ML/jitter
-	t := time.NewTimer(DefaultFlushTime + jitter)
+	t := time.NewTimer(b.flushTime + jitter)
 	enqueueCounter := 0
 	resetTimer := func(d time.Duration) {
 		if !t.Stop() {
@@ -258,7 +263,7 @@ func (b *walEnricherBase) runDequeueLoop(
 			return err
 		}
 		if empty {
-			resetTimer(DefaultFlushTime + jitter)
+			resetTimer(b.flushTime + jitter)
 		} else {
 			resetTimer(100*time.Millisecond + jitter)
 		}

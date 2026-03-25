@@ -1,4 +1,4 @@
-import type { RetrievalReasoningStep } from "@antfly/sdk";
+import type { AgentStep, SSEStepStarted } from "@antfly/sdk";
 import {
   ChevronDown,
   ChevronRight,
@@ -15,8 +15,8 @@ import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 
 interface ReasoningChainCollapsibleProps {
-  chain: RetrievalReasoningStep[];
-  activeSteps?: { id: string; step: string; action: string }[];
+  chain: AgentStep[];
+  activeSteps?: SSEStepStarted[];
   toolCallsMade?: number;
   reasoningText?: string;
   isStreaming?: boolean;
@@ -55,7 +55,7 @@ function StepItem({
   step,
   defaultOpen = false,
 }: {
-  step: RetrievalReasoningStep;
+  step: AgentStep;
   defaultOpen?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
@@ -66,7 +66,7 @@ function StepItem({
       {/* Connector line + icon */}
       <div className="flex flex-col items-center">
         <div className="flex h-6 w-6 items-center justify-center rounded-full border bg-background">
-          {getStepIcon(step.step ?? "")}
+          {getStepIcon(step.name ?? "")}
         </div>
         <div className="w-px flex-1 bg-border" />
       </div>
@@ -75,7 +75,7 @@ function StepItem({
       <div className="flex-1 pb-3 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
           <Badge variant="outline" className="text-xs font-mono">
-            {step.step}
+            {step.name}
           </Badge>
           {step.status && (
             <Badge variant={getStatusBadgeVariant(step.status)} className="text-xs">
@@ -112,7 +112,7 @@ function StepItem({
   );
 }
 
-function ActiveStepItem({ step }: { step: { id: string; step: string; action: string } }) {
+function ActiveStepItem({ step }: { step: SSEStepStarted }) {
   return (
     <div className="flex gap-2">
       <div className="flex flex-col items-center">
@@ -124,7 +124,7 @@ function ActiveStepItem({ step }: { step: { id: string; step: string; action: st
       <div className="flex-1 pb-3 min-w-0">
         <div className="flex items-center gap-2">
           <Badge variant="outline" className="text-xs font-mono">
-            {step.step}
+            {step.name}
           </Badge>
         </div>
         {step.action && (
@@ -164,7 +164,7 @@ export function ReasoningChainCollapsible({
       <CollapsibleContent>
         <div className="mt-2 ml-1 space-y-0">
           {chain.map((step) => (
-            <StepItem key={step.id || `${step.step}-${step.action}`} step={step} />
+            <StepItem key={step.id || `${step.name}-${step.action}`} step={step} />
           ))}
           {activeSteps.map((step) => (
             <ActiveStepItem key={step.id} step={step} />

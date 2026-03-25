@@ -277,11 +277,6 @@ export class AntflyClient {
                         callbacks.onReasoning(JSON.parse(data));
                       }
                       break;
-                    case "clarification_required":
-                      if (callbacks.onClarificationRequired) {
-                        callbacks.onClarificationRequired(JSON.parse(data));
-                      }
-                      break;
                     case "filter_applied":
                       if (callbacks.onFilterApplied) {
                         callbacks.onFilterApplied(JSON.parse(data));
@@ -411,7 +406,7 @@ export class AntflyClient {
       ],
       generator: config.generator,
       messages: [...history, { role: "user", content: userMessage }],
-      max_iterations: config.maxIterations ?? 5,
+      max_internal_iterations: config.maxInternalIterations ?? 5,
       stream: !!callbacks,
       agent_knowledge: config.agentKnowledge,
     };

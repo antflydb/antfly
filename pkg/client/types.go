@@ -17,7 +17,9 @@ limitations under the License.
 package client
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/antflydb/antfly/pkg/client/oapi"
@@ -87,9 +89,11 @@ type (
 	AggregationType    = oapi.AggregationType
 
 	// Embedding types
-	Embedding       = oapi.Embedding
-	DenseEmbedding  = oapi.Embedding0 // []float32
-	SparseEmbedding = oapi.Embedding1 // {Indices []uint32, Values []float32}
+	Embedding            = oapi.Embedding
+	DenseEmbedding       = oapi.Embedding0 // []float32
+	SparseEmbedding      = oapi.Embedding1 // {Indices []uint32, Values []float32}
+	PackedDenseEmbedding  = oapi.Embedding2 // base64-encoded little-endian float32 bytes
+	PackedSparseEmbedding = oapi.Embedding3 // {PackedIndices, PackedValues} as base64 LE bytes
 
 	// Other types
 	AntflyType     = oapi.AntflyType
@@ -132,17 +136,23 @@ type (
 	ChainCondition                     = oapi.ChainCondition
 
 	// Chat/Agent types (used by retrieval agent)
-	ChatMessage          = oapi.ChatMessage
-	ChatMessageRole      = oapi.ChatMessageRole
-	ChatToolCall         = oapi.ChatToolCall
-	ChatToolResult       = oapi.ChatToolResult
-	ChatToolName         = oapi.ChatToolName
-	ChatToolsConfig      = oapi.ChatToolsConfig
-	ClarificationRequest = oapi.ClarificationRequest
-	FetchConfig          = oapi.FetchConfig
-	WebSearchConfig      = oapi.WebSearchConfig
-	FilterSpec           = oapi.FilterSpec
-	FilterSpecOperator   = oapi.FilterSpecOperator
+	ChatMessage        = oapi.ChatMessage
+	ChatMessageRole    = oapi.ChatMessageRole
+	ChatToolCall       = oapi.ChatToolCall
+	ChatToolResult     = oapi.ChatToolResult
+	ChatToolName       = oapi.ChatToolName
+	ChatToolsConfig    = oapi.ChatToolsConfig
+	FetchConfig        = oapi.FetchConfig
+	WebSearchConfig    = oapi.WebSearchConfig
+	FilterSpec         = oapi.FilterSpec
+	FilterSpecOperator = oapi.FilterSpecOperator
+	AgentDecision      = oapi.AgentDecision
+	AgentQuestion      = oapi.AgentQuestion
+	AgentQuestionKind  = oapi.AgentQuestionKind
+	AgentStatus        = oapi.AgentStatus
+	AgentStep          = oapi.AgentStep
+	AgentStepKind      = oapi.AgentStepKind
+	AgentStepStatus    = oapi.AgentStepStatus
 
 	// Query Builder types
 	QueryBuilderRequest = oapi.QueryBuilderRequest
@@ -151,7 +161,6 @@ type (
 	// Retrieval Agent types
 	RetrievalAgentRequest = oapi.RetrievalAgentRequest
 	RetrievalAgentResult  = oapi.RetrievalAgentResult
-	RetrievalAgentStatus  = oapi.RetrievalAgentStatus
 	RetrievalAgentUsage   = oapi.RetrievalAgentUsage
 	IncompleteDetails     = oapi.IncompleteDetails
 	PruneStats            = oapi.PruneStats
@@ -165,11 +174,10 @@ type (
 	SSEToolMode      = oapi.SSEToolMode
 	SSEError         = oapi.SSEError
 
-	RetrievalQueryRequest  = oapi.RetrievalQueryRequest
-	RetrievalReasoningStep = oapi.RetrievalReasoningStep
-	RetrievalStrategy      = oapi.RetrievalStrategy
-	TreeSearchConfig       = oapi.TreeSearchConfig
-	QueryHit               = oapi.QueryHit
+	RetrievalQueryRequest = oapi.RetrievalQueryRequest
+	RetrievalStrategy     = oapi.RetrievalStrategy
+	TreeSearchConfig      = oapi.TreeSearchConfig
+	QueryHit              = oapi.QueryHit
 
 	// Evaluation types
 	EvalConfig    = oapi.EvalConfig
@@ -238,6 +246,58 @@ type (
 	PathFindWeightMode = oapi.PathFindWeightMode
 	PathWeightMode     = oapi.PathWeightMode
 )
+
+// NewDenseEmbedding creates an Embedding from a float32 slice.
+// The vector is sent as a JSON array of floats on the wire.
+func NewDenseEmbedding(v []float32) Embedding {
+	var emb oapi.Embedding
+	if err := emb.FromEmbedding0(oapi.Embedding0(v)); err != nil {
+		panic(err) // only fails on marshal error, which can't happen for []float32
+	}
+	return emb
+}
+
+// NewPackedDenseEmbedding creates an Embedding from a float32 slice using the
+// packed dense format (base64-encoded little-endian float32 bytes). This is
+// ~4x more compact on the wire than the JSON array format from NewDenseEmbedding.
+func NewPackedDenseEmbedding(v []float32) Embedding {
+	raw := make([]byte, len(v)*4)
+	for i, f := range v {
+		binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(f))
+	}
+	var emb oapi.Embedding
+	if err := emb.FromEmbedding2(oapi.Embedding2(raw)); err != nil {
+		panic(err) // only fails on marshal error, which can't happen for []byte
+	}
+	return emb
+}
+
+// NewSparseEmbedding creates a sparse Embedding from indices and values.
+func NewSparseEmbedding(indices []uint32, values []float32) Embedding {
+	var emb oapi.Embedding
+	if err := emb.FromEmbedding1(oapi.Embedding1{Indices: indices, Values: values}); err != nil {
+		panic(err) // only fails on marshal error
+	}
+	return emb
+}
+
+// NewPackedSparseEmbedding creates a sparse Embedding using the packed format
+// (base64-encoded little-endian bytes for both indices and values).
+func NewPackedSparseEmbedding(indices []uint32, values []float32) Embedding {
+	rawIndices := make([]byte, len(indices)*4)
+	for i, idx := range indices {
+		binary.LittleEndian.PutUint32(rawIndices[i*4:], idx)
+	}
+	rawValues := make([]byte, len(values)*4)
+	for i, f := range values {
+		binary.LittleEndian.PutUint32(rawValues[i*4:], math.Float32bits(f))
+	}
+	var emb oapi.Embedding
+	if err := emb.FromEmbedding3(oapi.Embedding3{PackedIndices: rawIndices, PackedValues: rawValues}); err != nil {
+		panic(err) // only fails on marshal error
+	}
+	return emb
+}
 
 // ChunkingModel is just a string - use "fixed" or any ONNX model directory name
 // No predefined constants needed since any model name is valid
@@ -340,11 +400,32 @@ const (
 	FilterSpecOperatorRange    = oapi.FilterSpecOperatorRange
 	FilterSpecOperatorIn       = oapi.FilterSpecOperatorIn
 
-	// RetrievalAgentStatus values
-	RetrievalAgentStatusCompleted  = oapi.RetrievalAgentStatusCompleted
-	RetrievalAgentStatusInProgress = oapi.RetrievalAgentStatusInProgress
-	RetrievalAgentStatusIncomplete = oapi.RetrievalAgentStatusIncomplete
-	RetrievalAgentStatusFailed     = oapi.RetrievalAgentStatusFailed
+	// AgentQuestionKind values
+	AgentQuestionKindConfirm      = oapi.AgentQuestionKindConfirm
+	AgentQuestionKindSingleChoice = oapi.AgentQuestionKindSingleChoice
+	AgentQuestionKindMultiChoice  = oapi.AgentQuestionKindMultiChoice
+	AgentQuestionKindFreeText     = oapi.AgentQuestionKindFreeText
+	AgentQuestionKindFieldPolicy  = oapi.AgentQuestionKindFieldPolicy
+
+	// AgentStatus values
+	AgentStatusClarificationRequired = oapi.AgentStatusClarificationRequired
+	AgentStatusCompleted             = oapi.AgentStatusCompleted
+	AgentStatusInProgress            = oapi.AgentStatusInProgress
+	AgentStatusIncomplete            = oapi.AgentStatusIncomplete
+	AgentStatusFailed                = oapi.AgentStatusFailed
+
+	// AgentStepKind values
+	AgentStepKindToolCall       = oapi.AgentStepKindToolCall
+	AgentStepKindPlanning       = oapi.AgentStepKindPlanning
+	AgentStepKindClassification = oapi.AgentStepKindClassification
+	AgentStepKindGeneration     = oapi.AgentStepKindGeneration
+	AgentStepKindValidation     = oapi.AgentStepKindValidation
+	AgentStepKindClarification  = oapi.AgentStepKindClarification
+
+	// AgentStepStatus values
+	AgentStepStatusSuccess = oapi.AgentStepStatusSuccess
+	AgentStepStatusError   = oapi.AgentStepStatusError
+	AgentStepStatusSkipped = oapi.AgentStepStatusSkipped
 
 	// RetrievalStrategy values
 	RetrievalStrategySemantic = oapi.RetrievalStrategySemantic

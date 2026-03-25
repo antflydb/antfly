@@ -104,7 +104,7 @@ const ChatPlaygroundPage: React.FC = () => {
   const [systemPrompt, setSystemPrompt] = useState("");
   const [agentKnowledge, setAgentKnowledge] = useState("");
   const [agenticEnabled, setAgenticEnabled] = useState(false);
-  const [maxIterations, setMaxIterations] = useState(5);
+  const [maxInternalIterations, setMaxInternalIterations] = useState(5);
   const [enabledTools, setEnabledTools] = useState<ChatToolName[]>(DEFAULT_ENABLED_TOOLS);
   const [settingsOpen, setSettingsOpen] = useState(
     () => typeof window !== "undefined" && window.innerWidth >= 1024
@@ -123,7 +123,7 @@ const ChatPlaygroundPage: React.FC = () => {
     setSystemPrompt("");
     setAgentKnowledge("");
     setAgenticEnabled(false);
-    setMaxIterations(5);
+    setMaxInternalIterations(5);
     setEnabledTools(DEFAULT_ENABLED_TOOLS);
     setChatKey((k) => k + 1);
   }, []);
@@ -325,12 +325,14 @@ const ChatPlaygroundPage: React.FC = () => {
                       {agenticEnabled && (
                         <div className="space-y-3 pl-2">
                           <div className="space-y-2">
-                            <Label className="text-xs text-muted-foreground">Max Iterations</Label>
+                            <Label className="text-xs text-muted-foreground">
+                              Max Internal Iterations
+                            </Label>
                             <Input
                               type="number"
-                              value={maxIterations}
+                              value={maxInternalIterations}
                               onChange={(e) =>
-                                setMaxIterations(
+                                setMaxInternalIterations(
                                   Math.max(1, Math.min(20, parseInt(e.target.value, 10) || 5))
                                 )
                               }
@@ -412,7 +414,7 @@ const ChatPlaygroundPage: React.FC = () => {
                 semanticIndexes={chatIndexes.length > 0 ? chatIndexes : undefined}
                 agentKnowledge={agentKnowledge || undefined}
                 systemPrompt={systemPrompt || undefined}
-                maxIterations={agenticEnabled ? maxIterations : undefined}
+                maxInternalIterations={agenticEnabled ? maxInternalIterations : undefined}
                 limit={limit}
                 followUpCount={steps.followup.enabled ? steps.followup.count : undefined}
                 showFollowUpQuestions={steps.followup.enabled}
@@ -431,7 +433,7 @@ const ChatPlaygroundPage: React.FC = () => {
                   agenticEnabled
                     ? {
                         enabled_tools: enabledTools,
-                        max_tool_iterations: maxIterations,
+                        max_tool_iterations: maxInternalIterations,
                       }
                     : undefined
                 }
@@ -440,12 +442,12 @@ const ChatPlaygroundPage: React.FC = () => {
                 renderAssistantMessage={(message: string, isStreaming: boolean, turn: ChatTurn) => (
                   <>
                     {aiRenderers.renderAssistantMessage?.(message, isStreaming, turn)}
-                    {(turn.reasoningChain.length > 0 ||
+                    {(turn.steps.length > 0 ||
                       turn.activeSteps.length > 0 ||
                       turn.reasoningText) && (
                       <div className="mt-1 ml-1">
                         <ReasoningChainCollapsible
-                          chain={turn.reasoningChain}
+                          chain={turn.steps}
                           activeSteps={turn.activeSteps}
                           toolCallsMade={turn.toolCallsMade}
                           reasoningText={turn.reasoningText}

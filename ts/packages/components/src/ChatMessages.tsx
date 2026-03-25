@@ -1,4 +1,4 @@
-import type { ClarificationRequest, GenerationConfidence, QueryHit } from "@antfly/sdk";
+import type { AgentQuestion, GenerationConfidence, QueryHit } from "@antfly/sdk";
 import type { ReactNode } from "react";
 import { useEffect, useRef } from "react";
 import { useChatContext } from "./ChatContext";
@@ -27,7 +27,7 @@ export interface ChatMessagesProps {
   ) => ReactNode;
   /** Custom renderer for clarification requests */
   renderClarification?: (
-    clarification: ClarificationRequest,
+    clarification: AgentQuestion,
     onRespond: (response: string) => void,
     turn: ChatTurn
   ) => ReactNode;
@@ -86,7 +86,7 @@ function defaultRenderFollowUpQuestions(questions: string[], onSelect: (q: strin
 }
 
 function defaultRenderClarification(
-  clarification: ClarificationRequest,
+  clarification: AgentQuestion,
   onRespond: (r: string) => void
 ) {
   return (

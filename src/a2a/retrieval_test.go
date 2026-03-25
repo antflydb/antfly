@@ -64,7 +64,7 @@ func createQueuePair(t *testing.T) (writer eventqueue.Queue, reader eventqueue.Q
 func TestRetrievalHandlerTextOnly(t *testing.T) {
 	mock := &mockRetrievalExecutor{
 		result: &RetrievalResult{
-			State:      "complete",
+			State:      RetrievalStateComplete,
 			Generation: "Here is the answer.",
 			Hits:       []any{"hit1"},
 		},
@@ -108,7 +108,7 @@ func TestRetrievalHandlerTextOnly(t *testing.T) {
 		t.Fatalf("Execute failed: %v", err)
 	}
 
-	// Verify pipeline mode was called (MaxIterations=0 is default)
+	// Verify pipeline mode was called (MaxInternalIterations=0 is default)
 	if mock.pipelineReq == nil {
 		t.Fatal("expected pipeline to be called")
 	}
@@ -125,7 +125,7 @@ func TestRetrievalHandlerTextOnly(t *testing.T) {
 func TestRetrievalHandlerWithDataPart(t *testing.T) {
 	mock := &mockRetrievalExecutor{
 		result: &RetrievalResult{
-			State: "complete",
+			State: RetrievalStateComplete,
 			Hits:  []any{"hit1"},
 		},
 	}
@@ -142,8 +142,8 @@ func TestRetrievalHandlerWithDataPart(t *testing.T) {
 			Parts: a2a.ContentParts{
 				&a2a.TextPart{Text: "search query"},
 				&a2a.DataPart{Data: map[string]any{
-					"table":          "docs",
-					"max_iterations": float64(5),
+					"table":                   "docs",
+					"max_internal_iterations": float64(5),
 				}},
 			},
 		},
@@ -171,21 +171,21 @@ func TestRetrievalHandlerWithDataPart(t *testing.T) {
 		t.Fatalf("Execute failed: %v", err)
 	}
 
-	// Verify agentic mode was called (max_iterations=5)
+	// Verify agentic mode was called (max_internal_iterations=5)
 	if mock.agenticReq == nil {
 		t.Fatal("expected agentic mode to be called")
 	}
 	if mock.agenticReq.Table != "docs" {
 		t.Errorf("expected table 'docs', got %q", mock.agenticReq.Table)
 	}
-	if mock.agenticReq.MaxIterations != 5 {
-		t.Errorf("expected max_iterations=5, got %d", mock.agenticReq.MaxIterations)
+	if mock.agenticReq.MaxInternalIterations != 5 {
+		t.Errorf("expected max_internal_iterations=5, got %d", mock.agenticReq.MaxInternalIterations)
 	}
 }
 
 func TestRetrievalHandlerEmptyQuery(t *testing.T) {
 	mock := &mockRetrievalExecutor{
-		result: &RetrievalResult{State: "complete"},
+		result: &RetrievalResult{State: RetrievalStateComplete},
 	}
 	handler := NewRetrievalAgentHandler(mock, zap.NewNop())
 
@@ -225,7 +225,7 @@ func TestRetrievalHandlerEmptyQuery(t *testing.T) {
 func TestRetrievalHandlerAwaitingClarification(t *testing.T) {
 	mock := &mockRetrievalExecutor{
 		result: &RetrievalResult{
-			State:                 "awaiting_clarification",
+			State:                 RetrievalStateAwaitingClarification,
 			ClarificationQuestion: "Which table should I search?",
 		},
 	}
@@ -272,6 +272,50 @@ func TestRetrievalHandlerAwaitingClarification(t *testing.T) {
 	}
 	if lastStatus.Status.State != a2a.TaskStateInputRequired {
 		t.Errorf("expected input_required state, got %s", lastStatus.Status.State)
+	}
+}
+
+func TestRetrievalStateFromAgentStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		want   RetrievalState
+	}{
+		{name: "completed", status: "completed", want: RetrievalStateComplete},
+		{name: "clarification", status: "clarification_required", want: RetrievalStateAwaitingClarification},
+		{name: "in progress", status: "in_progress", want: RetrievalStateToolCalling},
+		{name: "incomplete", status: "incomplete", want: RetrievalStateIncomplete},
+		{name: "failed", status: "failed", want: RetrievalStateFailed},
+		{name: "unknown defaults complete", status: "something_else", want: RetrievalStateComplete},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RetrievalStateFromAgentStatus(tc.status); got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestRetrievalStateTaskState(t *testing.T) {
+	tests := []struct {
+		state RetrievalState
+		want  a2a.TaskState
+	}{
+		{state: RetrievalStateComplete, want: a2a.TaskStateCompleted},
+		{state: RetrievalStateAwaitingClarification, want: a2a.TaskStateInputRequired},
+		{state: RetrievalStateToolCalling, want: a2a.TaskStateCompleted},
+		{state: RetrievalStateIncomplete, want: a2a.TaskStateCompleted},
+		{state: RetrievalStateFailed, want: a2a.TaskStateFailed},
+	}
+
+	for _, tc := range tests {
+		t.Run(string(tc.state), func(t *testing.T) {
+			if got := tc.state.TaskState(); got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
 	}
 }
 
@@ -463,7 +507,7 @@ func TestBuildResultPartsWithGeneration(t *testing.T) {
 	handler := NewRetrievalAgentHandler(nil, zap.NewNop())
 	result := &RetrievalResult{
 		Generation:        "The answer is 42.",
-		State:             "complete",
+		State:             RetrievalStateComplete,
 		Hits:              []any{"hit1", "hit2"},
 		StrategyUsed:      "hybrid",
 		ToolCallsMade:     3,
@@ -489,8 +533,8 @@ func TestBuildResultPartsWithGeneration(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected second part to be DataPart, got %T", parts[1])
 	}
-	if dp.Data["state"] != "complete" {
-		t.Errorf("expected state 'complete', got %v", dp.Data["state"])
+	if dp.Data["state"] != string(RetrievalStateComplete) {
+		t.Errorf("expected state %q, got %v", RetrievalStateComplete, dp.Data["state"])
 	}
 	if dp.Data["hit_count"] != 2 {
 		t.Errorf("expected hit_count 2, got %v", dp.Data["hit_count"])
@@ -509,7 +553,7 @@ func TestBuildResultPartsWithGeneration(t *testing.T) {
 func TestBuildResultPartsNoGeneration(t *testing.T) {
 	handler := NewRetrievalAgentHandler(nil, zap.NewNop())
 	result := &RetrievalResult{
-		State: "complete",
+		State: RetrievalStateComplete,
 		Hits:  []any{"hit1"},
 	}
 
@@ -529,7 +573,7 @@ func TestBuildResultPartsNoGeneration(t *testing.T) {
 func TestBuildResultPartsNoFollowups(t *testing.T) {
 	handler := NewRetrievalAgentHandler(nil, zap.NewNop())
 	result := &RetrievalResult{
-		State: "complete",
+		State: RetrievalStateComplete,
 	}
 
 	parts := handler.buildResultParts(result)
@@ -570,7 +614,7 @@ func (m *streamingMockExecutor) ExecuteRetrievalAgentic(_ context.Context, _ *Re
 func TestRetrievalHandlerWithStreaming(t *testing.T) {
 	mock := &streamingMockExecutor{
 		result: &RetrievalResult{
-			State:      "complete",
+			State:      RetrievalStateComplete,
 			Generation: "Answer text",
 			Hits:       []any{"hit1"},
 		},

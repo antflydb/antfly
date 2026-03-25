@@ -78,6 +78,13 @@ export type {
   BatchRequest, // Now using our custom type
   CalendarInterval,
   // Chat Agent types
+  AgentDecision,
+  AgentQuestion,
+  AgentQuestionKind,
+  AgentStatus,
+  AgentStep,
+  AgentStepKind,
+  AgentStepStatus,
   ChatAgentConfig,
   ChatAgentTurnResult,
   ChatMessage,
@@ -89,7 +96,6 @@ export type {
   ChatToolsConfig,
   // Chat types (used by retrieval agent)
   // Retrieval Agent result types
-  ClarificationRequest,
   ClassificationTransformationResult,
   CreateTableRequest,
   CreateUserRequest,
@@ -165,8 +171,8 @@ export type {
   RetrievalAgentResult,
   RetrievalAgentSteps,
   RetrievalAgentStreamCallbacks,
-  RetrievalReasoningStep,
   RouteType,
+  SSEStepStarted,
   SemanticQueryMode,
   ShardsProfile,
   SignificanceAlgorithm,

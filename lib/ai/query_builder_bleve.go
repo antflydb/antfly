@@ -47,9 +47,10 @@ type QueryBuilderOption interface {
 }
 
 type queryBuilderOptions struct {
-	systemPrompt  string
-	withExamples  bool
-	maxComplexity int // Maximum query nesting depth
+	systemPrompt     string
+	withExamples     bool
+	maxComplexity    int // Maximum query nesting depth
+	exampleDocuments []string
 }
 
 type queryBuilderSystemPromptOption struct {
@@ -76,6 +77,20 @@ func (o queryBuilderExamplesOption) applyQueryBuilderOption(opts *queryBuilderOp
 // WithQueryBuilderExamples enables/disables example queries in the prompt
 func WithQueryBuilderExamples(enabled bool) QueryBuilderOption {
 	return queryBuilderExamplesOption{enabled: enabled}
+}
+
+type queryBuilderExampleDocumentsOption struct {
+	documents []string
+}
+
+func (o queryBuilderExampleDocumentsOption) applyQueryBuilderOption(opts *queryBuilderOptions) {
+	opts.exampleDocuments = append([]string(nil), o.documents...)
+}
+
+// WithQueryBuilderExampleDocuments adds example documents to the query builder prompt.
+// Documents should already be rendered into a compact, LLM-friendly format such as TOON.
+func WithQueryBuilderExampleDocuments(documents []string) QueryBuilderOption {
+	return queryBuilderExampleDocumentsOption{documents: documents}
 }
 
 type queryBuilderMaxComplexityOption struct {
@@ -144,7 +159,11 @@ func (g *GenKitModelImpl) BuildQueryBleve(
 	// Build system prompt for Bleve format
 	systemPrompt := options.systemPrompt
 	if systemPrompt == "" {
-		systemPrompt = buildBleveQueryBuilderSystemPrompt(schemaDescription, options.withExamples)
+		systemPrompt = buildBleveQueryBuilderSystemPrompt(
+			schemaDescription,
+			options.withExamples,
+			options.exampleDocuments,
+		)
 	}
 
 	// Build the user prompt
@@ -210,7 +229,11 @@ Return ONLY the JSON object, no additional text.`
 }
 
 // buildBleveQueryBuilderSystemPrompt constructs the system prompt for Bleve query building
-func buildBleveQueryBuilderSystemPrompt(schema query.SchemaDescription, withExamples bool) string {
+func buildBleveQueryBuilderSystemPrompt(
+	schema query.SchemaDescription,
+	withExamples bool,
+	exampleDocuments []string,
+) string {
 	var sb strings.Builder
 
 	sb.WriteString(`You are an expert search query builder. Your task is to translate natural language search intents into NATIVE BLEVE search queries.
@@ -311,8 +334,16 @@ Use the raw Bleve query format directly:
 	// Add schema context
 	if len(schema.Fields) > 0 {
 		sb.WriteString("\n## Available Fields\n\n")
-		sb.WriteString(query.FormatSchemaForLLM(schema))
+		sb.WriteString(query.FormatSchemaForLLMDetailed(schema))
 		sb.WriteString("\n")
+	}
+
+	if len(exampleDocuments) > 0 {
+		sb.WriteString("\n## Example Documents\n\n")
+		sb.WriteString("Use these only as hints about field shape and typical values. Do not invent fields that are not present in the schema or examples.\n\n")
+		for i, doc := range exampleDocuments {
+			fmt.Fprintf(&sb, "Example document %d:\n```\n%s\n```\n\n", i+1, doc)
+		}
 	}
 
 	// Add examples if enabled

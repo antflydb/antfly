@@ -4,12 +4,12 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="RetrievalReasoningStepDetails")
+T = TypeVar("T", bound="AgentStepDetails")
 
 
 @_attrs_define
-class RetrievalReasoningStepDetails:
-    """Additional details about the step (e.g., tool arguments, result count)"""
+class AgentStepDetails:
+    """Additional details about the step"""
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -22,10 +22,10 @@ class RetrievalReasoningStepDetails:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        retrieval_reasoning_step_details = cls()
+        agent_step_details = cls()
 
-        retrieval_reasoning_step_details.additional_properties = d
-        return retrieval_reasoning_step_details
+        agent_step_details.additional_properties = d
+        return agent_step_details
 
     @property
     def additional_keys(self) -> list[str]:

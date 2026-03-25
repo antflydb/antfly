@@ -27,12 +27,51 @@ import (
 
 // RetrievalResult holds the fields from a retrieval agent result that the A2A
 // facade needs. This avoids importing the metadata package.
+type RetrievalState string
+
+const (
+	RetrievalStateComplete              RetrievalState = "complete"
+	RetrievalStateAwaitingClarification RetrievalState = "awaiting_clarification"
+	RetrievalStateToolCalling           RetrievalState = "tool_calling"
+	RetrievalStateIncomplete            RetrievalState = "incomplete"
+	RetrievalStateFailed                RetrievalState = "failed"
+)
+
+// RetrievalStateFromAgentStatus maps the shared agent status string into the
+// narrower retrieval state vocabulary exposed by the A2A facade.
+func RetrievalStateFromAgentStatus(status string) RetrievalState {
+	switch status {
+	case "clarification_required":
+		return RetrievalStateAwaitingClarification
+	case "in_progress":
+		return RetrievalStateToolCalling
+	case "incomplete":
+		return RetrievalStateIncomplete
+	case "failed":
+		return RetrievalStateFailed
+	default:
+		return RetrievalStateComplete
+	}
+}
+
+// TaskState maps a retrieval state onto the A2A task lifecycle.
+func (s RetrievalState) TaskState() a2a.TaskState {
+	switch s {
+	case RetrievalStateAwaitingClarification:
+		return a2a.TaskStateInputRequired
+	case RetrievalStateFailed:
+		return a2a.TaskStateFailed
+	default:
+		return a2a.TaskStateCompleted
+	}
+}
+
 type RetrievalResult struct {
 	Hits                  []any
 	Generation            string
 	GenerationConfidence  float32
 	FollowupQuestions     []string
-	State                 string // "complete", "awaiting_clarification", "tool_calling"
+	State                 RetrievalState
 	StrategyUsed          string
 	ToolCallsMade         int
 	ClarificationQuestion string
@@ -40,11 +79,11 @@ type RetrievalResult struct {
 
 // RetrievalRequest holds the fields needed to invoke the retrieval agent.
 type RetrievalRequest struct {
-	Query            string
-	Table            string
-	MaxIterations    int
-	Messages         []ai.ChatMessage
-	EnableGeneration bool
+	Query                 string
+	Table                 string
+	MaxInternalIterations int
+	Messages              []ai.ChatMessage
+	EnableGeneration      bool
 }
 
 // StreamCallback is the streaming callback signature used by Antfly agents.
@@ -101,9 +140,9 @@ func (h *RetrievalAgentHandler) Execute(ctx context.Context, reqCtx *a2asrv.Requ
 
 	// Build the request
 	req := &RetrievalRequest{
-		Query:         query,
-		Table:         stringFromMap(data, "table", ""),
-		MaxIterations: intFromMap(data, "max_iterations", 0),
+		Query:                 query,
+		Table:                 stringFromMap(data, "table", ""),
+		MaxInternalIterations: intFromMap(data, "max_internal_iterations", 0),
 	}
 
 	// Extract steps config
@@ -133,7 +172,7 @@ func (h *RetrievalAgentHandler) Execute(ctx context.Context, reqCtx *a2asrv.Requ
 	// Execute the appropriate mode
 	var result *RetrievalResult
 	var err error
-	if req.MaxIterations == 0 {
+	if req.MaxInternalIterations == 0 {
 		result, err = h.executor.ExecuteRetrievalPipeline(ctx, req, streamCb)
 	} else {
 		result, err = h.executor.ExecuteRetrievalAgentic(ctx, req, streamCb)
@@ -160,10 +199,9 @@ func (h *RetrievalAgentHandler) Execute(ctx context.Context, reqCtx *a2asrv.Requ
 	}
 
 	// Map terminal state
-	state := a2a.TaskStateCompleted
+	state := result.State.TaskState()
 	var statusMsg *a2a.Message
-	if result.State == "awaiting_clarification" {
-		state = a2a.TaskStateInputRequired
+	if state == a2a.TaskStateInputRequired {
 		clarText := result.ClarificationQuestion
 		if clarText == "" {
 			clarText = "Please provide more details to continue."
@@ -254,7 +292,7 @@ func (h *RetrievalAgentHandler) buildResultParts(result *RetrievalResult) a2a.Co
 	}
 
 	resultData := map[string]any{
-		"state":      result.State,
+		"state":      string(result.State),
 		"hit_count":  len(result.Hits),
 		"strategy":   result.StrategyUsed,
 		"tool_calls": result.ToolCallsMade,

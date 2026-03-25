@@ -96,8 +96,8 @@ func RunRandomTransactionScenarioWithActions(
 
 	runner := &randomTransactionRunner{
 		cfg:            cfg,
-		rng:            rand.New(rand.NewSource(cfg.Seed)),
-		actionRNG:      rand.New(rand.NewSource(cfg.Seed ^ 0x5deece66d)),
+		rng:            rand.New(rand.NewSource(cfg.Seed)),       //nolint:gosec // deterministic seed for reproducible simulations
+		actionRNG:      rand.New(rand.NewSource(cfg.Seed ^ 0x5deece66d)), //nolint:gosec // deterministic seed for reproducible simulations
 		crashed:        make(map[types.ID]bool),
 		partitioned:    make(map[types.ID]bool),
 		cutLinks:       make(map[transportLink]transportFaultTarget),
@@ -713,7 +713,7 @@ func (r *randomTransactionRunner) txnReady(ctx context.Context) bool {
 
 func makeTxnID(seed int64, seq uint64) uuid.UUID {
 	var id uuid.UUID
-	binary.BigEndian.PutUint64(id[0:8], uint64(seed))
+	binary.BigEndian.PutUint64(id[0:8], uint64(seed)) //nolint:gosec // deterministic ID generation, overflow is acceptable
 	binary.BigEndian.PutUint64(id[8:16], seq+1)
 	id[6] = (id[6] & 0x0f) | 0x40
 	id[8] = (id[8] & 0x3f) | 0x80

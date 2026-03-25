@@ -74,17 +74,15 @@ func NewSimulationStore(
 	}
 
 	reconcilerConfig := reconciler.ReconciliationConfig{
-		ReplicationFactor:                config.ReplicationFactor,
-		MaxShardSizeBytes:                config.MaxShardSizeBytes,
-		MinShardSizeBytes:                config.MinShardSizeBytes,
-		MinShardsPerTable:                config.MinShardsPerTable,
-		MaxShardsPerTable:                config.MaxShardsPerTable,
-		DisableShardAlloc:                config.DisableShardAlloc,
-		AutoRangeTransitionPerTableLimit: config.AutoRangeTransitionPerTableLimit,
-		AutoRangeTransitionClusterLimit:  config.AutoRangeTransitionClusterLimit,
-		ShardCooldownPeriod:              config.ShardCooldownPeriod,
-		SplitTimeout:                     config.SplitTimeout,
-		SplitFinalizeGracePeriod:         opts.SplitFinalizeGracePeriod,
+		ReplicationFactor:        config.ReplicationFactor,
+		MaxShardSizeBytes:        config.MaxShardSizeBytes,
+		MinShardSizeBytes:        config.MinShardSizeBytes,
+		MinShardsPerTable:        config.MinShardsPerTable,
+		MaxShardsPerTable:        config.MaxShardsPerTable,
+		DisableShardAlloc:        config.DisableShardAlloc,
+		ShardCooldownPeriod:      config.ShardCooldownPeriod,
+		SplitTimeout:             config.SplitTimeout,
+		SplitFinalizeGracePeriod: opts.SplitFinalizeGracePeriod,
 	}
 	ms.reconciler = reconciler.NewReconcilerWithTimeProvider(
 		NewMetadataShardOperations(ms),

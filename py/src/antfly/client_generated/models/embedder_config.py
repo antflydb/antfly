@@ -155,13 +155,15 @@ class EmbedderConfig:
 
     **Importing Pre-computed Embeddings:**
 
-    You can import existing embeddings (from OpenAI, Cohere, or any provider) by including
-    them directly in your documents using the `_embeddings` field. This bypasses the
-    embedding generation step and writes vectors directly to the index.
+    You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
+    for indexes configured with `external: true`. External indexes accept vectors written
+    directly through the document `_embeddings` field and do not generate prompts from
+    `field` or `template`.
 
     **Steps:**
-    1. Create the index first with the appropriate dimension
-    2. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+    1. Create an embeddings index with `external: true`
+    2. For dense indexes, set the index `dimension`
+    3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
 
     **Example:**
     ```json
@@ -173,6 +175,10 @@ class EmbedderConfig:
       }
     }
     ```
+
+    **Delete Behavior:**
+    - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
+    - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
 
     **Use Cases:**
     - Migrating from another vector database with existing embeddings

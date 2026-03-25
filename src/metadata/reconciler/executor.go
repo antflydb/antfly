@@ -656,7 +656,7 @@ func (r *Reconciler) seedMergeReceiverFromArchive(
 	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	backupDir := filepath.Join(tempDir, "backup")
-	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+	if err := os.MkdirAll(backupDir, 0o750); err != nil {
 		return fmt.Errorf("creating merge seed backup dir: %w", err)
 	}
 

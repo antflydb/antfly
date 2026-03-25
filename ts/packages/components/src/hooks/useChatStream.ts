@@ -1,7 +1,8 @@
 import type {
+  AgentQuestion,
+  AgentStep,
   ChatMessage,
   ChatToolsConfig,
-  ClarificationRequest,
   ClassificationTransformationResult,
   FilterSpec,
   GenerationConfidence,
@@ -9,7 +10,7 @@ import type {
   QueryHit,
   RetrievalAgentRequest,
   RetrievalAgentSteps,
-  RetrievalReasoningStep,
+  SSEStepStarted,
 } from "@antfly/sdk";
 import { useCallback, useRef, useState } from "react";
 import { streamAnswer } from "../utils";
@@ -30,16 +31,16 @@ export interface ChatTurn {
   classification: ClassificationTransformationResult | null;
   /** Generation confidence assessment */
   confidence: GenerationConfidence | null;
-  /** Clarification request from the agent (if awaiting user input) */
-  clarification: ClarificationRequest | null;
+  /** Clarification question from the agent (if awaiting user input) */
+  clarification: AgentQuestion | null;
   /** Filters applied during retrieval */
   appliedFilters: FilterSpec[];
   /** Accumulated reasoning text */
   reasoningText: string;
-  /** Completed reasoning steps from the agent */
-  reasoningChain: RetrievalReasoningStep[];
+  /** Completed execution steps from the agent */
+  steps: AgentStep[];
   /** Steps currently in progress (during streaming) */
-  activeSteps: { id: string; step: string; action: string }[];
+  activeSteps: SSEStepStarted[];
   /** Number of tool calls made by the agent */
   toolCallsMade: number;
   /** Error for this turn */
@@ -57,7 +58,7 @@ export interface ChatConfig {
   semanticIndexes?: string[];
   agentKnowledge?: string;
   systemPrompt?: string;
-  maxIterations?: number;
+  maxInternalIterations?: number;
   followUpCount?: number;
   limit?: number;
   steps?: RetrievalAgentSteps;
@@ -112,7 +113,7 @@ export function useChatStream() {
       clarification: null,
       appliedFilters: [],
       reasoningText: "",
-      reasoningChain: [],
+      steps: [],
       activeSteps: [],
       toolCallsMade: 0,
       error: null,
@@ -158,7 +159,9 @@ export function useChatStream() {
         confidence: { enabled: true },
         ...(config.tools ? { tools: config.tools } : {}),
       },
-      ...(config.maxIterations ? { max_iterations: config.maxIterations } : {}),
+      ...(config.maxInternalIterations
+        ? { max_internal_iterations: config.maxInternalIterations }
+        : {}),
     };
 
     try {
@@ -178,7 +181,7 @@ export function useChatStream() {
         onStepCompleted: (step) => {
           updateTurn((t) => ({
             ...t,
-            reasoningChain: [...t.reasoningChain, step],
+            steps: [...t.steps, step],
             activeSteps: t.activeSteps.filter((s) => s.id !== step.id),
             toolCallsMade: t.toolCallsMade + 1,
           }));
@@ -208,9 +211,9 @@ export function useChatStream() {
             hits: result.hits || [],
             followUpQuestions: result.followup_questions || [],
             classification: result.classification || null,
-            clarification: result.clarification_request || null,
+            clarification: result.questions?.[0] || null,
             appliedFilters: result.applied_filters || [],
-            reasoningChain: result.reasoning_chain || t.reasoningChain,
+            steps: result.steps || t.steps,
             toolCallsMade: result.tool_calls_made ?? t.toolCallsMade,
             activeSteps: [],
             confidence:

@@ -243,6 +243,47 @@ func TestTableManager_CreateTable_GetTable_RemoveTable(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound, "Expected ErrNotFound for non-existent table")
 }
 
+func TestTableManager_RecreateTableGetsFreshShardIDs(t *testing.T) {
+	db := setupTestDB(t)
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	tableName := "recreateTest"
+	tc := TableConfig{
+		NumShards: 2,
+		Schema: &schema.TableSchema{
+			DefaultType: "default",
+			DocumentSchemas: map[string]schema.DocumentSchema{
+				"default": {Schema: map[string]any{"type": "object"}},
+			},
+		},
+	}
+
+	// First create
+	table1, err := tm.CreateTable(tableName, tc)
+	require.NoError(t, err)
+	shardIDs1 := slices.Sorted(maps.Keys(table1.Shards))
+
+	// Delete
+	require.NoError(t, tm.RemoveTable(tableName))
+
+	// Recreate with same name — must get different shard IDs
+	table2, err := tm.CreateTable(tableName, tc)
+	require.NoError(t, err)
+	shardIDs2 := slices.Sorted(maps.Keys(table2.Shards))
+
+	assert.NotEqual(t, shardIDs1, shardIDs2,
+		"Recreated table must have different shard IDs to avoid Raft conflicts with stale state")
+
+	// High 32 bits should still match (same table name)
+	for _, id := range shardIDs2 {
+		assert.Equal(t,
+			uint64(shardIDs1[0])&0xFFFFFFFF_00000000,
+			uint64(id)&0xFFFFFFFF_00000000,
+			"High bits should be deterministic based on table name")
+	}
+}
+
 func TestTableManager_IndexOperations(t *testing.T) {
 	db := setupTestDB(t)
 

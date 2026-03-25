@@ -2,8 +2,8 @@ from enum import Enum
 
 
 class IncompleteDetailsReason(str, Enum):
-    CLARIFICATION_NEEDED = "clarification_needed"
-    MAX_ITERATIONS = "max_iterations"
+    CLARIFICATION_REQUIRED = "clarification_required"
+    MAX_INTERNAL_ITERATIONS = "max_internal_iterations"
     MAX_TOKENS = "max_tokens"
     NO_TOOLS = "no_tools"
 

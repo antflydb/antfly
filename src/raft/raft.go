@@ -985,7 +985,8 @@ func (rc *raftNode) TransferLeadership(ctx context.Context, target types.ID) {
 var ErrRemoved = errors.New("ID removed from Raft group")
 
 func (rc *raftNode) serveChannels(ctx context.Context) {
-	ctx, cancel := context.WithCancel(ctx)
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
 	rc.serveCtxMu.Lock()
 	rc.serveCtxCancel = cancel
 	rc.serveCtxMu.Unlock()

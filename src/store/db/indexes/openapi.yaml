@@ -111,6 +111,11 @@ components:
         When sparse is false (default), creates a dense vector index (HNSW).
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
       properties:
+        external:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: "When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template."
         sparse:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -120,16 +125,16 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           minimum: 1
-          description: "Vector dimension for dense indexes. Can be omitted when an embedder is configured (auto-detected via probe). Ignored for sparse indexes."
+          description: "Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes."
         field:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Field to extract embeddings from"
+          description: "Field to extract embeddings from (managed indexes only; not allowed when external=true)"
         template:
           x-go-type-skip-optional-pointer: true
           type: string
           description: >-
-            Handlebars template for generating prompts.
+            Handlebars template for generating prompts (managed indexes only; not allowed when external=true).
             See https://handlebarsjs.com/guide/ for more information.
           example: 'Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.'
         distance_metric:
@@ -139,13 +144,13 @@ components:
           type: boolean
           description: "Whether to use in-memory only storage (dense only)"
         embedder:
-          description: "Configuration for the embeddings plugin"
+          description: "Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)"
           $ref: "../../../../lib/embeddings/openapi.yaml#/components/schemas/EmbedderConfig"
         summarizer:
-          description: "Configuration for the summarizer plugin (dense only)"
+          description: "Configuration for the summarizer plugin (dense managed indexes only)"
           $ref: "../../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
         chunker:
-          description: "Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense only)"
+          description: "Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)"
           $ref: "../../../../lib/chunking/openapi.yaml#/components/schemas/ChunkerConfig"
         top_k:
           x-go-type-skip-optional-pointer: true

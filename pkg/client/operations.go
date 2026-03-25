@@ -240,9 +240,9 @@ func (c *AntflyClient) ScanKeys(ctx context.Context, tableName string, request S
 // RetrievalAgentOptions configures streaming callbacks for the retrieval agent.
 // Callbacks are invoked as SSE events arrive during a streaming request.
 type RetrievalAgentOptions struct {
-	OnStepStarted    func(id, step, action string) error
+	OnStepStarted    func(step *SSEStepStarted) error
 	OnStepProgress   func(data map[string]any) error
-	OnStepCompleted  func(step *RetrievalReasoningStep) error
+	OnStepCompleted  func(step *AgentStep) error
 	OnClassification func(classification *ClassificationTransformationResult) error
 	OnReasoning      func(chunk string) error
 	OnGeneration     func(chunk string) error
@@ -342,13 +342,9 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		switch oapi.SSEEvent(eventType) {
 		case oapi.SSEEventStepStarted:
 			if opt.OnStepStarted != nil {
-				var d struct {
-					ID     string `json:"id"`
-					Step   string `json:"step"`
-					Action string `json:"action"`
-				}
+				var d SSEStepStarted
 				if json.UnmarshalString(data, &d) == nil {
-					if err := opt.OnStepStarted(d.ID, d.Step, d.Action); err != nil {
+					if err := opt.OnStepStarted(&d); err != nil {
 						return nil, fmt.Errorf("step_started callback: %w", err)
 					}
 				}
@@ -364,7 +360,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 			}
 		case oapi.SSEEventStepCompleted:
 			if opt.OnStepCompleted != nil {
-				var step RetrievalReasoningStep
+				var step AgentStep
 				if json.UnmarshalString(data, &step) == nil {
 					if err := opt.OnStepCompleted(&step); err != nil {
 						return nil, fmt.Errorf("step_completed callback: %w", err)

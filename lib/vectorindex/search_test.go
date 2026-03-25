@@ -45,7 +45,8 @@ func (s *stubVectorIndex) TotalVectors() uint64 { return s.total }
 
 func (s *stubVectorIndex) Close() error { return nil }
 
-func f32(v float32) *float32 { return &v }
+//go:fix inline
+func f32(v float32) *float32 { return new(v) }
 
 func TestShouldAutoRerank(t *testing.T) {
 	t.Parallel()
@@ -109,7 +110,6 @@ func TestShouldAutoRerank(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(
@@ -188,7 +188,6 @@ func TestSelectAutoRerankCandidates(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(

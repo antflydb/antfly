@@ -23,7 +23,7 @@ export interface ChatBarProps extends ChatMessagesProps, ChatInputProps {
   /** System prompt override */
   systemPrompt?: string;
   /** Maximum tool iterations per turn */
-  maxIterations?: number;
+  maxInternalIterations?: number;
   /** Number of follow-up questions to generate */
   followUpCount?: number;
   /** Results limit per search */
@@ -57,7 +57,7 @@ export default function ChatBar({
   semanticIndexes,
   agentKnowledge,
   systemPrompt,
-  maxIterations,
+  maxInternalIterations,
   followUpCount,
   limit,
   steps,
@@ -99,7 +99,7 @@ export default function ChatBar({
       semanticIndexes,
       agentKnowledge,
       systemPrompt,
-      maxIterations,
+      maxInternalIterations,
       followUpCount,
       limit,
       steps,
@@ -116,7 +116,7 @@ export default function ChatBar({
       semanticIndexes,
       agentKnowledge,
       systemPrompt,
-      maxIterations,
+      maxInternalIterations,
       followUpCount,
       limit,
       steps,

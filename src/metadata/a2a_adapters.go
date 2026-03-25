@@ -100,9 +100,9 @@ func (a *a2aAdapter) ExecuteQueryBuilderA2A(ctx context.Context, req *a2afacade.
 
 func (a *a2aAdapter) buildRetrievalRequest(req *a2afacade.RetrievalRequest) *RetrievalAgentRequest {
 	antflyReq := &RetrievalAgentRequest{
-		Query:         req.Query,
-		MaxIterations: req.MaxIterations,
-		Messages:      req.Messages,
+		Query:                 req.Query,
+		MaxInternalIterations: req.MaxInternalIterations,
+		Messages:              req.Messages,
 	}
 
 	if req.Table != "" {
@@ -159,7 +159,7 @@ func (a *a2aAdapter) mapRetrievalResult(result *RetrievalAgentResult) *a2afacade
 		Generation:           result.Generation,
 		GenerationConfidence: result.GenerationConfidence,
 		FollowupQuestions:    result.FollowupQuestions,
-		State:                string(result.Status),
+		State:                a2afacade.RetrievalStateFromAgentStatus(string(result.Status)),
 		StrategyUsed:         string(result.StrategyUsed),
 		ToolCallsMade:        result.ToolCallsMade,
 	}
@@ -169,8 +169,8 @@ func (a *a2aAdapter) mapRetrievalResult(result *RetrievalAgentResult) *a2afacade
 		r.Hits = append(r.Hits, hit)
 	}
 
-	if result.ClarificationRequest.Question != "" {
-		r.ClarificationQuestion = result.ClarificationRequest.Question
+	if len(result.Questions) > 0 {
+		r.ClarificationQuestion = result.Questions[0].Question
 	}
 
 	return r

@@ -143,7 +143,7 @@ func TestFilterQueryWithChunkedEmbeddings(t *testing.T) {
 		matchAll := bleve.NewMatchAllQuery()
 		bleveReq := bleve.NewSearchRequest(matchAll)
 		bleveReq.Size = 100
-		resp, err := db.indexManager.Search(ctx, "full_text_index_v0", bleveReq)
+		resp, err := db.SearchIndex(ctx, "full_text_index_v0", bleveReq)
 		require.NoError(t, err)
 		result := resp.(*bleve.SearchResult)
 		require.Equal(t, uint64(3), result.Total)
@@ -174,7 +174,7 @@ func TestFilterQueryWithChunkedEmbeddings(t *testing.T) {
 			K:         10,
 			Embedding: vector.T{1.0, 0.0, 0.0},
 		}
-		resp, err := db.indexManager.Search(ctx, indexName, searchReq)
+		resp, err := db.SearchIndex(ctx, indexName, searchReq)
 		require.NoError(t, err)
 		result := resp.(*vectorindex.SearchResult)
 		assert.NotEmpty(t, result.Hits)
@@ -286,7 +286,7 @@ func TestDeleteRemovesChunkedEmbeddings(t *testing.T) {
 		K:         10,
 		Embedding: vector.T{1.0, 0.0, 0.0},
 	}
-	resp, err := db.indexManager.Search(ctx, indexName, searchReq)
+	resp, err := db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	result := resp.(*vectorindex.SearchResult)
 	require.NotEmpty(t, result.Hits)
@@ -297,7 +297,7 @@ func TestDeleteRemovesChunkedEmbeddings(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	resp, err = db.indexManager.Search(ctx, indexName, searchReq)
+	resp, err = db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	result = resp.(*vectorindex.SearchResult)
 	require.Empty(t, result.Hits)
@@ -360,7 +360,7 @@ func TestDeleteRemovesChunkedEmbeddingsWhenDocKeyContainsIndexMarker(t *testing.
 		K:         10,
 		Embedding: vector.T{1.0, 0.0, 0.0},
 	}
-	resp, err := db.indexManager.Search(ctx, indexName, searchReq)
+	resp, err := db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	result := resp.(*vectorindex.SearchResult)
 	require.NotEmpty(t, result.Hits)
@@ -371,7 +371,7 @@ func TestDeleteRemovesChunkedEmbeddingsWhenDocKeyContainsIndexMarker(t *testing.
 		require.NoError(t, err)
 	}
 
-	resp, err = db.indexManager.Search(ctx, indexName, searchReq)
+	resp, err = db.SearchIndex(ctx, indexName, searchReq)
 	require.NoError(t, err)
 	result = resp.(*vectorindex.SearchResult)
 	require.Empty(t, result.Hits)

@@ -501,7 +501,9 @@ func (c *directStoreClient) GetEdges(
 }
 
 func (c *directStoreClient) node() (*storeNode, error) {
+	c.h.mu.RLock()
 	node := c.h.stores[c.nodeID]
+	c.h.mu.RUnlock()
 	if node == nil || node.store == nil {
 		return nil, fmt.Errorf("store %s is not running", c.nodeID)
 	}

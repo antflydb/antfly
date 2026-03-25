@@ -105,7 +105,7 @@ func TestHarness_MetadataLeaderFailover_DuringSplitReconciliation(t *testing.T) 
 
 	keys := []string{"0/docs/00", "z/docs/30"}
 	for i, key := range keys {
-		payload := []byte(fmt.Sprintf(`{"id":%d,"payload":"%s"}`, i, strings.Repeat("f", 1400)))
+		payload := fmt.Appendf(nil, `{"id":%d,"payload":"%s"}`, i, strings.Repeat("f", 1400))
 		require.NoError(t, h.Write(parentShardID, key, payload))
 		h.expectedKeys[key] = "docs"
 	}

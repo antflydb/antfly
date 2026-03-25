@@ -119,29 +119,6 @@ func onlyShardID(table *store.Table) types.ID {
 	return shardIDs[0]
 }
 
-func hasSnapshotTransferEvent(
-	events []TraceEvent,
-	kind string,
-	shardID, from, to types.ID,
-) bool {
-	wantKind := "kind=" + kind
-	wantShard := "shard=" + shardID.String()
-	wantFrom := "from=" + from.String()
-	wantTo := "to=" + to.String()
-	for _, event := range events {
-		if event.Kind != "snapshot_transfer" {
-			continue
-		}
-		if strings.Contains(event.Message, wantKind) &&
-			strings.Contains(event.Message, wantShard) &&
-			strings.Contains(event.Message, wantFrom) &&
-			strings.Contains(event.Message, wantTo) {
-			return true
-		}
-	}
-	return false
-}
-
 func hasTransportFaultActionEvent(events []TraceEvent, action ScenarioAction) bool {
 	wantAction := "action=" + string(action)
 	for _, event := range events {

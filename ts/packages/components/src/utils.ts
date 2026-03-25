@@ -166,8 +166,8 @@ export interface AnswerCallbacks {
   onConfidence?: (data: GenerationConfidence) => void;
   onFollowup?: (question: string) => void;
   onEvalResult?: (data: EvalResult) => void;
-  onStepStarted?: (step: { id: string; step: string; action: string }) => void;
-  onStepCompleted?: (step: import("@antfly/sdk").RetrievalReasoningStep) => void;
+  onStepStarted?: (step: import("@antfly/sdk").SSEStepStarted) => void;
+  onStepCompleted?: (step: import("@antfly/sdk").AgentStep) => void;
   onComplete?: () => void;
   onError?: (error: Error | string) => void;
   onRetrievalAgentResult?: (result: RetrievalAgentResult) => void;
@@ -224,7 +224,8 @@ export async function streamAnswer(
           onConfidence: callbacks.onConfidence,
           onFollowup: callbacks.onFollowup,
           onEvalResult: callbacks.onEvalResult,
-          onDone: () => {
+          onDone: (result) => {
+            callbacks.onRetrievalAgentResult?.(result);
             if (callbacks.onComplete) {
               callbacks.onComplete();
             }

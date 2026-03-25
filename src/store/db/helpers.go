@@ -56,8 +56,8 @@ func (db *DBImpl) compressAndSet(batch *pebble.Batch, encoder *zstd.Encoder, key
 type specialFieldBatchResult struct {
 	// IndexWrites are the writes that should be forwarded to the IndexManager.
 	IndexWrites [][2][]byte
-	// EdgeDeletes are edge keys that should be deleted from the IndexManager.
-	EdgeDeletes [][]byte
+	// IndexDeletes are enrichment/edge keys that should be deleted from the IndexManager.
+	IndexDeletes [][]byte
 	// NumWrites is the number of individual writes added to the batch.
 	NumWrites int
 	// CleanedJSON is the document JSON with special fields removed.
@@ -85,14 +85,14 @@ func (db *DBImpl) extractAndWriteSpecialFields(
 		return nil, nil
 	}
 
-	embWrites, sumWrites, edgeWrites, edgeDeletes, cleanedJSON, hasNonSpecialFields, err := db.extractSpecialFields(docJSON, docKey)
+	embWrites, sumWrites, edgeWrites, indexDeletes, cleanedJSON, hasNonSpecialFields, err := db.extractSpecialFields(docJSON, docKey)
 	if err != nil {
 		return nil, err
 	}
 
 	result := &specialFieldBatchResult{
 		IndexWrites:         make([][2][]byte, 0, len(embWrites)+len(sumWrites)+len(edgeWrites)),
-		EdgeDeletes:         make([][]byte, 0, len(edgeDeletes)),
+		IndexDeletes:        make([][]byte, 0, len(indexDeletes)),
 		CleanedJSON:         cleanedJSON,
 		HasNonSpecialFields: hasNonSpecialFields,
 	}
@@ -146,14 +146,14 @@ func (db *DBImpl) extractAndWriteSpecialFields(
 	}
 
 	// Delete edges that aren't in _edges (reconciliation)
-	for _, d := range edgeDeletes {
+	for _, d := range indexDeletes {
 		if err := batch.Delete(d, nil); err != nil {
-			db.logger.Error("could not delete edge",
-				zap.ByteString("edgeKey", d),
+			db.logger.Error("could not delete index key",
+				zap.ByteString("indexKey", d),
 				zap.Error(err))
 			continue
 		}
-		result.EdgeDeletes = append(result.EdgeDeletes, d)
+		result.IndexDeletes = append(result.IndexDeletes, d)
 	}
 
 	return result, nil

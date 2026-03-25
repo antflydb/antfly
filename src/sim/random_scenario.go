@@ -175,8 +175,8 @@ func RunRandomScenarioWithActions(
 		cfg:             cfg,
 		h:               h,
 		checker:         NewChecker(CheckerConfig{SplitLivenessTimeout: 45 * time.Second}),
-		rng:             rand.New(rand.NewSource(cfg.Seed)),
-		actionRNG:       rand.New(rand.NewSource(cfg.Seed ^ 0x5deece66d)),
+		rng:             rand.New(rand.NewSource(cfg.Seed)),       //nolint:gosec // deterministic seed for reproducible simulations
+		actionRNG:       rand.New(rand.NewSource(cfg.Seed ^ 0x5deece66d)), //nolint:gosec // deterministic seed for reproducible simulations
 		crashed:         make(map[types.ID]bool),
 		partitioned:     make(map[types.ID]bool),
 		crashedMeta:     make(map[types.ID]bool),
@@ -478,7 +478,7 @@ func (r *randomScenarioRunner) writeDoc(ctx context.Context) error {
 		`{"value":"seed-%d-write-%d-%s"}`,
 		r.cfg.Seed,
 		r.writes,
-		strings.Repeat(string(rune('a'+r.rng.Intn(26))), 96),
+		strings.Repeat(string(rune('a'+r.rng.Intn(26))), 96), //nolint:gosec // bounded to [0,26), no overflow
 	)
 	var lastErr error
 	for range 4 {

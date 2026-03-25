@@ -138,7 +138,7 @@ func runCommand(ctx context.Context, args ...string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("command is required")
 	}
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec // args are constructed internally, not from user input
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "GOCACHE=/tmp/antfly-go-cache")

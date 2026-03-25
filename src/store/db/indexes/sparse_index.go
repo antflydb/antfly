@@ -93,6 +93,7 @@ type SparseIndex struct {
 	walBuf   *inflight.WALBuffer
 
 	enqueueChan chan int
+	flushTime   time.Duration
 
 	sparseIdx *sparseindex.SparseIndex
 	name      string
@@ -168,8 +169,8 @@ func NewSparseIndex(
 		return nil, fmt.Errorf("unmarshaling config: %w", err)
 	}
 
-	if c.Template == "" && c.Field == "" {
-		return nil, errors.New("field or template must be specified")
+	if err := c.Validate(); err != nil {
+		return nil, err
 	}
 
 	indexSuffix := fmt.Appendf(nil, ":i:%s", name)
@@ -200,6 +201,7 @@ func NewSparseIndex(
 		embedderConf:     c.Embedder,
 		summarizerConf:   c.Summarizer,
 		conf:             c,
+		flushTime:        DefaultFlushTime,
 		pauseAckCh:       make(chan struct{}, 1),
 	}
 
@@ -345,7 +347,7 @@ func (si *SparseIndex) runPlexer(ctx context.Context, backfillWait chan struct{}
 
 	const maxJitter = time.Millisecond * 200
 	jitter := maxJitter - rand.N(maxJitter) //nolint:gosec // G404: non-security randomness for ML/jitter
-	t := time.NewTimer(DefaultFlushTime + jitter)
+	t := time.NewTimer(si.flushTime + jitter)
 	enqueueCounter := 0
 	op := &sparseOp{si: si}
 
@@ -374,7 +376,7 @@ func (si *SparseIndex) runPlexer(ctx context.Context, backfillWait chan struct{}
 		}
 		empty := len(op.keys) == 0
 		if empty {
-			t.Reset(DefaultFlushTime + jitter)
+			t.Reset(si.flushTime + jitter)
 		} else {
 			t.Reset(100*time.Millisecond + jitter)
 		}
@@ -563,6 +565,12 @@ func (si *SparseIndex) Batch(ctx context.Context, writes [][2][]byte, deletes []
 	sparseDeletes = append(sparseDeletes, sparseDeletesForInserts(sparseInserts)...)
 
 	for _, key := range deletes {
+		if bytes.HasSuffix(key, si.sparseSuffix) {
+			if docKey := extractDocKey(key, si.sparseSuffix); docKey != nil {
+				sparseDeletes = append(sparseDeletes, docKey)
+			}
+			continue
+		}
 		if storeutils.IsChunkKey(key) {
 			if bytes.Contains(key, si.suffix) {
 				sparseDeletes = append(sparseDeletes, key)

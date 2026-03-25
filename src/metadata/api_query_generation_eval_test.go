@@ -326,7 +326,26 @@ func (e *QueryStructureEvaluator) Evaluate(ctx context.Context, input eval.EvalI
 	similarity := float64(len(commonKeys)) / float64(len(referenceKeys))
 
 	// Check if main discriminator matches
-	discriminators := []string{"match", "term", "prefix", "wildcard", "regexp", "and", "or", "not", "field", "geo_distance", "geo_bbox", "match_all", "match_none", "ids", "bool"}
+	discriminators := []string{
+		"match",
+		"match_phrase",
+		"term",
+		"prefix",
+		"wildcard",
+		"regexp",
+		"conjuncts",
+		"disjuncts",
+		"must_not",
+		"must",
+		"should",
+		"field",
+		"geo_distance",
+		"geo_bounding_box",
+		"match_all",
+		"match_none",
+		"ids",
+		"boolean",
+	}
 	var generatedDiscriminator, referenceDiscriminator string
 	for _, d := range discriminators {
 		if _, ok := generatedQuery[d]; ok {

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/antflydb/antfly/lib/clock"
@@ -57,6 +58,7 @@ type Harness struct {
 	storeClientFactory       tablemgr.StoreClientFactory
 	metadataAlias            string
 	metadataOrder            []types.ID
+	mu                       sync.RWMutex // protects metadataNodes and stores maps
 	metadataNodes            map[types.ID]*metadataNode
 	storeOrder               []types.ID
 	stores                   map[types.ID]*storeNode
@@ -407,7 +409,9 @@ func (h *Harness) startMetadataNode(cfg HarnessConfig, nodeID types.ID, peers co
 		metadataStore.Close()
 		return fmt.Errorf("registering metadata route for %s: %w", nodeID, err)
 	}
+	h.mu.Lock()
 	h.metadataNodes[nodeID] = node
+	h.mu.Unlock()
 	return nil
 }
 
@@ -978,7 +982,9 @@ func (h *Harness) startStore(storeID types.ID) error {
 		storeInstance.Close()
 		return fmt.Errorf("registering store route for %s: %w", storeID, err)
 	}
+	h.mu.Lock()
 	h.stores[storeID] = node
+	h.mu.Unlock()
 
 	if err := h.runWithProgress(simulatorControlPlaneTimeout, func() error {
 		return h.tableManager.RegisterStore(context.Background(), &store.StoreRegistrationRequest{
@@ -989,7 +995,9 @@ func (h *Harness) startStore(storeID types.ID) error {
 		storeInstance.Close()
 		node.store = nil
 		node.errC = nil
+		h.mu.Lock()
 		delete(h.stores, storeID)
+		h.mu.Unlock()
 		return fmt.Errorf("registering store %s in metadata: %w", storeID, err)
 	}
 	return nil

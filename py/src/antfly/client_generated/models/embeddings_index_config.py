@@ -23,14 +23,18 @@ class EmbeddingsIndexConfig:
     omitted if an embedder is configured — it will be auto-detected.
 
         Attributes:
+            external (Union[Unset, bool]): When true, embeddings are supplied externally via _embeddings and the index does
+                not derive prompts from a field or template. Default: False.
             sparse (Union[Unset, bool]): When true, creates a sparse (SPLADE) inverted index. When false (default), creates
                 a dense (HNSW) vector index. Default: False.
-            dimension (Union[Unset, int]): Vector dimension for dense indexes. Can be omitted when an embedder is configured
-                (auto-detected via probe). Ignored for sparse indexes.
-            field (Union[Unset, str]): Field to extract embeddings from
-            template (Union[Unset, str]): Handlebars template for generating prompts. See https://handlebarsjs.com/guide/
-                for more information. Example: Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}}
-                years old..
+            dimension (Union[Unset, int]): Vector dimension for dense indexes. Required for external dense indexes. Can be
+                omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse
+                indexes.
+            field (Union[Unset, str]): Field to extract embeddings from (managed indexes only; not allowed when
+                external=true)
+            template (Union[Unset, str]): Handlebars template for generating prompts (managed indexes only; not allowed when
+                external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
+                "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
             distance_metric (Union[Unset, DistanceMetric]): Distance metric for the vector index (dense only). Use "cosine"
                 for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
                 product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
@@ -178,13 +182,15 @@ class EmbeddingsIndexConfig:
 
                 **Importing Pre-computed Embeddings:**
 
-                You can import existing embeddings (from OpenAI, Cohere, or any provider) by including
-                them directly in your documents using the `_embeddings` field. This bypasses the
-                embedding generation step and writes vectors directly to the index.
+                You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
+                for indexes configured with `external: true`. External indexes accept vectors written
+                directly through the document `_embeddings` field and do not generate prompts from
+                `field` or `template`.
 
                 **Steps:**
-                1. Create the index first with the appropriate dimension
-                2. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+                1. Create an embeddings index with `external: true`
+                2. For dense indexes, set the index `dimension`
+                3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
 
                 **Example:**
                 ```json
@@ -196,6 +202,10 @@ class EmbeddingsIndexConfig:
                   }
                 }
                 ```
+
+                **Delete Behavior:**
+                - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
+                - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
 
                 **Use Cases:**
                 - Migrating from another vector database with existing embeddings
@@ -212,6 +222,7 @@ class EmbeddingsIndexConfig:
             chunk_size (Union[Unset, int]): Number of documents per posting list chunk (sparse only) Default: 1024.
     """
 
+    external: Union[Unset, bool] = False
     sparse: Union[Unset, bool] = False
     dimension: Union[Unset, int] = UNSET
     field: Union[Unset, str] = UNSET
@@ -227,6 +238,8 @@ class EmbeddingsIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        external = self.external
+
         sparse = self.sparse
 
         dimension = self.dimension
@@ -262,6 +275,8 @@ class EmbeddingsIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if external is not UNSET:
+            field_dict["external"] = external
         if sparse is not UNSET:
             field_dict["sparse"] = sparse
         if dimension is not UNSET:
@@ -296,6 +311,8 @@ class EmbeddingsIndexConfig:
         from ..models.generator_config import GeneratorConfig
 
         d = dict(src_dict)
+        external = d.pop("external", UNSET)
+
         sparse = d.pop("sparse", UNSET)
 
         dimension = d.pop("dimension", UNSET)
@@ -341,6 +358,7 @@ class EmbeddingsIndexConfig:
         chunk_size = d.pop("chunk_size", UNSET)
 
         embeddings_index_config = cls(
+            external=external,
             sparse=sparse,
             dimension=dimension,
             field=field,

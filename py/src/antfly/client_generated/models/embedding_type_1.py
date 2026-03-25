@@ -9,7 +9,8 @@ T = TypeVar("T", bound="EmbeddingType1")
 
 @_attrs_define
 class EmbeddingType1:
-    """
+    """Sparse embedding with `indices` and `values` arrays
+
     Attributes:
         indices (list[int]):
         values (list[float]):

@@ -15,10 +15,10 @@ class IncompleteDetails:
 
     Attributes:
         reason (IncompleteDetailsReason): Why the agent stopped:
-            - max_iterations: Hit the configured max_iterations limit
+            - max_internal_iterations: Hit the configured max_internal_iterations limit
             - max_tokens: LLM output was truncated
             - no_tools: No tools were available for agentic mode
-            - clarification_needed: Agent needs user input to proceed
+            - clarification_required: The agent needs a user decision before it can continue
     """
 
     reason: IncompleteDetailsReason

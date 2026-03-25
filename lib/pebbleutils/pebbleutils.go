@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/antflydb/antfly/lib/logger"
@@ -151,7 +152,34 @@ func RecoverPebbleClosed(err *error) {
 			*err = pebble.ErrClosed
 			return
 		}
+		// When a Pebble DB is closed concurrently, iterator operations can panic
+		// with runtime errors (index out of range, nil pointer dereference) inside
+		// Pebble internals rather than returning pebble.ErrClosed. Detect these by
+		// checking whether the panic originated from within the pebble module.
+		if _, ok := r.(runtime.Error); ok && panicOriginatesFromPebble() {
+			*err = pebble.ErrClosed
+			return
+		}
 		// Re-panic for other panics
 		panic(r)
 	}
+}
+
+// panicOriginatesFromPebble walks the call stack to determine whether the
+// panic originated from within the cockroachdb/pebble module.
+func panicOriginatesFromPebble() bool {
+	var pcs [20]uintptr
+	// skip 4: runtime.Callers, this func, RecoverPebbleClosed, runtime.gopanic
+	n := runtime.Callers(4, pcs[:])
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		frame, more := frames.Next()
+		if strings.Contains(frame.Function, "cockroachdb/pebble") {
+			return true
+		}
+		if !more {
+			break
+		}
+	}
+	return false
 }

@@ -46,9 +46,10 @@ Pipeline steps (enable with flags):
   --confidence   Score confidence in the generated answer
 
 Tool calling & chat mode:
-  --max-iterations N   Enable agentic tool calling with N rounds per turn.
+  --max-internal-iterations N
+                        Enable agentic tool calling with N rounds per turn.
                         Starts an interactive REPL where conversation history,
-                        filters, and clarification requests persist across turns.
+                        filters, and clarification questions persist across turns.
   --tools              Comma-separated list of enabled tools. When omitted, defaults to
                         add_filter, ask_clarification, search plus any index-based tools
                         (semantic_search, full_text_search, tree_search, graph_search)
@@ -73,7 +74,7 @@ Tool calling & chat mode:
 			generate, _ := cmd.Flags().GetBool("generate")
 			followup, _ := cmd.Flags().GetBool("followup")
 			confidence, _ := cmd.Flags().GetBool("confidence")
-			maxIterations, _ := cmd.Flags().GetInt("max-iterations")
+			maxInternalIterations, _ := cmd.Flags().GetInt("max-internal-iterations")
 			maxContextTokens, _ := cmd.Flags().GetInt("max-context-tokens")
 
 			generator, err := parseJSONFlag[antfly.GeneratorConfig](generatorStr, "generator")
@@ -95,9 +96,9 @@ Tool calling & chat mode:
 				return err
 			}
 
-			// Chat mode: --max-iterations > 0 starts an interactive REPL
-			if maxIterations > 0 {
-				return runChat(cmd, params, generator, systemPrompt, docRenderer, maxIterations, toolsConfig)
+			// Chat mode: --max-internal-iterations > 0 starts an interactive REPL
+			if maxInternalIterations > 0 {
+				return runChat(cmd, params, generator, systemPrompt, docRenderer, maxInternalIterations, toolsConfig)
 			}
 
 			// Default query to prompt, then semantic search, then full-text-search flag
@@ -181,7 +182,7 @@ Tool calling & chat mode:
 
 	// Tool calling & chat mode
 	retrievalCmd.Flags().Int("max-context-tokens", 0, "Maximum tokens for document context (0 = no limit). Documents exceeding this budget are pruned.")
-	retrievalCmd.Flags().Int("max-iterations", 0, "Enable multi-turn chat with N tool-calling rounds per turn (0 = single-shot)")
+	retrievalCmd.Flags().Int("max-internal-iterations", 0, "Enable multi-turn chat with N tool-calling rounds per turn (0 = single-shot)")
 	retrievalCmd.Flags().String("tools", "", "Comma-separated list of enabled tools (e.g. semantic_search,websearch,fetch)")
 	retrievalCmd.Flags().String("websearch-config", "", "JSON config for websearch tool (e.g. '{\"provider\":\"tavily\"}')")
 	retrievalCmd.Flags().String("fetch-config", "", "JSON config for fetch tool (e.g. '{\"max_content_length\":10000}')")
@@ -284,23 +285,23 @@ func parseToolsConfig(cmd *cobra.Command) (antfly.ChatToolsConfig, error) {
 
 // configureStreamingCallbacks wires up the SSE streaming callbacks on a spinner.
 func configureStreamingCallbacks(sp *spinner, ragOpts *antfly.RetrievalAgentOptions) {
-	ragOpts.OnStepStarted = func(id, step, action string) error {
-		sp.start(action)
+	ragOpts.OnStepStarted = func(step *antfly.SSEStepStarted) error {
+		sp.start(step.Action)
 		return nil
 	}
 	ragOpts.OnStepProgress = func(data map[string]any) error {
-		step, _ := data["step"].(string)
+		name, _ := data["name"].(string)
 		if depth, ok := data["depth"]; ok {
-			sp.setDetail(fmt.Sprintf("[%s] depth=%v nodes=%v", step, depth, data["num_nodes"]))
+			sp.setDetail(fmt.Sprintf("[%s] depth=%v nodes=%v", name, depth, data["num_nodes"]))
 		}
 		if sufficient, ok := data["sufficient"]; ok {
-			sp.setDetail(fmt.Sprintf("[%s] sufficient=%v reason=%v", step, sufficient, data["reason"]))
+			sp.setDetail(fmt.Sprintf("[%s] sufficient=%v reason=%v", name, sufficient, data["reason"]))
 		}
 		return nil
 	}
-	ragOpts.OnStepCompleted = func(step *antfly.RetrievalReasoningStep) error {
+	ragOpts.OnStepCompleted = func(step *antfly.AgentStep) error {
 		msg := fmt.Sprintf("%s (%dms)", step.Action, step.DurationMs)
-		if step.Status == "error" {
+		if step.Status == antfly.AgentStepStatusError {
 			sp.stopError(msg)
 		} else {
 			sp.stop(msg)
@@ -367,8 +368,8 @@ func printStreamingFooter(resp *antfly.RetrievalAgentResult) {
 	}
 }
 
-// runChat implements the interactive multi-turn REPL for --max-iterations mode.
-func runChat(cmd *cobra.Command, params SearchParams, generator antfly.GeneratorConfig, systemPrompt, docRenderer string, maxIterations int, toolsConfig antfly.ChatToolsConfig) error {
+// runChat implements the interactive multi-turn REPL for --max-internal-iterations mode.
+func runChat(cmd *cobra.Command, params SearchParams, generator antfly.GeneratorConfig, systemPrompt, docRenderer string, maxInternalIterations int, toolsConfig antfly.ChatToolsConfig) error {
 	var messages []antfly.ChatMessage
 	var accumulatedFilters []antfly.FilterSpec
 
@@ -393,12 +394,12 @@ func runChat(cmd *cobra.Command, params SearchParams, generator antfly.Generator
 		}
 
 		ragReq := antfly.RetrievalAgentRequest{
-			Generator:          generator,
-			Query:              input,
-			Stream:             true,
-			Messages:           messages,
-			AccumulatedFilters: accumulatedFilters,
-			MaxIterations:      maxIterations,
+			Generator:             generator,
+			Query:                 input,
+			Stream:                true,
+			Messages:              messages,
+			AccumulatedFilters:    accumulatedFilters,
+			MaxInternalIterations: maxInternalIterations,
 		}
 
 		ragReq.Steps.Generation.Enabled = true
@@ -428,10 +429,9 @@ func runChat(cmd *cobra.Command, params SearchParams, generator antfly.Generator
 			accumulatedFilters = resp.AppliedFilters
 		}
 
-		// Handle clarification requests
-		if resp.Status == antfly.RetrievalAgentStatusIncomplete &&
-			resp.IncompleteDetails.Reason == "clarification_needed" {
-			cr := resp.ClarificationRequest
+		// Handle clarification questions
+		if resp.Status == antfly.AgentStatusClarificationRequired && len(resp.Questions) > 0 {
+			cr := resp.Questions[0]
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintf(os.Stderr, "\033[33m? %s\033[0m\n", cr.Question)
 			if cr.Reason != "" {

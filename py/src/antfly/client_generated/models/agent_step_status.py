@@ -1,7 +1,7 @@
 from enum import Enum
 
 
-class RetrievalReasoningStepStatus(str, Enum):
+class AgentStepStatus(str, Enum):
     ERROR = "error"
     SKIPPED = "skipped"
     SUCCESS = "success"

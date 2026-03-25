@@ -333,7 +333,7 @@ func (s *StoreDB) preEnrichBatch(
 	}
 
 	// 1. Extract user-provided enrichments (_embeddings, _summaries, _edges)
-	embWrites, sumWrites, edgeWrites, edgeDeletes, err := s.coreDB.ExtractEnrichments(ctx, writePairs)
+	embWrites, sumWrites, edgeWrites, indexDeletes, err := s.coreDB.ExtractEnrichments(ctx, writePairs)
 	if err != nil {
 		return nil, fmt.Errorf("extracting enrichments: %w", err)
 	}
@@ -355,7 +355,7 @@ func (s *StoreDB) preEnrichBatch(
 	// 3. Combine all writes
 	allWrites := make([]*Write, 0, len(writes)+len(embWrites)+len(sumWrites)+len(edgeWrites)+len(generatedWrites))
 	allWrites = append(allWrites, writes...)
-	allDeletes := append(batch.GetDeletes(), edgeDeletes...)
+	allDeletes := append(batch.GetDeletes(), indexDeletes...)
 
 	// Add extracted enrichments
 	for _, w := range embWrites {

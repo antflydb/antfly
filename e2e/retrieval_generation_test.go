@@ -63,7 +63,7 @@ func executeSingleRetrievalQuery(
 			},
 		},
 		Generator:     cfg.generator,
-		MaxIterations: 0, // Pipeline mode: execute queries directly
+		MaxInternalIterations: 0, // Pipeline mode: execute queries directly
 		Stream:        false,
 	}
 
@@ -240,7 +240,7 @@ func testPipelineRetrieval(t *testing.T, ctx context.Context, client *antfly.Ant
 				},
 				Generator:      cfg.generator,
 				AgentKnowledge: cfg.agentKnowledge,
-				MaxIterations:  0, // Pipeline mode
+				MaxInternalIterations:  0, // Pipeline mode
 				Stream:         false,
 				Steps: antfly.RetrievalAgentSteps{
 					Generation: antfly.GenerationStepConfig{Enabled: true},
@@ -314,7 +314,7 @@ func testFullPipeline(t *testing.T, ctx context.Context, client *antfly.AntflyCl
 			},
 			Generator:        cfg.generator,
 			AgentKnowledge:   cfg.agentKnowledge,
-			MaxIterations:    0,
+			MaxInternalIterations:    0,
 			MaxContextTokens: 2048,
 			Stream:           false,
 			Steps: antfly.RetrievalAgentSteps{
@@ -373,7 +373,7 @@ func testStreaming(t *testing.T, ctx context.Context, client *antfly.AntflyClien
 				},
 			},
 			Generator:     cfg.generator,
-			MaxIterations: 0, // Pipeline mode
+			MaxInternalIterations: 0, // Pipeline mode
 			Stream:        true,
 		}
 
@@ -412,7 +412,7 @@ func testStreaming(t *testing.T, ctx context.Context, client *antfly.AntflyClien
 			},
 			Generator:      cfg.generator,
 			AgentKnowledge: cfg.agentKnowledge,
-			MaxIterations:  0,
+			MaxInternalIterations:  0,
 			Stream:         true,
 			Steps: antfly.RetrievalAgentSteps{
 				Generation: antfly.GenerationStepConfig{Enabled: true},
@@ -458,7 +458,7 @@ func testAgentic(t *testing.T, ctx context.Context, client *antfly.AntflyClient,
 			},
 			Generator:      cfg.generator,
 			AgentKnowledge: cfg.agentKnowledge,
-			MaxIterations:  3, // Let LLM call tools up to 3 times
+			MaxInternalIterations:  3, // Let LLM call tools up to 3 times
 			Stream:         false,
 		}
 
@@ -469,16 +469,16 @@ func testAgentic(t *testing.T, ctx context.Context, client *antfly.AntflyClient,
 		t.Logf("Status: %s", resp.Status)
 		t.Logf("Hits: %d", len(resp.Hits))
 		t.Logf("Tool calls made: %d", resp.ToolCallsMade)
-		t.Logf("Reasoning chain steps: %d", len(resp.ReasoningChain))
-		for i, step := range resp.ReasoningChain {
-			t.Logf("  [%d] %s: %s", i, step.Step, step.Action)
+		t.Logf("Reasoning chain steps: %d", len(resp.Steps))
+		for i, step := range resp.Steps {
+			t.Logf("  [%d] %s: %s", i, step.Name, step.Action)
 		}
 
-		require.Equal(t, antfly.RetrievalAgentStatusCompleted, resp.Status,
+		require.Equal(t, antfly.AgentStatusCompleted, resp.Status,
 			"Agent should reach completed status")
 		require.NotEmpty(t, resp.Hits, "Agent should have found documents")
 		require.Positive(t, resp.ToolCallsMade, "Agent should have made at least one tool call")
-		require.NotEmpty(t, resp.ReasoningChain, "Reasoning chain should be non-empty")
+		require.NotEmpty(t, resp.Steps, "Reasoning chain should be non-empty")
 	})
 
 	t.Run("Streaming", func(t *testing.T) {
@@ -497,7 +497,7 @@ func testAgentic(t *testing.T, ctx context.Context, client *antfly.AntflyClient,
 			},
 			Generator:      cfg.generator,
 			AgentKnowledge: cfg.agentKnowledge,
-			MaxIterations:  3,
+			MaxInternalIterations:  3,
 			Stream:         true,
 		}
 
@@ -538,7 +538,7 @@ func testConfidenceAndFollowup(t *testing.T, ctx context.Context, client *antfly
 		},
 		Generator:      cfg.generator,
 		AgentKnowledge: cfg.agentKnowledge,
-		MaxIterations:  0,
+		MaxInternalIterations:  0,
 		Stream:         false,
 		Steps: antfly.RetrievalAgentSteps{
 			Generation: antfly.GenerationStepConfig{Enabled: true},
@@ -588,7 +588,7 @@ func testInlineEval(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 		},
 		Generator:      cfg.generator,
 		AgentKnowledge: cfg.agentKnowledge,
-		MaxIterations:  0,
+		MaxInternalIterations:  0,
 		Stream:         false,
 		Steps: antfly.RetrievalAgentSteps{
 			Generation: antfly.GenerationStepConfig{Enabled: true},
@@ -651,7 +651,7 @@ func testBM25Search(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 			},
 		},
 		Generator:     cfg.generator,
-		MaxIterations: 0,
+		MaxInternalIterations: 0,
 		Stream:        false,
 	}
 
@@ -700,7 +700,7 @@ func testErrorHandling(t *testing.T, ctx context.Context, client *antfly.AntflyC
 			},
 		},
 		Generator:     cfg.generator,
-		MaxIterations: 0,
+		MaxInternalIterations: 0,
 		Stream:        false,
 	}
 
@@ -721,7 +721,7 @@ func testErrorHandling(t *testing.T, ctx context.Context, client *antfly.AntflyC
 			},
 		},
 		Generator:     cfg.generator,
-		MaxIterations: 0,
+		MaxInternalIterations: 0,
 		Stream:        false,
 	}
 
@@ -754,7 +754,7 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 			},
 		},
 		Generator:     cfg.generator,
-		MaxIterations: 0, // Pipeline mode: execute queries directly
+		MaxInternalIterations: 0, // Pipeline mode: execute queries directly
 		Stream:        false,
 	}
 
@@ -764,10 +764,10 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 	} else {
 		t.Logf("  Retrieved %d documents from tree search", len(respFromRoots.Hits))
 		t.Logf("  Strategy used: %s", respFromRoots.StrategyUsed)
-		if len(respFromRoots.ReasoningChain) > 0 {
+		if len(respFromRoots.Steps) > 0 {
 			t.Log("  Reasoning chain:")
-			for _, step := range respFromRoots.ReasoningChain {
-				t.Logf("    - %s: %s", step.Step, step.Action)
+			for _, step := range respFromRoots.Steps {
+				t.Logf("    - %s: %s", step.Name, step.Action)
 			}
 		}
 	}
@@ -794,7 +794,7 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 			},
 		},
 		Generator:     cfg.generator,
-		MaxIterations: 0, // Pipeline mode: execute queries directly
+		MaxInternalIterations: 0, // Pipeline mode: execute queries directly
 		Stream:        false,
 	}
 
@@ -824,7 +824,7 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 			},
 		},
 		Generator:     cfg.generator,
-		MaxIterations: 0, // Pipeline mode
+		MaxInternalIterations: 0, // Pipeline mode
 		Stream:        true,
 	}
 
