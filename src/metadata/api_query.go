@@ -406,7 +406,7 @@ func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryRe
 			Star:      len(q.Fields) == 0,
 			CountStar: q.Count && len(q.Fields) == 0 && queryReq.FullTextSearch != nil,
 		},
-		t.ln.shardSearcher,
+		t.ln.localSearcher(),
 	)
 	if err != nil {
 		return QueryResult{
@@ -884,7 +884,7 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 				Star:      len(pq.query.Fields) == 0,
 				CountStar: pq.query.Count && len(pq.query.Fields) == 0 && pq.queryReq.FullTextSearch != nil,
 			},
-			t.ln.shardSearcher,
+			t.ln.localSearcher(),
 		)
 		if err != nil {
 			results[i] = QueryResult{

@@ -37,6 +37,7 @@ import (
 	"github.com/antflydb/antfly/src/raft"
 	"github.com/antflydb/antfly/src/store"
 	storeclient "github.com/antflydb/antfly/src/store/client"
+	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/antflydb/antfly/src/usermgr"
 	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
@@ -203,7 +204,8 @@ func NewRuntime(
 // and the StoreClientFactory returns a LocalStoreClient.
 // Call after both metadata and store runtimes are created in swarm mode.
 func (r *Runtime) SetLocalStore(nodeID types.ID, s store.StoreIface) {
-	r.node.shardSearcher = &storeShardSearcher{store: s}
+	ss := indexes.ShardSearcher(&storeShardSearcher{store: s})
+	r.node.shardSearcher.Store(&ss)
 	r.tableManager.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) storeclient.StoreRPC {
 		return storeclient.NewLocalStoreClient(id, s)
 	})
@@ -254,12 +256,12 @@ type storeShardSearcher struct {
 	store store.StoreIface
 }
 
-func (s *storeShardSearcher) SearchShard(ctx context.Context, shardID types.ID, query []byte) ([]byte, error) {
+func (s *storeShardSearcher) SearchShardTyped(ctx context.Context, shardID types.ID, req *indexes.RemoteIndexSearchRequest) (*indexes.RemoteIndexSearchResult, error) {
 	shard, ok := s.store.Shard(shardID)
 	if !ok {
 		return nil, fmt.Errorf("shard %s not found", shardID)
 	}
-	return shard.Search(ctx, query)
+	return shard.SearchTyped(ctx, req)
 }
 
 func newStoreHTTPClient(config *common.Config) (*http.Client, io.Closer, error) {

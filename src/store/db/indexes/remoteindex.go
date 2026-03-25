@@ -67,7 +67,7 @@ type ShardIndexes []ShardIndex
 // ShardSearcher provides direct (in-process) shard search, bypassing HTTP.
 // Implemented by a thin adapter over store.StoreIface in swarm mode.
 type ShardSearcher interface {
-	SearchShard(ctx context.Context, shardID types.ID, query []byte) ([]byte, error)
+	SearchShardTyped(ctx context.Context, shardID types.ID, req *RemoteIndexSearchRequest) (*RemoteIndexSearchResult, error)
 }
 
 var _ ShardIndex = (*RemoteIndex)(nil)

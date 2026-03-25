@@ -21,7 +21,6 @@ import (
 
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
-	json "github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/mapping"
 	bleveindex "github.com/blevesearch/bleve_index_api"
@@ -53,27 +52,8 @@ func (l *LocalIndex) RemoteSearch(
 	ctx context.Context,
 	req *RemoteIndexSearchRequest,
 ) (*RemoteIndexSearchResult, error) {
-	version := uint32(0)
-	if l.schema != nil {
-		version = l.schema.Version
-	}
-	req.FullTextIndexVersion = version
-
-	reqBytes, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal search request: %w", err)
-	}
-
-	respBytes, err := l.searcher.SearchShard(ctx, l.shard, reqBytes)
-	if err != nil {
-		return nil, fmt.Errorf("local shard search: %w", err)
-	}
-
-	var result RemoteIndexSearchResult
-	if err := json.Unmarshal(respBytes, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal search result: %w", err)
-	}
-	return &result, nil
+	req.FullTextIndexVersion = l.SchemaVersion()
+	return l.searcher.SearchShardTyped(ctx, l.shard, req)
 }
 
 func (l *LocalIndex) BatchRemoteSearch(
@@ -96,11 +76,7 @@ func (l *LocalIndex) SearchInContext(
 	ctx context.Context,
 	req *bleve.SearchRequest,
 ) (*bleve.SearchResult, error) {
-	version := uint32(0)
-	if l.schema != nil {
-		version = l.schema.Version
-	}
-	riReq := RemoteIndexSearchRequest{BleveSearchRequest: req, FullTextIndexVersion: version}
+	riReq := RemoteIndexSearchRequest{BleveSearchRequest: req, FullTextIndexVersion: l.SchemaVersion()}
 	if l.q != nil {
 		if l.q.CountStar {
 			riReq.CountStar = true
@@ -111,19 +87,9 @@ func (l *LocalIndex) SearchInContext(
 		}
 	}
 
-	reqBytes, err := json.Marshal(riReq)
-	if err != nil {
-		return nil, fmt.Errorf("marshal search request: %w", err)
-	}
-
-	respBytes, err := l.searcher.SearchShard(ctx, l.shard, reqBytes)
+	result, err := l.searcher.SearchShardTyped(ctx, l.shard, &riReq)
 	if err != nil {
 		return nil, fmt.Errorf("local shard search: %w", err)
-	}
-
-	var result RemoteIndexSearchResult
-	if err := json.Unmarshal(respBytes, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal search result: %w", err)
 	}
 	return result.BleveSearchResult, nil
 }

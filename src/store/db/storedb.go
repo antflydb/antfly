@@ -2186,6 +2186,10 @@ func (s *StoreDB) Search(ctx context.Context, encodedRequest []byte) ([]byte, er
 	return s.coreDB.Search(ctx, encodedRequest)
 }
 
+func (s *StoreDB) SearchTyped(ctx context.Context, req *indexes.RemoteIndexSearchRequest) (*indexes.RemoteIndexSearchResult, error) {
+	return s.coreDB.SearchTyped(ctx, req)
+}
+
 func (s *StoreDB) Scan(
 	ctx context.Context,
 	fromKey []byte,

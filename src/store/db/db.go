@@ -304,6 +304,7 @@ type DB interface {
 	Batch(ctx context.Context, writes [][2][]byte, deletes [][]byte, syncLevel Op_SyncLevel) error
 	// TODO (ajr) Should this be a standardized request format?
 	Search(ctx context.Context, encodedRequest []byte) (encodedResponse []byte, err error)
+	SearchTyped(ctx context.Context, req *indexes.RemoteIndexSearchRequest) (*indexes.RemoteIndexSearchResult, error)
 	Split(currRange types.Range, splitKey []byte, destDir1, destDir2 string, prepareOnly bool) error
 	FinalizeSplit(newRange types.Range) error
 	Snapshot(id string) (int64, error)
@@ -3855,19 +3856,32 @@ func (s *DBImpl) lookupFields(
 }
 
 func (s *DBImpl) Search(ctx context.Context, encodedReqest []byte) (resp []byte, err error) {
-	queryOps.WithLabelValues().Inc()
-	searchStart := time.Now()
 	defer pebbleutils.RecoverPebbleClosed(&err)
 	if len(encodedReqest) == 0 {
 		return nil, ErrEmptyRequest
-	}
-	res := indexes.RemoteIndexSearchResult{
-		VectorSearchResult: make(map[string]*vectorindex.SearchResult),
 	}
 	var searchRequest indexes.RemoteIndexSearchRequest
 	if err := json.Unmarshal(encodedReqest, &searchRequest); err != nil {
 		s.logger.Error("Failed to unmarshal search request", zap.Error(err))
 		return nil, fmt.Errorf("decoding search: %w", err)
+	}
+	result, err := s.SearchTyped(ctx, &searchRequest)
+	if err != nil {
+		return nil, err
+	}
+	resp, err = json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling search result: %w", err)
+	}
+	return resp, nil
+}
+
+func (s *DBImpl) SearchTyped(ctx context.Context, searchRequest *indexes.RemoteIndexSearchRequest) (_ *indexes.RemoteIndexSearchResult, err error) {
+	queryOps.WithLabelValues().Inc()
+	searchStart := time.Now()
+	defer pebbleutils.RecoverPebbleClosed(&err)
+	res := indexes.RemoteIndexSearchResult{
+		VectorSearchResult: make(map[string]*vectorindex.SearchResult),
 	}
 	fullTextIndexName := fmt.Sprintf("full_text_index_v%d", searchRequest.FullTextIndexVersion)
 	if !s.HasIndex(fullTextIndexName) {
@@ -4248,12 +4262,8 @@ func (s *DBImpl) Search(ctx context.Context, encodedReqest []byte) (resp []byte,
 		}
 	}
 
-	s.lookupFields(ctx, searchRequest, &res)
-	resp, err = json.Marshal(res)
-	if err != nil {
-		return nil, fmt.Errorf("marshalling search result: %w", err)
-	}
-	return resp, nil
+	s.lookupFields(ctx, *searchRequest, &res)
+	return &res, nil
 }
 
 // expandFilterIDsForChunks translates document-level filter IDs into the

@@ -133,6 +133,12 @@ func (m *MockShard) Search(ctx context.Context, query []byte) ([]byte, error) {
 	return res, args.Error(1)
 }
 
+func (m *MockShard) SearchTyped(ctx context.Context, req *indexes.RemoteIndexSearchRequest) (*indexes.RemoteIndexSearchResult, error) {
+	args := m.Called(ctx, req)
+	res, _ := args.Get(0).(*indexes.RemoteIndexSearchResult)
+	return res, args.Error(1)
+}
+
 func (m *MockShard) Delete(ctx context.Context, key []byte) error {
 	args := m.Called(ctx, key)
 	return args.Error(0)

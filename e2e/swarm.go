@@ -16,8 +16,11 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -66,6 +69,10 @@ type SwarmOptions struct {
 	// EnableAuth enables authentication and authorization. When enabled, a
 	// default admin:admin user with full permissions is auto-created at startup.
 	EnableAuth bool
+
+	// LocalBypass enables in-process communication between metadata and store,
+	// bypassing HTTP for shard queries and StoreRPC. Mirrors swarm mode behavior.
+	LocalBypass bool
 }
 
 // startAntflySwarm starts a full Antfly swarm (metadata + store + Termite) for testing.
@@ -151,44 +158,27 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		}
 	}
 
-	// Start metadata server
+	// Start metadata and store servers.
 	peers := common.Peers{
 		{ID: nodeID, URL: metadataRaftURL},
 	}
 
-	go func() {
-		metadata.RunAsMetadataServer(
-			swarmCtx,
-			logger.Named("metadata"),
-			config,
-			&store.StoreInfo{
-				ID:      nodeID,
-				RaftURL: metadataRaftURL,
-				ApiURL:  metadataAPIURL,
-			},
-			peers,
-			false, /* join */
-			metadataReadyC,
-			nil,
-		)
-	}()
+	metaConf := &store.StoreInfo{
+		ID:      nodeID,
+		RaftURL: metadataRaftURL,
+		ApiURL:  metadataAPIURL,
+	}
+	storeConf := &store.StoreInfo{
+		ID:      nodeID,
+		ApiURL:  storeAPIURL,
+		RaftURL: storeRaftURL,
+	}
 
-	// Start store server
-	go func() {
-		store.RunAsStore(
-			swarmCtx,
-			logger.Named("store"),
-			config,
-			&store.StoreInfo{
-				ID:      nodeID,
-				ApiURL:  storeAPIURL,
-				RaftURL: storeRaftURL,
-			},
-			"", /* serviceHostname */
-			storeReadyC,
-			nil,
-		)
-	}()
+	if opts.LocalBypass {
+		startSwarmWithLocalBypass(t, swarmCtx, logger, config, metaConf, storeConf, peers, metadataReadyC, storeReadyC)
+	} else {
+		startSwarmWithHTTP(t, swarmCtx, logger, config, metaConf, storeConf, peers, metadataReadyC, storeReadyC)
+	}
 
 	// Wait for both servers to be ready
 	select {
@@ -238,6 +228,111 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		Cancel:          cancel,
 		DataDir:         dataDir,
 	}
+}
+
+// startSwarmWithHTTP starts metadata and store using the standard HTTP-based path.
+func startSwarmWithHTTP(
+	t *testing.T,
+	ctx context.Context,
+	logger *zap.Logger,
+	config *common.Config,
+	metaConf, storeConf *store.StoreInfo,
+	peers common.Peers,
+	metadataReadyC, storeReadyC chan struct{},
+) {
+	t.Helper()
+	go metadata.RunAsMetadataServer(ctx, logger.Named("metadata"), config, metaConf, peers, false, metadataReadyC, nil)
+	go store.RunAsStore(ctx, logger.Named("store"), config, storeConf, "", storeReadyC, nil)
+}
+
+// startSwarmWithLocalBypass starts metadata and store with in-process bypass,
+// mirroring the production swarm.go wiring.
+func startSwarmWithLocalBypass(
+	t *testing.T,
+	ctx context.Context,
+	logger *zap.Logger,
+	config *common.Config,
+	metaConf, storeConf *store.StoreInfo,
+	peers common.Peers,
+	metadataReadyC, storeReadyC chan struct{},
+) {
+	t.Helper()
+
+	// Create metadata runtime inline.
+	metaRuntime, err := metadata.NewRuntime(logger.Named("metadata"), config, metaConf, peers, false, nil)
+	if err != nil {
+		t.Fatalf("creating metadata runtime: %v", err)
+	}
+	metaRuntime.StartRaft()
+	t.Cleanup(func() { _ = metaRuntime.Close() })
+
+	// Start metadata HTTP server.
+	go func() {
+		u, _ := url.Parse(metaConf.ApiURL)
+		srv := &http.Server{Addr: u.Host, Handler: metaRuntime.HTTPHandler(), ReadTimeout: 10 * time.Second}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+		listener, listenErr := net.Listen("tcp", u.Host)
+		if listenErr != nil {
+			logger.Fatal("metadata listener failed", zap.Error(listenErr))
+		}
+		close(metadataReadyC)
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metadata HTTP error", zap.Error(err))
+		}
+	}()
+
+	// Wait for metadata before starting store.
+	select {
+	case <-metadataReadyC:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Timeout waiting for metadata in local bypass mode")
+	}
+	// Create store runtime inline.
+	storeRuntime, err := store.NewRuntime(logger.Named("store"), config, storeConf, nil)
+	if err != nil {
+		t.Fatalf("creating store runtime: %v", err)
+	}
+	storeRuntime.StartRaft()
+	t.Cleanup(func() { _ = storeRuntime.Close() })
+
+	// Wire local bypass.
+	metaRuntime.SetLocalStore(metaConf.ID, storeRuntime.Store())
+	logger.Info("Local shard bypass enabled for e2e test")
+
+	// Start store HTTP server (still needed for raft transport).
+	go func() {
+		u, _ := url.Parse(storeConf.ApiURL)
+		srv := &http.Server{Addr: u.Host, Handler: storeRuntime.HTTPHandler(), ReadTimeout: time.Minute}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+		listener, listenErr := net.Listen("tcp", u.Host)
+		if listenErr != nil {
+			logger.Fatal("store listener failed", zap.Error(listenErr))
+		}
+		close(storeReadyC)
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("store HTTP error", zap.Error(err))
+		}
+	}()
+
+	// Register store with metadata.
+	go func() {
+		orchURLs, _ := config.Metadata.GetOrchestrationURLs()
+		if err := store.RegisterWithLeaderWithRetry(ctx, logger, storeRuntime.Store(), storeConf, orchURLs); err != nil {
+			if ctx.Err() == nil {
+				logger.Error("store registration failed", zap.Error(err))
+			}
+		}
+	}()
 }
 
 // findRepoRoot finds the repository root by walking up from the test file

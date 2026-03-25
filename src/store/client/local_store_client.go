@@ -64,12 +64,16 @@ func (c *LocalStoreClient) Batch(
 	if err != nil {
 		return err
 	}
-	return shard.Batch(ctx, db.BatchOp_builder{
+	err = shard.Batch(ctx, db.BatchOp_builder{
 		Writes:     db.WritesFromTuples(writes),
 		Deletes:    deletes,
 		Transforms: transforms,
 		SyncLevel:  &syncLevel,
 	}.Build(), false)
+	if errors.Is(err, db.ErrPartialSuccess) {
+		return nil
+	}
+	return err
 }
 
 func (c *LocalStoreClient) ApplyMergeChunk(
@@ -84,11 +88,15 @@ func (c *LocalStoreClient) ApplyMergeChunk(
 		return err
 	}
 	level := db.Op_SyncLevelInternalMergeCopy
-	return shard.ApplyMergeChunk(ctx, db.BatchOp_builder{
+	err = shard.ApplyMergeChunk(ctx, db.BatchOp_builder{
 		Writes:    db.WritesFromTuples(writes),
 		Deletes:   deletes,
 		SyncLevel: &level,
 	}.Build())
+	if errors.Is(err, db.ErrPartialSuccess) {
+		return nil
+	}
+	return err
 }
 
 func (c *LocalStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string) error {

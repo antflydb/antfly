@@ -72,8 +72,17 @@ type MetadataStore struct {
 	txnIDGenerator func() uuid.UUID
 
 	// shardSearcher enables in-process shard search, bypassing HTTP.
-	// Set in swarm mode via Runtime.SetLocalStore.
-	shardSearcher indexes.ShardSearcher
+	// Set once at startup in swarm mode via Runtime.SetLocalStore;
+	// read concurrently by query handlers, hence atomic.
+	shardSearcher atomic.Pointer[indexes.ShardSearcher]
+}
+
+// localSearcher returns the in-process ShardSearcher if configured (swarm mode), or nil.
+func (ms *MetadataStore) localSearcher() indexes.ShardSearcher {
+	if p := ms.shardSearcher.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func (ms *MetadataStore) clockOrReal() clock.Clock {
