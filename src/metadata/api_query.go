@@ -344,6 +344,14 @@ func (q *QueryRequest) mergeConfigToInternal() *indexes.MergeConfig {
 	}
 }
 
+func fieldFilterForQuery(q *indexes.Query, queryReq *QueryRequest) *indexes.FieldFilter {
+	return &indexes.FieldFilter{
+		Fields:    q.Fields,
+		Star:      len(q.Fields) == 0,
+		CountStar: q.Count && len(q.Fields) == 0 && queryReq.FullTextSearch != nil,
+	}
+}
+
 // getOrCreateBaseIndexes returns cached base RemoteIndexes for the given schema
 // and shard topology, creating them if the cache misses or topology changed.
 // The cache avoids rebuilding bleve index mappings on every query.
@@ -353,8 +361,8 @@ func (t *TableApi) getOrCreateBaseIndexes(
 ) (indexes.RemoteIndexes, error) {
 	// Build a deterministic cache key from schema version + sorted shard peers.
 	h := xxhash.New()
+	var buf [8]byte
 	if tableSchema != nil {
-		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(tableSchema.Version))
 		h.Write(buf[:])
 	}
@@ -364,10 +372,11 @@ func (t *TableApi) getOrCreateBaseIndexes(
 	}
 	slices.SortFunc(shardIDs, func(a, b types.ID) int { return cmp.Compare(a, b) })
 	for _, id := range shardIDs {
-		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(id))
 		h.Write(buf[:])
-		for _, u := range peers[id] {
+		urls := slices.Clone(peers[id])
+		slices.Sort(urls)
+		for _, u := range urls {
 			h.WriteString(u)
 		}
 	}
@@ -381,6 +390,16 @@ func (t *TableApi) getOrCreateBaseIndexes(
 	if err != nil {
 		return nil, err
 	}
+
+	// Evict all entries when the cache grows too large (e.g. after many
+	// schema migrations or topology changes). Hot entries are re-cached
+	// on the next query.
+	count := 0
+	t.baseIndexCache.Range(func(_, _ any) bool { count++; return count < 64 })
+	if count >= 64 {
+		t.baseIndexCache.Clear()
+	}
+
 	t.baseIndexCache.Store(key, base)
 	return base, nil
 }
@@ -448,11 +467,7 @@ func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryRe
 			Error:  fmt.Sprintf("creating search indexes: %v", err),
 		}
 	}
-	shardIndexes := baseIndexes.WithFieldFilter(&indexes.FieldFilter{
-		Fields:    q.Fields,
-		Star:      len(q.Fields) == 0,
-		CountStar: q.Count && len(q.Fields) == 0 && queryReq.FullTextSearch != nil,
-	})
+	shardIndexes := baseIndexes.WithFieldFilter(fieldFilterForQuery(q, queryReq))
 	t.logger.Debug("Received JSON query",
 		zap.Any("remoteindex.Query", q),
 		zap.Any("QueryRequest", queryReq))
@@ -899,6 +914,18 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 		querySchema = table.ReadSchema
 	}
 
+	// Build base indexes once for the table (shared across all queries in the batch).
+	baseIndexes, err := t.getOrCreateBaseIndexes(querySchema, shardPeers)
+	if err != nil {
+		for i := range results {
+			results[i] = QueryResult{
+				Status: http.StatusInternalServerError,
+				Error:  fmt.Sprintf("creating search indexes: %v", err),
+			}
+		}
+		return results
+	}
+
 	// Build batched shard requests
 	// For each valid query, we need to send to ALL shards
 	// Structure: [query0_shard0, query0_shard1, ..., query1_shard0, query1_shard1, ...]
@@ -913,20 +940,7 @@ func (t *TableApi) runBatchQueriesForTable(ctx context.Context, queryReqs []Quer
 			continue
 		}
 
-		// Create shard indexes for this query (reuses cached base indexes).
-		baseIndexes, err := t.getOrCreateBaseIndexes(querySchema, shardPeers)
-		if err != nil {
-			results[i] = QueryResult{
-				Status: http.StatusInternalServerError,
-				Error:  fmt.Sprintf("creating search indexes: %v", err),
-			}
-			continue
-		}
-		shardIndexes := baseIndexes.WithFieldFilter(&indexes.FieldFilter{
-			Fields:    pq.query.Fields,
-			Star:      len(pq.query.Fields) == 0,
-			CountStar: pq.query.Count && len(pq.query.Fields) == 0 && pq.queryReq.FullTextSearch != nil,
-		})
+		shardIndexes := baseIndexes.WithFieldFilter(fieldFilterForQuery(pq.query, pq.queryReq))
 
 		// Convert query to search request
 		searchReq, err := pq.query.RemoteIndexSearchRequest()

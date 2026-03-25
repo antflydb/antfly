@@ -475,21 +475,6 @@ func MakeBaseIndexesForShards(
 	return indexes, nil
 }
 
-// MakeIndexesForShards creates RemoteIndex objects for each shard with a
-// per-query FieldFilter applied.
-func MakeIndexesForShards(
-	client *http.Client,
-	tableSchema *schema.TableSchema,
-	peers map[types.ID][]string,
-	ff *FieldFilter,
-) (RemoteIndexes, error) {
-	base, err := MakeBaseIndexesForShards(client, tableSchema, peers)
-	if err != nil {
-		return nil, err
-	}
-	return base.WithFieldFilter(ff), nil
-}
-
 // WithFieldFilter returns a copy of each RemoteIndex with the given FieldFilter
 // applied. The underlying client, mapping, and schema are shared (not copied).
 func (r RemoteIndexes) WithFieldFilter(ff *FieldFilter) RemoteIndexes {
@@ -1001,6 +986,9 @@ func MultiSearch(
 		}
 		if sr == nil {
 			sr = &RemoteIndexSearchResult{}
+		}
+		if sr.Status == nil {
+			sr.Status = &RemoteIndexSearchStatus{Total: 1, Successful: 1}
 		}
 		sr.Took = time.Since(searchStart)
 		return sr, nil
