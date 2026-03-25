@@ -93,6 +93,35 @@ func writeStoreStatus(t *testing.T, db kv.DB, nodeID types.ID, healthy bool) {
 	require.NoError(t, err)
 }
 
+func writeStoreStatusWithShards(
+	t *testing.T,
+	db kv.DB,
+	nodeID types.ID,
+	healthy bool,
+	shards map[types.ID]*store.ShardInfo,
+) {
+	t.Helper()
+	state := store.StoreState_Healthy
+	if !healthy {
+		state = store.StoreState_Unhealthy
+	}
+	status := &tablemgr.StoreStatus{
+		StoreInfo: store.StoreInfo{
+			ID:     nodeID,
+			ApiURL: "http://127.0.0.1:0",
+		},
+		State:  state,
+		Shards: shards,
+	}
+	data, err := json.Marshal(status)
+	require.NoError(t, err)
+	err = db.Batch(context.Background(),
+		[][2][]byte{{[]byte("tm:sts:" + nodeID.String()), data}},
+		nil,
+	)
+	require.NoError(t, err)
+}
+
 type stubStoreRPC struct {
 	client.StoreRPC
 	id       types.ID
@@ -218,7 +247,7 @@ func TestFindWriteShardForKey_FallsBackToParentUntilSplitOffReady(t *testing.T) 
 	assert.Equal(t, parentID, shardID)
 }
 
-func TestPartitionWriteKeysByShard_KeepsParentAsWriteOwnerWhileParentSplitIsActive(t *testing.T) {
+func TestPartitionWriteKeysByShard_KeepsParentAsWriteOwnerUntilChildCatchesUp(t *testing.T) {
 	ms, db := setupTestMetadataStore(t)
 
 	parentID := types.ID(10)
@@ -256,12 +285,73 @@ func TestPartitionWriteKeysByShard_KeepsParentAsWriteOwnerWhileParentSplitIsActi
 		false,
 		2,
 	))
+	childStatus, err := ms.tm.GetShardStatus(childID)
+	require.NoError(t, err)
+	childStatus.SplitReplayRequired = true
+	childStatus.SplitReplayCaughtUp = false
+	writeShardStatus(t, db, childStatus)
 
 	partitions, unfound, err := partitionWriteKeysByShard(ms.tm, table, []string{"apple", "mango"})
 	require.NoError(t, err)
 	assert.Empty(t, unfound)
 	assert.Equal(t, []string{"apple", "mango"}, partitions[parentID])
 	assert.Nil(t, partitions[childID])
+}
+
+func TestPartitionWriteKeysByShard_UsesChildOnceItCanInitiateCutover(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	parentID := types.ID(10)
+	childID := types.ID(11)
+	splitKey := []byte("m:\x00")
+
+	table := &store.Table{
+		Name: "test_table",
+		Shards: map[types.ID]*store.ShardConfig{
+			parentID: {ByteRange: [2][]byte{{0x00}, splitKey}},
+			childID:  {ByteRange: [2][]byte{splitKey, {0xff}}},
+		},
+	}
+
+	writeShardStatus(t, db, splitShardStatus(
+		parentID,
+		store.ShardState_Splitting,
+		[2][]byte{{0x00}, splitKey},
+		false,
+		false,
+		1,
+	))
+	parentStatus, err := ms.tm.GetShardStatus(parentID)
+	require.NoError(t, err)
+	parentStatus.SplitState = &storedb.SplitState{}
+	parentStatus.SplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	parentStatus.SplitState.SetSplitKey(splitKey)
+	parentStatus.SplitState.SetNewShardId(uint64(childID))
+	writeShardStatus(t, db, parentStatus)
+	writeShardStatus(t, db, &store.ShardStatus{
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xff}},
+			},
+			HasSnapshot:         true,
+			Initializing:        false,
+			Peers:               common.NewPeerSet(1, 2, 3),
+			ReportedBy:          common.NewPeerSet(1, 2, 3),
+			SplitReplayRequired: true,
+			SplitReplayCaughtUp: true,
+			SplitCutoverReady:   false,
+			RaftStatus:          &common.RaftStatus{Lead: 2, Voters: common.NewPeerSet(1, 2, 3)},
+		},
+		ID:    childID,
+		Table: "test_table",
+		State: store.ShardState_SplitOffPreSnap,
+	})
+
+	partitions, unfound, err := partitionWriteKeysByShard(ms.tm, table, []string{"apple", "mango"})
+	require.NoError(t, err)
+	assert.Empty(t, unfound)
+	assert.Equal(t, []string{"apple"}, partitions[parentID])
+	assert.Equal(t, []string{"mango"}, partitions[childID])
 }
 
 func TestPartitionWriteKeysByShard_UsesChildOnceParentSplitIsInactive(t *testing.T) {
@@ -332,6 +422,9 @@ func TestResolveWriteShardID_AdjacentShardNotReroutedDuringSplit(t *testing.T) {
 				ShardConfig: storedb.ShardConfig{
 					ByteRange: [2][]byte{splitKey, {0x80}},
 				},
+				HasSnapshot:  true,
+				Initializing: false,
+				RaftStatus:   &common.RaftStatus{Lead: 1},
 			},
 			Table: "test_table",
 			State: store.ShardState_SplitOffPreSnap,
@@ -352,13 +445,22 @@ func TestResolveWriteShardID_AdjacentShardNotReroutedDuringSplit(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, adjacentShardID, resolved)
 
-	// The split child should resolve to the parent.
+	childStatus := statuses[splitChildID]
+	childStatus.SplitReplayRequired = true
+	childStatus.SplitReplayCaughtUp = false
+
+	// The split child should resolve to the parent until it catches up.
 	resolved, err = resolveWriteShardID(statuses, splitChildID)
 	require.NoError(t, err)
 	assert.Equal(t, splittingParentID, resolved)
+
+	childStatus.SplitReplayCaughtUp = true
+	resolved, err = resolveWriteShardID(statuses, splitChildID)
+	require.NoError(t, err)
+	assert.Equal(t, splitChildID, resolved)
 }
 
-func TestForwardInsertToShard_ReroutesDirectlyToChildWhenParentRoutingIsStale(t *testing.T) {
+func TestForwardInsertToShard_UsesChildDirectlyOnceItCanInitiateCutover(t *testing.T) {
 	ms, db := setupTestMetadataStore(t)
 
 	tableName := "test_table"
@@ -449,7 +551,7 @@ func TestForwardInsertToShard_ReroutesDirectlyToChildWhenParentRoutingIsStale(t 
 	childStatus.Initializing = false
 	childStatus.SplitReplayRequired = true
 	childStatus.SplitReplayCaughtUp = true
-	childStatus.SplitCutoverReady = false
+	childStatus.SplitCutoverReady = true
 	childStatus.Peers = common.NewPeerSet(childNodeID)
 	childStatus.ReportedBy = common.NewPeerSet(childNodeID)
 	childStatus.RaftStatus = &common.RaftStatus{
@@ -469,7 +571,7 @@ func TestForwardInsertToShard_ReroutesDirectlyToChildWhenParentRoutingIsStale(t 
 		storedb.Op_SyncLevelWrite,
 	)
 	require.NoError(t, err)
-	assert.Equal(t, 1, parentRPC.batchHit)
+	assert.Equal(t, 0, parentRPC.batchHit)
 	assert.Equal(t, 1, childRPC.batchHit)
 }
 
@@ -591,7 +693,155 @@ func TestForwardInsertToShard_DoesNotBypassToChildBeforeCutover(t *testing.T) {
 	assert.Equal(t, 0, childRPC.batchHit)
 }
 
-func TestResolveWriteShardID_FinalizingParentIsNotWriteOwner(t *testing.T) {
+func TestDirectLeaderClientForShardBypassesSplitFallback_PrefersSelfReportedLeader(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	shardID := types.ID(101)
+	leaderNodeID := types.ID(1)
+	followerNodeID := types.ID(2)
+
+	leaderRPC := &stubStoreRPC{id: leaderNodeID}
+	followerRPC := &stubStoreRPC{id: followerNodeID}
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case leaderNodeID:
+			return leaderRPC
+		case followerNodeID:
+			return followerRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+
+	childStatus := splitShardStatus(
+		shardID,
+		store.ShardState_SplitOffPreSnap,
+		[2][]byte{[]byte("m:\x00"), {0xff}},
+		true,
+		false,
+		followerNodeID, // stale merged leader
+	)
+	childStatus.SplitReplayRequired = true
+	childStatus.SplitReplayCaughtUp = true
+	childStatus.SplitCutoverReady = true
+	childStatus.Peers = common.NewPeerSet(leaderNodeID, followerNodeID)
+	childStatus.ReportedBy = common.NewPeerSet(leaderNodeID, followerNodeID)
+	writeShardStatus(t, db, childStatus)
+	reloadedShardStatus, err := ms.tm.GetShardStatus(shardID)
+	require.NoError(t, err)
+	assert.True(t, reloadedShardStatus.ReportedBy.Contains(leaderNodeID))
+	assert.True(t, reloadedShardStatus.ReportedBy.Contains(followerNodeID))
+
+	leaderLocalInfo := childStatus.ShardInfo.DeepCopy()
+	leaderLocalInfo.HasSnapshot = true
+	leaderLocalInfo.Initializing = false
+	leaderLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+	followerLocalInfo := childStatus.ShardInfo.DeepCopy()
+	followerLocalInfo.HasSnapshot = true
+	followerLocalInfo.Initializing = false
+	followerLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+
+	writeStoreStatusWithShards(t, db, leaderNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: leaderLocalInfo,
+	})
+	writeStoreStatusWithShards(t, db, followerNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: followerLocalInfo,
+	})
+	leaderStoreStatus, err := ms.tm.GetStoreStatus(context.Background(), leaderNodeID)
+	require.NoError(t, err)
+	require.NotNil(t, leaderStoreStatus.Shards[shardID])
+	assert.Equal(t, leaderNodeID, leaderStoreStatus.Shards[shardID].RaftStatus.Lead)
+	assert.True(t, leaderStoreStatus.Shards[shardID].CanInitiateSplitCutover())
+	followerStoreStatus, err := ms.tm.GetStoreStatus(context.Background(), followerNodeID)
+	require.NoError(t, err)
+	require.NotNil(t, followerStoreStatus.Shards[shardID])
+	assert.Equal(t, leaderNodeID, followerStoreStatus.Shards[shardID].RaftStatus.Lead)
+	leaderClient, leaderReachable, err := ms.tm.GetStoreClient(context.Background(), leaderNodeID)
+	require.NoError(t, err)
+	require.True(t, leaderReachable)
+	require.NotNil(t, leaderClient)
+	assert.Equal(t, leaderNodeID, leaderClient.ID())
+	liveLeaderClient, err := ms.selfReportedLeaderClientForShard(context.Background(), shardID, splitChildIsFullyCutOver)
+	require.NoError(t, err)
+	require.NotNil(t, liveLeaderClient)
+	assert.Equal(t, leaderNodeID, liveLeaderClient.ID())
+
+	_, gotClient, err := ms.directLeaderClientForShardBypassesSplitFallback(context.Background(), shardID)
+	require.NoError(t, err)
+	require.NotNil(t, gotClient)
+	assert.Equal(t, leaderNodeID, gotClient.ID())
+}
+
+func TestLeaderClientForShardNoFallback_SplitChildUsesLiveLeaderOnceCaughtUp(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	shardID := types.ID(101)
+	leaderNodeID := types.ID(1)
+	followerNodeID := types.ID(2)
+
+	leaderRPC := &stubStoreRPC{id: leaderNodeID}
+	followerRPC := &stubStoreRPC{id: followerNodeID}
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case leaderNodeID:
+			return leaderRPC
+		case followerNodeID:
+			return followerRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+
+	childStatus := splitShardStatus(
+		shardID,
+		store.ShardState_SplitOffPreSnap,
+		[2][]byte{[]byte("m:\x00"), {0xff}},
+		true,
+		false,
+		followerNodeID, // stale merged leader
+	)
+	childStatus.SplitReplayRequired = true
+	childStatus.SplitReplayCaughtUp = true
+	childStatus.SplitCutoverReady = false
+	childStatus.Peers = common.NewPeerSet(leaderNodeID, followerNodeID)
+	childStatus.ReportedBy = common.NewPeerSet(leaderNodeID, followerNodeID)
+	writeShardStatus(t, db, childStatus)
+
+	leaderLocalInfo := childStatus.ShardInfo.DeepCopy()
+	leaderLocalInfo.HasSnapshot = true
+	leaderLocalInfo.Initializing = false
+	leaderLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+	followerLocalInfo := childStatus.ShardInfo.DeepCopy()
+	followerLocalInfo.HasSnapshot = true
+	followerLocalInfo.Initializing = false
+	followerLocalInfo.RaftStatus = &common.RaftStatus{
+		Lead:   leaderNodeID,
+		Voters: common.NewPeerSet(leaderNodeID, followerNodeID),
+	}
+
+	writeStoreStatusWithShards(t, db, leaderNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: leaderLocalInfo,
+	})
+	writeStoreStatusWithShards(t, db, followerNodeID, true, map[types.ID]*store.ShardInfo{
+		shardID: followerLocalInfo,
+	})
+
+	_, gotClient, err := ms.leaderClientForShardNoFallback(context.Background(), shardID)
+	require.NoError(t, err)
+	require.NotNil(t, gotClient)
+	assert.Equal(t, leaderNodeID, gotClient.ID())
+}
+
+func TestResolveWriteShardID_FinalizingParentRoutesToChild(t *testing.T) {
 	parentID := types.ID(20)
 	childID := types.ID(21)
 	splitKey := []byte("m:\x00")
@@ -628,12 +878,12 @@ func TestResolveWriteShardID_FinalizingParentIsNotWriteOwner(t *testing.T) {
 		},
 	}
 
-	_, err := resolveWriteShardID(statuses, childID)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "parent shard not found")
+	resolved, err := resolveWriteShardID(statuses, childID)
+	require.NoError(t, err)
+	assert.Equal(t, childID, resolved)
 }
 
-func TestResolveWriteShardID_PreSplitParentWithoutSplitStateIsNotWriteOwner(t *testing.T) {
+func TestResolveWriteShardID_PreSplitParentWithoutSplitStateRoutesToChild(t *testing.T) {
 	parentID := types.ID(30)
 	childID := types.ID(31)
 	splitKey := []byte("m:\x00")
@@ -664,9 +914,9 @@ func TestResolveWriteShardID_PreSplitParentWithoutSplitStateIsNotWriteOwner(t *t
 		},
 	}
 
-	_, err := resolveWriteShardID(statuses, childID)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "parent shard not found")
+	resolved, err := resolveWriteShardID(statuses, childID)
+	require.NoError(t, err)
+	assert.Equal(t, childID, resolved)
 }
 
 func TestResolveWriteShardID_ErrorWhenStatusMissing(t *testing.T) {

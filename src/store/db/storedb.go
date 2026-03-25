@@ -355,25 +355,39 @@ func (s *StoreDB) preEnrichBatch(
 	// 3. Combine all writes
 	allWrites := make([]*Write, 0, len(writes)+len(embWrites)+len(sumWrites)+len(edgeWrites)+len(generatedWrites))
 	allWrites = append(allWrites, writes...)
+	allDeletes := append(batch.GetDeletes(), edgeDeletes...)
 
 	// Add extracted enrichments
 	for _, w := range embWrites {
+		if w[1] == nil {
+			allDeletes = append(allDeletes, w[0])
+			continue
+		}
 		allWrites = append(allWrites, Write_builder{Key: w[0], Value: w[1]}.Build())
 	}
 	for _, w := range sumWrites {
+		if w[1] == nil {
+			allDeletes = append(allDeletes, w[0])
+			continue
+		}
 		allWrites = append(allWrites, Write_builder{Key: w[0], Value: w[1]}.Build())
 	}
 	for _, w := range edgeWrites {
+		if w[1] == nil {
+			allDeletes = append(allDeletes, w[0])
+			continue
+		}
 		allWrites = append(allWrites, Write_builder{Key: w[0], Value: w[1]}.Build())
 	}
 
 	// Add generated enrichments
 	for _, w := range generatedWrites {
+		if w[1] == nil {
+			allDeletes = append(allDeletes, w[0])
+			continue
+		}
 		allWrites = append(allWrites, Write_builder{Key: w[0], Value: w[1]}.Build())
 	}
-
-	// 4. Combine deletes
-	allDeletes := append(batch.GetDeletes(), indexDeletes...)
 
 	// Log enrichment stats
 	if len(embWrites) > 0 || len(sumWrites) > 0 || len(edgeWrites) > 0 || len(generatedWrites) > 0 {

@@ -83,13 +83,13 @@ func resolveWriteShardID(
 			return receiverShardID, nil
 		}
 	}
-	parentShardID, err := findParentShardForSplitOffStatus(shardStatuses, status)
-	if err == nil {
-		return parentShardID, nil
-	}
-	if status.State == store.ShardState_SplittingOff ||
-		status.State == store.ShardState_SplitOffPreSnap {
-		if !status.IsReadyForSplitReads() {
+	if shouldRouteWriteToParent(status) {
+		parentShardID, err := findParentShardForSplitOffStatus(shardStatuses, status)
+		if err == nil {
+			return parentShardID, nil
+		}
+		if status.State == store.ShardState_SplittingOff ||
+			status.State == store.ShardState_SplitOffPreSnap {
 			return 0, err
 		}
 	}

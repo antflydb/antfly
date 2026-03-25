@@ -268,6 +268,75 @@ func TestHBCIndex_BulkBuildRejectsDuplicateIDs(t *testing.T) {
 	require.ErrorIs(t, err, ErrDuplicateVectorID)
 }
 
+func TestHBCIndex_ReopenRejectsDistanceMetricMismatch(t *testing.T) {
+	db := setupPebbleWithVectors(t, "test_hbc_metric_mismatch", &Batch{})
+
+	config := HBCConfig{
+		Dimension:       3,
+		DistanceMetric:  vector.DistanceMetric_L2Squared,
+		Name:            "test_hbc_metric_mismatch",
+		BranchingFactor: 4,
+		LeafSize:        10,
+		SearchWidth:     8,
+		CacheSizeNodes:  100,
+		CacheTTL:        5 * time.Minute,
+		VectorDB:        db,
+		IndexDB:         db,
+	}
+
+	index, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	require.NoError(t, index.Close())
+
+	config.DistanceMetric = vector.DistanceMetric_Cosine
+	_, err = NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.Error(t, err)
+	require.ErrorContains(t, err, "distance metric mismatch index")
+}
+
+func TestHBCIndex_DuplicateInsertDoesNotIncrementActiveCount(t *testing.T) {
+	vectors := []vector.T{{1.0, 0.0, 0.0}}
+	ids := []uint64{1}
+	metadata := [][]byte{[]byte("meta_0")}
+
+	db := setupPebbleWithVectors(t, "test_hbc_duplicate_insert", &Batch{
+		IDs:          ids,
+		Vectors:      vectors,
+		MetadataList: metadata,
+	})
+
+	config := HBCConfig{
+		Dimension:       3,
+		Name:            "test_hbc_duplicate_insert",
+		BranchingFactor: 4,
+		LeafSize:        5,
+		SearchWidth:     8,
+		CacheSizeNodes:  100,
+		CacheTTL:        5 * time.Minute,
+		VectorDB:        db,
+		IndexDB:         db,
+	}
+
+	index, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	batch := &Batch{
+		IDs:          ids,
+		Vectors:      vectors,
+		MetadataList: metadata,
+	}
+	require.NoError(t, index.Batch(t.Context(), batch))
+	require.EqualValues(t, 1, index.TotalVectors())
+
+	require.NoError(t, index.Batch(t.Context(), batch))
+	require.EqualValues(t, 1, index.TotalVectors())
+
+	meta, err := index.getMetadata(index.indexDB)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, meta.ActiveCount)
+}
+
 func TestHBCIndex_TreeSplitting(t *testing.T) {
 	// Insert enough vectors to trigger splits
 	numVectors := 20

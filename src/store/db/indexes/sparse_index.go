@@ -970,6 +970,7 @@ func (si *SparseIndex) LeaderFactory(ctx context.Context, persistFunc PersistFun
 					if !si.byteRange.Contains(k) {
 						return common.NewErrKeyOutOfRange(k, si.byteRange)
 					}
+					desiredChunkKeys := make([][]byte, 0, len(chunks[j]))
 					for _, chunk := range chunks[j] {
 						if len(strings.TrimSpace(chunk.GetText())) == 0 {
 							continue
@@ -980,6 +981,7 @@ func (si *SparseIndex) LeaderFactory(ctx context.Context, persistFunc PersistFun
 						} else {
 							chunkKey = storeutils.MakeChunkKey(k, si.name, chunk.Id)
 						}
+						desiredChunkKeys = append(desiredChunkKeys, chunkKey)
 						chunkJSON, err := json.Marshal(chunk)
 						if err != nil {
 							return fmt.Errorf("marshaling chunk: %w", err)
@@ -989,6 +991,19 @@ func (si *SparseIndex) LeaderFactory(ctx context.Context, persistFunc PersistFun
 						b = append(b, chunkJSON...)
 						writes = append(writes, [2][]byte{chunkKey, b})
 					}
+
+					deleteWrites, err := collectChunkReplacementDeletes(
+						si.db,
+						k,
+						si.name,
+						desiredChunkKeys,
+						si.sparseSuffix,
+						si.summarizerSuffix,
+					)
+					if err != nil {
+						return fmt.Errorf("collecting stale chunk deletes: %w", err)
+					}
+					writes = append(writes, deleteWrites...)
 				}
 				return persistFunc(ctx, writes)
 			}
@@ -1258,6 +1273,39 @@ func (si *SparseIndex) computeEnrichmentsPipeline(
 	allEnrichmentWrites := make([][2][]byte, 0, len(embeddingWrites)+len(chunkWrites))
 	allEnrichmentWrites = append(allEnrichmentWrites, embeddingWrites...)
 	allEnrichmentWrites = append(allEnrichmentWrites, chunkWrites...)
+
+	failedSet := make(map[string]struct{}, len(failed))
+	for _, key := range failed {
+		failedSet[string(key)] = struct{}{}
+	}
+
+	desiredByDoc := make(map[string][][]byte, len(filteredKeys))
+	for _, chunkWrite := range chunkWrites {
+		docKey, _, ok := storeutils.ParseChunkKey(chunkWrite[0])
+		if !ok {
+			continue
+		}
+		sKey := string(docKey)
+		desiredByDoc[sKey] = append(desiredByDoc[sKey], chunkWrite[0])
+	}
+
+	for _, docKey := range filteredKeys {
+		if _, failed := failedSet[string(docKey)]; failed {
+			continue
+		}
+		deleteWrites, err := collectChunkReplacementDeletes(
+			si.db,
+			docKey,
+			si.name,
+			desiredByDoc[string(docKey)],
+			si.sparseSuffix,
+			si.summarizerSuffix,
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("collecting stale chunk deletes: %w", err)
+		}
+		allEnrichmentWrites = append(allEnrichmentWrites, deleteWrites...)
+	}
 
 	si.logger.Debug("ComputeEnrichments (pipeline) completed",
 		zap.String("index", si.name),

@@ -108,15 +108,17 @@ type HBCConfig struct {
 
 // hbcIndexMetadata holds the global index metadata
 type hbcIndexMetadata struct {
-	Version         uint32
-	Dimension       uint32
-	BranchingFactor int64
-	LeafSize        int64
-	RootNode        uint64
-	ActiveCount     uint64
-	NodeCount       uint64
-	UseQuantization bool
-	QuantizerSeed   uint64
+	Version           uint32
+	Dimension         uint32
+	HasDistanceMetric bool
+	DistanceMetric    vector.DistanceMetric
+	BranchingFactor   int64
+	LeafSize          int64
+	RootNode          uint64
+	ActiveCount       uint64
+	NodeCount         uint64
+	UseQuantization   bool
+	QuantizerSeed     uint64
 }
 
 // HBCNode represents a node in the hierarchical clustering tree
@@ -431,6 +433,14 @@ func (idx *HBCIndex) loadIndex() (bool, error) {
 	if meta.Version != hbcIndexVersion {
 		return true, fmt.Errorf("unsupported version: %d", meta.Version)
 	}
+	if meta.Dimension != idx.config.Dimension {
+		return true, fmt.Errorf("dimension mismatch index: %d, config: %d",
+			meta.Dimension, idx.config.Dimension)
+	}
+	if meta.HasDistanceMetric && meta.DistanceMetric != idx.config.DistanceMetric {
+		return true, fmt.Errorf("distance metric mismatch index: %s, config: %s",
+			meta.DistanceMetric, idx.config.DistanceMetric)
+	}
 
 	idx.config.BranchingFactor = int(meta.BranchingFactor)
 	idx.config.LeafSize = int(meta.LeafSize)
@@ -478,15 +488,17 @@ func (idx *HBCIndex) initializeNewIndex() error {
 
 	// Save metadata
 	meta := hbcIndexMetadata{
-		Version:         hbcIndexVersion,
-		Dimension:       idx.config.Dimension,
-		BranchingFactor: int64(idx.config.BranchingFactor),
-		LeafSize:        int64(idx.config.LeafSize),
-		RootNode:        rootID,
-		ActiveCount:     0,
-		NodeCount:       1,
-		UseQuantization: idx.config.UseQuantization,
-		QuantizerSeed:   idx.config.QuantizerSeed,
+		Version:           hbcIndexVersion,
+		Dimension:         idx.config.Dimension,
+		HasDistanceMetric: true,
+		DistanceMetric:    idx.config.DistanceMetric,
+		BranchingFactor:   int64(idx.config.BranchingFactor),
+		LeafSize:          int64(idx.config.LeafSize),
+		RootNode:          rootID,
+		ActiveCount:       0,
+		NodeCount:         1,
+		UseQuantization:   idx.config.UseQuantization,
+		QuantizerSeed:     idx.config.QuantizerSeed,
 	}
 
 	if err := idx.saveMetadata(batch, &meta); err != nil {
@@ -861,9 +873,18 @@ func (idx *HBCIndex) loadNodeNoCache(db pebble.Reader, nodeID uint64) (*HBCNode,
 	if idx.config.UseQuantization {
 		quantizedKey := makeHBCQuantizedKey(idx.prefix, nodeID)
 		if quantizedData, closer, err := db.Get(quantizedKey); err == nil {
-			// Deserialize quantized vector set
-			node.QuantizedVectors = idx.deserializeQuantizedSet(quantizedData, node.Parent == 0)
 			_ = closer.Close()
+			expectedCount := len(node.Children)
+			if node.IsLeaf {
+				expectedCount = len(node.Members)
+			}
+			node.QuantizedVectors, err = idx.deserializeQuantizedSet(
+				quantizedData, node.Parent == 0, expectedCount)
+			if err != nil {
+				node.reset()
+				idx.nodePool.Put(node)
+				return nil, fmt.Errorf("loading quantized vectors for node %d: %w", nodeID, err)
+			}
 		}
 	}
 
@@ -1132,11 +1153,13 @@ func (idx *HBCIndex) Batch(ctx context.Context, b *Batch) (err error) {
 		// Note: Vectors are stored in VectorDB and managed externally - we only manage metadata here
 
 		// Insert into tree
-		if err := idx.insertIntoTree(batch, idx.writerCache, meta, ids[i], vec, existingLeafID); err != nil {
+		inserted, err := idx.insertIntoTree(batch, idx.writerCache, meta, ids[i], vec, existingLeafID)
+		if err != nil {
 			return fmt.Errorf("inserting %d tree: %w", ids[i], err)
 		}
-
-		meta.ActiveCount++
+		if inserted {
+			meta.ActiveCount++
+		}
 	}
 
 	// Acquire locks in the same order as Search to prevent ABBA deadlock:
@@ -1452,7 +1475,7 @@ func (idx *HBCIndex) insertIntoTree(
 	vectorID uint64,
 	inputVector vector.T,
 	existingLeafID uint64, // Optional existing leaf ID if known
-) error {
+) (inserted bool, err error) {
 	q := &queryVector{}
 	q.InitOriginal(idx.config.DistanceMetric, inputVector, idx.rot)
 	// Start from root and find the best leaf
@@ -1462,13 +1485,13 @@ func (idx *HBCIndex) insertIntoTree(
 	for {
 		nodeUnsafe, err := idx.loadNode(batch, cacheBatch, currentID)
 		if err != nil {
-			return fmt.Errorf("loading node %d: %w", currentID, err)
+			return false, fmt.Errorf("loading node %d: %w", currentID, err)
 		}
 		if nodeUnsafe.IsLeaf {
 			if existingLeafID != 0 {
 				if existingLeafID != nodeUnsafe.ID {
 					if err := idx.removeFromLeaf(batch, cacheBatch, meta, existingLeafID, vectorID); err != nil {
-						return fmt.Errorf(
+						return false, fmt.Errorf(
 							"removing existing vector %d from leaf %d: %w",
 							vectorID,
 							existingLeafID,
@@ -1477,7 +1500,7 @@ func (idx *HBCIndex) insertIntoTree(
 					}
 				} else {
 					// Already in the correct leaf, no need to re-insert
-					return nil
+					return false, nil
 				}
 			}
 			node := idx.nodePool.Get().(*HBCNode)
@@ -1502,15 +1525,15 @@ func (idx *HBCIndex) insertIntoTree(
 				idx.maybeNormalizeForMetric(node.Centroid)
 			}
 			if err := idx.saveNode(batch, cacheBatch, node, q.Transformed()); err != nil {
-				return fmt.Errorf("saving node: %w", err)
+				return false, fmt.Errorf("saving node: %w", err)
 			}
 			// Check if we need to split
 			if len(node.Members) > idx.config.LeafSize {
 				if err := idx.splitLeaf(batch, cacheBatch, meta, node); err != nil {
-					return fmt.Errorf("splitting leaf %d: %w", node.ID, err)
+					return false, fmt.Errorf("splitting leaf %d: %w", node.ID, err)
 				}
 			}
-			break
+			return true, nil
 		} else {
 			// Find closest child
 			minDist := float32(math.MaxFloat32)
@@ -1519,19 +1542,19 @@ func (idx *HBCIndex) insertIntoTree(
 			if idx.config.UseQuantization {
 				// Use quantized distance if available
 				if nodeUnsafe.QuantizedVectors == nil {
-					return fmt.Errorf("quantized vectors not found for node %d", nodeUnsafe.ID)
+					return false, fmt.Errorf("quantized vectors not found for node %d", nodeUnsafe.ID)
 				}
 				tempDists := idx.writerAllocator.AllocFloat32s(nodeUnsafe.QuantizedVectors.GetCount())
 				tempErrorBounds := idx.writerAllocator.AllocFloat32s(nodeUnsafe.QuantizedVectors.GetCount())
 				var quantizer quantize.Quantizer
 				if nodeUnsafe.Parent == 0 {
 					if _, ok := nodeUnsafe.QuantizedVectors.(*quantize.RaBitQuantizedVectorSet); ok {
-						return fmt.Errorf("expected non-quantized vector set for root node %d", nodeUnsafe.ID)
+						return false, fmt.Errorf("expected non-quantized vector set for root node %d", nodeUnsafe.ID)
 					}
 					quantizer = idx.rootQuantizer
 				} else {
 					if _, ok := nodeUnsafe.QuantizedVectors.(*quantize.NonQuantizedVectorSet); ok {
-						return fmt.Errorf("expected RaBitQuantizedVectorSet for non-root node %d", nodeUnsafe.ID)
+						return false, fmt.Errorf("expected RaBitQuantizedVectorSet for non-root node %d", nodeUnsafe.ID)
 					}
 					quantizer = idx.quantizer
 				}
@@ -1600,12 +1623,12 @@ func (idx *HBCIndex) insertIntoTree(
 					vecKey := makeHBCCentroidKey(idx.prefix, childID)
 					vecData, closer, err := batch.Get(vecKey)
 					if err != nil {
-						return fmt.Errorf("loading vector %d: %w", childID, err)
+						return false, fmt.Errorf("loading vector %d: %w", childID, err)
 					}
 					var childCentroid vector.T
 					_, childCentroid, err = vector.Decode(vecData)
 					if err != nil {
-						return fmt.Errorf("decoding centroid vector %d: %w", childID, err)
+						return false, fmt.Errorf("decoding centroid vector %d: %w", childID, err)
 					}
 					_ = closer.Close()
 					dist := vector.MeasureDistance(idx.config.DistanceMetric, q.Transformed(), childCentroid)
@@ -1618,14 +1641,12 @@ func (idx *HBCIndex) insertIntoTree(
 			}
 
 			if closestChild == 0 {
-				return errors.New("no valid child found")
+				return false, errors.New("no valid child found")
 			}
 
 			currentID = closestChild
 		}
 	}
-
-	return nil
 }
 
 // splitLeaf splits a leaf node that has exceeded capacity
@@ -3273,21 +3294,78 @@ func (idx *HBCIndex) serializeQuantizedSet(qs quantize.QuantizedVectorSet) []byt
 }
 
 // deserializeQuantizedSet deserializes a quantized vector set from storage
-func (idx *HBCIndex) deserializeQuantizedSet(data []byte, isRoot bool) quantize.QuantizedVectorSet {
+func (idx *HBCIndex) deserializeQuantizedSet(
+	data []byte, isRoot bool, expectedCount int,
+) (quantize.QuantizedVectorSet, error) {
 	if idx.config.UseQuantization && !isRoot {
 		// Deserialize RaBitQuantizedVectorSet
 		r := &quantize.RaBitQuantizedVectorSet{}
 		if err := proto.Unmarshal(data, r); err != nil {
-			panic(fmt.Errorf("decoding quantized set: %w", err))
+			return nil, fmt.Errorf("decoding quantized set: %w", err)
 		}
-		return r
+		if err := idx.validateRaBitQuantizedSet(r, expectedCount); err != nil {
+			return nil, err
+		}
+		return r, nil
 	} else {
 		r := &quantize.NonQuantizedVectorSet{}
 		if err := proto.Unmarshal(data, r); err != nil {
-			panic(fmt.Errorf("decoding quantized set: %w", err))
+			return nil, fmt.Errorf("decoding quantized set: %w", err)
 		}
-		return r
+		return r, nil
 	}
+}
+
+func (idx *HBCIndex) validateRaBitQuantizedSet(
+	qs *quantize.RaBitQuantizedVectorSet, expectedCount int,
+) error {
+	if qs.GetMetric() != idx.config.DistanceMetric {
+		return fmt.Errorf("quantized set distance metric mismatch: expected %s, got %s",
+			idx.config.DistanceMetric, qs.GetMetric())
+	}
+	if len(qs.GetCentroid()) != int(idx.config.Dimension) {
+		return fmt.Errorf("quantized set centroid dimension mismatch: expected %d, got %d",
+			idx.config.Dimension, len(qs.GetCentroid()))
+	}
+
+	codes := qs.GetCodes()
+	if codes == nil {
+		return errors.New("quantized set is missing codes")
+	}
+	expectedWidth := quantize.RaBitQCodeSetWidth(int(idx.config.Dimension))
+	if int(codes.GetWidth()) != expectedWidth {
+		return fmt.Errorf("quantized set code width mismatch: expected %d, got %d",
+			expectedWidth, codes.GetWidth())
+	}
+	if int(codes.GetCount()) != expectedCount {
+		return fmt.Errorf("quantized set code count mismatch: expected %d, got %d",
+			expectedCount, codes.GetCount())
+	}
+	if len(codes.GetData()) != expectedCount*expectedWidth {
+		return fmt.Errorf("quantized set code data length mismatch: expected %d, got %d",
+			expectedCount*expectedWidth, len(codes.GetData()))
+	}
+	if len(qs.GetCodeCounts()) != expectedCount {
+		return fmt.Errorf("quantized set code_counts length mismatch: expected %d, got %d",
+			expectedCount, len(qs.GetCodeCounts()))
+	}
+	if len(qs.GetCentroidDistances()) != expectedCount {
+		return fmt.Errorf(
+			"quantized set centroid_distances length mismatch: expected %d, got %d",
+			expectedCount, len(qs.GetCentroidDistances()))
+	}
+	if len(qs.GetQuantizedDotProducts()) != expectedCount {
+		return fmt.Errorf(
+			"quantized set quantized_dot_products length mismatch: expected %d, got %d",
+			expectedCount, len(qs.GetQuantizedDotProducts()))
+	}
+	if idx.config.DistanceMetric != vector.DistanceMetric_L2Squared &&
+		len(qs.GetCentroidDotProducts()) != expectedCount {
+		return fmt.Errorf(
+			"quantized set centroid_dot_products length mismatch: expected %d, got %d",
+			expectedCount, len(qs.GetCentroidDotProducts()))
+	}
+	return nil
 }
 
 // Close closes the index and releases resources

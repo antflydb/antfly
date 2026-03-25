@@ -266,6 +266,9 @@ func (q *RaBitQuantizer) EstimateDistances(
 	}
 
 	raBitSet := quantizedSet.(*RaBitQuantizedVectorSet)
+	if raBitSet.GetCount() == 0 {
+		return
+	}
 
 	// Allocate temp space for calculations.
 	tempCodes := allocRaBitQCodes(w, 4, int(raBitSet.GetCodes().GetWidth()))
