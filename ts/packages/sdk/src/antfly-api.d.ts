@@ -5803,13 +5803,15 @@ export interface components {
          *
          *     **Importing Pre-computed Embeddings:**
          *
-         *     You can import existing embeddings (from OpenAI, Cohere, or any provider) by including
-         *     them directly in your documents using the `_embeddings` field. This bypasses the
-         *     embedding generation step and writes vectors directly to the index.
+         *     You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
+         *     for indexes configured with `external: true`. External indexes accept vectors written
+         *     directly through the document `_embeddings` field and do not generate prompts from
+         *     `field` or `template`.
          *
          *     **Steps:**
-         *     1. Create the index first with the appropriate dimension
-         *     2. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+         *     1. Create an embeddings index with `external: true`
+         *     2. For dense indexes, set the index `dimension`
+         *     3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
          *
          *     **Example:**
          *     ```json
@@ -5821,6 +5823,10 @@ export interface components {
          *       }
          *     }
          *     ```
+         *
+         *     **Delete Behavior:**
+         *     - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
+         *     - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
          *
          *     **Use Cases:**
          *     - Migrating from another vector database with existing embeddings
@@ -5996,23 +6002,23 @@ export interface components {
              * @default false
              */
             sparse?: boolean;
-            /** @description Vector dimension for dense indexes. Can be omitted when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
+            /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
-            /** @description Field to extract embeddings from */
+            /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
             /**
-             * @description Handlebars template for generating prompts. See https://handlebarsjs.com/guide/ for more information.
+             * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
              * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
              */
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
-            /** @description Configuration for the embeddings plugin */
+            /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
             embedder?: components["schemas"]["EmbedderConfig"];
-            /** @description Configuration for the summarizer plugin (dense only) */
+            /** @description Configuration for the summarizer plugin (dense managed indexes only) */
             summarizer?: components["schemas"]["GeneratorConfig"];
-            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense only) */
+            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only) */
             chunker?: components["schemas"]["ChunkerConfig"];
             /**
              * @description Default number of results to return from search (sparse only)

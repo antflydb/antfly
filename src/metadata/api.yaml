@@ -706,7 +706,7 @@ tags:
       {
         "type": "embeddings",
         "name": "embedding_idx",
-        "dimension": 384,
+        "field": "description",
         "embedder": {
           "provider": "ollama",
           "model": "all-minilm",
@@ -715,15 +715,59 @@ tags:
       }
       ```
 
-      **Required Fields**:
-      - `embedder`: Embedder configuration for generating vectors
+      **Index Modes**:
 
-      **Optional Fields**:
-      - `dimension`: Vector dimension (inferred from embedder if not specified)
+      **Managed indexes** (`external: false`, default)
+      - Antfly owns embedding generation
+      - Must specify `field` or `template`
+      - Must specify `embedder`
+      - Reject manual `_embeddings` writes for that index
+
+      **External indexes** (`external: true`)
+      - Your application owns embedding generation
+      - Must not specify `field`, `template`, or `embedder`
+      - Dense external indexes must specify `dimension`
+      - Vectors are written directly through the document `_embeddings` field
+
+      **Managed Index Fields**:
       - `field`: Field to embed using JSONPath syntax (e.g., `"description"`, `"metadata.content"`, `"$.user.bio"`)
       - `template`: Handlebars template for custom prompt generation
+      - `embedder`: Embedder configuration for generating vectors
+      - `dimension`: Optional for dense indexes; inferred from the embedder if omitted
       - `summarizer`: Vision/multimodal model for processing images/audio/video
       - `mem_only`: Store index in memory only
+
+      **External Index Fields**:
+      - `external: true`
+      - `dimension`: Required for dense indexes
+      - `sparse: true`: Use sparse vectors supplied through `_embeddings`
+
+      **External Dense Example**:
+      ```json
+      {
+        "type": "embeddings",
+        "name": "manual_dense_idx",
+        "external": true,
+        "dimension": 384
+      }
+      ```
+
+      **External Sparse Example**:
+      ```json
+      {
+        "type": "embeddings",
+        "name": "manual_sparse_idx",
+        "external": true,
+        "sparse": true
+      }
+      ```
+
+      **Writing Manual Embeddings**:
+      - Manual `_embeddings` writes are only accepted for `external: true` indexes
+      - Dense vectors use arrays: `"_embeddings": { "manual_dense_idx": [0.1, 0.2, 0.3] }`
+      - Sparse vectors use token-weight maps: `"_embeddings": { "manual_sparse_idx": { "7": 1.5, "42": 2.0 } }`
+      - Explicit delete uses `null`: `"_embeddings": { "manual_dense_idx": null }`
+      - Omitting `_embeddings[<index>]` is a no-op; it does not delete the stored vector
 
       ## Embedder Providers
 
