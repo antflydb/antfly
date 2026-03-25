@@ -128,8 +128,11 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Preserve raw JSON to avoid re-serialization when passing to shards
+		rq.FilterQueryRaw = q.FilterQuery
 	}
-	if len(q.ExclusionQuery) > 0 && !bytes.Equal(q.ExclusionQuery, []byte("null")) {
+	hasExclusion := len(q.ExclusionQuery) > 0 && !bytes.Equal(q.ExclusionQuery, []byte("null"))
+	if hasExclusion {
 		rq.ExclusionQuery, err = query.ParseQuery(q.ExclusionQuery)
 		if err != nil {
 			return nil, err

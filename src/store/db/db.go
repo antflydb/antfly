@@ -4005,7 +4005,10 @@ func (s *DBImpl) Search(ctx context.Context, encodedReqest []byte) (resp []byte,
 				if !ok {
 					return nil, fmt.Errorf("unexpected response type from vector search: %T", resp)
 				}
-				result.Request = req
+				// result.Request has already been consumed by mergeVectorResults
+				// for K-limiting; nil it to avoid echoing the query embedding
+				// back in the response (the metadata node never reads it).
+				result.Request = nil
 				s.logger.Debug(
 					"Searched vectorindex with query",
 					zap.String("index", indexToSearch),

@@ -16,6 +16,8 @@ package vector
 
 import (
 	"cmp"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -23,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/ajroetker/go-highway/hwy/contrib/vec"
 	"github.com/antflydb/antfly/lib/encoding"
@@ -36,6 +39,96 @@ const MaxDim = 16000
 var ErrMaxDimExceeded = fmt.Errorf("vector cannot have more than %d dimensions", MaxDim)
 
 type T []float32
+
+// MarshalJSON encodes the vector as a base64 string of raw little-endian float32 bytes.
+// This is ~4x more compact than the default JSON array of decimal numbers.
+func (v T) MarshalJSON() ([]byte, error) {
+	if v == nil {
+		return []byte("null"), nil
+	}
+	if len(v) == 0 {
+		return []byte(`""`), nil
+	}
+	raw := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(v))), len(v)*4)
+	if !isLittleEndian() {
+		raw = make([]byte, len(v)*4)
+		for i, f := range v {
+			binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(f))
+		}
+	}
+	// Single allocation: quote + base64 + quote. Encode directly into buffer.
+	n := base64.StdEncoding.EncodedLen(len(raw))
+	buf := make([]byte, n+2)
+	buf[0] = '"'
+	base64.StdEncoding.Encode(buf[1:1+n], raw)
+	buf[n+1] = '"'
+	return buf, nil
+}
+
+// UnmarshalJSON decodes a vector from either a base64 string (binary format)
+// or a JSON array of numbers (legacy format) for backward compatibility.
+func (v *T) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		*v = nil
+		return nil
+	}
+	// Base64 string format: "aGVsbG8..."
+	if data[0] == '"' {
+		if len(data) < 2 || data[len(data)-1] != '"' {
+			return errors.New("invalid JSON string for vector")
+		}
+		src := data[1 : len(data)-1]
+		maxLen := base64.StdEncoding.DecodedLen(len(src))
+		// Allocate float32 slice at max possible size, decode directly into its
+		// backing bytes, then trim. This avoids an intermediate []byte allocation
+		// on little-endian systems.
+		maxFloats := (maxLen + 3) / 4 // round up to cover DecodedLen overestimate
+		result := make(T, maxFloats)
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(result))), maxFloats*4)
+		n, err := base64.StdEncoding.Decode(dst, src)
+		if err != nil {
+			return fmt.Errorf("decoding base64 vector: %w", err)
+		}
+		if n%4 != 0 {
+			return fmt.Errorf("invalid vector byte length: %d (must be multiple of 4)", n)
+		}
+		result = result[:n/4]
+		if !isLittleEndian() {
+			for i := range result {
+				result[i] = math.Float32frombits(binary.LittleEndian.Uint32(dst[i*4:]))
+			}
+		}
+		*v = result
+		return nil
+	}
+	// Legacy JSON array format: [0.1, 0.2, 0.3]
+	if data[0] == '[' {
+		// Manually parse to avoid infinite recursion
+		s := strings.TrimSpace(string(data))
+		s = s[1 : len(s)-1] // strip brackets
+		if strings.TrimSpace(s) == "" {
+			*v = T{}
+			return nil
+		}
+		parts := strings.Split(s, ",")
+		result := make(T, len(parts))
+		for i, p := range parts {
+			f, err := strconv.ParseFloat(strings.TrimSpace(p), 32)
+			if err != nil {
+				return fmt.Errorf("parsing vector element %d: %w", i, err)
+			}
+			result[i] = float32(f)
+		}
+		*v = result
+		return nil
+	}
+	return fmt.Errorf("unexpected JSON type for vector: %c", data[0])
+}
+
+func isLittleEndian() bool {
+	var x uint16 = 0x0102
+	return *(*byte)(unsafe.Pointer(&x)) == 0x02
+}
 
 // FromString parses the string representation of a vector.
 //

@@ -355,7 +355,7 @@ func (s *StoreDB) preEnrichBatch(
 	// 3. Combine all writes
 	allWrites := make([]*Write, 0, len(writes)+len(embWrites)+len(sumWrites)+len(edgeWrites)+len(generatedWrites))
 	allWrites = append(allWrites, writes...)
-	allDeletes := append(batch.GetDeletes(), edgeDeletes...)
+	allDeletes := append(batch.GetDeletes(), indexDeletes...)
 
 	// Add extracted enrichments
 	for _, w := range embWrites {

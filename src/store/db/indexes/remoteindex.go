@@ -1393,6 +1393,10 @@ type Query struct {
 	FilterQuery    query.Query `json:"filter_query,omitempty"`    // Query for filtering
 	ExclusionQuery query.Query `json:"exclusion_query,omitempty"` // Query for exclusion
 
+	// Raw JSON of FilterQuery, preserved from the API request to avoid
+	// re-serialization when passing to shards.
+	FilterQueryRaw json.RawMessage `json:"-"`
+
 	// Full text search
 	OrderBy             []SortField         `json:"order_by,omitempty"`
 	Offset              int                 `json:"offset,omitempty,omitzero"`
@@ -1526,24 +1530,40 @@ func (q *Query) RemoteIndexSearchRequest() (*RemoteIndexSearchRequest, error) {
 			return nil, errors.New("offset is not supported with vector searches")
 		}
 	}
+	// Build the combined filter query for the wire format.
+	// When possible, use preserved raw JSON bytes to avoid re-serialization.
 	var filterQuery query.Query
+	var fqBytes json.RawMessage
 	if q.FilterQuery != nil && q.ExclusionQuery != nil {
+		// Must compose a new boolean query — need to marshal
 		filterQuery = query.NewBooleanQuery([]query.Query{
 			q.FilterQuery,
 		}, nil /* should */, []query.Query{
 			q.ExclusionQuery,
 		})
-	} else if q.FilterQuery != nil {
-		filterQuery = q.FilterQuery
-	} else if q.ExclusionQuery != nil {
-		filterQuery = query.NewBooleanQuery(nil /* must */, nil /* should */, []query.Query{q.ExclusionQuery})
-	}
-	var fqBytes json.RawMessage
-	if filterQuery != nil {
 		var err error
 		fqBytes, err = json.Marshal(filterQuery)
 		if err != nil {
 			return nil, fmt.Errorf("marshalling filter query: %w", err)
+		}
+	} else if q.FilterQuery != nil {
+		filterQuery = q.FilterQuery
+		if len(q.FilterQueryRaw) > 0 {
+			fqBytes = q.FilterQueryRaw // pass through original bytes
+		} else {
+			var err error
+			fqBytes, err = json.Marshal(filterQuery)
+			if err != nil {
+				return nil, fmt.Errorf("marshalling filter query: %w", err)
+			}
+		}
+	} else if q.ExclusionQuery != nil {
+		// Must wrap in boolean query — always needs marshaling
+		filterQuery = query.NewBooleanQuery(nil /* must */, nil /* should */, []query.Query{q.ExclusionQuery})
+		var err error
+		fqBytes, err = json.Marshal(filterQuery)
+		if err != nil {
+			return nil, fmt.Errorf("marshalling exclusion query: %w", err)
 		}
 	}
 	risr := &RemoteIndexSearchRequest{
