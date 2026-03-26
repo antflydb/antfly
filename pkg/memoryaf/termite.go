@@ -86,30 +86,40 @@ func (c *NERClient) setAvailable(v bool) {
 	c.mu.Unlock()
 }
 
-// RecognizeEntities calls Termite GLiNER2 to extract named entities.
-// Returns empty slice if Termite is unavailable (graceful degradation).
-func (c *NERClient) RecognizeEntities(ctx context.Context, text string) []Entity {
+// Extract implements the Extractor interface using Termite GLiNER2.
+// Returns empty extractions if Termite is unavailable (graceful degradation).
+func (c *NERClient) Extract(ctx context.Context, texts []string, opts ExtractOptions) ([]Extraction, error) {
 	if !c.isAvailable(ctx) {
-		return nil
+		out := make([]Extraction, len(texts))
+		return out, nil
 	}
 
-	resp, err := c.client.Recognize(ctx, c.nerModel, []string{text}, c.nerLabels)
+	labels := opts.EntityLabels
+	if len(labels) == 0 {
+		labels = c.nerLabels
+	}
+
+	resp, err := c.client.Recognize(ctx, c.nerModel, texts, labels)
 	if err != nil {
 		c.logger.Warn("Termite NER request failed", zap.Error(err))
-		return nil
+		out := make([]Extraction, len(texts))
+		return out, nil
 	}
 
-	if len(resp.Entities) == 0 || len(resp.Entities[0]) == 0 {
-		return nil
+	results := make([]Extraction, len(texts))
+	for i, textEntities := range resp.Entities {
+		if i >= len(texts) {
+			break
+		}
+		entities := make([]ExtractedEntity, 0, len(textEntities))
+		for _, e := range textEntities {
+			entities = append(entities, ExtractedEntity{
+				Text:  e.Text,
+				Label: e.Label,
+				Score: e.Score,
+			})
+		}
+		results[i] = Extraction{Entities: entities}
 	}
-
-	entities := make([]Entity, 0, len(resp.Entities[0]))
-	for _, e := range resp.Entities[0] {
-		entities = append(entities, Entity{
-			Text:  e.Text,
-			Label: e.Label,
-			Score: float64(e.Score),
-		})
-	}
-	return entities
+	return results, nil
 }

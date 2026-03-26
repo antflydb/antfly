@@ -9,8 +9,6 @@ import (
 	"sync"
 	"time"
 
-
-
 	"github.com/antflydb/antfly/pkg/client"
 	"github.com/antflydb/antfly/pkg/client/query"
 	"github.com/google/uuid"
@@ -31,26 +29,50 @@ const (
 
 // Handler implements all memoryaf operations against an Antfly instance.
 type Handler struct {
-	client  Client
-	ner     *NERClient
-	logger  *zap.Logger
+	client    Client
+	extractor Extractor
+	logger    *zap.Logger
+
+	entityLabels    []string
+	entityThreshold float32
 
 	mu                    sync.RWMutex
 	initializedNamespaces map[string]bool
 }
 
+// HandlerOption configures a Handler.
+type HandlerOption func(*Handler)
+
+// WithEntityLabels sets the NER labels used for entity extraction.
+func WithEntityLabels(labels []string) HandlerOption {
+	return func(h *Handler) { h.entityLabels = append([]string(nil), labels...) }
+}
+
+// WithEntityThreshold sets the minimum entity score to keep (default 0.5).
+func WithEntityThreshold(threshold float32) HandlerOption {
+	return func(h *Handler) { h.entityThreshold = threshold }
+}
+
 // NewHandler creates a new memory handler.
+// The extractor can be nil to disable entity extraction.
 func NewHandler(
 	client Client,
-	ner *NERClient,
+	extractor Extractor,
 	logger *zap.Logger,
+	opts ...HandlerOption,
 ) *Handler {
-	return &Handler{
+	h := &Handler{
 		client:                client,
-		ner:                   ner,
+		extractor:             extractor,
 		logger:                logger,
+		entityLabels:          defaultNERLabels,
+		entityThreshold:       0.5,
 		initializedNamespaces: make(map[string]bool),
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // ValidateNamespace checks that a namespace is safe for use in table names.
@@ -478,8 +500,8 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 		reqMap["filter_query"] = json.RawMessage(mustMarshal(filter))
 	}
 
-	if args.ExpandGraph {
-		queryEntities := h.ner.RecognizeEntities(ctx, args.Query)
+	if args.ExpandGraph && h.extractor != nil {
+		queryEntities := h.extractEntities(ctx, args.Query)
 		if len(queryEntities) > 0 {
 			var entityKeys []string
 			for _, e := range queryEntities {
@@ -721,16 +743,58 @@ func (h *Handler) GetStats(ctx context.Context, args MemoryStatsArgs, uctx UserC
 
 // --- Entity extraction and graph linking ---
 
+// extractEntities runs the extractor on a single text and returns filtered entities.
+func (h *Handler) extractEntities(ctx context.Context, text string) []Entity {
+	if h.extractor == nil {
+		return nil
+	}
+	extractions, err := h.extractor.Extract(ctx, []string{text}, ExtractOptions{
+		EntityLabels: h.entityLabels,
+	})
+	if err != nil {
+		h.logger.Warn("entity extraction failed", zap.Error(err))
+		return nil
+	}
+	if len(extractions) == 0 || len(extractions[0].Entities) == 0 {
+		return nil
+	}
+	var entities []Entity
+	for _, e := range extractions[0].Entities {
+		if e.Score >= h.entityThreshold {
+			entities = append(entities, Entity{
+				Text:  e.Text,
+				Label: e.Label,
+				Score: float64(e.Score),
+			})
+		}
+	}
+	return entities
+}
+
 func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content, namespace string) []Entity {
-	entities := h.ner.RecognizeEntities(ctx, content)
-	if len(entities) == 0 {
+	if h.extractor == nil {
+		return nil
+	}
+
+	extractions, err := h.extractor.Extract(ctx, []string{content}, ExtractOptions{
+		EntityLabels: h.entityLabels,
+	})
+	if err != nil {
+		h.logger.Warn("entity extraction failed", zap.Error(err))
+		return nil
+	}
+	if len(extractions) == 0 || len(extractions[0].Entities) == 0 {
 		return nil
 	}
 
 	var filtered []Entity
-	for _, e := range entities {
-		if e.Score >= 0.5 {
-			filtered = append(filtered, e)
+	for _, e := range extractions[0].Entities {
+		if e.Score >= h.entityThreshold {
+			filtered = append(filtered, Entity{
+				Text:  e.Text,
+				Label: e.Label,
+				Score: float64(e.Score),
+			})
 		}
 	}
 	if len(filtered) == 0 {

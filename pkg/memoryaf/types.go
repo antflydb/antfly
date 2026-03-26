@@ -1,5 +1,7 @@
 package memoryaf
 
+import "context"
+
 const (
 	MemoryTypeEpisodic   = "episodic"
 	MemoryTypeSemantic   = "semantic"
@@ -44,6 +46,29 @@ type Entity struct {
 	Text  string  `json:"text"`
 	Label string  `json:"label"`
 	Score float64 `json:"score"`
+}
+
+// ExtractedEntity is a single entity returned by an Extractor.
+type ExtractedEntity struct {
+	Text  string
+	Label string
+	Score float32
+}
+
+// Extraction contains the entities extracted from one input text.
+type Extraction struct {
+	Entities []ExtractedEntity
+}
+
+// ExtractOptions configures an Extractor request.
+type ExtractOptions struct {
+	EntityLabels []string
+}
+
+// Extractor extracts entities from a batch of texts.
+// Implementations may use GLiNER2 (via Termite), tool-calling LLMs, or any other backend.
+type Extractor interface {
+	Extract(ctx context.Context, texts []string, opts ExtractOptions) ([]Extraction, error)
 }
 
 // EntityNode is a graph node representing a named entity.
