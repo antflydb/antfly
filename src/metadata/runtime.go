@@ -25,6 +25,7 @@ import (
 
 	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/middleware"
+	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/multirafthttp/transport"
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
@@ -204,8 +205,12 @@ func NewRuntime(
 // and the StoreClientFactory returns a LocalStoreClient.
 // Call after both metadata and store runtimes are created in swarm mode.
 func (r *Runtime) SetLocalStore(nodeID types.ID, s store.StoreIface) {
-	ss := indexes.ShardSearcher(&storeShardSearcher{store: s})
-	r.node.shardSearcher.Store(&ss)
+	searcher := indexes.ShardSearcher(&storeShardSearcher{store: s})
+	factory := indexes.ShardIndexFactory(func(tableSchema *schema.TableSchema, shardIDs []types.ID, peers map[types.ID][]string) (indexes.ShardIndexes, error) {
+		return indexes.MakeLocalIndexesForShards(searcher, tableSchema, shardIDs), nil
+	})
+	r.node.makeIndexes.Store(&factory)
+
 	r.tableManager.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) storeclient.StoreRPC {
 		return storeclient.NewLocalStoreClient(id, s)
 	})

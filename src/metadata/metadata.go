@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/lib/clock"
+	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
@@ -71,23 +72,19 @@ type MetadataStore struct {
 
 	txnIDGenerator func() uuid.UUID
 
-	// shardSearcher enables in-process shard search, bypassing HTTP.
-	// Set once at startup in swarm mode via Runtime.SetLocalStore;
-	// read concurrently by query handlers, hence atomic.
-	shardSearcher atomic.Pointer[indexes.ShardSearcher]
+	// makeIndexes builds ShardIndexes for a given schema and set of shards.
+	// Defaults to MakeRemoteIndexesForShards; swarm mode replaces it with
+	// MakeLocalIndexesForShards via Runtime.SetLocalStore.
+	makeIndexes atomic.Pointer[indexes.ShardIndexFactory]
 }
 
-// SwarmMode reports whether this node is running in single-node swarm mode.
-func (ms *MetadataStore) SwarmMode() bool {
-	return ms.config != nil && ms.config.SwarmMode
-}
-
-// localSearcher returns the in-process ShardSearcher if configured (swarm mode), or nil.
-func (ms *MetadataStore) localSearcher() indexes.ShardSearcher {
-	if p := ms.shardSearcher.Load(); p != nil {
-		return *p
+// getIndexes builds base ShardIndexes using the factory configured at startup.
+func (ms *MetadataStore) getIndexes(tableSchema *schema.TableSchema, shardIDs []types.ID, peers map[types.ID][]string) (indexes.ShardIndexes, error) {
+	if f := ms.makeIndexes.Load(); f != nil {
+		return (*f)(tableSchema, shardIDs, peers)
 	}
-	return nil
+	// Default to remote before SetLocalStore is called.
+	return indexes.MakeRemoteIndexesForShards(ms.tm.HttpClient(), tableSchema, shardIDs, peers)
 }
 
 func (ms *MetadataStore) clockOrReal() clock.Clock {

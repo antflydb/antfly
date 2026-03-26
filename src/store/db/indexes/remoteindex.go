@@ -66,6 +66,10 @@ type ShardIndex interface {
 // ShardIndexes is a collection of ShardIndex, one per shard.
 type ShardIndexes []ShardIndex
 
+// ShardIndexFactory builds base ShardIndexes (without FieldFilter) for the
+// given schema and shards. Set once at startup based on deployment mode.
+type ShardIndexFactory func(tableSchema *schema.TableSchema, shardIDs []types.ID, peers map[types.ID][]string) (ShardIndexes, error)
+
 // ShardSearcher provides direct (in-process) shard search, bypassing HTTP.
 // Implemented by a thin adapter over store.StoreIface in swarm mode.
 type ShardSearcher interface {
@@ -504,15 +508,18 @@ func MakeLocalIndexesForShards(
 // MakeRemoteIndexesForShards creates RemoteIndex objects for each shard without
 // a per-query FieldFilter. The returned indexes can be reused across queries
 // by calling WithFieldFilter to set query-specific field projections.
+// shardIDs controls iteration order; peers provides the URLs for each shard.
 func MakeRemoteIndexesForShards(
 	client *http.Client,
 	tableSchema *schema.TableSchema,
+	shardIDs []types.ID,
 	peers map[types.ID][]string,
 ) (ShardIndexes, error) {
 	idxMapping := schema.NewIndexMapFromSchema(tableSchema)
-	indexes := make(ShardIndexes, 0, len(peers))
+	indexes := make(ShardIndexes, 0, len(shardIDs))
 
-	for shardID, peerURLs := range peers {
+	for _, shardID := range shardIDs {
+		peerURLs := peers[shardID]
 		if len(peerURLs) == 0 {
 			return nil, fmt.Errorf("no peer URLs found for shard %s", shardID)
 		}

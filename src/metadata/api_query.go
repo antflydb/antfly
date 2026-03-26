@@ -352,18 +352,6 @@ func fieldFilterForQuery(q *indexes.Query, queryReq *QueryRequest) *indexes.Fiel
 	}
 }
 
-// buildBaseIndexes creates ShardIndexes for the given schema and shards,
-// using local in-process search in swarm mode or HTTP in cluster mode.
-func (t *TableApi) buildBaseIndexes(
-	tableSchema *schema.TableSchema,
-	shardIDs []types.ID,
-	peers map[types.ID][]string,
-) (indexes.ShardIndexes, error) {
-	if t.ln.SwarmMode() {
-		return indexes.MakeLocalIndexesForShards(t.ln.localSearcher(), tableSchema, shardIDs), nil
-	}
-	return indexes.MakeRemoteIndexesForShards(t.tm.HttpClient(), tableSchema, peers)
-}
 
 // getOrCreateBaseIndexes returns cached base ShardIndexes for the given schema
 // and shard topology, creating them if the cache misses or topology changed.
@@ -410,7 +398,7 @@ func (t *TableApi) getOrCreateBaseIndexes(
 		t.baseIndexCache.Clear()
 	}
 
-	base, err := t.buildBaseIndexes(tableSchema, shardIDs, peers)
+	base, err := t.ln.getIndexes(tableSchema, shardIDs, peers)
 	if err != nil {
 		return nil, err
 	}
