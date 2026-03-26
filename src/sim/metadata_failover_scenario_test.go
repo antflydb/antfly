@@ -196,11 +196,18 @@ func TestHarness_MetadataLeaderFailover_DuringSplitReconciliation(t *testing.T) 
 	})
 	require.NoErrorf(t, err, "split reconciliation did not continue after metadata failover\n%s", h.Trace().CompactTrace(160, 20))
 
-	for _, key := range []string{keys[1], keys[len(keys)-2]} {
-		value, err := h.LookupKey("docs", key)
-		require.NoError(t, err)
-		require.NotEmpty(t, value)
-	}
+	require.NoError(t, h.WaitFor(30*time.Second, func() error {
+		for _, key := range []string{keys[1], keys[len(keys)-2]} {
+			value, err := h.LookupKey("docs", key)
+			if err != nil {
+				return fmt.Errorf("lookup %s: %w", key, err)
+			}
+			if len(value) == 0 {
+				return fmt.Errorf("key %s not yet readable after split", key)
+			}
+		}
+		return nil
+	}))
 
 	checker := NewChecker(CheckerConfig{SplitLivenessTimeout: 45 * time.Second})
 	require.NoError(t, h.WaitFor(15*time.Second, func() error {
