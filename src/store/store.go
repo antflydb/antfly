@@ -494,6 +494,11 @@ func (m *Store) Close() {
 	if err := m.db.Close(); err != nil {
 		m.logger.Warn("Error closing store metadata Pebble database", zap.Error(err))
 	}
+
+	// Cancel the store context to stop the ErrorC goroutine. This must happen
+	// after closing shards so in-flight errgroup work can complete cleanly.
+	m.egCancel()
+
 	m.logger.Info("Store closed", zap.String("storeID", m.config.ID.String()))
 }
 

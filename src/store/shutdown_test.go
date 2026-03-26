@@ -15,9 +15,12 @@
 package store
 
 import (
+	"context"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
@@ -74,6 +77,8 @@ func newTestStore(t *testing.T) *Store {
 	metaDB, err := pebble.Open(filepath.Join(tmpDir, "meta"), &pebble.Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = metaDB.Close() })
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	return &Store{
 		logger: zap.NewNop(),
 		antflyConfig: &common.Config{
@@ -83,10 +88,13 @@ func newTestStore(t *testing.T) *Store {
 				},
 			},
 		},
-		config:    &StoreInfo{ID: 1},
-		shardMu:   xsync.NewMap[types.ID, *sync.Mutex](),
-		shardsMap: xsync.NewMap[types.ID, *Shard](),
-		db:        metaDB,
+		config:     &StoreInfo{ID: 1},
+		shardMu:    xsync.NewMap[types.ID, *sync.Mutex](),
+		shardsMap:  xsync.NewMap[types.ID, *Shard](),
+		db:         metaDB,
+		egCancel:   cancel,
+		errorChanC: make(chan errorChanCItem, 1),
+		closingCh:  make(chan struct{}),
 	}
 }
 
@@ -131,4 +139,61 @@ func TestStopRaftGroup_ConcurrentStops(t *testing.T) {
 	for i, err := range errs {
 		assert.ErrorIs(t, err, ErrShardInitializing, "goroutine %d", i)
 	}
+}
+
+// TestStoreClose_ErrorCGoroutineStopped verifies that Store.Close cancels
+// the context used by the ErrorC goroutine, preventing goroutine leaks.
+// This was the root cause of an OOM kill in CI: sequential sim tests each
+// leaked the ErrorC goroutine (which uses reflect.Select), accumulating
+// resources until the runner was killed with a bare FAIL and no panic trace.
+func TestStoreClose_ErrorCGoroutineStopped(t *testing.T) {
+	tmpDir := t.TempDir()
+	metaDB, err := pebble.Open(filepath.Join(tmpDir, "meta"), &pebble.Options{})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Store{
+		logger: zap.NewNop(),
+		antflyConfig: &common.Config{
+			Storage: common.StorageConfig{
+				Local: common.LocalStorageConfig{
+					BaseDir: tmpDir,
+				},
+			},
+		},
+		config:     &StoreInfo{ID: 1},
+		shardMu:    xsync.NewMap[types.ID, *sync.Mutex](),
+		shardsMap:  xsync.NewMap[types.ID, *Shard](),
+		db:         metaDB,
+		egCancel:   cancel,
+		errorChanC: make(chan errorChanCItem, 1),
+		closingCh:  make(chan struct{}),
+	}
+
+	// Start the ErrorC goroutine — this is the goroutine that leaked before the fix.
+	errCh := s.ErrorC(ctx)
+
+	// Let the goroutine settle into its reflect.Select loop.
+	runtime.Gosched()
+
+	baseline := runtime.NumGoroutine()
+
+	// Close the store — this should cancel the context and stop ErrorC.
+	s.Close()
+
+	// Wait for the ErrorC goroutine to exit (channel close is the signal).
+	select {
+	case _, ok := <-errCh:
+		if ok {
+			t.Fatal("expected errCh to be closed, got a value")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ErrorC goroutine did not exit within 5 seconds after Store.Close")
+	}
+
+	// Verify goroutine count did not grow — the ErrorC goroutine should be gone.
+	runtime.Gosched()
+	after := runtime.NumGoroutine()
+	assert.LessOrEqual(t, after, baseline,
+		"goroutine count should not increase after Store.Close (before=%d after=%d)", baseline, after)
 }
