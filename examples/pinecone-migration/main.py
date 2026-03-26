@@ -133,7 +133,7 @@ def main():
     # ANCHOR_END: create_index
 
     # ANCHOR: fetch_vectors
-    def fetch_all_vectors(pc_index, namespace: str):
+    def fetch_all_vectors(pc_index, namespace: str, dim: int):
         """
         Fetch all vectors from a Pinecone namespace.
 
@@ -141,9 +141,6 @@ def main():
         since Pinecone doesn't have a direct "list all" API.
         """
         print(f"Fetching vectors from namespace: '{namespace}'...")
-
-        stats = pc_index.describe_index_stats()
-        dim = stats['dimension']
 
         # Query with zero vector to get all vectors
         query_response = pc_index.query(
@@ -164,7 +161,7 @@ def main():
     # Fetch from all namespaces
     all_vectors = {}
     for namespace in namespaces:
-        vectors = fetch_all_vectors(pinecone_index, namespace)
+        vectors = fetch_all_vectors(pinecone_index, namespace, dimension)
 
         if not vectors:
             continue

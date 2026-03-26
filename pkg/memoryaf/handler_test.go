@@ -193,8 +193,15 @@ func TestStoreMemory_WithExtractor(t *testing.T) {
 		t.Error("expected non-empty ID")
 	}
 
-	// Entity extraction runs async, so we can't deterministically check
-	// the batch count here. Just verify the store itself succeeded.
+	// Wait for async entity extraction to complete.
+	h.Close()
+
+	mc.mu.Lock()
+	// 1 batch for the memory insert + 2 for entity extraction (nodes + edges).
+	if len(mc.batches) != 3 {
+		t.Errorf("expected 3 batches (insert + entity nodes + edges), got %d", len(mc.batches))
+	}
+	mc.mu.Unlock()
 }
 
 func TestGetMemory(t *testing.T) {

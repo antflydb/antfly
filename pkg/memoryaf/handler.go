@@ -38,6 +38,8 @@ type Handler struct {
 
 	mu                    sync.RWMutex
 	initializedNamespaces map[string]bool
+
+	wg sync.WaitGroup
 }
 
 // HandlerOption configures a Handler.
@@ -51,6 +53,11 @@ func WithEntityLabels(labels []string) HandlerOption {
 // WithEntityThreshold sets the minimum entity score to keep (default 0.5).
 func WithEntityThreshold(threshold float32) HandlerOption {
 	return func(h *Handler) { h.entityThreshold = threshold }
+}
+
+// Close waits for all background entity extraction goroutines to finish.
+func (h *Handler) Close() {
+	h.wg.Wait()
 }
 
 // NewHandler creates a new memory handler.
@@ -325,7 +332,11 @@ func (h *Handler) StoreMemory(ctx context.Context, args StoreMemoryArgs, uctx Us
 	}
 
 	// Extract entities and link graph edges in the background.
-	go h.extractAndLinkEntities(context.WithoutCancel(ctx), id, args.Content, uctx.Namespace)
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.extractAndLinkEntities(context.WithoutCancel(ctx), id, args.Content, uctx.Namespace)
+	}()
 
 	m := hitToMemory(key, doc)
 	return &m, nil
@@ -391,7 +402,11 @@ func (h *Handler) UpdateMemory(ctx context.Context, args UpdateMemoryArgs, uctx 
 
 	// Re-extract entities in the background if content changed.
 	if args.Content != "" && args.Content != existing.Content {
-		go h.extractAndLinkEntities(context.WithoutCancel(ctx), args.ID, args.Content, uctx.Namespace)
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			h.extractAndLinkEntities(context.WithoutCancel(ctx), args.ID, args.Content, uctx.Namespace)
+		}()
 	}
 
 	m := hitToMemory(key, updated)
@@ -815,8 +830,6 @@ func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content,
 			"entity_type": entityDocType,
 			"text":        entity.Text,
 			"label":       entity.Label,
-			"first_seen":  now,
-			"last_seen":   now,
 		}
 		edgesByType["mentions"] = append(edgesByType["mentions"], map[string]any{
 			"target": eKey,
@@ -826,6 +839,7 @@ func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content,
 			Key: eKey,
 			Operations: []client.TransformOp{
 				{Op: client.TransformOpTypeInc, Path: "$.mention_count", Value: 1},
+				{Op: client.TransformOpTypeMin, Path: "$.first_seen", Value: now},
 				{Op: client.TransformOpTypeSet, Path: "$.last_seen", Value: now},
 			},
 		})
