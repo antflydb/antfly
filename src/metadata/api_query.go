@@ -175,6 +175,7 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 	rq.FilterPrefix = q.FilterPrefix
 	rq.DistanceUnder = q.DistanceUnder
 	rq.DistanceOver = q.DistanceOver
+	rq.SearchEffort = q.SearchEffort
 	rq.OrderBy = q.OrderBy
 	rq.SearchAfter = q.SearchAfter
 	rq.SearchBefore = q.SearchBefore

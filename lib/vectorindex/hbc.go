@@ -2641,6 +2641,13 @@ func (idx *HBCIndex) Search(req *SearchRequest) (r []*Result, err error) {
 	})
 	rerankPolicy := idx.resolveRerankPolicy(req)
 	populateApproxSearchDebug(req.Debug, finalResults, req.K, req.DistanceOver, req.DistanceUnder, rerankPolicy)
+	if req.Debug != nil {
+		req.Debug.ResolvedSearchWidth = searchWidth
+		req.Debug.ResolvedEpsilon2 = epsilon2
+		req.Debug.NodesExplored = nodesExplored
+		req.Debug.LeavesExplored = leavesExplored
+		req.Debug.StoppedBySearchWidth = candidates.Len() > 0 && leavesExplored >= searchWidth
+	}
 	exactRerank := rerankPolicy == RerankPolicyAlways
 	rerankCandidates := []int(nil)
 	switch rerankPolicy {

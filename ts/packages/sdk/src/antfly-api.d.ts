@@ -2678,6 +2678,20 @@ export interface components {
                 [key: string]: components["schemas"]["Embedding"];
             };
             /**
+             * Format: float
+             * @description Controls the vector search recall/latency tradeoff for semantic searches.
+             *
+             *     - `0.0` = fastest, lowest recall
+             *     - `0.5` = balanced default
+             *     - `1.0` = highest recall
+             *
+             *     When omitted, Antfly uses the balanced default effort (`0.5`) unless
+             *     lower-level vector search overrides are provided internally.
+             * @default 0.5
+             * @example 0.5
+             */
+            search_effort?: number;
+            /**
              * @description List of fields to include in the results. If not specified, all fields are returned.
              *     Use to reduce response size and improve performance.
              * @example [

@@ -40,7 +40,8 @@ type SearchRequest struct {
 	DistanceUnder *float32 `json:"distance_under,omitempty"`
 
 	// SearchEffort controls the recall vs latency tradeoff.
-	// Range: 0.0 (fastest) to 1.0 (highest recall). nil uses index defaults.
+	// Range: 0.0 (fastest) to 1.0 (highest recall). nil uses the balanced
+	// default effort (0.5) unless SearchWidth or Epsilon2 is explicitly set.
 	SearchEffort *float32 `json:"search_effort,omitempty"`
 
 	// SearchWidth, if set, overrides the index's configured SearchWidth
@@ -125,6 +126,11 @@ type SearchDebugPair struct {
 }
 
 type SearchDebugInfo struct {
+	ResolvedSearchWidth        int              `json:"resolved_search_width,omitempty"`
+	ResolvedEpsilon2           float32          `json:"resolved_epsilon2,omitempty"`
+	NodesExplored              int              `json:"nodes_explored,omitempty"`
+	LeavesExplored             int              `json:"leaves_explored,omitempty"`
+	StoppedBySearchWidth       bool             `json:"stopped_by_search_width,omitempty"`
 	ResolvedRerankPolicy       RerankPolicy     `json:"resolved_rerank_policy,omitempty"`
 	ExactRerank                bool             `json:"exact_rerank,omitempty"`
 	RerankCandidateCount       int              `json:"rerank_candidate_count,omitempty"`

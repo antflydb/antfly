@@ -997,6 +997,7 @@ func queryRequestFromRetrieval(qr *RetrievalQueryRequest) *QueryRequest {
 		DocumentRenderer:  qr.DocumentRenderer,
 		DistanceUnder:     qr.DistanceUnder,
 		DistanceOver:      qr.DistanceOver,
+		SearchEffort:      qr.SearchEffort,
 		ExpandStrategy:    QueryRequestExpandStrategy(qr.ExpandStrategy),
 		Count:             qr.Count,
 		Analyses:          qr.Analyses,

@@ -527,6 +527,74 @@ func TestHBCIndex_SearchReturnsKAcrossLeaves(t *testing.T) {
 	assert.EqualValues(t, 4, results[2].ID)
 }
 
+func TestHBCIndex_SearchPopulatesTraversalDebug(t *testing.T) {
+	vectors := []vector.T{
+		{1.0, 0.0},
+		{0.9, 0.1},
+		{0.0, 1.0},
+		{0.1, 0.9},
+		{5.0, 5.0},
+		{5.2, 5.1},
+	}
+	ids := []uint64{1, 2, 3, 4, 5, 6}
+	metadata := [][]byte{
+		[]byte("doc:1"),
+		[]byte("doc:2"),
+		[]byte("doc:3"),
+		[]byte("doc:4"),
+		[]byte("doc:5"),
+		[]byte("doc:6"),
+	}
+
+	db := setupPebbleWithVectors(t, "test_hbc_debug", &Batch{
+		IDs:          ids,
+		Vectors:      vectors,
+		MetadataList: metadata,
+	})
+
+	config := HBCConfig{
+		Dimension:       2,
+		Name:            "test_hbc_debug",
+		BranchingFactor: 2,
+		LeafSize:        2,
+		SearchWidth:     1,
+		CacheSizeNodes:  100,
+		CacheTTL:        5 * time.Minute,
+		VectorDB:        db,
+		IndexDB:         db,
+		UseQuantization: false,
+	}
+
+	index, err := NewHBCIndex(config, rand.NewPCG(42, 1024))
+	require.NoError(t, err)
+	defer index.Close()
+
+	err = index.Batch(t.Context(), &Batch{
+		IDs:          ids,
+		Vectors:      vectors,
+		MetadataList: metadata,
+	})
+	require.NoError(t, err)
+
+	searchWidth := 1
+	epsilon2 := float32(3.0)
+	debug := &SearchDebugInfo{}
+	results, err := index.Search(&SearchRequest{
+		Embedding:   []float32{1.0, 0.0},
+		K:           2,
+		SearchWidth: &searchWidth,
+		Epsilon2:    &epsilon2,
+		Debug:       debug,
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	assert.Equal(t, 1, debug.ResolvedSearchWidth)
+	assert.InDelta(t, 3.0, debug.ResolvedEpsilon2, 0.001)
+	assert.Greater(t, debug.NodesExplored, 0)
+	assert.Equal(t, 1, debug.LeavesExplored)
+	assert.True(t, debug.StoppedBySearchWidth)
+}
+
 func TestHBCIndex_LeafCentroidsTrackInsertedMembers(t *testing.T) {
 	vectors := []vector.T{
 		{1.0, 0.0},

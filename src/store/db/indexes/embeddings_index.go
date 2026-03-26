@@ -512,44 +512,133 @@ func (s *EmbeddingIndex) Search(ctx context.Context, query any) (any, error) {
 	return searchResult, nil
 }
 
+const defaultBalancedSearchEffort = float32(0.5)
+
 // resolveSearchEffort translates the user-facing search_effort (0.0-1.0) into
 // concrete SearchWidth and Epsilon2 overrides on the SearchRequest.
-// Only applies when SearchEffort is set and SearchWidth/Epsilon2 are not
-// already explicitly provided.
+// When no search tuning is specified, it applies the balanced default effort.
 func (s *EmbeddingIndex) resolveSearchEffort(req *vectorindex.SearchRequest) {
-	if req.SearchEffort == nil {
+	if req == nil {
 		return
 	}
-	effort := *req.SearchEffort
-	if math.IsNaN(float64(effort)) {
-		return
-	}
-	if effort < 0 {
-		effort = 0
-	} else if effort > 1 {
-		effort = 1
+
+	effort, ok := normalizedSearchEffort(req.SearchEffort)
+	if !ok {
+		if req.SearchWidth != nil || req.Epsilon2 != nil {
+			return
+		}
+		effort = defaultBalancedSearchEffort
 	}
 
 	if req.SearchWidth == nil {
-		// Scale search width from a minimum of K up to a high upper bound.
-		minWidth := max(req.K, 64)
-		maxWidth := max(minWidth*20, 4096)
-		w := minWidth + int(float32(maxWidth-minWidth)*effort)
-		req.SearchWidth = &w
+		req.SearchWidth = intPtr(s.resolveSearchWidth(req.K, effort))
 	}
 
 	if req.Epsilon2 == nil {
-		// Piecewise linear pruning threshold:
-		//   effort 0.0 -> ε₂=1.0   (aggressive pruning)
-		//   effort 0.5 -> ε₂=7.0   (default)
-		//   effort 1.0 -> ε₂=100.0 (effectively no pruning)
-		var e float32
-		if effort < 0.5 {
-			e = 1.0 + (effort * 12.0)
-		} else {
-			e = 7.0 + ((effort - 0.5) * 186.0)
+		req.Epsilon2 = float32Ptr(resolveSearchEpsilon2(effort))
+	}
+}
+
+func normalizedSearchEffort(effort *float32) (float32, bool) {
+	if effort == nil {
+		return 0, false
+	}
+	v := *effort
+	if math.IsNaN(float64(v)) {
+		return 0, false
+	}
+	if v < 0 {
+		return 0, true
+	}
+	if v > 1 {
+		return 1, true
+	}
+	return v, true
+}
+
+func (s *EmbeddingIndex) resolveSearchWidth(k int, effort float32) int {
+	minWidth := max(k, 64)
+	legacyMaxWidth := max(minWidth*20, 4096)
+	sizeAwareMaxWidth := s.resolveSearchWidthCap(legacyMaxWidth)
+	balancedWidth := minWidth + int(float32(legacyMaxWidth-minWidth)*defaultBalancedSearchEffort)
+
+	if effort <= defaultBalancedSearchEffort {
+		if balancedWidth <= minWidth {
+			return minWidth
 		}
-		req.Epsilon2 = &e
+		ratio := effort / defaultBalancedSearchEffort
+		return minWidth + int(float32(balancedWidth-minWidth)*ratio)
+	}
+
+	if sizeAwareMaxWidth <= balancedWidth {
+		return sizeAwareMaxWidth
+	}
+	ratio := (effort - defaultBalancedSearchEffort) / (1 - defaultBalancedSearchEffort)
+	w := balancedWidth + int(float32(sizeAwareMaxWidth-balancedWidth)*ratio)
+	if w > sizeAwareMaxWidth {
+		return sizeAwareMaxWidth
+	}
+	return w
+}
+
+func resolveSearchEpsilon2(effort float32) float32 {
+	// Piecewise linear pruning threshold:
+	//   effort 0.0 -> ε₂=1.0   (aggressive pruning)
+	//   effort 0.5 -> ε₂=7.0   (balanced default)
+	//   effort 1.0 -> ε₂=100.0 (effectively no pruning)
+	if effort < defaultBalancedSearchEffort {
+		return 1.0 + (effort * 12.0)
+	}
+	return 7.0 + ((effort - defaultBalancedSearchEffort) * 186.0)
+}
+
+func intPtr(v int) *int {
+	return &v
+}
+
+func float32Ptr(v float32) *float32 {
+	return &v
+}
+
+func (s *EmbeddingIndex) resolveSearchWidthCap(legacyMaxWidth int) int {
+	if s == nil || s.idx == nil {
+		return legacyMaxWidth
+	}
+	stats := s.idx.Stats()
+	totalNodes, ok := statInt(stats["total_nodes"])
+	if !ok || totalNodes <= legacyMaxWidth {
+		return legacyMaxWidth
+	}
+	return totalNodes
+}
+
+func statInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int32:
+		return int(n), true
+	case int64:
+		if n < 0 {
+			return 0, false
+		}
+		return int(n), true
+	case uint:
+		return int(n), true
+	case uint32:
+		return int(n), true
+	case uint64:
+		if n > math.MaxInt {
+			return 0, false
+		}
+		return int(n), true
+	case float64:
+		if n < 0 || n > math.MaxInt {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
 	}
 }
 

@@ -45,6 +45,25 @@ type mockEmbedder struct {
 	embedFunc func(ctx context.Context, values []string) ([][]float32, error)
 }
 
+type stubStatsVectorIndex struct {
+	stats map[string]any
+}
+
+func (s *stubStatsVectorIndex) Name() string { return "stub" }
+func (s *stubStatsVectorIndex) Batch(context.Context, *vectorindex.Batch) error {
+	return nil
+}
+func (s *stubStatsVectorIndex) Search(*vectorindex.SearchRequest) ([]*vectorindex.Result, error) {
+	return nil, nil
+}
+func (s *stubStatsVectorIndex) Delete(...uint64) error { return nil }
+func (s *stubStatsVectorIndex) GetMetadata(uint64) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStatsVectorIndex) Stats() map[string]any { return s.stats }
+func (s *stubStatsVectorIndex) TotalVectors() uint64  { return 0 }
+func (s *stubStatsVectorIndex) Close() error          { return nil }
+
 func (m *mockEmbedder) Capabilities() embeddings.EmbedderCapabilities {
 	return embeddings.TextOnlyCapabilities()
 }
@@ -1052,19 +1071,19 @@ func TestResolveSearchEffort(t *testing.T) {
 	var idx EmbeddingIndex
 	f32 := func(v float32) *float32 { return &v }
 
-	t.Run("nil effort is no-op", func(t *testing.T) {
+	t.Run("nil effort uses balanced defaults", func(t *testing.T) {
 		req := &vectorindex.SearchRequest{K: 10}
 		idx.resolveSearchEffort(req)
-		assert.Nil(t, req.SearchWidth)
-		assert.Nil(t, req.Epsilon2)
+		assert.Equal(t, 2080, *req.SearchWidth)
+		assert.InDelta(t, 7.0, *req.Epsilon2, 0.01)
 	})
 
-	t.Run("NaN effort is no-op", func(t *testing.T) {
+	t.Run("NaN effort falls back to balanced defaults", func(t *testing.T) {
 		nan := float32(math.NaN())
 		req := &vectorindex.SearchRequest{K: 10, SearchEffort: &nan}
 		idx.resolveSearchEffort(req)
-		assert.Nil(t, req.SearchWidth)
-		assert.Nil(t, req.Epsilon2)
+		assert.Equal(t, 2080, *req.SearchWidth)
+		assert.InDelta(t, 7.0, *req.Epsilon2, 0.01)
 	})
 
 	t.Run("effort 0.0 gives minimum values", func(t *testing.T) {
@@ -1087,7 +1106,31 @@ func TestResolveSearchEffort(t *testing.T) {
 		assert.InDelta(t, 100.0, *req.Epsilon2, 0.01)
 	})
 
+	t.Run("large index scales upper effort width by total nodes", func(t *testing.T) {
+		idx.idx = &stubStatsVectorIndex{stats: map[string]any{"total_nodes": uint64(17_591)}}
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(1.0)}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 17_591, *req.SearchWidth)
+		assert.InDelta(t, 100.0, *req.Epsilon2, 0.01)
+	})
+
+	t.Run("mid effort stays on the balanced preset even on large index", func(t *testing.T) {
+		idx.idx = &stubStatsVectorIndex{stats: map[string]any{"total_nodes": uint64(17_591)}}
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(0.5)}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 2080, *req.SearchWidth) // legacy midpoint between 64 and 4096
+		assert.InDelta(t, 7.0, *req.Epsilon2, 0.01)
+	})
+
+	t.Run("small index does not reduce legacy cap", func(t *testing.T) {
+		idx.idx = &stubStatsVectorIndex{stats: map[string]any{"total_nodes": uint64(879)}}
+		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(1.0)}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 4096, *req.SearchWidth)
+	})
+
 	t.Run("negative effort clamped to 0", func(t *testing.T) {
+		idx.idx = nil
 		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(-0.5)}
 		idx.resolveSearchEffort(req)
 		assert.Equal(t, 64, *req.SearchWidth)
@@ -1095,12 +1138,14 @@ func TestResolveSearchEffort(t *testing.T) {
 	})
 
 	t.Run("effort > 1 clamped to 1", func(t *testing.T) {
+		idx.idx = nil
 		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(5.0)}
 		idx.resolveSearchEffort(req)
 		assert.InDelta(t, 100.0, *req.Epsilon2, 0.01)
 	})
 
 	t.Run("explicit SearchWidth not overwritten", func(t *testing.T) {
+		idx.idx = nil
 		w := 500
 		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(1.0), SearchWidth: &w}
 		idx.resolveSearchEffort(req)
@@ -1109,6 +1154,7 @@ func TestResolveSearchEffort(t *testing.T) {
 	})
 
 	t.Run("explicit Epsilon2 not overwritten", func(t *testing.T) {
+		idx.idx = nil
 		e := float32(3.0)
 		req := &vectorindex.SearchRequest{K: 10, SearchEffort: f32(1.0), Epsilon2: &e}
 		idx.resolveSearchEffort(req)
@@ -1116,7 +1162,26 @@ func TestResolveSearchEffort(t *testing.T) {
 		assert.NotNil(t, req.SearchWidth) // search width still set
 	})
 
+	t.Run("explicit width without effort keeps epsilon at index default", func(t *testing.T) {
+		idx.idx = nil
+		w := 500
+		req := &vectorindex.SearchRequest{K: 10, SearchWidth: &w}
+		idx.resolveSearchEffort(req)
+		assert.Equal(t, 500, *req.SearchWidth)
+		assert.Nil(t, req.Epsilon2)
+	})
+
+	t.Run("explicit epsilon without effort keeps width at index default", func(t *testing.T) {
+		idx.idx = nil
+		e := float32(3.0)
+		req := &vectorindex.SearchRequest{K: 10, Epsilon2: &e}
+		idx.resolveSearchEffort(req)
+		assert.Nil(t, req.SearchWidth)
+		assert.Equal(t, float32(3.0), *req.Epsilon2)
+	})
+
 	t.Run("large K scales search width", func(t *testing.T) {
+		idx.idx = nil
 		req := &vectorindex.SearchRequest{K: 500, SearchEffort: f32(0.0)}
 		idx.resolveSearchEffort(req)
 		assert.Equal(t, 500, *req.SearchWidth) // max(500, 64) = 500

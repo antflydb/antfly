@@ -6835,6 +6835,29 @@ components:
             avoid redundant embedding calls.
           additionalProperties:
             $ref: '#/components/schemas/Embedding'
+        search_effort:
+          x-go-type-skip-optional-pointer: false
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.5
+          description: >
+            Controls the vector search recall/latency tradeoff for semantic
+            searches.
+
+
+            - `0.0` = fastest, lowest recall
+
+            - `0.5` = balanced default
+
+            - `1.0` = highest recall
+
+
+            When omitted, Antfly uses the balanced default effort (`0.5`) unless
+
+            lower-level vector search overrides are provided internally.
+          example: 0.5
         fields:
           type: array
           description: >
