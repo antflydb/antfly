@@ -49,33 +49,6 @@ type FieldFilter struct {
 	Star      bool     `json:"star,omitempty"`
 }
 
-// ShardIndex is the interface for querying a shard, whether local (in-process)
-// or remote (over HTTP). Both RemoteIndex and LocalIndex implement this.
-type ShardIndex interface {
-	bleve.Index // SearchInContext for FullTextSearch via bleve IndexAlias
-	RemoteSearch(ctx context.Context, req *RemoteIndexSearchRequest) (*RemoteIndexSearchResult, error)
-	BatchRemoteSearch(ctx context.Context, reqs []*RemoteIndexSearchRequest) ([]*RemoteIndexSearchResult, []error)
-	Name() string
-	ShardID() types.ID
-	IndexMapping() mapping.IndexMapping
-	SchemaVersion() uint32
-	// WithFieldFilter returns a shallow clone with the given field projection applied.
-	WithFieldFilter(ff *FieldFilter) ShardIndex
-}
-
-// ShardIndexes is a collection of ShardIndex, one per shard.
-type ShardIndexes []ShardIndex
-
-// ShardIndexFactory builds base ShardIndexes (without FieldFilter) for the
-// given schema and shards. Set once at startup based on deployment mode.
-type ShardIndexFactory func(tableSchema *schema.TableSchema, shardIDs []types.ID, peers map[types.ID][]string) (ShardIndexes, error)
-
-// ShardSearcher provides direct (in-process) shard search, bypassing HTTP.
-// Implemented by a thin adapter over store.StoreIface in swarm mode.
-type ShardSearcher interface {
-	SearchShardTyped(ctx context.Context, shardID types.ID, req *RemoteIndexSearchRequest) (*RemoteIndexSearchResult, error)
-}
-
 var _ ShardIndex = (*RemoteIndex)(nil)
 
 type RemoteIndex struct {
@@ -150,6 +123,24 @@ type RemoteIndexSearchRequest struct {
 	// ExpandStrategy defines how to incorporate graph search results with other search results
 	// Options: "union" (merge all results), "intersection" (only common results), "" (keep separate)
 	ExpandStrategy string `json:"expand_strategy,omitempty"`
+}
+
+// Clone returns a shallow copy of the request struct so shard-specific metadata
+// can be applied without mutating the caller-owned request object.
+func (r *RemoteIndexSearchRequest) Clone() *RemoteIndexSearchRequest {
+	if r == nil {
+		return nil
+	}
+	clone := *r
+	return &clone
+}
+
+func (r *RemoteIndexSearchRequest) withFullTextIndexVersion(version uint32) *RemoteIndexSearchRequest {
+	clone := r.Clone()
+	if clone != nil {
+		clone.FullTextIndexVersion = version
+	}
+	return clone
 }
 
 // FusionKeyFullText is the named weight key for the full-text search index.
@@ -487,24 +478,6 @@ func (ss *RemoteIndexSearchStatus) Merge(other *RemoteIndexSearchStatus) {
 // the given ShardSearcher for direct in-process search (swarm mode).
 // The returned indexes have no FieldFilter; call WithFieldFilter on the
 // collection to set per-query field projections.
-func MakeLocalIndexesForShards(
-	searcher ShardSearcher,
-	tableSchema *schema.TableSchema,
-	shardIDs []types.ID,
-) ShardIndexes {
-	idxMapping := schema.NewIndexMapFromSchema(tableSchema)
-	out := make(ShardIndexes, len(shardIDs))
-	for i, id := range shardIDs {
-		out[i] = &LocalIndex{
-			shard:      id,
-			searcher:   searcher,
-			idxMapping: idxMapping,
-			schema:     tableSchema,
-		}
-	}
-	return out
-}
-
 // MakeRemoteIndexesForShards creates RemoteIndex objects for each shard without
 // a per-query FieldFilter. The returned indexes can be reused across queries
 // by calling WithFieldFilter to set query-specific field projections.
@@ -534,16 +507,6 @@ func MakeRemoteIndexesForShards(
 	}
 
 	return indexes, nil
-}
-
-// WithFieldFilter returns a copy of each ShardIndex with the given FieldFilter
-// applied. The underlying client, mapping, and schema are shared (not copied).
-func (s ShardIndexes) WithFieldFilter(ff *FieldFilter) ShardIndexes {
-	out := make(ShardIndexes, len(s))
-	for i, si := range s {
-		out[i] = si.WithFieldFilter(ff)
-	}
-	return out
 }
 
 type FullTextPagingOptions struct {
@@ -708,8 +671,7 @@ func (r *RemoteIndex) RemoteSearch(
 	if r.schema != nil {
 		version = r.schema.Version
 	}
-	req.FullTextIndexVersion = version
-	reqBytes, err := json.Marshal(req)
+	reqBytes, err := json.Marshal(req.withFullTextIndexVersion(version))
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal search request: %w", err)
 	}
@@ -764,8 +726,7 @@ func (r *RemoteIndex) BatchRemoteSearch(
 	// Build ndjson body
 	var buf bytes.Buffer
 	for i, req := range reqs {
-		req.FullTextIndexVersion = version
-		encoded, err := json.Marshal(req)
+		encoded, err := json.Marshal(req.withFullTextIndexVersion(version))
 		if err != nil {
 			errors := make([]error, len(reqs))
 			errors[i] = fmt.Errorf("failed to marshal search request: %w", err)
@@ -864,7 +825,7 @@ func BatchMultiSearch(
 			idx := shardIndex[shardName]
 			batchReqs := make([]*RemoteIndexSearchRequest, len(indexedReqs))
 			for i, ir := range indexedReqs {
-				batchReqs[i] = ir.req
+				batchReqs[i] = ir.req.Clone()
 			}
 
 			batchResults, batchErrors := idx.BatchRemoteSearch(ctx, batchReqs)
@@ -1013,8 +974,8 @@ func (r *RemoteIndex) SetInternal(key, val []byte) error {
 func (r *RemoteIndex) DeleteInternal(key []byte) error {
 	return errors.New("operation not implemented remotely")
 }
-func (r *RemoteIndex) Name() string            { return r.shard.String() }
-func (r *RemoteIndex) ShardID() types.ID       { return r.shard }
+func (r *RemoteIndex) Name() string                       { return r.shard.String() }
+func (r *RemoteIndex) ShardID() types.ID                  { return r.shard }
 func (r *RemoteIndex) IndexMapping() mapping.IndexMapping { return r.mapping }
 func (r *RemoteIndex) SchemaVersion() uint32 {
 	if r.schema != nil {
@@ -1075,7 +1036,7 @@ func MultiSearch(
 
 	waitGroup.Add(len(indexes))
 	for _, in := range indexes {
-		go searchChildIndex(in, req)
+		go searchChildIndex(in, req.Clone())
 	}
 
 	// on another go routine, close after finished

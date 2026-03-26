@@ -25,9 +25,9 @@ import (
 
 	"github.com/antflydb/antfly/lib/clock"
 	"github.com/antflydb/antfly/lib/middleware"
-	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/multirafthttp/transport"
 	"github.com/antflydb/antfly/lib/pebbleutils"
+	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
 	"github.com/antflydb/antfly/src/common"
@@ -209,7 +209,7 @@ func (r *Runtime) SetLocalStore(nodeID types.ID, s store.StoreIface) {
 	factory := indexes.ShardIndexFactory(func(tableSchema *schema.TableSchema, shardIDs []types.ID, peers map[types.ID][]string) (indexes.ShardIndexes, error) {
 		return indexes.MakeLocalIndexesForShards(searcher, tableSchema, shardIDs), nil
 	})
-	r.node.makeIndexes.Store(&factory)
+	r.node.setShardIndexFactory(factory)
 
 	r.tableManager.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) storeclient.StoreRPC {
 		return storeclient.NewLocalStoreClient(id, s)

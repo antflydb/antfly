@@ -34,9 +34,9 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/antflydb/antfly/src/metadata/reconciler"
-	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
+	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/antflydb/antfly/src/usermgr"
 	"github.com/cockroachdb/pebble/v2"
@@ -76,6 +76,9 @@ type MetadataStore struct {
 	// Defaults to MakeRemoteIndexesForShards; swarm mode replaces it with
 	// MakeLocalIndexesForShards via Runtime.SetLocalStore.
 	makeIndexes atomic.Pointer[indexes.ShardIndexFactory]
+	// shardIndexFactoryGeneration invalidates base index cache entries when the
+	// shard index construction mode changes (for example remote -> local).
+	shardIndexFactoryGeneration atomic.Uint64
 }
 
 // getIndexes builds base ShardIndexes using the factory configured at startup.
@@ -85,6 +88,11 @@ func (ms *MetadataStore) getIndexes(tableSchema *schema.TableSchema, shardIDs []
 	}
 	// Default to remote before SetLocalStore is called.
 	return indexes.MakeRemoteIndexesForShards(ms.tm.HttpClient(), tableSchema, shardIDs, peers)
+}
+
+func (ms *MetadataStore) setShardIndexFactory(f indexes.ShardIndexFactory) {
+	ms.makeIndexes.Store(&f)
+	ms.shardIndexFactoryGeneration.Add(1)
 }
 
 func (ms *MetadataStore) clockOrReal() clock.Clock {

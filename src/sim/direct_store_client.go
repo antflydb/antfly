@@ -20,6 +20,7 @@ import (
 	storeclient "github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
+	"github.com/antflydb/antfly/src/store/storeutils"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -53,6 +54,7 @@ func (c *directStoreClient) Batch(
 		Deletes:    deletes,
 		Transforms: transforms,
 		SyncLevel:  &syncLevel,
+		Timestamp:  storeutils.GetTimestampFromContext(ctx),
 	}.Build(), false)
 }
 
@@ -68,8 +70,9 @@ func (c *directStoreClient) ApplyMergeChunk(
 		return err
 	}
 	return shard.ApplyMergeChunk(ctx, db.BatchOp_builder{
-		Writes:  db.WritesFromTuples(writes),
-		Deletes: deletes,
+		Writes:    db.WritesFromTuples(writes),
+		Deletes:   deletes,
+		Timestamp: storeutils.GetTimestampFromContext(ctx),
 		SyncLevel: func() *db.Op_SyncLevel {
 			level := db.Op_SyncLevelInternalMergeCopy
 			return &level

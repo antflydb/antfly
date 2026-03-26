@@ -26,6 +26,7 @@ import (
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
+	"github.com/antflydb/antfly/src/store/storeutils"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -69,6 +70,7 @@ func (c *LocalStoreClient) Batch(
 		Deletes:    deletes,
 		Transforms: transforms,
 		SyncLevel:  &syncLevel,
+		Timestamp:  storeutils.GetTimestampFromContext(ctx),
 	}.Build(), false)
 	if errors.Is(err, db.ErrPartialSuccess) {
 		return nil
@@ -92,6 +94,7 @@ func (c *LocalStoreClient) ApplyMergeChunk(
 		Writes:    db.WritesFromTuples(writes),
 		Deletes:   deletes,
 		SyncLevel: &level,
+		Timestamp: storeutils.GetTimestampFromContext(ctx),
 	}.Build())
 	if errors.Is(err, db.ErrPartialSuccess) {
 		return nil

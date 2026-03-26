@@ -44,9 +44,31 @@ func (l *LocalIndex) WithFieldFilter(ff *FieldFilter) ShardIndex {
 	return &clone
 }
 
-func (l *LocalIndex) Name() string                        { return l.shard.String() }
-func (l *LocalIndex) ShardID() types.ID                   { return l.shard }
-func (l *LocalIndex) IndexMapping() mapping.IndexMapping   { return l.idxMapping }
+// MakeLocalIndexesForShards creates LocalIndex objects for each shard, using
+// the given ShardSearcher for direct in-process search (swarm mode).
+// The returned indexes have no FieldFilter; call WithFieldFilter on the
+// collection to set per-query field projections.
+func MakeLocalIndexesForShards(
+	searcher ShardSearcher,
+	tableSchema *schema.TableSchema,
+	shardIDs []types.ID,
+) ShardIndexes {
+	idxMapping := schema.NewIndexMapFromSchema(tableSchema)
+	out := make(ShardIndexes, len(shardIDs))
+	for i, id := range shardIDs {
+		out[i] = &LocalIndex{
+			shard:      id,
+			searcher:   searcher,
+			idxMapping: idxMapping,
+			schema:     tableSchema,
+		}
+	}
+	return out
+}
+
+func (l *LocalIndex) Name() string                       { return l.shard.String() }
+func (l *LocalIndex) ShardID() types.ID                  { return l.shard }
+func (l *LocalIndex) IndexMapping() mapping.IndexMapping { return l.idxMapping }
 func (l *LocalIndex) SchemaVersion() uint32 {
 	if l.schema != nil {
 		return l.schema.Version
@@ -58,8 +80,7 @@ func (l *LocalIndex) RemoteSearch(
 	ctx context.Context,
 	req *RemoteIndexSearchRequest,
 ) (*RemoteIndexSearchResult, error) {
-	req.FullTextIndexVersion = l.SchemaVersion()
-	return l.searcher.SearchShardTyped(ctx, l.shard, req)
+	return l.searcher.SearchShardTyped(ctx, l.shard, req.withFullTextIndexVersion(l.SchemaVersion()))
 }
 
 func (l *LocalIndex) BatchRemoteSearch(
@@ -104,14 +125,28 @@ func (l *LocalIndex) SearchInContext(
 func (l *LocalIndex) IndexSynonym(string, string, *bleve.SynonymDefinition) error {
 	return errors.New("operation not supported on local index")
 }
-func (l *LocalIndex) Index(string, any) error                              { return errors.New("operation not supported on local index") }
-func (l *LocalIndex) Delete(string) error                                  { return errors.New("operation not supported on local index") }
-func (l *LocalIndex) NewBatch() *bleve.Batch                               { panic("operation not supported on local index") }
-func (l *LocalIndex) Batch(*bleve.Batch) error                             { return errors.New("operation not supported on local index") }
-func (l *LocalIndex) Document(string) (bleveindex.Document, error)         { return nil, errors.New("operation not supported on local index") }
-func (l *LocalIndex) DocCount() (uint64, error)                            { return 0, errors.New("operation not supported on local index") }
-func (l *LocalIndex) Fields() ([]string, error)                            { return nil, errors.New("operation not supported on local index") }
-func (l *LocalIndex) FieldDict(string) (bleveindex.FieldDict, error)       { return nil, errors.New("operation not supported on local index") }
+func (l *LocalIndex) Index(string, any) error {
+	return errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) Delete(string) error {
+	return errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) NewBatch() *bleve.Batch { panic("operation not supported on local index") }
+func (l *LocalIndex) Batch(*bleve.Batch) error {
+	return errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) Document(string) (bleveindex.Document, error) {
+	return nil, errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) DocCount() (uint64, error) {
+	return 0, errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) Fields() ([]string, error) {
+	return nil, errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) FieldDict(string) (bleveindex.FieldDict, error) {
+	return nil, errors.New("operation not supported on local index")
+}
 func (l *LocalIndex) FieldDictRange(string, []byte, []byte) (bleveindex.FieldDict, error) {
 	return nil, errors.New("operation not supported on local index")
 }
@@ -125,9 +160,13 @@ func (l *LocalIndex) StatsMap() map[string]any      { return nil }
 func (l *LocalIndex) GetInternal([]byte) ([]byte, error) {
 	return nil, errors.New("operation not supported on local index")
 }
-func (l *LocalIndex) SetInternal([]byte, []byte) error  { return errors.New("operation not supported on local index") }
-func (l *LocalIndex) DeleteInternal([]byte) error        { return errors.New("operation not supported on local index") }
-func (l *LocalIndex) SetName(string)                     {}
+func (l *LocalIndex) SetInternal([]byte, []byte) error {
+	return errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) DeleteInternal([]byte) error {
+	return errors.New("operation not supported on local index")
+}
+func (l *LocalIndex) SetName(string) {}
 func (l *LocalIndex) Advanced() (bleveindex.Index, error) {
 	return nil, errors.New("operation not supported on local index")
 }

@@ -352,7 +352,6 @@ func fieldFilterForQuery(q *indexes.Query, queryReq *QueryRequest) *indexes.Fiel
 	}
 }
 
-
 // getOrCreateBaseIndexes returns cached base ShardIndexes for the given schema
 // and shard topology, creating them if the cache misses or topology changed.
 // The cache avoids rebuilding bleve index mappings on every query.
@@ -360,9 +359,12 @@ func (t *TableApi) getOrCreateBaseIndexes(
 	tableSchema *schema.TableSchema,
 	peers map[types.ID][]string,
 ) (indexes.ShardIndexes, error) {
-	// Build a deterministic cache key from schema version + sorted shard peers.
+	// Build a deterministic cache key from schema version + shard-index factory
+	// generation + sorted shard peers.
 	h := xxhash.New()
 	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], t.ln.shardIndexFactoryGeneration.Load())
+	h.Write(buf[:])
 	if tableSchema != nil {
 		binary.LittleEndian.PutUint64(buf[:], uint64(tableSchema.Version))
 		h.Write(buf[:])
