@@ -520,6 +520,8 @@ func (s *StoreDB) isActiveSplitReplaySource() bool {
 	return isActiveSplitPhase(s.splitState)
 }
 
+// startSplitReplayIfNeeded must only be called once per StoreDB (from NewStoreDB).
+// The goroutine it launches is tracked by backgroundWG, so CloseDB waits for it.
 func (s *StoreDB) startSplitReplayIfNeeded() error {
 	s.splitReplayMu.Lock()
 	defer s.splitReplayMu.Unlock()
@@ -551,7 +553,11 @@ func (s *StoreDB) startSplitReplayIfNeeded() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.splitReplayCancel = cancel
-	go s.runSplitReplayLoop(ctx, parentShardID, startSeq)
+	s.backgroundWG.Add(1)
+	go func() {
+		defer s.backgroundWG.Done()
+		s.runSplitReplayLoop(ctx, parentShardID, startSeq)
+	}()
 	return nil
 }
 

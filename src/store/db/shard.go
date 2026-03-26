@@ -207,7 +207,7 @@ func (s *Shard) ErrorC() <-chan error {
 // It closes channels, cancels contexts, waits for the raft node to stop, and closes the database.
 // Close is safe to call multiple times; only the first call performs the shutdown.
 func (s *Shard) Close() error {
-	if s.IsInitializing() {
+	if s.storeDB == nil {
 		return ErrShardNotReady
 	}
 

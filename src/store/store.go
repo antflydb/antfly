@@ -475,13 +475,9 @@ func (m *Store) Close() {
 	// Close all active shards to release Pebble and Bleve resources.
 	// This is critical to prevent memory leaks when store nodes are removed.
 	m.shardsMap.Range(func(shardID types.ID, shard *Shard) bool {
-		if shard.IsInitializing() {
-			return true // Skip initializing shards
-		}
-
 		m.logger.Debug("Closing shard during store shutdown", zap.Stringer("shardID", shardID))
 
-		if err := shard.Close(); err != nil {
+		if err := shard.Close(); err != nil && !errors.Is(err, db.ErrShardNotReady) {
 			m.logger.Warn("Error closing shard database",
 				zap.Stringer("shardID", shardID),
 				zap.Error(err))
