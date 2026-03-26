@@ -77,6 +77,11 @@ type MetadataStore struct {
 	shardSearcher atomic.Pointer[indexes.ShardSearcher]
 }
 
+// SwarmMode reports whether this node is running in single-node swarm mode.
+func (ms *MetadataStore) SwarmMode() bool {
+	return ms.config != nil && ms.config.SwarmMode
+}
+
 // localSearcher returns the in-process ShardSearcher if configured (swarm mode), or nil.
 func (ms *MetadataStore) localSearcher() indexes.ShardSearcher {
 	if p := ms.shardSearcher.Load(); p != nil {

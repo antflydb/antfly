@@ -49,7 +49,7 @@ import (
 
 func (t *TableApi) executeHybridFullTextFallback(
 	ctx context.Context,
-	shardIndexes indexes.RemoteIndexes,
+	shardIndexes indexes.ShardIndexes,
 	queryReq *QueryRequest,
 	q *indexes.Query,
 	graphSearches map[string]*indexes.GraphQuery,
@@ -352,13 +352,26 @@ func fieldFilterForQuery(q *indexes.Query, queryReq *QueryRequest) *indexes.Fiel
 	}
 }
 
-// getOrCreateBaseIndexes returns cached base RemoteIndexes for the given schema
+// buildBaseIndexes creates ShardIndexes for the given schema and shards,
+// using local in-process search in swarm mode or HTTP in cluster mode.
+func (t *TableApi) buildBaseIndexes(
+	tableSchema *schema.TableSchema,
+	shardIDs []types.ID,
+	peers map[types.ID][]string,
+) (indexes.ShardIndexes, error) {
+	if t.ln.SwarmMode() {
+		return indexes.MakeLocalIndexesForShards(t.ln.localSearcher(), tableSchema, shardIDs), nil
+	}
+	return indexes.MakeRemoteIndexesForShards(t.tm.HttpClient(), tableSchema, peers)
+}
+
+// getOrCreateBaseIndexes returns cached base ShardIndexes for the given schema
 // and shard topology, creating them if the cache misses or topology changed.
 // The cache avoids rebuilding bleve index mappings on every query.
 func (t *TableApi) getOrCreateBaseIndexes(
 	tableSchema *schema.TableSchema,
 	peers map[types.ID][]string,
-) (indexes.RemoteIndexes, error) {
+) (indexes.ShardIndexes, error) {
 	// Build a deterministic cache key from schema version + sorted shard peers.
 	h := xxhash.New()
 	var buf [8]byte
@@ -383,11 +396,11 @@ func (t *TableApi) getOrCreateBaseIndexes(
 	key := h.Sum64()
 
 	if cached, ok := t.baseIndexCache.Load(key); ok {
-		return cached.(indexes.RemoteIndexes), nil
+		return cached.(indexes.ShardIndexes), nil
 	}
 
 	// Evict before construction so concurrent goroutines don't all race
-	// on clear+store after the expensive MakeBaseIndexesForShards call.
+	// on clear+store after the expensive index construction call.
 	cacheSize := 0
 	t.baseIndexCache.Range(func(_, _ any) bool {
 		cacheSize++
@@ -397,7 +410,7 @@ func (t *TableApi) getOrCreateBaseIndexes(
 		t.baseIndexCache.Clear()
 	}
 
-	base, err := indexes.MakeBaseIndexesForShards(t.tm.HttpClient(), tableSchema, peers, t.ln.localSearcher())
+	base, err := t.buildBaseIndexes(tableSchema, shardIDs, peers)
 	if err != nil {
 		return nil, err
 	}
@@ -405,7 +418,7 @@ func (t *TableApi) getOrCreateBaseIndexes(
 	// LoadOrStore ensures only one goroutine's result is cached when
 	// concurrent queries compute the same key simultaneously.
 	actual, _ := t.baseIndexCache.LoadOrStore(key, base)
-	return actual.(indexes.RemoteIndexes), nil
+	return actual.(indexes.ShardIndexes), nil
 }
 
 func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryResult {

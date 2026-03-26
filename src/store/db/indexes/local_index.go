@@ -38,6 +38,12 @@ type LocalIndex struct {
 	q          *FieldFilter
 }
 
+func (l *LocalIndex) WithFieldFilter(ff *FieldFilter) ShardIndex {
+	clone := *l
+	clone.q = ff
+	return &clone
+}
+
 func (l *LocalIndex) Name() string                        { return l.shard.String() }
 func (l *LocalIndex) ShardID() types.ID                   { return l.shard }
 func (l *LocalIndex) IndexMapping() mapping.IndexMapping   { return l.idxMapping }

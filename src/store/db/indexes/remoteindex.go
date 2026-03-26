@@ -59,6 +59,8 @@ type ShardIndex interface {
 	ShardID() types.ID
 	IndexMapping() mapping.IndexMapping
 	SchemaVersion() uint32
+	// WithFieldFilter returns a shallow clone with the given field projection applied.
+	WithFieldFilter(ff *FieldFilter) ShardIndex
 }
 
 // ShardIndexes is a collection of ShardIndex, one per shard.
@@ -81,6 +83,12 @@ type RemoteIndex struct {
 	schema  *schema.TableSchema
 
 	q *FieldFilter
+}
+
+func (r *RemoteIndex) WithFieldFilter(ff *FieldFilter) ShardIndex {
+	clone := *r
+	clone.q = ff
+	return &clone
 }
 
 // NewRemoteIndex creates a new client connecting to a remote bleve index
@@ -471,29 +479,40 @@ func (ss *RemoteIndexSearchStatus) Merge(other *RemoteIndexSearchStatus) {
 	}
 }
 
-// MakeBaseIndexesForShards creates RemoteIndex objects for each shard without
+// MakeLocalIndexesForShards creates LocalIndex objects for each shard, using
+// the given ShardSearcher for direct in-process search (swarm mode).
+// The returned indexes have no FieldFilter; call WithFieldFilter on the
+// collection to set per-query field projections.
+func MakeLocalIndexesForShards(
+	searcher ShardSearcher,
+	tableSchema *schema.TableSchema,
+	shardIDs []types.ID,
+) ShardIndexes {
+	idxMapping := schema.NewIndexMapFromSchema(tableSchema)
+	out := make(ShardIndexes, len(shardIDs))
+	for i, id := range shardIDs {
+		out[i] = &LocalIndex{
+			shard:      id,
+			searcher:   searcher,
+			idxMapping: idxMapping,
+			schema:     tableSchema,
+		}
+	}
+	return out
+}
+
+// MakeRemoteIndexesForShards creates RemoteIndex objects for each shard without
 // a per-query FieldFilter. The returned indexes can be reused across queries
 // by calling WithFieldFilter to set query-specific field projections.
-func MakeBaseIndexesForShards(
+func MakeRemoteIndexesForShards(
 	client *http.Client,
 	tableSchema *schema.TableSchema,
 	peers map[types.ID][]string,
-	localSearcher ShardSearcher,
 ) (ShardIndexes, error) {
 	idxMapping := schema.NewIndexMapFromSchema(tableSchema)
 	indexes := make(ShardIndexes, 0, len(peers))
 
 	for shardID, peerURLs := range peers {
-		if localSearcher != nil {
-			indexes = append(indexes, &LocalIndex{
-				shard:      shardID,
-				searcher:   localSearcher,
-				idxMapping: idxMapping,
-				schema:     tableSchema,
-				})
-			continue
-		}
-
 		if len(peerURLs) == 0 {
 			return nil, fmt.Errorf("no peer URLs found for shard %s", shardID)
 		}
@@ -510,26 +529,12 @@ func MakeBaseIndexesForShards(
 	return indexes, nil
 }
 
-// RemoteIndexes is kept as an alias for backward compatibility.
-type RemoteIndexes = ShardIndexes
-
 // WithFieldFilter returns a copy of each ShardIndex with the given FieldFilter
 // applied. The underlying client, mapping, and schema are shared (not copied).
-func (r RemoteIndexes) WithFieldFilter(ff *FieldFilter) RemoteIndexes {
-	out := make(RemoteIndexes, len(r))
-	for i, si := range r {
-		switch v := si.(type) {
-		case *RemoteIndex:
-			clone := *v
-			clone.q = ff
-			out[i] = &clone
-		case *LocalIndex:
-			clone := *v
-			clone.q = ff
-			out[i] = &clone
-		default:
-			out[i] = si
-		}
+func (s ShardIndexes) WithFieldFilter(ff *FieldFilter) ShardIndexes {
+	out := make(ShardIndexes, len(s))
+	for i, si := range s {
+		out[i] = si.WithFieldFilter(ff)
 	}
 	return out
 }
