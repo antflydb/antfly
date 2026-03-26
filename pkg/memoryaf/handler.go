@@ -32,7 +32,7 @@ const (
 // Handler implements all memoryaf operations against an Antfly instance.
 type Handler struct {
 	client  Client
-	termite *TermiteClient
+	ner     *NERClient
 	logger  *zap.Logger
 
 	mu                    sync.RWMutex
@@ -42,12 +42,12 @@ type Handler struct {
 // NewHandler creates a new memory handler.
 func NewHandler(
 	client Client,
-	termite *TermiteClient,
+	ner *NERClient,
 	logger *zap.Logger,
 ) *Handler {
 	return &Handler{
 		client:                client,
-		termite:               termite,
+		ner:                   ner,
 		logger:                logger,
 		initializedNamespaces: make(map[string]bool),
 	}
@@ -294,15 +294,16 @@ func (h *Handler) StoreMemory(ctx context.Context, args StoreMemoryArgs, uctx Us
 	doc := buildMemoryDoc(args, uctx.UserID, now)
 	doc["created_at"] = now
 
-	entities := h.extractAndLinkEntities(ctx, id, args.Content, uctx.Namespace)
-	doc["entities"] = entitiesToSlice(entities)
-
+	// Insert the memory document immediately; entity extraction runs async.
 	_, err := h.client.Batch(ctx, table, client.BatchRequest{
 		Inserts: map[string]any{key: doc},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("batch insert: %w", err)
 	}
+
+	// Extract entities and link graph edges in the background.
+	go h.extractAndLinkEntities(context.WithoutCancel(ctx), id, args.Content, uctx.Namespace)
 
 	m := hitToMemory(key, doc)
 	return &m, nil
@@ -359,16 +360,16 @@ func (h *Handler) UpdateMemory(ctx context.Context, args UpdateMemoryArgs, uctx 
 
 	updated := mergeMemoryFields(existing, args, now)
 
-	if args.Content != "" && args.Content != existing.Content {
-		entities := h.extractAndLinkEntities(ctx, args.ID, args.Content, uctx.Namespace)
-		updated["entities"] = entitiesToSlice(entities)
-	}
-
 	_, err = h.client.Batch(ctx, table, client.BatchRequest{
 		Inserts: map[string]any{key: updated},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("batch update: %w", err)
+	}
+
+	// Re-extract entities in the background if content changed.
+	if args.Content != "" && args.Content != existing.Content {
+		go h.extractAndLinkEntities(context.WithoutCancel(ctx), args.ID, args.Content, uctx.Namespace)
 	}
 
 	m := hitToMemory(key, updated)
@@ -478,7 +479,7 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 	}
 
 	if args.ExpandGraph {
-		queryEntities := h.termite.RecognizeEntities(ctx, args.Query)
+		queryEntities := h.ner.RecognizeEntities(ctx, args.Query)
 		if len(queryEntities) > 0 {
 			var entityKeys []string
 			for _, e := range queryEntities {
@@ -721,7 +722,7 @@ func (h *Handler) GetStats(ctx context.Context, args MemoryStatsArgs, uctx UserC
 // --- Entity extraction and graph linking ---
 
 func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content, namespace string) []Entity {
-	entities := h.termite.RecognizeEntities(ctx, content)
+	entities := h.ner.RecognizeEntities(ctx, content)
 	if len(entities) == 0 {
 		return nil
 	}
