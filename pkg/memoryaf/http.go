@@ -433,6 +433,7 @@ func (h *HTTPHandler) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessions, err := h.handler.ListSessions(r.Context(), ListSessionsArgs{
+		Project: r.URL.Query().Get("project"),
 		AgentID: r.URL.Query().Get("agent_id"),
 		Limit:   parseInt(r.URL.Query().Get("limit"), 0),
 	}, uctx)

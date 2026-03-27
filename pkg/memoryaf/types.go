@@ -270,6 +270,7 @@ type MemoryStatsArgs struct {
 }
 
 type ListSessionsArgs struct {
+	Project string `json:"project,omitempty"  mcp:"Filter to a specific project"`
 	AgentID string `json:"agent_id,omitempty" mcp:"Filter to a specific agent"`
 	Limit   int    `json:"limit,omitempty"    mcp:"Max results (default: 20)"`
 }

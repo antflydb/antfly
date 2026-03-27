@@ -1028,6 +1028,9 @@ func (h *Handler) ListSessions(ctx context.Context, args ListSessionsArgs, uctx 
 	// Query the ephemeral table for session aggregations.
 	ephTable := ephemeralTableName(uctx.Namespace)
 	fopts := filterOpts{}
+	if args.Project != "" {
+		fopts.Project = args.Project
+	}
 	if args.AgentID != "" {
 		fopts.AgentID = args.AgentID
 	}
