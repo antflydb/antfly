@@ -449,6 +449,9 @@ func TestEntityKey(t *testing.T) {
 	if entityKey("technology", "Go") != entityKey("technology", "  Go  ") {
 		t.Error("entityKey should normalize whitespace")
 	}
+	if entityKey("technology", "Go") != entityKey("technology", "\"Go.\"") {
+		t.Error("entityKey should normalize quotes and trailing punctuation")
+	}
 }
 
 func TestIsMemoryHit(t *testing.T) {
@@ -517,6 +520,44 @@ func TestExtractEntities_ThresholdFiltering(t *testing.T) {
 	}
 	if entities[0].Text != "Go" {
 		t.Errorf("got entity %q, want %q", entities[0].Text, "Go")
+	}
+}
+
+func TestNormalizeEntityText(t *testing.T) {
+	if got := normalizeEntityText(`  "Go."  `); got != "Go" {
+		t.Fatalf("normalizeEntityText = %q, want %q", got, "Go")
+	}
+	if got := normalizeEntityText(" Apache   Kafka! "); got != "Apache Kafka" {
+		t.Fatalf("normalizeEntityText = %q, want %q", got, "Apache Kafka")
+	}
+}
+
+func TestExtractEntities_NormalizesAndDedupes(t *testing.T) {
+	ext := &mockExtractor{
+		extractFn: func(_ context.Context, texts []string, _ ExtractOptions) ([]Extraction, error) {
+			return []Extraction{{
+				Entities: []ExtractedEntity{
+					{Text: "Go", Label: "technology", Score: 0.80},
+					{Text: ` "Go." `, Label: "project", Score: 0.92},
+					{Text: "Apache Kafka!", Label: "technology", Score: 0.89},
+				},
+			}}, nil
+		},
+	}
+	h := newTestHandler(newMockClient(), ext)
+
+	entities := h.extractEntities(context.Background(), "Go and Apache Kafka")
+	if len(entities) != 2 {
+		t.Fatalf("expected 2 deduped entities, got %d", len(entities))
+	}
+	if entities[0].Text != "Go" {
+		t.Fatalf("first entity text = %q, want Go", entities[0].Text)
+	}
+	if entities[0].Label != "project" {
+		t.Fatalf("expected highest-score label to win, got %q", entities[0].Label)
+	}
+	if entities[1].Text != "Apache Kafka" {
+		t.Fatalf("second entity text = %q, want Apache Kafka", entities[1].Text)
 	}
 }
 
@@ -740,6 +781,24 @@ func TestBuildFilterQuery_ScopeFields(t *testing.T) {
 	}
 	if !strings.Contains(s, "laptop-1") {
 		t.Errorf("expected device_id in filter: %s", s)
+	}
+}
+
+func TestBuildFilterQuery_SourceFields(t *testing.T) {
+	q := buildFilterQuery(filterOpts{
+		SourceBackend: "git",
+		SourceID:      "github.com/antflydb/colony@main:docs/runbooks.md",
+	}, nil)
+	if q == nil {
+		t.Fatal("expected filter")
+	}
+	data, _ := json.Marshal(q)
+	s := string(data)
+	if !strings.Contains(s, "source_backend") || !strings.Contains(s, "git") {
+		t.Fatalf("expected source_backend filter, got %s", s)
+	}
+	if !strings.Contains(s, "source_id") || !strings.Contains(s, "runbooks.md") {
+		t.Fatalf("expected source_id filter, got %s", s)
 	}
 }
 

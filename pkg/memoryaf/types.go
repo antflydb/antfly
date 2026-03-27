@@ -111,19 +111,34 @@ type SearchResult struct {
 
 // MemoryStats holds aggregated memory statistics.
 type MemoryStats struct {
-	TotalMemories int            `json:"total_memories"`
-	ByType        map[string]int `json:"by_type"`
-	ByProject     map[string]int `json:"by_project"`
-	ByTag         map[string]int `json:"by_tag"`
-	ByVisibility  map[string]int `json:"by_visibility"`
-	ByAgent       map[string]int `json:"by_agent"`
-	BySession     map[string]int `json:"by_session"`
+	TotalMemories   int            `json:"total_memories"`
+	ByType          map[string]int `json:"by_type"`
+	ByProject       map[string]int `json:"by_project"`
+	ByTag           map[string]int `json:"by_tag"`
+	ByVisibility    map[string]int `json:"by_visibility"`
+	BySourceBackend map[string]int `json:"by_source_backend"`
+	ByAgent         map[string]int `json:"by_agent"`
+	BySession       map[string]int `json:"by_session"`
 }
 
 // SessionInfo summarizes a session.
 type SessionInfo struct {
 	SessionID   string `json:"session_id"`
 	MemoryCount int    `json:"memory_count"`
+}
+
+// HealthStatus is a lightweight HTTP health payload for the dashboard/API.
+type HealthStatus struct {
+	Status  string `json:"status"`
+	Antfly  bool   `json:"antfly"`
+	Termite bool   `json:"termite"`
+}
+
+// ServerInfo describes the running memoryaf service.
+type ServerInfo struct {
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Description string `json:"description"`
 }
 
 // UserContext carries identity and authorization context.
@@ -170,13 +185,15 @@ type StoreMemoryArgs struct {
 }
 
 type SearchMemoriesArgs struct {
-	Query       string   `json:"query"                  mcp:"Natural language search query"`
-	Project     string   `json:"project,omitempty"      mcp:"Filter to a specific project"`
-	Tags        []string `json:"tags,omitempty"          mcp:"Filter by tags"`
-	MemoryType  string   `json:"memory_type,omitempty"   mcp:"Filter by type: episodic, semantic, procedural"`
-	CreatedBy   string   `json:"created_by,omitempty"    mcp:"Filter by creator"`
-	ExpandGraph bool     `json:"expand_graph,omitempty"  mcp:"Expand results via entity graph (default: false)"`
-	Limit       int      `json:"limit,omitempty"         mcp:"Max results (default: 10)"`
+	Query         string   `json:"query"                  mcp:"Natural language search query"`
+	Project       string   `json:"project,omitempty"      mcp:"Filter to a specific project"`
+	Tags          []string `json:"tags,omitempty"          mcp:"Filter by tags"`
+	MemoryType    string   `json:"memory_type,omitempty"   mcp:"Filter by type: episodic, semantic, procedural"`
+	CreatedBy     string   `json:"created_by,omitempty"    mcp:"Filter by creator"`
+	SourceBackend string   `json:"source_backend,omitempty" mcp:"Filter by external source backend, such as filesystem, git, s3, google_drive, or web"`
+	SourceID      string   `json:"source_id,omitempty"      mcp:"Filter to a specific external source document"`
+	ExpandGraph   bool     `json:"expand_graph,omitempty"  mcp:"Expand results via entity graph (default: false)"`
+	Limit         int      `json:"limit,omitempty"         mcp:"Max results (default: 10)"`
 	// Scoping
 	SessionID string `json:"session_id,omitempty" mcp:"Filter to a specific session"`
 	AgentID   string `json:"agent_id,omitempty"   mcp:"Filter to a specific agent"`
@@ -186,13 +203,15 @@ type SearchMemoriesArgs struct {
 }
 
 type ListMemoriesArgs struct {
-	Project    string   `json:"project,omitempty"     mcp:"Filter to a specific project"`
-	Tags       []string `json:"tags,omitempty"         mcp:"Filter by tags"`
-	MemoryType string   `json:"memory_type,omitempty"  mcp:"Filter by type"`
-	CreatedBy  string   `json:"created_by,omitempty"   mcp:"Filter by creator"`
-	Visibility string   `json:"visibility,omitempty"   mcp:"Filter by visibility"`
-	Limit      int      `json:"limit,omitempty"        mcp:"Max results (default: 20)"`
-	Offset     int      `json:"offset,omitempty"       mcp:"Pagination offset"`
+	Project       string   `json:"project,omitempty"     mcp:"Filter to a specific project"`
+	Tags          []string `json:"tags,omitempty"         mcp:"Filter by tags"`
+	MemoryType    string   `json:"memory_type,omitempty"  mcp:"Filter by type"`
+	CreatedBy     string   `json:"created_by,omitempty"   mcp:"Filter by creator"`
+	Visibility    string   `json:"visibility,omitempty"   mcp:"Filter by visibility"`
+	SourceBackend string   `json:"source_backend,omitempty" mcp:"Filter by external source backend"`
+	SourceID      string   `json:"source_id,omitempty"      mcp:"Filter to a specific external source document"`
+	Limit         int      `json:"limit,omitempty"        mcp:"Max results (default: 20)"`
+	Offset        int      `json:"offset,omitempty"       mcp:"Pagination offset"`
 	// Scoping
 	SessionID string `json:"session_id,omitempty" mcp:"Filter to a specific session"`
 	AgentID   string `json:"agent_id,omitempty"   mcp:"Filter to a specific agent"`
@@ -241,11 +260,12 @@ type ListEntitiesArgs struct {
 }
 
 type MemoryStatsArgs struct {
-	Project   string `json:"project,omitempty"    mcp:"Filter stats to a specific project"`
-	SessionID string `json:"session_id,omitempty" mcp:"Filter stats to a specific session"`
-	AgentID   string `json:"agent_id,omitempty"   mcp:"Filter stats to a specific agent"`
-	DeviceID  string `json:"device_id,omitempty"  mcp:"Filter stats to a specific device"`
-	Ephemeral bool   `json:"ephemeral,omitempty"  mcp:"Read stats from the ephemeral table instead of persistent (default: false)"`
+	Project       string `json:"project,omitempty"    mcp:"Filter stats to a specific project"`
+	SourceBackend string `json:"source_backend,omitempty" mcp:"Filter stats to a specific external source backend"`
+	SessionID     string `json:"session_id,omitempty" mcp:"Filter stats to a specific session"`
+	AgentID       string `json:"agent_id,omitempty"   mcp:"Filter stats to a specific agent"`
+	DeviceID      string `json:"device_id,omitempty"  mcp:"Filter stats to a specific device"`
+	Ephemeral     bool   `json:"ephemeral,omitempty"  mcp:"Read stats from the ephemeral table instead of persistent (default: false)"`
 }
 
 type ListSessionsArgs struct {

@@ -2,7 +2,7 @@
 
 Shared team memory for AI agents. Open source. Backed by [Antfly](https://antfly.io).
 
-memoryaf gives your AI agents persistent, searchable long-term memory — across sessions, teammates, and projects. It exposes an **MCP server** (for Claude Code, Cursor, and other MCP clients) backed by Antfly's hybrid search and graph indexes.
+memoryaf gives your AI agents persistent, searchable long-term memory — across sessions, teammates, and projects. It exposes an **MCP server** (for Claude Code, Cursor, and other MCP clients), a lightweight **HTTP API**, and an embedded **dashboard UI** backed by Antfly's hybrid search and graph indexes.
 
 This Go package (`pkg/memoryaf`) is the core library.
 
@@ -22,7 +22,20 @@ handler := memoryaf.NewHandler(antflyClient, extractor, logger)
 // Wrap as an MCP HTTP handler.
 mcpHandler := memoryaf.NewMCPHandler(handler, userContextFn)
 http.Handle("/mcp", mcpHandler)
+
+// Or serve the JSON API + embedded dashboard UI.
+httpHandler := memoryaf.NewHTTPHandler(handler, nil)
+http.Handle("/", httpHandler)
 ```
+
+When `NewHTTPHandler` is created with `nil`, it reads identity from request headers:
+
+- `X-User-ID` default: `dashboard`
+- `X-Namespace` default: `default`
+- `X-Role` default: `member`
+- `X-Agent-ID`, `X-Device-ID`, `X-Session-ID`: optional
+
+That keeps the embedded dashboard safe by default while still allowing admin operations when you intentionally opt into them.
 
 ### Entity Extraction
 
@@ -114,6 +127,41 @@ The older `source` field still exists, but it is best treated as free-form origi
 4. Keep the markdown file or external object as the source of truth; use `memoryaf` as the searchable memory/index layer.
 
 See [docsaf-integration.md](./docsaf-integration.md) for the backend mapping conventions.
+
+## Dashboard
+
+The embedded dashboard is served by `NewHTTPHandler`. It includes:
+
+- an overview page with stats, recent memories, and health/info panels
+- memory search, create, edit, delete, related-memory inspection, and sibling-section lookup for docsaf-backed memories
+- entity browsing with linked-memory lookup
+- settings for browser-stored identity, namespace initialization, and ephemeral session management
+
+The HTTP API behind the dashboard exposes:
+
+- `GET /health`
+- `GET /api/v1/info`
+- `GET/POST /api/v1/memories`
+- `POST /api/v1/memories/search`
+- `GET/PUT/DELETE /api/v1/memories/{id}`
+- `GET /api/v1/memories/{id}/related`
+- `GET /api/v1/entities`
+- `GET /api/v1/entities/{label}:{text}/memories`
+- `GET /api/v1/stats`
+- `GET /api/v1/sessions`
+- `POST /api/v1/sessions/{id}/end`
+- `POST /api/v1/namespaces/{namespace}/init`
+
+Unlike the older standalone TS dashboard, this UI understands:
+
+- `ephemeral` session memories
+- `session_id`, `agent_id`, and `device_id`
+- `source_backend`, `source_id`, `source_path`, `source_url`, `source_version`
+- `section_path` for docsaf-derived content
+
+`find_related` and `entity_memories` now use graph merge strategy `intersection`, matching Drew's tighter graph behavior for graph-only traversals.
+
+Source-reference fields are treated as immutable after creation. If an external document identity changes, the recommended flow is to create a replacement memory rather than mutate those identifiers in place.
 
 ## Configuration
 

@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>memoryaf</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">M</div>
+          <div>
+            <p class="eyebrow">Antfly</p>
+            <h1>memoryaf</h1>
+          </div>
+        </div>
+
+        <nav class="nav">
+          <button class="nav-link active" data-view="overview">Overview</button>
+          <button class="nav-link" data-view="memories">Memories</button>
+          <button class="nav-link" data-view="entities">Entities</button>
+          <button class="nav-link" data-view="settings">Settings</button>
+        </nav>
+
+        <section class="identity-card">
+          <p class="eyebrow">Identity</p>
+          <div class="identity-row">
+            <span>User</span>
+            <strong id="identity-user">dashboard</strong>
+          </div>
+          <div class="identity-row">
+            <span>Namespace</span>
+            <strong id="identity-namespace">default</strong>
+          </div>
+          <div class="identity-row">
+            <span>Role</span>
+            <strong id="identity-role">member</strong>
+          </div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="hero">
+          <div>
+            <p class="eyebrow">Shared Agent Memory</p>
+            <h2>Operational memory, docs-derived memory, and session traces in one place.</h2>
+            <p class="hero-copy">
+              Browse long-term memory, inspect extracted entities, and manage docsaf-backed memories with stable source references.
+            </p>
+          </div>
+          <div class="hero-actions">
+            <button id="refresh-all" class="button button-secondary">Refresh</button>
+            <button id="new-memory" class="button">New Memory</button>
+          </div>
+        </header>
+
+        <div id="status-banner" class="banner hidden"></div>
+
+        <section class="view active" id="view-overview">
+          <div class="card-grid metrics-grid">
+            <article class="card metric-card">
+              <p class="eyebrow">Total Memories</p>
+              <strong id="metric-total">0</strong>
+            </article>
+            <article class="card metric-card">
+              <p class="eyebrow">Namespaces</p>
+              <strong id="metric-namespace">default</strong>
+            </article>
+            <article class="card metric-card">
+              <p class="eyebrow">Health</p>
+              <strong id="metric-health">Unknown</strong>
+            </article>
+            <article class="card metric-card">
+              <p class="eyebrow">Extractor</p>
+              <strong id="metric-extractor">Unknown</strong>
+            </article>
+          </div>
+
+          <div class="card-grid overview-grid">
+            <article class="card">
+              <div class="section-heading">
+                <h3>Memory Types</h3>
+                <span class="subtle">By current filter context</span>
+              </div>
+              <div id="chart-types" class="bars"></div>
+            </article>
+            <article class="card">
+              <div class="section-heading">
+                <h3>Projects</h3>
+                <span class="subtle">Top memory clusters</span>
+              </div>
+              <div id="chart-projects" class="bars"></div>
+            </article>
+            <article class="card">
+              <div class="section-heading">
+                <h3>Tags</h3>
+                <span class="subtle">Most common labels</span>
+              </div>
+              <div id="chart-tags" class="bars"></div>
+            </article>
+            <article class="card">
+              <div class="section-heading">
+                <h3>Source Backends</h3>
+                <span class="subtle">Where docs-backed memories come from</span>
+              </div>
+              <div id="chart-sources" class="bars"></div>
+            </article>
+            <article class="card">
+              <div class="section-heading">
+                <h3>Recent Memories</h3>
+                <span class="subtle">Latest writes in the selected namespace</span>
+              </div>
+              <div id="overview-recent" class="stack-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-memories">
+          <div class="toolbar card">
+            <div class="toolbar-row">
+              <input id="memory-query" class="input grow" type="search" placeholder="Search content, decisions, runbooks, docs..." />
+              <input id="memory-project" class="input" type="text" placeholder="Project" />
+              <input id="memory-source-backend" class="input" type="text" placeholder="Source backend" />
+              <select id="memory-type" class="input">
+                <option value="">All Types</option>
+                <option value="semantic">Semantic</option>
+                <option value="episodic">Episodic</option>
+                <option value="procedural">Procedural</option>
+              </select>
+              <select id="memory-visibility" class="input">
+                <option value="">All Visibility</option>
+                <option value="team">Team</option>
+                <option value="private">Private</option>
+              </select>
+            </div>
+            <div class="toolbar-row">
+              <label class="toggle">
+                <input id="memory-ephemeral" type="checkbox" />
+                <span>Ephemeral only</span>
+              </label>
+              <label class="toggle">
+                <input id="memory-expand-graph" type="checkbox" />
+                <span>Graph expansion</span>
+              </label>
+              <button id="apply-memory-filters" class="button button-secondary">Apply</button>
+            </div>
+          </div>
+
+          <div class="split">
+            <article class="card">
+              <div class="section-heading">
+                <h3>Results</h3>
+                <span class="subtle" id="memory-result-summary">No results loaded yet</span>
+              </div>
+              <div id="memory-list" class="stack-list"></div>
+            </article>
+
+            <article class="card detail-card">
+              <div class="section-heading">
+                <h3>Memory Detail</h3>
+                <div class="inline-actions">
+                  <button id="edit-memory" class="button button-secondary" disabled>Edit</button>
+                  <button id="delete-memory" class="button button-danger" disabled>Delete</button>
+                </div>
+              </div>
+              <div id="memory-detail" class="detail-empty">
+                Select a memory to inspect its metadata, entities, and source references.
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-entities">
+          <div class="toolbar card">
+            <div class="toolbar-row">
+              <input id="entity-label" class="input" type="text" placeholder="Filter by label (technology, service...)" />
+              <label class="toggle">
+                <input id="entity-ephemeral" type="checkbox" />
+                <span>Ephemeral only</span>
+              </label>
+              <button id="load-entities" class="button button-secondary">Load Entities</button>
+            </div>
+          </div>
+
+          <div class="split">
+            <article class="card">
+              <div class="section-heading">
+                <h3>Entity Graph Index</h3>
+                <span class="subtle">Extracted terms normalized for graph linkage</span>
+              </div>
+              <div id="entity-list" class="stack-list"></div>
+            </article>
+
+            <article class="card detail-card">
+              <div class="section-heading">
+                <h3>Entity Memories</h3>
+                <span class="subtle" id="entity-detail-heading">Pick an entity to inspect linked memories</span>
+              </div>
+              <div id="entity-detail" class="detail-empty">
+                No entity selected.
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-settings">
+          <div class="card-grid settings-grid">
+            <article class="card">
+              <div class="section-heading">
+                <h3>Identity</h3>
+                <span class="subtle">Stored in your browser for dashboard requests</span>
+              </div>
+              <form id="identity-form" class="form-grid">
+                <label>
+                  <span>User ID</span>
+                  <input id="settings-user-id" class="input" type="text" />
+                </label>
+                <label>
+                  <span>Namespace</span>
+                  <input id="settings-namespace" class="input" type="text" />
+                </label>
+                <label>
+                  <span>Role</span>
+                  <select id="settings-role" class="input">
+                    <option value="member">member</option>
+                    <option value="admin">admin</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Agent ID</span>
+                  <input id="settings-agent-id" class="input" type="text" />
+                </label>
+                <label>
+                  <span>Device ID</span>
+                  <input id="settings-device-id" class="input" type="text" />
+                </label>
+                <label>
+                  <span>Session ID</span>
+                  <input id="settings-session-id" class="input" type="text" />
+                </label>
+                <div class="full-row inline-actions">
+                  <button class="button" type="submit">Save Identity</button>
+                </div>
+              </form>
+            </article>
+
+            <article class="card">
+              <div class="section-heading">
+                <h3>Namespace Setup</h3>
+                <span class="subtle">Admin-only table initialization</span>
+              </div>
+              <form id="namespace-form" class="form-grid">
+                <label class="full-row">
+                  <span>Namespace</span>
+                  <input id="settings-init-namespace" class="input" type="text" placeholder="team-alpha" />
+                </label>
+                <div class="full-row inline-actions">
+                  <button class="button button-secondary" type="submit">Initialize Namespace</button>
+                </div>
+              </form>
+            </article>
+
+            <article class="card">
+              <div class="section-heading">
+                <h3>Server</h3>
+                <span class="subtle">Information and basic health checks</span>
+              </div>
+              <div id="server-info" class="stack-list"></div>
+            </article>
+
+            <article class="card">
+              <div class="section-heading">
+                <h3>Sessions</h3>
+                <span class="subtle">Active ephemeral sessions in this namespace</span>
+              </div>
+              <div class="inline-actions">
+                <button id="refresh-sessions" class="button button-secondary" type="button">Refresh Sessions</button>
+                <button id="end-current-session" class="button button-danger" type="button">End Current Session</button>
+              </div>
+              <div id="session-list" class="stack-list"></div>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="memory-dialog" class="dialog">
+      <form id="memory-form" class="dialog-card">
+        <div class="section-heading">
+          <h3 id="memory-dialog-title">New Memory</h3>
+          <button type="button" class="icon-button" id="close-memory-dialog">Close</button>
+        </div>
+
+        <div class="form-grid">
+          <label class="full-row">
+            <span>Content</span>
+            <textarea id="form-content" class="input textarea" required></textarea>
+          </label>
+
+          <label>
+            <span>Type</span>
+            <select id="form-memory-type" class="input">
+              <option value="semantic">semantic</option>
+              <option value="episodic">episodic</option>
+              <option value="procedural">procedural</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Visibility</span>
+            <select id="form-visibility" class="input">
+              <option value="team">team</option>
+              <option value="private">private</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Project</span>
+            <input id="form-project" class="input" type="text" />
+          </label>
+
+          <label>
+            <span>Source</span>
+            <input id="form-source" class="input" type="text" placeholder="dashboard, docsaf sync, api..." />
+          </label>
+
+          <label class="full-row">
+            <span>Tags</span>
+            <input id="form-tags" class="input" type="text" placeholder="comma,separated,tags" />
+          </label>
+
+          <label class="toggle full-row">
+            <input id="form-ephemeral" type="checkbox" />
+            <span>Store as ephemeral/session memory</span>
+          </label>
+
+          <label>
+            <span>Session ID</span>
+            <input id="form-session-id" class="input" type="text" />
+          </label>
+
+          <label>
+            <span>Agent ID</span>
+            <input id="form-agent-id" class="input" type="text" />
+          </label>
+
+          <label>
+            <span>Device ID</span>
+            <input id="form-device-id" class="input" type="text" />
+          </label>
+
+          <label>
+            <span>Event Time</span>
+            <input id="form-event-time" class="input" type="datetime-local" />
+          </label>
+
+          <label class="full-row">
+            <span>Context</span>
+            <textarea id="form-context" class="input textarea small"></textarea>
+          </label>
+
+          <label>
+            <span>Confidence</span>
+            <input id="form-confidence" class="input" type="number" step="0.01" min="0" max="1" />
+          </label>
+
+          <label>
+            <span>Supersedes</span>
+            <input id="form-supersedes" class="input" type="text" />
+          </label>
+
+          <label>
+            <span>Trigger</span>
+            <input id="form-trigger" class="input" type="text" />
+          </label>
+
+          <label class="full-row">
+            <span>Steps</span>
+            <textarea id="form-steps" class="input textarea small" placeholder="One step per line"></textarea>
+          </label>
+
+          <label class="full-row">
+            <span>Outcome</span>
+            <textarea id="form-outcome" class="input textarea small"></textarea>
+          </label>
+        </div>
+
+        <section id="source-fields" class="source-fields">
+          <div class="section-heading">
+            <h4>External Source Reference</h4>
+            <span class="subtle">Useful for docsaf- or markdown-derived memory</span>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span>Source Backend</span>
+              <input id="form-source-backend" class="input" type="text" placeholder="filesystem, git, s3, google_drive, web" />
+            </label>
+            <label>
+              <span>Source ID</span>
+              <input id="form-source-id" class="input" type="text" />
+            </label>
+            <label class="full-row">
+              <span>Source Path</span>
+              <input id="form-source-path" class="input" type="text" />
+            </label>
+            <label class="full-row">
+              <span>Source URL</span>
+              <input id="form-source-url" class="input" type="url" />
+            </label>
+            <label>
+              <span>Source Version</span>
+              <input id="form-source-version" class="input" type="text" />
+            </label>
+            <label class="full-row">
+              <span>Section Path</span>
+              <input id="form-section-path" class="input" type="text" placeholder="Heading 1, Heading 2" />
+            </label>
+          </div>
+          <p id="source-readonly-note" class="subtle hidden">
+            Source-reference fields are treated as immutable after creation. Create a replacement memory if those identifiers change.
+          </p>
+        </section>
+
+        <div class="inline-actions">
+          <button type="submit" class="button">Save Memory</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

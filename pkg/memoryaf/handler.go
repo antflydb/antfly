@@ -123,7 +123,7 @@ func memoryKey(id string) string {
 
 // entityKey returns the Antfly document key for an entity.
 func entityKey(label, text string) string {
-	normalized := strings.ToLower(strings.TrimSpace(text))
+	normalized := strings.ToLower(normalizeEntityText(text))
 	normalized = whitespaceRe.ReplaceAllString(normalized, "_")
 	return "ent:" + label + ":" + normalized
 }
@@ -265,6 +265,11 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 	return nil
 }
 
+// InitNamespace ensures the backing tables and indexes exist for a namespace.
+func (h *Handler) InitNamespace(ctx context.Context, namespace string) error {
+	return h.ensureNamespace(ctx, namespace)
+}
+
 // --- Query helpers ---
 
 func buildFilterQuery(opts filterOpts, ctx *UserContext) *query.Query {
@@ -278,6 +283,12 @@ func buildFilterQuery(opts filterOpts, ctx *UserContext) *query.Query {
 	}
 	if opts.CreatedBy != "" {
 		clauses = append(clauses, query.NewTerm(opts.CreatedBy, "created_by"))
+	}
+	if opts.SourceBackend != "" {
+		clauses = append(clauses, query.NewTerm(opts.SourceBackend, "source_backend"))
+	}
+	if opts.SourceID != "" {
+		clauses = append(clauses, query.NewTerm(opts.SourceID, "source_id"))
 	}
 	if opts.EntityType != "" {
 		clauses = append(clauses, query.NewTerm(opts.EntityType, "entity_type"))
@@ -318,15 +329,17 @@ func buildFilterQuery(opts filterOpts, ctx *UserContext) *query.Query {
 }
 
 type filterOpts struct {
-	Project    string
-	Tags       []string
-	MemoryType string
-	CreatedBy  string
-	Visibility string
-	EntityType string
-	SessionID  string
-	AgentID    string
-	DeviceID   string
+	Project       string
+	Tags          []string
+	MemoryType    string
+	CreatedBy     string
+	Visibility    string
+	SourceBackend string
+	SourceID      string
+	EntityType    string
+	SessionID     string
+	AgentID       string
+	DeviceID      string
 }
 
 // resolveScope fills in explicit scope filter fields from UserContext when a
@@ -582,14 +595,16 @@ func (h *Handler) ListMemories(ctx context.Context, args ListMemoriesArgs, uctx 
 	}
 
 	filter := buildFilterQuery(filterOpts{
-		Project:    args.Project,
-		Tags:       args.Tags,
-		MemoryType: args.MemoryType,
-		CreatedBy:  args.CreatedBy,
-		Visibility: args.Visibility,
-		SessionID:  args.SessionID,
-		AgentID:    args.AgentID,
-		DeviceID:   args.DeviceID,
+		Project:       args.Project,
+		Tags:          args.Tags,
+		MemoryType:    args.MemoryType,
+		CreatedBy:     args.CreatedBy,
+		Visibility:    args.Visibility,
+		SourceBackend: args.SourceBackend,
+		SourceID:      args.SourceID,
+		SessionID:     args.SessionID,
+		AgentID:       args.AgentID,
+		DeviceID:      args.DeviceID,
 	}, &uctx)
 
 	reqMap := map[string]any{
@@ -644,13 +659,15 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 	}
 
 	filter := buildFilterQuery(filterOpts{
-		Project:    args.Project,
-		Tags:       args.Tags,
-		MemoryType: args.MemoryType,
-		CreatedBy:  args.CreatedBy,
-		SessionID:  args.SessionID,
-		AgentID:    args.AgentID,
-		DeviceID:   args.DeviceID,
+		Project:       args.Project,
+		Tags:          args.Tags,
+		MemoryType:    args.MemoryType,
+		CreatedBy:     args.CreatedBy,
+		SourceBackend: args.SourceBackend,
+		SourceID:      args.SourceID,
+		SessionID:     args.SessionID,
+		AgentID:       args.AgentID,
+		DeviceID:      args.DeviceID,
 	}, &uctx)
 
 	ftsQuery := query.MatchQuery{Match: args.Query}.ToQuery()
@@ -754,7 +771,7 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 				"include_documents": true,
 			},
 		},
-		"graph_merge_strategy": "union",
+		"graph_merge_strategy": "intersection",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
@@ -814,7 +831,7 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 				"include_documents": true,
 			},
 		},
-		"graph_merge_strategy": "union",
+		"graph_merge_strategy": "intersection",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
@@ -894,10 +911,11 @@ func (h *Handler) GetStats(ctx context.Context, args MemoryStatsArgs, uctx UserC
 
 	table := tableForNamespace(uctx.Namespace, args.Ephemeral)
 	filter := buildFilterQuery(filterOpts{
-		Project:   args.Project,
-		SessionID: args.SessionID,
-		AgentID:   args.AgentID,
-		DeviceID:  args.DeviceID,
+		Project:       args.Project,
+		SourceBackend: args.SourceBackend,
+		SessionID:     args.SessionID,
+		AgentID:       args.AgentID,
+		DeviceID:      args.DeviceID,
 	}, &uctx)
 
 	reqMap := map[string]any{
@@ -906,12 +924,13 @@ func (h *Handler) GetStats(ctx context.Context, args MemoryStatsArgs, uctx UserC
 		"limit":            0,
 		"count":            true,
 		"aggregations": map[string]any{
-			"by_type":       map[string]any{"type": "terms", "field": "memory_type", "size": 5},
-			"by_project":    map[string]any{"type": "terms", "field": "project", "size": 20},
-			"by_tag":        map[string]any{"type": "terms", "field": "tags", "size": 30},
-			"by_visibility": map[string]any{"type": "terms", "field": "visibility", "size": 2},
-			"by_agent":      map[string]any{"type": "terms", "field": "agent_id", "size": 20},
-			"by_session":    map[string]any{"type": "terms", "field": "session_id", "size": 50},
+			"by_type":           map[string]any{"type": "terms", "field": "memory_type", "size": 5},
+			"by_project":        map[string]any{"type": "terms", "field": "project", "size": 20},
+			"by_tag":            map[string]any{"type": "terms", "field": "tags", "size": 30},
+			"by_visibility":     map[string]any{"type": "terms", "field": "visibility", "size": 2},
+			"by_source_backend": map[string]any{"type": "terms", "field": "source_backend", "size": 10},
+			"by_agent":          map[string]any{"type": "terms", "field": "agent_id", "size": 20},
+			"by_session":        map[string]any{"type": "terms", "field": "session_id", "size": 50},
 		},
 	}
 	if filter != nil {
@@ -1077,7 +1096,7 @@ func (h *Handler) extractEntities(ctx context.Context, text string) []Entity {
 			})
 		}
 	}
-	return entities
+	return dedupeEntities(entities)
 }
 
 func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content, table string) []Entity {
@@ -1106,6 +1125,7 @@ func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content,
 			})
 		}
 	}
+	filtered = dedupeEntities(filtered)
 	if len(filtered) == 0 {
 		return nil
 	}
@@ -1120,9 +1140,12 @@ func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content,
 	for _, entity := range filtered {
 		eKey := entityKey(entity.Label, entity.Text)
 		inserts[eKey] = map[string]any{
-			"entity_type": entityDocType,
-			"text":        entity.Text,
-			"label":       entity.Label,
+			"entity_type":   entityDocType,
+			"text":          entity.Text,
+			"label":         entity.Label,
+			"mention_count": 0,
+			"first_seen":    now,
+			"last_seen":     now,
 		}
 		edgesByType["mentions"] = append(edgesByType["mentions"], map[string]any{
 			"target": eKey,

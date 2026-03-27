@@ -3,6 +3,7 @@ package memoryaf
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // mustMarshal marshals v to JSON or panics.
@@ -93,24 +94,26 @@ func statsFromResponse(data []byte) (*MemoryStats, error) {
 	}
 	if len(resp.Responses) == 0 {
 		return &MemoryStats{
-			ByType:       map[string]int{},
-			ByProject:    map[string]int{},
-			ByTag:        map[string]int{},
-			ByVisibility: map[string]int{},
-			ByAgent:      map[string]int{},
-			BySession:    map[string]int{},
+			ByType:          map[string]int{},
+			ByProject:       map[string]int{},
+			ByTag:           map[string]int{},
+			ByVisibility:    map[string]int{},
+			BySourceBackend: map[string]int{},
+			ByAgent:         map[string]int{},
+			BySession:       map[string]int{},
 		}, nil
 	}
 
 	r := resp.Responses[0]
 	return &MemoryStats{
-		TotalMemories: int(r.Hits.Total),
-		ByType:        bucketsToMap(r.Aggregations["by_type"]),
-		ByProject:     bucketsToMap(r.Aggregations["by_project"]),
-		ByTag:         bucketsToMap(r.Aggregations["by_tag"]),
-		ByVisibility:  bucketsToMap(r.Aggregations["by_visibility"]),
-		ByAgent:       bucketsToMap(r.Aggregations["by_agent"]),
-		BySession:     bucketsToMap(r.Aggregations["by_session"]),
+		TotalMemories:   int(r.Hits.Total),
+		ByType:          bucketsToMap(r.Aggregations["by_type"]),
+		ByProject:       bucketsToMap(r.Aggregations["by_project"]),
+		ByTag:           bucketsToMap(r.Aggregations["by_tag"]),
+		ByVisibility:    bucketsToMap(r.Aggregations["by_visibility"]),
+		BySourceBackend: bucketsToMap(r.Aggregations["by_source_backend"]),
+		ByAgent:         bucketsToMap(r.Aggregations["by_agent"]),
+		BySession:       bucketsToMap(r.Aggregations["by_session"]),
 	}, nil
 }
 
@@ -166,17 +169,20 @@ func getStringSlice(m map[string]any, key string) []string {
 	if !ok {
 		return nil
 	}
-	arr, ok := v.([]any)
-	if !ok {
+	switch arr := v.(type) {
+	case []string:
+		return append([]string(nil), arr...)
+	case []any:
+		var out []string
+		for _, item := range arr {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
 		return nil
 	}
-	var out []string
-	for _, item := range arr {
-		if s, ok := item.(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 func getEntities(m map[string]any, key string) []Entity {
@@ -379,6 +385,42 @@ func entitiesToSlice(entities []Entity) []any {
 			"label": e.Label,
 			"score": e.Score,
 		}
+	}
+	return out
+}
+
+func normalizeEntityText(text string) string {
+	text = whitespaceRe.ReplaceAllString(strings.TrimSpace(text), " ")
+	text = strings.Trim(text, "\"'")
+	text = strings.TrimSpace(text)
+	text = strings.TrimRight(text, ".,;:!?")
+	text = whitespaceRe.ReplaceAllString(strings.TrimSpace(text), " ")
+	return text
+}
+
+func dedupeEntities(entities []Entity) []Entity {
+	if len(entities) == 0 {
+		return nil
+	}
+
+	var out []Entity
+	indexByText := make(map[string]int, len(entities))
+	for _, entity := range entities {
+		entity.Text = normalizeEntityText(entity.Text)
+		if entity.Text == "" {
+			continue
+		}
+
+		key := strings.ToLower(entity.Text)
+		if idx, ok := indexByText[key]; ok {
+			if entity.Score > out[idx].Score {
+				out[idx] = entity
+			}
+			continue
+		}
+
+		indexByText[key] = len(out)
+		out = append(out, entity)
 	}
 	return out
 }
