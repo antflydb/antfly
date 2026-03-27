@@ -1331,6 +1331,21 @@ func computeSplitTransitions(
 			if autoTransitionsPerTable[status.Table] >= autoRangeTransitionPerTableLimit {
 				continue
 			}
+			// Generate a new unique shard ID for the split
+			// Note: This uses a hash of table name, shard ID, and byte range
+			newShardID := types.ID(
+				xxhash.Sum64(fmt.Append(nil, status.Table, status.ID, status.ByteRange)),
+			)
+
+			// Avoid ID collision with parent or existing child shard
+			// (e.g., after metadata failover loses cooldown state)
+			if shardID == newShardID {
+				continue
+			}
+			if _, exists := shards[newShardID]; exists {
+				continue
+			}
+
 			// Get median key for splitting
 			medianKey, err := getMedianKey(ctx, shardID)
 			if err != nil {
@@ -1340,17 +1355,6 @@ func computeSplitTransitions(
 
 			if len(medianKey) == 0 {
 				// Skip if median key is empty (can't split)
-				continue
-			}
-
-			// Generate a new unique shard ID for the split
-			// Note: This uses a hash of table name, shard ID, and byte range
-			newShardID := types.ID(
-				xxhash.Sum64(fmt.Append(nil, status.Table, status.ID, status.ByteRange)),
-			)
-
-			// Avoid ID collision
-			if shardID == newShardID {
 				continue
 			}
 
