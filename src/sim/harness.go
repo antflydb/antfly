@@ -22,6 +22,7 @@ import (
 	"github.com/antflydb/antfly/src/store"
 	storeclient "github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/store/db"
+	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -512,6 +513,26 @@ func (h *Harness) ShardForKey(tableName, key string) (types.ID, error) {
 	shardID, err := table.FindShardForKey(key)
 	if err != nil {
 		return 0, fmt.Errorf("finding shard for %s/%s: %w", tableName, key, err)
+	}
+	status, err := h.tableManager.GetShardStatus(shardID)
+	if err != nil || status == nil || status.SplitState == nil {
+		return shardID, nil
+	}
+	if status.SplitState.GetPhase() == db.SplitState_PHASE_NONE || status.SplitState.GetNewShardId() == 0 {
+		return shardID, nil
+	}
+	keyBytes := storeutils.KeyRangeStart([]byte(key))
+	splitKey := status.SplitState.GetSplitKey()
+	if len(splitKey) == 0 || bytes.Compare(keyBytes, splitKey) < 0 {
+		return shardID, nil
+	}
+	childID := types.ID(status.SplitState.GetNewShardId())
+	childStatus, err := h.tableManager.GetShardStatus(childID)
+	if err != nil || childStatus == nil || childStatus.Table != tableName {
+		return shardID, nil
+	}
+	if childStatus.ByteRange.Contains(keyBytes) {
+		return childID, nil
 	}
 	return shardID, nil
 }
