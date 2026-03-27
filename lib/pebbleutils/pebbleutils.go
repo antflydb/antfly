@@ -122,6 +122,14 @@ func (c *Cache) Apply(opts *pebble.Options, fallbackBytes int64) {
 	}
 }
 
+// IgnorePebbleClosed normalizes Pebble closed errors to nil in shutdown paths
+// where concurrent close is expected and should not be treated as fatal.
+func IgnorePebbleClosed(err *error) {
+	if err != nil && errors.Is(*err, pebble.ErrClosed) {
+		*err = nil
+	}
+}
+
 // RecoverPebbleClosed recovers from pebble.ErrClosed panics during shutdown.
 // Pebble panics (rather than returning an error) when operating on a closed DB.
 // This helper converts the panic to an error for graceful shutdown handling.

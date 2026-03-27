@@ -401,7 +401,10 @@ func (ei *EmbeddingIndex) RenderPrompt(doc map[string]any) (string, uint64, erro
 	return prompt, hashID, nil
 }
 
-func (i *EmbeddingIndex) Close() error {
+func (i *EmbeddingIndex) Close() (err error) {
+	defer pebbleutils.IgnorePebbleClosed(&err)
+	defer pebbleutils.RecoverPebbleClosed(&err)
+
 	if i == nil {
 		return nil
 	}
@@ -425,7 +428,7 @@ func (i *EmbeddingIndex) Close() error {
 	}
 
 	// Now safe to close resources since plexer has stopped
-	if err := i.walBuf.Close(); err != nil {
+	if err := i.walBuf.Close(); err != nil && !errors.Is(err, inflight.ErrBufferClosed) {
 		return fmt.Errorf("closing WAL buffer: %w", err)
 	}
 	if err := i.idx.Close(); err != nil {

@@ -1880,12 +1880,46 @@ func (db *DBImpl) deleteDenseEmbeddingsSplitRebuildState(batch *pebble.Batch, in
 	return nil
 }
 
-func (db *DBImpl) removeSplitRebuildIndexDirs(indexNames []string) error {
-	for _, name := range indexNames {
-		if err := os.RemoveAll(filepath.Join(db.dir, "indexes", name)); err != nil {
-			return fmt.Errorf("removing index directory for %s: %w", name, err)
+func (db *DBImpl) rebuildIndexesAfterFinalize(
+	newRange types.Range,
+	denseEmbeddings []string,
+	sparseEmbeddings []string,
+) error {
+	im := db.getIndexManager()
+	if im == nil {
+		return nil
+	}
+	if err := im.UpdateRange(newRange); err != nil {
+		return fmt.Errorf("updating index ranges after finalize: %w", err)
+	}
+
+	rebuildIndexNames := append(append([]string(nil), denseEmbeddings...), sparseEmbeddings...)
+	if len(rebuildIndexNames) == 0 {
+		return nil
+	}
+
+	db.indexesMu.RLock()
+	rebuildConfigs := make(map[string]indexes.IndexConfig, len(rebuildIndexNames))
+	for _, name := range rebuildIndexNames {
+		conf, ok := db.indexes[name]
+		if !ok {
+			db.indexesMu.RUnlock()
+			return fmt.Errorf("missing index config for split rebuild: %s", name)
+		}
+		rebuildConfigs[name] = conf
+	}
+	db.indexesMu.RUnlock()
+
+	for _, name := range rebuildIndexNames {
+		if err := im.Unregister(name); err != nil {
+			return fmt.Errorf("unregistering index %s for split rebuild: %w", name, err)
+		}
+		if err := im.Register(name, true, rebuildConfigs[name]); err != nil {
+			return fmt.Errorf("registering index %s for split rebuild: %w", name, err)
 		}
 	}
+
+	im.WaitForNamedBackfills(context.Background(), rebuildIndexNames)
 	return nil
 }
 
@@ -2072,47 +2106,11 @@ func (db *DBImpl) finalizeSplitInternal(newRange types.Range, destDir1 string) e
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("committing range update: %w", err)
 	}
-	if err := db.Close(); err != nil {
-		// NOTE: "leaked iterators" errors can occur here if background workers
-		// (TTL cleaner, transaction recovery) have active iterators when Close() is called.
-		// These workers run under LeaderFactory context which isn't cancelled by this call.
-		// The workers handle pebble.ErrClosed gracefully, so this is non-fatal.
-		db.logger.Warn("Error closing db after range update", zap.Error(err))
-	}
-	rebuildIndexDirs := append(append([]string(nil), denseEmbeddingsToRebuild...), sparseEmbeddingsToRebuild...)
-	if len(rebuildIndexDirs) > 0 {
-		if err := db.removeSplitRebuildIndexDirs(rebuildIndexDirs); err != nil {
-			return fmt.Errorf("removing embeddings index directories for split rebuild: %w", err)
-		}
-	}
-
-	// Move prebuilt indexes into place if a caller provided them. The current split
-	// path prunes the existing parent indexes in place, so this is legacy-only.
-	if destDir1 != "" {
-		oldIndexesPath := filepath.Join(db.dir, "indexes")
-		newIndexesPath := filepath.Join(destDir1, "indexes")
-		tempIndexesPath := filepath.Join(db.dir, "indexes.old")
-
-		// Move old indexes out of the way
-		if err := os.Rename(oldIndexesPath, tempIndexesPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("renaming old indexes directory: %w", err)
-		}
-
-		// Move new indexes into place
-		if err := os.Rename(newIndexesPath, oldIndexesPath); err != nil {
-			return fmt.Errorf("moving new indexes to db directory: %w", err)
-		}
-
-		// Clean up old indexes
-		_ = os.RemoveAll(tempIndexesPath)
-	}
-
-	// Re-open the DB to ensure everything is in a clean state
-	if err := db.Open(db.dir, true, db.schema, db.getByteRange()); err != nil {
-		return fmt.Errorf("re-opening db after range update: %w", err)
-	}
-	if len(rebuildIndexDirs) > 0 {
-		db.getIndexManager().WaitForNamedBackfills(context.Background(), rebuildIndexDirs)
+	// Keep the parent Pebble DB open while finalizing the split. Closing and
+	// reopening here races live readers and background leader workers that still
+	// share this DB handle. Update the active indexes in place instead.
+	if err := db.rebuildIndexesAfterFinalize(newRange, denseEmbeddingsToRebuild, sparseEmbeddingsToRebuild); err != nil {
+		return fmt.Errorf("refreshing indexes after range update: %w", err)
 	}
 
 	return nil

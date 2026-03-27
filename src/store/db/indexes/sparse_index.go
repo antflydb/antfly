@@ -791,7 +791,10 @@ func (si *SparseIndex) Stats() IndexStats {
 	return is.AsIndexStats()
 }
 
-func (si *SparseIndex) Close() error {
+func (si *SparseIndex) Close() (err error) {
+	defer pebbleutils.IgnorePebbleClosed(&err)
+	defer pebbleutils.RecoverPebbleClosed(&err)
+
 	if si == nil {
 		return nil
 	}
@@ -811,7 +814,7 @@ func (si *SparseIndex) Close() error {
 	}
 
 	if si.walBuf != nil {
-		if err := si.walBuf.Close(); err != nil {
+		if err := si.walBuf.Close(); err != nil && !errors.Is(err, inflight.ErrBufferClosed) {
 			return fmt.Errorf("closing WAL buffer: %w", err)
 		}
 	}
@@ -832,9 +835,6 @@ func (si *SparseIndex) Close() error {
 }
 
 func (si *SparseIndex) Delete() error {
-	if err := si.Close(); err != nil {
-		return err
-	}
 	return os.RemoveAll(si.indexPath)
 }
 
