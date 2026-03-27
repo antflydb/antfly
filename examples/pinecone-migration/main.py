@@ -2,7 +2,11 @@
 Pinecone to Antfly Migration Script
 ====================================
 
-Migrates vectors from Pinecone to Antfly.
+Migrates pre-computed vectors from Pinecone to Antfly.
+
+The Antfly-side pattern in this example also applies to vector exports from
+Milvus, Weaviate, pgvector, and other systems where you already have vectors.
+Only the fetch step in this script is Pinecone-specific.
 
 Usage:
     python main.py
@@ -28,16 +32,9 @@ from antfly.exceptions import AntflyException
 PINECONE_INDEX_NAME = "my-pinecone-index" # Your Pinecone index name
 TABLE_NAME = PINECONE_INDEX_NAME          # Antfly table name (using same name)
 INDEX_NAME = "nomic_index"                # Name for the vector index in Antfly
-TEMPLATE = "{{text}}"                     # Handlebars template - which field(s) to embed
-QUERY_TEXT = "example search"             # Test query for verification
+DISTANCE_METRIC = "cosine"                # Match the metric used by your source index
 
 ANTFLY_BASE_URL = os.getenv("ANTFLY_BASE_URL", "http://localhost:8080/api/v1")
-
-# Embedder configuration (optional)
-# Set these if you have a local embedder matching your Pinecone vectors' dimension
-# Common options: ("ollama", "nomic-embed-text") for 768d, ("openai", "text-embedding-3-small") for 1536d
-EMBEDDER_PROVIDER = "ollama"              # "ollama", "termite", or "openai"
-EMBEDDER_MODEL = "nomic-embed-text"       # Model name
 # ANCHOR_END: config
 
 
@@ -112,19 +109,19 @@ def main():
         print(f"\nCreating vector index '{INDEX_NAME}' with dimension {dimension}...")
         index_config = {
             "name": INDEX_NAME,
-            "type": "aknn_v0",
+            "type": "embeddings",
+            "external": True,
             "dimension": dimension,
-            "template": TEMPLATE,
-            "embedder": {"provider": EMBEDDER_PROVIDER, "model": EMBEDDER_MODEL}
+            "distance_metric": DISTANCE_METRIC,
         }
-        print(f"  -> Using embedder: {EMBEDDER_PROVIDER}/{EMBEDDER_MODEL}")
+        print(f"  -> Creating external index for imported vectors (metric: {DISTANCE_METRIC})")
 
         resp = httpx.post(
             f"{ANTFLY_BASE_URL}/tables/{TABLE_NAME}/indexes/{INDEX_NAME}",
             json=index_config,
             timeout=30.0
         )
-        if resp.status_code == 200:
+        if resp.status_code in (200, 201):
             print("Index created successfully.")
         else:
             print(f"Index creation response: {resp.status_code} - {resp.text}")
@@ -136,7 +133,7 @@ def main():
     # ANCHOR_END: create_index
 
     # ANCHOR: fetch_vectors
-    def fetch_all_vectors(pc_index, namespace: str):
+    def fetch_all_vectors(pc_index, namespace: str, dim: int):
         """
         Fetch all vectors from a Pinecone namespace.
 
@@ -144,9 +141,6 @@ def main():
         since Pinecone doesn't have a direct "list all" API.
         """
         print(f"Fetching vectors from namespace: '{namespace}'...")
-
-        stats = pc_index.describe_index_stats()
-        dim = stats['dimension']
 
         # Query with zero vector to get all vectors
         query_response = pc_index.query(
@@ -167,7 +161,7 @@ def main():
     # Fetch from all namespaces
     all_vectors = {}
     for namespace in namespaces:
-        vectors = fetch_all_vectors(pinecone_index, namespace)
+        vectors = fetch_all_vectors(pinecone_index, namespace, dimension)
 
         if not vectors:
             continue
@@ -246,32 +240,44 @@ def main():
     except Exception as e:
         print(f"Verification failed: {e}")
 
-    # --- Test semantic search ---
-    print(f"\nTesting semantic search with: '{QUERY_TEXT}'...")
-    try:
-        resp = httpx.post(
-            f"{ANTFLY_BASE_URL}/tables/{TABLE_NAME}/query",
-            json={"semantic": {"index": INDEX_NAME, "query": QUERY_TEXT}, "limit": 3},
-            timeout=30.0
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            hits = data.get('responses', [{}])[0].get('hits', {}).get('hits', [])
-            if hits:
-                print("Results:")
-                for hit in hits:
-                    score = hit.get('_score', 0)
-                    text = hit.get('_source', {}).get('text', '')[:60]
-                    print(f"  [{score:.4f}] {text}...")
+    # --- Test vector search using one of the imported vectors ---
+    sample_key = None
+    sample_vector = None
+    for items in all_vectors.values():
+        if items:
+            sample_key = items[0]['id']
+            sample_vector = items[0]['values']
+            break
+
+    if sample_vector is not None:
+        print(f"\nTesting vector search using imported vector from key '{sample_key}'...")
+        try:
+            resp = httpx.post(
+                f"{ANTFLY_BASE_URL}/tables/{TABLE_NAME}/query",
+                json={"embeddings": {INDEX_NAME: sample_vector}, "limit": 3},
+                timeout=30.0
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                hits = data.get('responses', [{}])[0].get('hits', {}).get('hits', [])
+                if hits:
+                    print("Results:")
+                    for hit in hits:
+                        score = hit.get('_score', 0)
+                        key = hit.get('_id', 'unknown')
+                        print(f"  [{score:.4f}] {key}")
+                else:
+                    print("  (no results)")
             else:
-                print("  (no results)")
-    except Exception as e:
-        print(f"  Search failed: {e}")
+                print(f"  Search failed: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"  Search failed: {e}")
+    else:
+        print("\nSkipping verification search because no vectors were imported.")
 
     print("\n=== Done ===")
     print(f"Table: {TABLE_NAME}")
-    print(f"Index: {INDEX_NAME} (dimension: {dimension})")
-    print(f"Embedder: {EMBEDDER_PROVIDER}/{EMBEDDER_MODEL}")
+    print(f"Index: {INDEX_NAME} (dimension: {dimension}, metric: {DISTANCE_METRIC})")
     # ANCHOR_END: verify
 
 

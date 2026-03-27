@@ -2,6 +2,10 @@
 
 Migrate your vector embeddings from Pinecone to Antfly.
 
+This example also covers the Antfly-side pattern for other systems that already
+have vectors, such as Milvus, Weaviate, pgvector exports, or custom offline
+embedding pipelines. Only the fetch step in `main.py` is Pinecone-specific.
+
 ## Use Cases
 
 - **Cost reduction**: Move from cloud-based Pinecone to local Antfly
@@ -18,9 +22,11 @@ Migrate your vector embeddings from Pinecone to Antfly.
 pip install -r requirements.txt
 ```
 
-## Embedding Model Compatibility
+## Vector Compatibility
 
-Your Pinecone index stores embeddings at a specific **dimension** (e.g., 768 for `nomic-embed-text`). To enable semantic search in Antfly, configure an embedder that produces vectors of the **same dimension**.
+Your source index stores embeddings at a specific **dimension** and uses a
+specific **distance metric**. To preserve search behavior in Antfly, create an
+external embeddings index with the same dimension and metric.
 
 ### Check Your Pinecone Dimension
 
@@ -33,14 +39,18 @@ stats = pc.Index("your-index").describe_index_stats()
 print(f"Dimension: {stats['dimension']}")
 ```
 
-### Common Models and Dimensions
+### What must match
 
-| Model | Dimension | Provider |
-|-------|-----------|----------|
-| nomic-embed-text | 768 | Ollama |
-| mxbai-embed-large | 1024 | Ollama |
-| text-embedding-3-small | 1536 | OpenAI |
-| all-minilm | 384 | Ollama |
+- `dimension`: Vector length (e.g. 768, 1024, 1536)
+- `distance_metric`: Usually `cosine`, `inner_product`, or `l2_squared`
+
+This example creates an Antfly embeddings index with:
+- `external: true`
+- the source vector `dimension`
+- the configured `distance_metric`
+
+No `embedder`, `field`, or `template` is used for this migration index, because
+the vectors are already computed upstream.
 
 ## Schemaless Storage
 
@@ -48,7 +58,7 @@ Antfly tables are **schemaless**. When migrating from Pinecone:
 
 - Each vector's **metadata** becomes top-level document fields
 - The **id** becomes the document key
-- Pre-computed embeddings go in the `_embeddings` field
+- Pre-computed embeddings go in the `_embeddings` field for an `external: true` index
 
 Example:
 ```
@@ -85,7 +95,9 @@ Tables are schemaless - no schema definition needed:
 
 ### 3. Create Vector Index
 
-The index is created before inserting data so Antfly knows where to store embeddings:
+The index is created before inserting data so Antfly knows where to store imported vectors.
+This is an **external** index, meaning Antfly will accept vectors written through
+`_embeddings` and will not try to generate them from document fields:
 
 <!-- include: main.py#create_index -->
 
@@ -105,15 +117,28 @@ Vectors are batch-upserted with the `_embeddings` field:
 
 <!-- include: main.py#verify -->
 
+The verification query uses one of the imported vectors directly via the query
+`embeddings` field. This keeps the example consistent with `external: true`
+indexes, which do not have an embedder for text-to-vector conversion.
+
 ## Troubleshooting
 
-### "No matching embedder"
+### "manual _embeddings are not allowed"
 
-Install the matching model. For Ollama:
-```bash
-ollama pull nomic-embed-text
-```
+The Antfly index was probably created as a managed index. For imported vectors,
+create the index with `external: true` and do not set `field`, `template`, or
+`embedder`.
 
 ### "Hit 1000 limit"
 
 Increase `top_k` in `fetch_all_vectors()` or implement pagination for larger datasets.
+
+### Adapting this example for Milvus / Weaviate / pgvector
+
+Reuse the same Antfly-side steps:
+- create the table
+- create an `external: true` embeddings index
+- write vectors via `_embeddings`
+- verify with a query-time `embeddings` vector
+
+Only the export/fetch step changes based on your source system.

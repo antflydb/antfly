@@ -56,6 +56,29 @@ export POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/postgres"
 ./postgres-sync --create-table
 ```
 
+## Memory Examples
+
+### [memoryaf + docsaf](./memoryaf/)
+
+Turn documentation into `memoryaf` records from local files, Git, S3, Google Drive, or web sources, with local watch mode for filesystem sync.
+
+**Use cases:**
+- Searchable long-term memory built from docs
+- Markdown knowledge bases with stable source references
+- Live local-doc sync during authoring
+
+**Features:**
+- `docsaf` section extraction for Markdown, MDX, OpenAPI, and more
+- `memoryaf` source references (`source_id`, `source_path`, `section_path`, etc.)
+- One-shot sync across multiple `docsaf` backends plus `fsnotify` watch mode for local directories
+- Create/update/delete reconciliation against managed memories
+
+**Quick start:**
+```bash
+cd examples/memoryaf
+GOWORK=off go run . watch --dir ../../docs --project antfly-docs
+```
+
 ## Comparison
 
 | Feature | Markdown Sync | Postgres Sync |
