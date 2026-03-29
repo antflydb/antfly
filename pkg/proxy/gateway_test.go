@@ -69,6 +69,29 @@ func TestGatewayServeHTTP(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsNonTablePublicPath(t *testing.T) {
+	gateway := NewGateway(NewRouter([]NamespaceRoute{
+		{
+			Tenant:          "t1",
+			Table:           "docs",
+			Namespace:       "docs",
+			AllowServerless: true,
+			ServerlessURL:   "http://serverless-query.default.svc:8080",
+		},
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/tenants/t1/namespaces/docs/search", nil)
+	rec := httptest.NewRecorder()
+	gateway.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got status %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "tenant and table are required\n" {
+		t.Fatalf("unexpected body %q", rec.Body.String())
+	}
+}
+
 func TestGatewayServeHTTPProxyForward(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/tables/docs/query/search" {
@@ -119,6 +142,9 @@ func TestGatewayServeHTTPProxyForward(t *testing.T) {
 	}
 	if rec.Header().Get("X-Antfly-Table") != "docs" {
 		t.Fatalf("missing normalized table header")
+	}
+	if rec.Header().Get("X-Antfly-Namespace") != "" {
+		t.Fatalf("serving namespace should not be exposed publicly")
 	}
 	if rec.Header().Get("X-Antfly-Required-Version") != "7" {
 		t.Fatalf("missing normalized required version header")

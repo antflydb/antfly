@@ -36,7 +36,7 @@ A serverless retrieval deployment with:
 - proxy auth via bearer-token `Secret`
 - route aggregation across serverless projects in one namespace
 
-**Use Case:** Retrieval-heavy namespaces, graph reads, hybrid search, and mixed stateful/serverless API routing.
+**Use Case:** Retrieval-heavy tables, graph reads, hybrid search, and mixed stateful/serverless API routing.
 
 **Prerequisites:**
 - object store credentials/config available to the serverless runtime
@@ -53,7 +53,7 @@ kubectl apply -f examples/serverless-project-with-proxy.yaml
 ### Serverless Multi-Project Routing (`serverless-multi-project-routing.yaml`)
 Two `AntflyServerlessProject` objects in one namespace with aggregated proxy routes.
 
-**Use Case:** One namespace-scoped proxy serving multiple tenant/table mappings across multiple serverless projects.
+**Use Case:** One proxy serving multiple tenant/table mappings across multiple serverless projects in the same Kubernetes namespace.
 
 **Deploy:**
 ```bash
@@ -63,7 +63,7 @@ kubectl apply -f examples/serverless-multi-project-routing.yaml
 ### Shared Proxy Route ConfigMap (`serverless-proxy-route-configmap.yaml`)
 An external proxy route source that can be referenced from `spec.proxy.routeConfigMapRef`.
 
-**Use Case:** Shared namespace route definitions without duplicating large route lists into every `AntflyServerlessProject`.
+**Use Case:** Shared table route definitions without duplicating large route lists into every `AntflyServerlessProject`.
 
 **Deploy:**
 ```bash

@@ -149,11 +149,11 @@ func requestContextFromHTTP(r *http.Request) (RequestContext, error) {
 		return RequestContext{}, fmt.Errorf("invalid max_lag_records: %w", err)
 	}
 
-	tenantFromPath, tableFromPath, namespaceFromPath, backendPath := parsePublicAPIPath(r.URL.Path)
+	tenantFromPath, tableFromPath, backendPath := parsePublicAPIPath(r.URL.Path)
 	req := RequestContext{
 		Tenant:       firstNonEmpty(tenantFromPath, r.Header.Get("X-Antfly-Tenant"), r.URL.Query().Get("tenant")),
-		Table:        firstNonEmpty(tableFromPath, r.Header.Get("X-Antfly-Table"), r.URL.Query().Get("table"), namespaceFromPath),
-		Namespace:    firstNonEmpty(namespaceFromPath, r.Header.Get("X-Antfly-Namespace"), r.URL.Query().Get("namespace")),
+		Table:        firstNonEmpty(tableFromPath, r.Header.Get("X-Antfly-Table"), r.URL.Query().Get("table")),
+		Namespace:    firstNonEmpty(r.Header.Get("X-Antfly-Namespace"), r.URL.Query().Get("namespace")),
 		RequireGraph: r.URL.Query().Get("graph") == "1" || strings.EqualFold(r.URL.Query().Get("graph"), "true"),
 		BackendPath:  backendPath,
 		Policy: RequestPolicy{
@@ -205,29 +205,21 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func parsePublicAPIPath(path string) (tenant string, table string, namespace string, backendPath string) {
+func parsePublicAPIPath(path string) (tenant string, table string, backendPath string) {
 	if !strings.HasPrefix(path, "/v1/tenants/") {
-		return "", "", "", ""
+		return "", "", ""
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	if len(parts) < 5 || parts[0] != "v1" || parts[1] != "tenants" {
-		return "", "", "", ""
+	if len(parts) < 5 || parts[0] != "v1" || parts[1] != "tenants" || parts[3] != "tables" {
+		return "", "", ""
 	}
 	tenant = strings.TrimSpace(parts[2])
-	switch parts[3] {
-	case "tables":
-		table = strings.TrimSpace(parts[4])
-	case "namespaces":
-		namespace = strings.TrimSpace(parts[4])
-		table = namespace
-	default:
-		return "", "", "", ""
-	}
+	table = strings.TrimSpace(parts[4])
 	suffix := "/"
 	if len(parts) > 5 {
 		suffix = "/" + strings.Join(parts[5:], "/")
 	}
-	return tenant, table, namespace, canonicalPublicBackendPath(suffix)
+	return tenant, table, canonicalPublicBackendPath(suffix)
 }
 
 func inferOperationFromBackendPath(path string) OperationKind {

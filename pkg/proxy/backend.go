@@ -52,10 +52,10 @@ func (StatefulBackendAdapter) RewriteRequest(outReq *http.Request, inbound *http
 
 func (StatefulBackendAdapter) NormalizeResponse(resp *http.Response, req RequestContext, route NamespaceRoute) {
 	_ = route
+	resp.Header.Del("X-Antfly-Namespace")
 	resp.Header.Set("X-Antfly-Backend", string(BackendStateful))
 	resp.Header.Set("X-Antfly-Tenant", req.Tenant)
 	resp.Header.Set("X-Antfly-Table", route.TableName())
-	resp.Header.Set("X-Antfly-Namespace", route.ServingNamespace())
 	resp.Header.Set("X-Antfly-View", NormalizePolicy(req.Policy).View)
 	if req.Policy.MaxLagRecords > 0 {
 		resp.Header.Set("X-Antfly-Max-Lag-Records", strconv.FormatUint(req.Policy.MaxLagRecords, 10))
@@ -111,10 +111,10 @@ func (ServerlessBackendAdapter) RewriteRequest(outReq *http.Request, inbound *ht
 
 func (ServerlessBackendAdapter) NormalizeResponse(resp *http.Response, req RequestContext, route NamespaceRoute) {
 	_ = route
+	resp.Header.Del("X-Antfly-Namespace")
 	resp.Header.Set("X-Antfly-Backend", string(BackendServerless))
 	resp.Header.Set("X-Antfly-Tenant", req.Tenant)
 	resp.Header.Set("X-Antfly-Table", route.TableName())
-	resp.Header.Set("X-Antfly-Namespace", route.ServingNamespace())
 	resp.Header.Set("X-Antfly-View", NormalizePolicy(req.Policy).View)
 	if req.Policy.MaxLagRecords > 0 {
 		resp.Header.Set("X-Antfly-Max-Lag-Records", strconv.FormatUint(req.Policy.MaxLagRecords, 10))

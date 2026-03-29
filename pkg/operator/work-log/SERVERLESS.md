@@ -31,7 +31,7 @@ Serverless needs different primitives:
 - object storage configuration
 - query cache configuration
 - proxy/gateway integration
-- namespace routing and policy
+- table routing and policy
 
 So the right split is:
 
@@ -57,14 +57,14 @@ The operator should not own:
 - manifest or artifact state
 - query execution
 - publish/build logic
-- cross-namespace routing policy decisions at request time
+- cross-project routing policy decisions at request time
 
 ### Proxy
 
 The proxy should own:
 
 - one public API over stateful and serverless backends
-- tenant-aware namespace routing
+- tenant-aware table routing
 - authn/authz on Antfly resources
 - request freshness/consistency policy
 - backend capability checks
@@ -83,8 +83,8 @@ Start with a new CRD:
 
 - `AntflyServerlessProject`
 
-This should be a project-level deployment surface, not a per-namespace object.
-Namespaces and their policies can be layered in later if needed.
+This should be a project-level deployment surface, not a per-table object.
+Tables and their policies can be layered in later if needed.
 
 ### Initial Spec Shape
 
@@ -128,7 +128,7 @@ Namespaces and their policies can be layered in later if needed.
 4. Reconcile Services, HPA, PDB, and config secrets/maps.
 5. Reconcile optional proxy deployment/service.
 6. Add status probing against serverless `/health`, `/status`, and `/metrics`.
-7. Add namespace/policy integration once the project-level deployment shape is stable.
+7. Add table/policy integration once the project-level deployment shape is stable.
 
 ## Proposed Proxy Package Layout
 
@@ -149,7 +149,7 @@ Create:
 ### First Pass
 
 - authenticate caller
-- resolve tenant and namespace
+- resolve tenant and table
 - authorize read/write/admin operations
 - route to stateful or serverless backend
 - normalize errors and responses
@@ -167,7 +167,7 @@ Create:
 Initial default rules:
 
 - writes route to stateful
-- retrieval namespaces can route to serverless
+- retrieval tables can route to serverless
 - graph reads can route to serverless when graph artifacts exist
 - unsupported requests fail cleanly at the proxy instead of leaking backend-specific errors
 
@@ -202,7 +202,7 @@ The current Go control-plane slice now includes:
 - generated serverless runtime `ConfigMap`
 - generated proxy `ConfigMap`
 - admission validation/defaulting
-- proxy route aggregation across serverless projects in the same namespace
+- proxy route aggregation across serverless projects in the same Kubernetes namespace
 
 ## Proxy Config Conventions
 
@@ -216,7 +216,7 @@ Operator-managed conventions:
 - bearer tokens are mounted at `/etc/antfly-proxy-secret/bearer_tokens.json`
 - optional external route sources can come from `spec.proxy.routeConfigMapRef`
 - those external routes are aggregated with inline `spec.proxy.routes`
-- namespace-scoped `ConfigMap`s labeled `antfly.io/serverless-proxy-route-source=true` are also aggregated as shared route sources
+- Kubernetes-namespace-scoped `ConfigMap`s labeled `antfly.io/serverless-proxy-route-source=true` are also aggregated as shared route sources
 
 Expected proxy env:
 
@@ -230,10 +230,9 @@ in-memory control channel.
 
 ## Public Proxy Path Shape
 
-The proxy now understands both:
+The proxy's public API is table-oriented:
 
-- legacy proxy paths like `/proxy/query/search`
-- public API paths like `/v1/tenants/<tenant>/tables/<table>/query/search`
+- `/v1/tenants/<tenant>/tables/<table>/query/search`
 
 The proxy is responsible for:
 
@@ -265,5 +264,5 @@ Internal/debug version-pinned serverless reads should use:
 The next implementation priorities are:
 
 1. richer request/response normalization between public proxy API and backend-specific APIs
-2. broader namespace-policy sources beyond static per-project route lists
+2. broader table-policy sources beyond static per-project route lists
 3. a full proxy deployment story in docs/examples, including multi-project route aggregation
