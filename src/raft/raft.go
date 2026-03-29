@@ -1220,6 +1220,8 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 	// event loop on raft state machine updates
 	for {
 		select {
+		case <-rc.stopc:
+			return
 		case <-ticker.C():
 			rc.node.Tick()
 
