@@ -190,6 +190,13 @@ kubectl apply -k ./examples/serverless-project-stack
 Example public calls through the proxy:
 
 ```bash
+# Ingest into the mutable serverless API role
+curl -X PUT \
+  -H 'Authorization: Bearer token-2' \
+  -H 'Content-Type: application/json' \
+  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/ingest-batch' \
+  -d '{"records":[{"id":"doc-1","body":{"title":"Antfly"}}]}'
+
 # Search a table
 curl -H 'Authorization: Bearer token-1' \
   'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/query/search?q=antfly'
@@ -203,6 +210,12 @@ curl -X POST \
 ```
 
 The public API stays table-first. Internal serverless debug/version routes remain under `/_internal/namespaces/...` and are not the recommended product surface.
+
+Routing split:
+
+- public writes go to the serverless `api` service
+- public reads, search, and graph go to the serverless `query` service
+- maintenance work stays on the non-listener `maintenance` service
 
 ### RBAC Requirements
 

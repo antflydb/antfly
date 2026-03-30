@@ -39,6 +39,10 @@ A serverless retrieval deployment with:
 
 **Use Case:** Retrieval-heavy tables, graph reads, hybrid search, and mixed stateful/serverless API routing.
 
+Public routing split:
+- writes route to the serverless `api` service
+- search and graph reads route to the serverless `query` service
+
 **Prerequisites:**
 - object store credentials/config available to the serverless runtime
 - `antfly-embedding-indexes` `Secret` if model-backed enrichments are enabled

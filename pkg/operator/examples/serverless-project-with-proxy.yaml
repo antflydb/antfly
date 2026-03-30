@@ -10,8 +10,8 @@
 # The operator will generate:
 # - <name>-serverless-config
 # - <name>-serverless-proxy-config
-# - query / maintenance / proxy Deployments
-# - query / proxy Services
+# - api / query / maintenance / proxy Deployments
+# - api / query / proxy Services
 # - optional HPA / PDB resources
 #
 # The proxy ConfigMap includes:

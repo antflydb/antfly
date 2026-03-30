@@ -21,6 +21,7 @@ kubectl apply -k examples/serverless-project-stack
 kubectl get antflyserverlessprojects
 kubectl get deploy
 kubectl get svc
+kubectl get antflyserverlessproject docs -o yaml
 ```
 
 The example project creates:
@@ -61,5 +62,6 @@ curl -X POST \
 ## Notes
 
 - Public callers use `tenant/table` paths only.
+- Public writes land on the serverless `api` service, while reads/search/graph land on the `query` service.
 - Internal serverless routing still maps each table to a `servingNamespace`.
 - Version-pinned serverless debug reads stay internal under `/_internal/namespaces/...`.
