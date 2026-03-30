@@ -35,10 +35,14 @@ type ServerlessObjectStoreSpec struct {
 }
 
 type ServerlessImagesSpec struct {
-	QueryImage       string `json:"queryImage,omitempty"`
-	MaintenanceImage string `json:"maintenanceImage,omitempty"`
-	ProxyImage       string `json:"proxyImage,omitempty"`
-	ImagePullPolicy  string `json:"imagePullPolicy,omitempty"`
+	ZigImage        string `json:"zigImage,omitempty"`
+	ProxyImage      string `json:"proxyImage,omitempty"`
+	ImagePullPolicy string `json:"imagePullPolicy,omitempty"`
+}
+
+type ServerlessAPIRuntimeSpec struct {
+	Replicas    int32                     `json:"replicas,omitempty"`
+	AutoScaling ServerlessAutoScalingSpec `json:"autoScaling,omitempty"`
 }
 
 type ServerlessQueryRuntimeSpec struct {
@@ -82,20 +86,22 @@ type ServerlessProxyAuthSpec struct {
 }
 
 type ServerlessProxyRouteSpec struct {
-	Tenant           string `json:"tenant"`
-	Table            string `json:"table,omitempty"`
-	Namespace        string `json:"namespace,omitempty"`
-	ServingNamespace string `json:"servingNamespace,omitempty"`
-	PreferredBackend string `json:"preferredBackend,omitempty"`
-	AllowStateful    bool   `json:"allowStateful,omitempty"`
-	AllowServerless  bool   `json:"allowServerless,omitempty"`
-	StatefulURL      string `json:"statefulURL,omitempty"`
-	ServerlessURL    string `json:"serverlessURL,omitempty"`
+	Tenant             string `json:"tenant"`
+	Table              string `json:"table,omitempty"`
+	Namespace          string `json:"namespace,omitempty"`
+	ServingNamespace   string `json:"servingNamespace,omitempty"`
+	PreferredBackend   string `json:"preferredBackend,omitempty"`
+	AllowStateful      bool   `json:"allowStateful,omitempty"`
+	AllowServerless    bool   `json:"allowServerless,omitempty"`
+	StatefulURL        string `json:"statefulURL,omitempty"`
+	ServerlessQueryURL string `json:"serverlessQueryURL,omitempty"`
+	ServerlessAPIURL   string `json:"serverlessAPIURL,omitempty"`
 }
 
 type AntflyServerlessProjectSpec struct {
 	ObjectStore ServerlessObjectStoreSpec        `json:"objectStore"`
 	Images      ServerlessImagesSpec             `json:"images,omitempty"`
+	API         ServerlessAPIRuntimeSpec         `json:"api,omitempty"`
 	Query       ServerlessQueryRuntimeSpec       `json:"query,omitempty"`
 	Maintenance ServerlessMaintenanceRuntimeSpec `json:"maintenance,omitempty"`
 	Proxy       ServerlessProxySpec              `json:"proxy,omitempty"`
@@ -108,11 +114,13 @@ type AntflyServerlessProjectStatus struct {
 	ObservedGeneration       int64              `json:"observedGeneration,omitempty"`
 	Phase                    string             `json:"phase,omitempty"`
 	Validated                bool               `json:"validated,omitempty"`
+	APIReadyReplicas         int32              `json:"apiReadyReplicas,omitempty"`
 	QueryReadyReplicas       int32              `json:"queryReadyReplicas,omitempty"`
 	MaintenanceReadyReplicas int32              `json:"maintenanceReadyReplicas,omitempty"`
 	ProxyReadyReplicas       int32              `json:"proxyReadyReplicas,omitempty"`
 	ConfigMapName            string             `json:"configMapName,omitempty"`
 	ProxyConfigMapName       string             `json:"proxyConfigMapName,omitempty"`
+	APIServiceName           string             `json:"apiServiceName,omitempty"`
 	QueryServiceName         string             `json:"queryServiceName,omitempty"`
 	ProxyServiceName         string             `json:"proxyServiceName,omitempty"`
 	Conditions               []metav1.Condition `json:"conditions,omitempty"`
@@ -122,6 +130,7 @@ type AntflyServerlessProjectStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Validated",type="boolean",JSONPath=".status.validated"
+// +kubebuilder:printcolumn:name="API",type="integer",JSONPath=".status.apiReadyReplicas"
 // +kubebuilder:printcolumn:name="Query",type="integer",JSONPath=".status.queryReadyReplicas"
 // +kubebuilder:printcolumn:name="Maint",type="integer",JSONPath=".status.maintenanceReadyReplicas"
 // +kubebuilder:printcolumn:name="Proxy",type="integer",JSONPath=".status.proxyReadyReplicas"
@@ -146,6 +155,9 @@ func init() {
 }
 
 func (r *AntflyServerlessProject) Default() {
+	if r.Spec.API.Replicas == 0 {
+		r.Spec.API.Replicas = 1
+	}
 	if r.Spec.Query.Replicas == 0 {
 		r.Spec.Query.Replicas = 1
 	}
@@ -169,6 +181,17 @@ func (r *AntflyServerlessProject) Default() {
 	}
 	if r.Spec.Maintenance.TickIntervalMS == 0 {
 		r.Spec.Maintenance.TickIntervalMS = 1000
+	}
+	if r.Spec.API.AutoScaling.Enabled {
+		if r.Spec.API.AutoScaling.MinReplicas == 0 {
+			r.Spec.API.AutoScaling.MinReplicas = 1
+		}
+		if r.Spec.API.AutoScaling.MaxReplicas == 0 {
+			r.Spec.API.AutoScaling.MaxReplicas = 3
+		}
+		if r.Spec.API.AutoScaling.TargetCPUUtilizationPercentage == 0 {
+			r.Spec.API.AutoScaling.TargetCPUUtilizationPercentage = 70
+		}
 	}
 	if r.Spec.Query.AutoScaling.Enabled {
 		if r.Spec.Query.AutoScaling.MinReplicas == 0 {
@@ -228,17 +251,17 @@ func (r *AntflyServerlessProject) ValidateAntflyServerlessProject() error {
 	if strings.TrimSpace(r.Spec.ObjectStore.ProgressURI) == "" {
 		missing = append(missing, "spec.objectStore.progressURI")
 	}
-	if strings.TrimSpace(r.Spec.Images.QueryImage) == "" {
-		missing = append(missing, "spec.images.queryImage")
-	}
-	if strings.TrimSpace(r.Spec.Images.MaintenanceImage) == "" {
-		missing = append(missing, "spec.images.maintenanceImage")
+	if strings.TrimSpace(r.Spec.Images.ZigImage) == "" {
+		missing = append(missing, "spec.images.zigImage")
 	}
 	if r.Spec.Proxy.Enabled && strings.TrimSpace(r.Spec.Images.ProxyImage) == "" {
 		missing = append(missing, "spec.images.proxyImage")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("AntflyServerlessProject validation failed:\n  - missing required fields: %s", strings.Join(missing, ", "))
+	}
+	if r.Spec.API.Replicas < 0 {
+		return fmt.Errorf("spec.api.replicas must be >= 0")
 	}
 	if r.Spec.Query.Replicas < 0 {
 		return fmt.Errorf("spec.query.replicas must be >= 0")
@@ -257,6 +280,9 @@ func (r *AntflyServerlessProject) ValidateAntflyServerlessProject() error {
 	}
 	if r.Spec.Maintenance.TickIntervalMS < 0 {
 		return fmt.Errorf("spec.maintenance.tickIntervalMS must be >= 0")
+	}
+	if err := validateServerlessAutoScaling("spec.api.autoScaling", r.Spec.API.AutoScaling); err != nil {
+		return err
 	}
 	if err := validateServerlessAutoScaling("spec.query.autoScaling", r.Spec.Query.AutoScaling); err != nil {
 		return err
@@ -278,8 +304,8 @@ func (r *AntflyServerlessProject) ValidateAntflyServerlessProject() error {
 		if route.AllowStateful && strings.TrimSpace(route.StatefulURL) == "" {
 			return fmt.Errorf("%s.statefulURL is required when allowStateful=true", path)
 		}
-		if route.AllowServerless && strings.TrimSpace(route.ServerlessURL) == "" {
-			return fmt.Errorf("%s.serverlessURL is required when allowServerless=true", path)
+		if route.AllowServerless && strings.TrimSpace(route.ServerlessQueryURL) == "" {
+			return fmt.Errorf("%s.serverlessQueryURL is required when allowServerless=true", path)
 		}
 		switch strings.TrimSpace(route.PreferredBackend) {
 		case "", "stateful", "serverless":

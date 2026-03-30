@@ -30,8 +30,7 @@ func TestAntflyServerlessProjectDefaultsAndValidation(t *testing.T) {
 				ProgressURI:  "s3://bucket/progress",
 			},
 			Images: antflyv1.ServerlessImagesSpec{
-				QueryImage:       "query:latest",
-				MaintenanceImage: "maintenance:latest",
+				ZigImage: "ghcr.io/antflydb/antfly:zig",
 			},
 		},
 	}
@@ -71,9 +70,8 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 				ProgressURI:  "s3://bucket/progress",
 			},
 			Images: antflyv1.ServerlessImagesSpec{
-				QueryImage:       "query:latest",
-				MaintenanceImage: "maintenance:latest",
-				ProxyImage:       "proxy:latest",
+				ZigImage:   "ghcr.io/antflydb/antfly:zig",
+				ProxyImage: "proxy:latest",
 			},
 			Proxy: antflyv1.ServerlessProxySpec{
 				Enabled: true,
@@ -89,13 +87,14 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 				RouteConfigMapRef: "docs-proxy-routes",
 				Routes: []antflyv1.ServerlessProxyRouteSpec{
 					{
-						Tenant:           "t1",
-						Namespace:        "docs",
-						PreferredBackend: "serverless",
-						AllowStateful:    true,
-						AllowServerless:  true,
-						StatefulURL:      "http://stateful.default.svc:8080",
-						ServerlessURL:    "http://docs-serverless-query.default.svc:8080",
+						Tenant:             "t1",
+						Namespace:          "docs",
+						PreferredBackend:   "serverless",
+						AllowStateful:      true,
+						AllowServerless:    true,
+						StatefulURL:        "http://stateful.default.svc:8080",
+						ServerlessQueryURL: "http://docs-serverless-query.default.svc:8080",
+						ServerlessAPIURL:   "http://docs-serverless-api.default.svc:8080",
 					},
 				},
 			},
@@ -105,6 +104,14 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 					MinReplicas:                    1,
 					MaxReplicas:                    4,
 					TargetCPUUtilizationPercentage: 75,
+				},
+			},
+			API: antflyv1.ServerlessAPIRuntimeSpec{
+				AutoScaling: antflyv1.ServerlessAutoScalingSpec{
+					Enabled:                        true,
+					MinReplicas:                    1,
+					MaxReplicas:                    3,
+					TargetCPUUtilizationPercentage: 70,
 				},
 			},
 			Embeddings: antflyv1.ServerlessEmbeddingSpec{
@@ -127,8 +134,7 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 				ProgressURI:  "s3://bucket2/progress",
 			},
 			Images: antflyv1.ServerlessImagesSpec{
-				QueryImage:       "query:latest",
-				MaintenanceImage: "maintenance:latest",
+				ZigImage: "ghcr.io/antflydb/antfly:zig",
 			},
 			Query: antflyv1.ServerlessQueryRuntimeSpec{
 				Port: 9090,
@@ -175,7 +181,7 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 			},
 		},
 		Data: map[string]string{
-			"routes.json": `[{"tenant":"t4","table":"shared","serving_namespace":"shared-serving","preferred_backend":"serverless","allow_serverless":true,"serverless_url":"http://shared-serverless-query.default.svc:8080"}]`,
+			"routes.json": `[{"tenant":"t4","table":"shared","serving_namespace":"shared-serving","preferred_backend":"serverless","allow_serverless":true,"serverless_query_url":"http://shared-serverless-query.default.svc:8080","serverless_api_url":"http://shared-serverless-api.default.svc:8080"}]`,
 		},
 	}
 
@@ -196,6 +202,7 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 	g.Expect(err).NotTo(HaveOccurred())
 
 	for _, name := range []string{
+		"docs-serverless-api",
 		"docs-serverless-query",
 		"docs-serverless-maintenance",
 		"docs-serverless-proxy",
@@ -209,10 +216,15 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 			g.Expect(deployment.Spec.Template.Spec.Containers[0].EnvFrom).To(HaveLen(1))
 			g.Expect(deployment.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(HaveField("MountPath", Equal("/etc/antfly-proxy"))))
 			g.Expect(deployment.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(HaveField("MountPath", Equal("/etc/antfly-proxy-secret"))))
+		} else {
+			g.Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
+			g.Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/antflydb/antfly:zig"))
+			g.Expect(deployment.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"antfly"}))
 		}
 	}
 
 	for _, name := range []string{
+		"docs-serverless-api",
 		"docs-serverless-query",
 		"docs-serverless-proxy",
 	} {
@@ -229,12 +241,14 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_ROUTES_JSON"]).To(ContainSubstring(`"tenant":"t2"`))
 	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_ROUTES_JSON"]).To(ContainSubstring(`"tenant":"t3"`))
 	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_ROUTES_JSON"]).To(ContainSubstring(`"tenant":"t4"`))
-	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_ROUTES_JSON"]).To(ContainSubstring(`"serverless_url":"http://analytics-serverless-query.default.svc:9090"`))
+	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_ROUTES_JSON"]).To(ContainSubstring(`"serverless_query_url":"http://analytics-serverless-query.default.svc:9090"`))
+	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_ROUTES_JSON"]).To(ContainSubstring(`"serverless_api_url":"http://analytics-serverless-api.default.svc:9090"`))
 	g.Expect(proxyConfigMap.Data["routes.json"]).To(ContainSubstring(`"tenant":"t1"`))
 	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_ROUTES_FILE"]).To(Equal("/etc/antfly-proxy/routes.json"))
 	g.Expect(proxyConfigMap.Data["ANTFLY_PROXY_BEARER_TOKENS_FILE"]).To(Equal("/etc/antfly-proxy-secret/bearer_tokens.json"))
 
 	for _, name := range []string{
+		"docs-serverless-api-pdb",
 		"docs-serverless-query-pdb",
 		"docs-serverless-maintenance-pdb",
 		"docs-serverless-proxy-pdb",
@@ -244,6 +258,7 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 	}
 
 	for _, name := range []string{
+		"docs-serverless-api-hpa",
 		"docs-serverless-query-hpa",
 		"docs-serverless-proxy-hpa",
 	} {
@@ -256,6 +271,7 @@ func TestAntflyServerlessProjectReconcileCreatesDeploymentsAndServices(t *testin
 	g.Expect(updated.Status.Validated).To(BeTrue())
 	g.Expect(updated.Status.ConfigMapName).To(Equal("docs-serverless-config"))
 	g.Expect(updated.Status.ProxyConfigMapName).To(Equal("docs-serverless-proxy-config"))
+	g.Expect(updated.Status.APIServiceName).To(Equal("docs-serverless-api"))
 	g.Expect(updated.Status.QueryServiceName).To(Equal("docs-serverless-query"))
 	g.Expect(updated.Status.ProxyServiceName).To(Equal("docs-serverless-proxy"))
 	g.Expect(updated.Status.Phase).To(Equal(antflyv1.ServerlessProjectPhaseReconciling))

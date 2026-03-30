@@ -10,7 +10,7 @@ import (
 
 type BackendAdapter interface {
 	Kind() BackendKind
-	BaseURL(route NamespaceRoute) (string, error)
+	BaseURL(req RequestContext, route NamespaceRoute) (string, error)
 	CanServe(req RequestContext, route NamespaceRoute) bool
 	RewriteRequest(outReq *http.Request, inbound *http.Request, req RequestContext, route NamespaceRoute) error
 	NormalizeResponse(resp *http.Response, req RequestContext, route NamespaceRoute)
@@ -22,7 +22,8 @@ func (StatefulBackendAdapter) Kind() BackendKind {
 	return BackendStateful
 }
 
-func (StatefulBackendAdapter) BaseURL(route NamespaceRoute) (string, error) {
+func (StatefulBackendAdapter) BaseURL(req RequestContext, route NamespaceRoute) (string, error) {
+	_ = req
 	if strings.TrimSpace(route.StatefulURL) == "" {
 		return "", fmt.Errorf("table %q has no stateful backend URL", route.TableName())
 	}
@@ -71,11 +72,17 @@ func (ServerlessBackendAdapter) Kind() BackendKind {
 	return BackendServerless
 }
 
-func (ServerlessBackendAdapter) BaseURL(route NamespaceRoute) (string, error) {
-	if strings.TrimSpace(route.ServerlessURL) == "" {
-		return "", fmt.Errorf("table %q has no serverless backend URL", route.TableName())
+func (ServerlessBackendAdapter) BaseURL(req RequestContext, route NamespaceRoute) (string, error) {
+	if req.Operation == OperationWrite || req.Operation == OperationAdmin {
+		if strings.TrimSpace(route.ServerlessAPIURL) == "" {
+			return "", fmt.Errorf("table %q has no serverless api URL", route.TableName())
+		}
+		return route.ServerlessAPIURL, nil
 	}
-	return route.ServerlessURL, nil
+	if strings.TrimSpace(route.ServerlessQueryURL) == "" {
+		return "", fmt.Errorf("table %q has no serverless query URL", route.TableName())
+	}
+	return route.ServerlessQueryURL, nil
 }
 
 func (ServerlessBackendAdapter) CanServe(req RequestContext, route NamespaceRoute) bool {

@@ -12,7 +12,7 @@ import (
 func TestFileCatalogReloadsRoutes(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "routes.json")
-	if err := os.WriteFile(path, []byte(`[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","allow_serverless":true,"serverless_url":"http://serverless-a"}]`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","allow_serverless":true,"serverless_query_url":"http://serverless-query-a","serverless_api_url":"http://serverless-api-a"}]`), 0o600); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
 
@@ -21,12 +21,12 @@ func TestFileCatalogReloadsRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve initial route: %v", err)
 	}
-	if route.ServerlessURL != "http://serverless-a" {
-		t.Fatalf("got serverless URL %q", route.ServerlessURL)
+	if route.ServerlessQueryURL != "http://serverless-query-a" || route.ServerlessAPIURL != "http://serverless-api-a" {
+		t.Fatalf("got serverless URLs query=%q api=%q", route.ServerlessQueryURL, route.ServerlessAPIURL)
 	}
 
 	time.Sleep(1100 * time.Millisecond)
-	if err := os.WriteFile(path, []byte(`[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","allow_serverless":true,"serverless_url":"http://serverless-b"}]`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","allow_serverless":true,"serverless_query_url":"http://serverless-query-b","serverless_api_url":"http://serverless-api-b"}]`), 0o600); err != nil {
 		t.Fatalf("rewrite routes: %v", err)
 	}
 
@@ -34,8 +34,8 @@ func TestFileCatalogReloadsRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve reloaded route: %v", err)
 	}
-	if route.ServerlessURL != "http://serverless-b" {
-		t.Fatalf("got reloaded serverless URL %q", route.ServerlessURL)
+	if route.ServerlessQueryURL != "http://serverless-query-b" || route.ServerlessAPIURL != "http://serverless-api-b" {
+		t.Fatalf("got reloaded serverless URLs query=%q api=%q", route.ServerlessQueryURL, route.ServerlessAPIURL)
 	}
 }
 

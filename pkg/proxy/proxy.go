@@ -14,14 +14,15 @@ type RequestPolicy struct {
 }
 
 type NamespaceRoute struct {
-	Tenant           string
-	Table            string
-	Namespace        string
-	PreferredBackend BackendKind
-	AllowStateful    bool
-	AllowServerless  bool
-	StatefulURL      string
-	ServerlessURL    string
+	Tenant             string
+	Table              string
+	Namespace          string
+	PreferredBackend   BackendKind
+	AllowStateful      bool
+	AllowServerless    bool
+	StatefulURL        string
+	ServerlessQueryURL string
+	ServerlessAPIURL   string
 }
 
 type GatewayConfig struct {

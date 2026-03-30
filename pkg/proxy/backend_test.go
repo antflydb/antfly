@@ -23,7 +23,7 @@ func TestStatefulBackendAdapter(t *testing.T) {
 	if !adapter.CanServe(req, route) {
 		t.Fatal("expected stateful adapter to serve plain read")
 	}
-	if _, err := adapter.BaseURL(route); err != nil {
+	if _, err := adapter.BaseURL(req, route); err != nil {
 		t.Fatalf("expected stateful base URL, got: %v", err)
 	}
 }
@@ -31,11 +31,12 @@ func TestStatefulBackendAdapter(t *testing.T) {
 func TestServerlessBackendAdapter(t *testing.T) {
 	adapter := ServerlessBackendAdapter{}
 	route := NamespaceRoute{
-		Tenant:          "acme",
-		Table:           "docs",
-		Namespace:       "docs",
-		AllowServerless: true,
-		ServerlessURL:   "http://serverless-query.default.svc:8080",
+		Tenant:             "acme",
+		Table:              "docs",
+		Namespace:          "docs",
+		AllowServerless:    true,
+		ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+		ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
 	}
 	req := RequestContext{
 		Tenant:       "acme",
@@ -47,8 +48,33 @@ func TestServerlessBackendAdapter(t *testing.T) {
 	if !adapter.CanServe(req, route) {
 		t.Fatal("expected serverless adapter to serve graph read")
 	}
-	if _, err := adapter.BaseURL(route); err != nil {
+	if _, err := adapter.BaseURL(req, route); err != nil {
 		t.Fatalf("expected serverless base URL, got: %v", err)
+	}
+}
+
+func TestServerlessBackendAdapterUsesAPIURLForWrites(t *testing.T) {
+	adapter := ServerlessBackendAdapter{}
+	route := NamespaceRoute{
+		Tenant:             "acme",
+		Table:              "docs",
+		Namespace:          "docs",
+		AllowServerless:    true,
+		ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+		ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
+	}
+	req := RequestContext{
+		Tenant:    "acme",
+		Table:     "docs",
+		Operation: OperationWrite,
+	}
+
+	baseURL, err := adapter.BaseURL(req, route)
+	if err != nil {
+		t.Fatalf("expected serverless api base URL, got: %v", err)
+	}
+	if baseURL != "http://serverless-api.default.svc:8080" {
+		t.Fatalf("got base URL %q", baseURL)
 	}
 }
 

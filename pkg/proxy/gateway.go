@@ -39,7 +39,7 @@ func (g *Gateway) Resolve(req RequestContext) (*ResolvedTarget, error) {
 	if err != nil {
 		return nil, err
 	}
-	baseURL, err := adapter.BaseURL(route)
+	baseURL, err := adapter.BaseURL(req, route)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +116,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetBaseURL, err := adapter.BaseURL(route)
+	targetBaseURL, err := adapter.BaseURL(req, route)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

@@ -16,7 +16,8 @@ data:
         "allow_stateful": true,
         "allow_serverless": true,
         "stateful_url": "http://docs-cluster-public-api.default.svc:80",
-        "serverless_url": "http://docs-serverless-query.default.svc:8080"
+        "serverless_query_url": "http://docs-serverless-query.default.svc:8080",
+        "serverless_api_url": "http://docs-serverless-api.default.svc:8080"
       },
       {
         "tenant": "tenant-b",
@@ -24,6 +25,7 @@ data:
         "serving_namespace": "analytics-serving",
         "preferred_backend": "serverless",
         "allow_serverless": true,
-        "serverless_url": "http://analytics-serverless-query.default.svc:9090"
+        "serverless_query_url": "http://analytics-serverless-query.default.svc:9090",
+        "serverless_api_url": "http://analytics-serverless-api.default.svc:9090"
       }
     ]

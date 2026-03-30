@@ -25,6 +25,7 @@ kubectl get svc
 
 The example project creates:
 
+- api deployment/service
 - query deployment/service
 - maintenance deployment
 - optional proxy deployment/service

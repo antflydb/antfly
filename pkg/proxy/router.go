@@ -63,7 +63,7 @@ func (r *Router) ResolveBackend(req RequestContext) (BackendKind, BackendAdapter
 		if adapter == nil {
 			return "", nil, NamespaceRoute{}, fmt.Errorf("no adapter configured for backend=%q", kind)
 		}
-		if _, err := adapter.BaseURL(route); err != nil {
+		if _, err := adapter.BaseURL(req, route); err != nil {
 			return "", nil, NamespaceRoute{}, err
 		}
 		if !adapter.CanServe(req, route) {
@@ -76,7 +76,10 @@ func (r *Router) ResolveBackend(req RequestContext) (BackendKind, BackendAdapter
 		if route.AllowStateful {
 			return resolve(BackendStateful)
 		}
-		return "", nil, NamespaceRoute{}, fmt.Errorf("table %q does not allow stateful writes", route.TableName())
+		if route.AllowServerless {
+			return resolve(BackendServerless)
+		}
+		return "", nil, NamespaceRoute{}, fmt.Errorf("table %q has no writable backend", route.TableName())
 	}
 
 	if req.PreferredBackend != "" {

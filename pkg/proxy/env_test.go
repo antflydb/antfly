@@ -6,7 +6,7 @@ func TestLoadGatewayEnvConfig(t *testing.T) {
 	getenv := func(key string) string {
 		switch key {
 		case "ANTFLY_PROXY_ROUTES_JSON":
-			return `[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","preferred_backend":"serverless","allow_stateful":true,"allow_serverless":true,"stateful_url":"http://stateful","serverless_url":"http://serverless"}]`
+			return `[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","preferred_backend":"serverless","allow_stateful":true,"allow_serverless":true,"stateful_url":"http://stateful","serverless_query_url":"http://serverless-query","serverless_api_url":"http://serverless-api"}]`
 		case "ANTFLY_PROXY_REQUIRE_AUTH":
 			return "true"
 		case "ANTFLY_PROXY_PUBLIC_ADDR":
@@ -43,7 +43,7 @@ func TestNewGatewayFromEnv(t *testing.T) {
 	getenv := func(key string) string {
 		switch key {
 		case "ANTFLY_PROXY_ROUTES_JSON":
-			return `[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","allow_serverless":true,"serverless_url":"http://serverless"}]`
+			return `[{"tenant":"t1","table":"docs","serving_namespace":"docs-serving","allow_serverless":true,"serverless_query_url":"http://serverless-query","serverless_api_url":"http://serverless-api"}]`
 		default:
 			return ""
 		}

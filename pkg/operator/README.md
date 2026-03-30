@@ -141,6 +141,7 @@ Keeping CRDs by default is safer because deleting them also deletes the custom r
 
 The operator can also deploy a table-first serverless stack around `AntflyServerlessProject`:
 
+- `serverless-api` runtime pods
 - `serverless-query` runtime pods
 - `serverless-maintenance` runtime pods
 - optional `antfly proxy` gateway pods
@@ -157,8 +158,7 @@ Typical images:
 
 - operator: `ghcr.io/antflydb/antfly-operator:<tag>`
 - proxy: `ghcr.io/antflydb/antfly-proxy:<tag>`
-- serverless query: `ghcr.io/antflydb/antfly-serverless-query:<tag>`
-- serverless maintenance: `ghcr.io/antflydb/antfly-serverless-maintenance:<tag>`
+- zig runtime: `ghcr.io/antflydb/antfly:zig`
 
 Local build helpers:
 

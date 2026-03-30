@@ -21,6 +21,9 @@ spec:
     - jsonPath: .status.validated
       name: Validated
       type: boolean
+    - jsonPath: .status.apiReadyReplicas
+      name: API
+      type: integer
     - jsonPath: .status.queryReadyReplicas
       name: Query
       type: integer
@@ -56,6 +59,26 @@ spec:
             type: object
           spec:
             properties:
+              api:
+                properties:
+                  autoScaling:
+                    properties:
+                      enabled:
+                        type: boolean
+                      maxReplicas:
+                        format: int32
+                        type: integer
+                      minReplicas:
+                        format: int32
+                        type: integer
+                      targetCPUUtilizationPercentage:
+                        format: int32
+                        type: integer
+                    type: object
+                  replicas:
+                    format: int32
+                    type: integer
+                type: object
               embeddings:
                 properties:
                   indexesSecretRef:
@@ -65,11 +88,9 @@ spec:
                 properties:
                   imagePullPolicy:
                     type: string
-                  maintenanceImage:
-                    type: string
                   proxyImage:
                     type: string
-                  queryImage:
+                  zigImage:
                     type: string
                 type: object
               maintenance:
@@ -144,7 +165,9 @@ spec:
                           type: string
                         preferredBackend:
                           type: string
-                        serverlessURL:
+                        serverlessAPIURL:
+                          type: string
+                        serverlessQueryURL:
                           type: string
                         servingNamespace:
                           type: string
@@ -201,6 +224,11 @@ spec:
             type: object
           status:
             properties:
+              apiReadyReplicas:
+                format: int32
+                type: integer
+              apiServiceName:
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

@@ -10,11 +10,12 @@ func TestChainedCatalogFallsBackToStaticRoutes(t *testing.T) {
 		NewStaticCatalog(nil),
 		NewStaticCatalog([]NamespaceRoute{
 			{
-				Tenant:          "t1",
-				Table:           "docs",
-				Namespace:       "docs-serving",
-				AllowServerless: true,
-				ServerlessURL:   "http://serverless",
+				Tenant:             "t1",
+				Table:              "docs",
+				Namespace:          "docs-serving",
+				AllowServerless:    true,
+				ServerlessQueryURL: "http://serverless-query",
+				ServerlessAPIURL:   "http://serverless-api",
 			},
 		}),
 	)
@@ -23,7 +24,7 @@ func TestChainedCatalogFallsBackToStaticRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected resolve error: %v", err)
 	}
-	if route.ServerlessURL != "http://serverless" {
+	if route.ServerlessQueryURL != "http://serverless-query" || route.ServerlessAPIURL != "http://serverless-api" {
 		t.Fatalf("got route %+v", route)
 	}
 }

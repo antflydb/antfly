@@ -17,8 +17,7 @@ spec:
     catalogURI: s3://antfly-docs/catalog
     progressURI: s3://antfly-docs/progress
   images:
-    queryImage: ghcr.io/antflydb/antfly-serverless-query:latest
-    maintenanceImage: ghcr.io/antflydb/antfly-serverless-maintenance:latest
+    zigImage: ghcr.io/antflydb/antfly:zig
     proxyImage: ghcr.io/antflydb/antfly-proxy:latest
   proxy:
     enabled: true
@@ -32,7 +31,8 @@ spec:
         allowStateful: true
         allowServerless: true
         statefulURL: http://docs-cluster-public-api.default.svc:80
-        serverlessURL: http://docs-serverless-query.default.svc:8080
+        serverlessQueryURL: http://docs-serverless-query.default.svc:8080
+        serverlessAPIURL: http://docs-serverless-api.default.svc:8080
 
 ---
 apiVersion: antfly.io/v1
@@ -48,8 +48,7 @@ spec:
     catalogURI: s3://antfly-analytics/catalog
     progressURI: s3://antfly-analytics/progress
   images:
-    queryImage: ghcr.io/antflydb/antfly-serverless-query:latest
-    maintenanceImage: ghcr.io/antflydb/antfly-serverless-maintenance:latest
+    zigImage: ghcr.io/antflydb/antfly:zig
   query:
     port: 9090
   proxy:

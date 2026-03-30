@@ -64,8 +64,10 @@ func (r *AntflyServerlessProjectReconciler) Reconcile(ctx context.Context, req c
 	project.Status.Validated = validated
 	project.Status.ConfigMapName = serverlessConfigMapName(project.Name)
 	project.Status.ProxyConfigMapName = ""
+	project.Status.APIServiceName = serverlessServiceName(project.Name, serverlessComponentAPI)
 	project.Status.QueryServiceName = serverlessServiceName(project.Name, serverlessComponentQuery)
 	project.Status.ProxyServiceName = ""
+	project.Status.APIReadyReplicas = 0
 	project.Status.QueryReadyReplicas = 0
 	project.Status.MaintenanceReadyReplicas = 0
 	project.Status.ProxyReadyReplicas = 0
@@ -98,10 +100,16 @@ func (r *AntflyServerlessProjectReconciler) Reconcile(ctx context.Context, req c
 	if err := r.reconcileConfigMap(ctx, project); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.reconcileDeployment(ctx, project, serverlessComponentAPI); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.reconcileDeployment(ctx, project, serverlessComponentQuery); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileDeployment(ctx, project, serverlessComponentMaintenance); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcilePDB(ctx, project, serverlessComponentAPI); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcilePDB(ctx, project, serverlessComponentQuery); err != nil {
@@ -110,7 +118,13 @@ func (r *AntflyServerlessProjectReconciler) Reconcile(ctx context.Context, req c
 	if err := r.reconcilePDB(ctx, project, serverlessComponentMaintenance); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.reconcileHPA(ctx, project, serverlessComponentAPI); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.reconcileHPA(ctx, project, serverlessComponentQuery); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileService(ctx, project, serverlessComponentAPI); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileService(ctx, project, serverlessComponentQuery); err != nil {
@@ -141,6 +155,10 @@ func (r *AntflyServerlessProjectReconciler) Reconcile(ctx context.Context, req c
 		}
 	}
 
+	apiReady, err := r.deploymentReadyReplicas(ctx, project.Namespace, serverlessDeploymentName(project.Name, serverlessComponentAPI))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	queryReady, err := r.deploymentReadyReplicas(ctx, project.Namespace, serverlessDeploymentName(project.Name, serverlessComponentQuery))
 	if err != nil {
 		return ctrl.Result{}, err
@@ -149,6 +167,7 @@ func (r *AntflyServerlessProjectReconciler) Reconcile(ctx context.Context, req c
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	project.Status.APIReadyReplicas = apiReady
 	project.Status.QueryReadyReplicas = queryReady
 	project.Status.MaintenanceReadyReplicas = maintenanceReady
 
@@ -161,6 +180,7 @@ func (r *AntflyServerlessProjectReconciler) Reconcile(ctx context.Context, req c
 	}
 	project.Status.ProxyReadyReplicas = proxyReady
 
+	apiDesired := desiredReplicas(project.Spec.API.Replicas)
 	queryDesired := desiredReplicas(project.Spec.Query.Replicas)
 	maintenanceDesired := desiredReplicas(project.Spec.Maintenance.Replicas)
 	proxyDesired := int32(0)
@@ -168,11 +188,11 @@ func (r *AntflyServerlessProjectReconciler) Reconcile(ctx context.Context, req c
 		proxyDesired = desiredReplicas(project.Spec.Proxy.Replicas)
 	}
 
-	if queryReady >= queryDesired && maintenanceReady >= maintenanceDesired && proxyReady >= proxyDesired {
+	if apiReady >= apiDesired && queryReady >= queryDesired && maintenanceReady >= maintenanceDesired && proxyReady >= proxyDesired {
 		project.Status.Phase = antflyv1.ServerlessProjectPhaseReady
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = antflyv1.ReasonServerlessProjectReady
-		condition.Message = "Serverless query, maintenance, and proxy workloads are ready"
+		condition.Message = "Serverless api, query, maintenance, and proxy workloads are ready"
 	} else {
 		project.Status.Phase = antflyv1.ServerlessProjectPhaseReconciling
 		condition.Status = metav1.ConditionFalse
@@ -203,6 +223,7 @@ func (r *AntflyServerlessProjectReconciler) SetupWithManager(mgr ctrl.Manager) e
 type serverlessComponent string
 
 const (
+	serverlessComponentAPI          serverlessComponent = "api"
 	serverlessComponentQuery        serverlessComponent = "query"
 	serverlessComponentMaintenance  serverlessComponent = "maintenance"
 	serverlessComponentProxy        serverlessComponent = "proxy"
@@ -239,6 +260,8 @@ func (r *AntflyServerlessProjectReconciler) reconcileDeployment(ctx context.Cont
 				Name:            string(component),
 				Image:           componentImage(project, component),
 				ImagePullPolicy: imagePullPolicy(project.Spec.Images.ImagePullPolicy),
+				Command:         componentCommand(component),
+				Args:            componentArgs(component),
 				Ports: []corev1.ContainerPort{
 					{
 						Name:          "http",
@@ -539,6 +562,11 @@ func serverlessHPAName(projectName string, component serverlessComponent) string
 
 func componentReplicas(project *antflyv1.AntflyServerlessProject, component serverlessComponent) int32 {
 	switch component {
+	case serverlessComponentAPI:
+		if project.Spec.API.AutoScaling.Enabled {
+			return desiredReplicas(project.Spec.API.AutoScaling.MinReplicas)
+		}
+		return desiredReplicas(project.Spec.API.Replicas)
 	case serverlessComponentQuery:
 		if project.Spec.Query.AutoScaling.Enabled {
 			return desiredReplicas(project.Spec.Query.AutoScaling.MinReplicas)
@@ -558,6 +586,8 @@ func componentReplicas(project *antflyv1.AntflyServerlessProject, component serv
 
 func componentAutoScaling(project *antflyv1.AntflyServerlessProject, component serverlessComponent) antflyv1.ServerlessAutoScalingSpec {
 	switch component {
+	case serverlessComponentAPI:
+		return project.Spec.API.AutoScaling
 	case serverlessComponentQuery:
 		return project.Spec.Query.AutoScaling
 	case serverlessComponentProxy:
@@ -569,10 +599,8 @@ func componentAutoScaling(project *antflyv1.AntflyServerlessProject, component s
 
 func componentImage(project *antflyv1.AntflyServerlessProject, component serverlessComponent) string {
 	switch component {
-	case serverlessComponentQuery:
-		return project.Spec.Images.QueryImage
-	case serverlessComponentMaintenance:
-		return project.Spec.Images.MaintenanceImage
+	case serverlessComponentAPI, serverlessComponentQuery, serverlessComponentMaintenance:
+		return project.Spec.Images.ZigImage
 	case serverlessComponentProxy:
 		return project.Spec.Images.ProxyImage
 	default:
@@ -586,6 +614,28 @@ func componentPort(project *antflyv1.AntflyServerlessProject, component serverle
 		return project.Spec.Proxy.Port
 	default:
 		return project.Spec.Query.Port
+	}
+}
+
+func componentCommand(component serverlessComponent) []string {
+	switch component {
+	case serverlessComponentAPI, serverlessComponentQuery, serverlessComponentMaintenance:
+		return []string{"antfly"}
+	default:
+		return nil
+	}
+}
+
+func componentArgs(component serverlessComponent) []string {
+	switch component {
+	case serverlessComponentAPI:
+		return []string{"serverless", "api"}
+	case serverlessComponentQuery:
+		return []string{"serverless", "query"}
+	case serverlessComponentMaintenance:
+		return []string{"serverless", "maintenance"}
+	default:
+		return nil
 	}
 }
 
@@ -745,14 +795,15 @@ func (r *AntflyServerlessProjectReconciler) serverlessProxyRoutesJSON(ctx contex
 	routes := make([]map[string]any, 0, len(aggregated))
 	for _, route := range aggregated {
 		routes = append(routes, map[string]any{
-			"tenant":            route.Tenant,
-			"table":             proxyRouteTableName(route),
-			"serving_namespace": proxyRouteServingNamespace(route),
-			"preferred_backend": route.PreferredBackend,
-			"allow_stateful":    route.AllowStateful,
-			"allow_serverless":  route.AllowServerless,
-			"stateful_url":      route.StatefulURL,
-			"serverless_url":    route.ServerlessURL,
+			"tenant":               route.Tenant,
+			"table":                proxyRouteTableName(route),
+			"serving_namespace":    proxyRouteServingNamespace(route),
+			"preferred_backend":    route.PreferredBackend,
+			"allow_stateful":       route.AllowStateful,
+			"allow_serverless":     route.AllowServerless,
+			"stateful_url":         route.StatefulURL,
+			"serverless_query_url": route.ServerlessQueryURL,
+			"serverless_api_url":   route.ServerlessAPIURL,
 		})
 	}
 	encoded, err := json.Marshal(routes)
@@ -788,11 +839,18 @@ func (r *AntflyServerlessProjectReconciler) aggregateProxyRoutes(ctx context.Con
 		}
 		for _, route := range projectRoutes {
 			key := route.Tenant + "/" + proxyRouteTableName(route)
-			if route.AllowServerless && route.ServerlessURL == "" {
-				route.ServerlessURL = fmt.Sprintf("http://%s.%s.svc:%d",
+			if route.AllowServerless && route.ServerlessQueryURL == "" {
+				route.ServerlessQueryURL = fmt.Sprintf("http://%s.%s.svc:%d",
 					serverlessServiceName(item.Name, serverlessComponentQuery),
 					item.Namespace,
 					componentPort(&item, serverlessComponentQuery),
+				)
+			}
+			if route.AllowServerless && route.ServerlessAPIURL == "" {
+				route.ServerlessAPIURL = fmt.Sprintf("http://%s.%s.svc:%d",
+					serverlessServiceName(item.Name, serverlessComponentAPI),
+					item.Namespace,
+					componentPort(&item, serverlessComponentAPI),
 				)
 			}
 			indexed[key] = route
@@ -867,15 +925,16 @@ func (r *AntflyServerlessProjectReconciler) projectProxyRoutes(ctx context.Conte
 }
 
 type proxyRouteConfig struct {
-	Tenant           string `json:"tenant"`
-	Table            string `json:"table"`
-	Namespace        string `json:"namespace"`
-	ServingNamespace string `json:"serving_namespace"`
-	PreferredBackend string `json:"preferred_backend"`
-	AllowStateful    bool   `json:"allow_stateful"`
-	AllowServerless  bool   `json:"allow_serverless"`
-	StatefulURL      string `json:"stateful_url"`
-	ServerlessURL    string `json:"serverless_url"`
+	Tenant             string `json:"tenant"`
+	Table              string `json:"table"`
+	Namespace          string `json:"namespace"`
+	ServingNamespace   string `json:"serving_namespace"`
+	PreferredBackend   string `json:"preferred_backend"`
+	AllowStateful      bool   `json:"allow_stateful"`
+	AllowServerless    bool   `json:"allow_serverless"`
+	StatefulURL        string `json:"stateful_url"`
+	ServerlessQueryURL string `json:"serverless_query_url"`
+	ServerlessAPIURL   string `json:"serverless_api_url"`
 }
 
 func parseProxyRouteSpecsJSON(raw string) ([]antflyv1.ServerlessProxyRouteSpec, error) {
@@ -889,15 +948,16 @@ func parseProxyRouteSpecsJSON(raw string) ([]antflyv1.ServerlessProxyRouteSpec, 
 	routes := make([]antflyv1.ServerlessProxyRouteSpec, 0, len(decoded))
 	for _, route := range decoded {
 		routes = append(routes, antflyv1.ServerlessProxyRouteSpec{
-			Tenant:           route.Tenant,
-			Table:            firstNonEmptyProxyString(route.Table, route.Namespace),
-			Namespace:        route.Namespace,
-			ServingNamespace: firstNonEmptyProxyString(route.ServingNamespace, route.Namespace, route.Table),
-			PreferredBackend: route.PreferredBackend,
-			AllowStateful:    route.AllowStateful,
-			AllowServerless:  route.AllowServerless,
-			StatefulURL:      route.StatefulURL,
-			ServerlessURL:    route.ServerlessURL,
+			Tenant:             route.Tenant,
+			Table:              firstNonEmptyProxyString(route.Table, route.Namespace),
+			Namespace:          route.Namespace,
+			ServingNamespace:   firstNonEmptyProxyString(route.ServingNamespace, route.Namespace, route.Table),
+			PreferredBackend:   route.PreferredBackend,
+			AllowStateful:      route.AllowStateful,
+			AllowServerless:    route.AllowServerless,
+			StatefulURL:        route.StatefulURL,
+			ServerlessQueryURL: route.ServerlessQueryURL,
+			ServerlessAPIURL:   route.ServerlessAPIURL,
 		})
 	}
 	return routes, nil

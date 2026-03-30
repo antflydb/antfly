@@ -31,7 +31,7 @@ This directory contains example configurations for deploying Antfly database clu
 ### Serverless Project With Proxy (`serverless-project-with-proxy.yaml`)
 A serverless retrieval deployment with:
 
-- query and maintenance `Deployment`s
+- api, query, and maintenance `Deployment`s
 - optional Antfly-aware proxy `Deployment`
 - object-store-backed state
 - proxy auth via bearer-token `Secret`
@@ -108,6 +108,7 @@ See [serverless-project-stack/README.md](./serverless-project-stack/README.md) f
 - ConfigMaps labeled `antfly.io/serverless-proxy-route-source=true` are aggregated as shared route sources
 - route entries map public `table` names to internal serverless `serving_namespace` values
 - the proxy container should run `antfly proxy`
+- the Zig runtime container should run `antfly serverless api|query|maintenance`
 
 **Bearer token secret shape:**
 ```yaml

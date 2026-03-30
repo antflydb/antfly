@@ -7,15 +7,16 @@ import (
 )
 
 type routeConfig struct {
-	Tenant           string `json:"tenant"`
-	Table            string `json:"table"`
-	Namespace        string `json:"namespace"`
-	ServingNamespace string `json:"serving_namespace"`
-	PreferredBackend string `json:"preferred_backend"`
-	AllowStateful    bool   `json:"allow_stateful"`
-	AllowServerless  bool   `json:"allow_serverless"`
-	StatefulURL      string `json:"stateful_url"`
-	ServerlessURL    string `json:"serverless_url"`
+	Tenant             string `json:"tenant"`
+	Table              string `json:"table"`
+	Namespace          string `json:"namespace"`
+	ServingNamespace   string `json:"serving_namespace"`
+	PreferredBackend   string `json:"preferred_backend"`
+	AllowStateful      bool   `json:"allow_stateful"`
+	AllowServerless    bool   `json:"allow_serverless"`
+	StatefulURL        string `json:"stateful_url"`
+	ServerlessQueryURL string `json:"serverless_query_url"`
+	ServerlessAPIURL   string `json:"serverless_api_url"`
 }
 
 func ParseRoutesJSON(raw string) ([]NamespaceRoute, error) {
@@ -31,14 +32,15 @@ func ParseRoutesJSON(raw string) ([]NamespaceRoute, error) {
 		table := firstNonEmpty(route.Table, route.Namespace)
 		namespace := firstNonEmpty(route.ServingNamespace, route.Namespace, route.Table)
 		routes = append(routes, NamespaceRoute{
-			Tenant:           route.Tenant,
-			Table:            table,
-			Namespace:        namespace,
-			PreferredBackend: BackendKind(route.PreferredBackend),
-			AllowStateful:    route.AllowStateful,
-			AllowServerless:  route.AllowServerless,
-			StatefulURL:      route.StatefulURL,
-			ServerlessURL:    route.ServerlessURL,
+			Tenant:             route.Tenant,
+			Table:              table,
+			Namespace:          namespace,
+			PreferredBackend:   BackendKind(route.PreferredBackend),
+			AllowStateful:      route.AllowStateful,
+			AllowServerless:    route.AllowServerless,
+			StatefulURL:        route.StatefulURL,
+			ServerlessQueryURL: route.ServerlessQueryURL,
+			ServerlessAPIURL:   route.ServerlessAPIURL,
 		})
 	}
 	return routes, nil

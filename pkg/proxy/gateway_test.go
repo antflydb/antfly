@@ -10,11 +10,12 @@ import (
 func TestGatewayResolve(t *testing.T) {
 	gateway := NewGateway(NewRouter([]NamespaceRoute{
 		{
-			Tenant:          "t1",
-			Table:           "docs",
-			Namespace:       "docs",
-			AllowServerless: true,
-			ServerlessURL:   "http://serverless-query.default.svc:8080",
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs",
+			AllowServerless:    true,
+			ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+			ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
 		},
 	}))
 
@@ -41,11 +42,12 @@ func TestGatewayResolve(t *testing.T) {
 func TestGatewayServeHTTP(t *testing.T) {
 	gateway := NewGateway(NewRouter([]NamespaceRoute{
 		{
-			Tenant:          "t1",
-			Table:           "docs",
-			Namespace:       "docs",
-			AllowServerless: true,
-			ServerlessURL:   "http://serverless-query.default.svc:8080",
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs",
+			AllowServerless:    true,
+			ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+			ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
 		},
 	}))
 
@@ -72,11 +74,12 @@ func TestGatewayServeHTTP(t *testing.T) {
 func TestGatewayRejectsNonTablePublicPath(t *testing.T) {
 	gateway := NewGateway(NewRouter([]NamespaceRoute{
 		{
-			Tenant:          "t1",
-			Table:           "docs",
-			Namespace:       "docs",
-			AllowServerless: true,
-			ServerlessURL:   "http://serverless-query.default.svc:8080",
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs",
+			AllowServerless:    true,
+			ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+			ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
 		},
 	}))
 
@@ -115,11 +118,12 @@ func TestGatewayServeHTTPProxyForward(t *testing.T) {
 
 	gateway := NewGateway(NewRouter([]NamespaceRoute{
 		{
-			Tenant:          "t1",
-			Table:           "docs",
-			Namespace:       "docs",
-			AllowServerless: true,
-			ServerlessURL:   backend.URL,
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs",
+			AllowServerless:    true,
+			ServerlessQueryURL: backend.URL,
+			ServerlessAPIURL:   backend.URL,
 		},
 	}))
 	gateway.authenticator = StaticBearerAuthenticator{
@@ -176,11 +180,12 @@ func TestGatewayServeHTTPProxyForwardNormalizesBackendError(t *testing.T) {
 
 	gateway := NewGateway(NewRouter([]NamespaceRoute{
 		{
-			Tenant:          "t1",
-			Table:           "docs",
-			Namespace:       "docs",
-			AllowServerless: true,
-			ServerlessURL:   backend.URL,
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs",
+			AllowServerless:    true,
+			ServerlessQueryURL: backend.URL,
+			ServerlessAPIURL:   backend.URL,
 		},
 	}))
 	gateway.authenticator = StaticBearerAuthenticator{
@@ -275,13 +280,14 @@ func TestGatewayServeHTTPProxyForwardNormalizesGraphResponse(t *testing.T) {
 
 	gateway := NewGateway(NewRouter([]NamespaceRoute{
 		{
-			Tenant:          "t1",
-			Table:           "docs",
-			Namespace:       "docs",
-			AllowStateful:   true,
-			AllowServerless: true,
-			StatefulURL:     "http://stateful.invalid",
-			ServerlessURL:   backend.URL,
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs",
+			AllowStateful:      true,
+			AllowServerless:    true,
+			StatefulURL:        "http://stateful.invalid",
+			ServerlessQueryURL: backend.URL,
+			ServerlessAPIURL:   backend.URL,
 		},
 	}))
 	gateway.authenticator = StaticBearerAuthenticator{

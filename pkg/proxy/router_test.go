@@ -5,14 +5,15 @@ import "testing"
 func TestRouterResolve(t *testing.T) {
 	router := NewRouter([]NamespaceRoute{
 		{
-			Tenant:           "t1",
-			Table:            "docs",
-			Namespace:        "docs-serving",
-			PreferredBackend: BackendServerless,
-			AllowStateful:    true,
-			AllowServerless:  true,
-			StatefulURL:      "http://stateful.default.svc:8080",
-			ServerlessURL:    "http://serverless-query.default.svc:8080",
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs-serving",
+			PreferredBackend:   BackendServerless,
+			AllowStateful:      true,
+			AllowServerless:    true,
+			StatefulURL:        "http://stateful.default.svc:8080",
+			ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+			ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
 		},
 		{
 			Tenant:           "t1",
@@ -23,6 +24,16 @@ func TestRouterResolve(t *testing.T) {
 			AllowServerless:  false,
 			StatefulURL:      "http://stateful.default.svc:8080",
 		},
+		{
+			Tenant:             "t1",
+			Table:              "logs",
+			Namespace:          "logs-serving",
+			PreferredBackend:   BackendServerless,
+			AllowStateful:      false,
+			AllowServerless:    true,
+			ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+			ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
+		},
 	})
 
 	tests := []struct {
@@ -32,13 +43,22 @@ func TestRouterResolve(t *testing.T) {
 		err  bool
 	}{
 		{
-			name: "writes prefer stateful",
+			name: "writes prefer stateful when available",
 			req: RequestContext{
 				Tenant:    "t1",
 				Table:     "docs",
 				Operation: OperationWrite,
 			},
 			want: BackendStateful,
+		},
+		{
+			name: "writes use serverless api when stateful is unavailable",
+			req: RequestContext{
+				Tenant:    "t1",
+				Table:     "logs",
+				Operation: OperationWrite,
+			},
+			want: BackendServerless,
 		},
 		{
 			name: "graph reads prefer serverless when allowed",
@@ -102,11 +122,12 @@ func TestRouterResolve(t *testing.T) {
 func TestRouterResolveBackend(t *testing.T) {
 	router := NewRouter([]NamespaceRoute{
 		{
-			Tenant:          "t1",
-			Table:           "docs",
-			Namespace:       "docs-serving",
-			AllowServerless: true,
-			ServerlessURL:   "http://serverless-query.default.svc:8080",
+			Tenant:             "t1",
+			Table:              "docs",
+			Namespace:          "docs-serving",
+			AllowServerless:    true,
+			ServerlessQueryURL: "http://serverless-query.default.svc:8080",
+			ServerlessAPIURL:   "http://serverless-api.default.svc:8080",
 		},
 	})
 

@@ -267,8 +267,7 @@ func TestAntflyServerlessProjectValidator_ValidateCreate_Valid(t *testing.T) {
 				ProgressURI:  "s3://bucket/progress",
 			},
 			Images: antflyv1.ServerlessImagesSpec{
-				QueryImage:       "query:latest",
-				MaintenanceImage: "maintenance:latest",
+				ZigImage: "ghcr.io/antflydb/antfly:zig",
 			},
 		},
 	}
@@ -310,8 +309,7 @@ func TestAntflyServerlessProjectValidator_ValidateCreate_InvalidRouteConfigSourc
 				ProgressURI:  "s3://bucket/progress",
 			},
 			Images: antflyv1.ServerlessImagesSpec{
-				QueryImage:       "query:latest",
-				MaintenanceImage: "maintenance:latest",
+				ZigImage: "ghcr.io/antflydb/antfly:zig",
 			},
 			Proxy: antflyv1.ServerlessProxySpec{
 				RouteConfigMapKey: "routes.json",

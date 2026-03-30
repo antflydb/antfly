@@ -1,6 +1,7 @@
 # Example: Serverless project with Antfly-aware proxy
 #
 # This example shows:
+# - a serverless api deployment
 # - a serverless query deployment
 # - a serverless maintenance deployment
 # - an optional proxy deployment
@@ -36,8 +37,7 @@ spec:
     progressURI: s3://antfly-docs/progress
 
   images:
-    queryImage: ghcr.io/antflydb/antfly-serverless-query:latest
-    maintenanceImage: ghcr.io/antflydb/antfly-serverless-maintenance:latest
+    zigImage: ghcr.io/antflydb/antfly:zig
     proxyImage: ghcr.io/antflydb/antfly-proxy:latest
     imagePullPolicy: IfNotPresent
 
@@ -50,6 +50,14 @@ spec:
       enabled: true
       minReplicas: 2
       maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+
+  api:
+    replicas: 2
+    autoScaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
       targetCPUUtilizationPercentage: 70
 
   maintenance:
@@ -84,6 +92,7 @@ spec:
         allowStateful: true
         allowServerless: true
         statefulURL: http://docs-cluster-public-api.default.svc:80
-        serverlessURL: http://docs-serverless-query.default.svc:8080
+        serverlessQueryURL: http://docs-serverless-query.default.svc:8080
+        serverlessAPIURL: http://docs-serverless-api.default.svc:8080
 
   serviceAccountName: antfly-serverless
