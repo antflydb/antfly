@@ -170,6 +170,11 @@ make proxy-docker-build
 make operator-docker-build
 ```
 
+Release tags:
+
+- operator image publish: `pkg/operator/v<version>`
+- proxy image publish: `proxy/v<version>`
+
 Start with:
 
 ```bash

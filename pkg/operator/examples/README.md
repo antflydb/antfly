@@ -97,6 +97,8 @@ A small apply-ready bundle for the serverless-with-proxy path.
 kubectl apply -k examples/serverless-project-stack
 ```
 
+See [serverless-project-stack/README.md](./serverless-project-stack/README.md) for end-to-end apply, port-forward, and `curl` verification steps.
+
 **Proxy config conventions:**
 - routes are mounted from `/etc/antfly-proxy/routes.json`
 - bearer tokens are mounted from `/etc/antfly-proxy-secret/bearer_tokens.json`
