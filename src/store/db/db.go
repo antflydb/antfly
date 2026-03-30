@@ -2837,15 +2837,15 @@ func (db *DBImpl) Batch(
 		if !internalMergeCopy &&
 			(!ownedByApplyRange || !isKeyOwnedDuringMerge(kv[0], db.getByteRange(), mergeState)) {
 			// This can happen during a shard split when a write was committed to Raft
-			// just before the split operation was applied. The write is skipped because
-			// the key is now outside this shard's range.
-			// WARNING: This causes data loss - the client received success but data is dropped.
-			// This should be rare if pendingSplitKey mechanism is working correctly.
-			db.logger.Warn("SPLIT_DATA_LOSS: Skipping write outside byte range - data will be lost",
+			// just before the split state transitioned to FINALIZING. The validation
+			// on the leader saw an active split phase (SPLITTING) but by apply time the
+			// state has progressed. Return ErrKeyOutOfRange so the error propagates
+			// through the Raft callback to the client, which retries with updated routing.
+			db.logger.Warn("Rejecting write outside byte range during split transition",
 				zap.String("key", types.FormatKey(kv[0])),
 				zap.Stringer("range", db.getByteRange()),
 				zap.String("dir", db.dir))
-			continue
+			return common.NewErrKeyOutOfRange(kv[0], db.getByteRange())
 		}
 		if isKeyInSplitOffRangeForState(kv[0], splitState) {
 			splitDeltaWrites = append(splitDeltaWrites, kv)
@@ -3015,7 +3015,11 @@ func (db *DBImpl) Batch(
 		}
 		if !internalMergeCopy &&
 			(!ownedByApplyRange || !isKeyOwnedDuringMerge(k, db.getByteRange(), mergeState)) {
-			continue
+			db.logger.Warn("Rejecting delete outside byte range during split transition",
+				zap.String("key", types.FormatKey(k)),
+				zap.Stringer("range", db.getByteRange()),
+				zap.String("dir", db.dir))
+			return common.NewErrKeyOutOfRange(k, db.getByteRange())
 		}
 		if isKeyInSplitOffRangeForState(k, splitState) {
 			splitDeltaDeletes = append(splitDeltaDeletes, k)

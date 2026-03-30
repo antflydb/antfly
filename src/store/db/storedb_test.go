@@ -207,6 +207,121 @@ func TestDBBatch_AllowsReceiverMergeDonorRangeOnApply(t *testing.T) {
 	require.Equal(t, "right", doc["doc"])
 }
 
+// TestDBBatch_RejectsWriteOutsideRangeAfterSplitStateCleared tests that writes
+// committed to Raft during an active split phase are rejected at apply time if
+// the split state has since transitioned to FINALIZING or been cleared. This
+// prevents silent data loss (previously the write was dropped with only a log
+// warning). The returned ErrKeyOutOfRange propagates through the Raft callback
+// to the client, which retries with updated routing.
+func TestDBBatch_RejectsWriteOutsideRangeAfterSplitStateCleared(t *testing.T) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+	snapStore, err := snapstore.NewLocalSnapStore(dir, 1, 1)
+	require.NoError(t, err)
+
+	coreDB := NewDBImplForTest(lg, snapStore)
+	// Parent shard range narrowed to [a, m) after split
+	require.NoError(t, coreDB.Open(filepath.Join(dir, "parent"), false, nil, types.Range{[]byte("a"), []byte("m")}))
+	defer coreDB.Close()
+
+	// Split state is nil (cleared after finalization) — simulates the race where
+	// the write was proposed during PHASE_SPLITTING but applied after the state
+	// transitioned to FINALIZING and was cleared.
+	// coreDB.splitState is already nil by default.
+
+	// Key "zoo" is outside [a, m) and the split state is inactive → should error.
+	key := []byte("zoo")
+	value := []byte(`{"doc":"lost"}`)
+	err = coreDB.Batch(context.Background(), [][2][]byte{{key, value}}, nil, Op_SyncLevelWrite)
+	require.Error(t, err)
+	var keyErr common.ErrKeyOutOfRange
+	require.ErrorAs(t, err, &keyErr, "expected ErrKeyOutOfRange, got: %v", err)
+	assert.Equal(t, key, keyErr.Key)
+}
+
+// TestDBBatch_RejectsDeleteOutsideRangeAfterSplitStateCleared mirrors the write
+// test for the delete path.
+func TestDBBatch_RejectsDeleteOutsideRangeAfterSplitStateCleared(t *testing.T) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+	snapStore, err := snapstore.NewLocalSnapStore(dir, 1, 1)
+	require.NoError(t, err)
+
+	coreDB := NewDBImplForTest(lg, snapStore)
+	require.NoError(t, coreDB.Open(filepath.Join(dir, "parent"), false, nil, types.Range{[]byte("a"), []byte("m")}))
+	defer coreDB.Close()
+
+	key := []byte("zoo")
+	err = coreDB.Batch(context.Background(), nil, [][]byte{key}, Op_SyncLevelWrite)
+	require.Error(t, err)
+	var keyErr common.ErrKeyOutOfRange
+	require.ErrorAs(t, err, &keyErr, "expected ErrKeyOutOfRange, got: %v", err)
+}
+
+// TestDBBatch_AcceptsWriteInOwnedRange verifies that writes within the shard's
+// byte range succeed normally, even when a split state is active.
+func TestDBBatch_AcceptsWriteInOwnedRange(t *testing.T) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+	snapStore, err := snapstore.NewLocalSnapStore(dir, 1, 1)
+	require.NoError(t, err)
+
+	coreDB := NewDBImplForTest(lg, snapStore)
+	require.NoError(t, coreDB.Open(filepath.Join(dir, "parent"), false, nil, types.Range{[]byte("a"), []byte("m")}))
+	defer coreDB.Close()
+
+	splitState := SplitState_builder{
+		Phase:            SplitState_PHASE_SPLITTING,
+		SplitKey:         []byte("m"),
+		OriginalRangeEnd: []byte("z"),
+	}.Build()
+	require.NoError(t, coreDB.SetSplitState(splitState))
+
+	// Key "foo" is inside [a, m) — should succeed.
+	key := []byte("foo")
+	value := []byte(`{"doc":"ok"}`)
+	err = coreDB.Batch(context.Background(), [][2][]byte{{key, value}}, nil, Op_SyncLevelWrite)
+	require.NoError(t, err)
+
+	doc, err := coreDB.Get(context.Background(), key)
+	require.NoError(t, err)
+	require.Equal(t, "ok", doc["doc"])
+}
+
+// TestDBBatch_RejectsWriteInSplitOffRangeAfterRangeNarrowed verifies that
+// writes to the split-off range are rejected even when the split state is
+// still active, because the byte range has already been narrowed. This is the
+// normal post-applyOpSplit state: the range is narrowed and the pendingSplitKey
+// mechanism on the leader prevents proposals from reaching Batch(). Any write
+// that does reach here (due to the committed-but-not-applied race) is rejected.
+func TestDBBatch_RejectsWriteInSplitOffRangeAfterRangeNarrowed(t *testing.T) {
+	dir := t.TempDir()
+	lg := zaptest.NewLogger(t)
+	snapStore, err := snapstore.NewLocalSnapStore(dir, 1, 1)
+	require.NoError(t, err)
+
+	coreDB := NewDBImplForTest(lg, snapStore)
+	// Range already narrowed to [a, m).
+	require.NoError(t, coreDB.Open(filepath.Join(dir, "parent"), false, nil, types.Range{[]byte("a"), []byte("m")}))
+	defer coreDB.Close()
+
+	// Split state still active (SPLITTING), but range already narrowed.
+	splitState := SplitState_builder{
+		Phase:            SplitState_PHASE_SPLITTING,
+		SplitKey:         []byte("m"),
+		OriginalRangeEnd: []byte("z"),
+	}.Build()
+	require.NoError(t, coreDB.SetSplitState(splitState))
+
+	// Key "nnn" is in the split-off range [m, z), outside the narrowed byte range.
+	key := []byte("nnn")
+	value := []byte(`{"doc":"lost"}`)
+	err = coreDB.Batch(context.Background(), [][2][]byte{{key, value}}, nil, Op_SyncLevelWrite)
+	require.Error(t, err)
+	var keyErr common.ErrKeyOutOfRange
+	require.ErrorAs(t, err, &keyErr, "expected ErrKeyOutOfRange, got: %v", err)
+}
+
 func TestDBWrapperSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	t.Cleanup(func() { os.RemoveAll("./antflydb") })
