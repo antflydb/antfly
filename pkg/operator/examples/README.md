@@ -133,6 +133,13 @@ stringData:
         "admin": false,
         "tables": ["docs"],
         "operations": ["read"]
+      },
+      "token-2": {
+        "subject": "writer-1",
+        "tenant": "tenant-a",
+        "admin": false,
+        "tables": ["docs"],
+        "operations": ["write"]
       }
     }
 ```
