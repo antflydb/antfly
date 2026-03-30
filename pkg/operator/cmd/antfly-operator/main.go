@@ -50,8 +50,10 @@ func main() {
 	var probeAddr string
 	var skipCRDInstall bool
 	var printInstallManifests bool
+	var printUninstallManifests bool
 	var installOperatorImage string
 	var installIncludeCRDs bool
+	var uninstallIncludeCRDs bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -61,10 +63,14 @@ func main() {
 		"Skip automatic CRD installation (use if CRDs managed externally)")
 	flag.BoolVar(&printInstallManifests, "print-install-manifests", false,
 		"Print a self-contained operator install manifest bundle and exit")
+	flag.BoolVar(&printUninstallManifests, "print-uninstall-manifests", false,
+		"Print a self-contained operator uninstall manifest bundle and exit")
 	flag.StringVar(&installOperatorImage, "install-operator-image", "",
 		"Operator image to use when printing install manifests")
 	flag.BoolVar(&installIncludeCRDs, "install-include-crds", true,
 		"Include CRDs when printing install manifests")
+	flag.BoolVar(&uninstallIncludeCRDs, "uninstall-include-crds", false,
+		"Include CRDs when printing uninstall manifests")
 	opts := zap.Options{
 		Development: false,
 		TimeEncoder: zapcore.RFC3339TimeEncoder,
@@ -82,6 +88,17 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Print(installYAML)
+		return
+	}
+	if printUninstallManifests {
+		uninstallYAML, err := manifests.OperatorUninstallYAML(manifests.UninstallOptions{
+			IncludeCRDs: uninstallIncludeCRDs,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "print uninstall manifests: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(uninstallYAML)
 		return
 	}
 

@@ -42,3 +42,35 @@ func TestOperatorInstallYAMLRespectsOptions(t *testing.T) {
 		t.Fatalf("expected custom operator image to be rendered")
 	}
 }
+
+func TestOperatorUninstallYAMLDefaultsToKeepingCRDs(t *testing.T) {
+	yaml, err := OperatorUninstallYAML(UninstallOptions{})
+	if err != nil {
+		t.Fatalf("OperatorUninstallYAML() error = %v", err)
+	}
+
+	if strings.Contains(yaml, "kind: CustomResourceDefinition") {
+		t.Fatalf("expected CRDs to be omitted by default")
+	}
+	for _, want := range []string{
+		"kind: ValidatingWebhookConfiguration",
+		"kind: Deployment",
+		"kind: ClusterRoleBinding",
+		"kind: Namespace",
+	} {
+		if !strings.Contains(yaml, want) {
+			t.Fatalf("uninstall manifest missing %q", want)
+		}
+	}
+}
+
+func TestOperatorUninstallYAMLCanIncludeCRDs(t *testing.T) {
+	yaml, err := OperatorUninstallYAML(UninstallOptions{IncludeCRDs: true})
+	if err != nil {
+		t.Fatalf("OperatorUninstallYAML() error = %v", err)
+	}
+
+	if !strings.Contains(yaml, "kind: CustomResourceDefinition") {
+		t.Fatalf("expected CRDs to be included")
+	}
+}

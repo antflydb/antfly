@@ -27,6 +27,11 @@ type InstallOptions struct {
 	IncludeCRDs   bool
 }
 
+// UninstallOptions controls the generated uninstall manifest bundle.
+type UninstallOptions struct {
+	IncludeCRDs bool
+}
+
 // OperatorInstallYAML returns a self-contained install manifest bundle for the
 // operator, including CRDs, RBAC, the manager Deployment, and validating
 // webhook resources.
@@ -64,6 +69,43 @@ func OperatorInstallYAML(opts InstallOptions) (string, error) {
 	}
 	docs = append(docs, installDocs...)
 	docs = append(docs, certManagerIssuerYAML(), certManagerCertificateYAML())
+
+	return strings.Join(filterEmpty(docs), "\n---\n") + "\n", nil
+}
+
+// OperatorUninstallYAML returns a manifest bundle suitable for deleting the
+// operator installation. By default it preserves CRDs unless explicitly
+// requested, which avoids deleting custom resources unexpectedly.
+func OperatorUninstallYAML(opts UninstallOptions) (string, error) {
+	rbacDocs, err := marshalYAMLDocuments(
+		validatingWebhookConfiguration(),
+		webhookService(),
+		managerDeployment(defaultOperatorImage),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	docs := make([]string, 0, 12)
+	docs = append(docs, rbacDocs...)
+	docs = append(docs, certManagerCertificateYAML(), certManagerIssuerYAML())
+
+	leaderElectionDocs, err := marshalYAMLDocuments(
+		LeaderElectionRoleBinding(),
+		LeaderElectionRole(),
+		ClusterRoleBinding(),
+		mustClusterRoleFromYAML(),
+		ServiceAccount(),
+		Namespace(),
+	)
+	if err != nil {
+		return "", err
+	}
+	docs = append(docs, leaderElectionDocs...)
+
+	if opts.IncludeCRDs {
+		docs = append(docs, strings.TrimSpace(AllCRDsYAML()))
+	}
 
 	return strings.Join(filterEmpty(docs), "\n---\n") + "\n", nil
 }

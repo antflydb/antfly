@@ -1,0 +1,33 @@
+# Stage 1: Build
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+COPY termite /app/termite
+COPY cmd/antfly /app/cmd/antfly
+COPY pkg /app/pkg
+
+RUN go mod download
+
+COPY . .
+
+ARG TARGETOS
+ARG TARGETARCH
+
+RUN GOEXPERIMENT=simd CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -a -installsuffix cgo -o antfly ./cmd/antfly
+
+# Stage 2: Minimal runtime image
+FROM gcr.io/distroless/static:nonroot
+
+LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
+LABEL org.opencontainers.image.description="Antfly Proxy - Antfly-aware gateway for stateful and serverless backends"
+LABEL org.opencontainers.image.licenses=Elastic-2.0
+
+WORKDIR /
+COPY --from=builder /app/antfly /antfly
+
+EXPOSE 8080
+
+ENTRYPOINT ["/antfly", "proxy"]

@@ -3,11 +3,11 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/antflydb/antfly/pkg/operator)](https://goreportcard.com/report/github.com/antflydb/antfly/pkg/operator)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.20+-blue.svg)](https://kubernetes.io/)
 
-A cloud-native Kubernetes operator for deploying and managing [Antfly](https://github.com/antflydb/antfly) database clusters with built-in high availability, automatic scaling, and operational simplicity.
+A cloud-native Kubernetes operator for deploying and managing [Antfly](https://github.com/antflydb/antfly) database clusters and serverless projects with built-in high availability, automatic scaling, and operational simplicity.
 
 ## 🚀 Quick Start
 
-Deploy the operator and create your first database cluster in under 60 seconds:
+Deploy the operator and create your first Antfly workload in under 60 seconds:
 
 ```bash
 # 1. Deploy the operator
@@ -36,6 +36,7 @@ That's it! You now have a highly available Antfly database cluster running in Ku
 - **🛠️ Cloud Native**: Follows Kubernetes best practices and conventions
 - **⚡ Performance**: Optimized for cloud environments with configurable caching layers
 - **☁️ GKE Autopilot Support**: Native support for GKE Autopilot with Spot Pods for cost optimization
+- **🛰️ Serverless Projects**: Deploy query, maintenance, and optional proxy pods for table-first serverless retrieval
 
 ## 🏗️ Architecture
 
@@ -120,6 +121,77 @@ go run ./cmd/antfly-operator --print-install-manifests \
 ```
 
 The generated manifest is the supported install surface; it stays aligned with the embedded CRDs, RBAC, Deployment, and webhook resources.
+
+### Uninstall
+
+Use the matching generated uninstall bundle:
+
+```bash
+# Remove the operator but keep CRDs by default
+go run ./cmd/antfly-operator --print-uninstall-manifests | kubectl delete -f - --ignore-not-found=true
+
+# Remove the operator and CRDs too
+go run ./cmd/antfly-operator --print-uninstall-manifests \
+  --uninstall-include-crds=true | kubectl delete -f - --ignore-not-found=true
+```
+
+Keeping CRDs by default is safer because deleting them also deletes the custom resources they own.
+
+## Serverless With Proxy
+
+The operator can also deploy a table-first serverless stack around `AntflyServerlessProject`:
+
+- `serverless-query` runtime pods
+- `serverless-maintenance` runtime pods
+- optional `antfly proxy` gateway pods
+- object-store-backed manifests, WAL, and artifacts
+- table-to-`servingNamespace` routing for internal serverless reads
+
+The proxy image is expected to run the Go gateway entrypoint:
+
+```bash
+antfly proxy
+```
+
+Typical images:
+
+- operator: `ghcr.io/antflydb/antfly-operator:<tag>`
+- proxy: `ghcr.io/antflydb/antfly-proxy:<tag>`
+- serverless query: `ghcr.io/antflydb/antfly-serverless-query:<tag>`
+- serverless maintenance: `ghcr.io/antflydb/antfly-serverless-maintenance:<tag>`
+
+Local build helpers:
+
+```bash
+# Build the proxy image locally
+make proxy-docker-build
+
+# Build the operator image locally
+make operator-docker-build
+```
+
+Start with:
+
+```bash
+kubectl apply -k ./examples/serverless-project-stack
+```
+
+Example public calls through the proxy:
+
+```bash
+# Search a table
+curl -H 'Authorization: Bearer token-1' \
+  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/query/search?q=antfly'
+
+# Graph neighbors
+curl -X POST \
+  -H 'Authorization: Bearer token-1' \
+  -H 'Content-Type: application/json' \
+  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/query/graph/neighbors' \
+  -d '{"doc_id":"doc-1","direction":"out"}'
+```
+
+The public API stays table-first. Internal serverless debug/version routes remain under `/_internal/namespaces/...` and are not the recommended product surface.
 
 ### RBAC Requirements
 

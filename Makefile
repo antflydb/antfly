@@ -362,7 +362,7 @@ show-ingress:
 # Operator Commands
 # ====================================================================================
 
-.PHONY: operator-build operator-test operator-docker-build operator-lint
+.PHONY: operator-build operator-test operator-docker-build operator-lint proxy-docker-build
 
 operator-build: ## Build the antfly-operator binary
 	(cd ./pkg/operator && $(MAKE) build)
@@ -375,6 +375,9 @@ operator-lint: ## Run linter on antfly-operator
 
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./pkg/operator/Dockerfile ./pkg/operator
+
+proxy-docker-build: ## Build antfly-proxy Docker image
+	docker build -t antfly-proxy:latest -f ./Dockerfile.proxy .
 
 
 # ====================================================================================

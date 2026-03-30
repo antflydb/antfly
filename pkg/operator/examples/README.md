@@ -17,7 +17,7 @@ This directory contains example configurations for deploying Antfly database clu
 
    Or for the serverless path:
    ```bash
-   kubectl apply -f examples/serverless-project-with-proxy.yaml
+   kubectl apply -k examples/serverless-project-stack
    ```
 
 3. **Check the cluster status**:
@@ -47,8 +47,21 @@ A serverless retrieval deployment with:
 
 **Deploy:**
 ```bash
-kubectl apply -f examples/serverless-proxy-route-configmap.yaml
-kubectl apply -f examples/serverless-project-with-proxy.yaml
+kubectl apply -k examples/serverless-project-stack
+```
+
+**Public API examples:**
+```bash
+# Search
+curl -H 'Authorization: Bearer token-1' \
+  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/query/search?q=antfly'
+
+# Graph neighbors
+curl -X POST \
+  -H 'Authorization: Bearer token-1' \
+  -H 'Content-Type: application/json' \
+  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/query/graph/neighbors' \
+  -d '{"doc_id":"doc-1","direction":"out"}'
 ```
 
 ### Serverless Multi-Project Routing (`serverless-multi-project-routing.yaml`)
@@ -71,6 +84,19 @@ An external proxy route source that can be referenced from `spec.proxy.routeConf
 kubectl apply -f examples/serverless-proxy-route-configmap.yaml
 ```
 
+### Serverless Project Stack (`serverless-project-stack/kustomization.yaml`)
+A small apply-ready bundle for the serverless-with-proxy path.
+
+**Includes:**
+- `serverless-proxy-bearer-tokens-secret.yaml`
+- `serverless-proxy-route-configmap.yaml`
+- `serverless-project-with-proxy.yaml`
+
+**Deploy:**
+```bash
+kubectl apply -k examples/serverless-project-stack
+```
+
 **Proxy config conventions:**
 - routes are mounted from `/etc/antfly-proxy/routes.json`
 - bearer tokens are mounted from `/etc/antfly-proxy-secret/bearer_tokens.json`
@@ -79,6 +105,7 @@ kubectl apply -f examples/serverless-proxy-route-configmap.yaml
 - freshness controls can be passed with `view`, `required_version`, and `max_lag_records`
 - ConfigMaps labeled `antfly.io/serverless-proxy-route-source=true` are aggregated as shared route sources
 - route entries map public `table` names to internal serverless `serving_namespace` values
+- the proxy container should run `antfly proxy`
 
 **Bearer token secret shape:**
 ```yaml
@@ -98,6 +125,12 @@ stringData:
         "operations": ["read"]
       }
     }
+```
+
+**Local image build helpers:**
+```bash
+make proxy-docker-build
+make operator-docker-build
 ```
 
 ### Simple Cluster (`small-dev-cluster.yaml`)
@@ -335,4 +368,4 @@ kubectl delete antflycluster simple-antfly-cluster
 To remove the operator:
 ```bash
 cd pkg/operator
-go run ./cmd/antfly-operator --print-install-manifests | kubectl delete -f - --ignore-not-found=true
+go run ./cmd/antfly-operator --print-uninstall-manifests | kubectl delete -f - --ignore-not-found=true

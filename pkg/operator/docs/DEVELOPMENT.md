@@ -128,7 +128,7 @@ This section provides a complete workflow for cleaning up everything in your loc
 kubectl delete antflyclusters --all --all-namespaces
 
 # Remove the operator
-go run ./cmd/antfly-operator --print-install-manifests | kubectl delete -f - --ignore-not-found=true
+go run ./cmd/antfly-operator --print-uninstall-manifests | kubectl delete -f - --ignore-not-found=true
 
 # Remove any leftover resources
 kubectl delete all,pvc,secrets,configmaps -l app=antfly --all-namespaces
@@ -242,7 +242,7 @@ set -e
 
 echo "🧹 Cleaning up everything..."
 kubectl delete antflyclusters --all --all-namespaces --ignore-not-found=true
-go run ./cmd/antfly-operator --print-install-manifests | kubectl delete -f - --ignore-not-found=true
+go run ./cmd/antfly-operator --print-uninstall-manifests | kubectl delete -f - --ignore-not-found=true
 make clean
 
 echo "🔨 Building fresh..."
