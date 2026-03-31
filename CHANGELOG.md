@@ -21,6 +21,54 @@ All notable changes to Antfly will be documented in this file.
 
 ## Releases
 
+### [0.1.1] - 2026-03-31
+
+#### Highlights
+
+- **Faster Swarm Mode** — local shard bypass eliminates network hops and JSON serialization for single-node deployments, significantly reducing query latency
+- **Smarter Vector Search** — automatic reranking and size-aware search effort tuning deliver better recall out of the box
+- **Friendlier Errors** — LLM generation failures now return clear, actionable error messages with appropriate HTTP status codes
+- **Automatic Shard Management** — Antfly now automatically splits large shards and merges underutilized ones, keeping cluster performance balanced without manual intervention
+- **memoryaf** — a new MCP-compatible memory service with built-in HTTP API and dashboard for memory-augmented search
+
+#### Features
+
+- Automatic shard split policy keeps individual shards from growing too large
+- Online shard merges consolidate underutilized shards without downtime
+- Local shard bypass skips HTTP and serialization overhead in swarm mode
+- Single-shard fast path and index caching speed up common query patterns
+- Automatic reranking for HBC vector search improves recall without configuration
+- Size-aware search effort defaults adapt to index size automatically
+- Hybrid full-text fallback when embedding indexes are unavailable
+- Packed dense and sparse embedding format accepted in the query API
+- Unified bounded agent APIs across all generated clients
+- memoryaf: MCP-compatible memory service with HTTP API and embedded dashboard
+- Richer query builder schema context for better autocomplete
+- NER entity extraction and knowledge graph support in docsaf
+- LLM generation error classification with user-friendly messages @dovinmu
+
+#### Bug Fixes
+
+- Fix cosine distance centroid normalization in HBC indexes @dovinmu
+- Fix RaBit centroid clone aliasing causing quantization regressions @dovinmu
+- Fix nil-interface panic in enricher stats during health checks — thanks @montanaflynn!
+- Fix raft serveChannels shutdown hang — thanks @montanaflynn!
+- Fix shard orphaning in StopRaftGroup when shard is initializing @esniff
+- Fix Pebble close races during split finalize and node shutdown
+- Fix split write routing during handoff, cutover, and readiness transitions
+- Fix Store.Close goroutine leak after shard shutdown
+- Fix index cache concurrency with proper LoadOrStore semantics
+- Fix SSE error events not being sent when RAG generation fails @dovinmu
+
+#### Performance
+
+- Eliminate JSON serialization on the local shard search path
+- Optimize inter-node vector search serialization
+
+[Full changelog](https://github.com/antflydb/antfly/compare/v0.1.0...v0.1.1)
+
+---
+
 ### [0.1.0] - 2026-03-17
 
 #### Highlights
