@@ -144,15 +144,11 @@ The operator can also deploy a table-first serverless stack around `AntflyServer
 - `serverless-api` runtime pods
 - `serverless-query` runtime pods
 - `serverless-maintenance` runtime pods
-- optional `antfly proxy` gateway pods
+- optional `antfly-proxy` gateway pods
 - object-store-backed manifests, WAL, and artifacts
 - table-to-`servingNamespace` routing for internal serverless reads
 
-The proxy image is expected to run the Go gateway entrypoint:
-
-```bash
-antfly proxy
-```
+The proxy image runs the standalone `antfly-proxy` binary (see `pkg/proxy/cmd/antfly-proxy/`).
 
 Typical images:
 

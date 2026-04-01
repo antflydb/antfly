@@ -23,7 +23,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 Antfly also has a table-first serverless deployment path built around:
 
 - the Go [operator](pkg/operator)
-- the Go `antfly proxy` gateway
+- the Go [`antfly-proxy`](pkg/proxy) gateway
 - one shared Zig runtime image: `ghcr.io/antflydb/antfly:zig`
 
 That Zig image runs different roles via subcommands:

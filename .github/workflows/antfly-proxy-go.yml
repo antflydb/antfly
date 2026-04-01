@@ -53,13 +53,13 @@ jobs:
         run: go mod download
 
       - name: Run proxy unit tests
-        run: go test ./pkg/proxy ./cmd/antfly/cmd
+        run: cd pkg/proxy && go test ./...
 
-      - name: Build antfly CLI
-        run: go build -v -o antfly ./cmd/antfly
+      - name: Build antfly-proxy
+        run: cd pkg/proxy && go build -v -o ../../antfly-proxy ./cmd/antfly-proxy
 
-      - name: Smoke test proxy CLI
-        run: ./antfly proxy --help >/dev/null
+      - name: Smoke test antfly-proxy
+        run: timeout 2 ./antfly-proxy || [ $? -eq 124 ]
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

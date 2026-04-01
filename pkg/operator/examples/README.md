@@ -118,7 +118,7 @@ See [serverless-project-stack/README.md](./serverless-project-stack/README.md) f
 - freshness controls can be passed with `view`, `required_version`, and `max_lag_records`
 - ConfigMaps labeled `antfly.io/serverless-proxy-route-source=true` are aggregated as shared route sources
 - route entries map public `table` names to internal serverless `serving_namespace` values
-- the proxy container should run `antfly proxy`
+- the proxy container runs the standalone `antfly-proxy` binary
 - the Zig runtime container should run `antfly serverless api|query|maintenance`
 
 **Bearer token secret shape:**
