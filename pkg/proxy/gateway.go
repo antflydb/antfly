@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -71,8 +72,8 @@ func NewGatewayFromConfig(cfg GatewayConfig) *Gateway {
 	return g
 }
 
-func (g *Gateway) Resolve(req RequestContext) (*ResolvedTarget, error) {
-	kind, adapter, route, err := g.router.ResolveBackend(req)
+func (g *Gateway) Resolve(ctx context.Context, req RequestContext) (*ResolvedTarget, error) {
+	kind, adapter, route, err := g.router.ResolveBackend(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +109,7 @@ func (g *Gateway) handleResolve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	resolved, err := g.Resolve(req)
+	resolved, err := g.Resolve(r.Context(), req)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "no route configured") {
@@ -137,7 +138,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kind, adapter, route, err := g.router.ResolveBackend(req)
+	kind, adapter, route, err := g.router.ResolveBackend(r.Context(), req)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "no route configured") {

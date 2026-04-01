@@ -15,6 +15,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -34,7 +35,7 @@ func TestGatewayResolve(t *testing.T) {
 		},
 	}))
 
-	resolved, err := gateway.Resolve(RequestContext{
+	resolved, err := gateway.Resolve(context.Background(), RequestContext{
 		Tenant:       "t1",
 		Table:        "docs",
 		Operation:    OperationRead,

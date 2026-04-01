@@ -14,7 +14,10 @@
 
 package proxy
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestLoadGatewayEnvConfig(t *testing.T) {
 	getenv := func(key string) string {
@@ -67,7 +70,7 @@ func TestNewGatewayFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resolved, err := gateway.Resolve(RequestContext{
+	resolved, err := gateway.Resolve(context.Background(), RequestContext{
 		Tenant:       "t1",
 		Table:        "docs",
 		Operation:    OperationRead,

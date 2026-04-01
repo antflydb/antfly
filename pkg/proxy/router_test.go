@@ -14,7 +14,10 @@
 
 package proxy
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestRouterResolve(t *testing.T) {
 	router := NewRouter([]NamespaceRoute{
@@ -116,7 +119,7 @@ func TestRouterResolve(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := router.Resolve(tt.req)
+			got, err := router.Resolve(context.Background(), tt.req)
 			if tt.err {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -145,7 +148,7 @@ func TestRouterResolveBackend(t *testing.T) {
 		},
 	})
 
-	kind, adapter, route, err := router.ResolveBackend(RequestContext{
+	kind, adapter, route, err := router.ResolveBackend(context.Background(), RequestContext{
 		Tenant:       "t1",
 		Table:        "docs",
 		Operation:    OperationRead,

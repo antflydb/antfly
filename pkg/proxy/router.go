@@ -52,12 +52,12 @@ func NewRouterWithCatalog(catalog Catalog) *Router {
 	return &Router{catalog: catalog}
 }
 
-func (r *Router) Resolve(req RequestContext) (BackendKind, error) {
-	kind, _, _, err := r.ResolveBackend(req)
+func (r *Router) Resolve(ctx context.Context, req RequestContext) (BackendKind, error) {
+	kind, _, _, err := r.ResolveBackend(ctx, req)
 	return kind, err
 }
 
-func (r *Router) ResolveBackend(req RequestContext) (BackendKind, BackendAdapter, NamespaceRoute, error) {
+func (r *Router) ResolveBackend(ctx context.Context, req RequestContext) (BackendKind, BackendAdapter, NamespaceRoute, error) {
 	if err := ValidatePolicy(req); err != nil {
 		return "", nil, NamespaceRoute{}, err
 	}
@@ -67,7 +67,7 @@ func (r *Router) ResolveBackend(req RequestContext) (BackendKind, BackendAdapter
 	}
 
 	resource := req.ResourceName()
-	route, err := r.catalog.ResolveRoute(context.Background(), req.Tenant, resource)
+	route, err := r.catalog.ResolveRoute(ctx, req.Tenant, resource)
 	if err != nil {
 		return "", nil, NamespaceRoute{}, err
 	}
