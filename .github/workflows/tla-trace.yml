@@ -47,7 +47,6 @@ jobs:
           echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
 
       - name: Validate raft traces
-        if: ${{ hashFiles('/tmp/raft-trace.ndjson') != '' }}
         run: |
           if [ -s /tmp/raft-trace.ndjson ]; then
             make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
@@ -57,12 +56,11 @@ jobs:
 
       - name: Run transaction tests and extract traces
         run: |
-          go test -tags with_tla -run TestTransaction -v ./src/sim/ 2>&1 | \
+          go test -tags with_tla -run TestHarness_Transaction -v ./src/sim/ 2>&1 | \
             grep '"tag":"antfly-trace"' > /tmp/txn-trace.ndjson || true
           echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
 
       - name: Validate transaction traces
-        if: ${{ hashFiles('/tmp/txn-trace.ndjson') != '' }}
         run: |
           if [ -s /tmp/txn-trace.ndjson ]; then
             make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson

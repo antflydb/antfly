@@ -3,132 +3,123 @@
 package db
 
 import (
-	"encoding/hex"
-
+	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/tracing"
 )
 
-// traceInitTransaction emits a TLA+ trace event for InitTransaction.
+// traceTxnEvent is the shared helper for all transaction trace events.
+// It handles the nil-writer guard, txnID formatting, and shard ID caching.
+func (db *DBImpl) traceTxnEvent(name string, txnID []byte, shardID string, state map[string]any) {
+	tw := db.traceWriter
+	if tw == nil {
+		return
+	}
+	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
+		Name:    name,
+		TxnID:   types.FormatKey(txnID),
+		ShardID: shardID,
+		State:   state,
+	})
+}
+
+// traceShardID returns the cached shard ID string for trace events.
+func (db *DBImpl) traceShardID() string {
+	if db.traceShardIDStr == "" {
+		shardID, _, err := common.ParseStorageDBDir(db.dir)
+		if err != nil {
+			db.traceShardIDStr = "unknown"
+		} else {
+			db.traceShardIDStr = shardID.String()
+		}
+	}
+	return db.traceShardIDStr
+}
+
 func (db *DBImpl) traceInitTransaction(record *TxnRecord) {
+	db.traceTxnEvent("InitTransaction", record.TxnID, db.traceShardID(), map[string]any{
+		"txnStatus":    record.Status,
+		"timestamp":    record.Timestamp,
+		"participants": len(record.Participants),
+	})
+}
+
+// traceWriteIntent emits a WriteIntentOnShard event with full key data
+// so the TLA+ trace spec can derive TxnKeys, TxnReadSet, and Keys constants.
+func (db *DBImpl) traceWriteIntent(op *WriteIntentOp) {
 	tw := db.traceWriter
 	if tw == nil {
 		return
 	}
-	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
-		Name:    "InitTransaction",
-		TxnID:   hex.EncodeToString(record.TxnID),
-		ShardID: db.traceShardID(),
-		State: map[string]any{
-			"txnStatus":    record.Status,
-			"timestamp":    record.Timestamp,
-			"participants": len(record.Participants),
-		},
+	batch := op.GetBatch()
+	writeKeys := make([]string, len(batch.GetWrites()))
+	for i, w := range batch.GetWrites() {
+		writeKeys[i] = types.FormatKey(w.GetKey())
+	}
+	deleteKeys := make([]string, len(batch.GetDeletes()))
+	for i, d := range batch.GetDeletes() {
+		deleteKeys[i] = types.FormatKey(d)
+	}
+	predicateKeys := make([]string, len(op.GetPredicates()))
+	for i, p := range op.GetPredicates() {
+		predicateKeys[i] = types.FormatKey(p.GetKey())
+	}
+	db.traceTxnEvent("WriteIntentOnShard", op.GetTxnId(), db.traceShardID(), map[string]any{
+		"writeKeys":     writeKeys,
+		"deleteKeys":    deleteKeys,
+		"predicateKeys": predicateKeys,
 	})
 }
 
-// traceWriteIntent emits a TLA+ trace event for a successful WriteIntent.
-func (db *DBImpl) traceWriteIntent(txnID []byte, numWrites, numDeletes int) {
+// traceWriteIntentFails emits a WriteIntentFails event with key data.
+// Keys are needed even for failed intents so the TLA+ spec can derive TxnKeys
+// for the conflicting transaction.
+func (db *DBImpl) traceWriteIntentFails(op *WriteIntentOp, err error) {
 	tw := db.traceWriter
 	if tw == nil {
 		return
 	}
-	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
-		Name:    "WriteIntentOnShard",
-		TxnID:   hex.EncodeToString(txnID),
-		ShardID: db.traceShardID(),
-		State: map[string]any{
-			"numWrites":  numWrites,
-			"numDeletes": numDeletes,
-		},
-	})
-}
-
-// traceWriteIntentFails emits a TLA+ trace event for a predicate check failure.
-func (db *DBImpl) traceWriteIntentFails(txnID []byte, err error) {
-	tw := db.traceWriter
-	if tw == nil {
-		return
+	batch := op.GetBatch()
+	writeKeys := make([]string, len(batch.GetWrites()))
+	for i, w := range batch.GetWrites() {
+		writeKeys[i] = types.FormatKey(w.GetKey())
 	}
-	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
-		Name:    "WriteIntentFails",
-		TxnID:   hex.EncodeToString(txnID),
-		ShardID: db.traceShardID(),
-		State: map[string]any{
-			"reason": err.Error(),
-		},
+	deleteKeys := make([]string, len(batch.GetDeletes()))
+	for i, d := range batch.GetDeletes() {
+		deleteKeys[i] = types.FormatKey(d)
+	}
+	db.traceTxnEvent("WriteIntentFails", op.GetTxnId(), db.traceShardID(), map[string]any{
+		"writeKeys":  writeKeys,
+		"deleteKeys": deleteKeys,
+		"reason":     err.Error(),
 	})
 }
 
-// traceFinalizeTransaction emits a TLA+ trace event for CommitTransaction or AbortTransaction.
 func (db *DBImpl) traceFinalizeTransaction(txnID []byte, status int32, commitVersion uint64) {
-	tw := db.traceWriter
-	if tw == nil {
-		return
-	}
 	name := "CommitTransaction"
 	if status == TxnStatusAborted {
 		name = "AbortTransaction"
 	}
-	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
-		Name:    name,
-		TxnID:   hex.EncodeToString(txnID),
-		ShardID: db.traceShardID(),
-		State: map[string]any{
-			"txnStatus":     status,
-			"commitVersion": commitVersion,
-		},
+	db.traceTxnEvent(name, txnID, db.traceShardID(), map[string]any{
+		"txnStatus":     status,
+		"commitVersion": commitVersion,
 	})
 }
 
-// traceResolveIntents emits a TLA+ trace event for ResolveIntents.
 func (db *DBImpl) traceResolveIntents(txnID []byte, status int32, count int) {
-	tw := db.traceWriter
-	if tw == nil {
-		return
-	}
-	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
-		Name:    "ResolveIntentsOnShard",
-		TxnID:   hex.EncodeToString(txnID),
-		ShardID: db.traceShardID(),
-		State: map[string]any{
-			"txnStatus":     status,
-			"intentsCount":  count,
-		},
+	db.traceTxnEvent("ResolveIntentsOnShard", txnID, db.traceShardID(), map[string]any{
+		"txnStatus":    status,
+		"intentsCount": count,
 	})
 }
 
-// traceRecoveryAbort emits a TLA+ trace event for auto-abort of stale transactions.
+// traceRecoveryAbort emits a RecoveryResolve event with empty ShardID.
+// The TLA+ spec uses the empty shardId to distinguish auto-abort (coordinator-level)
+// from per-shard recovery resolve.
 func (db *DBImpl) traceRecoveryAbort(txnID []byte) {
-	tw := db.traceWriter
-	if tw == nil {
-		return
-	}
-	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
-		Name:    "RecoveryResolve",
-		TxnID:   hex.EncodeToString(txnID),
-		ShardID: db.traceShardID(),
-	})
+	db.traceTxnEvent("RecoveryResolve", txnID, "", nil)
 }
 
-// traceCleanupTxnRecord emits a TLA+ trace event for removing a completed transaction record.
 func (db *DBImpl) traceCleanupTxnRecord(txnID []byte) {
-	tw := db.traceWriter
-	if tw == nil {
-		return
-	}
-	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
-		Name:    "CleanupTxnRecord",
-		TxnID:   hex.EncodeToString(txnID),
-		ShardID: db.traceShardID(),
-	})
-}
-
-// traceShardID returns the shard ID string for trace events.
-func (db *DBImpl) traceShardID() string {
-	_, shardID, err := common.ParseStorageDBDir(db.dir)
-	if err != nil {
-		return "unknown"
-	}
-	return shardID.String()
+	db.traceTxnEvent("CleanupTxnRecord", txnID, db.traceShardID(), nil)
 }

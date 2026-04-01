@@ -345,7 +345,7 @@ tla-trace-txn: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson)
 endif
-	@bash scripts/tla-validate-trace.sh \
+	@bash scripts/tla-validate-trace.sh -S \
 	  -s specs/tla/TraceAntflyTransaction.tla \
 	  -c specs/tla/TraceAntflyTransaction.cfg \
 	  $(TRACE_FILES)

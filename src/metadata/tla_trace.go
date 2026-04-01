@@ -3,6 +3,8 @@
 package metadata
 
 import (
+	"encoding/hex"
+
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/tracing"
 	"github.com/google/uuid"
@@ -21,7 +23,7 @@ func (ms *MetadataStore) traceCheckPredicates(txnID uuid.UUID, shards map[types.
 	}
 	tw.TraceAntflyEvent(&tracing.AntflyTracingEvent{
 		Name:  "CheckPredicates",
-		TxnID: txnID.String(),
+		TxnID: hex.EncodeToString(txnID[:]),
 		State: map[string]any{
 			"shards": shardIDs,
 		},

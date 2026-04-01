@@ -6,6 +6,10 @@
   (built with -tags with_tla) constitute valid behaviors of the
   AntflyTransaction specification.
 
+  All TLA+ constants (Txns, Shards, Keys, TxnShards, TxnKeys, TxnReadSet,
+  TxnCoord, MaxTimestamp, StalePendingThreshold) are derived from the trace
+  itself -- no MC module or model values needed.
+
   Modeled after etcd/raft's Traceetcdraft.tla.
 
   Usage:
@@ -26,6 +30,12 @@ ASSUME TLCGet("config").mode = "bfs"
 ASSUME TLCGet("config").worker = 1
 
 -------------------------------------------------------------------------------------
+\* Helpers
+
+\* Convert a TLA+ sequence (from JSON array) to a set.
+LOCAL SeqToSet(seq) == {seq[i] : i \in 1..Len(seq)}
+
+-------------------------------------------------------------------------------------
 \* Read and filter the trace log
 
 JsonFile ==
@@ -44,17 +54,87 @@ TraceLog ==
         ELSE OriginTraceLog)
 
 -------------------------------------------------------------------------------------
-\* Derive constants from the trace
+\* Derive all constants from the trace
 
-\* Extract set of txn IDs mentioned in the trace
+\* Set of transaction IDs mentioned in the trace
 TraceTxns == TLCEval(FoldSeq(
     LAMBDA x, acc: acc \cup {x.event.txnId},
     {}, TraceLog))
 
-\* Extract set of shard IDs mentioned in the trace
+\* Set of shard IDs mentioned in the trace (non-empty shardId only)
 TraceShards == TLCEval(FoldSeq(
     LAMBDA x, acc: acc \cup IF x.event.shardId /= "" THEN {x.event.shardId} ELSE {},
     {}, TraceLog))
+
+\* Set of all keys from WriteIntentOnShard and WriteIntentFails events
+TraceKeys == TLCEval(FoldSeq(
+    LAMBDA x, acc:
+        IF x.event.name \in {"WriteIntentOnShard", "WriteIntentFails"}
+           /\ "state" \in DOMAIN x.event
+           /\ "writeKeys" \in DOMAIN x.event.state
+        THEN acc \cup SeqToSet(x.event.state.writeKeys)
+                  \cup SeqToSet(x.event.state.deleteKeys)
+                  \cup IF "predicateKeys" \in DOMAIN x.event.state
+                      THEN SeqToSet(x.event.state.predicateKeys) ELSE {}
+        ELSE acc,
+    {}, TraceLog))
+
+\* TxnShards[t]: set of shards touched by txn t (from any event with non-empty shardId)
+TraceTxnShards == TLCEval(FoldSeq(
+    LAMBDA x, acc:
+        IF x.event.shardId /= "" THEN
+            [acc EXCEPT ![x.event.txnId] = @ \cup {x.event.shardId}]
+        ELSE acc,
+    [t \in TraceTxns |-> {}], TraceLog))
+
+\* TxnKeys[<<t, s>>]: keys written by txn t on shard s
+\* (from WriteIntentOnShard and WriteIntentFails events)
+TraceTxnKeys == TLCEval(FoldSeq(
+    LAMBDA x, acc:
+        IF x.event.name \in {"WriteIntentOnShard", "WriteIntentFails"}
+           /\ "state" \in DOMAIN x.event
+           /\ "writeKeys" \in DOMAIN x.event.state
+        THEN LET pair == <<x.event.txnId, x.event.shardId>>
+                 keys == SeqToSet(x.event.state.writeKeys)
+                         \cup SeqToSet(x.event.state.deleteKeys)
+             IN [acc EXCEPT ![pair] = @ \cup keys]
+        ELSE acc,
+    [p \in TraceTxns \X TraceShards |-> {}], TraceLog))
+
+\* TxnReadSet[t]: OCC predicate keys for txn t
+\* (union of predicateKeys from WriteIntentOnShard/WriteIntentFails events)
+TraceTxnReadSet == TLCEval(FoldSeq(
+    LAMBDA x, acc:
+        IF x.event.name \in {"WriteIntentOnShard", "WriteIntentFails"}
+           /\ "state" \in DOMAIN x.event
+           /\ "predicateKeys" \in DOMAIN x.event.state
+        THEN [acc EXCEPT ![x.event.txnId] = @ \cup SeqToSet(x.event.state.predicateKeys)]
+        ELSE acc,
+    [t \in TraceTxns |-> {}], TraceLog))
+
+\* TxnCoord[t]: coordinator shard for txn t (shard where InitTransaction fired)
+TraceTxnCoord == TLCEval(FoldSeq(
+    LAMBDA x, acc:
+        IF x.event.name = "InitTransaction" THEN
+            [acc EXCEPT ![x.event.txnId] = x.event.shardId]
+        ELSE acc,
+    [t \in TraceTxns |-> ""], TraceLog))
+
+\* MaxTimestamp: largest timestamp observed in the trace + 2 (buffer for clock ticks)
+TraceMaxTimestamp == TLCEval(
+    FoldSeq(
+        LAMBDA x, acc:
+            IF x.event.name = "InitTransaction"
+               /\ "state" \in DOMAIN x.event
+               /\ "timestamp" \in DOMAIN x.event.state
+               /\ x.event.state.timestamp > acc
+            THEN x.event.state.timestamp
+            ELSE acc,
+        0, TraceLog) + 2)
+
+\* StalePendingThreshold: minimum clock ticks before auto-abort.
+\* Set to 1 (the minimum) since trace validation uses a bounded clock.
+TraceStalePendingThreshold == 1
 
 -------------------------------------------------------------------------------------
 \* Trace cursor variables
@@ -134,9 +214,10 @@ CleanupTxnRecordIfLogged(t) ==
     /\ CleanupTxnRecord(t)
     /\ StepToNextTrace
 
+\* RecoveryAutoAbort: coordinator-level auto-abort, shardId is empty
 RecoveryAutoAbortIfLogged(t) ==
     /\ LoglineIsTxnEvent("RecoveryResolve", t)
-    /\ logline.event.shardId = ""  \* Recovery abort has no shard
+    /\ logline.event.shardId = ""
     /\ RecoveryAutoAbort(t)
     /\ StepToNextTrace
 

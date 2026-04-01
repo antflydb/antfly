@@ -10,7 +10,7 @@ import "go.uber.org/zap"
 type AntflyTracingEvent struct {
 	Name    string         `json:"name"`              // TLA+ action name
 	TxnID   string         `json:"txnId,omitempty"`   // transaction identifier (hex)
-	ShardID string         `json:"shardId,omitempty"` // shard where the action occurred
+	ShardID string         `json:"shardId"`           // shard where the action occurred ("" for coordinator-level events)
 	State   map[string]any `json:"state,omitempty"`   // snapshot of TLA+ variables
 }
 

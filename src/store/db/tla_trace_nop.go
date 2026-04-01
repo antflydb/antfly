@@ -2,23 +2,10 @@
 
 package db
 
-// traceInitTransaction is a no-op without the with_tla build tag.
-func (db *DBImpl) traceInitTransaction(_ *TxnRecord) {}
-
-// traceWriteIntent is a no-op without the with_tla build tag.
-func (db *DBImpl) traceWriteIntent(_ []byte, _, _ int) {}
-
-// traceWriteIntentFails is a no-op without the with_tla build tag.
-func (db *DBImpl) traceWriteIntentFails(_ []byte, _ error) {}
-
-// traceFinalizeTransaction is a no-op without the with_tla build tag.
-func (db *DBImpl) traceFinalizeTransaction(_ []byte, _ int32, _ uint64) {}
-
-// traceResolveIntents is a no-op without the with_tla build tag.
-func (db *DBImpl) traceResolveIntents(_ []byte, _ int32, _ int) {}
-
-// traceRecoveryAbort is a no-op without the with_tla build tag.
-func (db *DBImpl) traceRecoveryAbort(_ []byte) {}
-
-// traceCleanupTxnRecord is a no-op without the with_tla build tag.
-func (db *DBImpl) traceCleanupTxnRecord(_ []byte) {}
+func (db *DBImpl) traceInitTransaction(_ *TxnRecord)                      {}
+func (db *DBImpl) traceWriteIntent(_ *WriteIntentOp)                      {}
+func (db *DBImpl) traceWriteIntentFails(_ *WriteIntentOp, _ error)        {}
+func (db *DBImpl) traceFinalizeTransaction(_ []byte, _ int32, _ uint64)   {}
+func (db *DBImpl) traceResolveIntents(_ []byte, _ int32, _ int)           {}
+func (db *DBImpl) traceRecoveryAbort(_ []byte)                            {}
+func (db *DBImpl) traceCleanupTxnRecord(_ []byte)                         {}

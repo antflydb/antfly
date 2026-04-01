@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   tla-check:
-    runs-on: ubuntu-latest
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6

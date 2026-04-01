@@ -401,7 +401,8 @@ type DBImpl struct {
 
 	// traceWriter emits TLA+ trace events for transaction validation.
 	// Non-nil only when built with -tags with_tla.
-	traceWriter tracing.AntflyTraceWriter
+	traceWriter      tracing.AntflyTraceWriter
+	traceShardIDStr  string // cached shard ID for trace events; set lazily
 
 	cache *pebbleutils.Cache // shared Pebble block cache (may be nil)
 }
@@ -5210,7 +5211,7 @@ func (db *DBImpl) WriteIntent(ctx context.Context, op *WriteIntentOp) error {
 	// Also checks for conflicting intents from other transactions to prevent lost updates
 	if predicates := op.GetPredicates(); len(predicates) > 0 {
 		if err := db.checkVersionPredicates(predicates, txnID); err != nil {
-			db.traceWriteIntentFails(txnID, err)
+			db.traceWriteIntentFails(op, err)
 			transactionOpsTotal.WithLabelValues("write_intent", "predicate_conflict").Inc()
 			return fmt.Errorf("version predicate check failed: %w", err)
 		}
@@ -5277,7 +5278,7 @@ func (db *DBImpl) WriteIntent(ctx context.Context, op *WriteIntentOp) error {
 
 	transactionOpsTotal.WithLabelValues("write_intent", "success").Inc()
 
-	db.traceWriteIntent(txnID, len(batchOp.GetWrites()), len(batchOp.GetDeletes()))
+	db.traceWriteIntent(op)
 
 	db.logger.Debug("Wrote transaction intents",
 		zap.Binary("txnID", txnID),

@@ -2,11 +2,15 @@
 # Validate ndjson trace files against a TLA+ specification using TLC.
 #
 # Usage:
-#   scripts/tla-validate-trace.sh -s <spec.tla> -c <config.cfg> [-p <parallel>] <trace files...>
+#   scripts/tla-validate-trace.sh -s <spec.tla> -c <config.cfg> [-p <parallel>] [-S] <trace files...>
 #
 # Each trace file is validated independently. TLC reads the trace via the JSON
 # environment variable and checks that it constitutes a valid behavior of the
 # spec.
+#
+# Flags:
+#   -S  Skip sorting (for specs that require chronological trace order).
+#       Default: sort by field 8 (node ID), suitable for multi-raft traces.
 #
 # Adapted from etcd/raft's validate.sh with macOS compatibility and cleanup.
 
@@ -20,16 +24,18 @@ source "${SCRIPT_DIR}/tla-tools.sh"
 PARALLEL="${PARALLEL:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 SPEC=""
 CONFIG=""
+SKIP_SORT=false
 
 show_usage() {
-    echo "usage: tla-validate-trace.sh [-p <parallel>] -s <spec.tla> -c <config.cfg> <trace files...>" >&2
+    echo "usage: tla-validate-trace.sh [-p <parallel>] [-S] -s <spec.tla> -c <config.cfg> <trace files...>" >&2
 }
 
-while getopts ":hs:c:p:" flag; do
+while getopts ":hSs:c:p:" flag; do
     case "${flag}" in
         s) SPEC="${OPTARG}" ;;
         c) CONFIG="${OPTARG}" ;;
         p) PARALLEL="${OPTARG}" ;;
+        S) SKIP_SORT=true ;;
         h|*) show_usage; exit 1 ;;
     esac
 done
@@ -55,8 +61,12 @@ preprocess_trace() {
     local trace="${1}"
     local out="${2}"
     # Strip any non-JSON prefix (e.g., log level/timestamp from structured loggers)
-    # and sort by node ID field for TLC.
-    sed -E 's/^[^{]+//' "${trace}" | sort -t'"' -k8 > "${out}"
+    if [ "${SKIP_SORT}" = "true" ]; then
+        sed -E 's/^[^{]+//' "${trace}" > "${out}"
+    else
+        # Sort by node ID field for multi-raft trace interleaving
+        sed -E 's/^[^{]+//' "${trace}" | sort -t'"' -k8 > "${out}"
+    fi
 }
 
 passed=0
@@ -101,17 +111,17 @@ if [ "${PARALLEL}" -le 1 ] || [ ${total} -eq 1 ]; then
     done
 else
     export -f validate_one preprocess_trace
-    export TLA_JAVA TLA2TOOLS COMMUNITY_MODULES SPEC CONFIG STATEDIR
+    export TLA_JAVA TLA2TOOLS COMMUNITY_MODULES SPEC CONFIG STATEDIR SKIP_SORT
 
     results="$(mktemp)"
     printf '%s\n' "${trace_files[@]}" | \
         xargs -P "${PARALLEL}" -I{} bash -c '
-            if validate_one "{}"; then
+            if validate_one "$1"; then
                 echo "pass"
             else
                 echo "fail"
             fi
-        ' >> "${results}"
+        ' -- {} >> "${results}"
 
     passed=$(grep -c "^pass$" "${results}" || true)
     failed=$(grep -c "^fail$" "${results}" || true)
