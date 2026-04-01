@@ -60,6 +60,8 @@ help:
 	@echo "  tla-check-snap     Model check snapshot transfer spec only (~90s)"
 	@echo "  tla-trace-raft     Validate raft ndjson traces against etcd/raft TLA+ spec"
 	@echo "                     Options: TRACE_FILES=path/to/*.ndjson"
+	@echo "  tla-trace-txn      Validate transaction ndjson traces against AntflyTransaction"
+	@echo "                     Options: TRACE_FILES=path/to/*.ndjson"
 	@echo ""
 	@echo "Minikube Commands:"
 	@echo "  minikube-start     Start a Minikube instance"
@@ -302,7 +304,7 @@ endif
 GOMODCACHE := $(shell go env GOMODCACHE)
 RAFT_TLA := $(GOMODCACHE)/go.etcd.io/raft/v3@v3.6.0/tla
 
-.PHONY: tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft
+.PHONY: tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft tla-trace-txn
 
 tla-tools:
 	@bash scripts/tla-tools.sh
@@ -337,6 +339,15 @@ endif
 	@bash scripts/tla-validate-trace.sh \
 	  -s "$(RAFT_TLA)/Traceetcdraft.tla" \
 	  -c "$(RAFT_TLA)/Traceetcdraft.cfg" \
+	  $(TRACE_FILES)
+
+tla-trace-txn: tla-tools
+ifndef TRACE_FILES
+	$(error TRACE_FILES is required. Example: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson)
+endif
+	@bash scripts/tla-validate-trace.sh \
+	  -s specs/tla/TraceAntflyTransaction.tla \
+	  -c specs/tla/TraceAntflyTransaction.cfg \
 	  $(TRACE_FILES)
 
 

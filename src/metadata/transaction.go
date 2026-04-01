@@ -99,6 +99,7 @@ func (ms *MetadataStore) ExecuteTransaction(
 	}
 
 	// Step 2: Write intents to all participants (parallel)
+	ms.traceCheckPredicates(txnID, allShards)
 	if err := ms.writeIntents(ctx, txnID, timestamp, coordinatorID, allShards, writes, deletes, transforms, predicates); err != nil {
 		// Abort transaction on coordinator. If this fails, the recovery loop
 		// will eventually auto-abort the stale Pending transaction.

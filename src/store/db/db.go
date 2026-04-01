@@ -48,6 +48,7 @@ import (
 	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/store/s3storage"
 	"github.com/antflydb/antfly/src/store/storeutils"
+	"github.com/antflydb/antfly/src/tracing"
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search"
 	"github.com/blevesearch/bleve/v2/search/query"
@@ -398,6 +399,10 @@ type DBImpl struct {
 	// Used by the recovery loop to auto-abort stale Pending transactions.
 	proposeAbortTransactionFunc func(ctx context.Context, op *AbortTransactionOp) error
 
+	// traceWriter emits TLA+ trace events for transaction validation.
+	// Non-nil only when built with -tags with_tla.
+	traceWriter tracing.AntflyTraceWriter
+
 	cache *pebbleutils.Cache // shared Pebble block cache (may be nil)
 }
 
@@ -420,6 +425,7 @@ func NewDBImpl(
 		snapStore:     snapStore,
 		shardNotifier: shardNotifier,
 		cache:         cache,
+		traceWriter:   tracing.NewAntflyTraceWriter(logger),
 	}
 }
 
@@ -1290,6 +1296,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 						zap.Binary("txnID", record.TxnID),
 						zap.Error(abortErr))
 				} else {
+					db.traceRecoveryAbort(record.TxnID)
 					db.logger.Info("Auto-aborted stale pending transaction",
 						zap.Binary("txnID", record.TxnID),
 						zap.Int64("createdAt", record.CreatedAt))
@@ -1318,6 +1325,7 @@ func (db *DBImpl) notifyPendingResolutions(ctx context.Context) {
 						zap.String("key", types.FormatKey(iter.Key())),
 						zap.Error(err))
 				} else {
+					db.traceCleanupTxnRecord(record.TxnID)
 					cleaned++
 					transactionsCleanedTotal.Inc()
 				}
@@ -5151,6 +5159,8 @@ func (db *DBImpl) InitTransaction(ctx context.Context, op *InitTransactionOp) er
 
 	transactionOpsTotal.WithLabelValues("init", "success").Inc()
 
+	db.traceInitTransaction(&record)
+
 	db.logger.Info("Initialized transaction",
 		zap.Binary("txnID", op.GetTxnId()),
 		zap.Uint64("timestamp", op.GetTimestamp()),
@@ -5200,6 +5210,7 @@ func (db *DBImpl) WriteIntent(ctx context.Context, op *WriteIntentOp) error {
 	// Also checks for conflicting intents from other transactions to prevent lost updates
 	if predicates := op.GetPredicates(); len(predicates) > 0 {
 		if err := db.checkVersionPredicates(predicates, txnID); err != nil {
+			db.traceWriteIntentFails(txnID, err)
 			transactionOpsTotal.WithLabelValues("write_intent", "predicate_conflict").Inc()
 			return fmt.Errorf("version predicate check failed: %w", err)
 		}
@@ -5265,6 +5276,8 @@ func (db *DBImpl) WriteIntent(ctx context.Context, op *WriteIntentOp) error {
 	}
 
 	transactionOpsTotal.WithLabelValues("write_intent", "success").Inc()
+
+	db.traceWriteIntent(txnID, len(batchOp.GetWrites()), len(batchOp.GetDeletes()))
 
 	db.logger.Debug("Wrote transaction intents",
 		zap.Binary("txnID", txnID),
@@ -5453,6 +5466,8 @@ func (db *DBImpl) ResolveIntents(ctx context.Context, op *ResolveIntentsOp) erro
 	// if the database is closed between Commit and Flush.
 
 	transactionOpsTotal.WithLabelValues("resolve_intents", "success").Inc()
+
+	db.traceResolveIntents(op.GetTxnId(), op.GetStatus(), count)
 
 	statusStr := "committed"
 	if op.GetStatus() == TxnStatusAborted {

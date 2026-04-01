@@ -205,6 +205,8 @@ func (db *DBImpl) finalizeTransaction(ctx context.Context, txnID []byte, status 
 
 	transactionOpsTotal.WithLabelValues(label, "success").Inc()
 
+	db.traceFinalizeTransaction(txnID, status, commitVersion)
+
 	db.logger.Info("Finalized transaction",
 		zap.Binary("txnID", txnID),
 		zap.String("status", label))

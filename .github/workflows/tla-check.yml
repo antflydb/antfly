@@ -1,0 +1,35 @@
+name: TLA+ Model Check
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "specs/tla/**"
+      - "src/tracing/**"
+      - "scripts/tla-*.sh"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "specs/tla/**"
+      - "src/tracing/**"
+      - "scripts/tla-*.sh"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tla-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Run TLC on all specs
+        run: make tla-check
