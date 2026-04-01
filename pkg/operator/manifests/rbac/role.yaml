@@ -9,7 +9,6 @@ rules:
   resources:
   - configmaps
   - persistentvolumeclaims
-  - secrets
   - services
   verbs:
   - create
@@ -30,6 +29,7 @@ rules:
   - ""
   resources:
   - pods
+  - secrets
   verbs:
   - get
   - list
@@ -40,7 +40,6 @@ rules:
   - antflybackups
   - antflyclusters
   - antflyrestores
-  - antflyserverlessprojects
   verbs:
   - create
   - delete
@@ -55,7 +54,6 @@ rules:
   - antflybackups/finalizers
   - antflyclusters/finalizers
   - antflyrestores/finalizers
-  - antflyserverlessprojects/finalizers
   verbs:
   - update
 - apiGroups:
@@ -64,7 +62,6 @@ rules:
   - antflybackups/status
   - antflyclusters/status
   - antflyrestores/status
-  - antflyserverlessprojects/status
   verbs:
   - get
   - patch
@@ -72,20 +69,7 @@ rules:
 - apiGroups:
   - apps
   resources:
-  - deployments
   - statefulsets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - autoscaling
-  resources:
-  - horizontalpodautoscalers
   verbs:
   - create
   - delete

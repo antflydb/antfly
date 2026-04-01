@@ -82,29 +82,3 @@ webhooks:
         resources:
           - antflyrestores
     sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: antfly-operator-webhook-service
-        namespace: system
-        path: /validate-antfly-io-v1-antflyserverlessproject
-    failurePolicy: Fail
-    name: vantflyserverlessproject.kb.io
-    namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values:
-            - antfly-system
-    rules:
-      - apiGroups:
-          - antfly.io
-        apiVersions:
-          - v1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - antflyserverlessprojects
-    sideEffects: None

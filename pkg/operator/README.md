@@ -3,16 +3,16 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/antflydb/antfly/pkg/operator)](https://goreportcard.com/report/github.com/antflydb/antfly/pkg/operator)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.20+-blue.svg)](https://kubernetes.io/)
 
-A cloud-native Kubernetes operator for deploying and managing [Antfly](https://github.com/antflydb/antfly) database clusters and serverless projects with built-in high availability, automatic scaling, and operational simplicity.
+A cloud-native Kubernetes operator for deploying and managing [Antfly](https://github.com/antflydb/antfly) database clusters with built-in high availability, automatic scaling, and operational simplicity.
 
 ## 🚀 Quick Start
 
-Deploy the operator and create your first Antfly workload in under 60 seconds:
+Deploy the operator and create your first database cluster in under 60 seconds:
 
 ```bash
-# 1. Deploy the operator
-cd pkg/operator
-go run ./cmd/antfly-operator --print-install-manifests | kubectl apply -f -
+# 1. Copy and deploy the operator
+cp deploy/example_install.yaml deploy/install.yaml
+kubectl apply -f ./deploy/install.yaml
 
 # 2. Create a database cluster
 kubectl create namespace antfly-dev-ns
@@ -36,7 +36,6 @@ That's it! You now have a highly available Antfly database cluster running in Ku
 - **🛠️ Cloud Native**: Follows Kubernetes best practices and conventions
 - **⚡ Performance**: Optimized for cloud environments with configurable caching layers
 - **☁️ GKE Autopilot Support**: Native support for GKE Autopilot with Spot Pods for cost optimization
-- **🛰️ Serverless Projects**: Deploy query, maintenance, and optional proxy pods for table-first serverless retrieval
 
 ## 🏗️ Architecture
 
@@ -74,7 +73,6 @@ That's it! You now have a highly available Antfly database cluster running in Ku
 
 - **metrics-server** (required for autoscaling features)
 - **Istio or Linkerd** (for service mesh integration)
-- **cert-manager** (required for the bundled validating webhook install path)
 
 #### Validation Commands
 
@@ -90,128 +88,29 @@ kubectl get storageclass
 
 ### Installation
 
-The operator now exposes a self-contained install bundle directly from the manager binary:
+The operator requires a custom installation manifest tailored to your environment. Use the example as a starting point:
 
 ```bash
-# 1. Generate and apply the default install bundle
-go run ./cmd/antfly-operator --print-install-manifests | kubectl apply -f -
+# 1. Copy the example installation manifest
+cp deploy/example_install.yaml deploy/install.yaml
 
-# 2. Or write it out first so you can review or patch it
-go run ./cmd/antfly-operator --print-install-manifests > install.yaml
-kubectl apply -f ./install.yaml
+# 2. Customize the manifest (optional - review and adjust as needed):
+#    - Container image version/registry
+#    - Resource limits for operator pod
+#    - Namespace names
+#    - RBAC permissions
+
+# 3. Deploy the operator
+kubectl apply -f ./deploy/install.yaml
 ```
 
 This installs:
 - **Namespace**: `antfly-operator-namespace`
-- **Custom Resource Definitions** (CRDs): `AntflyCluster`, `AntflyBackup`, `AntflyRestore`, `AntflyServerlessProject`
+- **Custom Resource Definitions** (CRDs): `AntflyCluster`
 - **RBAC** roles and bindings
 - **Operator Deployment**: Uses container image `ghcr.io/antflydb/antfly-operator:latest`
-- **Validating webhooks** and cert-manager resources for admission
 
-Useful flags:
-
-```bash
-# Use a different operator image
-go run ./cmd/antfly-operator --print-install-manifests \
-  --install-operator-image ghcr.io/antflydb/antfly-operator:vNEXT
-
-# Omit CRDs if they are managed separately
-go run ./cmd/antfly-operator --print-install-manifests \
-  --install-include-crds=false
-```
-
-The generated manifest is the supported install surface; it stays aligned with the embedded CRDs, RBAC, Deployment, and webhook resources.
-
-### Uninstall
-
-Use the matching generated uninstall bundle:
-
-```bash
-# Remove the operator but keep CRDs by default
-go run ./cmd/antfly-operator --print-uninstall-manifests | kubectl delete -f - --ignore-not-found=true
-
-# Remove the operator and CRDs too
-go run ./cmd/antfly-operator --print-uninstall-manifests \
-  --uninstall-include-crds=true | kubectl delete -f - --ignore-not-found=true
-```
-
-Keeping CRDs by default is safer because deleting them also deletes the custom resources they own.
-
-## Serverless With Proxy
-
-The operator can also deploy a table-first serverless stack around `AntflyServerlessProject`:
-
-- `serverless-api` runtime pods
-- `serverless-query` runtime pods
-- `serverless-maintenance` runtime pods
-- optional `antfly-proxy` gateway pods
-- object-store-backed manifests, WAL, and artifacts
-- table-to-`servingNamespace` routing for internal serverless reads
-
-The proxy image runs the standalone `antfly-proxy` binary (see `pkg/proxy/cmd/antfly-proxy/`).
-
-Typical images:
-
-- operator: `ghcr.io/antflydb/antfly-operator:<tag>`
-- proxy: `ghcr.io/antflydb/antfly-proxy:<tag>`
-- zig runtime: `ghcr.io/antflydb/antfly:zig`
-
-The operator runs the same Zig image for three serverless roles:
-
-- `antfly serverless api`
-- `antfly serverless query`
-- `antfly serverless maintenance`
-
-Local build helpers:
-
-```bash
-# Build the proxy image locally
-make proxy-docker-build
-
-# Build the operator image locally
-make operator-docker-build
-```
-
-Release tags:
-
-- operator image publish: `pkg/operator/v<version>`
-- proxy image publish: `proxy/v<version>`
-
-Start with:
-
-```bash
-kubectl apply -k ./examples/serverless-project-stack
-```
-
-Example public calls through the proxy:
-
-```bash
-# Ingest into the mutable serverless API role
-curl -X PUT \
-  -H 'Authorization: Bearer token-2' \
-  -H 'Content-Type: application/json' \
-  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/ingest-batch' \
-  -d '{"records":[{"id":"doc-1","body":{"title":"Antfly"}}]}'
-
-# Search a table
-curl -H 'Authorization: Bearer token-1' \
-  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/query/search?q=antfly'
-
-# Graph neighbors
-curl -X POST \
-  -H 'Authorization: Bearer token-1' \
-  -H 'Content-Type: application/json' \
-  'http://<proxy-host>/v1/tenants/tenant-a/tables/docs/query/graph/neighbors' \
-  -d '{"doc_id":"doc-1","direction":"out"}'
-```
-
-The public API stays table-first. Internal serverless debug/version routes remain under `/_internal/namespaces/...` and are not the recommended product surface.
-
-Routing split:
-
-- public writes go to the serverless `api` service
-- public reads, search, and graph go to the serverless `query` service
-- maintenance work stays on the non-listener `maintenance` service
+See `deploy/example_install.yaml` for the complete installation manifest structure.
 
 ### RBAC Requirements
 
@@ -311,7 +210,6 @@ kubectl get pods -n antfly-operator-namespace
 
 # Check CRDs are installed
 kubectl get crd antflyclusters.antfly.io
-kubectl get crd antflyserverlessprojects.antfly.io
 ```
 
 ## 🔐 Container Image Verification

@@ -37,9 +37,6 @@ spec:
         - /manager
         args:
         - --leader-elect
-        env:
-        - name: ENABLE_WEBHOOKS
-          value: "true"
         resources:
           limits:
             cpu: 500m
@@ -53,9 +50,6 @@ spec:
           protocol: TCP
         - containerPort: 8081
           name: health
-          protocol: TCP
-        - containerPort: 9443
-          name: webhook-server
           protocol: TCP
         livenessProbe:
           httpGet:
@@ -81,15 +75,6 @@ spec:
           readOnlyRootFilesystem: true
           runAsNonRoot: true
           runAsUser: 65532
-        volumeMounts:
-        - mountPath: /tmp/k8s-webhook-server/serving-certs
-          name: cert
-          readOnly: true
-      volumes:
-      - name: cert
-        secret:
-          defaultMode: 420
-          secretName: webhook-server-cert
       tolerations:
       - key: "cloud.google.com/gke-spot"
         operator: "Equal"

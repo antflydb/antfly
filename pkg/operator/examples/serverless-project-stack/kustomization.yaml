@@ -1,7 +1,0 @@
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - ../serverless-proxy-bearer-tokens-secret.yaml
-  - ../serverless-proxy-route-configmap.yaml
-  - ../serverless-project-with-proxy.yaml

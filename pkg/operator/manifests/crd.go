@@ -16,9 +16,6 @@ var antflyBackupCRDYAML []byte
 //go:embed crd/antfly.io_antflyrestores.yaml
 var antflyRestoreCRDYAML []byte
 
-//go:embed crd/antfly.io_antflyserverlessprojects.yaml
-var antflyServerlessProjectCRDYAML []byte
-
 // AntflyClusterCRD returns the parsed CustomResourceDefinition for AntflyCluster.
 func AntflyClusterCRD() (*apiextv1.CustomResourceDefinition, error) {
 	var crd apiextv1.CustomResourceDefinition
@@ -62,20 +59,6 @@ func AntflyRestoreCRDYAML() string {
 	return string(antflyRestoreCRDYAML)
 }
 
-// AntflyServerlessProjectCRD returns the parsed CustomResourceDefinition for AntflyServerlessProject.
-func AntflyServerlessProjectCRD() (*apiextv1.CustomResourceDefinition, error) {
-	var crd apiextv1.CustomResourceDefinition
-	if err := yaml.Unmarshal(antflyServerlessProjectCRDYAML, &crd); err != nil {
-		return nil, err
-	}
-	return &crd, nil
-}
-
-// AntflyServerlessProjectCRDYAML returns the raw CRD YAML for AntflyServerlessProject.
-func AntflyServerlessProjectCRDYAML() string {
-	return string(antflyServerlessProjectCRDYAML)
-}
-
 // AllCRDs returns all CRDs needed for the Antfly operator as parsed objects.
 func AllCRDs() ([]*apiextv1.CustomResourceDefinition, error) {
 	clusterCRD, err := AntflyClusterCRD()
@@ -90,20 +73,16 @@ func AllCRDs() ([]*apiextv1.CustomResourceDefinition, error) {
 	if err != nil {
 		return nil, err
 	}
-	serverlessProjectCRD, err := AntflyServerlessProjectCRD()
-	if err != nil {
-		return nil, err
-	}
-	return []*apiextv1.CustomResourceDefinition{clusterCRD, backupCRD, restoreCRD, serverlessProjectCRD}, nil
+	return []*apiextv1.CustomResourceDefinition{clusterCRD, backupCRD, restoreCRD}, nil
 }
 
 // AllCRDYAMLBytes returns raw YAML bytes for each CRD.
 func AllCRDYAMLBytes() [][]byte {
-	return [][]byte{antflyClusterCRDYAML, antflyBackupCRDYAML, antflyRestoreCRDYAML, antflyServerlessProjectCRDYAML}
+	return [][]byte{antflyClusterCRDYAML, antflyBackupCRDYAML, antflyRestoreCRDYAML}
 }
 
 // AllCRDsYAML returns all CRD YAML files concatenated.
 // This can be used directly with kubectl apply -f.
 func AllCRDsYAML() string {
-	return AntflyClusterCRDYAML() + "---\n" + AntflyBackupCRDYAML() + "---\n" + AntflyRestoreCRDYAML() + "---\n" + AntflyServerlessProjectCRDYAML()
+	return AntflyClusterCRDYAML() + "---\n" + AntflyBackupCRDYAML() + "---\n" + AntflyRestoreCRDYAML()
 }

@@ -37,22 +37,6 @@ make run
 
 ## 🔄 Development Workflow
 
-The operator now manages both:
-
-- stateful `AntflyCluster` workloads
-- table-first serverless `AntflyServerlessProject` workloads
-
-For serverless, the operator expects:
-
-- proxy image: `ghcr.io/antflydb/antfly-proxy:<tag>`
-- shared Zig runtime image: `ghcr.io/antflydb/antfly:zig`
-
-And it runs the Zig image with role-specific args:
-
-- `antfly serverless api`
-- `antfly serverless query`
-- `antfly serverless maintenance`
-
 ### Quick Development Cycle
 
 ```bash
@@ -144,7 +128,7 @@ This section provides a complete workflow for cleaning up everything in your loc
 kubectl delete antflyclusters --all --all-namespaces
 
 # Remove the operator
-go run ./cmd/antfly-operator --print-uninstall-manifests | kubectl delete -f - --ignore-not-found=true
+kubectl delete -f deploy/install.yaml --ignore-not-found=true
 
 # Remove any leftover resources
 kubectl delete all,pvc,secrets,configmaps -l app=antfly --all-namespaces
@@ -258,7 +242,7 @@ set -e
 
 echo "🧹 Cleaning up everything..."
 kubectl delete antflyclusters --all --all-namespaces --ignore-not-found=true
-go run ./cmd/antfly-operator --print-uninstall-manifests | kubectl delete -f - --ignore-not-found=true
+kubectl delete -f deploy/install.yaml --ignore-not-found=true
 make clean
 
 echo "🔨 Building fresh..."

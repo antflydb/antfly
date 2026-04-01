@@ -18,23 +18,6 @@ That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:808
 
 See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full walkthrough.
 
-## Serverless
-
-Antfly also has a table-first serverless deployment path built around:
-
-- the Go [operator](pkg/operator)
-- the Go [`antfly-proxy`](pkg/proxy) gateway
-- one shared Zig runtime image: `ghcr.io/antflydb/antfly:zig`
-
-That Zig image runs different roles via subcommands:
-
-- `antfly serverless api`
-- `antfly serverless query`
-- `antfly serverless maintenance`
-- `antfly serverless swarm`
-
-The public API stays table-first. Writes go through the serverless `api` role, while search and graph reads go through the serverless `query` role. See [pkg/operator/README.md](pkg/operator/README.md) and [pkg/operator/examples](pkg/operator/examples) for the install flow and end-to-end examples.
-
 ## Features
 
 - **Hybrid search** — full-text (BM25), dense vectors, and [sparse vectors (SPLADE)](https://huggingface.co/naver/splade-cocondenser-ensembledistil), all in one query
@@ -52,7 +35,7 @@ The public API stays table-first. Writes go through the serverless `api` role, w
 - **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with [Termite](https://github.com/antflydb/termite)
 - **Auth** — built-in [user management](src/usermgr) with API keys, basic auth, and bearer tokens
 - **Backup & restore** — to local disk or S3
-- **Kubernetes operator** — deploy and manage both stateful clusters and serverless projects with the [operator](pkg/operator)
+- **Kubernetes operator** — deploy and manage clusters with the [operator](pkg/operator)
 - **MCP server** — [Model Context Protocol](src/mcp) so LLMs can use Antfly as a tool
 - **A2A protocol** — [Agent-to-Agent](src/a2a) support for Google's A2A standard
 - **Antfarm** — [web dashboard](ts/apps/antfarm) with playgrounds for search, RAG, knowledge graphs, embeddings, reranking, chunking, NER, OCR, and transcription
