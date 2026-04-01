@@ -17,8 +17,10 @@ package metadata
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/antflydb/antfly/src/usermgr"
 	"go.uber.org/zap"
@@ -29,6 +31,29 @@ type apiKeyPermissionsKey struct{}
 func apiKeyPermissionsFromContext(r *http.Request) []usermgr.Permission {
 	perms, _ := r.Context().Value(apiKeyPermissionsKey{}).([]usermgr.Permission)
 	return perms
+}
+
+type rowFilterResolverKey struct{}
+
+// RowFilterResolver returns the security filter JSON for a given table name.
+// Returns nil if no filter applies to that table.
+type RowFilterResolver func(table string) json.RawMessage
+
+func rowFilterResolverFromContext(r *http.Request) RowFilterResolver {
+	fn, _ := r.Context().Value(rowFilterResolverKey{}).(RowFilterResolver)
+	return fn
+}
+
+func mapRowFilterResolver(filters map[string]json.RawMessage) RowFilterResolver {
+	return func(table string) json.RawMessage {
+		if f, ok := filters[table]; ok {
+			return f
+		}
+		if f, ok := filters["*"]; ok {
+			return f
+		}
+		return nil
+	}
 }
 
 // checkPermission performs the two-step auth check (Casbin RBAC + API key scope)
@@ -188,6 +213,26 @@ func (ms *MetadataStore) authnMiddleware(next http.Handler) http.Handler {
 			}
 			r.Header.Set("X-Authenticated-User", username)
 
+			// Lazy row filter resolver for Basic auth — calls GetRowFilters
+			// at most once per request, only if a query is actually made.
+			basicUsername := username
+			var once sync.Once
+			var basicFilters map[string]json.RawMessage
+			resolver := RowFilterResolver(func(table string) json.RawMessage {
+				once.Do(func() {
+					basicFilters, _ = ms.um.GetRowFilters(basicUsername)
+				})
+				if f, ok := basicFilters[table]; ok {
+					return f
+				}
+				if f, ok := basicFilters["*"]; ok {
+					return f
+				}
+				return nil
+			})
+			ctx := context.WithValue(r.Context(), rowFilterResolverKey{}, resolver)
+			r = r.WithContext(ctx)
+
 		case "ApiKey", "Bearer":
 			// Both use base64(id:secret) format
 			decoded, err := base64.StdEncoding.DecodeString(authParts[1])
@@ -201,16 +246,20 @@ func (ms *MetadataStore) authnMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			keyID, keySecret := creds[0], creds[1]
-			username, permissions, err := ms.um.ValidateApiKey(keyID, keySecret)
+			username, permissions, rowFilter, err := ms.um.ValidateApiKey(keyID, keySecret)
 			if err != nil {
 				errorResponse(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 			r.Header.Set("X-Authenticated-User", username)
+			ctx := r.Context()
 			if len(permissions) > 0 {
-				ctx := context.WithValue(r.Context(), apiKeyPermissionsKey{}, permissions)
-				r = r.WithContext(ctx)
+				ctx = context.WithValue(ctx, apiKeyPermissionsKey{}, permissions)
 			}
+			if len(rowFilter) > 0 {
+				ctx = context.WithValue(ctx, rowFilterResolverKey{}, mapRowFilterResolver(rowFilter))
+			}
+			r = r.WithContext(ctx)
 
 		default:
 			errorResponse(w, "Unauthorized", http.StatusUnauthorized)

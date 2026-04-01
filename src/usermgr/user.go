@@ -49,14 +49,15 @@ const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345
 
 // ApiKeyRecord stores an API key's metadata and hashed secret.
 type ApiKeyRecord struct {
-	KeyID       string       `json:"key_id"`
-	SecretHash  []byte       `json:"secret_hash"` // SHA-256(salt + secret)
-	SecretSalt  []byte       `json:"secret_salt"` // 16-byte random salt
-	Username    string       `json:"username"`    // owner
-	Name        string       `json:"name"`
-	Permissions []Permission `json:"permissions,omitempty"` // optional scoping
-	CreatedAt   time.Time    `json:"created_at"`
-	ExpiresAt   time.Time    `json:"expires_at"` // zero = never
+	KeyID       string                       `json:"key_id"`
+	SecretHash  []byte                       `json:"secret_hash"` // SHA-256(salt + secret)
+	SecretSalt  []byte                       `json:"secret_salt"` // 16-byte random salt
+	Username    string                       `json:"username"`    // owner
+	Name        string                       `json:"name"`
+	Permissions []Permission                 `json:"permissions,omitempty"`  // optional scoping
+	RowFilter   map[string]json.RawMessage   `json:"row_filter,omitempty"`  // per-table bleve query filter
+	CreatedAt   time.Time                    `json:"created_at"`
+	ExpiresAt   time.Time                    `json:"expires_at"` // zero = never
 }
 
 const rbacModelConf = `
@@ -65,6 +66,7 @@ r = sub, typ, obj, act
 
 [policy_definition]
 p = sub, typ, obj, act
+p2 = sub, obj, filter
 
 [role_definition]
 g = _, _
@@ -434,6 +436,12 @@ func (um *UserManager) DeleteUser(username string) error {
 		fmt.Printf("Error removing grouping policies for user %s from Casbin: %v\n", username, errG)
 	}
 
+	// Remove all p2 (row filter) policies for this user.
+	_, errP2 := um.enforcer.RemoveFilteredNamedPolicy("p2", 0, username)
+	if errP2 != nil {
+		fmt.Printf("Error removing row filter policies for user %s from Casbin: %v\n", username, errP2)
+	}
+
 	// if (errP != nil || errG != nil) && !(removedPolicies || removedGroupingPolicies) {
 	// If there was an error AND nothing was removed, it might be a more significant issue.
 	// For now, just logging. A more robust error handling might be needed.
@@ -471,6 +479,147 @@ func (um *UserManager) UpdatePassword(username string, newPassword string) error
 	return nil
 }
 
+// SetRowFilter stores a row filter for a user on a specific table using p2 named policy.
+func (um *UserManager) SetRowFilter(username, table string, filterJSON json.RawMessage) error {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+
+	if _, exists := um.passwordHashes[username]; !exists {
+		return ErrUserNotFound
+	}
+
+	// Validate that the filter is valid JSON.
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(filterJSON, &parsed); err != nil {
+		return fmt.Errorf("invalid row filter JSON for table %q: %w", table, err)
+	}
+
+	// Remove any existing filter for this user+table, then add the new one.
+	_, _ = um.enforcer.RemoveFilteredNamedPolicy("p2", 0, username, table)
+	_, err := um.enforcer.AddNamedPolicy("p2", username, table, string(filterJSON))
+	if err != nil {
+		return fmt.Errorf("failed to set row filter for user %s table %s: %w", username, table, err)
+	}
+	return nil
+}
+
+// RemoveRowFilter removes the row filter for a user on a specific table.
+func (um *UserManager) RemoveRowFilter(username, table string) error {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+
+	if _, exists := um.passwordHashes[username]; !exists {
+		return ErrUserNotFound
+	}
+
+	removed, err := um.enforcer.RemoveFilteredNamedPolicy("p2", 0, username, table)
+	if err != nil {
+		return fmt.Errorf("failed to remove row filter for user %s table %s: %w", username, table, err)
+	}
+	if !removed {
+		return ErrRowFilterNotFound
+	}
+	return nil
+}
+
+// GetRowFilters returns the effective row filters for a user across all p2 policies.
+// When multiple filters apply to the same table, they are conjuncted.
+func (um *UserManager) GetRowFilters(username string) (map[string]json.RawMessage, error) {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+
+	// Get all p2 policies for this user (fieldIndex 0 = subject).
+	policies, err := um.enforcer.GetFilteredNamedPolicy("p2", 0, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get row filters for user %s: %w", username, err)
+	}
+
+	if len(policies) == 0 {
+		return nil, nil
+	}
+
+	// p2 format: [sub, obj, filter] → policies[i] = [username, table, filterJSON]
+	filters := make(map[string]json.RawMessage)
+	for _, p := range policies {
+		if len(p) < 3 {
+			continue
+		}
+		table := p[1]
+		filterJSON := json.RawMessage(p[2])
+
+		existing, ok := filters[table]
+		if !ok {
+			filters[table] = filterJSON
+		} else {
+			// Conjunct multiple filters for the same table.
+			conjunction, _ := json.Marshal(map[string]interface{}{
+				"conjuncts": []json.RawMessage{existing, filterJSON},
+			})
+			filters[table] = conjunction
+		}
+	}
+	return filters, nil
+}
+
+// ListRowFilters returns individual row filter entries for a user (not merged).
+func (um *UserManager) ListRowFilters(username string) ([]rowFilterPolicy, error) {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+
+	if _, exists := um.passwordHashes[username]; !exists {
+		return nil, ErrUserNotFound
+	}
+
+	policies, err := um.enforcer.GetFilteredNamedPolicy("p2", 0, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list row filters for user %s: %w", username, err)
+	}
+
+	entries := make([]rowFilterPolicy, 0, len(policies))
+	for _, p := range policies {
+		if len(p) < 3 {
+			continue
+		}
+		entries = append(entries, rowFilterPolicy{
+			Table:  p[1],
+			Filter: json.RawMessage(p[2]),
+		})
+	}
+	return entries, nil
+}
+
+// GetRowFilter returns the row filter for a user on a specific table.
+func (um *UserManager) GetRowFilter(username, table string) (json.RawMessage, error) {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+
+	if _, exists := um.passwordHashes[username]; !exists {
+		return nil, ErrUserNotFound
+	}
+
+	policies, err := um.enforcer.GetFilteredNamedPolicy("p2", 0, username, table)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get row filter for user %s table %s: %w", username, table, err)
+	}
+	if len(policies) == 0 {
+		return nil, ErrRowFilterNotFound
+	}
+	// Return the first match's filter JSON.
+	if len(policies[0]) < 3 {
+		return nil, ErrRowFilterNotFound
+	}
+	return json.RawMessage(policies[0][2]), nil
+}
+
+// rowFilterPolicy represents a single row filter policy for a user+table (internal type).
+type rowFilterPolicy struct {
+	Table  string
+	Filter json.RawMessage
+}
+
+// Predefined row filter errors.
+var ErrRowFilterNotFound = errors.New("row filter not found")
+
 // Predefined API key errors.
 var (
 	ErrApiKeyNotFound      = errors.New("api key not found")
@@ -503,7 +652,7 @@ func hashApiKeySecret(salt, secretRaw []byte) []byte {
 
 // CreateApiKey creates a new API key for the given user.
 // It returns the key ID and cleartext secret (shown once, never stored).
-func (um *UserManager) CreateApiKey(username, name string, permissions []Permission, expiresAt time.Time) (keyID, keySecret string, err error) {
+func (um *UserManager) CreateApiKey(username, name string, permissions []Permission, rowFilter map[string]json.RawMessage, expiresAt time.Time) (keyID, keySecret string, err error) {
 	um.mu.Lock()
 	defer um.mu.Unlock()
 
@@ -519,6 +668,14 @@ func (um *UserManager) CreateApiKey(username, name string, permissions []Permiss
 		}
 		if !ok {
 			return "", "", fmt.Errorf("%w: permission (%s, %s, %s) not held by creator", ErrPrivilegeEscalation, perm.ResourceType, perm.Resource, perm.Type)
+		}
+	}
+
+	// Validate row filter values are valid bleve query JSON
+	for table, filterJSON := range rowFilter {
+		var parsed map[string]interface{}
+		if err := json.Unmarshal(filterJSON, &parsed); err != nil {
+			return "", "", fmt.Errorf("invalid row_filter for table %q: %w", table, err)
 		}
 	}
 
@@ -547,6 +704,7 @@ func (um *UserManager) CreateApiKey(username, name string, permissions []Permiss
 		Username:    username,
 		Name:        name,
 		Permissions: permissions,
+		RowFilter:   rowFilter,
 		CreatedAt:   time.Now(),
 		ExpiresAt:   expiresAt,
 	}
@@ -559,32 +717,32 @@ func (um *UserManager) CreateApiKey(username, name string, permissions []Permiss
 	return keyID, keySecret, nil
 }
 
-// ValidateApiKey validates an API key credential, returning the owner and permissions.
+// ValidateApiKey validates an API key credential, returning the owner, permissions, and row filter.
 // Hash is verified before expiration to prevent timing-based enumeration of valid key IDs.
-func (um *UserManager) ValidateApiKey(keyID, keySecret string) (username string, permissions []Permission, err error) {
+func (um *UserManager) ValidateApiKey(keyID, keySecret string) (username string, permissions []Permission, rowFilter map[string]json.RawMessage, err error) {
 	um.mu.RLock()
 	record, exists := um.apiKeys[keyID]
 	um.mu.RUnlock()
 
 	if !exists {
-		return "", nil, ErrApiKeyNotFound
+		return "", nil, nil, ErrApiKeyNotFound
 	}
 
 	secretRaw, err := base64.RawURLEncoding.DecodeString(keySecret)
 	if err != nil {
-		return "", nil, ErrApiKeyInvalid
+		return "", nil, nil, ErrApiKeyInvalid
 	}
 
 	computedHash := hashApiKeySecret(record.SecretSalt, secretRaw)
 	if subtle.ConstantTimeCompare(computedHash, record.SecretHash) != 1 {
-		return "", nil, ErrApiKeyInvalid
+		return "", nil, nil, ErrApiKeyInvalid
 	}
 
 	if !record.ExpiresAt.IsZero() && time.Now().After(record.ExpiresAt) {
-		return "", nil, ErrApiKeyExpired
+		return "", nil, nil, ErrApiKeyExpired
 	}
 
-	return record.Username, record.Permissions, nil
+	return record.Username, record.Permissions, record.RowFilter, nil
 }
 
 // ListApiKeys returns all API keys owned by the given user, with hash/salt omitted.
@@ -604,6 +762,7 @@ func (um *UserManager) ListApiKeys(username string) ([]*ApiKeyRecord, error) {
 				Username:    record.Username,
 				Name:        record.Name,
 				Permissions: record.Permissions,
+				RowFilter:   record.RowFilter,
 				CreatedAt:   record.CreatedAt,
 				ExpiresAt:   record.ExpiresAt,
 			})

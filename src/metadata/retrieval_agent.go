@@ -15,6 +15,7 @@
 package metadata
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1868,6 +1869,18 @@ func (t *TableApi) batchLookupDocuments(
 		})
 	}
 	_ = g.Wait()
+
+	// Post-fetch row filter: remove documents that don't match the security filter.
+	if resolve, ok := ctx.Value(rowFilterResolverKey{}).(RowFilterResolver); ok && resolve != nil {
+		secFilter := resolve(tableName)
+		if len(secFilter) > 0 && !bytes.Equal(secFilter, []byte("null")) {
+			for key := range docs {
+				if !t.docMatchesRowFilter(ctx, tableName, key, secFilter) {
+					delete(docs, key)
+				}
+			}
+		}
+	}
 
 	return docs, nil
 }

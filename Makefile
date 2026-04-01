@@ -1,3 +1,4 @@
+SHELL := /bin/bash
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
@@ -51,6 +52,17 @@ help:
 	@echo ""
 	@echo "Omni Cross-Compilation (for goreleaser):"
 	@echo "  download-omni-deps     Download ONNX Runtime and PJRT to antfly root"
+	@echo ""
+	@echo "TLA+ Verification Commands:"
+	@echo "  tla-tools          Download TLA+ tools (tla2tools.jar, CommunityModules)"
+	@echo "  tla-check          Run TLC model checker on all Antfly TLA+ specs"
+	@echo "  tla-check-txn      Model check transaction spec only (~10s)"
+	@echo "  tla-check-split    Model check shard split spec only"
+	@echo "  tla-check-snap     Model check snapshot transfer spec only (~90s)"
+	@echo "  tla-trace-raft     Validate raft ndjson traces against etcd/raft TLA+ spec"
+	@echo "                     Options: TRACE_FILES=path/to/*.ndjson"
+	@echo "  tla-trace-txn      Validate transaction ndjson traces against AntflyTransaction"
+	@echo "                     Options: TRACE_FILES=path/to/*.ndjson"
 	@echo ""
 	@echo "Minikube Commands:"
 	@echo "  minikube-start     Start a Minikube instance"
@@ -287,6 +299,60 @@ endif
 
 
 # ====================================================================================
+# TLA+ Verification Commands
+# ====================================================================================
+
+GOMODCACHE := $(shell go env GOMODCACHE)
+RAFT_TLA := $(GOMODCACHE)/go.etcd.io/raft/v3@v3.6.0/tla
+
+.PHONY: tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft tla-trace-txn
+
+tla-tools:
+	@bash scripts/tla-tools.sh
+
+tla-check: tla-check-txn tla-check-split tla-check-snap
+
+tla-check-txn: tla-tools
+	@echo "==> Model checking transaction spec..."
+	source scripts/tla-tools.sh && \
+	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
+	  -config specs/tla/AntflyTransaction.cfg specs/tla/MC.tla \
+	  -workers auto -deadlock
+
+tla-check-split: tla-tools
+	@echo "==> Model checking shard split spec..."
+	source scripts/tla-tools.sh && \
+	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
+	  -config specs/tla/AntflyShardSplit.cfg specs/tla/ShardSplitMC.tla \
+	  -workers auto -deadlock
+
+tla-check-snap: tla-tools
+	@echo "==> Model checking snapshot transfer spec (safety only, ~90s)..."
+	source scripts/tla-tools.sh && \
+	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
+	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \
+	  -workers auto -deadlock
+
+tla-trace-raft: tla-tools
+ifndef TRACE_FILES
+	$(error TRACE_FILES is required. Example: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson)
+endif
+	@bash scripts/tla-validate-trace.sh \
+	  -s "$(RAFT_TLA)/Traceetcdraft.tla" \
+	  -c "$(RAFT_TLA)/Traceetcdraft.cfg" \
+	  $(TRACE_FILES)
+
+tla-trace-txn: tla-tools
+ifndef TRACE_FILES
+	$(error TRACE_FILES is required. Example: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson)
+endif
+	@bash scripts/tla-validate-trace.sh -S \
+	  -s specs/tla/TraceAntflyTransaction.tla \
+	  -c specs/tla/TraceAntflyTransaction.cfg \
+	  $(TRACE_FILES)
+
+
+# ====================================================================================
 # Minikube Commands
 # ====================================================================================
 
@@ -362,7 +428,7 @@ show-ingress:
 # Operator Commands
 # ====================================================================================
 
-.PHONY: operator-build operator-test operator-docker-build operator-lint
+.PHONY: operator-build operator-test operator-docker-build operator-lint proxy-docker-build
 
 operator-build: ## Build the antfly-operator binary
 	(cd ./pkg/operator && $(MAKE) build)
@@ -375,6 +441,9 @@ operator-lint: ## Run linter on antfly-operator
 
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./pkg/operator/Dockerfile ./pkg/operator
+
+proxy-docker-build: ## Build antfly-proxy Docker image
+	docker build -t antfly-proxy:latest -f ./Dockerfile.proxy .
 
 
 # ====================================================================================

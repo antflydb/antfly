@@ -26,6 +26,9 @@ tags:
   - name: ApiKey
     x-displayName: API Key
     description: Operations related to API key management
+  - name: RowFilter
+    x-displayName: Row Filter
+    description: Operations related to row-level security filters
 
 components:
   securitySchemes:
@@ -151,6 +154,14 @@ components:
             $ref: "#/components/schemas/Permission"
           nullable: true
           description: "Optional permission scoping. If empty, inherits owner's full permissions."
+        row_filter:
+          type: object
+          additionalProperties: {}
+          nullable: true
+          description: >
+            Per-table row filter. Keys are table names (or '*' for all tables).
+            Values are bleve query JSON objects. Documents must match this query
+            to be visible through this API key.
         created_at:
           type: string
           format: date-time
@@ -184,6 +195,25 @@ components:
             - key_secret
             - encoded
 
+    RowFilterEntry:
+      type: object
+      description: "A row filter policy for a user on a specific table."
+      properties:
+        table:
+          type: string
+          description: "Table name (or '*' for all tables)."
+          example: "orders"
+        filter:
+          type: object
+          additionalProperties: {}
+          description: "Bleve query JSON that documents must match to be visible."
+          example:
+            term:
+              department: "engineering"
+      required:
+        - table
+        - filter
+
     CreateApiKeyRequest:
       type: object
       description: "Request to create a new API key."
@@ -202,6 +232,14 @@ components:
             $ref: "#/components/schemas/Permission"
           nullable: true
           description: "Optional permission scoping. Each permission must be a subset of the creator's permissions."
+        row_filter:
+          type: object
+          additionalProperties: {}
+          nullable: true
+          description: >
+            Per-table row filter. Keys are table names (or '*' for all tables).
+            Values are bleve query JSON objects. Documents must match this query
+            to be visible through this API key.
       required:
         - name
 
@@ -545,6 +583,133 @@ paths:
                 $ref: "#/components/schemas/Error"
         "404":
           description: User not found or Role not found for the given resource
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users/{userName}/row-filters:
+    parameters:
+      - $ref: "#/components/parameters/UserNamePathParameter"
+    get:
+      tags:
+        - RowFilter
+      summary: List row filters for a user
+      description: Returns all row filter policies for the specified user.
+      operationId: listRowFilters
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RowFilterEntry"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /users/{userName}/row-filters/{table}:
+    parameters:
+      - $ref: "#/components/parameters/UserNamePathParameter"
+      - name: table
+        in: path
+        required: true
+        description: "Table name (or '*' for all tables)."
+        schema:
+          type: string
+          example: "orders"
+    get:
+      tags:
+        - RowFilter
+      summary: Get row filter for a user on a table
+      description: Returns the row filter policy for the specified user and table.
+      operationId: getRowFilter
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowFilterEntry"
+        "404":
+          description: User or row filter not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      tags:
+        - RowFilter
+      summary: Set row filter for a user on a table
+      description: Sets or replaces the row filter policy for the specified user and table. The request body is the bleve query JSON.
+      operationId: setRowFilter
+      requestBody:
+        description: Bleve query JSON for filtering documents
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: {}
+      responses:
+        "200":
+          description: Row filter set successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowFilterEntry"
+        "400":
+          description: Bad Request (e.g., invalid filter JSON)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      tags:
+        - RowFilter
+      summary: Remove row filter for a user on a table
+      description: Removes the row filter policy for the specified user and table.
+      operationId: removeRowFilter
+      responses:
+        "204":
+          description: Row filter removed successfully
+        "404":
+          description: User or row filter not found
           content:
             application/json:
               schema:

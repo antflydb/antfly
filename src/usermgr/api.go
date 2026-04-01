@@ -28,6 +28,7 @@ import (
 	"go.uber.org/zap"
 )
 
+
 type UserApi struct {
 	logger *zap.Logger
 	um     *UserManager
@@ -370,7 +371,20 @@ func (um *UserApi) CreateApiKey(
 		permissions = *req.Permissions
 	}
 
-	keyID, keySecret, err := um.um.CreateApiKey(userName, req.Name, permissions, expiresAt)
+	var rowFilter map[string]json.RawMessage
+	if req.RowFilter != nil {
+		rowFilter = make(map[string]json.RawMessage)
+		for k, v := range *req.RowFilter {
+			raw, marshalErr := json.Marshal(v)
+			if marshalErr != nil {
+				um.httpError(w, "Invalid row_filter value for table "+k, http.StatusBadRequest, marshalErr)
+				return
+			}
+			rowFilter[k] = raw
+		}
+	}
+
+	keyID, keySecret, err := um.um.CreateApiKey(userName, req.Name, permissions, rowFilter, expiresAt)
 	if err != nil {
 		if errors.Is(err, ErrUserNotFound) {
 			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
@@ -397,11 +411,119 @@ func (um *UserApi) CreateApiKey(
 	if len(permissions) > 0 {
 		response.Permissions = &permissions
 	}
+	if len(rowFilter) > 0 {
+		rf := make(map[string]interface{})
+		for k, v := range rowFilter {
+			var parsed interface{}
+			_ = json.Unmarshal(v, &parsed)
+			rf[k] = parsed
+		}
+		response.RowFilter = &rf
+	}
 	if !expiresAt.IsZero() {
 		response.ExpiresAt = &expiresAt
 	}
 
 	um.jsonResponse(w, response, http.StatusCreated)
+}
+
+func (um *UserApi) ListRowFilters(
+	w http.ResponseWriter,
+	r *http.Request,
+	userName UserNamePathParameter,
+) {
+	entries, err := um.um.ListRowFilters(userName)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to list row filters", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	result := make([]RowFilterEntry, len(entries))
+	for i, e := range entries {
+		result[i] = RowFilterEntry{
+			Table:  e.Table,
+			Filter: rawToMap(e.Filter),
+		}
+	}
+	um.jsonResponse(w, result, http.StatusOK)
+}
+
+func (um *UserApi) GetRowFilter(
+	w http.ResponseWriter,
+	r *http.Request,
+	userName UserNamePathParameter,
+	table string,
+) {
+	filterJSON, err := um.um.GetRowFilter(userName, table)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
+		} else if errors.Is(err, ErrRowFilterNotFound) {
+			um.httpError(w, ErrRowFilterNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to get row filter", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	um.jsonResponse(w, RowFilterEntry{
+		Table:  table,
+		Filter: rawToMap(filterJSON),
+	}, http.StatusOK)
+}
+
+func (um *UserApi) SetRowFilter(
+	w http.ResponseWriter,
+	r *http.Request,
+	userName UserNamePathParameter,
+	table string,
+) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		um.httpError(w, "Invalid request body: "+err.Error(), http.StatusBadRequest, err)
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	filterJSON, err := json.Marshal(body)
+	if err != nil {
+		um.httpError(w, "Failed to marshal filter", http.StatusBadRequest, err)
+		return
+	}
+
+	if err := um.um.SetRowFilter(userName, table, filterJSON); err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to set row filter: "+err.Error(), http.StatusBadRequest, err)
+		}
+		return
+	}
+	um.jsonResponse(w, RowFilterEntry{
+		Table:  table,
+		Filter: body,
+	}, http.StatusOK)
+}
+
+func (um *UserApi) RemoveRowFilter(
+	w http.ResponseWriter,
+	r *http.Request,
+	userName UserNamePathParameter,
+	table string,
+) {
+	if err := um.um.RemoveRowFilter(userName, table); err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
+		} else if errors.Is(err, ErrRowFilterNotFound) {
+			um.httpError(w, ErrRowFilterNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to remove row filter", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	um.jsonResponse(w, nil, http.StatusNoContent)
 }
 
 func (um *UserApi) DeleteApiKey(
@@ -419,4 +541,11 @@ func (um *UserApi) DeleteApiKey(
 		return
 	}
 	um.jsonResponse(w, nil, http.StatusNoContent)
+}
+
+// rawToMap converts json.RawMessage to map[string]interface{} for the generated types.
+func rawToMap(raw json.RawMessage) map[string]interface{} {
+	var m map[string]interface{}
+	_ = json.Unmarshal(raw, &m)
+	return m
 }

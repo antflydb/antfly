@@ -39,7 +39,7 @@ func TestCreateApiKey_Success(t *testing.T) {
 	um, _ := newTestUserManager(t)
 	createTestUser(t, um, "alice", "password123")
 
-	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, time.Time{})
+	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, nil, time.Time{})
 	require.NoError(err)
 
 	assert.Len(keyID, apiKeyIDLength)
@@ -57,10 +57,10 @@ func TestValidateApiKey_CorrectSecret(t *testing.T) {
 	um, _ := newTestUserManager(t)
 	createTestUser(t, um, "alice", "password123")
 
-	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, time.Time{})
+	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, nil, time.Time{})
 	require.NoError(err)
 
-	username, perms, err := um.ValidateApiKey(keyID, keySecret)
+	username, perms, _, err := um.ValidateApiKey(keyID, keySecret)
 	require.NoError(err)
 	assert.Equal("alice", username)
 	assert.Empty(perms)
@@ -72,17 +72,17 @@ func TestValidateApiKey_WrongSecret(t *testing.T) {
 	um, _ := newTestUserManager(t)
 	createTestUser(t, um, "alice", "password123")
 
-	keyID, _, err := um.CreateApiKey("alice", "test key", nil, time.Time{})
+	keyID, _, err := um.CreateApiKey("alice", "test key", nil, nil, time.Time{})
 	require.NoError(err)
 
-	_, _, err = um.ValidateApiKey(keyID, "wrongsecretvalue12345")
+	_, _, _, err = um.ValidateApiKey(keyID, "wrongsecretvalue12345")
 	require.ErrorIs(err, ErrApiKeyInvalid)
 }
 
 func TestValidateApiKey_NonexistentKey(t *testing.T) {
 	um, _ := newTestUserManager(t)
 
-	_, _, err := um.ValidateApiKey("nonexistentkeyid12345", "somesecret")
+	_, _, _, err := um.ValidateApiKey("nonexistentkeyid12345", "somesecret")
 	require.ErrorIs(t, err, ErrApiKeyNotFound)
 }
 
@@ -93,12 +93,12 @@ func TestValidateApiKey_ExpiredKey(t *testing.T) {
 	createTestUser(t, um, "alice", "password123")
 
 	expiresAt := time.Now().Add(-1 * time.Hour)
-	keyID, keySecret, err := um.CreateApiKey("alice", "expired key", nil, expiresAt)
+	keyID, keySecret, err := um.CreateApiKey("alice", "expired key", nil, nil, expiresAt)
 	require.NoError(err)
 
 	// Hash verification happens before expiration check (timing safety),
 	// but the result should still be ErrApiKeyExpired.
-	_, _, err = um.ValidateApiKey(keyID, keySecret)
+	_, _, _, err = um.ValidateApiKey(keyID, keySecret)
 	require.ErrorIs(err, ErrApiKeyExpired)
 }
 
@@ -109,12 +109,12 @@ func TestValidateApiKey_HashCheckedBeforeExpiry(t *testing.T) {
 	createTestUser(t, um, "alice", "password123")
 
 	expiresAt := time.Now().Add(-1 * time.Hour)
-	keyID, _, err := um.CreateApiKey("alice", "expired key", nil, expiresAt)
+	keyID, _, err := um.CreateApiKey("alice", "expired key", nil, nil, expiresAt)
 	require.NoError(err)
 
 	// Wrong secret on an expired key should return ErrApiKeyInvalid (not ErrApiKeyExpired)
 	// because hash is checked first.
-	_, _, err = um.ValidateApiKey(keyID, "wrongsecretvalue12345")
+	_, _, _, err = um.ValidateApiKey(keyID, "wrongsecretvalue12345")
 	require.ErrorIs(err, ErrApiKeyInvalid)
 }
 
@@ -125,9 +125,9 @@ func TestListApiKeys_OmitsSensitiveFields(t *testing.T) {
 	um, _ := newTestUserManager(t)
 	createTestUser(t, um, "alice", "password123")
 
-	_, _, err := um.CreateApiKey("alice", "test key 1", nil, time.Time{})
+	_, _, err := um.CreateApiKey("alice", "test key 1", nil, nil, time.Time{})
 	require.NoError(err)
-	_, _, err = um.CreateApiKey("alice", "test key 2", nil, time.Time{})
+	_, _, err = um.CreateApiKey("alice", "test key 2", nil, nil, time.Time{})
 	require.NoError(err)
 
 	keys, err := um.ListApiKeys("alice")
@@ -147,15 +147,15 @@ func TestDeleteApiKey_Success(t *testing.T) {
 	um, _ := newTestUserManager(t)
 	createTestUser(t, um, "alice", "password123")
 
-	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, time.Time{})
+	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, nil, time.Time{})
 	require.NoError(err)
 
-	_, _, err = um.ValidateApiKey(keyID, keySecret)
+	_, _, _, err = um.ValidateApiKey(keyID, keySecret)
 	require.NoError(err, "should succeed before deletion")
 
 	require.NoError(um.DeleteApiKey("alice", keyID))
 
-	_, _, err = um.ValidateApiKey(keyID, keySecret)
+	_, _, _, err = um.ValidateApiKey(keyID, keySecret)
 	require.ErrorIs(err, ErrApiKeyNotFound)
 }
 
@@ -169,7 +169,7 @@ func TestDeleteApiKey_NotFound(t *testing.T) {
 func TestCreateApiKey_NonexistentUser(t *testing.T) {
 	um, _ := newTestUserManager(t)
 
-	_, _, err := um.CreateApiKey("nonexistent", "test key", nil, time.Time{})
+	_, _, err := um.CreateApiKey("nonexistent", "test key", nil, nil, time.Time{})
 	require.ErrorIs(t, err, ErrUserNotFound)
 }
 
@@ -191,10 +191,10 @@ func TestCreateApiKey_WithPermissions(t *testing.T) {
 	keyPerms := []Permission{
 		{Resource: "orders", ResourceType: ResourceTypeTable, Type: PermissionTypeRead},
 	}
-	keyID, keySecret, err := um.CreateApiKey("alice", "read-only key", keyPerms, time.Time{})
+	keyID, keySecret, err := um.CreateApiKey("alice", "read-only key", keyPerms, nil, time.Time{})
 	require.NoError(err)
 
-	_, perms, err := um.ValidateApiKey(keyID, keySecret)
+	_, perms, _, err := um.ValidateApiKey(keyID, keySecret)
 	require.NoError(err)
 	require.Len(perms, 1)
 	assert.Equal("orders", perms[0].Resource)
@@ -208,7 +208,7 @@ func TestCreateApiKey_PrivilegeEscalationPrevented(t *testing.T) {
 	escalatedPerms := []Permission{
 		{Resource: "*", ResourceType: "*", Type: PermissionTypeAdmin},
 	}
-	_, _, err := um.CreateApiKey("alice", "escalated key", escalatedPerms, time.Time{})
+	_, _, err := um.CreateApiKey("alice", "escalated key", escalatedPerms, nil, time.Time{})
 	require.ErrorIs(t, err, ErrPrivilegeEscalation)
 }
 
@@ -227,14 +227,14 @@ func TestApiKey_PersistenceAcrossReload(t *testing.T) {
 	_, err = um1.CreateUser("alice", "password123", nil)
 	require.NoError(err)
 
-	keyID, keySecret, err := um1.CreateApiKey("alice", "persistent key", nil, time.Time{})
+	keyID, keySecret, err := um1.CreateApiKey("alice", "persistent key", nil, nil, time.Time{})
 	require.NoError(err)
 
 	// Simulate restart by creating new UserManager from same DB
 	um2, err := NewUserManager(kvDB)
 	require.NoError(err)
 
-	username, _, err := um2.ValidateApiKey(keyID, keySecret)
+	username, _, _, err := um2.ValidateApiKey(keyID, keySecret)
 	require.NoError(err)
 	assert.Equal("alice", username)
 }

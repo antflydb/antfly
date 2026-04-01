@@ -750,6 +750,19 @@ func (t *TableApi) LookupKey(w http.ResponseWriter, r *http.Request, tableName s
 		return
 	}
 
+	// Enforce row-level security: if a row filter is active, verify the
+	// document matches by running a filtered query against the bleve index.
+	if resolve := rowFilterResolverFromContext(r); resolve != nil {
+		secFilter := resolve(tableName)
+		if len(secFilter) > 0 && !bytes.Equal(secFilter, []byte("null")) {
+			match := t.docMatchesRowFilter(r.Context(), tableName, key, secFilter)
+			if !match {
+				errorResponse(w, "Not found", http.StatusNotFound)
+				return
+			}
+		}
+	}
+
 	// Set version header for OCC transaction support
 	w.Header().Set("X-Antfly-Version", strconv.FormatUint(version, 10))
 
@@ -827,6 +840,24 @@ func (t *TableApi) LookupKey(w http.ResponseWriter, r *http.Request, tableName s
 	if _, err := w.Write(lookupResp); err != nil {
 		t.logger.Error("Error writing response", zap.Error(err))
 	}
+}
+
+// docMatchesRowFilter checks whether a document (identified by key) in the given
+// table passes the row-level security filter. It runs a targeted query against
+// the existing bleve index using conjunction(docID term, securityFilter).
+func (t *TableApi) docMatchesRowFilter(ctx context.Context, tableName, key string, secFilter json.RawMessage) bool {
+	// Build a query that matches the specific document AND the security filter.
+	idTerm := json.RawMessage(fmt.Sprintf(`{"term":{"_id":"%s"}}`, key))
+	conjunction, _ := json.Marshal(map[string]interface{}{
+		"conjuncts": []json.RawMessage{idTerm, secFilter},
+	})
+	qr := &QueryRequest{
+		Table:       tableName,
+		FilterQuery: conjunction,
+		Count:       true,
+	}
+	result := t.runQuery(ctx, qr)
+	return result.Status == http.StatusOK && result.Hits.Total > 0
 }
 
 // hasSpecialFieldsOnly returns true if all fields are special fields (_embeddings, _summaries, _chunks)

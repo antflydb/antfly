@@ -652,6 +652,26 @@ func (ms *MetadataStore) forwardLookupToShardWithVersion(
 			return err
 		}
 		result, version, err = targetClient.LookupWithVersion(ctx, effectiveShardID, key)
+		// During split cutover, writes can start routing to the child as soon as it
+		// is write-ready, while reads may still temporarily fall back to the parent
+		// until the child crosses the final replay fence. If the parent reports a
+		// miss in that window, probe the child directly before surfacing a 404.
+		if errors.Is(err, client.ErrNotFound) && effectiveShardID != shardID {
+			childShardID, childClient, childErr := ms.leaderClientForShardNoFallback(ctx, shardID)
+			if childErr == nil {
+				childResult, childVersion, childLookupErr := childClient.LookupWithVersion(ctx, childShardID, key)
+				if childLookupErr == nil {
+					result = childResult
+					version = childVersion
+					return nil
+				}
+				if isTransientShardError(childLookupErr) {
+					return retry.RetryableError(childLookupErr)
+				}
+			} else if isTransientShardError(childErr) {
+				return retry.RetryableError(childErr)
+			}
+		}
 		if err != nil && isTransientShardError(err) {
 			return retry.RetryableError(err)
 		}

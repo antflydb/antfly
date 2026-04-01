@@ -33,6 +33,7 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/antflydb/antfly/src/metadata/reconciler"
+	"github.com/antflydb/antfly/src/tracing"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
@@ -75,6 +76,10 @@ type MetadataStore struct {
 	// shard indexes and control-plane StoreRPCs. It is fixed at runtime
 	// construction, which avoids mixed-mode bootstrap states.
 	executionProvider ExecutionProvider
+
+	// traceWriter emits TLA+ trace events for transaction validation.
+	// Non-nil only when built with -tags with_tla.
+	traceWriter tracing.AntflyTraceWriter
 }
 
 // materializeIndexes builds fresh ShardIndexes from an immutable base plan

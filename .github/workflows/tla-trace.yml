@@ -1,0 +1,69 @@
+name: TLA+ Trace Validation
+
+on:
+  schedule:
+    # Weekly on Sunday at 03:00 UTC
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trace-validate:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set Go experiment
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Download TLA+ tools
+        run: make tla-tools
+
+      - name: Build with TLA+ tracing
+        run: go build -tags with_tla ./cmd/antfly
+
+      - name: Run sim tests and extract raft traces
+        run: |
+          go test -tags with_tla -run TestHarness -v ./src/sim/ 2>&1 | \
+            grep '"tag":"trace"' > /tmp/raft-trace.ndjson || true
+          echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
+
+      - name: Validate raft traces
+        run: |
+          if [ -s /tmp/raft-trace.ndjson ]; then
+            make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
+          else
+            echo "No raft trace events found, skipping validation"
+          fi
+
+      - name: Run transaction tests and extract traces
+        run: |
+          go test -tags with_tla -run TestHarness_Transaction -v ./src/sim/ 2>&1 | \
+            grep '"tag":"antfly-trace"' > /tmp/txn-trace.ndjson || true
+          echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
+
+      - name: Validate transaction traces
+        run: |
+          if [ -s /tmp/txn-trace.ndjson ]; then
+            make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson
+          else
+            echo "No transaction trace events found, skipping validation"
+          fi

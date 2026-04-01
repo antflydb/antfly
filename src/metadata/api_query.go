@@ -47,6 +47,27 @@ import (
 	"go.uber.org/zap"
 )
 
+// injectRowFilter ANDs a security filter from the RowFilterResolver into the
+// query's FilterQuery. This ensures row-level visibility is enforced before the
+// query reaches bleve/vector indexes.
+func injectRowFilter(qr *QueryRequest, resolve RowFilterResolver) {
+	if resolve == nil {
+		return
+	}
+	secFilter := resolve(qr.Table)
+	if len(secFilter) == 0 || bytes.Equal(secFilter, []byte("null")) {
+		return
+	}
+	if len(qr.FilterQuery) == 0 || bytes.Equal(qr.FilterQuery, []byte("null")) {
+		qr.FilterQuery = secFilter
+	} else {
+		conjunction, _ := json.Marshal(map[string]interface{}{
+			"conjuncts": []json.RawMessage{qr.FilterQuery, secFilter},
+		})
+		qr.FilterQuery = conjunction
+	}
+}
+
 func (t *TableApi) executeHybridFullTextFallback(
 	ctx context.Context,
 	shardIndexes indexes.ShardIndexes,
@@ -402,6 +423,12 @@ func (t *TableApi) getOrCreateBaseIndexPlan(
 }
 
 func (t *TableApi) runQuery(ctx context.Context, queryReq *QueryRequest) QueryResult {
+	// Inject row-level security filter before validation so it participates in
+	// the full FilterQuery pipeline (bleve, vector FilterIDs, foreign SQL WHERE).
+	if resolve, ok := ctx.Value(rowFilterResolverKey{}).(RowFilterResolver); ok {
+		injectRowFilter(queryReq, resolve)
+	}
+
 	// Validate request configuration first
 	if err := queryReq.Validate(); err != nil {
 		return QueryResult{

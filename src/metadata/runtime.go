@@ -37,6 +37,7 @@ import (
 	"github.com/antflydb/antfly/src/raft"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/tablemgr"
+	"github.com/antflydb/antfly/src/tracing"
 	"github.com/antflydb/antfly/src/usermgr"
 	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
 	"github.com/jellydator/ttlcache/v3"
@@ -162,6 +163,8 @@ func NewRuntime(
 		clock: clock.RealClock{},
 
 		executionProvider: provider,
+
+		traceWriter: tracing.NewAntflyTraceWriter(zl),
 	}
 
 	shardOps := NewMetadataShardOperations(node)

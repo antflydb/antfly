@@ -73,6 +73,32 @@ func TestLoadSnapshotRetriesInitialSnapshotFetch(t *testing.T) {
 	require.EqualValues(t, 3, transport.attempts.Load())
 }
 
+func TestLoadSnapshotReturnsErrorWhenInitialSnapshotFetchFails(t *testing.T) {
+	ps, cleanup := newTestPebbleStorage(t)
+	defer cleanup()
+
+	transport := &retrySnapshotTransport{failuresBeforeSuccess: 1 << 30}
+	rc := &raftNode{
+		shardID:                 10,
+		id:                      1,
+		raftLogStorage:          ps,
+		snapStore:               &mockSnapStore{},
+		initWithStorageSnapshot: "split-archive",
+		transport:               transport,
+		clock:                   clock.RealClock{},
+		logger:                  zaptest.NewLogger(t),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	snapshotID, err := rc.loadSnapshot(ctx)
+	require.Empty(t, snapshotID)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "fetching initial snapshot split-archive")
+	require.Contains(t, err.Error(), "canceled")
+}
+
 func TestProcessMessages(t *testing.T) {
 	cases := []struct {
 		name             string
@@ -320,8 +346,8 @@ func (m *retrySnapshotTransport) GetSnapshot(_ context.Context, _ types.ID, _ sn
 	}
 	return nil
 }
-func (m *retrySnapshotTransport) AddPeer(_, _ types.ID, _ []string)         {}
-func (m *retrySnapshotTransport) RemovePeer(_, _ types.ID)                  {}
+func (m *retrySnapshotTransport) AddPeer(_, _ types.ID, _ []string) {}
+func (m *retrySnapshotTransport) RemovePeer(_, _ types.ID)          {}
 func (m *retrySnapshotTransport) ServeRaft(_ types.ID, _ Raft, _ []raft.Peer) error {
 	return nil
 }
