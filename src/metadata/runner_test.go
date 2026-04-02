@@ -18,11 +18,23 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
+
+func TestNewAPIServerUsesUploadFriendlyReadTimeout(t *testing.T) {
+	t.Parallel()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	srv := NewAPIServer("127.0.0.1:8080", handler)
+
+	assert.Equal(t, "127.0.0.1:8080", srv.Addr)
+	assert.NotNil(t, srv.Handler)
+	assert.Equal(t, time.Minute, srv.ReadTimeout)
+}
 
 // TestCombinedAPIServerRouting tests that the combined API server
 // properly routes requests to internal and public APIs

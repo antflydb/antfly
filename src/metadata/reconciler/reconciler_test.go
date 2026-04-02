@@ -261,6 +261,16 @@ func (m *MockTableOperations) ReassignShardsForSplit(
 	return args.Get(0).(types.IDSlice), args.Get(1).(*store.ShardConfig), args.Error(2)
 }
 
+func (m *MockTableOperations) RollbackShardsForSplit(
+	transition tablemgr.SplitTransition,
+) (*store.ShardConfig, error) {
+	args := m.Called(transition)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*store.ShardConfig), args.Error(1)
+}
+
 func (m *MockTableOperations) ReassignShardsForMerge(
 	transition tablemgr.MergeTransition,
 ) (*store.ShardConfig, error) {

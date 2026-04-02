@@ -1609,6 +1609,53 @@ func (tm *TableManager) ReassignShardsForSplit(
 	return shardStatus.Peers.IDSlice(), newShards[split.SplitShardID], nil
 }
 
+func (tm *TableManager) RollbackShardsForSplit(split SplitTransition) (*store.ShardConfig, error) {
+	tm.Lock()
+	defer tm.Unlock()
+
+	table, err := tm.GetTable(split.TableName)
+	if err != nil {
+		return nil, err
+	}
+	parentConf, ok := table.Shards[split.ShardID]
+	if !ok {
+		return nil, fmt.Errorf("parent shard %s does not exist", split.ShardID)
+	}
+	childConf, ok := table.Shards[split.SplitShardID]
+	if !ok {
+		return nil, fmt.Errorf("split shard %s does not exist", split.SplitShardID)
+	}
+
+	restoredConfig := &store.ShardConfig{
+		ByteRange:     [2][]byte{parentConf.ByteRange[0], childConf.ByteRange[1]},
+		Indexes:       parentConf.Indexes,
+		Schema:        parentConf.Schema,
+		RestoreConfig: parentConf.RestoreConfig,
+	}
+	table.Shards[split.ShardID] = restoredConfig
+	delete(table.Shards, split.SplitShardID)
+
+	parentStatus, err := tm.GetShardStatus(split.ShardID)
+	if err != nil {
+		return nil, fmt.Errorf("getting parent shard status %s: %w", split.ShardID, err)
+	}
+	parentStatus.ShardConfig = *restoredConfig
+	parentStatus.State = store.ShardState_Default
+	parentStatus.Splitting = false
+	parentStatus.SplitState = nil
+
+	if err := tm.saveTableAndShardStatus(
+		table,
+		map[types.ID]*store.ShardStatus{
+			split.ShardID: parentStatus,
+		},
+		split.SplitShardID,
+	); err != nil {
+		return nil, fmt.Errorf("saving rolled back split metadata: %w", err)
+	}
+	return restoredConfig, nil
+}
+
 // RemoveTable deletes a table by name
 func (tm *TableManager) RemoveTable(name string) error {
 	tm.Lock()

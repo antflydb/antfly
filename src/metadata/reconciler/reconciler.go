@@ -718,6 +718,7 @@ func (r *Reconciler) computeSplitStatePhaseActionWithDesired(
 			ShardID:     shardID,
 			State:       shardStatus.State,
 			Action:      SplitStateActionRollback,
+			NewShardID:  newShardID,
 			SplitKey:    splitState.GetSplitKey(),
 			TargetRange: [2][]byte{shardStatus.ByteRange[0], splitState.GetOriginalRangeEnd()},
 		}
@@ -824,6 +825,7 @@ func (r *Reconciler) computeSplitStatePhaseActionWithDesired(
 			ShardID:     shardID,
 			State:       shardStatus.State,
 			Action:      SplitStateActionRollback,
+			NewShardID:  types.ID(splitState.GetNewShardId()),
 			SplitKey:    splitState.GetSplitKey(),
 			TargetRange: [2][]byte{shardStatus.ByteRange[0], splitState.GetOriginalRangeEnd()},
 		}

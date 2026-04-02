@@ -915,6 +915,69 @@ func TestTableManager_ReassignShardsForSplit(t *testing.T) {
 	require.NoError(t, err, "New shard status not persisted")
 }
 
+func TestTableManager_RollbackShardsForSplit(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	tableName := "rollbackSplitTable"
+	_, err = tm.CreateTable(tableName, TableConfig{
+		NumShards: 1,
+		StartID:   150,
+		Schema:    &schema.TableSchema{},
+	})
+	require.NoError(t, err)
+
+	parentID := types.ID(150)
+	childID := types.ID(151)
+	transition := SplitTransition{
+		ShardID:      parentID,
+		SplitShardID: childID,
+		SplitKey:     []byte("M"),
+		TableName:    tableName,
+	}
+
+	_, _, err = tm.ReassignShardsForSplit(transition)
+	require.NoError(t, err)
+
+	table, err := tm.GetTable(tableName)
+	require.NoError(t, err)
+	parentStatus, err := tm.GetShardStatus(parentID)
+	require.NoError(t, err)
+	parentStatus.Splitting = true
+	parentStatus.SplitState = &storedb.SplitState{}
+	parentStatus.SplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	parentStatus.SplitState.SetSplitKey([]byte("M"))
+	parentStatus.SplitState.SetNewShardId(uint64(childID))
+	err = tm.saveTableAndShardStatus(
+		table,
+		map[types.ID]*store.ShardStatus{parentID: parentStatus},
+	)
+	require.NoError(t, err)
+
+	restoredConf, err := tm.RollbackShardsForSplit(transition)
+	require.NoError(t, err)
+	require.NotNil(t, restoredConf)
+	assert.Equal(t, []byte{}, restoredConf.ByteRange[0])
+	assert.Equal(t, []byte{0xFF}, restoredConf.ByteRange[1])
+
+	table, err = tm.GetTable(tableName)
+	require.NoError(t, err)
+	assert.Contains(t, table.Shards, parentID)
+	assert.NotContains(t, table.Shards, childID)
+
+	parentStatus, err = tm.GetShardStatus(parentID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardState_Default, parentStatus.State)
+	assert.False(t, parentStatus.Splitting)
+	assert.Nil(t, parentStatus.SplitState)
+	assert.Equal(t, *restoredConf, parentStatus.ShardConfig)
+
+	_, err = tm.GetShardStatus(childID)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestNeedsUpdates_PreMergeRetainsMergeStateWhenLeaderHeartbeatOmitsIt(t *testing.T) {
 	db := setupTestDB(t)
 

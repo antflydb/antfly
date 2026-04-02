@@ -1979,6 +1979,60 @@ func TestExecuteMergeRollback_ResetsMetadata(t *testing.T) {
 	assert.True(t, reconciler.IsShardInCooldown(donorID))
 }
 
+func TestExecuteSplitRollback_ResetsMetadata(t *testing.T) {
+	mockShardOps := &MockShardOperations{}
+	mockTableOps := &MockTableOperations{}
+	mockStoreOps := &MockStoreOperations{}
+
+	parentID := types.ID(1)
+	childID := types.ID(2)
+	transition := tablemgr.SplitTransition{
+		ShardID:      parentID,
+		SplitShardID: childID,
+		SplitKey:     []byte("m"),
+		TableName:    "users",
+	}
+
+	mockStoreOps.On("GetShardStatuses").Return(map[types.ID]*store.ShardStatus{
+		parentID: {
+			ID:    parentID,
+			Table: "users",
+		},
+		childID: {
+			ID:    childID,
+			Table: "users",
+		},
+	}, nil)
+	mockShardOps.On("RollbackSplit", mock.Anything, parentID).Return(nil)
+	mockTableOps.On("RollbackShardsForSplit", transition).
+		Return(&store.ShardConfig{ByteRange: [2][]byte{{0x00}, {0xFF}}}, nil)
+	mockStoreOps.On("UpdateShardSplitState", mock.Anything, parentID, (*db.SplitState)(nil)).Return(nil)
+
+	reconciler := NewReconciler(
+		mockShardOps,
+		mockTableOps,
+		mockStoreOps,
+		ReconciliationConfig{ReplicationFactor: 1},
+		zap.NewNop(),
+	)
+
+	err := reconciler.ExecutePlan(context.Background(), &ReconciliationPlan{
+		SplitStateActions: []SplitStateAction{{
+			ShardID:    parentID,
+			NewShardID: childID,
+			Action:     SplitStateActionRollback,
+			SplitKey:   []byte("m"),
+		}},
+	}, CurrentClusterState{}, DesiredClusterState{})
+
+	assert.NoError(t, err)
+	mockStoreOps.AssertExpectations(t)
+	mockShardOps.AssertExpectations(t)
+	mockTableOps.AssertExpectations(t)
+	assert.True(t, reconciler.IsShardInCooldown(parentID))
+	assert.True(t, reconciler.IsShardInCooldown(childID))
+}
+
 func TestExecuteSplitAndMergeTransitions_SplitOperations(t *testing.T) {
 	t.Run("executes split transition successfully", func(t *testing.T) {
 		mockShardOps := &MockShardOperations{}

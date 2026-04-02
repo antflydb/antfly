@@ -183,6 +183,7 @@ type TableOperations interface {
 	ReassignShardsForSplit(
 		transition tablemgr.SplitTransition,
 	) (types.IDSlice, *store.ShardConfig, error)
+	RollbackShardsForSplit(transition tablemgr.SplitTransition) (*store.ShardConfig, error)
 
 	// ReassignShardsForMerge reassigns shards for a merge transition
 	ReassignShardsForMerge(transition tablemgr.MergeTransition) (*store.ShardConfig, error)

@@ -406,6 +406,12 @@ func (m *MetadataTableOperations) ReassignShardsForSplit(
 	return m.ms.tm.ReassignShardsForSplit(transition)
 }
 
+func (m *MetadataTableOperations) RollbackShardsForSplit(
+	transition tablemgr.SplitTransition,
+) (*store.ShardConfig, error) {
+	return m.ms.tm.RollbackShardsForSplit(transition)
+}
+
 func (m *MetadataTableOperations) ReassignShardsForMerge(
 	transition tablemgr.MergeTransition,
 ) (*store.ShardConfig, error) {

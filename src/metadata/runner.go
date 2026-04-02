@@ -70,11 +70,7 @@ func RunAsMetadataServer(
 
 	// Combined API server replaces both internal and public API servers
 	eg.Go(func() error {
-		srv := http.Server{
-			Addr:        u.Host,
-			Handler:     runtime.HTTPHandler(),
-			ReadTimeout: 10 * time.Second,
-		}
+		srv := NewAPIServer(u.Host, runtime.HTTPHandler())
 
 		// Graceful shutdown
 		go func() {
