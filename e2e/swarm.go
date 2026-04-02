@@ -286,7 +286,7 @@ func startSwarmWithLocalBypass(
 	// Start metadata HTTP server.
 	go func() {
 		u, _ := url.Parse(metaConf.ApiURL)
-		srv := &http.Server{Addr: u.Host, Handler: metaRuntime.HTTPHandler(), ReadTimeout: 10 * time.Second}
+		srv := &http.Server{Addr: u.Host, Handler: metaRuntime.HTTPHandler(), ReadHeaderTimeout: 30 * time.Second}
 		go func() {
 			<-ctx.Done()
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
