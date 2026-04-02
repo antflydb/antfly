@@ -15,11 +15,14 @@
 package metadata
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +33,105 @@ import (
 	"github.com/antflydb/antfly/src/usermgr"
 	"go.uber.org/zap"
 )
+
+const (
+	linearMergeMaxRecordsPerRequest       = 10000
+	linearMergeMaxKeysScanned             = 100000
+	linearMergeMaxBodyBytes         int64 = 64 << 20
+)
+
+type requestDecodeError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *requestDecodeError) Error() string {
+	return e.Message
+}
+
+func decodeLinearMergeRequest(w http.ResponseWriter, r *http.Request) (LinearMergeRequest, error) {
+	return decodeLinearMergeRequestWithLimit(w, r, linearMergeMaxBodyBytes)
+}
+
+func decodeLinearMergeRequestWithLimit(
+	w http.ResponseWriter,
+	r *http.Request,
+	maxBodyBytes int64,
+) (LinearMergeRequest, error) {
+	var req LinearMergeRequest
+
+	if r.ContentLength > maxBodyBytes {
+		return req, &requestDecodeError{
+			StatusCode: http.StatusRequestEntityTooLarge,
+			Message:    fmt.Sprintf("merge request body exceeds max_body_bytes=%d", maxBodyBytes),
+		}
+	}
+
+	reader := http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	encoding := strings.TrimSpace(strings.ToLower(r.Header.Get("Content-Encoding")))
+
+	var (
+		decodeReader io.Reader = reader
+		gzipReader   *gzip.Reader
+		err          error
+	)
+
+	switch encoding {
+	case "", "identity":
+	case "gzip":
+		gzipReader, err = gzip.NewReader(reader)
+		if err != nil {
+			return req, &requestDecodeError{
+				StatusCode: http.StatusBadRequest,
+				Message:    fmt.Sprintf("invalid gzip-compressed request body: %v", err),
+			}
+		}
+		defer func() { _ = gzipReader.Close() }()
+		decodeReader = gzipReader
+	default:
+		return req, &requestDecodeError{
+			StatusCode: http.StatusUnsupportedMediaType,
+			Message:    "unsupported Content-Encoding; supported values: identity, gzip",
+		}
+	}
+
+	body, err := io.ReadAll(io.LimitReader(decodeReader, maxBodyBytes+1))
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return req, &requestDecodeError{
+				StatusCode: http.StatusRequestEntityTooLarge,
+				Message:    fmt.Sprintf("merge request body exceeds max_body_bytes=%d", maxBodyBytes),
+			}
+		}
+		if encoding == "gzip" {
+			return req, &requestDecodeError{
+				StatusCode: http.StatusBadRequest,
+				Message:    fmt.Sprintf("invalid gzip-compressed request body: %v", err),
+			}
+		}
+		return req, &requestDecodeError{
+			StatusCode: http.StatusBadRequest,
+			Message:    fmt.Sprintf("reading request body: %v", err),
+		}
+	}
+
+	if int64(len(body)) > maxBodyBytes {
+		return req, &requestDecodeError{
+			StatusCode: http.StatusRequestEntityTooLarge,
+			Message:    fmt.Sprintf("merge request body exceeds max_body_bytes=%d", maxBodyBytes),
+		}
+	}
+
+	if err := json.Unmarshal(body, &req); err != nil {
+		return req, &requestDecodeError{
+			StatusCode: http.StatusBadRequest,
+			Message:    fmt.Sprintf("decoding request: %v", err),
+		}
+	}
+
+	return req, nil
+}
 
 func (t *TableApi) LinearMerge(w http.ResponseWriter, r *http.Request, tableName string) {
 	startTime := time.Now()
@@ -47,9 +149,14 @@ func (t *TableApi) LinearMerge(w http.ResponseWriter, r *http.Request, tableName
 	defer func() { _ = r.Body.Close() }()
 
 	// Decode request
-	var req LinearMergeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := decodeLinearMergeRequest(w, r)
+	if err != nil {
 		t.logger.Debug("LinearMerge failed to decode request", zap.String("tableName", tableName), zap.Error(err))
+		var decodeErr *requestDecodeError
+		if errors.As(err, &decodeErr) {
+			errorResponse(w, decodeErr.Message, decodeErr.StatusCode)
+			return
+		}
 		errorResponse(w, fmt.Sprintf("decoding request: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -75,17 +182,11 @@ func (t *TableApi) LinearMerge(w http.ResponseWriter, r *http.Request, tableName
 	}
 	t.logger.Debug("LinearMerge table found successfully", zap.String("tableName", tableName))
 
-	// Constants
-	const (
-		MaxRecordsPerRequest = 10000
-		MaxKeysScanned       = 100000
-	)
-
 	// Validate batch size
-	if len(req.Records) > MaxRecordsPerRequest {
+	if len(req.Records) > linearMergeMaxRecordsPerRequest {
 		errorResponse(
 			w,
-			fmt.Sprintf("Batch size exceeds maximum of %d records", MaxRecordsPerRequest),
+			fmt.Sprintf("Batch size exceeds maximum of %d records", linearMergeMaxRecordsPerRequest),
 			http.StatusBadRequest,
 		)
 		return
@@ -208,12 +309,12 @@ func (t *TableApi) LinearMerge(w http.ResponseWriter, r *http.Request, tableName
 	}
 
 	// Check scan limit
-	if len(existingHashes) > MaxKeysScanned {
+	if len(existingHashes) > linearMergeMaxKeysScanned {
 		result := LinearMergeResult{
 			Status: LinearMergePageStatusError,
 			Message: fmt.Sprintf(
 				"Range scan exceeded maximum of %d keys. Reduce batch size.",
-				MaxKeysScanned,
+				linearMergeMaxKeysScanned,
 			),
 			NextCursor: req.LastMergedId,
 		}

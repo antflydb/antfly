@@ -4374,6 +4374,12 @@ components:
         Linear merge operation for syncing sorted records from external sources.
         Use this to keep Antfly in sync with an external database or data source.
 
+        Requests may be sent as plain JSON or gzip-compressed JSON
+        (`Content-Encoding: gzip`).
+
+        Request bodies are limited to 64 MiB after decompression. Requests that
+        exceed this limit return HTTP 413.
+
         **How it works:**
         1. Send sorted records from your external source
         2. Server upserts records that exist in your batch
@@ -4389,8 +4395,7 @@ components:
             Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}}
 
             Requirements:
-            - Keys must be sorted lexicographically by your client
-            - Server will process keys in sorted order
+            - The server processes keys in lexicographic order
             - Use consistent key naming (e.g., all start with same prefix)
 
             This format avoids duplicate IDs and matches Antfly's batch write interface.
@@ -4755,8 +4760,20 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body exceeds the configured size limit
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     NotFound:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: Unsupported request media or content encoding
       content:
         application/json:
           schema:
@@ -5620,6 +5637,29 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/LinearMergeRequest"
+            examples:
+              plain:
+                summary: Uncompressed JSON merge request
+                value:
+                  records:
+                    product:001:
+                      name: Laptop
+                      price: 999.99
+                    product:002:
+                      name: Mouse
+                      price: 29.99
+                  last_merged_id: ""
+              gzip:
+                summary: Same JSON body with Content-Encoding gzip
+                value:
+                  records:
+                    product:001:
+                      name: Laptop
+                      price: 999.99
+                    product:002:
+                      name: Mouse
+                      price: 29.99
+                  last_merged_id: ""
       responses:
         "200":
           description: Merge completed successfully
@@ -5629,6 +5669,10 @@ paths:
                 $ref: "#/components/schemas/LinearMergeResult"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":

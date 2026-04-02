@@ -15,9 +15,14 @@
 package metadata
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +30,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func gzipTestPayload(t *testing.T, raw []byte) *bytes.Buffer {
+	t.Helper()
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, err := zw.Write(raw)
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	return &buf
+}
 
 // TestLinearMerge_BasicMerge tests the basic merge functionality
 func TestLinearMerge_BasicMerge(t *testing.T) {
@@ -261,11 +277,9 @@ func TestLinearMerge_RequestValidation(t *testing.T) {
 
 // TestLinearMerge_MaxRecordsValidation tests batch size limits
 func TestLinearMerge_MaxRecordsValidation(t *testing.T) {
-	const MaxRecordsPerRequest = 10000
-
 	// Create request with exactly max records
-	records := make(map[string]any, MaxRecordsPerRequest)
-	for i := range MaxRecordsPerRequest {
+	records := make(map[string]any, linearMergeMaxRecordsPerRequest)
+	for i := range linearMergeMaxRecordsPerRequest {
 		records[fmt.Sprintf("doc%d", i)] = map[string]any{"value": i}
 	}
 
@@ -275,11 +289,11 @@ func TestLinearMerge_MaxRecordsValidation(t *testing.T) {
 		DryRun:       false,
 	}
 
-	assert.Len(t, req.Records, MaxRecordsPerRequest)
+	assert.Len(t, req.Records, linearMergeMaxRecordsPerRequest)
 
 	// Exceeding max would be caught by handler
-	tooManyRecords := make(map[string]any, MaxRecordsPerRequest+1)
-	for i := range MaxRecordsPerRequest + 1 {
+	tooManyRecords := make(map[string]any, linearMergeMaxRecordsPerRequest+1)
+	for i := range linearMergeMaxRecordsPerRequest + 1 {
 		tooManyRecords[fmt.Sprintf("doc%d", i)] = map[string]any{"value": i}
 	}
 
@@ -289,7 +303,7 @@ func TestLinearMerge_MaxRecordsValidation(t *testing.T) {
 		DryRun:       false,
 	}
 
-	assert.Greater(t, len(req2.Records), MaxRecordsPerRequest)
+	assert.Greater(t, len(req2.Records), linearMergeMaxRecordsPerRequest)
 }
 
 // TestLinearMerge_JSONEncoding tests JSON encoding/decoding
@@ -316,6 +330,87 @@ func TestLinearMerge_JSONEncoding(t *testing.T) {
 	assert.Len(t, decoded.Records, len(req.Records))
 	assert.Equal(t, req.LastMergedId, decoded.LastMergedId)
 	assert.Equal(t, req.DryRun, decoded.DryRun)
+}
+
+func TestDecodeLinearMergeRequestWithLimit_PlainJSON(t *testing.T) {
+	reqBody := `{"records":{"doc1":{"name":"Alice"}},"last_merged_id":"","dry_run":false}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", strings.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+
+	decoded, err := decodeLinearMergeRequestWithLimit(rec, req, 1024)
+	require.NoError(t, err)
+	assert.Len(t, decoded.Records, 1)
+	assert.Equal(t, "", decoded.LastMergedId)
+	assert.False(t, decoded.DryRun)
+}
+
+func TestDecodeLinearMergeRequestWithLimit_GzipJSON(t *testing.T) {
+	payload := []byte(`{"records":{"doc1":{"name":"Alice"}},"last_merged_id":"","dry_run":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", gzipTestPayload(t, payload))
+	req.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+
+	decoded, err := decodeLinearMergeRequestWithLimit(rec, req, 1024)
+	require.NoError(t, err)
+	assert.Len(t, decoded.Records, 1)
+	assert.True(t, decoded.DryRun)
+}
+
+func TestDecodeLinearMergeRequestWithLimit_RejectsUnsupportedEncoding(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", strings.NewReader(`{"records":{}}`))
+	req.Header.Set("Content-Encoding", "br")
+	rec := httptest.NewRecorder()
+
+	_, err := decodeLinearMergeRequestWithLimit(rec, req, 1024)
+	require.Error(t, err)
+
+	var decodeErr *requestDecodeError
+	require.ErrorAs(t, err, &decodeErr)
+	assert.Equal(t, http.StatusUnsupportedMediaType, decodeErr.StatusCode)
+	assert.Contains(t, decodeErr.Message, "supported values: identity, gzip")
+}
+
+func TestDecodeLinearMergeRequestWithLimit_RejectsOversizedContentLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", strings.NewReader(`{"records":{}}`))
+	req.ContentLength = 1025
+	rec := httptest.NewRecorder()
+
+	_, err := decodeLinearMergeRequestWithLimit(rec, req, 1024)
+	require.Error(t, err)
+
+	var decodeErr *requestDecodeError
+	require.ErrorAs(t, err, &decodeErr)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, decodeErr.StatusCode)
+	assert.Contains(t, decodeErr.Message, "max_body_bytes=1024")
+}
+
+func TestDecodeLinearMergeRequestWithLimit_RejectsOversizedGzipPayload(t *testing.T) {
+	raw := []byte(strings.Repeat("a", 65))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", gzipTestPayload(t, raw))
+	req.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+
+	_, err := decodeLinearMergeRequestWithLimit(rec, req, 64)
+	require.Error(t, err)
+
+	var decodeErr *requestDecodeError
+	require.ErrorAs(t, err, &decodeErr)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, decodeErr.StatusCode)
+	assert.Contains(t, decodeErr.Message, "max_body_bytes=64")
+}
+
+func TestDecodeLinearMergeRequestWithLimit_RejectsInvalidGzip(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", bytes.NewBufferString("not-gzip"))
+	req.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+
+	_, err := decodeLinearMergeRequestWithLimit(rec, req, 1024)
+	require.Error(t, err)
+
+	var decodeErr *requestDecodeError
+	require.ErrorAs(t, err, &decodeErr)
+	assert.Equal(t, http.StatusBadRequest, decodeErr.StatusCode)
+	assert.Contains(t, decodeErr.Message, "invalid gzip-compressed request body")
 }
 
 // TestLinearMerge_MaxIDWithShardBoundary tests the maxID computation logic

@@ -184,11 +184,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			logger.Fatal("Error parsing metadata API URL", zap.Error(err))
 		}
-		srv := http.Server{
-			Addr:        u.Host,
-			Handler:     metaRuntime.HTTPHandler(),
-			ReadTimeout: 10 * time.Second,
-		}
+		srv := metadata.NewAPIServer(u.Host, metaRuntime.HTTPHandler())
 		go func() {
 			<-ctx.Done()
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
