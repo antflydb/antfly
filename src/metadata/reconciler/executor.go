@@ -511,6 +511,23 @@ func (r *Reconciler) executeSplitStateActions(
 			r.logger.Warn("Rolling back split operation",
 				zap.Stringer("shardID", action.ShardID),
 				zap.Binary("splitKey", action.SplitKey))
+			statuses, err := r.storeOps.GetShardStatuses()
+			if err != nil {
+				r.logger.Warn(
+					"Failed to load shard statuses for split rollback",
+					zap.Stringer("shardID", action.ShardID),
+					zap.Error(err),
+				)
+				continue
+			}
+			parentStatus := statuses[action.ShardID]
+			if parentStatus == nil {
+				r.logger.Warn(
+					"Missing parent shard status for split rollback",
+					zap.Stringer("shardID", action.ShardID),
+				)
+				continue
+			}
 			if err := r.shardOps.RollbackSplit(ctx, action.ShardID); err != nil {
 				r.logger.Warn(
 					"Failed to rollback split",
@@ -519,7 +536,33 @@ func (r *Reconciler) executeSplitStateActions(
 				)
 				continue
 			}
+			if action.NewShardID != 0 {
+				if _, err := r.tableOps.RollbackShardsForSplit(tablemgr.SplitTransition{
+					ShardID:      action.ShardID,
+					SplitShardID: action.NewShardID,
+					SplitKey:     action.SplitKey,
+					TableName:    parentStatus.Table,
+				}); err != nil {
+					r.logger.Warn(
+						"Failed to roll back split metadata",
+						zap.Stringer("shardID", action.ShardID),
+						zap.Stringer("newShardID", action.NewShardID),
+						zap.Error(err),
+					)
+					continue
+				}
+			}
+			if err := r.storeOps.UpdateShardSplitState(ctx, action.ShardID, nil); err != nil {
+				r.logger.Warn(
+					"Failed to clear ShardStatus SplitState after rollback",
+					zap.Stringer("shardID", action.ShardID),
+					zap.Error(err),
+				)
+			}
 			r.SetShardCooldown(action.ShardID, r.getCooldownDuration())
+			if action.NewShardID != 0 {
+				r.SetShardCooldown(action.NewShardID, r.getCooldownDuration())
+			}
 
 		case SplitStateActionCopyMerge:
 			if err := r.executeMergeCopy(ctx, action.ShardID, action.MergeShardID); err != nil {
