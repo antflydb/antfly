@@ -3,7 +3,6 @@ package sim
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -755,67 +754,36 @@ func (h *Harness) WaitForLeader(shardID types.ID, timeout time.Duration) (types.
 }
 
 func (h *Harness) Write(shardID types.ID, key string, value []byte) error {
-	currentShardID := shardID
-	leaderID := types.ID(0)
-	err := h.runWithProgress(60*time.Second, func() error {
-		rerouted := false
-		for {
-			nextLeaderID, err := h.WaitForLeader(currentShardID, 30*time.Second)
-			if err != nil {
-				return err
-			}
-			leaderID = nextLeaderID
-			status, err := h.tableManager.GetStoreStatus(context.Background(), leaderID)
-			if err != nil {
-				return fmt.Errorf("loading leader store %s status: %w", leaderID, err)
-			}
-			err = status.StoreClient.Batch(
-				context.Background(),
-				currentShardID,
-				[][2][]byte{{[]byte(key), value}},
-				nil,
-				nil,
-				db.Op_SyncLevelWrite,
-			)
-			if !errors.Is(err, storeclient.ErrKeyOutOfRange) {
-				return err
-			}
-			if rerouted {
-				return err
-			}
-			nextShardID, rerouteErr := h.currentWriteShardID(currentShardID, key)
-			if rerouteErr != nil || nextShardID == currentShardID {
-				return err
-			}
-			h.recordEvent("write_reroute", "key=%q shard=%s->%s", key, currentShardID, nextShardID)
-			currentShardID = nextShardID
-			rerouted = true
-		}
+	leaderID, err := h.WaitForLeader(shardID, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	status, err := h.tableManager.GetStoreStatus(context.Background(), leaderID)
+	if err != nil {
+		return fmt.Errorf("loading leader store %s status: %w", leaderID, err)
+	}
+	err = h.runWithProgress(60*time.Second, func() error {
+		return status.StoreClient.Batch(
+			context.Background(),
+			shardID,
+			[][2][]byte{{[]byte(key), value}},
+			nil,
+			nil,
+			db.Op_SyncLevelWrite,
+		)
 	})
 	if err != nil {
 		return fmt.Errorf(
-			"writing key %q via leader %s on shard %s: %w (%s)",
+			"writing key %q via leader %s: %w (%s)",
 			key,
 			leaderID,
-			currentShardID,
 			err,
-			h.describeShardLeadership(currentShardID),
+			h.describeShardLeadership(shardID),
 		)
 	}
 	h.expectedDocs[key] = bytes.Clone(value)
-	h.recordEvent("write", "shard=%s leader=%s key=%q bytes=%d", currentShardID, leaderID, key, len(value))
+	h.recordEvent("write", "shard=%s leader=%s key=%q bytes=%d", shardID, leaderID, key, len(value))
 	return nil
-}
-
-func (h *Harness) currentWriteShardID(shardID types.ID, key string) (types.ID, error) {
-	status, err := h.tableManager.GetShardStatus(shardID)
-	if err != nil {
-		return 0, fmt.Errorf("loading shard status %s: %w", shardID, err)
-	}
-	if status == nil || status.Table == "" {
-		return 0, fmt.Errorf("shard status unavailable for %s", shardID)
-	}
-	return h.ShardForKey(status.Table, key)
 }
 
 func (h *Harness) LookupFromStore(storeID, shardID types.ID, keys []string) (map[string][]byte, error) {

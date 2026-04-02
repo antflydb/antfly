@@ -106,8 +106,7 @@ func TestHarness_MetadataLeaderFailover_DuringSplitReconciliation(t *testing.T) 
 	keys := []string{"0/docs/00", "z/docs/30"}
 	for i, key := range keys {
 		payload := fmt.Appendf(nil, `{"id":%d,"payload":"%s"}`, i, strings.Repeat("f", 1400))
-		require.NoError(t, h.Write(parentShardID, key, payload))
-		h.expectedKeys[key] = "docs"
+		require.NoError(t, h.WriteKey("docs", key, payload))
 	}
 	require.NoError(t, h.Advance(2*time.Second))
 	require.NoError(t, h.TableManager().EnqueueReallocationRequest(context.Background()))
