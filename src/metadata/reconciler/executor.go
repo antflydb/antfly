@@ -1368,13 +1368,55 @@ func (r *Reconciler) executeShardTransitionPlan(
 			}
 
 			eg.Go(func() error {
-				// Add the peer to the existing raft group
-				if err := r.shardOps.AddPeer(ctx, shardID, leaderClient, peerToAdd); err != nil {
+				// Re-resolve the leader on retries because shard leadership and shard
+				// availability can lag heartbeats during split/rebalance churn.
+				addPeerLeader := leaderClient
+				firstAttempt := true
+				addPeerErr := retry.Do(
+					ctx,
+					retry.WithMaxRetries(5, retry.NewExponential(500*time.Millisecond)),
+					func(ctx context.Context) error {
+						if firstAttempt {
+							firstAttempt = false
+						} else {
+							var err error
+							addPeerLeader, err = r.storeOps.GetLeaderClientForShard(ctx, shardID)
+							if err != nil {
+								r.logger.Warn(
+									"Failed to resolve leader for AddPeer, retrying",
+									zap.Stringer("peerToAdd", peerToAdd),
+									zap.Stringer("shardID", shardID),
+									zap.Error(err),
+								)
+								return retry.RetryableError(err)
+							}
+						}
+						if err := r.shardOps.AddPeer(ctx, shardID, addPeerLeader, peerToAdd); err != nil {
+							if errors.Is(err, client.ErrNotFound) ||
+								errors.Is(err, client.ErrNotLeader) ||
+								errors.Is(err, client.ErrNoRaftStatus) ||
+								errors.Is(err, client.ErrProposalDropped) ||
+								errors.Is(err, client.ErrShardInitializing) {
+								r.logger.Warn(
+									"AddPeer hit transient shard/leader state, retrying",
+									zap.Stringer("peerToAdd", peerToAdd),
+									zap.Stringer("shardID", shardID),
+									zap.Stringer("leaderID", addPeerLeader.ID()),
+									zap.Error(err),
+								)
+								return retry.RetryableError(err)
+							}
+							return err
+						}
+						return nil
+					},
+				)
+				if addPeerErr != nil {
 					r.logger.Warn(
 						"Failed to add peer to shard",
 						zap.Stringer("peerToAdd", peerToAdd),
 						zap.Stringer("shardID", shardID),
-						zap.Error(err),
+						zap.Error(addPeerErr),
 					)
 					return nil
 				}

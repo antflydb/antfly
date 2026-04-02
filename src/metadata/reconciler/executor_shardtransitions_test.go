@@ -621,6 +621,59 @@ func TestExecuteShardTransitionPlan_Transitions_AddPeers(t *testing.T) {
 		mockShardOps.AssertExpectations(t)
 	})
 
+	t.Run("retries AddPeer on transient shard-not-found with fresh leader lookup", func(t *testing.T) {
+		mockShardOps := &MockShardOperations{}
+		mockTableOps := &MockTableOperations{}
+		mockStoreOps := &MockStoreOperations{}
+
+		shardID := types.ID(1)
+		peerToAdd := types.ID(10)
+		firstLeader := &client.StoreClient{}
+		secondLeader := &client.StoreClient{}
+
+		desired := DesiredClusterState{
+			Shards: map[types.ID]*store.ShardStatus{
+				shardID: {
+					ShardInfo: store.ShardInfo{
+						ShardConfig: store.ShardConfig{ByteRange: [2][]byte{{0x00}, {0xff}}},
+						RaftStatus:  &common.RaftStatus{Voters: common.NewPeerSet(1, 2, 3)},
+					},
+					State: store.ShardState_Default,
+				},
+			},
+		}
+
+		plan := &ShardTransitionPlan{
+			Transitions: []tablemgr.ShardTransition{
+				{ShardID: shardID, AddPeers: types.IDSlice{peerToAdd}},
+			},
+		}
+
+		mockStoreOps.On("GetLeaderClientForShard", mock.Anything, shardID).Return(firstLeader, nil).Once()
+		mockStoreOps.On("GetLeaderClientForShard", mock.Anything, shardID).Return(secondLeader, nil).Once()
+		mockShardOps.On("AddPeer", mock.Anything, shardID, firstLeader, peerToAdd).
+			Return(&client.ResponseError{StatusCode: 404, Body: "Shard not found"}).Once()
+		mockShardOps.On("AddPeer", mock.Anything, shardID, secondLeader, peerToAdd).Return(nil).Once()
+		mockShardOps.On("StartShardOnNode", mock.Anything, peerToAdd, shardID, mock.Anything, mock.Anything, false).
+			Return(nil).Once()
+
+		reconciler := NewReconciler(
+			mockShardOps,
+			mockTableOps,
+			mockStoreOps,
+			ReconciliationConfig{},
+			zap.NewNop(),
+		)
+
+		eg, ctx := errgroup.WithContext(context.Background())
+		reconciler.executeShardTransitionPlan(ctx, eg, CurrentClusterState{}, desired, plan)
+		err := eg.Wait()
+
+		assert.NoError(t, err)
+		mockShardOps.AssertExpectations(t)
+		mockStoreOps.AssertExpectations(t)
+	})
+
 	t.Run("handles unreachable store when starting shard", func(t *testing.T) {
 		mockShardOps := &MockShardOperations{}
 		mockTableOps := &MockTableOperations{}

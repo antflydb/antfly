@@ -79,15 +79,15 @@ func (ms *MetadataStore) leaderClientForShard(
 		}
 		nodeID = status.RaftStatus.Lead
 
-		// Validate that the leader has actually reported having the shard.
-		// During shard rebalancing, the leader info may be stale (pointing to
-		// a node that no longer has the shard). If the leader hasn't reported,
-		// fall back to finding any node that has reported having the shard.
+		// Validate that the leader is still serving the shard. During shard
+		// rebalancing, the stored Raft leader can point to a node whose current
+		// store status no longer contains the shard (or never finished starting it).
+		// In that case, fall back to another healthy replica that does report it.
 		if len(status.ReportedBy) > 0 && !status.ReportedBy.Contains(nodeID) {
 			for reportedNode := range status.ReportedBy {
-				client, reachable, err := ms.tm.GetStoreClient(ctx, reportedNode)
-				if err == nil && reachable {
-					return client, nil
+				reportingClient, ok := ms.storeClientIfServingShard(ctx, reportedNode, shardID)
+				if ok {
+					return reportingClient, nil
 				}
 			}
 			return nil, fmt.Errorf("leader %s has not reported shard %s and no other healthy node found", nodeID, shardID)
@@ -102,9 +102,9 @@ func (ms *MetadataStore) leaderClientForShard(
 			peersToCheck = status.Peers
 		}
 		for peerID := range peersToCheck {
-			client, reachable, err := ms.tm.GetStoreClient(ctx, peerID)
-			if err == nil && reachable {
-				return client, nil
+			reportingClient, ok := ms.storeClientIfServingShard(ctx, peerID, shardID)
+			if ok {
+				return reportingClient, nil
 			}
 		}
 		// If no peers are known yet (e.g., table just created and store hasn't
@@ -126,9 +126,9 @@ func (ms *MetadataStore) leaderClientForShard(
 		}
 		return nil, fmt.Errorf("no healthy peer found for shard %s: %w", shardID, client.ErrNoHealthyPeer)
 	}
-	client, reachable, err := ms.tm.GetStoreClient(ctx, nodeID)
-	if err == nil && reachable {
-		return client, nil
+	reportingClient, ok := ms.storeClientIfServingShard(ctx, nodeID, shardID)
+	if ok {
+		return reportingClient, nil
 	}
 
 	// Leader is not available (removed or unreachable). Fall back to any other
@@ -137,9 +137,9 @@ func (ms *MetadataStore) leaderClientForShard(
 		if reportedNode == nodeID {
 			continue // Already tried the leader
 		}
-		c, ok, err := ms.tm.GetStoreClient(ctx, reportedNode)
-		if err == nil && ok {
-			return c, nil
+		reportingClient, ok := ms.storeClientIfServingShard(ctx, reportedNode, shardID)
+		if ok {
+			return reportingClient, nil
 		}
 	}
 
@@ -148,17 +148,32 @@ func (ms *MetadataStore) leaderClientForShard(
 		if peerID == nodeID || status.ReportedBy.Contains(peerID) {
 			continue // Already tried
 		}
-		c, ok, err := ms.tm.GetStoreClient(ctx, peerID)
-		if err == nil && ok {
-			return c, nil
+		reportingClient, ok := ms.storeClientIfServingShard(ctx, peerID, shardID)
+		if ok {
+			return reportingClient, nil
 		}
 	}
 
-	// Return the original error
-	if err != nil {
-		return nil, fmt.Errorf("leader status %s not found and no fallback available: %w", nodeID, err)
+	return nil, fmt.Errorf("leader %s is not currently serving shard %s and no fallback available", nodeID, shardID)
+}
+
+func (ms *MetadataStore) storeClientIfServingShard(
+	ctx context.Context,
+	nodeID types.ID,
+	shardID types.ID,
+) (client.StoreRPC, bool) {
+	storeStatus, err := ms.tm.GetStoreStatus(ctx, nodeID)
+	if err != nil || !storeStatus.IsReachable() {
+		return nil, false
 	}
-	return nil, fmt.Errorf("leader status %s is not healthy and no fallback available", nodeID)
+	// Treat an explicit shard map as authoritative. If the node currently
+	// reports some shards and this shard is absent, don't route to it.
+	if len(storeStatus.Shards) > 0 {
+		if _, ok := storeStatus.Shards[shardID]; !ok {
+			return nil, false
+		}
+	}
+	return storeStatus.StoreClient, true
 }
 
 // isTransientShardError returns true if the error is a transient condition that
@@ -655,8 +670,10 @@ func (ms *MetadataStore) forwardLookupToShardWithVersion(
 		// During split cutover, writes can start routing to the child as soon as it
 		// is write-ready, while reads may still temporarily fall back to the parent
 		// until the child crosses the final replay fence. If the parent reports a
-		// miss in that window, probe the child directly before surfacing a 404.
-		if errors.Is(err, client.ErrNotFound) && effectiveShardID != shardID {
+		// miss or an out-of-range due to a narrowed parent byte range in that
+		// window, probe the child directly before surfacing the error.
+		if (errors.Is(err, client.ErrNotFound) || errors.Is(err, client.ErrKeyOutOfRange)) &&
+			effectiveShardID != shardID {
 			childShardID, childClient, childErr := ms.leaderClientForShardNoFallback(ctx, shardID)
 			if childErr == nil {
 				childResult, childVersion, childLookupErr := childClient.LookupWithVersion(ctx, childShardID, key)

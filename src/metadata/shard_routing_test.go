@@ -1069,6 +1069,28 @@ func TestLeaderClientForShardWithEffectiveID_LeaderElected_ReturnsLeader(t *test
 	assert.Equal(t, shardID, effectiveID)
 }
 
+func TestLeaderClientForShard_LeaderExplicitlyMissingShard_FallsBackToReporter(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	shardID := types.ID(100)
+	leaderNode := types.ID(1)
+	follower := types.ID(2)
+
+	status := newShardStatus(shardID, leaderNode, []types.ID{follower}, []types.ID{leaderNode, follower})
+	writeShardStatus(t, db, status)
+	writeStoreStatusWithShards(t, db, leaderNode, true, map[types.ID]*store.ShardInfo{
+		types.ID(999): {},
+	})
+	writeStoreStatusWithShards(t, db, follower, true, map[types.ID]*store.ShardInfo{
+		shardID: {},
+	})
+
+	gotClient, err := ms.leaderClientForShard(context.Background(), shardID)
+	require.NoError(t, err)
+	assert.NotNil(t, gotClient)
+	assert.Equal(t, follower, gotClient.ID())
+}
+
 func TestLeaderClientForShard_NoLeader_ReturnsErrNoLeaderElected(t *testing.T) {
 	ms, db := setupTestMetadataStore(t)
 
@@ -1232,6 +1254,101 @@ func TestForwardLookupToShardWithVersion_SplitParentMissFallsBackToWriteReadyChi
 			assert.Equal(t, parentShardID, shardID)
 			assert.Equal(t, key, gotKey)
 			return nil, 0, client.ErrNotFound
+		},
+	}
+	childRPC := &stubStoreRPC{
+		id: childNodeID,
+		lookupWithVersionFn: func(shardID types.ID, gotKey string) ([]byte, uint64, error) {
+			assert.Equal(t, childShardID, shardID)
+			assert.Equal(t, key, gotKey)
+			return expectedDoc, expectedVersion, nil
+		},
+	}
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case parentNodeID:
+			return parentRPC
+		case childNodeID:
+			return childRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: "test_table",
+		State: store.ShardState_Splitting,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, splitKey},
+			},
+			Peers:      common.NewPeerSet(parentNodeID),
+			ReportedBy: common.NewPeerSet(parentNodeID),
+			RaftStatus: &common.RaftStatus{
+				Lead:   parentNodeID,
+				Voters: common.NewPeerSet(parentNodeID),
+			},
+		},
+	}
+	parentStatus.SplitState = &storedb.SplitState{}
+	parentStatus.SplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	parentStatus.SplitState.SetSplitKey(splitKey)
+	parentStatus.SplitState.SetNewShardId(uint64(childShardID))
+
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: "test_table",
+		State: store.ShardState_SplitOffPreSnap,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xff}},
+			},
+			Peers:               common.NewPeerSet(childNodeID),
+			ReportedBy:          common.NewPeerSet(childNodeID),
+			HasSnapshot:         true,
+			Initializing:        false,
+			SplitReplayRequired: true,
+			SplitReplayCaughtUp: true,
+			SplitCutoverReady:   false,
+			RaftStatus: &common.RaftStatus{
+				Lead:   childNodeID,
+				Voters: common.NewPeerSet(childNodeID),
+			},
+		},
+	}
+
+	writeShardStatus(t, db, parentStatus)
+	writeShardStatus(t, db, childStatus)
+	writeStoreStatus(t, db, parentNodeID, true)
+	writeStoreStatus(t, db, childNodeID, true)
+
+	doc, version, err := ms.forwardLookupToShardWithVersion(context.Background(), childShardID, key)
+	require.NoError(t, err)
+	assert.Equal(t, expectedDoc, doc)
+	assert.Equal(t, uint64(expectedVersion), version)
+	assert.Equal(t, 1, parentRPC.lookupHit)
+	assert.Equal(t, 1, childRPC.lookupHit)
+}
+
+func TestForwardLookupToShardWithVersion_SplitParentOutOfRangeFallsBackToWriteReadyChild(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	parentShardID := types.ID(100)
+	childShardID := types.ID(101)
+	parentNodeID := types.ID(1)
+	childNodeID := types.ID(2)
+	splitKey := []byte("m")
+	key := "mango"
+	expectedDoc := []byte(`{"key":"mango"}`)
+	const expectedVersion = 42
+
+	parentRPC := &stubStoreRPC{
+		id: parentNodeID,
+		lookupWithVersionFn: func(shardID types.ID, gotKey string) ([]byte, uint64, error) {
+			assert.Equal(t, parentShardID, shardID)
+			assert.Equal(t, key, gotKey)
+			return nil, 0, client.ErrKeyOutOfRange
 		},
 	}
 	childRPC := &stubStoreRPC{
