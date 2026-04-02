@@ -599,6 +599,82 @@ func TestUpdateStatuses_RefreshesReportedBy(t *testing.T) {
 	assert.Equal(t, common.NewPeerSet(20), status.ReportedBy)
 }
 
+func TestUpdateStatuses_IgnoresUnhealthyStoresForShardRoutingState(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	_, err = tm.CreateTable(
+		"unhealthyStoreRoutingTable",
+		TableConfig{NumShards: 1, StartID: 620, Schema: &schema.TableSchema{}},
+	)
+	require.NoError(t, err)
+
+	shardID := types.ID(620)
+	originalStatus, err := tm.GetShardStatus(shardID)
+	require.NoError(t, err)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(10): {
+			StoreInfo: store.StoreInfo{ID: types.ID(10)},
+			State:     store.StoreState_Healthy,
+			Shards: map[types.ID]*store.ShardInfo{
+				shardID: {
+					ShardConfig: originalStatus.ShardConfig,
+					Peers:       common.NewPeerSet(10, 20),
+					RaftStatus:  &common.RaftStatus{Lead: 10, Voters: common.NewPeerSet(10, 20)},
+				},
+			},
+		},
+		types.ID(20): {
+			StoreInfo: store.StoreInfo{ID: types.ID(20)},
+			State:     store.StoreState_Healthy,
+			Shards: map[types.ID]*store.ShardInfo{
+				shardID: {
+					ShardConfig: originalStatus.ShardConfig,
+					Peers:       common.NewPeerSet(10, 20),
+					RaftStatus:  &common.RaftStatus{Lead: 10, Voters: common.NewPeerSet(10, 20)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	err = tm.UpdateStatuses(context.Background(), map[types.ID]*StoreStatus{
+		types.ID(10): {
+			StoreInfo: store.StoreInfo{ID: types.ID(10)},
+			State:     store.StoreState_Unhealthy,
+			Shards: map[types.ID]*store.ShardInfo{
+				shardID: {
+					ShardConfig: originalStatus.ShardConfig,
+					Peers:       common.NewPeerSet(10, 20),
+					RaftStatus:  &common.RaftStatus{Lead: 10, Voters: common.NewPeerSet(10, 20)},
+				},
+			},
+		},
+		types.ID(20): {
+			StoreInfo: store.StoreInfo{ID: types.ID(20)},
+			State:     store.StoreState_Healthy,
+			Shards: map[types.ID]*store.ShardInfo{
+				shardID: {
+					ShardConfig: originalStatus.ShardConfig,
+					Peers:       common.NewPeerSet(10, 20),
+					RaftStatus:  &common.RaftStatus{Lead: 20, Voters: common.NewPeerSet(10, 20)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	status, err := tm.GetShardStatus(shardID)
+	require.NoError(t, err)
+	assert.Equal(t, common.NewPeerSet(20), status.ReportedBy)
+	assert.Equal(t, common.NewPeerSet(10, 20), status.Peers)
+	require.NotNil(t, status.RaftStatus)
+	assert.Equal(t, types.ID(20), status.RaftStatus.Lead)
+}
+
 // TestUpdateStatuses_NilShardStatsPreservesExisting verifies that when a storage
 // node reports a heartbeat without ShardStats (nil), previously known stats are
 // preserved rather than being clobbered.

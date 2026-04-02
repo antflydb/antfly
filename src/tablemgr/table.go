@@ -137,10 +137,6 @@ func (tm *TableManager) UpdateStatuses(
 	currentShards := make(map[types.ID]*store.ShardInfo)
 	updatedStores := make(map[types.ID]*StoreStatus)
 	for nodeID, status := range newStatuses {
-		// FIXME (ajr) If a node disappears, we should remove it from the shard
-		//if !status.Healthy {
-		//	continue // Skip unhealthy nodes
-		//}
 		oldStoreStatus, err := tm.GetStoreStatus(ctx, nodeID)
 		// If the store status is not found i.e. ErrNotFound, we treat it as a new store
 		if errors.Is(err, ErrNotFound) {
@@ -149,6 +145,13 @@ func (tm *TableManager) UpdateStatuses(
 			return fmt.Errorf("getting store status for %s: %w", nodeID, err)
 		} else if !oldStoreStatus.Equivalent(status) {
 			updatedStores[nodeID] = status
+		}
+
+		// Unreachable stores keep their last known shard map for observability, but
+		// they must not contribute to aggregate shard routing state. Otherwise a dead
+		// node can linger in ReportedBy / leader-adjacent metadata and misroute reads.
+		if status.State == store.StoreState_Unhealthy {
+			continue
 		}
 
 		for shardID := range status.Shards {

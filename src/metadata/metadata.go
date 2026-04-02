@@ -33,11 +33,11 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/antflydb/antfly/src/metadata/reconciler"
-	"github.com/antflydb/antfly/src/tracing"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/tablemgr"
+	"github.com/antflydb/antfly/src/tracing"
 	"github.com/antflydb/antfly/src/usermgr"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/google/uuid"
@@ -440,9 +440,10 @@ func (ms *MetadataStore) checkShardAssignments(ctx context.Context) {
 	}
 	currentShards := make(map[types.ID]*store.ShardInfo)
 	err = ms.tm.RangeStoreStatuses(func(peerID types.ID, storeStatus *tablemgr.StoreStatus) bool {
-		if _, ok := removedStoresSet[peerID]; !ok {
-			currentStores = append(currentStores, peerID)
+		if _, ok := removedStoresSet[peerID]; ok || storeStatus.State == store.StoreState_Unhealthy {
+			return true
 		}
+		currentStores = append(currentStores, peerID)
 		for shardID, shardInfo := range storeStatus.Shards {
 			if _, ok := currentShards[shardID]; !ok {
 				// Build the reconciler's current view from live store heartbeats, not
