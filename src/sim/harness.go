@@ -3,6 +3,7 @@ package sim
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -539,15 +540,23 @@ func (h *Harness) ShardForKey(tableName, key string) (types.ID, error) {
 }
 
 func (h *Harness) WriteKey(tableName, key string, value []byte) error {
-	shardID, err := h.ShardForKey(tableName, key)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := range 3 {
+		shardID, err := h.ShardForKey(tableName, key)
+		if err != nil {
+			return err
+		}
+		if err := h.Write(shardID, key, value); err == nil {
+			h.expectedKeys[key] = tableName
+			return nil
+		} else if !errors.Is(err, storeclient.ErrKeyOutOfRange) {
+			return err
+		} else {
+			lastErr = err
+			h.recordEvent("write_reroute", "table=%s key=%q attempt=%d", tableName, key, attempt+1)
+		}
 	}
-	if err := h.Write(shardID, key, value); err != nil {
-		return err
-	}
-	h.expectedKeys[key] = tableName
-	return nil
+	return lastErr
 }
 
 func (h *Harness) LookupKey(tableName, key string) ([]byte, error) {

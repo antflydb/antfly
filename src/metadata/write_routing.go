@@ -22,6 +22,7 @@ import (
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/client"
 	db "github.com/antflydb/antfly/src/store/db"
+	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/antflydb/antfly/src/tablemgr"
 )
 
@@ -33,7 +34,8 @@ func isActiveSplitParentStatus(status *store.ShardStatus) bool {
 		return false
 	}
 	switch status.SplitState.GetPhase() {
-	case db.SplitState_PHASE_PREPARE, db.SplitState_PHASE_SPLITTING, db.SplitState_PHASE_FINALIZING:
+	case db.SplitState_PHASE_PREPARE, db.SplitState_PHASE_SPLITTING,
+		db.SplitState_PHASE_FINALIZING, db.SplitState_PHASE_ROLLING_BACK:
 		return true
 	default:
 		return false
@@ -73,6 +75,14 @@ func resolveWriteShardID(
 	if !ok || status == nil {
 		return 0, fmt.Errorf("no status info available for shard %s", shardID)
 	}
+	if parentShardID, err := findParentShardForSplitOffStatus(shardStatuses, status); err == nil {
+		parentStatus := shardStatuses[parentShardID]
+		if parentStatus != nil &&
+			parentStatus.SplitState != nil &&
+			parentStatus.SplitState.GetPhase() == db.SplitState_PHASE_ROLLING_BACK {
+			return parentShardID, nil
+		}
+	}
 	if status.MergeState != nil &&
 		status.MergeState.GetPhase() == db.MergeState_PHASE_FINALIZING &&
 		status.MergeState.GetReceiverShardId() != 0 {
@@ -96,16 +106,60 @@ func resolveWriteShardID(
 	return shardID, nil
 }
 
-func findWriteShardForKey(
-	tm *tablemgr.TableManager,
+func resolveWriteShardIDForKey(
+	shardStatuses map[types.ID]*store.ShardStatus,
+	tableName string,
+	shardID types.ID,
+	key string,
+) (types.ID, error) {
+	status, ok := shardStatuses[shardID]
+	if !ok || status == nil {
+		return 0, fmt.Errorf("no status info available for shard %s", shardID)
+	}
+	if status.SplitState != nil && status.SplitState.GetNewShardId() != 0 {
+		splitKey := status.SplitState.GetSplitKey()
+		keyBytes := storeutils.KeyRangeStart([]byte(key))
+		if len(splitKey) > 0 && bytes.Compare(keyBytes, splitKey) >= 0 {
+			if status.SplitState.GetPhase() == db.SplitState_PHASE_ROLLING_BACK {
+				return shardID, nil
+			}
+			childID := types.ID(status.SplitState.GetNewShardId())
+			childStatus := shardStatuses[childID]
+			if childStatus != nil &&
+				childStatus.Table == tableName &&
+				childStatus.ByteRange.Contains(keyBytes) {
+				if shouldRouteWriteToParent(childStatus) {
+					return shardID, nil
+				}
+				return childID, nil
+			}
+		}
+	}
+	return resolveWriteShardID(shardStatuses, shardID)
+}
+
+func findWriteShardForKeyWithStatuses(
 	table *store.Table,
+	shardStatuses map[types.ID]*store.ShardStatus,
 	key string,
 ) (types.ID, error) {
 	shardID, err := table.FindShardForKey(key)
 	if err != nil {
 		return 0, err
 	}
-	return resolveWriteShardIDFromTableManager(tm, shardID)
+	return resolveWriteShardIDForKey(shardStatuses, table.Name, shardID, key)
+}
+
+func findWriteShardForKey(
+	tm *tablemgr.TableManager,
+	table *store.Table,
+	key string,
+) (types.ID, error) {
+	shardStatuses, err := tm.GetShardStatuses()
+	if err != nil {
+		return 0, fmt.Errorf("loading shard statuses: %w", err)
+	}
+	return findWriteShardForKeyWithStatuses(table, shardStatuses, key)
 }
 
 func resolveWriteShardIDFromTableManager(tm *tablemgr.TableManager, shardID types.ID) (types.ID, error) {
@@ -133,13 +187,12 @@ func partitionWriteKeysByShard(
 
 	var unfoundKeys []string
 	for _, key := range keys {
-		shardID, err := table.FindShardForKey(key)
+		writeShardID, err := findWriteShardForKeyWithStatuses(table, shardStatuses, key)
 		if err != nil {
-			unfoundKeys = append(unfoundKeys, key)
-			continue
-		}
-		writeShardID, err := resolveWriteShardID(shardStatuses, shardID)
-		if err != nil {
+			if _, findErr := table.FindShardForKey(key); findErr != nil {
+				unfoundKeys = append(unfoundKeys, key)
+				continue
+			}
 			return nil, nil, fmt.Errorf("resolving write owner for key %q: %w", key, err)
 		}
 		partitions[writeShardID] = append(partitions[writeShardID], key)

@@ -513,6 +513,17 @@ func (ms *MetadataStore) selfReportedLeaderClientForShard(
 // Readiness is determined by ShardInfo.IsReadyForSplitReads(), the single source
 // of truth shared with tablemgr and the reconciler's FinalizeSplit guard.
 func (ms *MetadataStore) shouldFallbackToParentShard(status *store.ShardStatus) bool {
+	allStatuses, err := ms.tm.GetShardStatuses()
+	if err == nil {
+		if parentShardID, parentErr := findParentShardForSplitOffStatus(allStatuses, status); parentErr == nil {
+			parentStatus := allStatuses[parentShardID]
+			if parentStatus != nil &&
+				parentStatus.SplitState != nil &&
+				parentStatus.SplitState.GetPhase() == db.SplitState_PHASE_ROLLING_BACK {
+				return true
+			}
+		}
+	}
 	switch status.State {
 	case store.ShardState_SplittingOff, store.ShardState_SplitOffPreSnap:
 		return !status.IsReadyForSplitReads()
@@ -520,7 +531,6 @@ func (ms *MetadataStore) shouldFallbackToParentShard(status *store.ShardStatus) 
 		if status.IsReadyForSplitReads() {
 			return false
 		}
-		allStatuses, err := ms.tm.GetShardStatuses()
 		if err != nil {
 			return false
 		}
@@ -583,6 +593,68 @@ func (ms *MetadataStore) healthyPeerForShard(shardID types.ID) (client.StoreRPC,
 	return nil, fmt.Errorf("no healthy peer found: %w", client.ErrNoHealthyPeer)
 }
 
+func (ms *MetadataStore) rerouteBatchShardOnOutOfRange(
+	shardID types.ID,
+	writes [][2][]byte,
+	deletes [][]byte,
+	transforms []*db.Transform,
+) (types.ID, error) {
+	status, err := ms.tm.GetShardStatus(shardID)
+	if err != nil || status == nil {
+		return 0, fmt.Errorf("loading shard %s status: %w", shardID, err)
+	}
+	table, err := ms.tm.GetTable(status.Table)
+	if err != nil {
+		return 0, fmt.Errorf("loading table %s for shard %s: %w", status.Table, shardID, err)
+	}
+	shardStatuses, err := ms.tm.GetShardStatuses()
+	if err != nil {
+		return 0, fmt.Errorf("loading shard statuses for shard %s: %w", shardID, err)
+	}
+
+	var reroutedShardID types.ID
+	assignShard := func(key []byte) error {
+		targetShardID, err := findWriteShardForKeyWithStatuses(table, shardStatuses, string(key))
+		if err != nil {
+			return fmt.Errorf("resolving write owner for key %q: %w", string(key), err)
+		}
+		if reroutedShardID == 0 {
+			reroutedShardID = targetShardID
+			return nil
+		}
+		if reroutedShardID != targetShardID {
+			return fmt.Errorf(
+				"write batch for shard %s now spans shards %s and %s after reroute",
+				shardID,
+				reroutedShardID,
+				targetShardID,
+			)
+		}
+		return nil
+	}
+
+	for _, write := range writes {
+		if err := assignShard(write[0]); err != nil {
+			return 0, err
+		}
+	}
+	for _, key := range deletes {
+		if err := assignShard(key); err != nil {
+			return 0, err
+		}
+	}
+	for _, transform := range transforms {
+		if err := assignShard(transform.GetKey()); err != nil {
+			return 0, err
+		}
+	}
+
+	if reroutedShardID == 0 {
+		return shardID, nil
+	}
+	return reroutedShardID, nil
+}
+
 // forwardBatchToShard sends a batch request to the leader node of a specific shard.
 // Retries on transient errors (leader election, shard initialization) for both
 // client lookup and the actual RPC call.
@@ -595,15 +667,22 @@ func (ms *MetadataStore) forwardBatchToShard(
 	syncLevel db.Op_SyncLevel,
 ) error {
 	backoff := writeShardRetryBackoff()
+	targetShardID := shardID
 
 	return retry.Do(ctx, backoff, func(ctx context.Context) error {
 		// Use leaderClientForShardNoFallback for writes - don't fall back to parent
 		// during splits since parent's byteRange has been narrowed
-		effectiveShardID, leader, err := ms.leaderClientForShardNoFallback(ctx, shardID)
+		effectiveShardID, leader, err := ms.leaderClientForShardNoFallback(ctx, targetShardID)
 		if err != nil {
 			return ms.retryableWriteShardError(ctx, err)
 		}
 		err = leader.Batch(ctx, effectiveShardID, writes, deletes, transforms, syncLevel)
+		if errors.Is(err, client.ErrKeyOutOfRange) {
+			reroutedShardID, rerouteErr := ms.rerouteBatchShardOnOutOfRange(targetShardID, writes, deletes, transforms)
+			if rerouteErr == nil && reroutedShardID != targetShardID {
+				targetShardID = reroutedShardID
+			}
+		}
 		return ms.retryableWriteShardError(ctx, err)
 	})
 }
@@ -826,14 +905,7 @@ func (ms *MetadataStore) forwardInsertToShard(
 		if err != nil {
 			return fmt.Errorf("getting table %s: %w", tableName, err)
 		}
-		targetShardID, err := table.FindShardForKey(key)
-		if err != nil {
-			if isTransientShardError(err) {
-				return retry.RetryableError(err)
-			}
-			return fmt.Errorf("finding target shard for key %s: %w", key, err)
-		}
-		shardID, err := resolveWriteShardIDFromTableManager(ms.tm, targetShardID)
+		shardID, err := findWriteShardForKey(ms.tm, table, key)
 		if err != nil {
 			if isTransientShardError(err) {
 				return retry.RetryableError(err)
@@ -848,13 +920,6 @@ func (ms *MetadataStore) forwardInsertToShard(
 			return ms.retryableWriteShardError(ctx, err)
 		}
 		err = targetClient.Batch(ctx, effectiveShardID, writes, nil, nil, syncLevel)
-		if errors.Is(err, client.ErrKeyOutOfRange) && shardID != targetShardID {
-			effectiveChildID, childClient, childErr := ms.directLeaderClientForShardBypassesSplitFallback(ctx, targetShardID)
-			if childErr != nil {
-				return ms.retryableWriteShardError(ctx, childErr)
-			}
-			err = childClient.Batch(ctx, effectiveChildID, writes, nil, nil, syncLevel)
-		}
 		return ms.retryableWriteShardError(ctx, err)
 	})
 }
