@@ -255,10 +255,9 @@ type ReconciliationConfig struct {
 	// If zero, defaults to 5 minutes.
 	SplitTimeout time.Duration
 	// SplitFinalizeGracePeriod is the minimum duration a split-off shard must be continuously
-	// ready to serve reads before FinalizeSplit deletes data from the parent. This prevents
-	// the parent from dropping the split-off range while the child is only partially caught up
-	// or still unable to serve read traffic after a leadership change. If zero, defaults to
-	// 15 seconds.
+	// ready (HasSnapshot, !Initializing, hasLeader) before FinalizeSplit deletes data from the
+	// parent. This prevents data loss when the new shard's leader becomes temporarily unavailable
+	// right after appearing ready. If zero, defaults to 15 seconds.
 	SplitFinalizeGracePeriod time.Duration
 }
 

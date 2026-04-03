@@ -981,6 +981,48 @@ func TestFindParentShardForSplitOffStatus_NoParent(t *testing.T) {
 	assert.Contains(t, err.Error(), "parent shard not found")
 }
 
+func TestFindParentShardForSplitOffStatus_FindsFinalizingParent(t *testing.T) {
+	parentShardID := types.ID(100)
+	childShardID := types.ID(101)
+	splitKey := []byte("m:\x00")
+
+	finalizingState := &storedb.SplitState{}
+	finalizingState.SetPhase(storedb.SplitState_PHASE_FINALIZING)
+	finalizingState.SetSplitKey(splitKey)
+	finalizingState.SetNewShardId(uint64(childShardID))
+
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: "test_table",
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, splitKey},
+			},
+			SplitState: finalizingState,
+		},
+	}
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: "test_table",
+		State: store.ShardState_SplitOffPreSnap,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xff}},
+			},
+			SplitReplayRequired: true,
+			SplitReplayCaughtUp: true,
+			SplitCutoverReady:   false,
+		},
+	}
+
+	parentID, err := findParentShardForSplitOffStatus(map[types.ID]*store.ShardStatus{
+		parentShardID: parentStatus,
+		childShardID:  childStatus,
+	}, childStatus)
+	require.NoError(t, err)
+	assert.Equal(t, parentShardID, parentID)
+}
+
 func TestLeaderClientForShardWithEffectiveID_NoLeader_FallsBackToReportedBy(t *testing.T) {
 	ms, db := setupTestMetadataStore(t)
 

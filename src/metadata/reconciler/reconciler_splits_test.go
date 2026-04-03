@@ -1392,27 +1392,7 @@ func TestSplitStatePhaseActions(t *testing.T) {
 			allShards,
 			allShards,
 		)
-		assert.Nil(t, action, "Should not finalize before the child can serve reads")
-
-		mockTime.Advance(1100 * time.Millisecond)
-		action = reconciler.computeSplitStatePhaseActionWithDesired(
-			shardID,
-			shardStatus,
-			splitState,
-			allShards,
-			allShards,
-		)
-		assert.Nil(t, action, "Should keep waiting while replay is caught up but cutover is not ready")
-
-		allShards[newShardID].SplitCutoverReady = true
-		action = reconciler.computeSplitStatePhaseActionWithDesired(
-			shardID,
-			shardStatus,
-			splitState,
-			allShards,
-			allShards,
-		)
-		assert.Nil(t, action, "Should start grace tracking once the child can serve reads")
+		assert.Nil(t, action, "Should start grace tracking before finalizing")
 
 		mockTime.Advance(1100 * time.Millisecond)
 		action = reconciler.computeSplitStatePhaseActionWithDesired(

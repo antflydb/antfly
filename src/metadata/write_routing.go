@@ -33,7 +33,7 @@ func isActiveSplitParentStatus(status *store.ShardStatus) bool {
 		return false
 	}
 	switch status.SplitState.GetPhase() {
-	case db.SplitState_PHASE_PREPARE, db.SplitState_PHASE_SPLITTING:
+	case db.SplitState_PHASE_PREPARE, db.SplitState_PHASE_SPLITTING, db.SplitState_PHASE_FINALIZING:
 		return true
 	default:
 		return false

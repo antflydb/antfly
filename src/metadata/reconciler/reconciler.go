@@ -50,10 +50,10 @@ type Reconciler struct {
 	shardCooldown        map[types.ID]time.Time
 	shardForNodeCooldown map[string]time.Time
 
-	// splitReadySince tracks when a split-off shard first became ready to
-	// serve reads directly. FinalizeSplit is deferred until the shard has been
-	// continuously read-ready for SplitFinalizeGracePeriod, ensuring the new
-	// shard can actually take traffic before parent data is deleted.
+	// splitReadySince tracks when a split-off shard first became ready
+	// (HasSnapshot && !Initializing && hasLeader). FinalizeSplit is deferred
+	// until the shard has been continuously ready for SplitFinalizeGracePeriod,
+	// ensuring the new shard's leader is stable before parent data is deleted.
 	splitReadySince map[types.ID]time.Time
 
 	// Time abstraction for testing
@@ -557,7 +557,7 @@ func (r *Reconciler) computeSplitStateActions(current CurrentClusterState, desir
 			}
 
 			splitOffShard := desired.Shards[splitOffShardID]
-			if r.trackAndCheckSplitFinalizeReady(splitOffShardID, splitOffShard.IsReadyForSplitReads()) {
+			if r.trackAndCheckSplitFinalizeReady(splitOffShardID, splitOffShard.CanInitiateSplitCutover()) {
 				r.logger.Info("Split-off shard is stable, finalizing parent shard",
 					zap.Stringer("parentShardID", shardID),
 					zap.Stringer("splitOffShardID", splitOffShardID))
@@ -766,8 +766,8 @@ func (r *Reconciler) computeSplitStatePhaseActionWithDesired(
 		}
 		currentShard, currentExists := currentShards[newShardID]
 		desiredShard, desiredExists := desiredShards[newShardID]
-		isReady := currentExists && currentShard.IsReadyForSplitReads() ||
-			desiredExists && desiredShard.IsReadyForSplitReads()
+		isReady := currentExists && currentShard.CanInitiateSplitCutover() ||
+			desiredExists && desiredShard.CanInitiateSplitCutover()
 		if r.trackAndCheckSplitFinalizeReady(newShardID, isReady) {
 			r.logger.Info("New shard is stable, transitioning to FINALIZING phase",
 				zap.Stringer("parentShardID", shardID),
