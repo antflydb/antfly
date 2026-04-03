@@ -169,11 +169,28 @@ func (ms *MetadataStore) storeClientIfServingShard(
 	// Treat an explicit shard map as authoritative. If the node currently
 	// reports some shards and this shard is absent, don't route to it.
 	if len(storeStatus.Shards) > 0 {
-		if _, ok := storeStatus.Shards[shardID]; !ok {
+		shardInfo, ok := storeStatus.Shards[shardID]
+		if !ok {
+			return nil, false
+		}
+		if !shardInfoCanServeRead(shardInfo) {
 			return nil, false
 		}
 	}
 	return storeStatus.StoreClient, true
+}
+
+func shardInfoCanServeRead(shardInfo *store.ShardInfo) bool {
+	if shardInfo == nil || shardInfo.Initializing {
+		return false
+	}
+	// Split children must remain behind parent fallback until they are fully
+	// read-ready. Routing to a node that merely reports the shard but has not
+	// crossed the split replay fence can surface transient misses after failover.
+	if shardInfo.SplitParentShardID != 0 || shardInfo.SplitReplayRequired {
+		return shardInfo.IsReadyForSplitReads()
+	}
+	return true
 }
 
 // isTransientShardError returns true if the error is a transient condition that
@@ -282,8 +299,7 @@ func (ms *MetadataStore) leaderClientForShardWithEffectiveID(
 		if errors.Is(err, ErrNoLeaderElected) {
 			// Try ReportedBy nodes first (confirmed to have the shard data)
 			for reportedNode := range status.ReportedBy {
-				c, reachable, clientErr := ms.tm.GetStoreClient(ctx, reportedNode)
-				if clientErr == nil && reachable {
+				if c, ok := ms.storeClientIfServingShard(ctx, reportedNode, shardID); ok {
 					return shardID, c, nil
 				}
 			}
@@ -292,8 +308,7 @@ func (ms *MetadataStore) leaderClientForShardWithEffectiveID(
 				if status.ReportedBy.Contains(peerID) {
 					continue // Already tried above
 				}
-				c, reachable, clientErr := ms.tm.GetStoreClient(ctx, peerID)
-				if clientErr == nil && reachable {
+				if c, ok := ms.storeClientIfServingShard(ctx, peerID, shardID); ok {
 					return shardID, c, nil
 				}
 			}
@@ -655,6 +670,25 @@ func (ms *MetadataStore) rerouteBatchShardOnOutOfRange(
 	return reroutedShardID, nil
 }
 
+func (ms *MetadataStore) rerouteReadShardOnLookupMiss(
+	shardID types.ID,
+	key string,
+) (types.ID, error) {
+	status, err := ms.tm.GetShardStatus(shardID)
+	if err != nil || status == nil {
+		return 0, fmt.Errorf("loading shard %s status: %w", shardID, err)
+	}
+	table, err := ms.tm.GetTable(status.Table)
+	if err != nil {
+		return 0, fmt.Errorf("loading table %s for shard %s: %w", status.Table, shardID, err)
+	}
+	shardStatuses, err := ms.tm.GetShardStatuses()
+	if err != nil {
+		return 0, fmt.Errorf("loading shard statuses for shard %s: %w", shardID, err)
+	}
+	return findReadShardForKeyWithStatuses(table, shardStatuses, key)
+}
+
 // forwardBatchToShard sends a batch request to the leader node of a specific shard.
 // Retries on transient errors (leader election, shard initialization) for both
 // client lookup and the actual RPC call.
@@ -766,6 +800,28 @@ func (ms *MetadataStore) forwardLookupToShardWithVersion(
 				}
 			} else if isTransientShardError(childErr) {
 				return retry.RetryableError(childErr)
+			}
+		}
+		// If the caller started on a stale parent shard, re-resolve the current
+		// read owner from live split metadata before surfacing a miss or out-of-range.
+		if (errors.Is(err, client.ErrNotFound) || errors.Is(err, client.ErrKeyOutOfRange)) &&
+			effectiveShardID == shardID {
+			reroutedShardID, rerouteErr := ms.rerouteReadShardOnLookupMiss(shardID, key)
+			if rerouteErr == nil && reroutedShardID != shardID {
+				reroutedEffectiveShardID, reroutedClient, reroutedClientErr := ms.leaderClientForShardWithEffectiveID(ctx, reroutedShardID)
+				if reroutedClientErr == nil {
+					reroutedResult, reroutedVersion, reroutedLookupErr := reroutedClient.LookupWithVersion(ctx, reroutedEffectiveShardID, key)
+					if reroutedLookupErr == nil {
+						result = reroutedResult
+						version = reroutedVersion
+						return nil
+					}
+					if isTransientShardError(reroutedLookupErr) {
+						return retry.RetryableError(reroutedLookupErr)
+					}
+				} else if isTransientShardError(reroutedClientErr) {
+					return retry.RetryableError(reroutedClientErr)
+				}
 			}
 		}
 		if err != nil && isTransientShardError(err) {

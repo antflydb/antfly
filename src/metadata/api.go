@@ -723,6 +723,10 @@ func (t *TableApi) LookupKey(w http.ResponseWriter, r *http.Request, tableName s
 		)
 		return
 	}
+	readShardID, err := findReadShardForKey(t.tm, table, key)
+	if err == nil {
+		shardID = readShardID
+	}
 	lookupResp, version, err := t.ln.forwardLookupToShardWithVersion(r.Context(), shardID, key)
 	if err != nil {
 		if errors.Is(err, client.ErrKeyOutOfRange) {

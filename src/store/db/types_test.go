@@ -66,3 +66,26 @@ func TestShardInfoIsReadyForMergeCutover_DoesNotRequireSnapshot(t *testing.T) {
 
 	require.True(t, info.IsReadyForMergeCutover())
 }
+
+func TestShardInfoDeepCopy_PreservesLocalReadinessFields(t *testing.T) {
+	original := &ShardInfo{
+		HasSnapshot:         true,
+		Initializing:        true,
+		Splitting:           true,
+		SplitReplayRequired: true,
+		SplitCutoverReady:   true,
+		SplitParentShardID:  9,
+		RaftStatus:          &common.RaftStatus{Lead: 3},
+	}
+
+	copy := original.DeepCopy()
+	require.NotNil(t, copy)
+	require.Equal(t, original.HasSnapshot, copy.HasSnapshot)
+	require.Equal(t, original.Initializing, copy.Initializing)
+	require.Equal(t, original.Splitting, copy.Splitting)
+	require.Equal(t, original.SplitReplayRequired, copy.SplitReplayRequired)
+	require.Equal(t, original.SplitCutoverReady, copy.SplitCutoverReady)
+	require.Equal(t, original.SplitParentShardID, copy.SplitParentShardID)
+	require.NotNil(t, copy.RaftStatus)
+	require.Equal(t, original.RaftStatus.Lead, copy.RaftStatus.Lead)
+}

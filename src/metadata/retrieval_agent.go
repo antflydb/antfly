@@ -1842,7 +1842,10 @@ func (t *TableApi) batchLookupDocuments(
 		return nil, fmt.Errorf("getting table %s: %w", tableName, err)
 	}
 
-	shardKeys, _ := table.PartitionKeysByShard(keys)
+	shardKeys, _, err := partitionReadKeysByShard(t.tm, table, keys)
+	if err != nil {
+		return nil, fmt.Errorf("partitioning read keys by shard: %w", err)
+	}
 
 	var mu sync.Mutex
 	docs := make(map[string]map[string]any, len(keys))
