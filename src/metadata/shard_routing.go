@@ -84,12 +84,11 @@ func (ms *MetadataStore) leaderClientForShard(
 		// store status no longer contains the shard (or never finished starting it).
 		// In that case, fall back to another healthy replica that does report it.
 		if len(status.ReportedBy) > 0 && !status.ReportedBy.Contains(nodeID) {
-			candidateIDs := make([]types.ID, 0, len(status.ReportedBy))
 			for reportedNode := range status.ReportedBy {
-				candidateIDs = append(candidateIDs, reportedNode)
-			}
-			if reportingClient, ok := ms.bestServingShardClient(ctx, shardID, candidateIDs...); ok {
-				return reportingClient, nil
+				reportingClient, ok, _ := ms.storeClientIfServingShard(ctx, reportedNode, shardID)
+				if ok {
+					return reportingClient, nil
+				}
 			}
 			return nil, fmt.Errorf(
 				"leader %s has not reported shard %s and no other healthy node found: %w",
@@ -107,12 +106,11 @@ func (ms *MetadataStore) leaderClientForShard(
 		if len(peersToCheck) == 0 {
 			peersToCheck = status.Peers
 		}
-		candidateIDs := make([]types.ID, 0, len(peersToCheck))
 		for peerID := range peersToCheck {
-			candidateIDs = append(candidateIDs, peerID)
-		}
-		if reportingClient, ok := ms.bestServingShardClient(ctx, shardID, candidateIDs...); ok {
-			return reportingClient, nil
+			reportingClient, ok, _ := ms.storeClientIfServingShard(ctx, peerID, shardID)
+			if ok {
+				return reportingClient, nil
+			}
 		}
 		// If no peers are known yet (e.g., table just created and store hasn't
 		// reported the shard), fall back to any healthy registered store.
@@ -133,19 +131,21 @@ func (ms *MetadataStore) leaderClientForShard(
 		}
 		return nil, fmt.Errorf("no healthy peer found for shard %s: %w", shardID, client.ErrNoHealthyPeer)
 	}
-	reportingClient, ok, leaderEmpty := ms.storeClientIfServingShard(ctx, nodeID, shardID)
-	if ok && !leaderEmpty {
+	reportingClient, ok, _ := ms.storeClientIfServingShard(ctx, nodeID, shardID)
+	if ok {
 		return reportingClient, nil
 	}
 
 	// Leader is not available (removed or unreachable). Fall back to any other
 	// node that has reported having the shard.
-	candidateIDs := make([]types.ID, 0, len(status.ReportedBy)+len(status.Peers))
 	for reportedNode := range status.ReportedBy {
 		if reportedNode == nodeID {
 			continue // Already tried the leader
 		}
-		candidateIDs = append(candidateIDs, reportedNode)
+		reportingClient, ok, _ := ms.storeClientIfServingShard(ctx, reportedNode, shardID)
+		if ok {
+			return reportingClient, nil
+		}
 	}
 
 	// Also try Peers if ReportedBy didn't work
@@ -153,13 +153,10 @@ func (ms *MetadataStore) leaderClientForShard(
 		if peerID == nodeID || status.ReportedBy.Contains(peerID) {
 			continue // Already tried
 		}
-		candidateIDs = append(candidateIDs, peerID)
-	}
-	if reportingClient, ok := ms.bestServingShardClient(ctx, shardID, candidateIDs...); ok {
-		return reportingClient, nil
-	}
-	if ok {
-		return reportingClient, nil
+		reportingClient, ok, _ := ms.storeClientIfServingShard(ctx, peerID, shardID)
+		if ok {
+			return reportingClient, nil
+		}
 	}
 
 	return nil, fmt.Errorf(
@@ -228,6 +225,25 @@ func (ms *MetadataStore) bestServingShardClient(
 		return emptyFallback, true
 	}
 	return nil, false
+}
+
+func (ms *MetadataStore) preferNonEmptyReadClient(
+	ctx context.Context,
+	shardID types.ID,
+	current client.StoreRPC,
+	candidateIDs ...types.ID,
+) client.StoreRPC {
+	if current == nil {
+		return nil
+	}
+	_, ok, empty := ms.storeClientIfServingShard(ctx, current.ID(), shardID)
+	if !ok || !empty {
+		return current
+	}
+	if preferred, ok := ms.bestServingShardClient(ctx, shardID, candidateIDs...); ok {
+		return preferred
+	}
+	return current
 }
 
 func shardInfoCanServeRead(shardInfo *store.ShardInfo) bool {
@@ -365,7 +381,14 @@ func (ms *MetadataStore) leaderClientForShardWithEffectiveID(
 		}
 		return 0, nil, err
 	}
-	return shardID, c, nil
+	candidateIDs := make([]types.ID, 0, len(status.ReportedBy)+len(status.Peers))
+	for reportedNode := range status.ReportedBy {
+		candidateIDs = append(candidateIDs, reportedNode)
+	}
+	for peerID := range status.Peers {
+		candidateIDs = append(candidateIDs, peerID)
+	}
+	return shardID, ms.preferNonEmptyReadClient(ctx, shardID, c, candidateIDs...), nil
 }
 
 // ErrNoLeaderElected is returned when a shard's Raft group has no leader (e.g., during
@@ -588,9 +611,10 @@ func (ms *MetadataStore) selfReportedLeaderClientForShard(
 // of truth shared with tablemgr and the reconciler's FinalizeSplit guard.
 func (ms *MetadataStore) shouldFallbackToParentShard(status *store.ShardStatus) bool {
 	allStatuses, err := ms.tm.GetShardStatuses()
+	var parentStatus *store.ShardStatus
 	if err == nil {
 		if parentShardID, parentErr := findParentShardForSplitOffStatus(allStatuses, status); parentErr == nil {
-			parentStatus := allStatuses[parentShardID]
+			parentStatus = allStatuses[parentShardID]
 			if parentStatus != nil &&
 				parentStatus.SplitState != nil &&
 				parentStatus.SplitState.GetPhase() == db.SplitState_PHASE_ROLLING_BACK {
@@ -605,11 +629,7 @@ func (ms *MetadataStore) shouldFallbackToParentShard(status *store.ShardStatus) 
 		if status.IsReadyForSplitReads() {
 			return false
 		}
-		if err != nil {
-			return false
-		}
-		_, err = findParentShardForSplitOffStatus(allStatuses, status)
-		return err == nil
+		return parentStillServesChildRange(parentStatus, status)
 	default:
 		return false
 	}

@@ -75,6 +75,23 @@ func findParentShardForSplitOffStatus(
 	return 0, fmt.Errorf("parent shard not found for split-off shard: %w", client.ErrNotFound)
 }
 
+func parentStillServesChildRange(parentStatus, childStatus *store.ShardStatus) bool {
+	if parentStatus == nil || childStatus == nil {
+		return false
+	}
+	if parentStatus.SplitState != nil {
+		switch parentStatus.SplitState.GetPhase() {
+		case db.SplitState_PHASE_PREPARE, db.SplitState_PHASE_SPLITTING,
+			db.SplitState_PHASE_FINALIZING, db.SplitState_PHASE_ROLLING_BACK:
+			return true
+		}
+	}
+	if len(childStatus.ByteRange[0]) == 0 {
+		return parentStatus.ByteRange.Contains(nil)
+	}
+	return parentStatus.ByteRange.Contains(childStatus.ByteRange[0])
+}
+
 func resolveWriteShardID(
 	shardStatuses map[types.ID]*store.ShardStatus,
 	shardID types.ID,
@@ -220,7 +237,7 @@ func resolveReadShardIDForKey(
 		if status.IsReadyForSplitReads() {
 			return shardID, nil
 		}
-		if parentErr == nil {
+		if parentErr == nil && parentStillServesChildRange(shardStatuses[parentShardID], status) {
 			return parentShardID, nil
 		}
 	}
