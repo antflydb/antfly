@@ -2196,3 +2196,35 @@ func TestIsTransientShardError_NoLeaderElected(t *testing.T) {
 	assert.True(t, isTransientShardError(ErrNoLeaderElected),
 		"ErrNoLeaderElected should be classified as transient")
 }
+
+func TestLeaderClientForShard_LeaderNotServingReturnsTransientError(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	shardID := types.ID(500)
+	leaderNode := types.ID(101)
+	followerNode := types.ID(102)
+
+	status := newShardStatus(shardID, leaderNode, []types.ID{leaderNode, followerNode}, []types.ID{leaderNode, followerNode})
+	writeShardStatus(t, db, status)
+	writeStoreStatusWithShards(t, db, leaderNode, true, map[types.ID]*store.ShardInfo{
+		shardID: {
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0xff}},
+			},
+			Initializing: true,
+		},
+	})
+	writeStoreStatusWithShards(t, db, followerNode, true, map[types.ID]*store.ShardInfo{
+		shardID: {
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0xff}},
+			},
+			Initializing: true,
+		},
+	})
+
+	_, err := ms.leaderClientForShard(context.Background(), shardID)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, client.ErrShardInitializing)
+	assert.True(t, isTransientShardError(err))
+}

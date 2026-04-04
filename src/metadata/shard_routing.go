@@ -90,7 +90,12 @@ func (ms *MetadataStore) leaderClientForShard(
 					return reportingClient, nil
 				}
 			}
-			return nil, fmt.Errorf("leader %s has not reported shard %s and no other healthy node found", nodeID, shardID)
+			return nil, fmt.Errorf(
+				"leader %s has not reported shard %s and no other healthy node found: %w",
+				nodeID,
+				shardID,
+				client.ErrShardInitializing,
+			)
 		}
 	} else {
 		// In swarm mode, prefer nodes that have actually reported the shard (ReportedBy)
@@ -154,7 +159,12 @@ func (ms *MetadataStore) leaderClientForShard(
 		}
 	}
 
-	return nil, fmt.Errorf("leader %s is not currently serving shard %s and no fallback available", nodeID, shardID)
+	return nil, fmt.Errorf(
+		"leader %s is not currently serving shard %s and no fallback available: %w",
+		nodeID,
+		shardID,
+		client.ErrShardInitializing,
+	)
 }
 
 func (ms *MetadataStore) storeClientIfServingShard(
