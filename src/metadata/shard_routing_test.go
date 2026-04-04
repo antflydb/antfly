@@ -1600,6 +1600,44 @@ func TestFindParentShardForSplitOffStatus_FindsRollingBackParent(t *testing.T) {
 	assert.Equal(t, parentShardID, parentID)
 }
 
+func TestFindParentShardForSplitOffStatus_UsesExplicitSplitParentID(t *testing.T) {
+	parentShardID := types.ID(100)
+	childShardID := types.ID(101)
+	splitKey := []byte("m:\x00")
+
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: "test_table",
+		State: store.ShardState_Default,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0xff}},
+			},
+		},
+	}
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: "test_table",
+		State: store.ShardState_SplitOffPreSnap,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xff}},
+			},
+			SplitReplayRequired: true,
+			SplitReplayCaughtUp: true,
+			SplitCutoverReady:   false,
+			SplitParentShardID:  parentShardID,
+		},
+	}
+
+	parentID, err := findParentShardForSplitOffStatus(map[types.ID]*store.ShardStatus{
+		parentShardID: parentStatus,
+		childShardID:  childStatus,
+	}, childStatus)
+	require.NoError(t, err)
+	assert.Equal(t, parentShardID, parentID)
+}
+
 func TestLeaderClientForShardWithEffectiveID_NoLeader_FallsBackToReportedBy(t *testing.T) {
 	ms, db := setupTestMetadataStore(t)
 
@@ -1864,6 +1902,47 @@ func TestShouldFallbackToParentShard_WhenParentIsRollingBack(t *testing.T) {
 			RaftStatus:          &common.RaftStatus{Lead: 1},
 		},
 	}
+	writeShardStatus(t, db, childStatus)
+
+	assert.True(t, ms.shouldFallbackToParentShard(childStatus))
+}
+
+func TestShouldFallbackToParentShard_DefaultChildUsesExplicitParentLink(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	parentShardID := types.ID(100)
+	childShardID := types.ID(101)
+	splitKey := []byte("m:\x00")
+
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: "test_table",
+		State: store.ShardState_Default,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0xff}},
+			},
+		},
+	}
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: "test_table",
+		State: store.ShardState_Default,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xff}},
+			},
+			HasSnapshot:         true,
+			Initializing:        false,
+			SplitReplayRequired: true,
+			SplitReplayCaughtUp: true,
+			SplitCutoverReady:   false,
+			SplitParentShardID:  parentShardID,
+			RaftStatus:          &common.RaftStatus{Lead: 1},
+		},
+	}
+
+	writeShardStatus(t, db, parentStatus)
 	writeShardStatus(t, db, childStatus)
 
 	assert.True(t, ms.shouldFallbackToParentShard(childStatus))

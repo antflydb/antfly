@@ -55,6 +55,14 @@ func findParentShardForSplitOffStatus(
 	allStatuses map[types.ID]*store.ShardStatus,
 	splitOffStatus *store.ShardStatus,
 ) (types.ID, error) {
+	if splitOffStatus != nil && splitOffStatus.SplitParentShardID != 0 {
+		parentShardID := splitOffStatus.SplitParentShardID
+		parentStatus := allStatuses[parentShardID]
+		if parentStatus != nil && parentStatus.Table == splitOffStatus.Table {
+			return parentShardID, nil
+		}
+	}
+
 	splitKey := splitOffStatus.ByteRange[0]
 	for shardID, status := range allStatuses {
 		if status.Table != splitOffStatus.Table {
