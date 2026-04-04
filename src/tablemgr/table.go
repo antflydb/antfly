@@ -236,6 +236,7 @@ func (tm *TableManager) needsUpdates(
 			RaftStatus:          oldShardStatus.RaftStatus,
 			HasSnapshot:         oldShardStatus.HasSnapshot,
 			Initializing:        oldShardStatus.Initializing,
+			Splitting:           oldShardStatus.Splitting,
 			SplitReplayRequired: oldShardStatus.SplitReplayRequired,
 			SplitReplayCaughtUp: oldShardStatus.SplitReplayCaughtUp,
 			SplitCutoverReady:   oldShardStatus.SplitCutoverReady,

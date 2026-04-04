@@ -723,9 +723,13 @@ func (ms *MetadataStore) forwardBatchToShard(
 		err = leader.Batch(ctx, effectiveShardID, writes, deletes, transforms, syncLevel)
 		if errors.Is(err, client.ErrKeyOutOfRange) {
 			reroutedShardID, rerouteErr := ms.rerouteBatchShardOnOutOfRange(targetShardID, writes, deletes, transforms)
-			if rerouteErr == nil && reroutedShardID != targetShardID {
-				targetShardID = reroutedShardID
+			if rerouteErr != nil {
+				return rerouteErr
 			}
+			if reroutedShardID == targetShardID {
+				return err
+			}
+			targetShardID = reroutedShardID
 		}
 		return ms.retryableWriteShardError(ctx, err)
 	})

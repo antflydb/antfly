@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -1154,6 +1155,91 @@ func TestForwardBatchToShard_ReroutesToParentDuringRollback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, childRPC.batchHit)
 	assert.Equal(t, 1, parentRPC.batchHit)
+}
+
+func TestForwardBatchToShard_DoesNotRetryWhenRerouteStaysMultiShard(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	tableName := "test_table"
+	table, err := ms.tm.CreateTable(tableName, tablemgr.TableConfig{
+		NumShards: 2,
+		StartID:   100,
+	})
+	require.NoError(t, err)
+	require.Len(t, table.Shards, 2)
+
+	var shardIDs []types.ID
+	for shardID := range table.Shards {
+		shardIDs = append(shardIDs, shardID)
+	}
+	require.Len(t, shardIDs, 2)
+	slices.Sort(shardIDs)
+
+	leftShardID := shardIDs[0]
+	rightShardID := shardIDs[1]
+	leftNodeID := types.ID(1)
+	rightNodeID := types.ID(2)
+
+	leftRPC := &stubStoreRPC{
+		id: leftNodeID,
+		batchFn: func(shardID types.ID, writes [][2][]byte) error {
+			assert.Equal(t, leftShardID, shardID)
+			return &client.ResponseError{
+				StatusCode: http.StatusBadRequest,
+				Body:       "key out of range",
+			}
+		},
+	}
+	rightRPC := &stubStoreRPC{id: rightNodeID}
+
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case leftNodeID:
+			return leftRPC
+		case rightNodeID:
+			return rightRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+
+	leftStatus, err := ms.tm.GetShardStatus(leftShardID)
+	require.NoError(t, err)
+	leftStatus.Peers = common.NewPeerSet(leftNodeID)
+	leftStatus.ReportedBy = common.NewPeerSet(leftNodeID)
+	leftStatus.RaftStatus = &common.RaftStatus{
+		Lead:   leftNodeID,
+		Voters: common.NewPeerSet(leftNodeID),
+	}
+	writeShardStatus(t, db, leftStatus)
+
+	rightStatus, err := ms.tm.GetShardStatus(rightShardID)
+	require.NoError(t, err)
+	rightStatus.Peers = common.NewPeerSet(rightNodeID)
+	rightStatus.ReportedBy = common.NewPeerSet(rightNodeID)
+	rightStatus.RaftStatus = &common.RaftStatus{
+		Lead:   rightNodeID,
+		Voters: common.NewPeerSet(rightNodeID),
+	}
+	writeShardStatus(t, db, rightStatus)
+
+	writeStoreStatus(t, db, leftNodeID, true)
+	writeStoreStatus(t, db, rightNodeID, true)
+
+	err = ms.forwardBatchToShard(
+		context.Background(),
+		leftShardID,
+		[][2][]byte{
+			{[]byte("apple"), []byte(`{"content":"left"}`)},
+			{[]byte("zebra"), []byte(`{"content":"right"}`)},
+		},
+		nil,
+		nil,
+		storedb.Op_SyncLevelWrite,
+	)
+	require.Error(t, err)
+	assert.Equal(t, 1, leftRPC.batchHit)
+	assert.Equal(t, 0, rightRPC.batchHit)
 }
 
 func TestDirectLeaderClientForShardBypassesSplitFallback_PrefersSelfReportedLeader(t *testing.T) {

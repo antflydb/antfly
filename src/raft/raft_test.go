@@ -43,6 +43,7 @@ func TestGetSnapshotIDReturnsInitError(t *testing.T) {
 		commitC:          make(chan *Commit),
 		logger:           zaptest.NewLogger(t),
 		snapshotterReady: make(chan func() (string, error), 1),
+		stopped:          make(chan struct{}),
 	}
 
 	rc.signalInitFailure(expectedErr)
@@ -50,6 +51,30 @@ func TestGetSnapshotIDReturnsInitError(t *testing.T) {
 	snapshotID, err := rc.GetSnapshotID(context.Background())
 	require.Empty(t, snapshotID)
 	require.ErrorIs(t, err, expectedErr)
+}
+
+func TestShutdownReturnsAfterInitFailure(t *testing.T) {
+	rc := &raftNode{
+		commitC:          make(chan *Commit),
+		logger:           zaptest.NewLogger(t),
+		snapshotterReady: make(chan func() (string, error), 1),
+		stopc:            make(chan struct{}),
+		stopped:          make(chan struct{}),
+	}
+
+	rc.signalInitFailure(errors.New("raft init failed"))
+
+	done := make(chan struct{})
+	go func() {
+		rc.Shutdown()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown blocked after init failure")
+	}
 }
 
 func TestLoadSnapshotRetriesInitialSnapshotFetch(t *testing.T) {

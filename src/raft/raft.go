@@ -613,6 +613,9 @@ func (rc *raftNode) signalInitFailure(err error) {
 
 	close(rc.snapshotterReady)
 	close(rc.commitC)
+	if rc.stopped != nil {
+		close(rc.stopped)
+	}
 }
 
 func dirExists(path string) (bool, error) {

@@ -1191,6 +1191,41 @@ func TestTableManager_ReassignShardsForMerge(t *testing.T) {
 	// For now, this requires more intricate setup of ranges.
 }
 
+func TestNeedsUpdates_PreservesSplittingWhenUnchanged(t *testing.T) {
+	tm := &TableManager{}
+
+	oldStatus := &store.ShardStatus{
+		ID:    400,
+		Table: "test",
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{},
+			Peers:       common.NewPeerSet(42),
+			ReportedBy:  common.NewPeerSet(42),
+			RaftStatus: &common.RaftStatus{
+				Lead:   42,
+				Voters: common.NewPeerSet(42),
+			},
+			Splitting: true,
+		},
+	}
+
+	newInfo := &store.ShardInfo{
+		ShardConfig: oldStatus.ShardConfig,
+		Peers:       common.NewPeerSet(42),
+		ReportedBy:  common.NewPeerSet(42),
+		RaftStatus: &common.RaftStatus{
+			Lead:   42,
+			Voters: common.NewPeerSet(42),
+		},
+		Splitting: true,
+	}
+
+	newStatus, needsUpdate := tm.needsUpdates(oldStatus, newInfo)
+	require.NotNil(t, newStatus)
+	assert.False(t, needsUpdate)
+	assert.True(t, newStatus.Splitting)
+}
+
 func TestTableManager_PrepareShardsForMerge(t *testing.T) {
 	db := setupTestDB(t)
 
