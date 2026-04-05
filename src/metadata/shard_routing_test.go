@@ -1808,6 +1808,43 @@ func TestLeaderClientForShardNoFallback_NonSplitUsesSelfReportedLeader(t *testin
 	assert.Equal(t, actualLeader, gotClient.ID())
 }
 
+func TestLeaderClientForShardNoFallback_NonSplitFallsBackWhenRaftStatusMissing(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	shardID := types.ID(100)
+	reportingNode := types.ID(1)
+
+	status := &store.ShardStatus{
+		ID:    shardID,
+		Table: "test_table",
+		State: store.ShardState_Default,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0xff}},
+			},
+			Peers:      common.NewPeerSet(reportingNode),
+			ReportedBy: common.NewPeerSet(reportingNode),
+		},
+	}
+	writeShardStatus(t, db, status)
+	writeStoreStatusWithShards(t, db, reportingNode, true, map[types.ID]*store.ShardInfo{
+		shardID: {
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0xff}},
+			},
+			Initializing: false,
+			ShardStats: &storedb.DBStats{
+				Storage: &storedb.DBStorageStats{Empty: true},
+			},
+		},
+	})
+
+	_, gotClient, err := ms.leaderClientForShardNoFallback(context.Background(), shardID)
+	require.NoError(t, err)
+	assert.NotNil(t, gotClient)
+	assert.Equal(t, reportingNode, gotClient.ID())
+}
+
 func TestLeaderClientForShardWithEffectiveID_EmptyLeaderFallsBackToNonEmptyReporter(t *testing.T) {
 	ms, db := setupTestMetadataStore(t)
 

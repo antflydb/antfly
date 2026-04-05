@@ -513,10 +513,23 @@ func (ms *MetadataStore) leaderClientForShardNoFallback(
 	if leaderClient, leaderErr := ms.selfReportedLeaderClientForShard(ctx, shardID, nil); leaderErr == nil {
 		return shardID, leaderClient, nil
 	}
+	candidateIDs := make([]types.ID, 0, len(status.ReportedBy)+len(status.Peers))
+	for reportedNode := range status.ReportedBy {
+		candidateIDs = append(candidateIDs, reportedNode)
+	}
+	for peerID := range status.Peers {
+		candidateIDs = append(candidateIDs, peerID)
+	}
 	if status.RaftStatus == nil {
+		if fallbackClient, ok := ms.bestServingShardClient(ctx, shardID, candidateIDs...); ok {
+			return shardID, fallbackClient, nil
+		}
 		return 0, nil, fmt.Errorf("no raft status available for shard: %w", client.ErrNoRaftStatus)
 	}
 	if status.RaftStatus.Lead == 0 {
+		if fallbackClient, ok := ms.bestServingShardClient(ctx, shardID, candidateIDs...); ok {
+			return shardID, fallbackClient, nil
+		}
 		return 0, nil, ErrNoLeaderElected
 	}
 	var reachable bool
