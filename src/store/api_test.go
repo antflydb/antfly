@@ -69,6 +69,16 @@ func (m *MockShard) Backup(ctx context.Context, location, backupID string) error
 	return args.Error(0)
 }
 
+func (m *MockShard) ExportPortable(ctx context.Context, w io.Writer) error {
+	args := m.Called(ctx, w)
+	return args.Error(0)
+}
+
+func (m *MockShard) ImportPortable(ctx context.Context, r io.Reader) error {
+	args := m.Called(ctx, r)
+	return args.Error(0)
+}
+
 func (m *MockShard) PrepareSplit(ctx context.Context, splitKey []byte) error {
 	args := m.Called(ctx, splitKey)
 	return args.Error(0)

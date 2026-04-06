@@ -168,10 +168,11 @@ func (sc *StoreClient) ApplyMergeChunk(
 	return nil
 }
 
-func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string) error {
+func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
 	backupReq := common.BackupConfig{
 		BackupID: id,
 		Location: loc,
+		Format:   format,
 	}
 	// Create the request
 	url := sc.url + "/shard/backup"
@@ -740,6 +741,9 @@ func (sc *StoreClient) StartShard(
 			// Local file: stream as multipart
 			localDir := strings.TrimPrefix(location, "file://")
 			backupFileName := common.ShardBackupFileName(backupID, shardID)
+			if restoreConfig.Format == common.BackupFormatPortable {
+				backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
+			}
 			fullBackupFilePath := filepath.Join(localDir, backupFileName)
 
 			// Use a pipe to avoid loading the whole file into memory

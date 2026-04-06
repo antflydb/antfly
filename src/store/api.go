@@ -283,6 +283,10 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 
 					// Here newShardID is shardIDForBackup and req.ShardConfig.RestoreConfig.BackupID is backupIDForLeader
 					backupFileName := common.ShardBackupFileName(req.RestoreConfig.BackupID, newShardID)
+					// Auto-detect portable backup from uploaded filename
+					if strings.HasSuffix(filePart.FileName(), ".afb") {
+						backupFileName = common.ShardPortableBackupFileName(req.RestoreConfig.BackupID, newShardID)
+					}
 					dataDir := h.antflyConfig.GetBaseDir()
 					snapDir := common.SnapDir(dataDir, newShardID, currentNodeID)
 					if err := os.MkdirAll(snapDir, os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
@@ -327,7 +331,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 							zap.Stringer("newShardID", newShardID))
 					}
 
-					initWithDBArchive = strings.TrimSuffix(backupFileName, ".tar.zst") // Use the base filename
+					initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 					// If err is http.ErrMissingFile, it's fine, just means no file was uploaded.
 				}
 			}
@@ -354,6 +358,9 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 			restoreConf := req.RestoreConfig
 			// newShardID is the shardID for this node, restoreConf.BackupID is the ID given by the leader.
 			backupFileName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
+			if restoreConf.Format == common.BackupFormatPortable {
+				backupFileName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
+			}
 			dataDir := h.antflyConfig.GetBaseDir()
 			snapDir := common.SnapDir(
 				dataDir,
@@ -378,12 +385,22 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 						err,
 					)
 				}
-				initWithDBArchive = strings.TrimSuffix(backupFileName, ".tar.zst")
+				initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 			} else if after, ok0 := strings.CutPrefix(restoreConf.Location, "file://"); ok0 {
 				// This case might occur if the leader specifies a local file path accessible to this node,
 				// though typically for file transfers it would use multipart.
 				localBasePath := after
 				srcPath := filepath.Join(localBasePath, backupFileName)
+
+				// Auto-detect: if the expected file doesn't exist, try the other format
+				if _, statErr := os.Stat(srcPath); os.IsNotExist(statErr) && !strings.HasSuffix(backupFileName, ".afb") {
+					afbName := common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
+					afbPath := filepath.Join(localBasePath, afbName)
+					if _, afbErr := os.Stat(afbPath); afbErr == nil {
+						backupFileName = afbName
+						srcPath = afbPath
+					}
+				}
 				destPath := filepath.Join(snapDir, backupFileName)
 
 				if _, err := os.Stat(srcPath); err == nil { //nolint:gosec // G703: path from internal config
@@ -408,7 +425,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 						zap.String("backupFileName", backupFileName),
 						zap.String("destPath", destPath),
 						zap.Stringer("newShardID", newShardID))
-					initWithDBArchive = strings.TrimSuffix(backupFileName, ".tar.zst")
+					initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 				} else {
 					h.logger.Warn("RestoreConfig for shard specified local file, but it was not found",
 						zap.Stringer("newShardID", newShardID),
@@ -883,6 +900,13 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shard, _ := h.store.Shard(shardID)
+
+	if req.Format == common.BackupFormatPortable {
+		h.handlePortableBackup(w, r, shard, shardID, req)
+		return
+	}
+
+	// Native backup: create tar.zst of Pebble checkpoint
 	// FIXME (ajr) Backups should include the byte range of the shard maybe?
 	fileName := common.ShardBackupFileName(req.BackupID, shardID)
 	if err := shard.Backup(r.Context(), req.Location, strings.TrimSuffix(fileName, ".tar.zst")); err != nil {
@@ -930,6 +954,72 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, shard db.ShardIface, shardID types.ID, req common.BackupConfig) {
+	fileName := common.ShardPortableBackupFileName(req.BackupID, shardID)
+	loc := strings.TrimPrefix(req.Location, "file://")
+
+	// Write portable backup to a temp file first, then stream to response
+	destDir := loc
+	if destDir == "" {
+		destDir = common.SnapDir(h.antflyConfig.GetBaseDir(), shardID, h.store.ID())
+	}
+	destPath := filepath.Join(destDir, fileName)
+
+	if err := os.MkdirAll(destDir, 0o750); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create backup dir: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	file, err := os.Create(filepath.Clean(destPath)) //nolint:gosec // internal path
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create backup file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if err := shard.ExportPortable(r.Context(), file); err != nil {
+		_ = file.Close()
+		_ = os.Remove(destPath)
+		http.Error(w, fmt.Sprintf("Failed to export portable backup: %v", err), http.StatusInternalServerError)
+		return
+	}
+	_ = file.Close()
+
+	// Stream the file back in the response
+	file, err = os.Open(filepath.Clean(destPath)) //nolint:gosec // internal path
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to open backup file: %v", err), http.StatusNotFound)
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to stat backup file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
+
+	buf := make([]byte, 64*1024*1024) // 64MB buffer
+	if _, err := io.CopyBuffer(w, file, buf); err != nil {
+		http.Error(w, "Error streaming file", http.StatusInternalServerError)
+		return
+	}
+}
+
+// initArchiveFromBackupFile converts a backup filename to the initWithDBArchive
+// value used by the shard start path. For native backups (.tar.zst) it strips
+// the extension; for portable backups (.afb) it keeps the full filename so the
+// downstream restore path can detect the format.
+func initArchiveFromBackupFile(backupFileName string) string {
+	if strings.HasSuffix(backupFileName, ".afb") {
+		return backupFileName
+	}
+	return strings.TrimSuffix(backupFileName, ".tar.zst")
 }
 
 func (h *StoreAPI) handleUpdateSchemaShard(w http.ResponseWriter, r *http.Request) {

@@ -23,9 +23,20 @@ import (
 	"go.etcd.io/raft/v3"
 )
 
+// BackupFormat selects the backup serialization format.
+type BackupFormat string
+
+const (
+	// BackupFormatNative uses engine-specific physical snapshots (fast, same-backend only).
+	BackupFormatNative BackupFormat = "native"
+	// BackupFormatPortable uses the cross-backend AFB logical format (slower restore, any backend).
+	BackupFormatPortable BackupFormat = "portable"
+)
+
 type BackupConfig struct {
-	BackupID string `json:"backup_id"`
-	Location string `json:"location"`
+	BackupID string       `json:"backup_id"`
+	Location string       `json:"location"`
+	Format   BackupFormat `json:"format,omitempty"`
 }
 
 func (rc *BackupConfig) Equal(other *BackupConfig) bool {

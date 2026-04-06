@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -438,6 +439,14 @@ func (s *StoreDB) Backup(ctx context.Context, loc, id string) error {
 	// TODO (ajr) Do we want to send the operation to the raft log?
 	// or is the leader doing the backup enough?
 	// return s.syncWriteOp(ctx, newBackupOp(loc, id))
+}
+
+func (s *StoreDB) ExportPortable(ctx context.Context, w io.Writer) error {
+	return s.coreDB.ExportPortable(ctx, w)
+}
+
+func (s *StoreDB) ImportPortable(ctx context.Context, r io.Reader) error {
+	return s.coreDB.ImportPortable(ctx, r)
 }
 
 func (s *StoreDB) SetRange(ctx context.Context, byteRange [2][]byte) error {
@@ -2088,13 +2097,74 @@ func (s *StoreDB) openDBAndIndex(recoverIndexes bool) error {
 	return s.coreDB.Open(s.dbDir, recoverIndexes, s.schema, byteRange)
 }
 
+// openDBWithoutIndexes opens only the Pebble database without initializing indexes.
+// Used for portable restore where data must be imported before indexes are built.
+func (s *StoreDB) openDBWithoutIndexes() error {
+	s.byteRangeMu.RLock()
+	byteRange := s.byteRange
+	s.byteRangeMu.RUnlock()
+	return s.coreDB.OpenWithoutIndexes(s.dbDir, s.schema, byteRange)
+}
+
+// openIndexes initializes and rebuilds indexes from the current Pebble data.
+func (s *StoreDB) openIndexes() error {
+	return s.coreDB.OpenIndexes(s.dbDir)
+}
+
 func (s *StoreDB) loadAndRecoverFromPersistentSnapshot(ctx context.Context) error {
+	// Peek at the snapshot ID to detect portable (AFB) backups, which
+	// require a different restore path: open an empty DB first, then import.
+	snapID, err := s.loadSnapshotID(ctx)
+	if errors.Is(err, pebble.ErrNotFound) {
+		snapID = ""
+	} else if err != nil {
+		return fmt.Errorf("loading snapshot ID: %w", err)
+	}
+
+	if snapID != "" && strings.HasSuffix(snapID, ".afb") {
+		// Portable backup: open Pebble without indexes, import AFB data,
+		// then open indexes so they rebuild from the populated DB.
+		if err := s.openDBWithoutIndexes(); err != nil {
+			return fmt.Errorf("opening db for portable restore: %w", err)
+		}
+		if err := s.importPortableSnapshot(ctx, snapID); err != nil {
+			return err
+		}
+		if err := s.openIndexes(); err != nil {
+			return fmt.Errorf("opening indexes after portable restore: %w", err)
+		}
+		return nil
+	}
+
+	// Native backup path (or no snapshot at all).
 	if err := s.loadPersistentSnapshot(ctx); err != nil {
 		return fmt.Errorf("loading snapshot: %w", err)
 	}
 	if err := s.openDBAndIndex(false); err != nil {
 		return fmt.Errorf("opening db and index: %w", err)
 	}
+	return nil
+}
+
+// importPortableSnapshot reads an AFB file from the snap store and imports
+// all data into the already-open coreDB via ImportPortable.
+func (s *StoreDB) importPortableSnapshot(ctx context.Context, snapID string) error {
+	startTime := time.Now()
+	s.logger.Info("Importing portable backup", zap.String("snapID", snapID))
+
+	rc, err := s.snapStore.Get(ctx, snapID)
+	if err != nil {
+		return fmt.Errorf("opening portable backup %s: %w", snapID, err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	if err := s.coreDB.ImportPortable(ctx, rc); err != nil {
+		return fmt.Errorf("importing portable backup %s: %w", snapID, err)
+	}
+
+	s.logger.Info("Imported portable backup",
+		zap.String("snapID", snapID),
+		zap.Duration("took", time.Since(startTime)))
 	return nil
 }
 

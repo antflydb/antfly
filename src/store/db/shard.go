@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/antflydb/antfly/lib/schema"
@@ -36,6 +37,8 @@ var _ ShardIface = (*Shard)(nil)
 
 type ShardIface interface {
 	Backup(ctx context.Context, location, backupID string) error
+	ExportPortable(ctx context.Context, w io.Writer) error
+	ImportPortable(ctx context.Context, r io.Reader) error
 	PrepareSplit(ctx context.Context, splitKey []byte) error
 	Split(ctx context.Context, newShardID uint64, splitKey []byte) error
 	FinalizeSplit(ctx context.Context, newRangeEnd []byte) error
@@ -454,6 +457,20 @@ func (s *Shard) Backup(ctx context.Context, loc, id string) error {
 		return err
 	}
 	return s.storeDB.Backup(ctx, loc, id)
+}
+
+func (s *Shard) ExportPortable(ctx context.Context, w io.Writer) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
+	return s.storeDB.ExportPortable(ctx, w)
+}
+
+func (s *Shard) ImportPortable(ctx context.Context, r io.Reader) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
+	return s.storeDB.ImportPortable(ctx, r)
 }
 
 func (s *Shard) SetRange(ctx context.Context, byteRange [2][]byte) error {

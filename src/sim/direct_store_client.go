@@ -80,7 +80,7 @@ func (c *directStoreClient) ApplyMergeChunk(
 	}.Build())
 }
 
-func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string) error {
+func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
 	shard, err := c.shard(shardID)
 	if err != nil {
 		return err

@@ -61,6 +61,7 @@ e2e/models/
 *.tar.gz
 *.tar.sz
 *.tar.zst
+e2e/backups/*.afb
 
 !antfly.json
 !antfly.go

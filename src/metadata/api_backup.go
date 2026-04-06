@@ -61,7 +61,7 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 	for shardID := range table.Shards {
 		g.Go(func(ctx context.Context) error {
 			// Forward the insert to the appropriate shard
-			if err := t.ln.forwardBackupToShard(ctx, shardID, br.Location, br.BackupId); err != nil {
+			if err := t.ln.forwardBackupToShard(ctx, shardID, br.Location, br.BackupId, backupFormatFromRequest(br.Format)); err != nil {
 				if !errors.Is(err, context.Canceled) {
 					t.logger.Error("Error forwarding backup", zap.Error(err))
 				}
@@ -138,6 +138,7 @@ func (t *TableApi) RestoreTable(w http.ResponseWriter, r *http.Request, tableNam
 	// MVP (ajr) Contains side-effects for raft log
 	if err := t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
 		Location: rr.Location, BackupID: rr.BackupId,
+		Format: backupFormatFromRequest(rr.Format),
 	}); err != nil {
 		errorResponse(
 			w,
@@ -159,6 +160,22 @@ func (t *TableApi) RestoreTable(w http.ResponseWriter, r *http.Request, tableNam
 		t.logger.Warn("Error encoding restore success response", zap.Error(err))
 		// Don't write another http.Error here as headers/status might have been sent.
 	}
+}
+
+// backupFormatFromRequest converts the OpenAPI-generated format type to the
+// internal BackupFormat used throughout the backup pipeline.
+func backupFormatFromRequest(format BackupRequestFormat) common.BackupFormat {
+	if format == BackupRequestFormatPortable {
+		return common.BackupFormatPortable
+	}
+	return common.BackupFormatNative
+}
+
+func clusterBackupFormatFromRequest(format ClusterBackupRequestFormat) common.BackupFormat {
+	if format == ClusterBackupRequestFormatPortable {
+		return common.BackupFormatPortable
+	}
+	return common.BackupFormatNative
 }
 
 // ClusterBackupMetadata represents the metadata for a cluster-level backup
@@ -353,7 +370,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			shardEg.SetLimit(innerFanOutLimit)
 			for shardID := range table.Shards {
 				shardEg.Go(func() error {
-					if err := t.ln.forwardBackupToShard(shardCtx, shardID, req.Location, req.BackupId); err != nil {
+					if err := t.ln.forwardBackupToShard(shardCtx, shardID, req.Location, req.BackupId, clusterBackupFormatFromRequest(req.Format)); err != nil {
 						if !errors.Is(err, context.Canceled) {
 							t.logger.Error("Error forwarding backup", zap.String("table", tableName), zap.Error(err))
 						}

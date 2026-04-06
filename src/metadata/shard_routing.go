@@ -27,6 +27,7 @@ import (
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
+	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/store/db"
@@ -821,12 +822,13 @@ func (ms *MetadataStore) forwardBackupToShard(
 	ctx context.Context,
 	shardID types.ID,
 	loc, id string,
+	format common.BackupFormat,
 ) error {
 	targetURL, err := ms.leaderClientForShard(ctx, shardID)
 	if err != nil {
 		return fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
 	}
-	return targetURL.Backup(ctx, shardID, loc, id)
+	return targetURL.Backup(ctx, shardID, loc, id, format)
 }
 
 // forwardLookupToShard sends a batch lookup request to the leader node of a specific shard.

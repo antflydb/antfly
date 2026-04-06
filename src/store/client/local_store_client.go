@@ -19,10 +19,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
+	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
@@ -115,10 +119,23 @@ func (c *LocalStoreClient) ApplyMergeChunk(
 	return err
 }
 
-func (c *LocalStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string) error {
+func (c *LocalStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
 	shard, err := c.shard(shardID)
 	if err != nil {
 		return err
+	}
+	if format == common.BackupFormatPortable {
+		fileName := common.ShardPortableBackupFileName(id, shardID)
+		destDir := strings.TrimPrefix(loc, "file://")
+		if err := os.MkdirAll(destDir, 0o750); err != nil {
+			return fmt.Errorf("creating portable backup dir: %w", err)
+		}
+		f, err := os.Create(filepath.Join(destDir, fileName)) //nolint:gosec
+		if err != nil {
+			return fmt.Errorf("creating portable backup file: %w", err)
+		}
+		defer func() { _ = f.Close() }()
+		return shard.ExportPortable(ctx, f)
 	}
 	return shard.Backup(ctx, loc, id)
 }
