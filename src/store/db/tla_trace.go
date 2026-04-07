@@ -107,6 +107,9 @@ func (db *DBImpl) traceFinalizeTransaction(txnID []byte, status int32, commitVer
 }
 
 func (db *DBImpl) traceResolveIntents(txnID []byte, status int32, count int) {
+	if count == 0 {
+		return
+	}
 	db.traceTxnEvent("ResolveIntentsOnShard", txnID, db.traceShardID(), map[string]any{
 		"txnStatus":    status,
 		"intentsCount": count,

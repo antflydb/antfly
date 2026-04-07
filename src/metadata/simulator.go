@@ -12,6 +12,7 @@ import (
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/antflydb/antfly/src/metadata/reconciler"
 	"github.com/antflydb/antfly/src/tablemgr"
+	"github.com/antflydb/antfly/src/tracing"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -71,6 +72,7 @@ func NewSimulationStore(
 		hlc:              NewHLCWithClock(clk),
 		clock:            clk,
 		txnIDGenerator:   opts.TxnIDGenerator,
+		traceWriter:      tracing.NewAntflyTraceWriter(logger),
 	}
 
 	reconcilerConfig := reconciler.ReconciliationConfig{

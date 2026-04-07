@@ -337,7 +337,7 @@ tla-trace-raft: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson)
 endif
-	@bash scripts/tla-validate-trace.sh \
+	@bash scripts/tla-validate-trace.sh -S \
 	  -s "$(RAFT_TLA)/Traceetcdraft.tla" \
 	  -c "$(RAFT_TLA)/Traceetcdraft.cfg" \
 	  $(TRACE_FILES)

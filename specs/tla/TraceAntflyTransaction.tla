@@ -21,7 +21,7 @@
     {"tag":"antfly-trace","event":{"name":"...","txnId":"...","shardId":"...","state":{...}}}
 *)
 
-EXTENDS AntflyTransaction, Json, IOUtils, Sequences, TLC
+EXTENDS AntflyTransaction, Json, IOUtils, Sequences, SequencesExt, TLC
 
 -------------------------------------------------------------------------------------
 
@@ -237,21 +237,25 @@ TraceInit ==
     /\ pl = 0
     /\ Init
 
+LoggedStep ==
+    /\ l <= Len(TraceLog)
+    /\ \/ \E t \in Txns :
+            \/ InitTransactionIfLogged(t)
+            \/ CheckPredicatesIfLogged(t)
+            \/ CommitTransactionIfLogged(t)
+            \/ AbortTransactionIfLogged(t)
+            \/ CleanupTxnRecordIfLogged(t)
+            \/ RecoveryAutoAbortIfLogged(t)
+            \/ \E s \in Shards :
+                \/ WriteIntentOnShardIfLogged(t, s)
+                \/ WriteIntentFailsIfLogged(t, s)
+                \/ ResolveIntentsOnShardIfLogged(t, s)
+                \/ RecoveryResolveIfLogged(t, s)
+
 TraceNext ==
-    \/ /\ l <= Len(TraceLog)
-       /\ \/ \E t \in Txns :
-               \/ InitTransactionIfLogged(t)
-               \/ CheckPredicatesIfLogged(t)
-               \/ CommitTransactionIfLogged(t)
-               \/ AbortTransactionIfLogged(t)
-               \/ CleanupTxnRecordIfLogged(t)
-               \/ RecoveryAutoAbortIfLogged(t)
-               \/ \E s \in Shards :
-                   \/ WriteIntentOnShardIfLogged(t, s)
-                   \/ WriteIntentFailsIfLogged(t, s)
-                   \/ ResolveIntentsOnShardIfLogged(t, s)
-                   \/ RecoveryResolveIfLogged(t, s)
-    \/ TickClockIfNeeded
+    \/ LoggedStep
+    \/ /\ ~ENABLED LoggedStep
+       /\ TickClockIfNeeded
 
 TraceSpec == TraceInit /\ [][TraceNext]_<<l, pl, vars>>
 
