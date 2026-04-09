@@ -165,17 +165,18 @@ func (t *TableApi) RestoreTable(w http.ResponseWriter, r *http.Request, tableNam
 // backupFormatFromRequest converts the OpenAPI-generated format type to the
 // internal BackupFormat used throughout the backup pipeline.
 func backupFormatFromRequest(format BackupRequestFormat) common.BackupFormat {
-	if format == BackupRequestFormatPortable {
-		return common.BackupFormatPortable
-	}
-	return common.BackupFormatNative
+	return common.NormalizeBackupFormat(common.BackupFormat(format))
 }
 
 func clusterBackupFormatFromRequest(format ClusterBackupRequestFormat) common.BackupFormat {
-	if format == ClusterBackupRequestFormatPortable {
-		return common.BackupFormatPortable
+	return common.NormalizeBackupFormat(common.BackupFormat(format))
+}
+
+func backupInfoFormatFromMetadata(format common.BackupFormat) BackupInfoFormat {
+	if format == "" {
+		return BackupInfoFormatNative
 	}
-	return common.BackupFormatNative
+	return BackupInfoFormat(format)
 }
 
 // ClusterBackupMetadata represents the metadata for a cluster-level backup
@@ -183,6 +184,7 @@ type ClusterBackupMetadata struct {
 	BackupID      string                   `json:"backup_id"`
 	Timestamp     time.Time                `json:"timestamp"`
 	AntflyVersion string                   `json:"antfly_version"`
+	Format        common.BackupFormat      `json:"format,omitempty"`
 	Tables        []ClusterBackupTableInfo `json:"tables"`
 }
 
@@ -330,10 +332,12 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create cluster metadata
+	backupFormat := clusterBackupFormatFromRequest(req.Format)
 	clusterMeta := &ClusterBackupMetadata{
 		BackupID:      req.BackupId,
 		Timestamp:     time.Now(),
 		AntflyVersion: multirafthttp.Version,
+		Format:        backupFormat,
 		Tables:        make([]ClusterBackupTableInfo, 0, len(tableNames)),
 	}
 
@@ -370,7 +374,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			shardEg.SetLimit(innerFanOutLimit)
 			for shardID := range table.Shards {
 				shardEg.Go(func() error {
-					if err := t.ln.forwardBackupToShard(shardCtx, shardID, req.Location, req.BackupId, clusterBackupFormatFromRequest(req.Format)); err != nil {
+					if err := t.ln.forwardBackupToShard(shardCtx, shardID, req.Location, req.BackupId, backupFormat); err != nil {
 						if !errors.Is(err, context.Canceled) {
 							t.logger.Error("Error forwarding backup", zap.String("table", tableName), zap.Error(err))
 						}
@@ -506,6 +510,10 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, fmt.Sprintf("Failed to read cluster backup metadata: %v", err), http.StatusInternalServerError)
 		return
 	}
+	restoreFormat := clusterMeta.Format
+	if restoreFormat == "" {
+		restoreFormat = common.BackupFormatNative
+	}
 
 	// Determine which tables to restore
 	tablesToRestore := req.TableNames
@@ -615,6 +623,7 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 			if err := t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
 				Location: req.Location,
 				BackupID: req.BackupId,
+				Format:   restoreFormat,
 			}); err != nil {
 				mu.Lock()
 				results[i] = TableRestoreStatus{
@@ -733,6 +742,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 					Tables:        tableNames,
 					Location:      location,
 					AntflyVersion: meta.AntflyVersion,
+					Format:        backupInfoFormatFromMetadata(meta.Format),
 				})
 			}
 		}
@@ -773,6 +783,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 					Tables:        tableNames,
 					Location:      location,
 					AntflyVersion: meta.AntflyVersion,
+					Format:        backupInfoFormatFromMetadata(meta.Format),
 				})
 			}
 		}

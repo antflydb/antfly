@@ -2430,14 +2430,14 @@ components:
         format:
           type: string
           enum: [native, portable]
-          default: native
+          default: portable
           description: |
             Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend)
 
             On restore, the format is auto-detected from file magic bytes.
-          example: "native"
+          example: "portable"
     RestoreRequest:
       allOf: # Identical to BackupRequest
         - $ref: "#/components/schemas/BackupRequest"
@@ -2465,14 +2465,14 @@ components:
         format:
           type: string
           enum: [native, portable]
-          default: native
+          default: portable
           description: |
             Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend)
 
             On restore, the format is auto-detected from file magic bytes.
-          example: "native"
+          example: "portable"
         table_names:
           type: array
           items:
@@ -2621,7 +2621,7 @@ components:
           type: string
           enum: [native, portable]
           description: Backup format used
-          example: "native"
+          example: "portable"
     BackupListResponse:
       type: object
       required:

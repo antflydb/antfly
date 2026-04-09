@@ -27,11 +27,20 @@ import (
 type BackupFormat string
 
 const (
+	// DefaultBackupFormat is used when callers omit a backup format.
+	DefaultBackupFormat BackupFormat = BackupFormatPortable
 	// BackupFormatNative uses engine-specific physical snapshots (fast, same-backend only).
 	BackupFormatNative BackupFormat = "native"
 	// BackupFormatPortable uses the cross-backend AFB logical format (slower restore, any backend).
 	BackupFormatPortable BackupFormat = "portable"
 )
+
+func NormalizeBackupFormat(format BackupFormat) BackupFormat {
+	if format == "" {
+		return DefaultBackupFormat
+	}
+	return format
+}
 
 type BackupConfig struct {
 	BackupID string       `json:"backup_id"`

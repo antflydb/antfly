@@ -420,6 +420,7 @@ func TestHandleBackup_FileLocation_Success(t *testing.T) {
 	backupReq := common.BackupConfig{
 		BackupID: backupID,
 		Location: backupLocation,
+		Format:   common.BackupFormatNative,
 	}
 	body, err := json.Marshal(backupReq)
 	require.NoError(t, err)
@@ -442,6 +443,66 @@ func TestHandleBackup_FileLocation_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "backup data", string(responseBody), "handler returned unexpected body content")
 	assert.Equal(t, strconv.Itoa(len("backup data")), rr.Header().Get("Content-Length"))
+
+	mockShard.AssertExpectations(t)
+	mockStore.AssertExpectations(t)
+}
+
+func TestHandleBackup_DefaultsToPortable(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	mockShard := new(MockShard)
+	baseDir := t.TempDir()
+	mockStore := &MockStore{
+		logger: logger,
+		nodeID: types.ID(1),
+	}
+	api := &StoreAPI{
+		logger: logger,
+		store:  mockStore,
+		antflyConfig: &common.Config{
+			Storage: common.StorageConfig{
+				Local: common.LocalStorageConfig{
+					BaseDir: baseDir,
+				},
+			},
+		},
+	}
+
+	shardID := types.ID(123)
+	backupID := "test-default-portable"
+	tempDir := t.TempDir()
+	backupLocation := "file://" + tempDir
+
+	mockShard.On("ExportPortable", mock.Anything, mock.Anything).
+		Return(nil).
+		Run(func(args mock.Arguments) {
+			_, err := args.Get(1).(io.Writer).Write([]byte("portable backup data"))
+			require.NoError(t, err)
+		})
+	mockStore.On("Shard", shardID).Return(mockShard, true)
+
+	backupReq := common.BackupConfig{
+		BackupID: backupID,
+		Location: backupLocation,
+	}
+	body, err := json.Marshal(backupReq)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/shard/backup", bytes.NewReader(body))
+	req.Header.Set("X-Raft-Shard-Id", shardID.String())
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	api.setupRoutes().ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "attachment; filename="+common.ShardPortableBackupFileName(backupID, shardID), rr.Header().Get("Content-Disposition"))
+	assert.Equal(t, "portable backup data", rr.Body.String())
+
+	expectedPath := filepath.Join(tempDir, common.ShardPortableBackupFileName(backupID, shardID))
+	content, err := os.ReadFile(expectedPath)
+	require.NoError(t, err)
+	assert.Equal(t, "portable backup data", string(content))
 
 	mockShard.AssertExpectations(t)
 	mockStore.AssertExpectations(t)
@@ -543,6 +604,7 @@ func TestHandleBackup_ShardBackupFails(t *testing.T) {
 	backupReq := common.BackupConfig{
 		BackupID: backupID,
 		Location: backupLocation,
+		Format:   common.BackupFormatNative,
 	}
 	body, err := json.Marshal(backupReq)
 	require.NoError(t, err)
@@ -584,6 +646,7 @@ func TestHandleBackup_FileLocation_BackupFileNotCreated(t *testing.T) {
 	backupReq := common.BackupConfig{
 		BackupID: backupID,
 		Location: backupLocation,
+		Format:   common.BackupFormatNative,
 	}
 	body, err := json.Marshal(backupReq)
 	require.NoError(t, err)
@@ -622,6 +685,7 @@ func TestHandleBackup_NonFileLocation_Success(t *testing.T) {
 	backupReq := common.BackupConfig{
 		BackupID: backupID,
 		Location: s3Location,
+		Format:   common.BackupFormatNative,
 	}
 	body, err := json.Marshal(backupReq)
 	require.NoError(t, err)

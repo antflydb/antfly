@@ -356,9 +356,10 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 		// Process RestoreConfig if present and archive not already set by multipart
 		if req.RestoreConfig != nil && initWithDBArchive == "" {
 			restoreConf := req.RestoreConfig
+			format := common.NormalizeBackupFormat(restoreConf.Format)
 			// newShardID is the shardID for this node, restoreConf.BackupID is the ID given by the leader.
 			backupFileName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
-			if restoreConf.Format == common.BackupFormatPortable {
+			if format == common.BackupFormatPortable {
 				backupFileName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
 			}
 			dataDir := h.antflyConfig.GetBaseDir()
@@ -373,17 +374,29 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 				// Don't cancel the download if the request context is canceled,
 				// it could take a while.
 				if err := downloadFromS3(context.Background(), h.logger, restoreConf.Location, backupFileName, destPath, &h.antflyConfig.Storage.S3); err != nil {
-					h.logger.Error(
-						"Failed to download backup from S3 for shard",
-						zap.Stringer("newShardID", newShardID),
-						zap.Error(err),
-					)
-					return fmt.Errorf(
-						"downloading s3 backup (%s, object: %s): %w",
-						restoreConf.Location,
-						backupFileName,
-						err,
-					)
+					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
+					if format == common.BackupFormatNative {
+						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
+					}
+					alternateDestPath := filepath.Join(snapDir, alternateName)
+					alternateErr := downloadFromS3(context.Background(), h.logger, restoreConf.Location, alternateName, alternateDestPath, &h.antflyConfig.Storage.S3)
+					if alternateErr != nil {
+						h.logger.Error(
+							"Failed to download backup from S3 for shard",
+							zap.Stringer("newShardID", newShardID),
+							zap.Error(err),
+							zap.NamedError("fallbackError", alternateErr),
+						)
+						return fmt.Errorf(
+							"downloading s3 backup (%s, object: %s): %w; fallback object %s: %v",
+							restoreConf.Location,
+							backupFileName,
+							err,
+							alternateName,
+							alternateErr,
+						)
+					}
+					backupFileName = alternateName
 				}
 				initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 			} else if after, ok0 := strings.CutPrefix(restoreConf.Location, "file://"); ok0 {
@@ -392,13 +405,15 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 				localBasePath := after
 				srcPath := filepath.Join(localBasePath, backupFileName)
 
-				// Auto-detect: if the expected file doesn't exist, try the other format
-				if _, statErr := os.Stat(srcPath); os.IsNotExist(statErr) && !strings.HasSuffix(backupFileName, ".afb") {
-					afbName := common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
-					afbPath := filepath.Join(localBasePath, afbName)
-					if _, afbErr := os.Stat(afbPath); afbErr == nil {
-						backupFileName = afbName
-						srcPath = afbPath
+				if _, statErr := os.Stat(srcPath); os.IsNotExist(statErr) {
+					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
+					if format == common.BackupFormatNative {
+						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
+					}
+					alternatePath := filepath.Join(localBasePath, alternateName)
+					if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
+						backupFileName = alternateName
+						srcPath = alternatePath
 					}
 				}
 				destPath := filepath.Join(snapDir, backupFileName)
@@ -898,6 +913,7 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to read request body: %v", err), http.StatusBadRequest)
 		return
 	}
+	req.Format = common.NormalizeBackupFormat(req.Format)
 
 	shard, _ := h.store.Shard(shardID)
 
@@ -958,12 +974,13 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 
 func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, shard db.ShardIface, shardID types.ID, req common.BackupConfig) {
 	fileName := common.ShardPortableBackupFileName(req.BackupID, shardID)
-	loc := strings.TrimPrefix(req.Location, "file://")
-
-	// Write portable backup to a temp file first, then stream to response
-	destDir := loc
-	if destDir == "" {
-		destDir = common.SnapDir(h.antflyConfig.GetBaseDir(), shardID, h.store.ID())
+	destDir := common.SnapDir(h.antflyConfig.GetBaseDir(), shardID, h.store.ID())
+	streamResponse := false
+	if after, ok := strings.CutPrefix(req.Location, "file://"); ok {
+		destDir = after
+		streamResponse = true
+	} else if req.Location == "" {
+		streamResponse = true
 	}
 	destPath := filepath.Join(destDir, fileName)
 
@@ -985,6 +1002,20 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	_ = file.Close()
+
+	if strings.HasPrefix(req.Location, "s3://") {
+		if err := db.WriteBackupToBlobStore(context.Background(), req.Location, destPath, &h.antflyConfig.Storage.S3); err != nil {
+			_ = os.Remove(destPath)
+			http.Error(w, fmt.Sprintf("Failed to upload portable backup: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if !streamResponse {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
 	// Stream the file back in the response
 	file, err = os.Open(filepath.Clean(destPath)) //nolint:gosec // internal path

@@ -280,6 +280,10 @@ func (m *Store) ID() types.ID {
 	return m.config.ID
 }
 
+func (m *Store) S3Info() *common.S3Info {
+	return &m.antflyConfig.Storage.S3
+}
+
 // ErrorcC dynamically receives new error channels from shards and fans them in
 func (m *Store) ErrorC(ctx context.Context) chan error {
 	errCh := make(chan error)
@@ -773,18 +777,21 @@ func copyLocalBackupToSnapDir(
 	format common.BackupFormat,
 ) (string, error) {
 	backupFileName := common.ShardBackupFileName(backupID, shardID)
+	format = common.NormalizeBackupFormat(format)
 	if format == common.BackupFormatPortable {
 		backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
 	}
 	srcPath := filepath.Join(localDir, backupFileName)
 
-	// Auto-detect: if the native file doesn't exist, try portable
-	if _, err := os.Stat(srcPath); os.IsNotExist(err) && format != common.BackupFormatPortable {
-		afbName := common.ShardPortableBackupFileName(backupID, shardID)
-		afbPath := filepath.Join(localDir, afbName)
-		if _, afbErr := os.Stat(afbPath); afbErr == nil {
-			backupFileName = afbName
-			srcPath = afbPath
+	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+		alternateName := common.ShardBackupFileName(backupID, shardID)
+		if format == common.BackupFormatNative {
+			alternateName = common.ShardPortableBackupFileName(backupID, shardID)
+		}
+		alternatePath := filepath.Join(localDir, alternateName)
+		if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
+			backupFileName = alternateName
+			srcPath = alternatePath
 		}
 	}
 

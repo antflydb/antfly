@@ -169,6 +169,7 @@ func (sc *StoreClient) ApplyMergeChunk(
 }
 
 func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
+	format = common.NormalizeBackupFormat(format)
 	backupReq := common.BackupConfig{
 		BackupID: id,
 		Location: loc,
@@ -205,7 +206,11 @@ func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id str
 			return fmt.Errorf("creating backup directory: %w", err)
 		}
 		// Create a file to save the streamed data
-		filePath := path.Join(loc, common.ShardBackupFileName(backupReq.BackupID, shardID))
+		backupFileName := common.ShardBackupFileName(backupReq.BackupID, shardID)
+		if format == common.BackupFormatPortable {
+			backupFileName = common.ShardPortableBackupFileName(backupReq.BackupID, shardID)
+		}
+		filePath := path.Join(loc, backupFileName)
 		file, err := os.Create(filepath.Clean(filePath))
 		if err != nil {
 			return fmt.Errorf("creating file: %w", err)
@@ -740,11 +745,23 @@ func (sc *StoreClient) StartShard(
 			backupID := restoreConfig.BackupID
 			// Local file: stream as multipart
 			localDir := strings.TrimPrefix(location, "file://")
+			format := common.NormalizeBackupFormat(restoreConfig.Format)
 			backupFileName := common.ShardBackupFileName(backupID, shardID)
-			if restoreConfig.Format == common.BackupFormatPortable {
+			if format == common.BackupFormatPortable {
 				backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
 			}
 			fullBackupFilePath := filepath.Join(localDir, backupFileName)
+			if _, statErr := os.Stat(fullBackupFilePath); os.IsNotExist(statErr) {
+				alternateBackupFileName := common.ShardBackupFileName(backupID, shardID)
+				if format == common.BackupFormatNative {
+					alternateBackupFileName = common.ShardPortableBackupFileName(backupID, shardID)
+				}
+				alternatePath := filepath.Join(localDir, alternateBackupFileName)
+				if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
+					backupFileName = alternateBackupFileName
+					fullBackupFilePath = alternatePath
+				}
+			}
 
 			// Use a pipe to avoid loading the whole file into memory
 			pipeR, pipeW := io.Pipe()
