@@ -371,7 +371,7 @@ func (a *mcpAdapter) Backup(ctx context.Context, tableName, backupID, location s
 	eg, egCtx := errgroup.WithContext(ctx)
 	for shardID := range table.Shards {
 		eg.Go(func() error {
-			if err := a.t.ln.forwardBackupToShard(egCtx, shardID, location, backupID); err != nil {
+			if err := a.t.ln.forwardBackupToShard(egCtx, shardID, location, backupID, common.DefaultBackupFormat); err != nil {
 				return fmt.Errorf("backing up shard %s: %w", shardID, err)
 			}
 			return nil
@@ -404,6 +404,7 @@ func (a *mcpAdapter) Restore(ctx context.Context, tableName, backupID, location 
 	if err := a.t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
 		Location: location,
 		BackupID: backupID,
+		Format:   common.DefaultBackupFormat,
 	}); err != nil {
 		return fmt.Errorf("restoring table: %w", err)
 	}

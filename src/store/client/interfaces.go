@@ -19,6 +19,7 @@ import (
 
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
+	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
@@ -42,7 +43,7 @@ type StoreRPC interface {
 		deletes [][]byte,
 		syncLevel db.Op_SyncLevel,
 	) error
-	Backup(ctx context.Context, shardID types.ID, loc, id string) error
+	Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error
 	Lookup(ctx context.Context, shardID types.ID, keys []string) (map[string][]byte, error)
 	LookupWithVersion(ctx context.Context, shardID types.ID, key string) ([]byte, uint64, error)
 	AddIndex(ctx context.Context, shardID types.ID, name string, config *indexes.IndexConfig) error

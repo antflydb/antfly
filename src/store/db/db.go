@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -340,6 +341,15 @@ type DB interface {
 	TraverseEdges(ctx context.Context, indexName string, startKey []byte, rules indexes.TraversalRules) ([]*indexes.TraversalResult, error)
 	GetNeighbors(ctx context.Context, indexName string, key []byte, edgeType string, direction indexes.EdgeDirection) ([]*indexes.TraversalResult, error)
 	FindShortestPath(ctx context.Context, indexName string, source, target []byte, edgeTypes []string, direction indexes.EdgeDirection, weightMode indexes.PathWeightMode, maxDepth int, minWeight, maxWeight float64) (*indexes.Path, error)
+
+	// Portable backup (AFB format)
+	ExportPortable(ctx context.Context, w io.Writer) error
+	ImportPortable(ctx context.Context, r io.Reader) error
+
+	// OpenWithoutIndexes opens the database without initializing indexes.
+	OpenWithoutIndexes(dir string, schema *schema.TableSchema, byteRange types.Range) error
+	// OpenIndexes initializes and rebuilds indexes from current database contents.
+	OpenIndexes(dir string) error
 }
 
 // ShardNotifier provides a way for DBImpl to send notifications to other shards
@@ -1555,6 +1565,21 @@ func (db *DBImpl) Open(
 	byteRange types.Range,
 ) error {
 	return db.openInternal(dir, recovery, schema, byteRange, true)
+}
+
+// OpenWithoutIndexes opens the Pebble database without initializing indexes.
+func (db *DBImpl) OpenWithoutIndexes(
+	dir string,
+	schema *schema.TableSchema,
+	byteRange types.Range,
+) error {
+	return db.openInternal(dir, false, schema, byteRange, false)
+}
+
+// OpenIndexes initializes indexes after the database is already open.
+// Indexes are rebuilt from the current database contents.
+func (db *DBImpl) OpenIndexes(dir string) error {
+	return db.openIndex(dir, false)
 }
 
 func (s *DBImpl) Close() (err error) {

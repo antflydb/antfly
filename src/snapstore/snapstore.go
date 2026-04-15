@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
@@ -302,7 +303,12 @@ func (s *LocalSnapStore) ExtractSnapshot(ctx context.Context, snapID string, tar
 }
 
 // archiveFilePath returns the full path to a snapshot archive file.
+// If snapID already ends with ".afb" (portable backup), the extension is kept as-is.
+// Otherwise ".tar.zst" is appended for native snapshots.
 func (s *LocalSnapStore) archiveFilePath(snapID string) string {
+	if strings.HasSuffix(snapID, ".afb") {
+		return filepath.Join(s.snapDir, snapID)
+	}
 	return filepath.Join(s.snapDir, fmt.Sprintf("%s.tar.zst", snapID))
 }
 

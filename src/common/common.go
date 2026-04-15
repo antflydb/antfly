@@ -88,6 +88,11 @@ func ShardBackupFileName(backupID string, shardID types.ID) string {
 	return fmt.Sprintf("%s-%s.tar.zst", backupID, shardID)
 }
 
+// ShardPortableBackupFileName returns the AFB file name for a shard's portable backup.
+func ShardPortableBackupFileName(backupID string, shardID types.ID) string {
+	return fmt.Sprintf("%s-%s.afb", backupID, shardID)
+}
+
 func MetadataSnapDir(dataDir string, peerID types.ID) string {
 	return fmt.Sprintf("%s/metadata/%s/snap", dataDir, peerID)
 }

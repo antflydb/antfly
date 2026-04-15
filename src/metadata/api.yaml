@@ -2427,6 +2427,17 @@ components:
 
             The backup includes all table data, indexes, and metadata for the specified table.
           example: "s3://mybucket/antfly-backups/users-table/2025-01-15"
+        format:
+          type: string
+          enum: [native, portable]
+          default: portable
+          description: |
+            Backup format to use:
+            - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
+            - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend)
+
+            On restore, the format is auto-detected from file magic bytes.
+          example: "portable"
     RestoreRequest:
       allOf: # Identical to BackupRequest
         - $ref: "#/components/schemas/BackupRequest"
@@ -2451,6 +2462,17 @@ components:
 
             The backup includes all table data, indexes, and metadata.
           example: "s3://mybucket/antfly-backups/cluster/2025-01-15"
+        format:
+          type: string
+          enum: [native, portable]
+          default: portable
+          description: |
+            Backup format to use:
+            - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
+            - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend)
+
+            On restore, the format is auto-detected from file magic bytes.
+          example: "portable"
         table_names:
           type: array
           items:
@@ -2595,6 +2617,11 @@ components:
           type: string
           description: Antfly version that created the backup
           example: "v1.0.0"
+        format:
+          type: string
+          enum: [native, portable]
+          description: Backup format used
+          example: "portable"
     BackupListResponse:
       type: object
       required:

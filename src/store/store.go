@@ -280,6 +280,10 @@ func (m *Store) ID() types.ID {
 	return m.config.ID
 }
 
+func (m *Store) S3Info() *common.S3Info {
+	return &m.antflyConfig.Storage.S3
+}
+
 // ErrorcC dynamically receives new error channels from shards and fans them in
 func (m *Store) ErrorC(ctx context.Context) chan error {
 	errCh := make(chan error)
@@ -554,6 +558,21 @@ func (m *Store) StartRaftGroup(
 		return fmt.Errorf("creating snapshot store: %w", err)
 	}
 
+	// If RestoreConfig is set but InitWithDBArchive is not (local client path),
+	// copy the backup file from the source location to the snap directory.
+	if conf.InitWithDBArchive == "" && conf.RestoreConfig != nil {
+		if after, ok := strings.CutPrefix(conf.RestoreConfig.Location, "file://"); ok {
+			archiveName, copyErr := copyLocalBackupToSnapDir(
+				lg, snapStore, shardID, after,
+				conf.RestoreConfig.BackupID, conf.RestoreConfig.Format,
+			)
+			if copyErr != nil {
+				return fmt.Errorf("copying local backup for restore: %w", copyErr)
+			}
+			conf.InitWithDBArchive = archiveName
+		}
+	}
+
 	// For new shards (not rejoining existing cluster) or split shards,
 	// clean up any leftover raft log state from failed previous attempts.
 	// This prevents "could not open manifest file" errors when Pebble finds
@@ -743,4 +762,55 @@ func (m *Store) StartRaftGroup(
 	lg.Info("Saved shard metadata to local store")
 	removeShard = false
 	return nil
+}
+
+// copyLocalBackupToSnapDir copies a backup file from a local directory into the
+// shard's snap store and returns the initWithDBArchive name to use. This handles
+// the local-client restore path (swarm mode) where the HTTP multipart upload
+// path in api.go is not used.
+func copyLocalBackupToSnapDir(
+	lg *zap.Logger,
+	snapStore snapstore.SnapStore,
+	shardID types.ID,
+	localDir string,
+	backupID string,
+	format common.BackupFormat,
+) (string, error) {
+	backupFileName := common.ShardBackupFileName(backupID, shardID)
+	format = common.NormalizeBackupFormat(format)
+	if format == common.BackupFormatPortable {
+		backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
+	}
+	srcPath := filepath.Join(localDir, backupFileName)
+
+	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+		alternateName := common.ShardBackupFileName(backupID, shardID)
+		if format == common.BackupFormatNative {
+			alternateName = common.ShardPortableBackupFileName(backupID, shardID)
+		}
+		alternatePath := filepath.Join(localDir, alternateName)
+		if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
+			backupFileName = alternateName
+			srcPath = alternatePath
+		}
+	}
+
+	f, err := os.Open(filepath.Clean(srcPath))
+	if err != nil {
+		return "", fmt.Errorf("opening backup file %s: %w", srcPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := snapStore.Put(context.Background(), backupFileName, f); err != nil {
+		return "", fmt.Errorf("storing backup in snap dir: %w", err)
+	}
+
+	lg.Info("Copied local backup to snap directory",
+		zap.String("src", srcPath),
+		zap.String("snapID", backupFileName))
+
+	if strings.HasSuffix(backupFileName, ".afb") {
+		return backupFileName, nil
+	}
+	return strings.TrimSuffix(backupFileName, ".tar.zst"), nil
 }

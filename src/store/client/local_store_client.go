@@ -19,10 +19,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/types"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
+	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
@@ -37,6 +41,10 @@ var _ StoreRPC = (*LocalStoreClient)(nil)
 type LocalStoreClient struct {
 	nodeID types.ID
 	store  func() (store.StoreIface, error)
+}
+
+type storeS3InfoProvider interface {
+	S3Info() *common.S3Info
 }
 
 func NewLocalStoreClient(nodeID types.ID, s store.StoreIface) *LocalStoreClient {
@@ -115,10 +123,53 @@ func (c *LocalStoreClient) ApplyMergeChunk(
 	return err
 }
 
-func (c *LocalStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string) error {
-	shard, err := c.shard(shardID)
+func (c *LocalStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
+	format = common.NormalizeBackupFormat(format)
+	s, err := c.store()
 	if err != nil {
 		return err
+	}
+	shard, ok := s.Shard(shardID)
+	if !ok {
+		return fmt.Errorf("shard %s not found on store %s", shardID, c.nodeID)
+	}
+	if format == common.BackupFormatPortable {
+		if strings.HasPrefix(loc, "s3://") {
+			s3Provider, ok := s.(storeS3InfoProvider)
+			if !ok {
+				return fmt.Errorf("portable S3 backup requires store S3 configuration")
+			}
+			tempDir, err := os.MkdirTemp("", "antfly-portable-backup-")
+			if err != nil {
+				return fmt.Errorf("creating portable backup temp dir: %w", err)
+			}
+			defer func() { _ = os.RemoveAll(tempDir) }()
+
+			filePath := filepath.Join(tempDir, common.ShardPortableBackupFileName(id, shardID))
+			f, err := os.Create(filePath) //nolint:gosec
+			if err != nil {
+				return fmt.Errorf("creating portable backup file: %w", err)
+			}
+			if err := shard.ExportPortable(ctx, f); err != nil {
+				_ = f.Close()
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return fmt.Errorf("closing portable backup file: %w", err)
+			}
+			return db.WriteBackupToBlobStore(context.Background(), loc, filePath, s3Provider.S3Info())
+		}
+		fileName := common.ShardPortableBackupFileName(id, shardID)
+		destDir := strings.TrimPrefix(loc, "file://")
+		if err := os.MkdirAll(destDir, 0o750); err != nil {
+			return fmt.Errorf("creating portable backup dir: %w", err)
+		}
+		f, err := os.Create(filepath.Join(destDir, fileName)) //nolint:gosec
+		if err != nil {
+			return fmt.Errorf("creating portable backup file: %w", err)
+		}
+		defer func() { _ = f.Close() }()
+		return shard.ExportPortable(ctx, f)
 	}
 	return shard.Backup(ctx, loc, id)
 }
