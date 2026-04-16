@@ -1811,8 +1811,18 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 	}
 
-	// Determine phase
-	if cluster.Status.MetadataNodesReady >= 3 && cluster.Status.DataNodesReady >= 3 {
+	// Determine phase based on the configured replica counts rather than a
+	// hardcoded production-sized cluster. Local dev intentionally runs 1+1.
+	metadataReplicas := int32(3)
+	if cluster.Spec.MetadataNodes.Replicas > 0 {
+		metadataReplicas = cluster.Spec.MetadataNodes.Replicas
+	}
+	dataReplicas := int32(3)
+	if cluster.Spec.DataNodes.Replicas > 0 {
+		dataReplicas = cluster.Spec.DataNodes.Replicas
+	}
+
+	if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
 		cluster.Status.Phase = "Running"
 	} else {
 		cluster.Status.Phase = "Pending"
