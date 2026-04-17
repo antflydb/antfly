@@ -1354,6 +1354,145 @@ func TestValidateUpdate_PVCRetentionPolicyMutable(t *testing.T) {
 	}
 }
 
+func TestDefault_SwarmDefaults(t *testing.T) {
+	cluster := &AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "swarm-cluster",
+			Namespace: "default",
+		},
+		Spec: AntflyClusterSpec{
+			Mode:  ClusterModeSwarm,
+			Image: "antfly:latest",
+			Swarm: &SwarmSpec{},
+			Storage: StorageSpec{
+				StorageClass: "standard",
+				SwarmStorage: "1Gi",
+			},
+			Config: "{}",
+		},
+	}
+
+	cluster.Default()
+
+	if cluster.Spec.Mode != ClusterModeSwarm {
+		t.Fatalf("expected swarm mode to remain set, got %q", cluster.Spec.Mode)
+	}
+	if cluster.Spec.Swarm.Replicas != 1 {
+		t.Fatalf("expected default swarm replicas=1, got %d", cluster.Spec.Swarm.Replicas)
+	}
+	if cluster.Spec.Swarm.NodeID != 1 {
+		t.Fatalf("expected default swarm nodeID=1, got %d", cluster.Spec.Swarm.NodeID)
+	}
+	if cluster.Spec.Swarm.MetadataAPI.Port != 8080 {
+		t.Fatalf("expected default swarm metadata API port 8080, got %d", cluster.Spec.Swarm.MetadataAPI.Port)
+	}
+	if cluster.Spec.Swarm.MetadataRaft.Port != 9017 {
+		t.Fatalf("expected default swarm metadata raft port 9017, got %d", cluster.Spec.Swarm.MetadataRaft.Port)
+	}
+	if cluster.Spec.Swarm.StoreAPI.Port != 12380 {
+		t.Fatalf("expected default swarm store API port 12380, got %d", cluster.Spec.Swarm.StoreAPI.Port)
+	}
+	if cluster.Spec.Swarm.StoreRaft.Port != 9021 {
+		t.Fatalf("expected default swarm store raft port 9021, got %d", cluster.Spec.Swarm.StoreRaft.Port)
+	}
+	if cluster.Spec.Swarm.Health.Port != 4200 {
+		t.Fatalf("expected default swarm health port 4200, got %d", cluster.Spec.Swarm.Health.Port)
+	}
+	if cluster.Spec.Swarm.Termite == nil {
+		t.Fatal("expected default termite configuration to be populated")
+	}
+	if !cluster.Spec.Swarm.Termite.Enabled {
+		t.Fatal("expected termite to default enabled for swarm mode")
+	}
+	if cluster.Spec.Swarm.Termite.APIURL != "http://0.0.0.0:11433" {
+		t.Fatalf("expected default termite API URL, got %q", cluster.Spec.Swarm.Termite.APIURL)
+	}
+}
+
+func TestValidateCreate_ValidSwarm(t *testing.T) {
+	cluster := baseSwarmCluster()
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid swarm cluster to pass validation, got: %v", err)
+	}
+}
+
+func TestValidateCreate_SwarmRequiresStorage(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.Storage.SwarmStorage = ""
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected error when swarm storage is missing")
+	}
+	if !strings.Contains(err.Error(), "spec.storage.swarmStorage") {
+		t.Fatalf("expected swarm storage validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_SwarmRejectsClusteredFields(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.MetadataNodes.Replicas = 3
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected error when clustered fields are set in swarm mode")
+	}
+	if !strings.Contains(err.Error(), "spec.metadataNodes.replicas") {
+		t.Fatalf("expected clustered field validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_SwarmRejectsInvalidTermiteURL(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.Swarm.Termite = &SwarmTermiteSpec{
+		Enabled: true,
+		APIURL:  "localhost:11433",
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected error for invalid termite API URL")
+	}
+	if !strings.Contains(err.Error(), "spec.swarm.termite.apiURL") {
+		t.Fatalf("expected termite URL validation error, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_ModeImmutable(t *testing.T) {
+	oldCluster := baseCluster()
+
+	newCluster := oldCluster.DeepCopy()
+	newCluster.Spec.Mode = ClusterModeSwarm
+	newCluster.Spec.Swarm = &SwarmSpec{
+		Replicas:     1,
+		NodeID:       1,
+		MetadataAPI:  APISpec{Port: 8080},
+		MetadataRaft: APISpec{Port: 9017},
+		StoreAPI:     APISpec{Port: 12380},
+		StoreRaft:    APISpec{Port: 9021},
+		Health:       APISpec{Port: 4200},
+		Termite: &SwarmTermiteSpec{
+			Enabled: true,
+			APIURL:  "http://0.0.0.0:11433",
+		},
+	}
+	newCluster.Spec.MetadataNodes = MetadataNodesSpec{}
+	newCluster.Spec.DataNodes = DataNodesSpec{}
+	newCluster.Spec.Storage = StorageSpec{
+		StorageClass: "standard",
+		SwarmStorage: "1Gi",
+	}
+
+	err := newCluster.ValidateUpdate(oldCluster)
+	if err == nil {
+		t.Fatal("expected error when changing mode from Clustered to Swarm")
+	}
+	if !strings.Contains(err.Error(), "spec.mode") {
+		t.Fatalf("expected immutable mode validation error, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1372,6 +1511,38 @@ func baseCluster() *AntflyCluster {
 				StorageClass:    "standard",
 				MetadataStorage: "1Gi",
 				DataStorage:     "1Gi",
+			},
+			Config: "{}",
+		},
+	}
+}
+
+func baseSwarmCluster() *AntflyCluster {
+	return &AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-swarm-cluster",
+			Namespace: "default",
+		},
+		Spec: AntflyClusterSpec{
+			Mode:  ClusterModeSwarm,
+			Image: "antfly:latest",
+			Swarm: &SwarmSpec{
+				Replicas:     1,
+				NodeID:       1,
+				Resources:    ResourceSpec{CPU: "500m", Memory: "1Gi"},
+				MetadataAPI:  APISpec{Port: 8080},
+				MetadataRaft: APISpec{Port: 9017},
+				StoreAPI:     APISpec{Port: 12380},
+				StoreRaft:    APISpec{Port: 9021},
+				Health:       APISpec{Port: 4200},
+				Termite: &SwarmTermiteSpec{
+					Enabled: true,
+					APIURL:  "http://0.0.0.0:11433",
+				},
+			},
+			Storage: StorageSpec{
+				StorageClass: "standard",
+				SwarmStorage: "1Gi",
 			},
 			Config: "{}",
 		},

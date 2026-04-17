@@ -68,19 +68,44 @@ const (
 	FinalizerPVCCleanup = "antfly.io/pvc-cleanup"
 )
 
+// ClusterMode selects the topology managed by the operator.
+type ClusterMode string
+
+const (
+	// ClusterModeClustered is the existing split metadata/data topology.
+	ClusterModeClustered ClusterMode = "Clustered"
+
+	// ClusterModeSwarm is the single-node operator-managed swarm topology.
+	ClusterModeSwarm ClusterMode = "Swarm"
+)
+
 // AntflyClusterSpec defines the desired state of AntflyCluster
 type AntflyClusterSpec struct {
+	// Mode selects the runtime topology managed by the operator.
+	// +optional
+	// +kubebuilder:validation:Enum=Clustered;Swarm
+	// +kubebuilder:default=Clustered
+	Mode ClusterMode `json:"mode,omitempty"`
+
 	// Image is the container image to use for Antfly
 	Image string `json:"image"`
 
 	// ImagePullPolicy defines the image pull policy
 	ImagePullPolicy string `json:"imagePullPolicy,omitempty"`
 
-	// MetadataNodes defines the configuration for metadata nodes (StatefulSet)
-	MetadataNodes MetadataNodesSpec `json:"metadataNodes"`
+	// Swarm defines the single-node swarm topology when Mode=Swarm.
+	// +optional
+	Swarm *SwarmSpec `json:"swarm,omitempty"`
 
-	// DataNodes defines the configuration for data nodes (StatefulSet)
-	DataNodes DataNodesSpec `json:"dataNodes"`
+	// MetadataNodes defines the configuration for metadata nodes (StatefulSet).
+	// Required for Clustered mode and must be omitted in Swarm mode.
+	// +optional
+	MetadataNodes MetadataNodesSpec `json:"metadataNodes,omitempty"`
+
+	// DataNodes defines the configuration for data nodes (StatefulSet).
+	// Required for Clustered mode and must be omitted in Swarm mode.
+	// +optional
+	DataNodes DataNodesSpec `json:"dataNodes,omitempty"`
 
 	// Config is the configuration file content for Antfly
 	Config string `json:"config"`
@@ -231,6 +256,66 @@ type DataNodesSpec struct {
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
 
+// SwarmSpec defines the configuration for operator-managed swarm mode.
+type SwarmSpec struct {
+	// Replicas is the number of swarm replicas. MVP only supports 1.
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// NodeID is the swarm node ID used for local orchestration URLs.
+	NodeID int32 `json:"nodeID,omitempty"`
+
+	// Resources defines the resource requirements.
+	Resources ResourceSpec `json:"resources"`
+
+	// MetadataAPI defines the metadata API configuration.
+	MetadataAPI APISpec `json:"metadataAPI,omitempty"`
+
+	// MetadataRaft defines the metadata raft configuration.
+	MetadataRaft APISpec `json:"metadataRaft,omitempty"`
+
+	// StoreAPI defines the store API configuration.
+	StoreAPI APISpec `json:"storeAPI,omitempty"`
+
+	// StoreRaft defines the store raft configuration.
+	StoreRaft APISpec `json:"storeRaft,omitempty"`
+
+	// Health defines the health endpoint configuration.
+	Health APISpec `json:"health,omitempty"`
+
+	// Termite controls the optional termite sidecar runtime integrated into swarm mode.
+	// +optional
+	Termite *SwarmTermiteSpec `json:"termite,omitempty"`
+
+	// EnvFrom is a list of sources to populate environment variables in the container.
+	// +optional
+	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
+
+	// Tolerations defines tolerations for pod scheduling.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// NodeSelector defines node selector labels for pod scheduling.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Affinity defines affinity rules for pod scheduling.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// TopologySpreadConstraints describes how pods should spread across topology domains.
+	// +optional
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+}
+
+// SwarmTermiteSpec defines termite configuration for swarm mode.
+type SwarmTermiteSpec struct {
+	// Enabled controls whether termite runs alongside the swarm node.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// APIURL is the termite API URL.
+	APIURL string `json:"apiURL,omitempty"`
+}
+
 // APISpec defines API configuration
 type APISpec struct {
 	// Port is the port number (optional, operator sets defaults)
@@ -298,6 +383,11 @@ type StorageSpec struct {
 
 	// DataStorage defines storage for data nodes
 	DataStorage string `json:"dataStorage,omitempty"`
+
+	// SwarmStorage defines storage for the swarm topology.
+	// Used when spec.mode=Swarm.
+	// +optional
+	SwarmStorage string `json:"swarmStorage,omitempty"`
 
 	// PVCRetentionPolicy controls what happens to PVCs when the cluster is deleted or scaled down.
 	// Maps to StatefulSet's persistentVolumeClaimRetentionPolicy (beta in K8s 1.27, GA in 1.32).
@@ -480,6 +570,10 @@ type AntflyClusterStatus struct {
 	// Phase represents the current phase of the cluster
 	Phase string `json:"phase,omitempty"`
 
+	// Mode reports the observed topology mode.
+	// +optional
+	Mode ClusterMode `json:"mode,omitempty"`
+
 	// ObservedGeneration is the most recent generation observed by the controller.
 	// Used to skip expensive validation when the spec has not changed since
 	// the last successful reconciliation.
@@ -489,14 +583,26 @@ type AntflyClusterStatus struct {
 	// Conditions represent the current conditions of the cluster
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
+	// ReadyReplicas is the total number of ready replicas across the active topology.
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
 	// MetadataNodesReady represents the number of ready metadata nodes
 	MetadataNodesReady int32 `json:"metadataNodesReady,omitempty"`
 
 	// DataNodesReady represents the number of ready data nodes
 	DataNodesReady int32 `json:"dataNodesReady,omitempty"`
 
+	// SwarmNodesReady represents the number of ready swarm nodes.
+	// +optional
+	SwarmNodesReady int32 `json:"swarmNodesReady,omitempty"`
+
 	// AutoScalingStatus tracks autoscaling state
 	AutoScalingStatus *AutoScalingStatus `json:"autoScalingStatus,omitempty"`
+
+	// SwarmStatus reports swarm-specific operational state.
+	// +optional
+	SwarmStatus *SwarmStatus `json:"swarmStatus,omitempty"`
 
 	// ServiceMeshStatus reports service mesh operational state
 	// +optional
@@ -542,6 +648,36 @@ type ServiceMeshStatus struct {
 	TotalPods int32 `json:"totalPods,omitempty"`
 
 	// LastTransitionTime when status last changed
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
+// SwarmStatus reports swarm mode operational status.
+type SwarmStatus struct {
+	// Ready indicates that the combined swarm workload is ready.
+	Ready bool `json:"ready,omitempty"`
+
+	// MetadataReady indicates that the metadata API is ready.
+	MetadataReady bool `json:"metadataReady,omitempty"`
+
+	// StoreReady indicates that the store API is ready.
+	StoreReady bool `json:"storeReady,omitempty"`
+
+	// TermiteReady indicates that termite is ready when enabled.
+	TermiteReady bool `json:"termiteReady,omitempty"`
+
+	// NodeID is the configured swarm node ID.
+	NodeID int32 `json:"nodeID,omitempty"`
+
+	// PodName is the name of the backing swarm pod.
+	PodName string `json:"podName,omitempty"`
+
+	// PodIP is the IP of the backing swarm pod.
+	PodIP string `json:"podIP,omitempty"`
+
+	// ObservedConfigHash records the config hash seen by the controller.
+	ObservedConfigHash string `json:"observedConfigHash,omitempty"`
+
+	// LastTransitionTime records the last swarm status transition.
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 

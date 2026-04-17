@@ -38,6 +38,22 @@ A basic Antfly cluster suitable for testing and small workloads.
 kubectl apply -f examples/small-dev-cluster.yaml
 ```
 
+### Swarm Cluster (`swarm-cluster.yaml`)
+A single-node swarm-mode Antfly cluster managed by the operator.
+
+**Features:**
+- explicit `mode: Swarm`
+- single StatefulSet instead of split metadata/data StatefulSets
+- one PVC via `storage.swarmStorage`
+- public API service retained at `*-public-api`
+
+**Use Case:** local development, smoke testing, reduced-topology deployments
+
+**Deploy:**
+```bash
+kubectl apply -f examples/swarm-cluster.yaml
+```
+
 ### Production Cluster (`production-cluster.yaml`)
 A production-ready Antfly cluster with high availability and performance.
 
@@ -95,6 +111,8 @@ Each Antfly cluster consists of two main components:
    - Handle data storage and replication
    - Always requires exactly 3 replicas for Raft consensus
    - Stores the actual database data
+
+Swarm mode is the exception. It runs a single operator-managed StatefulSet and uses `spec.swarm` plus `storage.swarmStorage` instead of `metadataNodes` / `dataNodes`.
 
 ### Key Configuration Options
 

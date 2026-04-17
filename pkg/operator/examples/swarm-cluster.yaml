@@ -1,0 +1,52 @@
+apiVersion: antfly.io/v1
+kind: AntflyCluster
+metadata:
+  name: swarm-antfly-cluster
+  namespace: default
+  labels:
+    app.kubernetes.io/name: antfly-cluster
+    app.kubernetes.io/instance: swarm-antfly-cluster
+    app.kubernetes.io/part-of: antfly
+spec:
+  image: ghcr.io/antflydb/antfly:latest
+  imagePullPolicy: IfNotPresent
+  mode: Swarm
+
+  swarm:
+    replicas: 1
+    nodeID: 1
+    metadataAPI:
+      port: 8080
+    metadataRaft:
+      port: 9017
+    storeAPI:
+      port: 12380
+    storeRaft:
+      port: 9021
+    health:
+      port: 4200
+    resources:
+      cpu: "500m"
+      memory: "1Gi"
+      limits:
+        cpu: "1000m"
+        memory: "2Gi"
+
+  publicAPI:
+    enabled: true
+    serviceType: ClusterIP
+    port: 80
+
+  storage:
+    storageClass: ""
+    swarmStorage: "5Gi"
+
+  config: |
+    {
+      "log": {
+        "level": "info",
+        "style": "json"
+      },
+      "cache_size": 1000,
+      "enable_metrics": true
+    }

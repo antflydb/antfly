@@ -206,6 +206,49 @@ func TestApplyDefaults_PublicAPIDefaultsFalse(t *testing.T) {
 	g.Expect(*clusterEnabled.Spec.PublicAPI.Enabled).To(BeTrue(), "Explicitly enabled PublicAPI should remain true")
 }
 
+func TestApplyDefaults_SwarmDefaults(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	err := antflyv1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme: s,
+	}
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-swarm",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode:  antflyv1.ClusterModeSwarm,
+			Image: "antfly:latest",
+			Swarm: &antflyv1.SwarmSpec{},
+			Storage: antflyv1.StorageSpec{
+				StorageClass: "standard",
+				SwarmStorage: "1Gi",
+			},
+		},
+	}
+
+	reconciler.applyDefaults(cluster)
+
+	g.Expect(cluster.Spec.Swarm).ToNot(BeNil())
+	g.Expect(cluster.Spec.Swarm.Replicas).To(Equal(int32(1)))
+	g.Expect(cluster.Spec.Swarm.NodeID).To(Equal(int32(1)))
+	g.Expect(cluster.Spec.Swarm.MetadataAPI.Port).To(Equal(int32(8080)))
+	g.Expect(cluster.Spec.Swarm.MetadataRaft.Port).To(Equal(int32(9017)))
+	g.Expect(cluster.Spec.Swarm.StoreAPI.Port).To(Equal(int32(12380)))
+	g.Expect(cluster.Spec.Swarm.StoreRaft.Port).To(Equal(int32(9021)))
+	g.Expect(cluster.Spec.Swarm.Health.Port).To(Equal(int32(4200)))
+	g.Expect(cluster.Spec.Swarm.Termite).ToNot(BeNil())
+	g.Expect(cluster.Spec.Swarm.Termite.Enabled).To(BeTrue())
+	g.Expect(cluster.Spec.Swarm.Termite.APIURL).To(Equal("http://0.0.0.0:11433"))
+}
+
 // T006: Unit test for public API service deletion when disabled
 func TestReconcileServices_DeletesPublicAPIWhenDisabled(t *testing.T) {
 	g := NewWithT(t)
@@ -757,6 +800,215 @@ func TestGenerateCompleteConfig(t *testing.T) {
 	g.Expect(url1).To(Equal(expectedURL))
 }
 
+func TestGenerateCompleteConfig_Swarm(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	err := antflyv1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme: s,
+	}
+
+	cluster := baseSwarmControllerCluster()
+	cluster.Spec.Config = `{
+	  "replication_factor": 3,
+	  "swarm_mode": false,
+	  "storage": {
+	    "s3": {
+	      "bucket": "test-bucket"
+	    }
+	  }
+	}`
+
+	configJSON, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var config map[string]any
+	err = json.Unmarshal([]byte(configJSON), &config)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	g.Expect(config["swarm_mode"]).To(Equal(true))
+	g.Expect(config["replication_factor"]).To(Equal(float64(1)))
+	g.Expect(config["default_shards_per_table"]).To(Equal(float64(1)))
+	g.Expect(config["disable_shard_alloc"]).To(Equal(true))
+
+	storage, ok := config["storage"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	localStorage, ok := storage["local"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(localStorage["base_dir"]).To(Equal("/antflydb"))
+	_, hasS3 := storage["s3"]
+	g.Expect(hasS3).To(BeTrue(), "expected user-provided S3 storage config to be preserved")
+
+	metadata, ok := config["metadata"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	orchestrationURLs, ok := metadata["orchestration_urls"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(orchestrationURLs["1"]).To(Equal("http://test-swarm-swarm.default.svc.cluster.local:8080"))
+}
+
+func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	err := antflyv1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = corev1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	cluster := baseSwarmControllerCluster()
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	err = reconciler.reconcileServices(context.Background(), cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	publicSvc := &corev1.Service{}
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+	g.Expect(publicSvc.Spec.Ports).To(HaveLen(1))
+	g.Expect(publicSvc.Spec.Ports[0].TargetPort.IntValue()).To(Equal(8080))
+
+	swarmSvc := &corev1.Service{}
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, swarmSvc)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(swarmSvc.Spec.Ports).To(HaveLen(5))
+
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-metadata", Namespace: "default"}, &corev1.Service{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-data", Namespace: "default"}, &corev1.Service{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
+func TestUpdateStatus_Swarm(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	err := antflyv1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = appsv1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = corev1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	cluster := baseSwarmControllerCluster()
+	swarmSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-swarm-swarm",
+			Namespace: "default",
+		},
+		Status: appsv1.StatefulSetStatus{
+			ReadyReplicas: 1,
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-swarm-swarm-0",
+			Namespace: "default",
+			Labels:    serviceSelectorLabels("test-swarm", "swarm"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.0.0.10",
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(cluster).
+		WithObjects(cluster, swarmSts, pod).
+		Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	err = reconciler.updateStatus(context.Background(), cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	updated := &antflyv1.AntflyCluster{}
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm", Namespace: "default"}, updated)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(updated.Status.Mode).To(Equal(antflyv1.ClusterModeSwarm))
+	g.Expect(updated.Status.ReadyReplicas).To(Equal(int32(1)))
+	g.Expect(updated.Status.SwarmNodesReady).To(Equal(int32(1)))
+	g.Expect(updated.Status.Phase).To(Equal("Running"))
+	g.Expect(updated.Status.SwarmStatus).ToNot(BeNil())
+	g.Expect(updated.Status.SwarmStatus.Ready).To(BeTrue())
+	g.Expect(updated.Status.SwarmStatus.PodName).To(Equal("test-swarm-swarm-0"))
+	g.Expect(updated.Status.SwarmStatus.PodIP).To(Equal("10.0.0.10"))
+	g.Expect(updated.Status.SwarmStatus.ObservedConfigHash).ToNot(BeEmpty())
+}
+
+func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	err := antflyv1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = corev1.AddToScheme(s)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	cluster := baseSwarmControllerCluster()
+	clusterPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-swarm-swarm-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/name":     "antfly-database",
+				"app.kubernetes.io/instance": "test-swarm",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "antfly"},
+				{Name: "istio-proxy"},
+			},
+		},
+	}
+	otherClusterPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-cluster-swarm-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/name":     "antfly-database",
+				"app.kubernetes.io/instance": "other-cluster",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "antfly"},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(cluster, clusterPod, otherClusterPod).
+		Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	podsWithSidecars, totalPods, err := reconciler.detectSidecarInjectionStatus(context.Background(), cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(totalPods).To(Equal(int32(1)))
+	g.Expect(podsWithSidecars).To(Equal(int32(1)))
+}
+
 // TestPodLabels tests that podLabels returns correct labels including instance
 func TestPodLabels(t *testing.T) {
 	g := NewWithT(t)
@@ -948,4 +1200,44 @@ func TestContainsVolumeAffinityMessage(t *testing.T) {
 	g.Expect(containsVolumeAffinityMessage("0/3 nodes are available: 1 volume node affinity conflict, 2 node(s) didn't match")).To(BeTrue())
 	g.Expect(containsVolumeAffinityMessage("no matching nodes")).To(BeFalse())
 	g.Expect(containsVolumeAffinityMessage("")).To(BeFalse())
+}
+
+func baseSwarmControllerCluster() *antflyv1.AntflyCluster {
+	enabled := true
+	serviceType := corev1.ServiceTypeClusterIP
+
+	return &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-swarm",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode:  antflyv1.ClusterModeSwarm,
+			Image: "antfly:latest",
+			Swarm: &antflyv1.SwarmSpec{
+				Replicas:     1,
+				NodeID:       1,
+				Resources:    antflyv1.ResourceSpec{CPU: "500m", Memory: "1Gi"},
+				MetadataAPI:  antflyv1.APISpec{Port: 8080},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+				StoreAPI:     antflyv1.APISpec{Port: 12380},
+				StoreRaft:    antflyv1.APISpec{Port: 9021},
+				Health:       antflyv1.APISpec{Port: 4200},
+				Termite: &antflyv1.SwarmTermiteSpec{
+					Enabled: true,
+					APIURL:  "http://0.0.0.0:11433",
+				},
+			},
+			Storage: antflyv1.StorageSpec{
+				StorageClass: "standard",
+				SwarmStorage: "1Gi",
+			},
+			PublicAPI: &antflyv1.PublicAPIConfig{
+				Enabled:     &enabled,
+				ServiceType: &serviceType,
+				Port:        80,
+			},
+			Config: "{}",
+		},
+	}
 }

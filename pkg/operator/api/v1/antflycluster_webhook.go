@@ -2,6 +2,7 @@ package v1
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -38,9 +39,64 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 	return r.ValidateAntflyCluster()
 }
 
+// Default applies admission defaults to AntflyCluster.
+func (r *AntflyCluster) Default() {
+	if r.Spec.Mode == "" {
+		r.Spec.Mode = ClusterModeClustered
+	}
+
+	if r.Spec.Mode != ClusterModeSwarm || r.Spec.Swarm == nil {
+		return
+	}
+
+	if r.Spec.Swarm.Replicas == 0 {
+		r.Spec.Swarm.Replicas = 1
+	}
+
+	if r.Spec.Swarm.NodeID == 0 {
+		r.Spec.Swarm.NodeID = 1
+	}
+
+	if r.Spec.Swarm.MetadataAPI.Port == 0 {
+		r.Spec.Swarm.MetadataAPI.Port = 8080
+	}
+
+	if r.Spec.Swarm.MetadataRaft.Port == 0 {
+		r.Spec.Swarm.MetadataRaft.Port = 9017
+	}
+
+	if r.Spec.Swarm.StoreAPI.Port == 0 {
+		r.Spec.Swarm.StoreAPI.Port = 12380
+	}
+
+	if r.Spec.Swarm.StoreRaft.Port == 0 {
+		r.Spec.Swarm.StoreRaft.Port = 9021
+	}
+
+	if r.Spec.Swarm.Health.Port == 0 {
+		r.Spec.Swarm.Health.Port = 4200
+	}
+
+	if r.Spec.Swarm.Termite == nil {
+		r.Spec.Swarm.Termite = &SwarmTermiteSpec{
+			Enabled: true,
+			APIURL:  "http://0.0.0.0:11433",
+		}
+		return
+	}
+
+	if r.Spec.Swarm.Termite.APIURL == "" {
+		r.Spec.Swarm.Termite.APIURL = "http://0.0.0.0:11433"
+	}
+}
+
 // ValidateAntflyCluster performs all validation checks
 func (r *AntflyCluster) ValidateAntflyCluster() error {
 	var allErrors []string
+
+	if err := r.validateModeConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
 
 	if err := r.validateGKEConfig(); err != nil {
 		allErrors = append(allErrors, err.Error())
@@ -117,15 +173,18 @@ Solution: Either:
 	// Validate Accelerator compute class requires GPU
 	if gke.AutopilotComputeClass == "Accelerator" {
 		hasGPU := false
+		if r.isSwarmMode() {
+			hasGPU = hasGPUInResourceSpec(r.Spec.Swarm.Resources)
+		} else {
+			// Check if metadata nodes have GPU
+			if hasGPUInResourceSpec(r.Spec.MetadataNodes.Resources) {
+				hasGPU = true
+			}
 
-		// Check if metadata nodes have GPU
-		if hasGPUInResourceSpec(r.Spec.MetadataNodes.Resources) {
-			hasGPU = true
-		}
-
-		// Check if data nodes have GPU
-		if hasGPUInResourceSpec(r.Spec.DataNodes.Resources) {
-			hasGPU = true
+			// Check if data nodes have GPU
+			if hasGPUInResourceSpec(r.Spec.DataNodes.Resources) {
+				hasGPU = true
+			}
 		}
 
 		if !hasGPU {
@@ -273,6 +332,19 @@ func (r *AntflyCluster) validateNoConflictingSettings() error {
 		return nil
 	}
 
+	if r.isSwarmMode() {
+		if len(r.Spec.Swarm.NodeSelector) > 0 {
+			return fmt.Errorf(`spec.swarm.nodeSelector conflicts with spec.gke.autopilot=true
+
+Problem: GKE Autopilot manages node scheduling via compute classes, not node selectors.
+Any custom nodeSelector values will be overridden.
+
+Solution: Remove spec.swarm.nodeSelector when using GKE Autopilot.
+Use spec.gke.autopilotComputeClass to control scheduling instead`)
+		}
+		return nil
+	}
+
 	// Check metadata nodes
 	if r.Spec.MetadataNodes.UseSpotPods {
 		return fmt.Errorf(`spec.metadataNodes.useSpotPods=true conflicts with spec.gke.autopilot=true
@@ -336,6 +408,16 @@ Use spec.gke.autopilotComputeClass to control scheduling instead`)
 // Metadata nodes run Raft consensus and require an odd number of replicas >= 1
 // for quorum. Data nodes just need non-negative counts.
 func (r *AntflyCluster) validateNodeCounts() error {
+	if r.isSwarmMode() {
+		if r.Spec.Swarm.Replicas < 1 {
+			return fmt.Errorf("spec.swarm.replicas must be >= 1, got %d", r.Spec.Swarm.Replicas)
+		}
+		if r.Spec.Swarm.NodeID < 1 {
+			return fmt.Errorf("spec.swarm.nodeID must be >= 1, got %d", r.Spec.Swarm.NodeID)
+		}
+		return nil
+	}
+
 	if r.Spec.MetadataNodes.Replicas < 1 {
 		//nolint:staticcheck // ST1005: intentionally capitalized user-facing webhook error
 		return fmt.Errorf(`spec.metadataNodes.replicas must be >= 1, got %d
@@ -368,6 +450,21 @@ Solution: Use an odd replica count:
 // ValidateImmutability validates that immutable fields haven't changed
 func (r *AntflyCluster) ValidateImmutability(old *AntflyCluster) error {
 	var errors []string
+
+	oldMode := old.effectiveMode()
+	newMode := r.effectiveMode()
+	if newMode != oldMode {
+		errors = append(errors, fmt.Sprintf(
+			`field 'spec.mode' is immutable after deployment
+
+Problem: Changing topology mode requires replacing the workload shape and storage layout.
+
+Solution: Delete and recreate the cluster to change this setting.
+
+Current value: "%s"
+Attempted change: "%s"`,
+			oldMode, newMode))
+	}
 
 	// Check if both old and new have GKE config
 	if r.Spec.GKE != nil && old.Spec.GKE != nil {
@@ -562,6 +659,18 @@ Current configuration:
 func (r *AntflyCluster) validateEnvFrom() error {
 	var errors []string
 
+	if r.isSwarmMode() {
+		for i, source := range r.Spec.Swarm.EnvFrom {
+			if err := validateEnvFromSource(source, fmt.Sprintf("spec.swarm.envFrom[%d]", i)); err != nil {
+				errors = append(errors, err.Error())
+			}
+		}
+		if len(errors) > 0 {
+			return fmt.Errorf("EnvFrom validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+		}
+		return nil
+	}
+
 	// Validate metadata nodes EnvFrom
 	for i, source := range r.Spec.MetadataNodes.EnvFrom {
 		if err := validateEnvFromSource(source, fmt.Sprintf("spec.metadataNodes.envFrom[%d]", i)); err != nil {
@@ -622,6 +731,10 @@ func (r *AntflyCluster) validatePVCRetentionPolicy() error {
 
 	policy := r.Spec.Storage.PVCRetentionPolicy
 
+	if r.isSwarmMode() {
+		return nil
+	}
+
 	// Reject WhenScaled: Delete with autoscaling enabled
 	if policy.WhenScaled == PVCRetentionDelete && r.Spec.DataNodes.AutoScaling != nil && r.Spec.DataNodes.AutoScaling.Enabled {
 		return fmt.Errorf(`spec.storage.pvcRetentionPolicy.whenScaled=Delete conflicts with spec.dataNodes.autoScaling.enabled=true
@@ -652,11 +765,218 @@ func (r *AntflyCluster) validateResourceQuantities() error {
 
 	validateQuantity("spec.metadataNodes.resources.limits.gpu", r.Spec.MetadataNodes.Resources.Limits.GPU)
 	validateQuantity("spec.dataNodes.resources.limits.gpu", r.Spec.DataNodes.Resources.Limits.GPU)
+	if r.Spec.Swarm != nil {
+		validateQuantity("spec.swarm.resources.limits.gpu", r.Spec.Swarm.Resources.Limits.GPU)
+	}
 
 	if len(errors) > 0 {
 		return fmt.Errorf("%s", strings.Join(errors, "; "))
 	}
 	return nil
+}
+
+func (r *AntflyCluster) validateModeConfig() error {
+	if r.Spec.Mode == "" {
+		if r.Spec.Swarm != nil {
+			return fmt.Errorf("spec.swarm may only be set when spec.mode=Swarm")
+		}
+		return nil
+	}
+
+	switch r.Spec.Mode {
+	case ClusterModeClustered:
+		if r.Spec.Swarm != nil {
+			return fmt.Errorf("spec.swarm may only be set when spec.mode=Swarm")
+		}
+	case ClusterModeSwarm:
+		if r.Spec.Swarm == nil {
+			return fmt.Errorf("spec.swarm is required when spec.mode=Swarm")
+		}
+		if err := r.validateSwarmConfig(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("spec.mode must be one of: Clustered, Swarm")
+	}
+
+	return nil
+}
+
+func (r *AntflyCluster) effectiveMode() ClusterMode {
+	if r.Spec.Mode == "" {
+		return ClusterModeClustered
+	}
+	return r.Spec.Mode
+}
+
+func (r *AntflyCluster) validateSwarmConfig() error {
+	swarm := r.Spec.Swarm
+	if swarm == nil {
+		return nil
+	}
+
+	if swarm.Termite != nil && swarm.Termite.Enabled && strings.TrimSpace(swarm.Termite.APIURL) == "" {
+		return fmt.Errorf("spec.swarm.termite.apiURL must be set when termite is enabled")
+	}
+
+	if swarm.Termite != nil && strings.TrimSpace(swarm.Termite.APIURL) != "" {
+		parsed, err := url.Parse(swarm.Termite.APIURL)
+		if err != nil {
+			return fmt.Errorf("spec.swarm.termite.apiURL is invalid: %w", err)
+		}
+		if parsed.Scheme == "" || parsed.Host == "" {
+			return fmt.Errorf("spec.swarm.termite.apiURL must include a scheme and host")
+		}
+	}
+
+	ports := map[string]int32{
+		"metadataAPI":  swarm.MetadataAPI.Port,
+		"metadataRaft": swarm.MetadataRaft.Port,
+		"storeAPI":     swarm.StoreAPI.Port,
+		"storeRaft":    swarm.StoreRaft.Port,
+		"health":       swarm.Health.Port,
+	}
+	seen := map[int32]string{}
+	var portErrors []string
+	for name, port := range ports {
+		if port <= 0 {
+			portErrors = append(portErrors, fmt.Sprintf("spec.swarm.%s.port must be greater than 0", name))
+			continue
+		}
+		if prev, ok := seen[port]; ok {
+			portErrors = append(portErrors, fmt.Sprintf("spec.swarm.%s.port conflicts with spec.swarm.%s.port: %d", name, prev, port))
+			continue
+		}
+		seen[port] = name
+	}
+
+	if len(portErrors) > 0 {
+		return fmt.Errorf("swarm port validation failed:\n  - %s", strings.Join(portErrors, "\n  - "))
+	}
+
+	if swarm.Replicas > 1 {
+		return fmt.Errorf("spec.swarm.replicas > 1 is not supported in the MVP, got %d", swarm.Replicas)
+	}
+
+	if strings.TrimSpace(r.Spec.Storage.SwarmStorage) == "" {
+		return fmt.Errorf("spec.storage.swarmStorage is required when spec.mode=Swarm")
+	}
+
+	if err := r.validateSwarmTopologyIsolation(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *AntflyCluster) validateSwarmTopologyIsolation() error {
+	var errors []string
+
+	if r.Spec.MetadataNodes.Replicas != 0 {
+		errors = append(errors, "spec.metadataNodes.replicas must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.Replicas != 0 {
+		errors = append(errors, "spec.dataNodes.replicas must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.MetadataNodes.Resources != (ResourceSpec{}) {
+		errors = append(errors, "spec.metadataNodes.resources must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.Resources != (ResourceSpec{}) {
+		errors = append(errors, "spec.dataNodes.resources must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.MetadataNodes.MetadataAPI != (APISpec{}) {
+		errors = append(errors, "spec.metadataNodes.metadataAPI must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.MetadataNodes.MetadataRaft != (APISpec{}) {
+		errors = append(errors, "spec.metadataNodes.metadataRaft must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.API != (APISpec{}) {
+		errors = append(errors, "spec.dataNodes.api must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.Raft != (APISpec{}) {
+		errors = append(errors, "spec.dataNodes.raft must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.MetadataNodes.Health != (APISpec{}) {
+		errors = append(errors, "spec.metadataNodes.health must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.Health != (APISpec{}) {
+		errors = append(errors, "spec.dataNodes.health must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.MetadataNodes.UseSpotPods {
+		errors = append(errors, "spec.metadataNodes.useSpotPods must be false when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.UseSpotPods {
+		errors = append(errors, "spec.dataNodes.useSpotPods must be false when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.AutoScaling != nil && r.Spec.DataNodes.AutoScaling.Enabled {
+		errors = append(errors, "spec.dataNodes.autoScaling.enabled must be false when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.MetadataNodes.EnvFrom) > 0 {
+		errors = append(errors, "spec.metadataNodes.envFrom must be empty when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.DataNodes.EnvFrom) > 0 {
+		errors = append(errors, "spec.dataNodes.envFrom must be empty when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.MetadataNodes.Tolerations) > 0 {
+		errors = append(errors, "spec.metadataNodes.tolerations must be empty when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.DataNodes.Tolerations) > 0 {
+		errors = append(errors, "spec.dataNodes.tolerations must be empty when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.MetadataNodes.NodeSelector) > 0 {
+		errors = append(errors, "spec.metadataNodes.nodeSelector must be empty when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.DataNodes.NodeSelector) > 0 {
+		errors = append(errors, "spec.dataNodes.nodeSelector must be empty when spec.mode=Swarm")
+	}
+
+	if r.Spec.MetadataNodes.Affinity != nil {
+		errors = append(errors, "spec.metadataNodes.affinity must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.Affinity != nil {
+		errors = append(errors, "spec.dataNodes.affinity must be unset when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.MetadataNodes.TopologySpreadConstraints) > 0 {
+		errors = append(errors, "spec.metadataNodes.topologySpreadConstraints must be empty when spec.mode=Swarm")
+	}
+
+	if len(r.Spec.DataNodes.TopologySpreadConstraints) > 0 {
+		errors = append(errors, "spec.dataNodes.topologySpreadConstraints must be empty when spec.mode=Swarm")
+	}
+
+	if r.Spec.Storage.MetadataStorage != "" || r.Spec.Storage.DataStorage != "" {
+		errors = append(errors, "spec.storage.metadataStorage and spec.storage.dataStorage must be empty when spec.mode=Swarm")
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("swarm topology validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+
+	return nil
+}
+
+func (r *AntflyCluster) isSwarmMode() bool {
+	return r.effectiveMode() == ClusterModeSwarm
 }
 
 // hasGPUInResourceSpec checks if GPU resources are present in ResourceSpec.

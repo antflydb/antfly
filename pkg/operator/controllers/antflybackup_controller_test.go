@@ -208,3 +208,42 @@ func TestBuildCronJobSpec_WithTables(t *testing.T) {
 		t.Errorf("tables flag not properly set: %s", cmd)
 	}
 }
+
+func TestBuildCronJobSpec_SwarmStillUsesPublicAPIService(t *testing.T) {
+	r := &AntflyBackupReconciler{}
+	backup := &antflyv1.AntflyBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "swarm-backup", Namespace: "default"},
+		Spec: antflyv1.AntflyBackupSpec{
+			ClusterRef:  antflyv1.ClusterReference{Name: "swarm-cluster"},
+			Schedule:    "0 2 * * *",
+			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
+		},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "swarm-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode:  antflyv1.ClusterModeSwarm,
+			Image: "antfly:latest",
+			Swarm: &antflyv1.SwarmSpec{
+				Replicas:     1,
+				NodeID:       1,
+				MetadataAPI:  antflyv1.APISpec{Port: 8080},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+				StoreAPI:     antflyv1.APISpec{Port: 12380},
+				StoreRaft:    antflyv1.APISpec{Port: 9021},
+				Health:       antflyv1.APISpec{Port: 4200},
+			},
+			Storage: antflyv1.StorageSpec{
+				StorageClass: "standard",
+				SwarmStorage: "1Gi",
+			},
+		},
+	}
+
+	spec := r.buildCronJobSpec(backup, cluster)
+	cmd := spec.JobTemplate.Spec.Template.Spec.Containers[0].Args[0]
+
+	if !strings.Contains(cmd, "--url 'http://swarm-cluster-public-api.default.svc.cluster.local'") {
+		t.Fatalf("expected backup URL to continue using public-api service in swarm mode, got: %s", cmd)
+	}
+}
