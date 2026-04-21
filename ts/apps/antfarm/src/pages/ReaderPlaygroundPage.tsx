@@ -154,7 +154,7 @@ const ReaderPlaygroundPage: React.FC = () => {
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/api/models`);
+        const response = await fetch(`${termiteApiUrl}/ml/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           const readers = Object.keys(data.readers || {});
@@ -266,7 +266,7 @@ const ReaderPlaygroundPage: React.FC = () => {
       if (maxTokens && Number.parseInt(maxTokens, 10) > 0)
         body.max_tokens = Number.parseInt(maxTokens, 10);
 
-      const response = await fetchWithRetry(`${termiteApiUrl}/api/read`, {
+      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/read`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),

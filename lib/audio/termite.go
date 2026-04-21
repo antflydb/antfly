@@ -22,7 +22,7 @@ import (
 	"net/http"
 
 	libtermite "github.com/antflydb/antfly/lib/termite"
-	"github.com/antflydb/termite/pkg/client"
+	"github.com/antflydb/antfly/pkg/termite-client"
 )
 
 func init() {

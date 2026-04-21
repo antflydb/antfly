@@ -32,7 +32,7 @@ components:
         metadata:
           $ref: "#/components/schemas/MetadataInfo"
         termite:
-          $ref: "../../termite/pkg/termite/openapi.yaml#/components/schemas/Config"
+          $ref: "../../pkg/termite/openapi.yaml#/components/schemas/Config"
         tls:
           $ref: "#/components/schemas/TLSInfo"
         remote_content:

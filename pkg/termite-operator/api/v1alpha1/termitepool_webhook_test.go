@@ -301,3 +301,12 @@ func TestValidateEKS_ClearlyInvalidInstanceTypes(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateTermitePool_AllowsCustomAntflyCompatibleImage(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Image = "ghcr.io/acme/custom-antfly-runtime:latest"
+
+	if err := pool.ValidateTermitePool(); err != nil {
+		t.Fatalf("expected no error for custom Antfly-compatible image, got: %v", err)
+	}
+}

@@ -18,7 +18,7 @@ import (
 	"context"
 	"testing"
 
-	builtinreranker "github.com/antflydb/termite/pkg/termite/lib/builtin/reranker"
+	builtinreranker "github.com/antflydb/antfly/pkg/termite/lib/builtin/reranker"
 )
 
 func getBuiltinReranker(t *testing.T) *builtinreranker.BuiltinReranker {

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Antfly is a distributed key-value store and vector search engine built on etcd's Raft consensus library. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
 
-Multiple independent Go modules exist (`e2e/`, `pkg/antfly-operator/`, `pkg/client/`, `pkg/libaf/`, etc.) — each must be built from within its own directory. CLI subcommands (query, table, load, etc.) are registered directly on the root command. Git submodule: `termite/`.
+Multiple independent Go modules exist (`e2e/`, `pkg/antfly-operator/`, `pkg/client/`, `pkg/libaf/`, `pkg/termite/`, `pkg/termite-client/`, etc.) — each must be built from within its own directory. CLI subcommands (query, table, load, etc.) are registered directly on the root command.
 
 ## Go Version
 
@@ -100,7 +100,11 @@ go run ./cmd/antfly swarm              # Single-node dev
 Tags follow Go module conventions and trigger CI:
 
 - `v*` — root module release + container build
-- `pkg/antfly-operator/v*` — operator container build
+- `pkg/antfly-operator/v*` — antfly-operator container build
+- `pkg/antfly-proxy/v*` — antfly-proxy container build
+- `pkg/termite/v*` — termite container build (both pure-Go and omni images)
+- `pkg/termite-operator/v*` — termite-operator container build
+- `pkg/termite-proxy/v*` — termite-proxy container build
 
 ## Secrets Management
 

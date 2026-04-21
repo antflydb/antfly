@@ -32,7 +32,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 - **SIMD / SME acceleration** — vector operations use hardware intrinsics via [go-highway](https://github.com/ajroetker/go-highway) on x86 and ARM
 - **Distributed** — Raft consensus, automatic sharding and replication, horizontal scaling
 - **Enrichment pipelines** — [configurable pipelines](src/store/db/indexes/walenricher.go) per index for embeddings, summaries, graph edges, and custom computed fields
-- **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with [Termite](https://github.com/antflydb/termite)
+- **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with [Termite](pkg/termite)
 - **Auth** — built-in [user management](src/usermgr) with API keys, basic auth, and bearer tokens
 - **Backup & restore** — to local disk or S3
 - **Kubernetes operator** — deploy and manage clusters with the [operator](pkg/antfly-operator)
@@ -71,7 +71,7 @@ SELECT * FROM docs WHERE content @@@ 'fix my computer';
 
 ### Termite — ML Inference
 
-[Termite](https://github.com/antflydb/termite) handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. It ships as a [submodule](termite/) and runs automatically in swarm mode — you don't need to set it up separately.
+[Termite](pkg/termite) handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. It ships as an in-tree module (`pkg/termite`) and runs automatically in swarm mode — you don't need to set it up separately.
 
 ## Libraries & Tools
 

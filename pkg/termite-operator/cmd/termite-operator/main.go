@@ -62,7 +62,7 @@ func main() {
 	viper.SetDefault("metrics_bind_address", ":8080")
 	viper.SetDefault("health_probe_bind_address", ":8081")
 	viper.SetDefault("leader_elect", false)
-	viper.SetDefault("termite_image", "antfly/termite:latest")
+	viper.SetDefault("antfly_image", "antfly/antfly:omni")
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("log.style", "json") // JSON for production/k8s
 
@@ -96,8 +96,8 @@ Examples:
   # Run with leader election enabled
   termite-operator --leader-elect
 
-  # Run with custom Termite image
-  termite-operator --termite-image myregistry/termite:v1.0.0
+  # Run with custom Antfly image
+  termite-operator --antfly-image myregistry/antfly:omni
 
   # Run with debug logging
   termite-operator --log-level debug --log-style terminal`,
@@ -115,7 +115,7 @@ Examples:
 	cmd.Flags().Bool("leader-elect", false, "Enable leader election for controller manager")
 
 	// Operator-specific flags
-	cmd.Flags().String("termite-image", "antfly/termite:latest", "Default Termite container image")
+	cmd.Flags().String("antfly-image", "antfly/antfly:omni", "Default Antfly container image for TermitePool pods")
 
 	// Bind flags to viper
 	_ = viper.BindPFlag("log.level", cmd.PersistentFlags().Lookup("log-level"))
@@ -123,7 +123,7 @@ Examples:
 	_ = viper.BindPFlag("metrics_bind_address", cmd.Flags().Lookup("metrics-bind-address"))
 	_ = viper.BindPFlag("health_probe_bind_address", cmd.Flags().Lookup("health-probe-bind-address"))
 	_ = viper.BindPFlag("leader_elect", cmd.Flags().Lookup("leader-elect"))
-	_ = viper.BindPFlag("termite_image", cmd.Flags().Lookup("termite-image"))
+	_ = viper.BindPFlag("antfly_image", cmd.Flags().Lookup("antfly-image"))
 
 	return cmd
 }
@@ -167,7 +167,7 @@ func runOperator(cmd *cobra.Command, args []string) error {
 	metricsAddr := viper.GetString("metrics_bind_address")
 	probeAddr := viper.GetString("health_probe_bind_address")
 	enableLeaderElection := viper.GetBool("leader_elect")
-	termiteImage := viper.GetString("termite_image")
+	antflyImage := viper.GetString("antfly_image")
 
 	// Setup logger using antfly's logging package for consistency
 	logCfg := &logging.Config{
@@ -206,10 +206,10 @@ func runOperator(cmd *cobra.Command, args []string) error {
 
 	// Setup TermitePool controller
 	if err := (&controllers.TermitePoolReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		TermiteImage: termiteImage,
-		Recorder:     mgr.GetEventRecorder("termitepool-controller"),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		AntflyImage: antflyImage,
+		Recorder:    mgr.GetEventRecorder("termitepool-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create TermitePool controller: %w", err)
 	}
@@ -242,7 +242,7 @@ func runOperator(cmd *cobra.Command, args []string) error {
 		"metricsAddr", metricsAddr,
 		"probeAddr", probeAddr,
 		"leaderElection", enableLeaderElection,
-		"termiteImage", termiteImage,
+		"antflyImage", antflyImage,
 	)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

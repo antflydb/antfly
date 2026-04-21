@@ -93,7 +93,7 @@ const TranscribePlaygroundPage: React.FC = () => {
   const { termiteApiUrl } = useApiConfig();
 
   const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: `${termiteApiUrl}/api` }),
+    () => new TermiteClient({ baseUrl: termiteApiUrl }),
     [termiteApiUrl]
   );
 
@@ -367,7 +367,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "cleaning" });
 
         try {
-          const resp = await fetchWithRetry(`${termiteApiUrl}/api/generate`, {
+          const resp = await fetchWithRetry(`${termiteApiUrl}/ml/v1/generate`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -429,7 +429,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     try {
       if (useVAD && selectedChunkerModel && audioDuration != null && audioDuration > 30) {
         // VAD pipeline: chunk -> transcribe each -> optionally clean up
-        const resp = await fetchWithRetry(`${termiteApiUrl}/api/chunk`, {
+        const resp = await fetchWithRetry(`${termiteApiUrl}/ml/v1/chunk`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

@@ -1,0 +1,193 @@
+# Build and test Termite with different inference backends
+#
+# Uses matrix strategy to test:
+# - pure-go: Pure Go backend (full tests)
+# - onnx: ONNX Runtime backend (build + tests)
+# - xla: GoMLX XLA backend with PJRT CPU plugin (build + tests)
+# - omni: Both ONNX + XLA backends (build + tests)
+
+name: Termite Go
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "pkg/termite/**"
+      - "pkg/termite-client/**"
+      - "pkg/libaf/**"
+      - ".github/workflows/termite-go.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "pkg/termite/**"
+      - "pkg/termite-client/**"
+      - "pkg/libaf/**"
+      - ".github/workflows/termite-go.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOKENIZERS_VERSION: "1.26.0"
+  ONNXRUNTIME_VERSION: "1.24.3"
+  GENAI_VERSION: "0.12.1"
+  PJRT_CPU_VERSION: "0.83.1"
+
+jobs:
+  test:
+    name: Test (${{ matrix.backend }})
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    # XLA/omni backends require GLIBC 2.38+ (Ubuntu 24.04)
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [pure-go, onnx, xla, omni]
+        include:
+          - backend: pure-go
+            tags: ""
+            cgo: "0"
+            container: ""
+          - backend: onnx
+            tags: "onnx,ORT"
+            cgo: "1"
+            container: ""
+          - backend: xla
+            tags: "xla,XLA"
+            cgo: "1"
+            container: "ubuntu:24.04"
+          - backend: omni
+            tags: "onnx,ORT,xla,XLA"
+            cgo: "1"
+            container: "ubuntu:24.04"
+
+    steps:
+      - name: Install container prerequisites
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y git ca-certificates curl
+
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set GOEXPERIMENT
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Install build dependencies
+        if: matrix.cgo == '1'
+        run: |
+          if command -v apt-get &> /dev/null; then
+            # In container, we may not have sudo and need more packages
+            if [ -n "${{ matrix.container }}" ]; then
+              apt-get update
+              apt-get install -y build-essential pkg-config curl git ca-certificates
+            else
+              sudo apt-get update
+              sudo apt-get install -y build-essential pkg-config curl
+            fi
+          elif command -v dnf &> /dev/null; then
+            sudo dnf install -y --allowerasing gcc gcc-c++ make pkgconfig curl
+          elif command -v yum &> /dev/null; then
+            sudo yum install -y gcc gcc-c++ make pkgconfig curl
+          fi
+
+      - name: Download libtokenizers
+        if: matrix.cgo == '1'
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "amd64")
+          if [ -n "${{ matrix.container }}" ]; then
+            curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
+              | tar -xzf - -C /usr/local/lib
+            ldconfig
+          else
+            curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
+              | sudo tar -xzf - -C /usr/local/lib
+            sudo ldconfig
+          fi
+
+      - name: Download ONNX Runtime
+        if: matrix.backend == 'onnx' || matrix.backend == 'omni'
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
+          mkdir -p /tmp/onnxruntime
+          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
+            | tar -xzf - --strip-components=1 -C /tmp/onnxruntime
+          echo "CGO_CFLAGS=-I/tmp/onnxruntime/include" >> $GITHUB_ENV
+          echo "CGO_LDFLAGS=-L/tmp/onnxruntime/lib -lonnxruntime" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/tmp/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
+
+      - name: Download ONNX Runtime GenAI
+        if: matrix.backend == 'onnx' || matrix.backend == 'omni'
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "x64")
+          mkdir -p /tmp/onnxruntime-genai
+          curl -fsSL "https://github.com/microsoft/onnxruntime-genai/releases/download/v${GENAI_VERSION}/onnxruntime-genai-${GENAI_VERSION}-linux-${ARCH}.tar.gz" \
+            | tar -xzf - --strip-components=1 -C /tmp/onnxruntime-genai
+          cp /tmp/onnxruntime-genai/lib/libonnxruntime-genai*.so* /tmp/onnxruntime/lib/ 2>/dev/null || true
+          echo "ORTGENAI_DYLIB_PATH=/tmp/onnxruntime/lib/libonnxruntime-genai.so" >> $GITHUB_ENV
+
+      - name: Download PJRT CPU plugin
+        if: matrix.backend == 'xla' || matrix.backend == 'omni'
+        run: |
+          if [ -n "${{ matrix.container }}" ]; then
+            mkdir -p /usr/local/lib/go-xla
+            curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/download/v${PJRT_CPU_VERSION}/pjrt_cpu_linux_amd64.tar.gz" \
+              | tar -xzf - -C /usr/local/lib/go-xla
+            ldconfig
+          else
+            sudo mkdir -p /usr/local/lib/go-xla
+            curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/download/v${PJRT_CPU_VERSION}/pjrt_cpu_linux_amd64.tar.gz" \
+              | sudo tar -xzf - -C /usr/local/lib/go-xla
+            sudo ldconfig
+          fi
+          if [ -n "$LD_LIBRARY_PATH" ]; then
+            echo "LD_LIBRARY_PATH=/usr/local/lib/go-xla:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          else
+            echo "LD_LIBRARY_PATH=/usr/local/lib/go-xla:/usr/local/lib" >> $GITHUB_ENV
+          fi
+          echo "GOMLX_BACKEND=xla:cpu" >> $GITHUB_ENV
+
+      - name: Download dependencies
+        run: |
+          for mod in pkg/termite pkg/termite-client; do
+            (cd $mod && GOWORK=off go mod download)
+          done
+
+      - name: Build
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          if [ -n "${{ matrix.tags }}" ]; then
+            # Backend-specific builds only need pkg/termite
+            cd pkg/termite && GOWORK=off go build -v -tags="${{ matrix.tags }}" ./...
+          else
+            # Pure-go builds both modules
+            for mod in pkg/termite pkg/termite-client; do
+              (cd $mod && GOWORK=off go build -v ./...)
+            done
+          fi
+
+      - name: Test termite
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          if [ -n "${{ matrix.tags }}" ]; then
+            cd pkg/termite && GOWORK=off go test -v -tags="${{ matrix.tags }}" ./...
+          else
+            cd pkg/termite && GOWORK=off go test -v ./...
+          fi
+
+      - name: Test termite-client
+        if: matrix.backend == 'pure-go'
+        run: cd pkg/termite-client && GOWORK=off go test -v ./...

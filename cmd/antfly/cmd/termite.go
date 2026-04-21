@@ -22,9 +22,9 @@ import (
 	"syscall"
 
 	"github.com/antflydb/antfly/src/common"
-	"github.com/antflydb/termite/pkg/termite"
-	"github.com/antflydb/termite/pkg/termite/lib/cli"
-	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
+	"github.com/antflydb/antfly/pkg/termite"
+	"github.com/antflydb/antfly/pkg/termite/lib/cli"
+	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )

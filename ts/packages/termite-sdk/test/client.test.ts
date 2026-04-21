@@ -4,7 +4,7 @@ import { serializeEmbeddings, TermiteClient } from "../src/index.js";
 describe("TermiteClient", () => {
   it("should create a client with base config", () => {
     const client = new TermiteClient({
-      baseUrl: "http://localhost:8080/api",
+      baseUrl: "http://localhost:8080",
     });
     expect(client).toBeDefined();
     expect(client.getRawClient).toBeDefined();
@@ -12,7 +12,7 @@ describe("TermiteClient", () => {
 
   it("should create a client with custom headers", () => {
     const client = new TermiteClient({
-      baseUrl: "http://localhost:8080/api",
+      baseUrl: "http://localhost:8080",
       headers: {
         "X-Custom-Header": "test-value",
       },
@@ -22,7 +22,7 @@ describe("TermiteClient", () => {
 
   it("should have all expected methods", () => {
     const client = new TermiteClient({
-      baseUrl: "http://localhost:8080/api",
+      baseUrl: "http://localhost:8080",
     });
 
     expect(typeof client.embed).toBe("function");
@@ -40,7 +40,7 @@ describe("TermiteClient", () => {
 
   it("should expose raw client for advanced usage", () => {
     const client = new TermiteClient({
-      baseUrl: "http://localhost:8080/api",
+      baseUrl: "http://localhost:8080",
     });
 
     const rawClient = client.getRawClient();
@@ -51,7 +51,21 @@ describe("TermiteClient", () => {
 
   it("should strip trailing slash from baseUrl", () => {
     const client = new TermiteClient({
-      baseUrl: "http://localhost:8080/api/",
+      baseUrl: "http://localhost:8080/",
+    });
+    expect(client).toBeDefined();
+  });
+
+  it("should accept legacy /api-prefixed base URLs", () => {
+    const client = new TermiteClient({
+      baseUrl: "http://localhost:8080/api",
+    });
+    expect(client).toBeDefined();
+  });
+
+  it("should accept explicit /ml/v1-prefixed base URLs", () => {
+    const client = new TermiteClient({
+      baseUrl: "http://localhost:8080/ml/v1",
     });
     expect(client).toBeDefined();
   });
@@ -150,7 +164,7 @@ describe("TermiteClient with mock fetch", () => {
 
       expect(fetch).toHaveBeenCalledTimes(1);
       const [url, options] = vi.mocked(fetch).mock.calls[0];
-      expect(url).toBe("http://localhost:8080/api/embed");
+      expect(url).toBe("http://localhost:8080/ml/v1/embed");
       expect(options?.method).toBe("POST");
       expect(options?.headers).toBeDefined();
       const headers = options?.headers as Record<string, string>;

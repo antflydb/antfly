@@ -33,7 +33,8 @@ py/                  Python SDK
 rs/
   pgaf/              PostgreSQL extension (Rust/pgrx)
   antfly-client/     Generated Rust SDK (shared types with pgaf)
-termite/             ML inference service (git submodule)
+pkg/termite/         ML inference service (Go module)
+pkg/termite-client/  Termite Go SDK (generated from openapi.yaml)
 e2e/                 End-to-end tests
 configs/             Example configuration files
 devops/              Kubernetes manifests (minikube, etc.)
@@ -89,7 +90,7 @@ Run `make help` for the full list. Key targets:
 
 ### Swarm Mode (Single Process)
 
-Runs metadata, storage, and [Termite](https://github.com/antflydb/termite) together:
+Runs metadata, storage, and [Termite](pkg/termite) together:
 
 ```bash
 go run ./cmd/antfly swarm
@@ -137,7 +138,10 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | evalaf antfly plugin | `pkg/evalaf/plugins/antfly/` |
 | Genkit plugin | `pkg/genkit/antfly/` |
 | Genkit OpenRouter | `pkg/genkit/openrouter/` |
-| Termite | `termite/` (submodule, has own Makefile) |
+| Termite | `pkg/termite/` |
+| Termite Go client | `pkg/termite-client/` |
+| Termite operator | `pkg/termite-operator/` |
+| Termite proxy | `pkg/termite-proxy/` |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
 `make tidy` and `make tidy-check` do too.
@@ -243,4 +247,4 @@ go tool goreleaser release --clean
 
 ## License
 
-Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). Packages under `pkg/`, `ts/`, `py/`, `rs/`, and `termite/` are Apache 2.0 — check individual LICENSE files.
+Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). Packages under `pkg/`, `ts/`, `py/`, and `rs/` are Apache 2.0 — check individual LICENSE files.

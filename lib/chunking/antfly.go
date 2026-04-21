@@ -18,7 +18,7 @@ import (
 	"context"
 
 	libafchunking "github.com/antflydb/antfly/pkg/libaf/chunking"
-	termchunking "github.com/antflydb/termite/pkg/termite/lib/chunking"
+	termchunking "github.com/antflydb/antfly/pkg/termite/lib/chunking"
 )
 
 // AntflyProvider provides local chunking without requiring an external Termite service

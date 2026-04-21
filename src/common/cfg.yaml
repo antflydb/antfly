@@ -20,4 +20,4 @@ import-mapping:
   ../../lib/chunking/openapi.yaml: github.com/antflydb/antfly/lib/chunking
   ../../pkg/libaf/logging/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/logging
   ../../pkg/libaf/scraping/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/scraping
-  ../../termite/pkg/termite/openapi.yaml: github.com/antflydb/termite/pkg/termite
+  ../../pkg/termite/openapi.yaml: github.com/antflydb/antfly/pkg/termite

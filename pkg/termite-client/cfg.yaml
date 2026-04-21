@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: oapi
+output: oapi/client.gen.go
+generate:
+  embedded-spec: true
+  models: true
+  client: true
+compatibility:
+  always-prefix-enum-values: true
+output-options:
+  # to make sure that all types are generated
+  skip-prune: true
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true
+import-mapping:
+  ../libaf/chunking/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/chunking
+  ../libaf/logging/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/logging
+  ../libaf/s3/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/s3
+  ../libaf/scraping/openapi.yaml: github.com/antflydb/antfly/pkg/libaf/scraping

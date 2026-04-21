@@ -138,7 +138,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: `${termiteApiUrl}/api` }),
+    () => new TermiteClient({ baseUrl: termiteApiUrl }),
     [termiteApiUrl]
   );
 
@@ -146,7 +146,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await fetchWithRetry(`${termiteApiUrl}/api/models`);
+        const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           const rerankers = Object.keys(data.rerankers || {});

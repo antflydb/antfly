@@ -29,6 +29,7 @@ import (
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
+	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 	"github.com/antflydb/antfly/src/common"
 	antflymcp "github.com/antflydb/antfly/src/mcp"
 	"github.com/antflydb/antfly/src/metadata/foreign"
@@ -39,7 +40,6 @@ import (
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/antflydb/antfly/src/tracing"
 	"github.com/antflydb/antfly/src/usermgr"
-	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -59,11 +59,12 @@ type Runtime struct {
 	tableManager  *tablemgr.TableManager
 	userManager   *usermgr.UserManager
 
-	httpClient  *http.Client
-	httpCloser  io.Closer
-	workerPool  *workerpool.Pool
-	embedCache  *ttlcache.Cache[string, []float32]
-	httpHandler http.Handler
+	httpClient       *http.Client
+	httpCloser       io.Closer
+	workerPool       *workerpool.Pool
+	embedCache       *ttlcache.Cache[string, []float32]
+	httpHandler      http.Handler
+	termiteMLHandler http.Handler
 
 	closeOnce sync.Once
 	closeErr  error
@@ -71,6 +72,12 @@ type Runtime struct {
 
 type RuntimeOptions struct {
 	ExecutionProvider ExecutionProvider
+	// TermiteMLHandler is an optional in-process Termite handler. When set, it
+	// is mounted at /ml/v1/ (and also handles /healthz, /readyz, and
+	// /ml/v1/generate as exposed by pkg/termite.TermiteNode.APIMLHandler).
+	// When nil and config.Termite.ApiUrl is set, the metadata server instead
+	// reverse-proxies /termite/* to that URL.
+	TermiteMLHandler http.Handler
 }
 
 func NewRuntime(
@@ -195,18 +202,19 @@ func NewRuntime(
 	metadataStore.SetLeaderFactory(newMetadataLeaderFactory(zl, node, metadataStore, replMgr))
 
 	runtime := &Runtime{
-		logger:        zl,
-		config:        config,
-		info:          conf,
-		raft:          rs,
-		metadataStore: metadataStore,
-		node:          node,
-		tableManager:  tm,
-		userManager:   um,
-		httpClient:    httpClient,
-		httpCloser:    httpCloser,
-		workerPool:    pool,
-		embedCache:    embeddingCache,
+		logger:           zl,
+		config:           config,
+		info:             conf,
+		raft:             rs,
+		metadataStore:    metadataStore,
+		node:             node,
+		tableManager:     tm,
+		userManager:      um,
+		httpClient:       httpClient,
+		httpCloser:       httpCloser,
+		workerPool:       pool,
+		embedCache:       embeddingCache,
+		termiteMLHandler: opts.TermiteMLHandler,
 	}
 	runtime.httpHandler = runtime.newHTTPHandler()
 	return runtime, nil
@@ -433,7 +441,17 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	}
 	addRegistryProxy(apiRoutes, registryURL)
 
-	if r.config.Termite.ApiUrl != "" {
+	if r.termiteMLHandler != nil {
+		// Mount in-process termite handler at /ml/v1/. The handler's own
+		// mux is already registered with /ml/v1/* routes, so we pass the
+		// full path through without stripping.
+		apiRoutes.Handle("/ml/v1/", r.termiteMLHandler)
+		// Also expose the embedded Termite surface under /termite/* so the
+		// Antfly dashboard and existing clients can treat Termite as a stable
+		// sub-service regardless of whether it runs in-process or standalone.
+		apiRoutes.Handle("/termite/", http.StripPrefix("/termite", r.termiteMLHandler))
+		r.logger.Info("In-process Termite ML handler mounted", zap.String("path", "/ml/v1/"))
+	} else if r.config.Termite.ApiUrl != "" {
 		addTermiteProxy(apiRoutes, r.config.Termite.ApiUrl)
 	}
 

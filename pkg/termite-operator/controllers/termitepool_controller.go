@@ -58,9 +58,9 @@ const (
 // TermitePoolReconciler reconciles a TermitePool object
 type TermitePoolReconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	TermiteImage string
-	Recorder     events.EventRecorder
+	Scheme      *runtime.Scheme
+	AntflyImage string
+	Recorder    events.EventRecorder
 
 	// validationAttempts tracks consecutive validation failure counts per pool
 	// (namespace/name -> int). Reset on successful validation.
@@ -378,9 +378,10 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
 	replicas := pool.Spec.Replicas.Min
 
-	// Build model list for init container pull command
-	// Group models by variant to use --variants flag (backward compatible with older images)
-	// Example: /termite pull --models-dir /models --variants i8 bge-small-en-v1.5 mxbai-rerank-base-v1
+	// Build model list for init container pull command.
+	// Group models by variant to use --variants flag.
+	// Example:
+	//   /antfly termite pull --models-dir /models --variants i8 bge-small-en-v1.5 mxbai-rerank-base-v1
 	variantGroups := make(map[string][]string) // variant -> []model names
 	for _, m := range pool.Spec.Models.Preload {
 		variant := m.Variant
@@ -390,26 +391,41 @@ func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *
 		variantGroups[variant] = append(variantGroups[variant], m.Name)
 	}
 
-	// Build pull command(s) - one per variant group, sorted for deterministic ordering
+	// Build preload init containers - one per variant group, sorted for deterministic ordering.
 	variants := make([]string, 0, len(variantGroups))
 	for v := range variantGroups {
 		variants = append(variants, v)
 	}
 	slices.Sort(variants)
 
-	var pullCmds []string
-	for _, variant := range variants {
-		names := variantGroups[variant]
-		slices.Sort(names) // Sort model names too for consistency
-		pullCmds = append(pullCmds, fmt.Sprintf("/termite pull --models-dir /models --variants %s %s",
-			variant, strings.Join(names, " ")))
-	}
-	pullCmd := strings.Join(pullCmds, " && ")
-
 	// Determine image
-	image := r.TermiteImage
+	image := r.AntflyImage
 	if pool.Spec.Image != "" {
 		image = pool.Spec.Image
+	}
+
+	initContainers := make([]corev1.Container, 0, len(variants))
+	for i, variant := range variants {
+		names := variantGroups[variant]
+		slices.Sort(names) // Sort model names too for consistency
+
+		args := []string{"termite", "pull", "--models-dir", "/models", "--variants", variant}
+		args = append(args, names...)
+
+		initContainers = append(initContainers, corev1.Container{
+			Name:    fmt.Sprintf("model-puller-%d", i),
+			Image:   image,
+			Command: []string{"/antfly"},
+			Args:    args,
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "models", MountPath: "/models"},
+			},
+			EnvFrom: []corev1.EnvFromSource{
+				{ConfigMapRef: &corev1.ConfigMapEnvSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: pool.Name + "-config"},
+				}},
+			},
+		})
 	}
 
 	sts := &appsv1.StatefulSet{
@@ -429,28 +445,13 @@ func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *
 					Labels: r.labels(pool),
 				},
 				Spec: corev1.PodSpec{
-					InitContainers: []corev1.Container{
-						{
-							Name:    "model-puller",
-							Image:   image,
-							Command: []string{"/bin/sh", "-c"},
-							Args:    []string{pullCmd},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "models", MountPath: "/models"},
-							},
-							EnvFrom: []corev1.EnvFromSource{
-								{ConfigMapRef: &corev1.ConfigMapEnvSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: pool.Name + "-config"},
-								}},
-							},
-						},
-					},
+					InitContainers: initContainers,
 					Containers: []corev1.Container{
 						{
 							Name:    "termite",
 							Image:   image,
-							Command: []string{"/termite"},
-							Args:    []string{"run", "--config", "/config/config.json"},
+							Command: []string{"/antfly"},
+							Args:    []string{"termite", "run", "--config", "/config/config.json"},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: TermiteAPIPort, Protocol: corev1.ProtocolTCP},
 							},
@@ -922,7 +923,7 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.StartupProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/api/models",
+				Path: "/ml/v1/models",
 				Port: intstr.FromString("http"),
 			},
 		},
@@ -933,7 +934,7 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.ReadinessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/api/models",
+				Path: "/ml/v1/models",
 				Port: intstr.FromString("http"),
 			},
 		},
@@ -943,7 +944,7 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.LivenessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/api/models",
+				Path: "/ml/v1/models",
 				Port: intstr.FromString("http"),
 			},
 		},

@@ -1,0 +1,2278 @@
+openapi: "3.0.3"
+info:
+  version: v1alpha1
+  title: Termite API
+  description: |
+    Termite is an Ollama-like local inference server for ONNX-based ML models.
+
+    ## What is Termite
+
+    Termite provides local ML inference with an Ollama-compatible API:
+    - **Embedding Generation**: Text and multimodal (CLIP) embedding models
+    - **Text Chunking**: Semantic chunking with ONNX models or fixed-size fallback
+    - **Reranking**: Relevance re-scoring for search results
+    - **Named Entity Recognition**: Extract persons, organizations, locations from text
+    - **Text Rewriting**: Transform text using Seq2Seq models (question generation, query generation, etc.)
+
+    Download the latest release at https://antfly.io/docs/downloads
+
+    ## When to Use Termite
+
+    Termite can run standalone or as part of an Antfly cluster:
+    - Local ONNX model inference without external API dependencies
+    - Ollama-compatible `/ml/v1/embed` endpoint for embeddings
+    - Semantic text chunking for RAG pipelines
+    - Relevance reranking for improved search quality
+    - Centralized model serving across distributed nodes
+    - Privacy-preserving ML inference (data never leaves your infrastructure)
+
+    ## Features
+
+    ### Embedding Generation
+    - **Models**: ONNX models auto-discovered from `{models_dir}/embedders/`
+    - **API**: Ollama-compatible `/ml/v1/embed` endpoint
+    - **Response Formats**: Binary (default), JSON
+
+    ### Multimodal Support (CLIP)
+    - **Image Embeddings**: CLIP models for joint text-image embedding space
+    - **Input Formats**: Base64 data URIs (`data:image/png;base64,...`) or URLs
+    - **OpenAI-Compatible**: Uses content parts format (`{"type": "image_url", "image_url": {"url": "..."}}`)
+    - **Use Cases**: Image search, cross-modal retrieval, visual similarity
+
+    ### Text Chunking
+    - **Models**: Fixed-size chunking (always available) + ONNX models
+    - **Model Discovery**: Auto-discovers models from `{models_dir}/chunkers/`
+    - **Caching**: 2-minute TTL memory cache
+    - **Fallback**: Falls back to fixed chunking if model fails
+
+    ### Reranking
+    - **Model Discovery**: Auto-discovers ONNX models from `{models_dir}/rerankers/`
+    - **Quantization**: Automatically uses quantized models if available
+    - **Input**: Pre-rendered text prompts (client handles field extraction)
+
+  contact:
+    name: Antfly
+    url: https://github.com/antflydb/antfly
+  license:
+    name: All Rights Reserved
+    url: https://antfly.io/legal
+servers:
+  - url: /ml/v1
+    description: Termite API server
+
+security: []  # No authentication required - Termite runs locally
+
+components:
+  schemas:
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+
+    # Multimodal Content Types (OpenAI-compatible)
+    TextContentPart:
+      type: object
+      description: Text content for embedding
+      required:
+        - type
+        - text
+      properties:
+        type:
+          type: string
+          enum: [text]
+        text:
+          type: string
+          description: Text content to embed
+
+    ImageURL:
+      type: object
+      description: Image URL or data URI
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          description: URL or data URI (data:image/png;base64,...)
+          example: "data:image/png;base64,iVBORw0KGgo..."
+
+    ImageURLContentPart:
+      type: object
+      description: Image content for embedding (OpenAI-compatible format)
+      required:
+        - type
+        - image_url
+      properties:
+        type:
+          type: string
+          enum: [image_url]
+        image_url:
+          $ref: "#/components/schemas/ImageURL"
+
+    MediaContentPart:
+      type: object
+      description: Inline binary media content (audio, image, etc.)
+      required:
+        - type
+        - data
+        - mime_type
+      properties:
+        type:
+          type: string
+          enum: [media]
+        data:
+          type: string
+          format: byte
+          description: "Base64-encoded binary data"
+        mime_type:
+          type: string
+          description: "MIME type (audio/wav, image/gif, image/png, etc.)"
+
+    ContentPart:
+      description: A content part for multimodal input (text, image URL, or inline media)
+      oneOf:
+        - $ref: "#/components/schemas/TextContentPart"
+        - $ref: "#/components/schemas/ImageURLContentPart"
+        - $ref: "#/components/schemas/MediaContentPart"
+
+    # Embedding Types (Ollama-compatible with multimodal extension)
+    EmbedRequest:
+      type: object
+      required:
+        - model
+        - input
+      properties:
+        model:
+          type: string
+          description: Name of the embedder model from models_dir/embedders/
+          example: "BAAI/bge-small-en-v1.5"
+        input:
+          oneOf:
+            - type: string
+              description: Single text string (backward compatible)
+            - type: array
+              items:
+                type: string
+              description: Array of text strings (backward compatible)
+            - type: array
+              items:
+                $ref: "#/components/schemas/ContentPart"
+              description: Array of multimodal content parts (text or images)
+          description: |
+            Input content to embed. Supports three formats:
+            - Single text string: `"hello world"`
+            - Array of text strings: `["hello", "world"]`
+            - Array of content parts (multimodal): `[{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]`
+          example: ["hello world", "machine learning"]
+        truncate:
+          type: boolean
+          default: true
+          description: Truncate input to fit model context length
+        top_k:
+          type: integer
+          description: Maximum number of non-zero entries per sparse vector (only for sparse models, default 256)
+        min_weight:
+          type: number
+          format: float
+          description: Minimum weight threshold for sparse vector entries (only for sparse models, default 0.0)
+
+    EmbedResponse:
+      type: object
+      example:
+        {
+          "model": "BAAI/bge-small-en-v1.5",
+          "embeddings": [[0.0123, -0.0456, 0.0789], [0.0234, -0.0567, 0.0890]],
+        }
+      required:
+        - model
+      properties:
+        model:
+          type: string
+          description: Model used for embedding
+          example: "BAAI/bge-small-en-v1.5"
+        embeddings:
+          type: array
+          items:
+            type: array
+            items:
+              type: number
+              format: float
+          description: Array of dense embedding vectors (one per input, populated for dense models)
+        sparse_embeddings:
+          type: array
+          items:
+            $ref: "#/components/schemas/SparseVector"
+          description: Array of sparse embedding vectors (one per input, populated for sparse models)
+
+    SparseVector:
+      type: object
+      description: A sparse vector with parallel index/value arrays, sorted by index ascending
+      required:
+        - indices
+        - values
+      properties:
+        indices:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: Token IDs from the model vocabulary (sorted ascending)
+        values:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Corresponding weights for each index (always positive)
+
+    # Chunking Types - reference existing schemas
+    Chunk:
+      $ref: "../libaf/chunking/openapi.yaml#/components/schemas/Chunk"
+
+    VADOptions:
+      type: object
+      description: "Options for Voice Activity Detection (VAD) based audio segmentation. Termite-specific."
+      properties:
+        min_silence_duration_ms:
+          type: integer
+          description: "Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300."
+        min_speech_duration_ms:
+          type: integer
+          description: "Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250."
+        speech_pad_ms:
+          type: integer
+          description: "Padding (ms) added before and after detected speech. Default: 30."
+        max_segment_duration_ms:
+          type: integer
+          description: "Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000."
+
+    AudioChunkConfig:
+      type: object
+      description: "Audio chunking configuration for Termite, including VAD options."
+      properties:
+        window_duration_ms:
+          type: integer
+          description: "Window duration in milliseconds for fixed-window audio chunking (default: 30000)."
+        overlap_duration_ms:
+          type: integer
+          description: "Overlap duration in milliseconds between audio chunks (default: 0)."
+        vad:
+          $ref: "#/components/schemas/VADOptions"
+
+    ChunkConfig:
+      type: object
+      description: |
+        Configuration for chunking requests to Termite API.
+        Combines shared text options with Termite-specific audio/VAD options.
+      properties:
+        model:
+          type: string
+          description: "The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/."
+          default: "fixed"
+          example: "fixed"
+        max_chunks:
+          type: integer
+          description: "Maximum number of chunks to generate per document."
+        threshold:
+          type: number
+          format: float
+          description: "Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models."
+        text:
+          $ref: "../libaf/chunking/openapi.yaml#/components/schemas/TextChunkOptions"
+        audio:
+          $ref: "#/components/schemas/AudioChunkConfig"
+
+    ChunkRequest:
+      type: object
+      properties:
+        input:
+          description: |
+            Input content to chunk. Supports two formats:
+            - Text string: `"This is a long document..."` (backward compatible)
+            - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
+            - ContentPart: `{"type": "text", "text": "..."}`
+          oneOf:
+            - type: string
+              description: "Text to chunk (backward compatible)"
+            - $ref: "#/components/schemas/ContentPart"
+              description: "Content part (text or media)"
+        text:
+          type: string
+          deprecated: true
+          description: "DEPRECATED: Use 'input' instead. Text to chunk."
+          example: "This is a long document that needs to be split into smaller chunks..."
+        config:
+          $ref: "#/components/schemas/ChunkConfig"
+
+    ChunkResponse:
+      type: object
+      required:
+        - chunks
+        - model
+        - cache_hit
+      example:
+        {
+          "chunks":
+            [
+              {
+                "id": 0,
+                "text": "This is the first chunk...",
+                "start_char": 0,
+                "end_char": 100,
+              },
+              {
+                "id": 1,
+                "text": "This is the second chunk...",
+                "start_char": 90,
+                "end_char": 190,
+              },
+            ],
+          "model": "fixed",
+          "cache_hit": false,
+        }
+      properties:
+        chunks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Chunk"
+          description: Array of text chunks
+        model:
+          type: string
+          description: Chunking model actually used (may differ from requested if fallback occurred)
+          example: "fixed"
+        cache_hit:
+          type: boolean
+          description: Whether result was served from cache
+
+    # Reranking Types
+    RerankRequest:
+      type: object
+      required:
+        - model
+        - query
+        - prompts
+      properties:
+        model:
+          type: string
+          description: Name of reranking model from models_dir/rerankers/
+          example: "BAAI/bge-reranker-v2-m3"
+        query:
+          type: string
+          description: Search query for relevance scoring
+          example: "machine learning applications"
+        prompts:
+          type: array
+          items:
+            type: string
+          description: |
+            Pre-rendered document texts to rerank. The client is responsible for extracting
+            and rendering document fields/templates before calling this endpoint.
+          example:
+            [
+              "Introduction to machine learning...",
+              "Deep learning fundamentals...",
+            ]
+
+    RerankResponse:
+      type: object
+      required:
+        - model
+        - scores
+      properties:
+        model:
+          type: string
+          description: Name of model used for reranking
+        scores:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Relevance scores (one per prompt, same order as input)
+
+    # Recognizer Types
+    RecognizeEntity:
+      type: object
+      required:
+        - text
+        - label
+        - start
+        - end
+        - score
+      properties:
+        text:
+          type: string
+          description: The entity text
+          example: "John Smith"
+        label:
+          type: string
+          description: Entity type (PER, ORG, LOC, MISC)
+          example: "PER"
+        start:
+          type: integer
+          description: Character offset where entity begins
+          example: 0
+        end:
+          type: integer
+          description: Character offset where entity ends (exclusive)
+          example: 10
+        score:
+          type: number
+          format: float
+          description: Confidence score (0.0 to 1.0)
+          example: 0.99
+
+    RecognizeRequest:
+      type: object
+      required:
+        - model
+        - texts
+      properties:
+        model:
+          type: string
+          description: Name of recognizer model from models_dir/recognizers/
+          example: "dslim/bert-base-NER"
+        texts:
+          type: array
+          items:
+            type: string
+          description: Texts to extract entities from
+          example: ["John Smith works at Google.", "Apple Inc. is in Cupertino."]
+        labels:
+          type: array
+          items:
+            type: string
+          description: |
+            Custom entity labels to extract (GLiNER models only).
+            When using a GLiNER model, you can specify any entity types to extract,
+            enabling zero-shot NER without model retraining.
+            If not provided, the model's default labels are used.
+          example: ["person", "company", "product", "date"]
+        relation_labels:
+          type: array
+          items:
+            type: string
+          description: |
+            Relation types to extract (for models with 'relations' capability).
+            Only used when the model supports relation extraction (GLiNER multitask, REBEL).
+            If not provided, the model extracts all relations it can detect.
+          example: ["founded", "works_at", "located_in"]
+        resolver:
+          $ref: '#/components/schemas/ResolverConfig'
+
+    ResolverConfig:
+      type: object
+      description: |
+        Configuration for entity resolution. When present in a RecognizeRequest,
+        the response entities and relations are deduplicated via entity resolution
+        (e.g., "Elon Musk" and "Musk" are merged into a single entity).
+      properties:
+        similarity_threshold:
+          type: number
+          format: float
+          default: 0.85
+          description: Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
+        type_must_match:
+          type: boolean
+          default: true
+          description: Whether entity types must match for merging
+        min_entity_confidence:
+          type: number
+          format: float
+          default: 0.0
+          description: Minimum confidence score for entities to be included
+        min_relation_confidence:
+          type: number
+          format: float
+          default: 0.0
+          description: Minimum confidence score for relations to be included
+        deduplicate_relations:
+          type: boolean
+          default: true
+          description: Whether to deduplicate relations after entity resolution
+        track_provenance:
+          type: boolean
+          default: true
+          description: Whether to track mention provenance for resolved entities
+
+    Relation:
+      type: object
+      required:
+        - head
+        - tail
+        - label
+        - score
+      properties:
+        head:
+          $ref: "#/components/schemas/RecognizeEntity"
+          description: The subject/head entity in the relationship
+        tail:
+          $ref: "#/components/schemas/RecognizeEntity"
+          description: The object/tail entity in the relationship
+        label:
+          type: string
+          description: The relationship type
+          example: "founded"
+        score:
+          type: number
+          format: float
+          description: Confidence score for the relation (0.0 to 1.0)
+          example: 0.95
+
+    RecognizeResponse:
+      type: object
+      required:
+        - model
+        - entities
+      properties:
+        model:
+          type: string
+          description: Name of model used for NER
+        entities:
+          type: array
+          items:
+            type: array
+            items:
+              $ref: "#/components/schemas/RecognizeEntity"
+          description: Array of entity arrays (one per input text)
+        relations:
+          type: array
+          items:
+            type: array
+            items:
+              $ref: "#/components/schemas/Relation"
+          description: |
+            Array of relation arrays (one per input text).
+            Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
+
+    # Rewriter Types (Seq2Seq)
+    RewriteRequest:
+      type: object
+      required:
+        - model
+        - inputs
+      properties:
+        model:
+          type: string
+          description: Name of Seq2Seq rewriter model from models_dir/rewriters/
+          example: "lmqg/flan-t5-small-squad-qg"
+        inputs:
+          type: array
+          items:
+            type: string
+          description: Input texts to rewrite/transform
+          example: ["Translate to German: Hello, how are you?"]
+
+    RewriteResponse:
+      type: object
+      required:
+        - model
+        - texts
+      properties:
+        model:
+          type: string
+          description: Name of model used for rewriting
+        texts:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+          description: Rewritten texts (array of arrays, one per input, multiple per beam)
+
+    # Classifier Types (Zero-Shot Classification)
+    ClassifyRequest:
+      type: object
+      required:
+        - model
+        - texts
+        - labels
+      properties:
+        model:
+          type: string
+          description: Name of classifier model from models_dir/classifiers/
+          example: "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
+        texts:
+          type: array
+          items:
+            type: string
+          description: Texts to classify
+          example: ["I love this product!", "The service was terrible."]
+        labels:
+          type: array
+          items:
+            type: string
+          description: |
+            Candidate labels for zero-shot classification.
+            The model will predict which label(s) best describe each text.
+          example: ["positive", "negative", "neutral"]
+        hypothesis_template:
+          type: string
+          description: |
+            Custom hypothesis template for NLI-based classification.
+            Use "{}" as placeholder for the label.
+            Default: "This example is {}."
+          example: "This text expresses a {} sentiment."
+        multi_label:
+          type: boolean
+          default: false
+          description: |
+            If true, allows multiple labels per text (independent scoring).
+            If false (default), scores are normalized across labels.
+
+    ClassifyResult:
+      type: object
+      required:
+        - label
+        - score
+      properties:
+        label:
+          type: string
+          description: The predicted class/category
+          example: "positive"
+        score:
+          type: number
+          format: float
+          description: Confidence score (0.0 to 1.0)
+          example: 0.95
+
+    ClassifyResponse:
+      type: object
+      required:
+        - model
+        - classifications
+      properties:
+        model:
+          type: string
+          description: Name of model used for classification
+        classifications:
+          type: array
+          items:
+            type: array
+            items:
+              $ref: "#/components/schemas/ClassifyResult"
+          description: |
+            Array of classification results (one per input text).
+            Each result is an array of ClassifyResult sorted by score descending.
+
+    # Extraction Types (GLiNER2)
+    ExtractRequest:
+      type: object
+      required:
+        - model
+        - texts
+        - schema
+      properties:
+        model:
+          type: string
+          description: Name of recognizer model with 'extraction' capability
+          example: "fastino/gliner2-base-v1"
+        texts:
+          type: array
+          items:
+            type: string
+          description: Texts to extract structured data from
+          example: ["John Smith is 30 years old and works at Google."]
+        schema:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          description: |
+            Extraction schema mapping structure names to field definitions.
+            Each field is defined as "field_name::type" where type is "str" or "list".
+            Optional choice fields: "field_name::[opt1|opt2]::str".
+            If no type is specified, defaults to "str".
+          example:
+            person:
+              - "name::str"
+              - "age::str"
+              - "company::str"
+        threshold:
+          type: number
+          format: float
+          description: Score threshold for span extraction (0.0-1.0)
+          default: 0.3
+        flat_ner:
+          type: boolean
+          description: If true, don't allow nested/overlapping entities
+          default: true
+        include_confidence:
+          type: boolean
+          description: If true, include confidence scores in output
+          default: false
+        include_spans:
+          type: boolean
+          description: If true, include character offset spans in output
+          default: false
+
+    ExtractFieldValue:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+          description: The extracted text value
+          example: "John Smith"
+        score:
+          type: number
+          format: float
+          description: Confidence score (only present when include_confidence=true)
+          example: 0.95
+        start:
+          type: integer
+          description: Character offset where value begins (only present when include_spans=true)
+          example: 0
+        end:
+          type: integer
+          description: Character offset where value ends (only present when include_spans=true)
+          example: 10
+
+    ExtractResponse:
+      type: object
+      required:
+        - model
+        - results
+      properties:
+        model:
+          type: string
+          description: Name of model used for extraction
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+          description: |
+            Array of extraction results (one per input text).
+            Each result maps structure names to arrays of extracted instances.
+            Each instance maps field names to ExtractFieldValue (for ::str fields)
+            or arrays of ExtractFieldValue (for ::list fields).
+
+    # Reader Types (OCR/Document Understanding)
+    ReadRequest:
+      type: object
+      required:
+        - model
+        - images
+      properties:
+        model:
+          type: string
+          description: Name of reader model from models_dir/readers/
+          example: "microsoft/trocr-base-printed"
+        images:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImageURL"
+          description: |
+            Images to read text from. Supports:
+            - Data URIs: `data:image/png;base64,...`
+            - URLs (if content_security allows)
+          example:
+            - url: "data:image/png;base64,iVBORw0KGgo..."
+        prompt:
+          type: string
+          description: |
+            Optional task prompt for document understanding models.
+            - TrOCR: Not used (pure OCR)
+            - Donut CORD: "<s_cord-v2>" for receipt parsing
+            - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
+            - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
+          example: "<s_cord-v2>"
+        max_tokens:
+          type: integer
+          description: Maximum tokens to generate
+          default: 256
+          example: 256
+
+    TextRegion:
+      type: object
+      required:
+        - text
+        - bbox
+      properties:
+        text:
+          type: string
+          description: Recognized text within the region
+        bbox:
+          type: array
+          items:
+            type: number
+          minItems: 4
+          maxItems: 4
+          description: "Bounding box [x1, y1, x2, y2] in pixel coordinates"
+        confidence:
+          type: number
+          description: Recognition confidence score (0-1)
+        label:
+          type: string
+          description: Semantic label from layout analysis (e.g., text, title, table)
+    ReadResult:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: Extracted text from the image
+          example: "Invoice Total: $123.45"
+        fields:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Structured fields extracted by document understanding models (Donut, Florence-2).
+            Fields are flattened with dot notation for nested structures.
+            Only present for models that output structured data.
+          example:
+            menu.nm: "Coffee"
+            menu.price: "$3.50"
+            total: "$123.45"
+        regions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TextRegion"
+          description: |
+            Individual text regions with bounding boxes and recognized text.
+            Populated by multi-stage OCR models (Surya, PaddleOCR).
+
+    ReadResponse:
+      type: object
+      required:
+        - model
+        - results
+      properties:
+        model:
+          type: string
+          description: Name of model used for reading
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReadResult"
+          description: Array of read results (one per input image)
+
+    # Transcriber Types (Speech-to-Text)
+    TranscribeRequest:
+      type: object
+      required:
+        - audio
+      properties:
+        model:
+          type: string
+          description: Name of transcriber model from models_dir/transcribers/
+          example: "openai/whisper-tiny"
+        audio:
+          type: string
+          format: byte
+          description: Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+        language:
+          type: string
+          description: Force specific language for transcription (optional, model-dependent)
+          example: "en"
+
+    TranscribeResponse:
+      type: object
+      required:
+        - model
+        - text
+      properties:
+        model:
+          type: string
+          description: Name of model used for transcription
+        text:
+          type: string
+          description: Transcribed text from the audio
+          example: "Hello, how are you today?"
+        language:
+          type: string
+          description: Detected or forced language
+          example: "en"
+
+    # Models Types
+    ModelInfo:
+      type: object
+      description: Information about a model including its capabilities
+      properties:
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: List of capabilities this model supports (omitted when empty)
+
+    ModelsResponse:
+      type: object
+      required:
+        - chunkers
+        - rerankers
+        - embedders
+        - generators
+        - recognizers
+        - extractors
+        - rewriters
+        - classifiers
+        - readers
+        - transcribers
+      properties:
+        chunkers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available chunking models (always includes "fixed")
+        rerankers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available reranking models
+        classifiers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available zero-shot classification models
+        embedders:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available embedding models from models_dir/embedders/
+        extractors:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available extractor models (NER models with 'extraction' capability)
+        generators:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available generator/LLM models from models_dir/generators/
+        recognizers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available recognizer models from models_dir/recognizers/
+        rewriters:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available Seq2Seq rewriter models from models_dir/rewriters/
+        readers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available reader/OCR models from models_dir/readers/
+        transcribers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInfo'
+          description: Available transcriber/speech-to-text models from models_dir/transcribers/
+
+    # Tool Calling Types (OpenAI-compatible)
+    Tool:
+      type: object
+      description: A tool (function) that the model can call
+      required:
+        - type
+        - function
+      properties:
+        type:
+          type: string
+          enum: [function]
+          description: The type of tool (currently only "function" is supported)
+        function:
+          $ref: "#/components/schemas/FunctionDefinition"
+
+    FunctionDefinition:
+      type: object
+      description: Definition of a function that can be called by the model
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: The name of the function to call
+          example: "get_weather"
+        description:
+          type: string
+          description: A description of what the function does
+          example: "Get the current weather in a location"
+        parameters:
+          type: object
+          additionalProperties: true
+          description: JSON Schema object describing the function parameters
+          example:
+            type: object
+            properties:
+              location:
+                type: string
+                description: The city and state, e.g. San Francisco, CA
+            required:
+              - location
+        strict:
+          type: boolean
+          description: Whether to enforce strict parameter validation
+          default: false
+
+    ToolCall:
+      type: object
+      description: A tool call made by the model
+      required:
+        - id
+        - type
+        - function
+      properties:
+        id:
+          type: string
+          description: Unique identifier for this tool call
+          example: "call_abc123"
+        type:
+          type: string
+          enum: [function]
+          description: The type of tool call (currently only "function")
+        function:
+          $ref: "#/components/schemas/ToolCallFunction"
+
+    ToolCallFunction:
+      type: object
+      description: The function called by the model
+      required:
+        - name
+        - arguments
+      properties:
+        name:
+          type: string
+          description: The name of the function called
+          example: "get_weather"
+        arguments:
+          type: string
+          description: JSON string of the arguments to the function
+          example: '{"location": "San Francisco, CA"}'
+
+    ToolChoice:
+      description: |
+        Controls how the model uses tools. Options:
+        - "auto": Model decides whether to call a tool (default)
+        - "none": Model will not call any tools
+        - "required": Model must call at least one tool
+        - object: Force a specific function to be called
+      oneOf:
+        - type: string
+          enum: [auto, none, required]
+        - type: object
+          description: Force a specific function to be called
+          required: [type, function]
+          properties:
+            type:
+              type: string
+              enum: [function]
+            function:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: The name of the function to call
+
+    # Generation Types (LLM/Chat)
+    Role:
+      type: string
+      enum: [system, user, assistant, tool]
+      description: The role of a message sender in a conversation
+
+    FinishReason:
+      type: string
+      enum:
+        - stop
+        - length
+        - tool_calls
+        - content_filter
+        - function_call
+      description: Reason why generation stopped
+
+    ChatMessageContent:
+      description: |
+        Message content. Supports two formats:
+        - Simple string: "Hello, how are you?"
+        - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
+      oneOf:
+        - type: string
+          description: Simple text content
+        - type: array
+          description: Array of content parts (OpenAI multimodal format)
+          items:
+            $ref: "#/components/schemas/ContentPart"
+
+    ChatMessage:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+        content:
+          $ref: "#/components/schemas/ChatMessageContent"
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolCall"
+          description: Tool calls made by the assistant (only for role=assistant)
+        tool_call_id:
+          type: string
+          description: ID of the tool call this message is responding to (only for role=tool)
+
+    GenerateRequest:
+      type: object
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+          description: Name of the generator model from models_dir/generators/
+          example: "google/gemma-3-1b-it"
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+          description: Conversation messages (OpenAI-compatible format)
+        max_tokens:
+          type: integer
+          description: Maximum tokens to generate
+          default: 256
+          example: 256
+        temperature:
+          type: number
+          format: float
+          description: Sampling temperature (0.0 = deterministic, higher = more random)
+          default: 1.0
+          example: 0.7
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling probability
+          default: 1.0
+        top_k:
+          type: integer
+          description: Top-k sampling (Termite extension, not in OpenAI API)
+          default: 50
+        stream:
+          type: boolean
+          description: If true, partial message deltas will be sent as SSE events
+          default: false
+        tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tool"
+          description: |
+            List of tools (functions) the model can call.
+            Only supported by models with tool_call_format configured.
+        tool_choice:
+          $ref: "#/components/schemas/ToolChoice"
+          description: Controls how the model uses tools
+
+    GenerateResponse:
+      type: object
+      description: OpenAI-compatible chat completion response
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+        - usage
+      properties:
+        id:
+          type: string
+          description: A unique identifier for the chat completion
+          example: "chatcmpl-abc123"
+        object:
+          type: string
+          enum: ["chat.completion"]
+          description: The object type, always "chat.completion"
+        created:
+          type: integer
+          description: Unix timestamp (seconds) when the completion was created
+          example: 1704123456
+        model:
+          type: string
+          description: Model used for generation
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenerateChoice"
+          description: List of completion choices (currently always 1)
+        usage:
+          $ref: "#/components/schemas/GenerateUsage"
+
+    GenerateChoice:
+      type: object
+      required:
+        - index
+        - message
+        - finish_reason
+      properties:
+        index:
+          type: integer
+          description: Index of this choice in the list
+        message:
+          $ref: "#/components/schemas/GenerateMessage"
+        finish_reason:
+          $ref: "#/components/schemas/FinishReason"
+        logprobs:
+          type: object
+          nullable: true
+          description: Log probability information (not supported, always null)
+
+    GenerateMessage:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+        content:
+          type: string
+          nullable: true
+          description: The generated message content (null when tool_calls is present)
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolCall"
+          description: Tool calls made by the model (only present when finish_reason is tool_calls)
+
+    GenerateUsage:
+      type: object
+      required:
+        - prompt_tokens
+        - completion_tokens
+        - total_tokens
+      properties:
+        prompt_tokens:
+          type: integer
+          description: Number of tokens in the prompt
+        completion_tokens:
+          type: integer
+          description: Number of tokens in the completion
+        total_tokens:
+          type: integer
+          description: Total tokens used (prompt + completion)
+
+    GenerateChunk:
+      type: object
+      description: Streaming generation chunk (SSE event data)
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: ["chat.completion.chunk"]
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenerateChunkChoice"
+
+    GenerateChunkChoice:
+      type: object
+      required:
+        - index
+        - delta
+      properties:
+        index:
+          type: integer
+        delta:
+          $ref: "#/components/schemas/GenerateDelta"
+        finish_reason:
+          $ref: "#/components/schemas/FinishReason"
+
+    GenerateDelta:
+      type: object
+      description: Delta content for streaming
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+        content:
+          type: string
+          nullable: true
+          description: Token content delta
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolCallDelta"
+          description: Tool call deltas for streaming tool calls
+
+    ToolCallDelta:
+      type: object
+      description: Incremental tool call data for streaming
+      properties:
+        index:
+          type: integer
+          description: Index of the tool call in the array
+        id:
+          type: string
+          description: Unique identifier (only in first delta for this index)
+        type:
+          type: string
+          enum: [function]
+          description: The type of tool call (only in first delta)
+        function:
+          $ref: "#/components/schemas/ToolCallFunctionDelta"
+
+    ToolCallFunctionDelta:
+      type: object
+      description: Incremental function call data for streaming
+      properties:
+        name:
+          type: string
+          description: Function name (only in first delta)
+        arguments:
+          type: string
+          description: Incremental arguments JSON string
+
+    Config:
+      type: object
+      required:
+        - api_url
+      properties:
+        api_url:
+          type: string
+          format: uri
+          description: "URL of the Termite embedding/chunking service"
+          example: "http://localhost:8080"
+        models_dir:
+          type: string
+          description: |
+            Base directory containing model subdirectories. Termite auto-discovers models from:
+            - `{models_dir}/embedders/` - Embedding models (ONNX)
+            - `{models_dir}/chunkers/` - Chunking models (ONNX)
+            - `{models_dir}/rerankers/` - Reranking models (ONNX)
+            - `{models_dir}/recognizers/` - Recognition models (ONNX)
+            - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+
+            Defaults to ~/.termite/models (set via viper). If not set, only built-in fixed chunking is available.
+          example: "~/.termite/models"
+        content_security:
+          $ref: "../libaf/scraping/openapi.yaml#/components/schemas/ContentSecurityConfig"
+          description: "Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts."
+        s3_credentials:
+          $ref: "../libaf/s3/openapi.yaml#/components/schemas/Credentials"
+          description: "S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail."
+        keep_alive:
+          type: string
+          description: |
+            How long to keep models loaded in memory after last use (Ollama-compatible).
+            Models are automatically unloaded after this duration of inactivity.
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+            where all models are loaded at startup and never unloaded.
+          default: "5m"
+          example: "5m"
+        max_loaded_models:
+          type: integer
+          description: |
+            Maximum total models loaded across all registry types (embedders, rerankers,
+            generators, chunkers, etc.). When the limit is reached, the least-recently-used
+            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+          default: 0
+          example: 3
+        pool_size:
+          type: integer
+          description: |
+            Number of concurrent inference pipelines per model. Each pipeline loads
+            a copy of the model, so higher values use more memory but allow more
+            concurrent requests. Note: pool_size multiplies per-model memory
+            independently of max_loaded_models.
+          default: 1
+          example: 1
+        backend_priority:
+          type: array
+          items:
+            type: string
+          description: |
+            Backend priority order for model loading with optional device specifiers.
+            Format: `backend` or `backend:device` where device defaults to `auto`.
+
+            Termite tries entries in order and uses the first available backend+device
+            combination that supports the model.
+
+            **Backends** (depend on build tags):
+            - `go` - Pure Go inference (always available, CPU only, slowest)
+            - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest)
+            - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU)
+
+            **Devices**:
+            - `auto` - Auto-detect best available (default)
+            - `cuda` - NVIDIA CUDA GPU
+            - `coreml` - Apple CoreML (macOS only, used by ONNX)
+            - `tpu` - Google TPU (used by XLA)
+            - `cpu` - Force CPU only
+
+            **Examples**:
+            - `["onnx", "xla", "go"]` - Try backends with auto device detection
+            - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU
+            - `["onnx:coreml", "go"]` - macOS with CoreML acceleration
+          default: [onnx, xla, go]
+          example: ["onnx:cuda", "xla:tpu", "onnx:cpu", "xla:cpu", "go"]
+        max_concurrent_requests:
+          type: integer
+          description: |
+            Maximum number of concurrent inference requests allowed.
+            Additional requests will be queued up to max_queue_size.
+            Set to 0 for unlimited (default).
+          default: 0
+          example: 4
+        max_queue_size:
+          type: integer
+          description: |
+            Maximum number of requests to queue when max_concurrent_requests is reached.
+            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
+            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+          default: 0
+          example: 100
+        request_timeout:
+          type: string
+          description: |
+            Maximum time to wait for a request to complete, including queue wait time.
+            Use Go duration format: "30s", "1m", "0" (no timeout, default).
+            Requests exceeding this timeout receive 504 Gateway Timeout.
+          default: "0"
+          example: "30s"
+        preload:
+          type: array
+          items:
+            type: string
+          description: |
+            List of model names to preload at startup (Ollama-compatible).
+            These models are loaded immediately when Termite starts, avoiding first-request latency.
+            Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
+            Only effective when keep_alive is non-zero (lazy loading mode).
+          example: ["BAAI/bge-small-en-v1.5", "openai/clip-vit-base-patch32"]
+        max_memory_mb:
+          type: integer
+          description: |
+            Maximum memory (in MB) to use for loaded models.
+            When this limit is approached, least recently used models are unloaded.
+            Set to 0 for unlimited (default). This is an advisory limit - actual memory
+            usage depends on model sizes and may temporarily exceed this value.
+            Works alongside max_loaded_models for fine-grained control.
+          default: 0
+          example: 4096
+        model_strategies:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [eager, lazy, bounded]
+          description: |
+            Per-model loading strategy overrides. Maps model names to their loading strategy.
+            Models not in this map use the default strategy based on keep_alive:
+            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
+            - If keep_alive="0": eager loading (load at startup, never unload)
+
+            When a model has strategy "eager" in this map:
+            - It is loaded at startup (as part of preload)
+            - It is never unloaded, even when keep_alive>0 (pinned in memory)
+
+            This allows mixing eager and lazy models in the same pool.
+          example:
+            BAAI/bge-small-en-v1.5: eager
+            mirth/chonky-mmbert-small-multilingual-1: lazy
+        allow_downloads:
+          type: boolean
+          description: |
+            Whether the dashboard should show model download commands.
+            Defaults to true for standalone/swarm mode. Set to false in managed
+            deployments (e.g., Kubernetes operator) where models are managed externally.
+          default: true
+        log:
+          $ref: "../libaf/logging/openapi.yaml#/components/schemas/Config"
+
+    VersionResponse:
+      type: object
+      required:
+        - version
+        - git_commit
+        - build_time
+        - go_version
+      properties:
+        version:
+          type: string
+          description: Termite version
+          example: "v1.0.0"
+        git_commit:
+          type: string
+          description: Git commit hash
+          example: "abc1234"
+        build_time:
+          type: string
+          description: Build timestamp
+          example: "2024-01-15T10:30:00Z"
+        go_version:
+          type: string
+          description: Go runtime version
+          example: "go1.25.0"
+        allow_downloads:
+          type: boolean
+          description: Whether model downloads are allowed in this deployment
+          example: true
+
+paths:
+  /embed:
+    post:
+      summary: Generate embeddings
+      description: |
+        Generates vector embeddings for input content using local ONNX models.
+        This endpoint is compatible with Ollama's `/api/embed` format for text,
+        and extends it with OpenAI-compatible multimodal support for CLIP models.
+
+        ## Models
+
+        Models are auto-discovered from `models_dir/embedders/` at startup.
+        Use the `/ml/v1/models` endpoint to list available models.
+
+        - **Text-only models** (e.g., BAAI/bge-small-en-v1.5): Accept text strings
+        - **Multimodal models** (e.g., CLIP): Accept text and images via data URIs
+
+        ## Input Formats
+
+        Three formats are supported:
+        - Single text string: `"hello world"`
+        - Array of text strings: `["hello", "world"]` (Ollama-compatible)
+        - Array of content parts: `[{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]` (OpenAI-compatible)
+
+        ## Caching
+
+        Results are cached in memory for 2 minutes. Concurrent identical requests are deduplicated
+        using singleflight to prevent redundant work.
+
+        ## Response Formats
+
+        Supports multiple content types via Accept header:
+        - `application/octet-stream`: Binary serialization (default, most efficient)
+        - `application/json`: JSON response with model name and embeddings
+      operationId: generateEmbeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmbedRequest"
+      responses:
+        "200":
+          description: Embeddings generated successfully
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+                description: Binary-serialized embedding vectors
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmbedResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /chunk:
+    post:
+      summary: Chunk text into smaller segments
+      description: |
+        Splits text into smaller chunks using semantic or fixed-size chunking models.
+
+        ## Models
+
+        ### Fixed Chunking (always available)
+        - Simple token-based splitting with overlap
+        - Use model="fixed"
+        - Fast and deterministic
+
+        ### ONNX Models
+        - Semantic chunking based on content similarity
+        - Models auto-discovered from `models_dir/chunkers/`
+        - Falls back to fixed chunking if model fails
+
+        ## Caching
+
+        Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+      operationId: chunkText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChunkRequest"
+      responses:
+        "200":
+          description: Text chunked successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rerank:
+    post:
+      summary: Rerank prompts by relevance
+      description: |
+        Re-scores pre-rendered text prompts based on relevance to a query using ONNX reranking models.
+
+        ## Client Responsibilities
+
+        The client must:
+        1. Extract relevant fields from documents
+        2. Render any templates
+        3. Send pre-rendered text strings as `prompts`
+
+        This design keeps Termite stateless and allows clients to customize rendering logic.
+
+        ## Models
+
+        - Models are auto-discovered from `models_dir/rerankers/`
+        - Supports quantized models (`model_quantized.onnx`)
+        - Automatically prefers quantized variants if available
+
+        For document-based reranking with field extraction, use the client-side
+        `lib/reranking` package which handles rendering before calling this endpoint.
+      operationId: rerankPrompts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RerankRequest"
+      responses:
+        "200":
+          description: Prompts reranked successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RerankResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Reranking service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /generate:
+    post:
+      summary: Generate text using LLM (OpenAI-compatible)
+      description: |
+        Generates text using local LLM models (e.g., Gemma 3).
+        Fully compatible with the OpenAI Chat Completions API.
+
+        ## Models
+
+        Models are auto-discovered from `models_dir/generators/` at startup.
+        Use the `/ml/v1/models` endpoint to list available models.
+
+        ## Streaming
+
+        Set `stream: true` to receive Server-Sent Events (SSE) with incremental
+        token deltas. Each event contains a `ChatCompletionChunk` object.
+        The stream ends with `data: [DONE]`.
+
+        ## Input Format
+
+        Uses OpenAI-compatible chat format with messages array containing role
+        (system, user, assistant) and content. Set `stream: true` for streaming responses.
+      operationId: generateContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateRequest"
+      responses:
+        "200":
+          description: |
+            Chat completion response. Returns JSON for non-streaming requests,
+            or Server-Sent Events for streaming requests (stream: true).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateResponse"
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/GenerateChunk"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Generation service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /recognize:
+    post:
+      summary: Recognize named entities
+      description: |
+        Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition models.
+
+        ## Entity Types
+
+        Standard CoNLL entity types:
+        - **PER**: Person names (e.g., "John Smith")
+        - **ORG**: Organizations (e.g., "Google", "Apple Inc.")
+        - **LOC**: Locations (e.g., "New York", "France")
+        - **MISC**: Miscellaneous entities
+
+        ## Models
+
+        - Models are auto-discovered from `models_dir/recognizers/`
+        - Supports quantized variants (model_i8.onnx)
+        - Compatible with HuggingFace BERT-based recognition models
+        - GLiNER models support custom entity labels via the `labels` parameter
+      operationId: recognizeEntities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecognizeRequest"
+      responses:
+        "200":
+          description: Entities extracted successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecognizeResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Recognition service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /classify:
+    post:
+      summary: Zero-shot text classification
+      description: |
+        Classifies text into arbitrary categories using NLI-based zero-shot classification models.
+
+        ## How It Works
+
+        Zero-shot classification uses Natural Language Inference (NLI) to classify text
+        without requiring training data for the specific categories. The model determines
+        how well a text "entails" each candidate label.
+
+        ## Models
+
+        - Models are auto-discovered from `models_dir/classifiers/`
+        - Supports multilingual models like mDeBERTa-mnli-xnli
+        - Compatible with HuggingFace NLI/MNLI models exported to ONNX
+
+        ## Use Cases
+
+        - **Sentiment Analysis**: Classify as positive/negative/neutral
+        - **Topic Classification**: Categorize by topic without training
+        - **Intent Detection**: Identify user intents from text
+        - **Content Moderation**: Detect inappropriate content types
+
+        ## Multilingual Support
+
+        The mDeBERTa-mnli-xnli model supports 100+ languages. You can classify text
+        in any supported language using labels in that language.
+      operationId: classifyText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClassifyRequest"
+      responses:
+        "200":
+          description: Classification completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClassifyResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Classification service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rewrite:
+    post:
+      summary: Rewrite text using Seq2Seq models
+      description: |
+        Rewrite/transform text using Seq2Seq models (T5, FLAN-T5, BART, etc.).
+
+        ## Models
+
+        - Models are auto-discovered from `models_dir/rewriters/`
+        - Seq2Seq models have encoder.onnx, decoder-init.onnx, and decoder.onnx files
+        - Compatible with LMQG question generation models
+
+        ## Use Cases
+
+        - **Question Generation**: Generate questions from answer-context pairs
+        - **Query Generation**: Generate search queries from documents
+        - **Paraphrasing**: Rewrite text in different words
+        - **Translation**: Translate text between languages
+      operationId: rewriteText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewriteRequest"
+      responses:
+        "200":
+          description: Text rewritten successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RewriteResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Generation service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /read:
+    post:
+      summary: Read text from images (OCR/document understanding)
+      description: |
+        Extracts text from images using Vision2Seq models like TrOCR, Donut, or Florence-2.
+
+        ## Models
+
+        Models are auto-discovered from `models_dir/readers/` at startup.
+        Use the `/ml/v1/models` endpoint to list available models.
+
+        - **TrOCR**: Pure OCR for printed/handwritten text
+        - **Donut**: Document understanding with structured output (receipts, forms)
+        - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
+
+        ## Task Prompts
+
+        Some models support task prompts for different extraction modes:
+
+        - **Donut CORD**: `<s_cord-v2>` for receipt parsing
+        - **Donut DocVQA**: `<s_docvqa><s_question>...</s_question><s_answer>` for visual QA
+        - **Florence-2 OCR**: `<OCR>` for text extraction
+        - **Florence-2 Caption**: `<CAPTION>` for image description
+      operationId: readImages
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReadRequest"
+      responses:
+        "200":
+          description: Images read successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Reader service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /transcribe:
+    post:
+      summary: Transcribe audio to text (speech-to-text)
+      description: |
+        Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
+
+        ## Models
+
+        Models are auto-discovered from `models_dir/transcribers/` at startup.
+        Use the `/ml/v1/models` endpoint to list available models.
+
+        - **Whisper**: OpenAI's Whisper models (multilingual, automatic language detection)
+        - **Wav2Vec2**: Facebook's Wav2Vec 2.0 models (English-focused)
+        - **HuBERT**: Facebook's HuBERT models (self-supervised)
+
+        ## Audio Input
+
+        Audio data should be base64-encoded. Supported formats depend on the model:
+        - WAV (recommended - raw PCM)
+        - MP3
+        - FLAC
+        - M4A/AAC
+
+        ## Example
+
+        ```json
+        {
+          "model": "openai/whisper-tiny",
+          "audio": "UklGRi..."
+        }
+        ```
+
+        With language hint:
+        ```json
+        {
+          "model": "openai/whisper-tiny",
+          "audio": "UklGRi...",
+          "language": "en"
+        }
+        ```
+      operationId: transcribeAudio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TranscribeRequest"
+      responses:
+        "200":
+          description: Audio transcribed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscribeResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Transcription service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /extract:
+    post:
+      summary: Extract structured data from text
+      description: |
+        Extracts structured data from text using GLiNER2 models.
+        Field names in the schema are treated as NER labels, and the model's
+        span extraction pipeline populates field values.
+
+        ## Schema Format
+
+        The schema maps structure names to arrays of field definitions:
+        ```json
+        {
+          "person": ["name::str", "age::str", "skills::list"]
+        }
+        ```
+
+        Field types:
+        - `::str` - Keep only the top-scoring span (default if no type specified)
+        - `::list` - Keep all extracted spans as an array
+        - `::[opt1|opt2]::str` - Choice field, classified against options
+
+        ## Example
+
+        ```json
+        {
+          "model": "fastino/gliner2-base-v1",
+          "texts": ["John Smith is 30 years old and works at Google."],
+          "schema": {
+            "person": ["name::str", "age::str", "company::str"]
+          }
+        }
+        ```
+
+        Response:
+        ```json
+        {
+          "model": "fastino/gliner2-base-v1",
+          "results": [
+            {
+              "person": [
+                {
+                  "name": {"value": "John Smith"},
+                  "age": {"value": "30"},
+                  "company": {"value": "Google"}
+                }
+              ]
+            }
+          ]
+        }
+        ```
+      operationId: extractJSON
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtractRequest"
+      responses:
+        "200":
+          description: Extraction completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtractResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Extraction service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /models:
+    get:
+      summary: List available models
+      description: |
+        Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and transcriber models.
+
+        ## Embedders
+
+        - ONNX models from `models_dir/embedders/`
+        - Quantized variants have `-i8` suffix
+
+        ## Chunkers
+
+        - Always includes "fixed" (built-in)
+        - Plus any ONNX models from `models_dir/chunkers/`
+
+        ## Rerankers
+
+        - ONNX models from `models_dir/rerankers/`
+        - Empty if no models configured
+
+        ## Generators
+
+        - LLM models from `models_dir/generators/`
+        - Empty if no models configured
+
+        ## Recognizers
+
+        - ONNX models from `models_dir/recognizers/`
+        - Includes GLiNER models for zero-shot recognition
+
+        ## Rewriters
+
+        - Seq2Seq models from `models_dir/rewriters/`
+        - T5, FLAN-T5, BART, and LMQG question generation models
+
+        ## Readers
+
+        - Vision2Seq models from `models_dir/readers/`
+        - TrOCR, Donut, Florence-2 for OCR and document understanding
+
+        ## Transcribers
+
+        - Speech2Seq models from `models_dir/transcribers/`
+        - Whisper, Wav2Vec2, HuBERT for speech-to-text
+
+        Models are discovered at service startup and cached.
+      operationId: listModels
+      responses:
+        "200":
+          description: Models retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelsResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /version:
+    get:
+      summary: Get version information
+      description: Returns Termite version, git commit, build time, and Go runtime version.
+      operationId: getVersion
+      responses:
+        "200":
+          description: Version information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"

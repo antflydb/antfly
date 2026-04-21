@@ -147,7 +147,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: `${termiteApiUrl}/api` }),
+    () => new TermiteClient({ baseUrl: termiteApiUrl }),
     [termiteApiUrl]
   );
 
@@ -161,7 +161,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/api/models`, {
+        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {

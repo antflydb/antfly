@@ -144,7 +144,7 @@ func TestProxyRequestRetriesRetryableStatus(t *testing.T) {
 		RetryOnStatuses: map[int]bool{http.StatusInternalServerError: true},
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
+	req := httptest.NewRequest(http.MethodPost, "/ml/v1/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 
@@ -201,7 +201,7 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 		RetryOnStatuses: map[int]bool{http.StatusInternalServerError: true},
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
+	req := httptest.NewRequest(http.MethodPost, "/ml/v1/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 
@@ -248,7 +248,7 @@ func TestProxyRequestRecordsFailureOnStreamCopyError(t *testing.T) {
 		},
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
+	req := httptest.NewRequest(http.MethodPost, "/ml/v1/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 
@@ -385,7 +385,7 @@ func TestProxyRequestDoesNotMatchHostedSourceRouteFromHeadersAlone(t *testing.T)
 		},
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
+	req := httptest.NewRequest(http.MethodPost, "/ml/v1/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Antfly-Project", "project-1")
 	req.Header.Set("X-Antfly-Organization", "org-1")
@@ -442,7 +442,7 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 		p.RegisterEndpoint("http://queued.internal", "queued", WorkloadTypeGeneral)
 	}()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
+	req := httptest.NewRequest(http.MethodPost, "/ml/v1/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 
@@ -1110,7 +1110,7 @@ func TestProxyRequestKeepsConnectionCountUntilResponseBodyCloses(t *testing.T) {
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModels("http://primary.internal", []string{"model-a"})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", bytes.NewBufferString(`{"model":"model-a"}`))
+	req := httptest.NewRequest(http.MethodPost, "/ml/v1/embed", bytes.NewBufferString(`{"model":"model-a"}`))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 

@@ -1,8 +1,6 @@
 github.com/RaveNoX/go-jsoncommentstrip v1.0.0/go.mod h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk=
 github.com/antflydb/antfly v0.1.0 h1:AsAbizq4hs9vklds9l2W3UygOgWkCV7Q8gvSmiU0s/U=
 github.com/antflydb/antfly v0.1.0/go.mod h1:BTUWXPNcm8oGociowTfc+FPeHlfslh2q66r+/8fWvtc=
-github.com/antflydb/termite/pkg/client v0.0.0-20260326174920-ff3b0abbdcbf h1:durhyBQ5a5jUySgk4t9cPp77LbRBLNQ/3Al9ZYmWCjg=
-github.com/antflydb/termite/pkg/client v0.0.0-20260326174920-ff3b0abbdcbf/go.mod h1:UMLEVSf5O1hfBVWv/bnDN5qCkVEz91XSPKhYnIaUZ/8=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
 github.com/bmatcuk/doublestar v1.1.1/go.mod h1:UD6OnuiIn0yFxxA2le/rnRU1G4RaI4UvFv1sNto9p6w=

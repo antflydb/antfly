@@ -529,7 +529,7 @@ func (r *ModelRegistry) isEndpointAvailableLocked(ep *Endpoint) bool {
 
 // RefreshEndpoint fetches current model list and health from an endpoint
 func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) error {
-	resp, err := r.client.Get(address + "/api/models")
+	resp, err := r.client.Get(address + "/ml/v1/models")
 	if err != nil {
 		r.markUnhealthy(address)
 		return err
@@ -871,9 +871,9 @@ func NewProxy(cfg Config) *Proxy {
 func (p *Proxy) Start(ctx context.Context) error {
 	// Main API mux
 	apiMux := http.NewServeMux()
-	apiMux.HandleFunc("/api/embed", p.handleEmbed)
-	apiMux.HandleFunc("/api/chunk", p.handleChunk)
-	apiMux.HandleFunc("/api/rerank", p.handleRerank)
+	apiMux.HandleFunc("/ml/v1/embed", p.handleEmbed)
+	apiMux.HandleFunc("/ml/v1/chunk", p.handleChunk)
+	apiMux.HandleFunc("/ml/v1/rerank", p.handleRerank)
 	apiMux.HandleFunc("/healthz", p.handleHealth)
 	apiMux.HandleFunc("/readyz", p.handleReady)
 

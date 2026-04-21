@@ -7,7 +7,7 @@ import (
 	"time"
 
 	libtermite "github.com/antflydb/antfly/lib/termite"
-	termiteclient "github.com/antflydb/termite/pkg/client"
+	termiteclient "github.com/antflydb/antfly/pkg/termite-client"
 	"go.uber.org/zap"
 )
 

@@ -4,7 +4,6 @@ FROM golang:1.26-alpine AS builder
 WORKDIR /app
 
 COPY go.mod go.sum ./
-COPY termite /app/termite
 COPY cmd/antfly /app/cmd/antfly
 COPY pkg /app/pkg
 

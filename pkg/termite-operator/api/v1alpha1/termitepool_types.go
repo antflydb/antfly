@@ -120,7 +120,8 @@ type TermitePoolSpec struct {
 	// +optional
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 
-	// Image is the Termite container image
+	// Image is the Antfly container image used for this TermitePool.
+	// The image must provide the `/antfly termite ...` runtime contract.
 	// +optional
 	Image string `json:"image,omitempty"`
 

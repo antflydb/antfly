@@ -67,7 +67,7 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
     const fetchTermiteModels = async () => {
       setTermiteModelsLoading(true);
       try {
-        const response = await fetch(`${termiteApiUrl}/api/models`);
+        const response = await fetch(`${termiteApiUrl}/ml/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           setTermiteEmbedders(Object.keys(data.embedders || {}));

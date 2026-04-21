@@ -21,7 +21,7 @@ import (
 	"time"
 
 	libtermite "github.com/antflydb/antfly/lib/termite"
-	"github.com/antflydb/termite/pkg/client"
+	"github.com/antflydb/antfly/pkg/termite-client"
 )
 
 // TermiteProvider is a client for the Termite chunking service

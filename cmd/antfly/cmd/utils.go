@@ -28,7 +28,7 @@ import (
 	"github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/antflydb/antfly/pkg/libaf/logging"
 	"github.com/antflydb/antfly/src/common"
-	"github.com/antflydb/termite/pkg/termite"
+	"github.com/antflydb/antfly/pkg/termite"
 	"github.com/go-viper/mapstructure/v2"
 	gojson "github.com/goccy/go-json"
 	"github.com/spf13/pflag"

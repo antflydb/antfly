@@ -1298,7 +1298,9 @@ spec:
                     type: string
                 type: object
               image:
-                description: Image is the Termite container image
+                description: |-
+                  Image is the Antfly container image used for this TermitePool.
+                  The image must provide the `/antfly termite ...` runtime contract.
                 type: string
               imagePullSecrets:
                 description: ImagePullSecrets for private registries

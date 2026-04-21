@@ -59,7 +59,7 @@ jobs:
         with:
           version: "0.15.1"
 
-      # Cache ONNX Runtime libraries (versions from termite/scripts/download-onnxruntime.sh)
+      # Cache ONNX Runtime libraries (versions from scripts/download-onnxruntime.sh)
       - name: Cache ONNX Runtime libraries
         id: cache-onnx
         uses: actions/cache@v5
@@ -69,9 +69,9 @@ jobs:
 
       - name: Download ONNX Runtime libraries
         if: steps.cache-onnx.outputs.cache-hit != 'true'
-        run: ./termite/scripts/download-onnxruntime.sh
+        run: ./scripts/download-onnxruntime.sh
 
-      # Cache PJRT libraries (versions from termite/scripts/download-pjrt.sh)
+      # Cache PJRT libraries (versions from scripts/download-pjrt.sh)
       - name: Cache PJRT libraries
         id: cache-pjrt
         uses: actions/cache@v5
@@ -81,7 +81,7 @@ jobs:
 
       - name: Download PJRT libraries
         if: steps.cache-pjrt.outputs.cache-hit != 'true'
-        run: ./termite/scripts/download-pjrt.sh
+        run: ./scripts/download-pjrt.sh
 
       # Cache macOS SDK for cross-compilation
       - name: Cache macOS SDK
