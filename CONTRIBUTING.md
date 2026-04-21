@@ -130,7 +130,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Root | `.` |
 | E2E tests | `e2e/` |
 | Go SDK | `pkg/client/` |
-| Operator | `pkg/operator/` |
+| Operator | `pkg/antfly-operator/` |
 | libaf | `pkg/libaf/` |
 | docsaf | `pkg/docsaf/` |
 | evalaf | `pkg/evalaf/` |
@@ -232,7 +232,7 @@ Example configs live in `configs/`:
 Tags follow Go module conventions and trigger CI:
 
 - `v*` — root module release + container build
-- `pkg/operator/v*` — operator container build
+- `pkg/antfly-operator/v*` — operator container build
 
 ```bash
 export GITHUB_TOKEN=...

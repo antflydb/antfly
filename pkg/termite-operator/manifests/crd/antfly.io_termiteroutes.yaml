@@ -1,0 +1,365 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: termiteroutes.antfly.io
+spec:
+  group: antfly.io
+  names:
+    kind: TermiteRoute
+    listKind: TermiteRouteList
+    plural: termiteroutes
+    singular: termiteroute
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.priority
+      name: Priority
+      type: integer
+    - jsonPath: .status.active
+      name: Active
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: TermiteRoute is the Schema for the termiteroutes API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: TermiteRouteSpec defines the desired state of TermiteRoute
+            properties:
+              fallback:
+                description: Fallback defines behavior when all destinations are unavailable
+                properties:
+                  action:
+                    description: Action is what to do when all destinations fail
+                    enum:
+                    - queue
+                    - reject
+                    - redirect
+                    type: string
+                  errorResponse:
+                    description: ErrorResponse customizes the error response (for
+                      action=reject)
+                    properties:
+                      message:
+                        description: Message is the error message
+                        type: string
+                      retryAfter:
+                        description: RetryAfter suggests when to retry (seconds)
+                        format: int32
+                        type: integer
+                      statusCode:
+                        default: 503
+                        description: StatusCode is the HTTP status code
+                        format: int32
+                        type: integer
+                    type: object
+                  maxQueueTime:
+                    description: MaxQueueTime is max time to queue before rejecting
+                      (for action=queue)
+                    type: string
+                  redirectPool:
+                    description: RedirectPool is the pool to redirect to (for action=redirect)
+                    type: string
+                required:
+                - action
+                type: object
+              match:
+                description: Match defines when this route applies
+                properties:
+                  headers:
+                    additionalProperties:
+                      description: StringMatch defines how to match a string value
+                      properties:
+                        exact:
+                          description: Exact matches the exact value
+                          type: string
+                        prefix:
+                          description: Prefix matches a prefix
+                          type: string
+                        regex:
+                          description: Regex matches a regular expression
+                          type: string
+                      type: object
+                    description: Headers matches request headers
+                    type: object
+                  models:
+                    description: 'Models matches model names (supports wildcards:
+                      "bge-*", "*-rerank-*")'
+                    items:
+                      type: string
+                    type: array
+                  operations:
+                    description: Operations matches specific API operations
+                    items:
+                      description: OperationType represents a Termite API operation
+                      type: string
+                    type: array
+                  source:
+                    description: Source matches the source of the request (e.g., specific
+                      Antfly tables)
+                    properties:
+                      apiKeyPrefixes:
+                        description: APIKeyPrefixes matches requests authenticated
+                          with specific hosted API key prefixes.
+                        items:
+                          type: string
+                        type: array
+                      namespaces:
+                        description: |-
+                          Namespaces is reserved for future authenticated source identity support.
+                          Requests that set this field are currently rejected.
+                        items:
+                          type: string
+                        type: array
+                      organizations:
+                        description: Organizations matches requests authenticated
+                          for specific hosted organizations.
+                        items:
+                          type: string
+                        type: array
+                      projects:
+                        description: Projects matches requests authenticated for specific
+                          hosted projects.
+                        items:
+                          type: string
+                        type: array
+                      serviceAccounts:
+                        description: |-
+                          ServiceAccounts is reserved for future authenticated source identity support.
+                          Requests that set this field are currently rejected.
+                        items:
+                          type: string
+                        type: array
+                      tables:
+                        description: Tables matches requests from specific Antfly
+                          tables
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  timeWindow:
+                    description: TimeWindow restricts when this route is active
+                    properties:
+                      days:
+                        description: Days restricts to specific days (0=Sunday, 6=Saturday)
+                        items:
+                          type: integer
+                        type: array
+                      end:
+                        description: End is the end time in HH:MM format (UTC)
+                        type: string
+                      start:
+                        description: Start is the start time in HH:MM format (UTC)
+                        type: string
+                    required:
+                    - end
+                    - start
+                    type: object
+                type: object
+              priority:
+                default: 100
+                description: |-
+                  Priority determines the order routes are evaluated (higher = first)
+                  Routes with the same priority are evaluated in alphabetical order
+                format: int32
+                type: integer
+              rateLimiting:
+                description: RateLimiting applies rate limits to this route
+                properties:
+                  burstSize:
+                    description: BurstSize allows temporary bursts
+                    format: int32
+                    type: integer
+                  perModel:
+                    description: PerModel applies limits per model (vs global)
+                    type: boolean
+                  requestsPerSecond:
+                    description: RequestsPerSecond limits requests per second
+                    format: int32
+                    type: integer
+                required:
+                - requestsPerSecond
+                type: object
+              retry:
+                description: Retry configures retry behavior for this route
+                properties:
+                  attempts:
+                    default: 3
+                    description: Attempts is the max retry attempts
+                    format: int32
+                    type: integer
+                  perTryTimeout:
+                    description: PerTryTimeout is the timeout per attempt
+                    type: string
+                  retryOn:
+                    description: RetryOn specifies which errors trigger retries
+                    items:
+                      description: RetryCondition defines a condition that triggers
+                        a retry
+                      type: string
+                    type: array
+                type: object
+              route:
+                description: Route defines where to send matching requests
+                items:
+                  description: RouteDestination defines a destination for requests
+                  properties:
+                    condition:
+                      description: Condition makes this destination conditional
+                      properties:
+                        availableReplicas:
+                          description: AvailableReplicas activates when replica count
+                            matches
+                          type: string
+                        latency:
+                          description: Latency activates when the rolling P99 latency
+                            matches (e.g., ">100ms")
+                          type: string
+                        modelLoaded:
+                          description: ModelLoaded activates only if the model is
+                            loaded on this pool
+                          type: boolean
+                        queueDepth:
+                          description: |-
+                            QueueDepth activates when queue depth matches
+                            Supports operators: ">50", "<10", ">=100"
+                          type: string
+                        timeOfDay:
+                          description: TimeOfDay activates during specific hours
+                          properties:
+                            days:
+                              description: Days restricts to specific days (0=Sunday,
+                                6=Saturday)
+                              items:
+                                type: integer
+                              type: array
+                            end:
+                              description: End is the end time in HH:MM format (UTC)
+                              type: string
+                            start:
+                              description: Start is the start time in HH:MM format
+                                (UTC)
+                              type: string
+                          required:
+                          - end
+                          - start
+                          type: object
+                      type: object
+                    pool:
+                      description: Pool is the TermitePool to route to
+                      type: string
+                    weight:
+                      default: 100
+                      description: |-
+                        Weight is the relative weight for this destination (0-100)
+                        Used for traffic splitting between multiple destinations
+                      format: int32
+                      maximum: 100
+                      minimum: 0
+                      type: integer
+                  required:
+                  - pool
+                  type: object
+                type: array
+            required:
+            - match
+            - route
+            type: object
+          status:
+            description: TermiteRouteStatus defines the observed state of TermiteRoute
+            properties:
+              active:
+                description: Active indicates if the route is currently active
+                type: boolean
+              conditions:
+                description: Conditions represent the latest available observations
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the most recent generation observed by the controller.
+                  Used to skip validation when the spec has not changed.
+                format: int64
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

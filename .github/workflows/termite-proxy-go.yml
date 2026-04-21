@@ -1,0 +1,43 @@
+# Termite Proxy CI workflow
+# Runs focused proxy checks and smoke-builds Dockerfile.termite-proxy on PRs/pushes.
+
+name: Termite Proxy Tests
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "pkg/termite-proxy/**"
+      - ".github/workflows/termite-proxy-*.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "pkg/termite-proxy/**"
+      - ".github/workflows/termite-proxy-*.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proxy:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Run proxy unit tests
+        run: cd pkg/termite-proxy && GOWORK=off go test ./...
+
+      - name: Build termite-proxy
+        run: cd pkg/termite-proxy && GOWORK=off go build -v -o ../../termite-proxy ./cmd/termite-proxy
+
+      - name: Smoke test termite-proxy
+        run: timeout 2 ./termite-proxy || [ $? -eq 124 ]

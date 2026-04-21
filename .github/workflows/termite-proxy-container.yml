@@ -1,0 +1,101 @@
+# Termite Proxy Release workflow
+# Builds and publishes container images on pkg/termite-proxy/v* tags
+
+name: Termite Proxy Container
+
+on:
+  push:
+    tags:
+      - "pkg/termite-proxy/v*"  # Triggers on pkg/termite-proxy/v1.0.0, etc.
+
+env:
+  GCP_REGION: us-east5
+  GCP_PROJECT: antfly-image-artifacts
+  GCP_REPOSITORY: antfly-labs
+  IMAGE_NAME: termite-proxy
+
+jobs:
+  publish:
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Google Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GCP_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#pkg/termite-proxy/}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Extracted version: ${VERSION}"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.termite-proxy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/antflydb/termite-proxy:latest
+            ghcr.io/antflydb/termite-proxy:${{ steps.version.outputs.version }}
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+          outputs: type=image,name=target,annotation-index.org.opencontainers.image.description=Load-balancing proxy for Termite ML inference services
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign GHCR container images with annotations (keyless)
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          for tag in latest "${VERSION}"; do
+            cosign sign --yes \
+              -a "repo=${{ github.repository }}" \
+              -a "workflow=${{ github.workflow }}" \
+              -a "ref=${{ github.sha }}" \
+              ghcr.io/antflydb/termite-proxy:${tag}
+          done
+
+      - name: Sign GAR container images with annotations (keyless)
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          for tag in latest "${VERSION}"; do
+            cosign sign --yes \
+              -a "repo=${{ github.repository }}" \
+              -a "workflow=${{ github.workflow }}" \
+              -a "ref=${{ github.sha }}" \
+              ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:${tag}
+          done

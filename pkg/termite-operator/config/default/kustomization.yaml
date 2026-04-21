@@ -1,0 +1,47 @@
+namespace: termite-system
+
+resources:
+  - ../manager
+  - ../webhook
+  - ../certmanager
+
+patches:
+  - path: manager_webhook_patch.yaml
+
+replacements:
+  # Patch the cert-manager Certificate dnsNames with the actual namespace.
+  # Kustomize's namespace transformer only rewrites metadata.namespace,
+  # not arbitrary spec fields like dnsNames.
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: termite-operator-serving-cert
+      fieldPath: metadata.namespace
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: termite-operator-serving-cert
+        fieldPaths:
+          - spec.dnsNames.0
+          - spec.dnsNames.1
+        options:
+          delimiter: '.'
+          index: 1
+  # Patch the webhook namespaceSelector to exclude the actual deployment
+  # namespace. The manifests.yaml hardcodes "termite-system" but kustomize's
+  # namespace transformer doesn't touch namespaceSelector values.
+  - source:
+      kind: Deployment
+      group: apps
+      version: v1
+      name: controller-manager
+      fieldPath: metadata.namespace
+    targets:
+      - select:
+          kind: ValidatingWebhookConfiguration
+          name: termite-operator-validating-webhook-configuration
+        fieldPaths:
+          - webhooks.*.namespaceSelector.matchExpressions.0.values.0

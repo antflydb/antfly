@@ -1,0 +1,34 @@
+# Build the termite-operator binary
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /workspace
+
+# Copy the Go Modules manifests
+COPY pkg/termite-operator/go.mod pkg/termite-operator/go.mod
+COPY pkg/termite-operator/go.sum pkg/termite-operator/go.sum
+
+# Copy the go source
+COPY pkg/termite-operator/ pkg/termite-operator/
+
+WORKDIR /workspace/pkg/termite-operator
+
+# Declare build arguments for multi-arch support (automatically provided by Docker Buildx)
+ARG TARGETOS
+ARG TARGETARCH
+
+# Build for the target platform
+RUN GOEXPERIMENT=simd CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o /workspace/manager ./cmd/termite-operator
+
+# Use distroless as minimal base image to package the manager binary
+# Refer to https://github.com/GoogleContainerTools/distroless for more details
+FROM gcr.io/distroless/static:nonroot
+
+LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
+LABEL org.opencontainers.image.description="Termite Operator - Kubernetes operator for Termite ML inference services"
+LABEL org.opencontainers.image.licenses=Apache-2.0
+
+WORKDIR /
+COPY --from=builder /workspace/manager .
+USER 65532:65532
+
+ENTRYPOINT ["/manager"]

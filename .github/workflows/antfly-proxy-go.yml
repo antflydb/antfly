@@ -7,12 +7,12 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "pkg/proxy/**"
+      - "pkg/antfly-proxy/**"
       - ".github/workflows/antfly-proxy-*.yml"
   pull_request:
     branches: ["main"]
     paths:
-      - "pkg/proxy/**"
+      - "pkg/antfly-proxy/**"
       - ".github/workflows/antfly-proxy-*.yml"
 
 concurrency:
@@ -34,10 +34,10 @@ jobs:
           cache: false
 
       - name: Run proxy unit tests
-        run: cd pkg/proxy && go test ./...
+        run: cd pkg/antfly-proxy && go test ./...
 
       - name: Build antfly-proxy
-        run: cd pkg/proxy && go build -v -o ../../antfly-proxy ./cmd/antfly-proxy
+        run: cd pkg/antfly-proxy && go build -v -o ../../antfly-proxy ./cmd/antfly-proxy
 
       - name: Smoke test antfly-proxy
         run: timeout 2 ./antfly-proxy || [ $? -eq 124 ]

@@ -70,8 +70,8 @@ e2e/backups/*.afb
 !evalaf/plugins/antfly
 !antfly-operator
 !src/metadata/antfarm/antfly-logo_icon-*.png
-!pkg/operator/manifests/crd/antfly.io_*.yaml
-!termite/pkg/operator/manifests/crd/antfly.io_*.yaml
+!pkg/antfly-operator/manifests/crd/antfly.io_*.yaml
+!pkg/termite-operator/manifests/crd/antfly.io_*.yaml
 !.github/workflows/antfly-operator-container.yml
 
 .specify/
