@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/antflydb/termite/pkg/termite/lib/cli"
-	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
+	"github.com/antflydb/antfly/pkg/termite/lib/cli"
+	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 )
 
 // testModelsDir is the shared models directory for all e2e tests

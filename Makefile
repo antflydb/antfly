@@ -5,7 +5,7 @@ SHELL := /bin/bash
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOEXPERIMENT=simd go
 
-# Go modules outside of root and termite (which has its own Makefile)
+# Go modules outside of root
 GO_SUBMODULES := \
 	./e2e \
 	./pkg/client \
@@ -18,6 +18,8 @@ GO_SUBMODULES := \
 	./pkg/evalaf/plugins/antfly \
 	./pkg/genkit/antfly \
 	./pkg/genkit/openrouter \
+	./pkg/termite \
+	./pkg/termite-client \
 	./pkg/termite-operator \
 	./pkg/termite-proxy
 
@@ -94,9 +96,9 @@ build-antfarm-main:
 build-termite-dashboard:
 	@echo "Building termite dashboard (antfarm with VITE_PRODUCTS=termite)..."
 	cd ts && pnpm install && VITE_PRODUCTS=termite pnpm --filter antfarm build
-	@echo "Copying dist files to termite/pkg/termite/dashboard..."
-	rm -rf termite/pkg/termite/dashboard/*
-	cp -r ts/apps/antfarm/dist/* termite/pkg/termite/dashboard/
+	@echo "Copying dist files to pkg/termite/dashboard..."
+	rm -rf pkg/termite/dashboard/*
+	cp -r ts/apps/antfarm/dist/* pkg/termite/dashboard/
 
 build: build-antfarm generate
 	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
@@ -107,7 +109,6 @@ build-docs:
 
 generate: build-docs build-termite-dashboard tidy
 	$(GO) generate ./...
-	$(MAKE) -C ./termite generate
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Generating in $$mod"; \
 		(cd $$mod && go generate ./...) || exit 1; \
@@ -119,7 +120,6 @@ generate: build-docs build-termite-dashboard tidy
 license-headers: ## Add ELv2 license headers to core files missing them
 	$(GO) run github.com/google/addlicense@latest \
 		-f .license-header.txt \
-		-ignore 'termite/**' \
 		-ignore 'lib/multirafthttp/**' \
 		-ignore 'lib/types/**' \
 		-ignore 'pkg/**' \
@@ -143,7 +143,6 @@ license-check: ## Check that all core files have license headers
 	$(GO) run github.com/google/addlicense@latest \
 		-check \
 		-f .license-header.txt \
-		-ignore 'termite/**' \
 		-ignore 'lib/multirafthttp/**' \
 		-ignore 'lib/types/**' \
 		-ignore 'pkg/**' \
@@ -173,7 +172,6 @@ lint:
 		(cd $$mod && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...) && \
 		(cd $$mod && go run github.com/Antonboom/testifylint@latest --fix ./...) || exit 1; \
 	done
-	$(MAKE) -C termite lint
 	cd ts && pnpm run lint
 
 sim-validate:
@@ -193,13 +191,38 @@ sim-soak:
 # Downloads ONNX Runtime and PJRT libraries needed for goreleaser omni builds.
 # Run this before: goreleaser release --snapshot --clean
 #
-# Downloads to termite/onnxruntime and termite/pjrt by default.
+# Downloads to ./onnxruntime and ./pjrt by default.
 # Uses stamp files to skip if already downloaded.
 
-.PHONY: download-omni-deps
+ONNXRUNTIME_ROOT ?= $(CURDIR)/onnxruntime
+PJRT_ROOT ?= $(CURDIR)/pjrt
 
-download-omni-deps:
-	$(MAKE) -C termite download-omni-deps
+ONNXRUNTIME_VERSION ?= 1.24.3
+GENAI_VERSION ?= 0.12.1
+PJRT_VERSION ?= 0.83.4
+
+ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
+PJRT_STAMP := $(PJRT_ROOT)/.version-$(PJRT_VERSION)
+
+$(ONNXRUNTIME_STAMP): scripts/download-onnxruntime.sh
+	@echo "Downloading ONNX Runtime (version changed or first run)..."
+	@rm -f $(ONNXRUNTIME_ROOT)/.version-*
+	ONNXRUNTIME_ROOT=$(ONNXRUNTIME_ROOT) ./scripts/download-onnxruntime.sh $(ONNXRUNTIME_VERSION) $(GENAI_VERSION)
+	@touch $@
+
+$(PJRT_STAMP): scripts/download-pjrt.sh
+	@echo "Downloading PJRT (version changed or first run)..."
+	@rm -f $(PJRT_ROOT)/.version-*
+	PJRT_ROOT=$(PJRT_ROOT) ./scripts/download-pjrt.sh $(PJRT_VERSION)
+	@touch $@
+
+.PHONY: download-omni-deps force-download-omni-deps
+
+download-omni-deps: $(ONNXRUNTIME_STAMP) $(PJRT_STAMP) ## Download ONNX Runtime and PJRT (skips if up-to-date).
+
+force-download-omni-deps: ## Force re-download of ONNX Runtime and PJRT.
+	@rm -f $(ONNXRUNTIME_ROOT)/.version-* $(PJRT_ROOT)/.version-*
+	$(MAKE) download-omni-deps
 
 tidy:
 	$(GO) mod tidy
@@ -225,7 +248,6 @@ update-deps:
 		echo "==> Updating deps in $$mod"; \
 		(cd $$mod && go get -u ./...) || exit 1; \
 	done
-	$(MAKE) -C termite update-deps
 	$(MAKE) tidy
 
 
@@ -239,12 +261,12 @@ update-deps:
 build-omni: download-omni-deps
 	@echo "Building antfly with ONNX + XLA backends (omni)..."
 	@echo "Platform: $(E2E_PLATFORM)"
-	export ONNXRUNTIME_ROOT=$$(pwd)/termite/onnxruntime && \
-	export PJRT_ROOT=$$(pwd)/termite/pjrt && \
+	export ONNXRUNTIME_ROOT=$(ONNXRUNTIME_ROOT) && \
+	export PJRT_ROOT=$(PJRT_ROOT) && \
 	export CGO_ENABLED=1 && \
-	export LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
-	export LD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
-	export DYLD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
+	export LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
+	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
+	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
 	$(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o antfly ./cmd/antfly
 
 
@@ -277,8 +299,7 @@ E2E_TEST ?=
 E2E_TIMEOUT ?= 30m
 E2E_MEMLIMIT ?= 16GiB
 
-e2e-deps:
-	$(MAKE) -C termite download-omni-deps
+e2e-deps: download-omni-deps
 
 e2e: e2e-deps
 	@echo "Running E2E tests with ONNX+XLA build (Termite provider)..."
@@ -289,13 +310,13 @@ ifdef E2E_TEST
 endif
 	@echo "Timeout: $(E2E_TIMEOUT)"
 	@echo "Memory limit: $(E2E_MEMLIMIT)"
-	export ONNXRUNTIME_ROOT=$$(pwd)/termite/onnxruntime && \
-	export PJRT_ROOT=$$(pwd)/termite/pjrt && \
+	export ONNXRUNTIME_ROOT=$(ONNXRUNTIME_ROOT) && \
+	export PJRT_ROOT=$(PJRT_ROOT) && \
 	export CGO_ENABLED=1 && \
 	export GOMEMLIMIT=$(E2E_MEMLIMIT) && \
-	export LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
-	export LD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
-	export DYLD_LIBRARY_PATH=$$(pwd)/termite/onnxruntime/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
+	export LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
+	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
+	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
 	export RUN_EVAL_TESTS=true && \
 	export E2E_PROVIDER=termite && \
 	cd e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
@@ -433,7 +454,9 @@ show-ingress:
 
 .PHONY: operator-build operator-test operator-docker-build operator-lint proxy-docker-build \
         termite-operator-build termite-operator-test termite-operator-lint termite-operator-docker-build \
-        termite-proxy-build termite-proxy-docker-build
+        termite-proxy-build termite-proxy-docker-build \
+        termite-build termite-test termite-lint termite-docker-build termite-omni-docker-build \
+        termite-client-test termite-client-lint
 
 operator-build: ## Build the antfly-operator binary
 	(cd ./pkg/antfly-operator && $(MAKE) build)
@@ -467,6 +490,27 @@ termite-proxy-build: ## Build the termite-proxy binary
 
 termite-proxy-docker-build: ## Build termite-proxy Docker image
 	docker build -t termite-proxy:latest -f ./Dockerfile.termite-proxy .
+
+termite-build: ## Build the termite binary (pure Go)
+	(cd ./pkg/termite && $(GO) build -o ../../termite ./cmd)
+
+termite-test: ## Run termite unit tests (pure Go)
+	(cd ./pkg/termite && $(GO) test ./...)
+
+termite-lint: ## Run linter on termite
+	(cd ./pkg/termite && $(GO) vet ./...)
+
+termite-docker-build: ## Build termite Docker image (pure Go)
+	docker build -t termite:latest -f ./Dockerfile.termite .
+
+termite-omni-docker-build: ## Build termite:omni Docker image (ONNX + XLA)
+	docker build -t termite:omni -f ./Dockerfile.termite-omni .
+
+termite-client-test: ## Run termite-client tests
+	(cd ./pkg/termite-client && $(GO) test ./...)
+
+termite-client-lint: ## Run linter on termite-client
+	(cd ./pkg/termite-client && $(GO) vet ./...)
 
 
 # ====================================================================================

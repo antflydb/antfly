@@ -35,7 +35,7 @@ import (
 
 	antfly "github.com/antflydb/antfly/pkg/client"
 	"github.com/antflydb/antfly/pkg/docsaf"
-	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
+	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"

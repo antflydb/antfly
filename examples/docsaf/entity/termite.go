@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	docsafentity "github.com/antflydb/antfly/pkg/docsaf/entity"
-	termiteclient "github.com/antflydb/termite/pkg/client"
-	"github.com/antflydb/termite/pkg/client/oapi"
+	termiteclient "github.com/antflydb/antfly/pkg/termite-client"
+	"github.com/antflydb/antfly/pkg/termite-client/oapi"
 	"github.com/mbleigh/raymond"
 )
 

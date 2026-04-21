@@ -33,7 +33,7 @@ import (
 	"github.com/antflydb/antfly/src/metadata"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
-	"github.com/antflydb/termite/pkg/termite"
+	"github.com/antflydb/antfly/pkg/termite"
 	"go.uber.org/zap"
 )
 

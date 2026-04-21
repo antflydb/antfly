@@ -25,7 +25,7 @@ import (
 	"testing"
 
 	libafchunking "github.com/antflydb/antfly/pkg/libaf/chunking"
-	termaudio "github.com/antflydb/termite/pkg/termite/lib/audio"
+	termaudio "github.com/antflydb/antfly/pkg/termite/lib/audio"
 )
 
 func TestAntflyProvider_NewChunkerConfig(t *testing.T) {

@@ -18,7 +18,7 @@ import (
 	"context"
 
 	"github.com/antflydb/antfly/lib/ai"
-	builtinembedder "github.com/antflydb/termite/pkg/termite/lib/builtin/embedder"
+	builtinembedder "github.com/antflydb/antfly/pkg/termite/lib/builtin/embedder"
 	"golang.org/x/time/rate"
 )
 

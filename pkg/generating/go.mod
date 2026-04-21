@@ -8,7 +8,7 @@ go 1.26.0
 replace (
 	github.com/antflydb/antfly/pkg/genkit/openrouter => ../genkit/openrouter
 	github.com/antflydb/antfly/pkg/libaf => ../libaf
-	github.com/antflydb/termite/pkg/client => ../../termite/pkg/client
+	github.com/antflydb/antfly/pkg/termite-client => ../termite-client
 	github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc => github.com/dprotaso/go-yit v0.0.0-20250513224043-18a80f8f6df4
 	github.com/getkin/kin-openapi v0.134.0 => github.com/getkin/kin-openapi v0.133.0
 	github.com/oasdiff/yaml v0.0.1 => github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037
@@ -19,7 +19,7 @@ require (
 	github.com/ajroetker/pdf/render v0.0.1-antfly003
 	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0
 	github.com/antflydb/antfly/pkg/libaf v0.0.1
-	github.com/antflydb/termite/pkg/client v0.0.0
+	github.com/antflydb/antfly/pkg/termite-client v0.0.0
 	github.com/firebase/genkit/go v1.5.0
 	github.com/getkin/kin-openapi v0.134.0
 	github.com/oapi-codegen/runtime v1.3.0

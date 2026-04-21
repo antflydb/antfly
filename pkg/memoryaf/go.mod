@@ -4,10 +4,12 @@ go 1.26.0
 
 replace github.com/antflydb/antfly/pkg/libaf => ../libaf
 
+replace github.com/antflydb/antfly/pkg/termite-client => ../termite-client
+
 require (
 	github.com/antflydb/antfly v0.1.0
 	github.com/antflydb/antfly/pkg/client v0.0.0
-	github.com/antflydb/termite/pkg/client v0.0.0-20260326174920-ff3b0abbdcbf
+	github.com/antflydb/antfly/pkg/termite-client v0.0.0
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 	go.uber.org/zap v1.27.1

@@ -130,7 +130,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/api/models`, {
+        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -200,7 +200,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const response = await fetchWithRetry(`${termiteApiUrl}/api/rerank`, {
+      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/rerank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

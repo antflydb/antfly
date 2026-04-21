@@ -10,8 +10,8 @@ on:
       - 'docs/**'
       - 'src/common/openapi.yaml'
       - 'pkg/antfly-operator/docs/**'
-      - 'termite/pkg/termite/openapi.yaml'
-      - 'termite/registry/index.json'
+      - 'pkg/termite/openapi.yaml'
+      - 'pkg/termite/registry/index.json'
 
 jobs:
   trigger:

@@ -11,8 +11,8 @@ replace (
 	github.com/antflydb/antfly/pkg/generating => ../pkg/generating
 	github.com/antflydb/antfly/pkg/genkit/openrouter => ../pkg/genkit/openrouter
 	github.com/antflydb/antfly/pkg/libaf => ../pkg/libaf
-	github.com/antflydb/termite => ../termite
-	github.com/antflydb/termite/pkg/client => ../termite/pkg/client
+	github.com/antflydb/antfly/pkg/termite => ../pkg/termite
+	github.com/antflydb/antfly/pkg/termite-client => ../pkg/termite-client
 )
 
 replace github.com/danaugrs/go-tsne => github.com/danaugrs/go-tsne/tsne v0.0.0-20220306155740-2250969e057f
@@ -32,7 +32,7 @@ require (
 	github.com/antflydb/antfly/pkg/client v0.0.1
 	github.com/antflydb/antfly/pkg/docsaf v0.0.0-00010101000000-000000000000
 	github.com/antflydb/antfly/pkg/libaf v0.0.1
-	github.com/antflydb/termite v0.0.10
+	github.com/antflydb/antfly/pkg/termite v0.0.0
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/johannesboyne/gofakes3 v0.0.0-20260208201424-4c385a1f6a73
 	github.com/minio/minio-go/v7 v7.0.99
@@ -76,7 +76,7 @@ require (
 	github.com/antflydb/antfly/pkg/evalaf v0.0.0 // indirect
 	github.com/antflydb/antfly/pkg/generating v0.0.0 // indirect
 	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0 // indirect
-	github.com/antflydb/termite/pkg/client v0.0.0 // indirect
+	github.com/antflydb/antfly/pkg/termite-client v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.4 // indirect

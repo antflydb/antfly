@@ -922,7 +922,7 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.StartupProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/api/models",
+				Path: "/ml/v1/models",
 				Port: intstr.FromString("http"),
 			},
 		},
@@ -933,7 +933,7 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.ReadinessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/api/models",
+				Path: "/ml/v1/models",
 				Port: intstr.FromString("http"),
 			},
 		},
@@ -943,7 +943,7 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.LivenessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/api/models",
+				Path: "/ml/v1/models",
 				Port: intstr.FromString("http"),
 			},
 		},

@@ -21,7 +21,7 @@ import (
 
 	antfly "github.com/antflydb/antfly/pkg/client"
 	"github.com/antflydb/antfly/pkg/client/query"
-	"github.com/antflydb/termite/pkg/termite/lib/modelregistry"
+	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

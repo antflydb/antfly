@@ -20,7 +20,7 @@ import (
 
 	"github.com/antflydb/antfly/lib/schema"
 	"github.com/antflydb/antfly/lib/template"
-	"github.com/antflydb/termite/pkg/termite/lib/tokenizers"
+	"github.com/antflydb/antfly/pkg/termite/lib/tokenizers"
 )
 
 // DefaultDocumentRenderer is the default handlebars template for rendering document content.

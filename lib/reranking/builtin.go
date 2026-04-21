@@ -19,7 +19,7 @@ import (
 	"fmt"
 
 	"github.com/antflydb/antfly/lib/schema"
-	builtinreranker "github.com/antflydb/termite/pkg/termite/lib/builtin/reranker"
+	builtinreranker "github.com/antflydb/antfly/pkg/termite/lib/builtin/reranker"
 )
 
 // antflyReranker wraps the builtin reranker from termite with per-config field/template settings.

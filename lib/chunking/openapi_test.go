@@ -18,7 +18,7 @@ import (
 	"testing"
 
 	libafchunking "github.com/antflydb/antfly/pkg/libaf/chunking"
-	termchunking "github.com/antflydb/termite/pkg/termite/lib/chunking"
+	termchunking "github.com/antflydb/antfly/pkg/termite/lib/chunking"
 )
 
 func TestNewChunkerConfig(t *testing.T) {

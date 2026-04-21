@@ -28,11 +28,12 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/lib/pebbleutils"
+	libtermite "github.com/antflydb/antfly/lib/termite"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/pkg/libaf/healthserver"
 	"github.com/antflydb/antfly/src/metadata"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/termite/pkg/termite"
+	"github.com/antflydb/antfly/pkg/termite"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -77,9 +78,13 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 
 	id := viper.GetUint64("swarm.id")
 	enableTermite := viper.GetBool("swarm.termite")
-	if enableTermite {
-		viper.SetDefault("termite.api_url", "http://0.0.0.0:11433")
-	}
+	// When termite is enabled, decide whether to run it in-process (mounted on
+	// antfly's metadata listener under /ml/v1/) or as a separate HTTP server.
+	// In-process is the default. If the user explicitly provides
+	// --termite-api-url, we run termite standalone on that URL and the
+	// metadata server reverse-proxies /termite/* to it.
+	termiteAPIURL := viper.GetString("termite.api_url")
+	runTermiteInProcess := enableTermite && termiteAPIURL == ""
 	viper.SetDefault("cors.enabled", true)
 	viper.SetDefault("replication_factor", 1)
 	viper.SetDefault("default_shards_per_table", 1)
@@ -109,7 +114,10 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	metadataReadyC := make(chan struct{})
 	storeReadyC := make(chan struct{})
 	var termiteReadyC chan struct{}
-	if enableTermite {
+	// Only create termiteReadyC when termite is run as a separate HTTP
+	// server. In-process termite is ready as soon as NewTermiteNode returns,
+	// before the metadata server is even started.
+	if enableTermite && !runTermiteInProcess {
 		termiteReadyC = make(chan struct{})
 	}
 
@@ -140,6 +148,30 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 
 	localProvider := metadata.NewDeferredLocalExecutionProvider()
 
+	// If termite is running in-process, construct the node synchronously so
+	// we can mount its /ml/v1/ handler on the metadata server. The node
+	// holds Pebble resources that need to be closed at shutdown.
+	var termiteNode *termite.TermiteNode
+	if runTermiteInProcess {
+		termiteNode = termite.NewTermiteNode(ctx, logger, termiteConfigWithSecurity(config))
+		defer func() {
+			if err := termiteNode.Close(); err != nil {
+				logger.Error("failed to close termite node", zap.Error(err))
+			}
+		}()
+		// Point the default Termite URL at the metadata listener — the
+		// termite-client appends /ml/v1 automatically, and the metadata
+		// handler mounts the in-process TermiteNode under /ml/v1/.
+		libtermite.SetDefaultURL(metaConf.ApiURL)
+	}
+
+	runtimeOpts := metadata.RuntimeOptions{
+		ExecutionProvider: localProvider,
+	}
+	if termiteNode != nil {
+		runtimeOpts.TermiteMLHandler = termiteNode.APIMLHandler()
+	}
+
 	metaRuntime, err := metadata.NewRuntime(
 		logger.Named("metadataServer"),
 		config,
@@ -147,9 +179,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		peers,
 		false,
 		cache,
-		metadata.RuntimeOptions{
-			ExecutionProvider: localProvider,
-		},
+		runtimeOpts,
 	)
 	if err != nil {
 		return fmt.Errorf("creating metadata runtime: %w", err)
@@ -161,7 +191,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	if enableTermite {
+	if enableTermite && !runTermiteInProcess {
 		go termite.RunAsTermite(ctx, logger, termiteConfigWithSecurity(config), termiteReadyC)
 		// Wait for termite to finish Pebble initialization before opening store Pebble.
 		<-termiteReadyC

@@ -150,7 +150,7 @@ describe("TermiteClient with mock fetch", () => {
 
       expect(fetch).toHaveBeenCalledTimes(1);
       const [url, options] = vi.mocked(fetch).mock.calls[0];
-      expect(url).toBe("http://localhost:8080/api/embed");
+      expect(url).toBe("http://localhost:8080/ml/v1/embed");
       expect(options?.method).toBe("POST");
       expect(options?.headers).toBeDefined();
       const headers = options?.headers as Record<string, string>;

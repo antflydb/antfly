@@ -34,10 +34,10 @@ export function BackendInfoBar() {
     async (signal?: AbortSignal) => {
       try {
         const [modelsRes, versionRes] = await Promise.all([
-          fetch(`${termiteApiUrl}/api/models`, {
+          fetch(`${termiteApiUrl}/ml/v1/models`, {
             signal: signal ?? AbortSignal.timeout(5000),
           }),
-          fetch(`${termiteApiUrl}/api/version`, {
+          fetch(`${termiteApiUrl}/ml/v1/version`, {
             signal: signal ?? AbortSignal.timeout(5000),
           }),
         ]);
