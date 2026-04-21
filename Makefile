@@ -455,7 +455,7 @@ show-ingress:
 .PHONY: operator-build operator-test operator-docker-build operator-lint proxy-docker-build \
         termite-operator-build termite-operator-test termite-operator-lint termite-operator-docker-build \
         termite-proxy-build termite-proxy-docker-build \
-        termite-build termite-test termite-lint termite-docker-build \
+        termite-build termite-test termite-lint \
         termite-client-test termite-client-lint
 
 operator-build: ## Build the antfly-operator binary
@@ -499,9 +499,6 @@ termite-test: ## Run termite unit tests (pure Go)
 
 termite-lint: ## Run linter on termite
 	(cd ./pkg/termite && $(GO) vet ./...)
-
-termite-docker-build: ## Build the canonical termite Docker image (ONNX + XLA)
-	docker build -t termite:latest -f ./Dockerfile.termite .
 
 termite-client-test: ## Run termite-client tests
 	(cd ./pkg/termite-client && $(GO) test ./...)

@@ -114,6 +114,13 @@ var _ = Describe("TermitePool Controller", func() {
 			Expect(createdSts.Spec.ServiceName).To(Equal(poolName))
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("termite"))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"termite", "run", "--config", "/config/config.json"}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
+				"termite", "pull", "--models-dir", "/models", "--variants", "f32", "bge-small-en-v1.5",
+			}))
 
 			// Verify TPU node selector
 			Expect(createdSts.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue(
@@ -347,7 +354,7 @@ var _ = Describe("TermitePool Controller", func() {
 	})
 
 	Context("When creating a TermitePool with custom image", func() {
-		It("Should use the custom image in the StatefulSet", func() {
+		It("Should use the custom Antfly image in the StatefulSet", func() {
 			ctx := context.Background()
 
 			pool := &antflyaiv1alpha1.TermitePool{
@@ -357,7 +364,7 @@ var _ = Describe("TermitePool Controller", func() {
 				},
 				Spec: antflyaiv1alpha1.TermitePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
-					Image:        "my-registry/termite:v1.0.0",
+					Image:        "my-registry/antfly:omni-v1.0.0",
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{Name: "test-model"},
@@ -382,9 +389,58 @@ var _ = Describe("TermitePool Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Image).To(Equal("my-registry/termite:v1.0.0"))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Image).To(Equal("my-registry/antfly:omni-v1.0.0"))
 
 			// Cleanup
+			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
+		})
+	})
+
+	Context("When creating a TermitePool with multiple preload variants", func() {
+		It("Should create one direct-exec init container per variant group", func() {
+			ctx := context.Background()
+
+			pool := &antflyaiv1alpha1.TermitePool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "multi-variant-pool",
+					Namespace: poolNamespace,
+				},
+				Spec: antflyaiv1alpha1.TermitePoolSpec{
+					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
+					Models: antflyaiv1alpha1.ModelConfig{
+						Preload: []antflyaiv1alpha1.ModelSpec{
+							{Name: "model-a", Variant: "i8"},
+							{Name: "model-b"},
+							{Name: "model-c", Variant: "i8"},
+						},
+						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
+					},
+					Replicas: antflyaiv1alpha1.ReplicaConfig{
+						Min: 1,
+						Max: 3,
+					},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, pool)).Should(Succeed())
+
+			stsLookupKey := types.NamespacedName{Name: "multi-variant-pool", Namespace: poolNamespace}
+			createdSts := &appsv1.StatefulSet{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, stsLookupKey, createdSts)
+				return err == nil
+			}, timeout, interval).Should(BeTrue())
+
+			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(2))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
+				"termite", "pull", "--models-dir", "/models", "--variants", "f32", "model-b",
+			}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Command).To(Equal([]string{"/antfly"}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Args).To(Equal([]string{
+				"termite", "pull", "--models-dir", "/models", "--variants", "i8", "model-a", "model-c",
+			}))
+
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
 		})
 	})

@@ -83,10 +83,10 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	err = (&TermitePoolReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		TermiteImage: "antfly/termite:test",
-		Recorder:     mgr.GetEventRecorder("termitepool-controller"),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		AntflyImage: "antfly/antfly:omni-test",
+		Recorder:    mgr.GetEventRecorder("termitepool-controller"),
 	}).SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
