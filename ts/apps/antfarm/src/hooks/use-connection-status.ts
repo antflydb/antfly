@@ -48,7 +48,7 @@ export function useConnectionStatus(): ConnectionStatus {
       }
 
       try {
-        const response = await fetch(`${termiteApiUrl}/`, {
+        const response = await fetch(`${termiteApiUrl}/healthz`, {
           method: "GET",
           signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
         });

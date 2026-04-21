@@ -138,7 +138,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: `${termiteApiUrl}/api` }),
+    () => new TermiteClient({ baseUrl: termiteApiUrl }),
     [termiteApiUrl]
   );
 

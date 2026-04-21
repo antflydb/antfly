@@ -93,7 +93,7 @@ const TranscribePlaygroundPage: React.FC = () => {
   const { termiteApiUrl } = useApiConfig();
 
   const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: `${termiteApiUrl}/api` }),
+    () => new TermiteClient({ baseUrl: termiteApiUrl }),
     [termiteApiUrl]
   );
 

@@ -28,7 +28,7 @@ export class TermiteClient {
   private headers: Record<string, string>;
 
   constructor(config: TermiteConfig) {
-    this.baseUrl = config.baseUrl.replace(/\/$/, ""); // Remove trailing slash
+    this.baseUrl = normalizeBaseUrl(config.baseUrl);
     this.headers = {
       "Content-Type": "application/json",
       ...config.headers,
@@ -418,4 +418,22 @@ export class TermiteClient {
   getRawClient() {
     return this.client;
   }
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/$/, "");
+
+  if (trimmed === "" || trimmed === "/") {
+    return "/ml/v1";
+  }
+
+  if (trimmed.endsWith("/ml/v1")) {
+    return trimmed;
+  }
+
+  if (trimmed.endsWith("/api")) {
+    return `${trimmed.slice(0, -4)}/ml/v1`;
+  }
+
+  return `${trimmed}/ml/v1`;
 }

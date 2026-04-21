@@ -29,6 +29,7 @@ import (
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
+	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 	"github.com/antflydb/antfly/src/common"
 	antflymcp "github.com/antflydb/antfly/src/mcp"
 	"github.com/antflydb/antfly/src/metadata/foreign"
@@ -39,7 +40,6 @@ import (
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/antflydb/antfly/src/tracing"
 	"github.com/antflydb/antfly/src/usermgr"
-	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -446,6 +446,10 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 		// mux is already registered with /ml/v1/* routes, so we pass the
 		// full path through without stripping.
 		apiRoutes.Handle("/ml/v1/", r.termiteMLHandler)
+		// Also expose the embedded Termite surface under /termite/* so the
+		// Antfly dashboard and existing clients can treat Termite as a stable
+		// sub-service regardless of whether it runs in-process or standalone.
+		apiRoutes.Handle("/termite/", http.StripPrefix("/termite", r.termiteMLHandler))
 		r.logger.Info("In-process Termite ML handler mounted", zap.String("path", "/ml/v1/"))
 	} else if r.config.Termite.ApiUrl != "" {
 		addTermiteProxy(apiRoutes, r.config.Termite.ApiUrl)

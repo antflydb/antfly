@@ -68,7 +68,6 @@ ENV LD_LIBRARY_PATH="${ONNXRUNTIME_ROOT}/lib:/usr/local/lib"
 
 # Copy module files and local replace targets for dependency caching
 COPY go.mod go.sum ./
-COPY termite /app/termite
 COPY cmd/antfly /app/cmd/antfly
 COPY pkg /app/pkg
 

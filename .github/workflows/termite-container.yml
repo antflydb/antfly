@@ -73,35 +73,19 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Extracted version: ${VERSION}"
 
-      # Build termite:latest (pure Go, multi-arch)
-      - name: Build and push termite:latest
+      # Build the canonical termite container image.
+      - name: Build and push termite image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.termite
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
             ghcr.io/antflydb/termite:latest
             ghcr.io/antflydb/termite:${{ steps.version.outputs.version }}
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-          cache-from: type=gha,scope=termite-base-bookworm
-          cache-to: type=gha,mode=max,scope=termite-base-bookworm
-
-      # Build termite:omni (ONNX + XLA, amd64 only)
-      - name: Build and push termite:omni
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.termite-omni
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ghcr.io/antflydb/termite:omni
-            ghcr.io/antflydb/termite:omni-${{ steps.version.outputs.version }}
-            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:omni
-            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:omni-${{ steps.version.outputs.version }}
           cache-from: type=gha,scope=termite-omni-bookworm
           cache-to: type=gha,mode=max,scope=termite-omni-bookworm
 
@@ -110,7 +94,7 @@ jobs:
       - name: Sign GHCR images (keyless)
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          for tag in latest "${VERSION}" omni "omni-${VERSION}"; do
+          for tag in latest "${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
@@ -122,7 +106,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           GAR_BASE="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}"
-          for tag in latest "${VERSION}" omni "omni-${VERSION}"; do
+          for tag in latest "${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
