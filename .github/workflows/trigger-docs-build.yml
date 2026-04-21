@@ -9,7 +9,7 @@ on:
       - 'examples/**'
       - 'docs/**'
       - 'src/common/openapi.yaml'
-      - 'pkg/operator/docs/**'
+      - 'pkg/antfly-operator/docs/**'
       - 'termite/pkg/termite/openapi.yaml'
       - 'termite/registry/index.json'
 

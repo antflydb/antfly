@@ -1,0 +1,58 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: termite-operator-validating-webhook-configuration
+webhooks:
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: termite-operator-webhook-service
+        namespace: system
+        path: /validate-antfly-io-v1alpha1-termitepool
+    failurePolicy: Fail
+    name: vtermitepool.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - termite-system
+    rules:
+      - apiGroups:
+          - antfly.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - termitepools
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: termite-operator-webhook-service
+        namespace: system
+        path: /validate-antfly-io-v1alpha1-termiteroute
+    failurePolicy: Fail
+    name: vtermiteroute.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - termite-system
+    rules:
+      - apiGroups:
+          - antfly.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - termiteroutes
+    sideEffects: None

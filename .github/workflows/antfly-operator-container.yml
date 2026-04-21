@@ -1,12 +1,12 @@
 # Antfly Operator Release workflow
-# Builds and publishes container images on pkg/operator/v* tags
+# Builds and publishes container images on pkg/antfly-operator/v* tags
 
 name: Antfly Operator Container
 
 on:
   push:
     tags:
-      - "pkg/operator/v*"  # Triggers on pkg/operator/v1.0.0, etc. (matches Go module tag convention)
+      - "pkg/antfly-operator/v*"  # Triggers on pkg/antfly-operator/v1.0.0, etc. (matches Go module tag convention)
 
 env:
   # Google Cloud Artifact Registry configuration
@@ -60,12 +60,12 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
-      # Extract version from tag (strip pkg/operator/ prefix)
+      # Extract version from tag (strip pkg/antfly-operator/ prefix)
       - name: Extract version
         id: version
         run: |
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#pkg/operator/}"
+          VERSION="${TAG#pkg/antfly-operator/}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Extracted version: ${VERSION}"
 
@@ -73,8 +73,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: ./pkg/operator
-          file: ./pkg/operator/Dockerfile
+          context: .
+          file: ./Dockerfile.antfly-operator
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
