@@ -21,9 +21,6 @@ spec:
     - jsonPath: .status.active
       name: Active
       type: boolean
-    - jsonPath: .status.matchedRequests
-      name: Matched
-      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -126,31 +123,33 @@ spec:
                     properties:
                       apiKeyPrefixes:
                         description: APIKeyPrefixes matches requests authenticated
-                          with specific hosted API key prefixes
+                          with specific hosted API key prefixes.
                         items:
                           type: string
                         type: array
                       namespaces:
-                        description: Namespaces matches requests from specific Kubernetes
-                          namespaces
+                        description: |-
+                          Namespaces is reserved for future authenticated source identity support.
+                          Requests that set this field are currently rejected.
                         items:
                           type: string
                         type: array
                       organizations:
                         description: Organizations matches requests authenticated
-                          for specific hosted organizations
+                          for specific hosted organizations.
                         items:
                           type: string
                         type: array
                       projects:
                         description: Projects matches requests authenticated for specific
-                          hosted projects
+                          hosted projects.
                         items:
                           type: string
                         type: array
                       serviceAccounts:
-                        description: ServiceAccounts matches requests from specific
-                          service accounts
+                        description: |-
+                          ServiceAccounts is reserved for future authenticated source identity support.
+                          Requests that set this field are currently rejected.
                         items:
                           type: string
                         type: array
@@ -236,8 +235,8 @@ spec:
                             matches
                           type: string
                         latency:
-                          description: Latency activates when P99 latency matches
-                            (e.g., ">100ms")
+                          description: Latency activates when the rolling P99 latency
+                            matches (e.g., ">100ms")
                           type: string
                         modelLoaded:
                           description: ModelLoaded activates only if the model is
@@ -352,40 +351,6 @@ spec:
                   - type
                   type: object
                 type: array
-              destinationStatus:
-                description: DestinationStatus shows the status of each destination
-                items:
-                  description: DestinationStatus shows the status of a route destination
-                  properties:
-                    activeConnections:
-                      description: ActiveConnections is the current connection count
-                      format: int32
-                      type: integer
-                    healthy:
-                      description: Healthy indicates if the destination is healthy
-                      type: boolean
-                    pool:
-                      description: Pool is the destination pool name
-                      type: string
-                    requestsRouted:
-                      description: RequestsRouted is the total requests routed to
-                        this destination
-                      format: int64
-                      type: integer
-                  required:
-                  - healthy
-                  - pool
-                  type: object
-                type: array
-              lastMatchTime:
-                description: LastMatchTime is when a request last matched this route
-                format: date-time
-                type: string
-              matchedRequests:
-                description: MatchedRequests is the total requests matched by this
-                  route
-                format: int64
-                type: integer
               observedGeneration:
                 description: |-
                   ObservedGeneration is the most recent generation observed by the controller.

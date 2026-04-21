@@ -21,7 +21,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -412,54 +411,36 @@ func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, regis
 }
 
 func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest, registry *ModelRegistry) bool {
-	// Get pool stats
-	endpoints := registry.GetEndpointsForPool(dest.Pool)
-	if len(endpoints) == 0 {
+	stats := registry.PoolConditionStats(dest.Pool, req.Model)
+	if stats.HealthyEndpoints == 0 {
 		return false // Pool has no healthy endpoints
 	}
 
-	// Calculate aggregate stats
-	var totalQueueDepth int32
-	var modelLoaded bool
-	var totalLatency float64
-	var latencySamples int
-	for _, ep := range endpoints {
-		totalQueueDepth += atomic.LoadInt32(&ep.QueueDepth)
-		if info, exists := ep.Models[req.Model]; exists {
-			modelLoaded = true
-			if info.RequestsTotal > 0 {
-				totalLatency += info.AvgLatencyMs / 1000
-				latencySamples++
-			}
-		}
-	}
-	avgQueueDepth := float64(totalQueueDepth) / float64(len(endpoints))
-
 	// Check queue depth condition
 	if dest.QueueDepthCondition != nil {
-		if !dest.QueueDepthCondition.Evaluate(avgQueueDepth) {
+		if !dest.QueueDepthCondition.Evaluate(stats.AvgQueueDepth) {
 			return false
 		}
 	}
 
 	// Check replica condition
 	if dest.ReplicaCondition != nil {
-		if !dest.ReplicaCondition.Evaluate(float64(len(endpoints))) {
+		if !dest.ReplicaCondition.Evaluate(float64(stats.HealthyEndpoints)) {
 			return false
 		}
 	}
 
 	if dest.LatencyCondition != nil {
-		if latencySamples == 0 {
+		if !stats.HasLatency {
 			return false
 		}
-		if !dest.LatencyCondition.Evaluate(totalLatency / float64(latencySamples)) {
+		if !dest.LatencyCondition.Evaluate(stats.P99Latency.Seconds()) {
 			return false
 		}
 	}
 
 	// Check model loaded condition
-	if dest.RequireModelLoaded && !modelLoaded {
+	if dest.RequireModelLoaded && !stats.ModelLoaded {
 		return false
 	}
 

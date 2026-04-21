@@ -115,6 +115,7 @@ type ModelInfo struct {
 	LoadedAt      time.Time
 	RequestsTotal int64
 	AvgLatencyMs  float64
+	Latency       *RollingLatency
 }
 
 // CircuitBreaker implements the circuit breaker pattern
@@ -139,6 +140,30 @@ func NewCircuitBreaker(threshold int32, timeout time.Duration) *CircuitBreaker {
 
 // Allow returns true if the circuit breaker allows a request
 func (cb *CircuitBreaker) Allow() bool {
+	return cb.TryAcquire()
+}
+
+// CanAttempt reports whether the circuit breaker is currently eligible for selection.
+// Unlike TryAcquire, it does not mutate half-open state.
+func (cb *CircuitBreaker) CanAttempt() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	state := atomic.LoadInt32(&cb.state)
+	switch state {
+	case 0: // closed
+		return true
+	case 1: // open
+		return time.Since(cb.lastFailure) > cb.timeout && atomic.LoadInt32(&cb.halfOpenInFlight) == 0
+	case 2: // half-open
+		return false
+	}
+	return false
+}
+
+// TryAcquire reserves permission to send a request through the circuit breaker.
+// In half-open recovery, exactly one caller is allowed to acquire the probe slot.
+func (cb *CircuitBreaker) TryAcquire() bool {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 
@@ -148,7 +173,6 @@ func (cb *CircuitBreaker) Allow() bool {
 		return true
 	case 1: // open
 		if time.Since(cb.lastFailure) > cb.timeout {
-			// Try to become the single "tester" - only 1 allowed in half-open
 			if atomic.CompareAndSwapInt32(&cb.halfOpenInFlight, 0, 1) {
 				atomic.CompareAndSwapInt32(&cb.state, 1, 2) // transition to half-open
 				return true
@@ -157,7 +181,6 @@ func (cb *CircuitBreaker) Allow() bool {
 		}
 		return false
 	case 2: // half-open
-		// Already being tested, don't allow more
 		return false
 	}
 	return false
@@ -187,6 +210,18 @@ func (cb *CircuitBreaker) RecordFailure() {
 	atomic.StoreInt32(&cb.halfOpenInFlight, 0) // reset half-open counter
 }
 
+// ReleaseReservation abandons a claimed half-open probe without recording success or failure.
+func (cb *CircuitBreaker) ReleaseReservation() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if atomic.LoadInt32(&cb.state) == 2 {
+		cb.lastFailure = time.Now()
+		atomic.StoreInt32(&cb.state, 1)
+		atomic.StoreInt32(&cb.halfOpenInFlight, 0)
+	}
+}
+
 // ModelRegistry tracks which models are available on which Termites
 type ModelRegistry struct {
 	endpoints map[string]*Endpoint   // address -> endpoint
@@ -213,6 +248,14 @@ func NewModelRegistry(refreshInterval time.Duration) *ModelRegistry {
 			Timeout: 5 * time.Second,
 		},
 	}
+}
+
+type PoolConditionStats struct {
+	HealthyEndpoints int
+	AvgQueueDepth    float64
+	ModelLoaded      bool
+	P99Latency       time.Duration
+	HasLatency       bool
 }
 
 // RegisterEndpoint adds or updates an endpoint
@@ -302,10 +345,7 @@ func (r *ModelRegistry) UpdateModels(address string, models []string) {
 	// Update models
 	for _, model := range models {
 		if _, exists := ep.Models[model]; !exists {
-			ep.Models[model] = &ModelInfo{
-				Name:     model,
-				LoadedAt: time.Now(),
-			}
+			ep.Models[model] = newModelInfo(model)
 		}
 		delete(oldModels, model)
 
@@ -357,17 +397,18 @@ func (r *ModelRegistry) RecordModelLatency(address, model string, duration time.
 
 	info, exists := ep.Models[model]
 	if !exists {
-		info = &ModelInfo{
-			Name:     model,
-			LoadedAt: time.Now(),
-		}
+		info = newModelInfo(model)
 		ep.Models[model] = info
+	}
+	if info.Latency == nil {
+		info.Latency = NewRollingLatency(defaultLatencyWindowSize)
 	}
 
 	count := info.RequestsTotal
 	latencyMs := float64(duration.Milliseconds())
 	info.AvgLatencyMs = ((info.AvgLatencyMs * float64(count)) + latencyMs) / float64(count+1)
 	info.RequestsTotal++
+	info.Latency.Record(duration)
 }
 
 // GetEndpointsForModel returns endpoints that have a specific model loaded
@@ -375,10 +416,25 @@ func (r *ModelRegistry) GetEndpointsForModel(model string) []*Endpoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	return r.getAvailableEndpointsForModelLocked(model, "")
+}
+
+// GetEndpointsForModelInPool returns endpoints in a specific pool that have a model loaded.
+func (r *ModelRegistry) GetEndpointsForModelInPool(model, pool string) []*Endpoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.getAvailableEndpointsForModelLocked(model, pool)
+}
+
+func (r *ModelRegistry) getAvailableEndpointsForModelLocked(model, pool string) []*Endpoint {
 	endpoints := r.models[model]
 	result := make([]*Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
-		if ep.Healthy && r.circuitBreakers[ep.Address].Allow() {
+		if pool != "" && ep.Pool != pool {
+			continue
+		}
+		if r.isEndpointAvailableLocked(ep) {
 			result = append(result, ep)
 		}
 	}
@@ -393,11 +449,82 @@ func (r *ModelRegistry) GetEndpointsForPool(pool string) []*Endpoint {
 	endpoints := r.pools[pool]
 	result := make([]*Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
-		if ep.Healthy && r.circuitBreakers[ep.Address].Allow() {
+		if r.isEndpointAvailableLocked(ep) {
 			result = append(result, ep)
 		}
 	}
 	return result
+}
+
+func (r *ModelRegistry) PoolConditionStats(pool, model string) PoolConditionStats {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	stats := PoolConditionStats{}
+	endpoints := r.pools[pool]
+	if len(endpoints) == 0 {
+		return stats
+	}
+
+	latencyBuckets := make([]int, latencyBucketCount+1)
+	var totalQueueDepth int64
+	var latencySamples int
+	for _, ep := range endpoints {
+		if !r.isEndpointAvailableLocked(ep) {
+			continue
+		}
+
+		stats.HealthyEndpoints++
+		totalQueueDepth += int64(atomic.LoadInt32(&ep.QueueDepth))
+
+		info, exists := ep.Models[model]
+		if !exists {
+			continue
+		}
+		stats.ModelLoaded = true
+		if info.Latency != nil {
+			latencySamples += info.Latency.MergeInto(latencyBuckets)
+		}
+	}
+
+	if stats.HealthyEndpoints > 0 {
+		stats.AvgQueueDepth = float64(totalQueueDepth) / float64(stats.HealthyEndpoints)
+	}
+	if latencySamples > 0 {
+		stats.P99Latency, stats.HasLatency = QuantileFromBuckets(latencyBuckets, latencySamples, 0.99)
+	}
+
+	return stats
+}
+
+func newModelInfo(name string) *ModelInfo {
+	return &ModelInfo{
+		Name:     name,
+		LoadedAt: time.Now(),
+		Latency:  NewRollingLatency(defaultLatencyWindowSize),
+	}
+}
+
+func (r *ModelRegistry) TryAcquireEndpoint(address string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	cb := r.circuitBreakers[address]
+	if cb == nil {
+		return false
+	}
+	return cb.TryAcquire()
+}
+
+func (r *ModelRegistry) isEndpointAvailableLocked(ep *Endpoint) bool {
+	if ep == nil || !ep.Healthy {
+		return false
+	}
+	cb := r.circuitBreakers[ep.Address]
+	if cb == nil {
+		return false
+	}
+	return cb.CanAttempt()
 }
 
 // RefreshEndpoint fetches current model list and health from an endpoint
@@ -475,6 +602,7 @@ type Router struct {
 	registry     *ModelRegistry
 	hashRing     *ConsistentHashRing
 	routeManager *RouteManager
+	rrCounter    uint64
 }
 
 // NewRouter creates a new Router
@@ -487,50 +615,87 @@ func NewRouter(registry *ModelRegistry) *Router {
 }
 
 // RouteRequest selects the best endpoint for a request
-func (r *Router) RouteRequest(ctx context.Context, model string, pool string, workloadType WorkloadType) (*Endpoint, error) {
-	var endpoints []*Endpoint
-
-	// First try to find endpoints with the model already loaded
-	endpoints = r.registry.GetEndpointsForModel(model)
-
-	// Filter by pool if specified
-	if pool != "" && len(endpoints) > 0 {
-		filtered := make([]*Endpoint, 0)
-		for _, ep := range endpoints {
-			if ep.Pool == pool {
-				filtered = append(filtered, ep)
-			}
-		}
-		if len(filtered) > 0 {
-			endpoints = filtered
-		}
-	}
-
-	// If no endpoints with model, fall back to pool endpoints
-	if len(endpoints) == 0 && pool != "" {
-		endpoints = r.registry.GetEndpointsForPool(pool)
-	}
-
+func (r *Router) RouteRequest(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool) (*Endpoint, error) {
+	endpoints := r.ResolveEndpointCandidates(model, pool, excluded)
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("no healthy endpoints available for model %s", model)
 	}
 
-	// Apply routing strategy based on workload type
+	candidates := make([]*Endpoint, len(endpoints))
+	copy(candidates, endpoints)
+
+	for len(candidates) > 0 {
+		endpoint, err := r.selectEndpoint(model, workloadType, candidates, true)
+		if err != nil {
+			return nil, err
+		}
+		if r.registry.TryAcquireEndpoint(endpoint.Address) {
+			return endpoint, nil
+		}
+
+		filtered := make([]*Endpoint, 0, len(candidates)-1)
+		for _, ep := range candidates {
+			if ep.Address != endpoint.Address {
+				filtered = append(filtered, ep)
+			}
+		}
+		candidates = filtered
+	}
+
+	return nil, fmt.Errorf("no healthy endpoints available for model %s", model)
+}
+
+// ResolveEndpointCandidates returns currently eligible endpoint candidates without reserving them.
+func (r *Router) ResolveEndpointCandidates(model string, pool string, excluded map[string]bool) []*Endpoint {
+	var endpoints []*Endpoint
+	if pool != "" {
+		endpoints = r.registry.GetEndpointsForModelInPool(model, pool)
+	} else {
+		endpoints = r.registry.GetEndpointsForModel(model)
+	}
+
+	if len(endpoints) == 0 && pool != "" {
+		endpoints = r.registry.GetEndpointsForPool(pool)
+	}
+
+	filtered := filterExcludedEndpoints(endpoints, excluded)
+	if len(filtered) > 0 {
+		return filtered
+	}
+	return endpoints
+}
+
+// RouteManager returns the route manager for advanced routing
+func (r *Router) RouteManager() *RouteManager {
+	return r.routeManager
+}
+
+func (r *Router) selectEndpoint(model string, workloadType WorkloadType, endpoints []*Endpoint, advance bool) (*Endpoint, error) {
 	switch workloadType {
 	case WorkloadTypeReadHeavy:
 		return r.consistentHashWithLeastLoaded(endpoints, model)
 	case WorkloadTypeWriteHeavy:
 		return r.leastLoaded(endpoints)
 	case WorkloadTypeBurst:
-		return r.roundRobinWithQueueAwareness(endpoints, 50)
+		return r.roundRobinWithQueueAwareness(endpoints, 50, advance)
 	default:
 		return r.leastLoaded(endpoints)
 	}
 }
 
-// RouteManager returns the route manager for advanced routing
-func (r *Router) RouteManager() *RouteManager {
-	return r.routeManager
+func filterExcludedEndpoints(endpoints []*Endpoint, excluded map[string]bool) []*Endpoint {
+	if len(endpoints) == 0 || len(excluded) == 0 {
+		return endpoints
+	}
+
+	filtered := make([]*Endpoint, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint == nil || excluded[endpoint.Address] {
+			continue
+		}
+		filtered = append(filtered, endpoint)
+	}
+	return filtered
 }
 
 // consistentHashWithLeastLoaded uses consistent hashing for model affinity
@@ -566,8 +731,9 @@ func (r *Router) leastLoaded(endpoints []*Endpoint) (*Endpoint, error) {
 	return sorted[0], nil
 }
 
-// roundRobinWithQueueAwareness distributes load but respects queue limits
-func (r *Router) roundRobinWithQueueAwareness(endpoints []*Endpoint, maxQueue int32) (*Endpoint, error) {
+// roundRobinWithQueueAwareness distributes load but respects queue limits.
+// When advance is false, it peeks the current round-robin choice without mutating router state.
+func (r *Router) roundRobinWithQueueAwareness(endpoints []*Endpoint, maxQueue int32, advance bool) (*Endpoint, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("no endpoints available")
 	}
@@ -586,7 +752,11 @@ func (r *Router) roundRobinWithQueueAwareness(endpoints []*Endpoint, maxQueue in
 	}
 
 	// Round robin among available
-	return available[0], nil
+	index := atomic.LoadUint64(&r.rrCounter)
+	if advance {
+		index = atomic.AddUint64(&r.rrCounter, 1) - 1
+	}
+	return available[index%uint64(len(available))], nil
 }
 
 // ConsistentHashRing implements consistent hashing for endpoint selection
@@ -713,17 +883,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// Start background refresh
-	go p.refreshLoop(ctx)
-
-	// Start RouteWatcher if configured
-	if p.routeWatcher != nil {
-		go func() {
-			if err := p.routeWatcher.Start(ctx); err != nil {
-				p.logger.Error("RouteWatcher stopped", zap.Error(err))
-			}
-		}()
-	}
+	p.startBackgroundWorkers(ctx)
 
 	return p.serve(ctx, p.server.ListenAndServe)
 }
@@ -797,7 +957,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		headers[k] = r.Header.Get(k)
 	}
 
-	resolution, err := p.ResolveRequest(r.Context(), ResolveRequest{
+	lease, err := p.AcquireRequestResolution(r.Context(), ResolveRequest{
 		Operation: OperationType(operation),
 		Model:     req.Model,
 		Headers:   headers,
@@ -817,10 +977,23 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	resolution := lease.Resolution
 
 	matchedRoute := resolution.Route
 	pool := resolution.Pool
-	workloadType := resolveWorkloadType(OperationType(operation), headers)
+
+	if err := lease.Admit(); err != nil {
+		lease.Release()
+		if resolutionErr, ok := err.(*ResolutionError); ok {
+			if resolutionErr.RetryAfter > 0 {
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", resolutionErr.RetryAfter))
+			}
+			http.Error(w, resolutionErr.Message, resolutionErr.StatusCode)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 
 	attempts := 1
 	if matchedRoute != nil && matchedRoute.RetryAttempts > 1 {
@@ -833,23 +1006,26 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 	for attempt := 0; attempt < attempts; attempt++ {
 		attemptStarted := time.Now()
-		endpoint := resolution.Endpoint
+		endpoint := lease.Resolution.Endpoint
 		if attempt > 0 {
-			endpoint, err = p.router.RouteRequest(r.Context(), req.Model, pool, workloadType)
+			lease, err = lease.NextAttempt(r.Context())
 		}
 		if err != nil {
 			requestsTotal.WithLabelValues(pool, req.Model, operation, "no_endpoint").Inc()
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
+		if attempt > 0 {
+			endpoint = lease.Resolution.Endpoint
+		}
 
+		forwardingLease := lease.BeginForwarding()
 		resp, reqErr := p.forwardRequest(r, body, endpoint, matchedRoute)
 		if reqErr != nil {
+			forwardingLease.Finish()
 			lastErr = reqErr
 			lastEndpoint = endpoint
-			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
-				cb.RecordFailure()
-			}
+			lease.RecordFailure()
 			if attempt+1 < attempts && shouldRetryRequestError(matchedRoute, reqErr) {
 				continue
 			}
@@ -860,35 +1036,32 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 		lastResp = resp
 		lastEndpoint = endpoint
-		p.registry.RecordModelLatency(endpoint.Address, req.Model, time.Since(attemptStarted))
+		resp.Body = wrapForwardingBody(resp.Body, forwardingLease)
 		if attempt+1 < attempts && shouldRetryStatus(matchedRoute, resp.StatusCode) {
-			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
-				cb.RecordFailure()
+			drainErr := copyResponse(io.Discard, resp)
+			p.registry.RecordModelLatency(endpoint.Address, req.Model, time.Since(attemptStarted))
+			lease.RecordFailure()
+			if drainErr != nil {
+				lastErr = drainErr
+				lastEndpoint = endpoint
 			}
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
 			continue
 		}
 
-		if resp.StatusCode >= 400 {
-			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
-				cb.RecordFailure()
-			}
+		streamErr := copyResponse(w, resp)
+		p.registry.RecordModelLatency(endpoint.Address, req.Model, time.Since(attemptStarted))
+
+		if resp.StatusCode >= 400 || streamErr != nil {
+			lease.RecordFailure()
 			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "error")
 		} else {
-			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
-				cb.RecordSuccess()
-			}
+			lease.RecordSuccess()
 			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "success")
 		}
-
-		defer func() { _ = resp.Body.Close() }()
-		copyResponse(w, resp)
 		return
 	}
 
 	if lastResp != nil {
-		defer func() { _ = lastResp.Body.Close() }()
 		status := "success"
 		if lastResp.StatusCode >= 400 {
 			status = "error"
@@ -896,7 +1069,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		if lastEndpoint != nil {
 			p.recordProxyMetrics(lastEndpoint.Pool, req.Model, operation, start, status)
 		}
-		copyResponse(w, lastResp)
+		_ = copyResponse(w, lastResp)
 		return
 	}
 
@@ -910,18 +1083,18 @@ func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) handleReady(w http.ResponseWriter, r *http.Request) {
-	// Check if we have any healthy endpoints
+	// Ready means the proxy can currently route to at least one endpoint.
 	p.registry.mu.RLock()
-	hasHealthy := false
+	hasAvailable := false
 	for _, ep := range p.registry.endpoints {
-		if ep.Healthy {
-			hasHealthy = true
+		if p.registry.isEndpointAvailableLocked(ep) {
+			hasAvailable = true
 			break
 		}
 	}
 	p.registry.mu.RUnlock()
 
-	if hasHealthy {
+	if hasAvailable {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
 	} else {
@@ -931,6 +1104,10 @@ func (p *Proxy) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) refreshLoop(ctx context.Context) {
+	if p.registry.refreshInterval <= 0 {
+		return
+	}
+
 	ticker := time.NewTicker(p.registry.refreshInterval)
 	defer ticker.Stop()
 
@@ -1009,13 +1186,6 @@ func (p *Proxy) forwardRequest(r *http.Request, body []byte, endpoint *Endpoint,
 	outReq.Body = io.NopCloser(bytes.NewReader(body))
 	outReq.ContentLength = int64(len(body))
 
-	atomic.AddInt32(&endpoint.Connections, 1)
-	activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Inc()
-	defer func() {
-		atomic.AddInt32(&endpoint.Connections, -1)
-		activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Dec()
-	}()
-
 	return p.registry.client.Do(outReq)
 }
 
@@ -1024,14 +1194,54 @@ func (p *Proxy) recordProxyMetrics(pool, model, operation string, started time.T
 	requestLatency.WithLabelValues(pool, model, operation).Observe(time.Since(started).Seconds())
 }
 
-func copyResponse(w http.ResponseWriter, resp *http.Response) {
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
+type forwardingBody struct {
+	io.ReadCloser
+	finish func()
+	once   sync.Once
+}
+
+func wrapForwardingBody(body io.ReadCloser, lease *ForwardingLease) io.ReadCloser {
+	if body == nil || lease == nil {
+		return body
 	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	return &forwardingBody{
+		ReadCloser: body,
+		finish:     lease.Finish,
+	}
+}
+
+func (b *forwardingBody) Close() error {
+	if b == nil || b.ReadCloser == nil {
+		return nil
+	}
+	err := b.ReadCloser.Close()
+	b.once.Do(func() {
+		if b.finish != nil {
+			b.finish()
+		}
+	})
+	return err
+}
+
+func copyResponse(w io.Writer, resp *http.Response) error {
+	if writer, ok := w.(http.ResponseWriter); ok {
+		for key, values := range resp.Header {
+			for _, value := range values {
+				writer.Header().Add(key, value)
+			}
+		}
+		writer.WriteHeader(resp.StatusCode)
+	}
+
+	var copyErr error
+	if w != nil {
+		_, copyErr = io.Copy(w, resp.Body)
+	}
+	closeErr := resp.Body.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func shouldRetryStatus(route *Route, statusCode int) bool {

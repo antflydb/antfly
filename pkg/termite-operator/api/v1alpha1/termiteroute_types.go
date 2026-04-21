@@ -162,7 +162,7 @@ type RouteCondition struct {
 	// +optional
 	AvailableReplicas string `json:"availableReplicas,omitempty"`
 
-	// Latency activates when P99 latency matches (e.g., ">100ms")
+	// Latency activates when the rolling P99 latency matches (e.g., ">100ms")
 	// +optional
 	Latency string `json:"latency,omitempty"`
 
