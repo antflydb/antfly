@@ -137,11 +137,15 @@ func (w *K8sWatcher) onEndpointSliceUpdate(oldObj, newObj any) {
 }
 
 func (w *K8sWatcher) onEndpointSliceDelete(obj any) {
-	endpointSlice := obj.(*discoveryv1.EndpointSlice)
+	endpointSlice, ok := endpointSliceFromDelete(obj)
+	if !ok {
+		return
+	}
+	port := endpointSlicePort(endpointSlice)
 	// Remove all addresses from this EndpointSlice
 	for _, endpoint := range endpointSlice.Endpoints {
 		for _, addr := range endpoint.Addresses {
-			address := fmt.Sprintf("http://%s:11433", addr)
+			address := fmt.Sprintf("http://%s:%d", addr, port)
 			w.proxy.UnregisterEndpoint(address)
 		}
 	}
@@ -170,15 +174,7 @@ func (w *K8sWatcher) processEndpointSlice(endpointSlice *discoveryv1.EndpointSli
 	}
 
 	// Get port from EndpointSlice ports
-	port := 11433
-	for _, p := range endpointSlice.Ports {
-		if p.Name != nil && (*p.Name == "http" || *p.Name == "api") {
-			if p.Port != nil {
-				port = int(*p.Port)
-			}
-			break
-		}
-	}
+	port := endpointSlicePort(endpointSlice)
 
 	// Process all endpoints in the slice
 	for _, endpoint := range endpointSlice.Endpoints {
@@ -208,9 +204,12 @@ func (w *K8sWatcher) onPodUpdate(oldObj, newObj any) {
 }
 
 func (w *K8sWatcher) onPodDelete(obj any) {
-	pod := obj.(*corev1.Pod)
+	pod, ok := podFromDelete(obj)
+	if !ok {
+		return
+	}
 	if pod.Status.PodIP != "" {
-		address := fmt.Sprintf("http://%s:11433", pod.Status.PodIP)
+		address := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, podPort(pod))
 		w.proxy.UnregisterEndpoint(address)
 	}
 }
@@ -241,6 +240,31 @@ func (w *K8sWatcher) processPod(pod *corev1.Pod) {
 	}
 
 	// Get port from container spec
+	port := podPort(pod)
+
+	address := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
+
+	if ready {
+		w.proxy.RegisterEndpoint(address, pool, workloadType)
+	} else {
+		w.proxy.UnregisterEndpoint(address)
+	}
+}
+
+func endpointSlicePort(endpointSlice *discoveryv1.EndpointSlice) int {
+	port := 11433
+	for _, p := range endpointSlice.Ports {
+		if p.Name != nil && (*p.Name == "http" || *p.Name == "api") {
+			if p.Port != nil {
+				port = int(*p.Port)
+			}
+			break
+		}
+	}
+	return port
+}
+
+func podPort(pod *corev1.Pod) int {
 	port := 11433
 	for _, container := range pod.Spec.Containers {
 		if container.Name == "termite" {
@@ -252,12 +276,29 @@ func (w *K8sWatcher) processPod(pod *corev1.Pod) {
 			}
 		}
 	}
+	return port
+}
 
-	address := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
-
-	if ready {
-		w.proxy.RegisterEndpoint(address, pool, workloadType)
-	} else {
-		w.proxy.UnregisterEndpoint(address)
+func endpointSliceFromDelete(obj any) (*discoveryv1.EndpointSlice, bool) {
+	if endpointSlice, ok := obj.(*discoveryv1.EndpointSlice); ok {
+		return endpointSlice, true
 	}
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, false
+	}
+	endpointSlice, ok := tombstone.Obj.(*discoveryv1.EndpointSlice)
+	return endpointSlice, ok
+}
+
+func podFromDelete(obj any) (*corev1.Pod, bool) {
+	if pod, ok := obj.(*corev1.Pod); ok {
+		return pod, true
+	}
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, false
+	}
+	pod, ok := tombstone.Obj.(*corev1.Pod)
+	return pod, ok
 }

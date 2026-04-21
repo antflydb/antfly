@@ -161,6 +161,37 @@ func TestTermiteRouteValidator_ValidateUpdate_Valid(t *testing.T) {
 	}
 }
 
+func TestTermiteRouteValidator_ValidateCreate_HostedSourceMatchValid(t *testing.T) {
+	v := &TermiteRouteValidator{}
+	route := baseRoute()
+	route.Spec.Match.Source = &antflyaiv1alpha1.SourceMatch{
+		Organizations:  []string{"org-1"},
+		Projects:       []string{"project-1"},
+		APIKeyPrefixes: []string{"deadbeef"},
+	}
+
+	_, err := v.ValidateCreate(context.Background(), route)
+	if err != nil {
+		t.Fatalf("expected hosted source match to validate, got %v", err)
+	}
+}
+
+func TestTermiteRouteValidator_ValidateCreate_RejectsNamespaceSourceMatch(t *testing.T) {
+	v := &TermiteRouteValidator{}
+	route := baseRoute()
+	route.Spec.Match.Source = &antflyaiv1alpha1.SourceMatch{
+		Namespaces: []string{"team-a"},
+	}
+
+	_, err := v.ValidateCreate(context.Background(), route)
+	if err == nil {
+		t.Fatal("expected namespace source match to be rejected")
+	}
+	if !strings.Contains(err.Error(), "spec.match.source.namespaces") {
+		t.Fatalf("expected namespace validation error, got %v", err)
+	}
+}
+
 func TestTermiteRouteValidator_ValidateDelete(t *testing.T) {
 	v := &TermiteRouteValidator{}
 	route := baseRoute()

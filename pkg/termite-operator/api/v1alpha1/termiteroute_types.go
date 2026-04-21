@@ -98,11 +98,25 @@ type SourceMatch struct {
 	// +optional
 	Tables []string `json:"tables,omitempty"`
 
-	// Namespaces matches requests from specific Kubernetes namespaces
+	// Organizations matches requests authenticated for specific hosted organizations.
+	// +optional
+	Organizations []string `json:"organizations,omitempty"`
+
+	// Projects matches requests authenticated for specific hosted projects.
+	// +optional
+	Projects []string `json:"projects,omitempty"`
+
+	// APIKeyPrefixes matches requests authenticated with specific hosted API key prefixes.
+	// +optional
+	APIKeyPrefixes []string `json:"apiKeyPrefixes,omitempty"`
+
+	// Namespaces is reserved for future authenticated source identity support.
+	// Requests that set this field are currently rejected.
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`
 
-	// ServiceAccounts matches requests from specific service accounts
+	// ServiceAccounts is reserved for future authenticated source identity support.
+	// Requests that set this field are currently rejected.
 	// +optional
 	ServiceAccounts []string `json:"serviceAccounts,omitempty"`
 }
@@ -263,40 +277,14 @@ type TermiteRouteStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// MatchedRequests is the total requests matched by this route
-	MatchedRequests int64 `json:"matchedRequests,omitempty"`
-
-	// LastMatchTime is when a request last matched this route
-	// +optional
-	LastMatchTime *metav1.Time `json:"lastMatchTime,omitempty"`
-
 	// Conditions represent the latest available observations
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	// DestinationStatus shows the status of each destination
-	DestinationStatus []DestinationStatus `json:"destinationStatus,omitempty"`
-}
-
-// DestinationStatus shows the status of a route destination
-type DestinationStatus struct {
-	// Pool is the destination pool name
-	Pool string `json:"pool"`
-
-	// Healthy indicates if the destination is healthy
-	Healthy bool `json:"healthy"`
-
-	// ActiveConnections is the current connection count
-	ActiveConnections int32 `json:"activeConnections,omitempty"`
-
-	// RequestsRouted is the total requests routed to this destination
-	RequestsRouted int64 `json:"requestsRouted,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Priority",type=integer,JSONPath=`.spec.priority`
 // +kubebuilder:printcolumn:name="Active",type=boolean,JSONPath=`.status.active`
-// +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.matchedRequests`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // TermiteRoute is the Schema for the termiteroutes API

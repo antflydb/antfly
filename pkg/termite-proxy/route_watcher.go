@@ -177,13 +177,16 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 	fullName := namespace + "/" + name
 
 	route := &Route{
-		Name:           fullName,
-		Priority:       getInt32(spec, "priority", 100),
-		Operations:     make(map[OperationType]bool),
-		ModelPatterns:  make([]*regexp.Regexp, 0),
-		HeaderMatchers: make(map[string]*StringMatcher),
-		SourceTables:   make(map[string]bool),
-		Destinations:   make([]Destination, 0),
+		Name:                fullName,
+		Priority:            getInt32(spec, "priority", 100),
+		Operations:          make(map[OperationType]bool),
+		ModelPatterns:       make([]*regexp.Regexp, 0),
+		HeaderMatchers:      make(map[string]*StringMatcher),
+		SourceTables:        make(map[string]bool),
+		SourceOrganizations: make(map[string]bool),
+		SourceProjects:      make(map[string]bool),
+		SourceAPIKeys:       make(map[string]bool),
+		Destinations:        make([]Destination, 0),
 	}
 
 	// Parse match conditions
@@ -241,6 +244,27 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 					}
 				}
 			}
+			if organizations, ok := source["organizations"].([]any); ok {
+				for _, organization := range organizations {
+					if organizationStr, ok := organization.(string); ok {
+						route.SourceOrganizations[organizationStr] = true
+					}
+				}
+			}
+			if projects, ok := source["projects"].([]any); ok {
+				for _, project := range projects {
+					if projectStr, ok := project.(string); ok {
+						route.SourceProjects[projectStr] = true
+					}
+				}
+			}
+			if apiKeys, ok := source["apiKeyPrefixes"].([]any); ok {
+				for _, apiKey := range apiKeys {
+					if apiKeyStr, ok := apiKey.(string); ok {
+						route.SourceAPIKeys[apiKeyStr] = true
+					}
+				}
+			}
 		}
 
 		// Time window
@@ -293,6 +317,11 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 		route.Fallback = &Fallback{
 			Action: getString(fallback, "action"),
 		}
+		if maxQueueTime, ok := fallback["maxQueueTime"].(string); ok && maxQueueTime != "" {
+			if parsed, err := time.ParseDuration(maxQueueTime); err == nil {
+				route.Fallback.MaxQueueTime = parsed
+			}
+		}
 		if errResp, ok := fallback["errorResponse"].(map[string]any); ok {
 			route.Fallback.StatusCode = int(getInt32(errResp, "statusCode", 503))
 			route.Fallback.Message = getString(errResp, "message")
@@ -318,22 +347,46 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 	// Parse retry config
 	if retry, ok := spec["retry"].(map[string]any); ok {
 		route.RetryAttempts = getInt32(retry, "attempts", 3)
+		if timeout, ok := retry["perTryTimeout"].(string); ok && timeout != "" {
+			if parsed, err := time.ParseDuration(timeout); err == nil {
+				route.RetryTimeout = parsed
+			}
+		}
 
 		if retryOn, ok := retry["retryOn"].([]any); ok {
 			route.RetryOnStatuses = make(map[int]bool)
 			for _, r := range retryOn {
 				if rs, ok := r.(string); ok {
-					// Handle "5xx" pattern
-					if before, ok0 := strings.CutSuffix(rs, "xx"); ok0 {
-						prefix := before
-						if p, err := strconv.Atoi(prefix); err == nil {
-							for i := p * 100; i < (p+1)*100; i++ {
-								route.RetryOnStatuses[i] = true
+					switch rs {
+					case "reset", "connect-failure", "refused-stream", "deadline-exceeded":
+						route.RetryOnRequestErrs = true
+					case "cancelled":
+						route.RetryOnCanceled = true
+					case "resource-exhausted":
+						route.RetryOnStatuses[429] = true
+						route.RetryOnRequestErrs = true
+					case "retriable-4xx":
+						for _, code := range []int{408, 409, 425, 429} {
+							route.RetryOnStatuses[code] = true
+						}
+					default:
+						if before, ok0 := strings.CutSuffix(rs, "xx"); ok0 {
+							prefix := before
+							if p, err := strconv.Atoi(prefix); err == nil {
+								for i := p * 100; i < (p+1)*100; i++ {
+									route.RetryOnStatuses[i] = true
+								}
 							}
 						}
 					}
 				}
 			}
+		} else {
+			route.RetryOnStatuses = make(map[int]bool, 100)
+			for code := 500; code < 600; code++ {
+				route.RetryOnStatuses[code] = true
+			}
+			route.RetryOnRequestErrs = true
 		}
 	}
 

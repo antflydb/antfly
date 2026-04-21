@@ -16,6 +16,7 @@
 package proxy
 
 import (
+	"hash/fnv"
 	"regexp"
 	"sort"
 	"strings"
@@ -30,11 +31,14 @@ type Route struct {
 	Priority int32
 
 	// Compiled matchers
-	Operations     map[OperationType]bool
-	ModelPatterns  []*regexp.Regexp
-	HeaderMatchers map[string]*StringMatcher
-	SourceTables   map[string]bool
-	TimeWindow     *TimeWindow
+	Operations          map[OperationType]bool
+	ModelPatterns       []*regexp.Regexp
+	HeaderMatchers      map[string]*StringMatcher
+	SourceTables        map[string]bool
+	SourceOrganizations map[string]bool
+	SourceProjects      map[string]bool
+	SourceAPIKeys       map[string]bool
+	TimeWindow          *TimeWindow
 
 	// Destinations
 	Destinations []Destination
@@ -46,13 +50,11 @@ type Route struct {
 	RateLimiter *RateLimiter
 
 	// Retry config
-	RetryAttempts   int32
-	RetryTimeout    time.Duration
-	RetryOnStatuses map[int]bool
-
-	// Stats
-	MatchedRequests int64
-	LastMatchTime   time.Time
+	RetryAttempts      int32
+	RetryTimeout       time.Duration
+	RetryOnStatuses    map[int]bool
+	RetryOnRequestErrs bool
+	RetryOnCanceled    bool
 }
 
 // OperationType for matching
@@ -225,11 +227,14 @@ func (rl *RateLimiter) Allow(model string) bool {
 
 // RouteRequest contains information about a request for routing
 type RouteRequest struct {
-	Operation   OperationType
-	Model       string
-	Headers     map[string]string
-	SourceTable string
-	Timestamp   time.Time
+	Operation          OperationType
+	Model              string
+	Headers            map[string]string
+	SourceTable        string
+	SourceOrganization string
+	SourceProject      string
+	SourceAPIKey       string
+	Timestamp          time.Time
 }
 
 // RouteManager manages all routes and performs matching
@@ -291,9 +296,6 @@ func (rm *RouteManager) Match(req *RouteRequest) *Route {
 
 	for _, route := range rm.routes {
 		if rm.matchRoute(route, req) {
-			// Update stats
-			atomic.AddInt64(&route.MatchedRequests, 1)
-			route.LastMatchTime = req.Timestamp
 			return route
 		}
 	}
@@ -337,6 +339,24 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 		}
 	}
 
+	if len(route.SourceOrganizations) > 0 {
+		if !route.SourceOrganizations[req.SourceOrganization] {
+			return false
+		}
+	}
+
+	if len(route.SourceProjects) > 0 {
+		if !route.SourceProjects[req.SourceProject] {
+			return false
+		}
+	}
+
+	if len(route.SourceAPIKeys) > 0 {
+		if !route.SourceAPIKeys[req.SourceAPIKey] {
+			return false
+		}
+	}
+
 	// Match time window (if specified)
 	if route.TimeWindow != nil {
 		if !route.TimeWindow.IsActive(req.Timestamp) {
@@ -373,15 +393,22 @@ func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, regis
 		return &eligible[0], nil
 	}
 
-	// Simple weighted selection (could use random for true distribution)
-	// For now, pick highest weight that's eligible
-	var best *Destination
+	if totalWeight <= 0 {
+		return &eligible[0], nil
+	}
+
+	// Use a deterministic weighted selection so repeated traffic splits
+	// remain stable without shared mutable RNG state.
+	selection := weightedSelectionValue(route, req, totalWeight)
+	cumulative := int32(0)
 	for i := range eligible {
-		if best == nil || eligible[i].Weight > best.Weight {
-			best = &eligible[i]
+		cumulative += eligible[i].Weight
+		if selection < cumulative {
+			return &eligible[i], nil
 		}
 	}
-	return best, nil
+
+	return &eligible[len(eligible)-1], nil
 }
 
 func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest, registry *ModelRegistry) bool {
@@ -394,10 +421,16 @@ func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest,
 	// Calculate aggregate stats
 	var totalQueueDepth int32
 	var modelLoaded bool
+	var totalLatency float64
+	var latencySamples int
 	for _, ep := range endpoints {
 		totalQueueDepth += atomic.LoadInt32(&ep.QueueDepth)
-		if _, exists := ep.Models[req.Model]; exists {
+		if info, exists := ep.Models[req.Model]; exists {
 			modelLoaded = true
+			if info.RequestsTotal > 0 {
+				totalLatency += info.AvgLatencyMs / 1000
+				latencySamples++
+			}
 		}
 	}
 	avgQueueDepth := float64(totalQueueDepth) / float64(len(endpoints))
@@ -412,6 +445,15 @@ func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest,
 	// Check replica condition
 	if dest.ReplicaCondition != nil {
 		if !dest.ReplicaCondition.Evaluate(float64(len(endpoints))) {
+			return false
+		}
+	}
+
+	if dest.LatencyCondition != nil {
+		if latencySamples == 0 {
+			return false
+		}
+		if !dest.LatencyCondition.Evaluate(totalLatency / float64(latencySamples)) {
 			return false
 		}
 	}
@@ -540,4 +582,37 @@ func parseFloatInternal(s string, v *float64, n *int) (bool, error) {
 	}
 	*v = result
 	return true, nil
+}
+
+func weightedSelectionValue(route *Route, req *RouteRequest, totalWeight int32) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(route.Name))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.Model))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.Operation))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.SourceTable))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.SourceOrganization))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.SourceProject))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.SourceAPIKey))
+	_, _ = h.Write([]byte{0})
+
+	headerNames := make([]string, 0, len(req.Headers))
+	for name := range req.Headers {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	for _, name := range headerNames {
+		_, _ = h.Write([]byte(name))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(req.Headers[name]))
+		_, _ = h.Write([]byte{0})
+	}
+
+	_, _ = h.Write([]byte(req.Timestamp.UTC().Format(time.RFC3339Nano)))
+	return int32(h.Sum32() % uint32(totalWeight))
 }

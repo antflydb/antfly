@@ -16,13 +16,14 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"sort"
 	"sync"
@@ -342,6 +343,31 @@ func (r *ModelRegistry) UpdateModels(address string, models []string) {
 	}
 
 	ep.LastSeen = time.Now()
+}
+
+// RecordModelLatency updates rolling per-model latency for an endpoint.
+func (r *ModelRegistry) RecordModelLatency(address, model string, duration time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ep, exists := r.endpoints[address]
+	if !exists || model == "" {
+		return
+	}
+
+	info, exists := ep.Models[model]
+	if !exists {
+		info = &ModelInfo{
+			Name:     model,
+			LoadedAt: time.Now(),
+		}
+		ep.Models[model] = info
+	}
+
+	count := info.RequestsTotal
+	latencyMs := float64(duration.Milliseconds())
+	info.AvgLatencyMs = ((info.AvgLatencyMs * float64(count)) + latencyMs) / float64(count+1)
+	info.RequestsTotal++
 }
 
 // GetEndpointsForModel returns endpoints that have a specific model loaded
@@ -699,7 +725,32 @@ func (p *Proxy) Start(ctx context.Context) error {
 		}()
 	}
 
-	return p.server.ListenAndServe()
+	return p.serve(ctx, p.server.ListenAndServe)
+}
+
+func (p *Proxy) serve(ctx context.Context, listen func() error) error {
+	serverErr := make(chan error, 1)
+	go func() {
+		err := listen()
+		if errors.Is(err, http.ErrServerClosed) {
+			serverErr <- nil
+			return
+		}
+		serverErr <- err
+	}()
+
+	select {
+	case err := <-serverErr:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := p.server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return <-serverErr
+	}
 }
 
 // Stop gracefully stops the proxy
@@ -746,129 +797,111 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		headers[k] = r.Header.Get(k)
 	}
 
-	// Try route-based matching first
-	var pool string
-	routeReq := &RouteRequest{
+	resolution, err := p.ResolveRequest(r.Context(), ResolveRequest{
 		Operation: OperationType(operation),
 		Model:     req.Model,
 		Headers:   headers,
+		Source: VerifiedSource{
+			Table: firstHeader(r, "X-Termite-Source-Table", "X-Antfly-Table"),
+		},
 		Timestamp: start,
-	}
-
-	if matchedRoute := p.router.RouteManager().Match(routeReq); matchedRoute != nil {
-		// Check rate limiting
-		if matchedRoute.RateLimiter != nil && !matchedRoute.RateLimiter.Allow(req.Model) {
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+	})
+	if err != nil {
+		if resolutionErr, ok := err.(*ResolutionError); ok {
+			if resolutionErr.RetryAfter > 0 {
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", resolutionErr.RetryAfter))
+			}
+			http.Error(w, resolutionErr.Message, resolutionErr.StatusCode)
 			return
 		}
-
-		// Select destination from matched route
-		dest, err := p.router.RouteManager().SelectDestination(matchedRoute, routeReq, p.registry)
-		if err == nil && dest != nil {
-			pool = dest.Pool
-		} else if matchedRoute.Fallback != nil {
-			// Handle fallback
-			switch matchedRoute.Fallback.Action {
-			case "reject":
-				statusCode := matchedRoute.Fallback.StatusCode
-				if statusCode == 0 {
-					statusCode = 503
-				}
-				msg := matchedRoute.Fallback.Message
-				if msg == "" {
-					msg = "no healthy endpoints available"
-				}
-				if matchedRoute.Fallback.RetryAfter > 0 {
-					w.Header().Set("Retry-After", fmt.Sprintf("%d", matchedRoute.Fallback.RetryAfter))
-				}
-				http.Error(w, msg, statusCode)
-				return
-			case "redirect":
-				pool = matchedRoute.Fallback.RedirectPool
-			}
-		}
-	}
-
-	// Fall back to X-Termite-Pool header or default pool
-	if pool == "" {
-		pool = r.Header.Get("X-Termite-Pool")
-	}
-	if pool == "" {
-		pool = p.defaultPool
-	}
-
-	// Determine workload type from header or infer from operation
-	workloadType := WorkloadType(r.Header.Get("X-Termite-Workload-Type"))
-	if workloadType == "" {
-		switch operation {
-		case "embed", "rerank":
-			workloadType = WorkloadTypeReadHeavy
-		case "chunk":
-			workloadType = WorkloadTypeWriteHeavy
-		default:
-			workloadType = WorkloadTypeGeneral
-		}
-	}
-
-	// Route the request
-	endpoint, err := p.router.RouteRequest(r.Context(), req.Model, pool, workloadType)
-	if err != nil {
-		requestsTotal.WithLabelValues(pool, req.Model, operation, "no_endpoint").Inc()
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	// Track active connections
-	atomic.AddInt32(&endpoint.Connections, 1)
-	activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Inc()
-	defer func() {
-		atomic.AddInt32(&endpoint.Connections, -1)
-		activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Dec()
-	}()
+	matchedRoute := resolution.Route
+	pool := resolution.Pool
+	workloadType := resolveWorkloadType(OperationType(operation), headers)
 
-	// Proxy the request — endpoint.Address comes from internal service discovery, not user input.
-	targetURL, _ := url.Parse(endpoint.Address)
-	proxy := httputil.NewSingleHostReverseProxy(targetURL) //nolint:gosec // G704: endpoint address is from trusted internal registry
+	attempts := 1
+	if matchedRoute != nil && matchedRoute.RetryAttempts > 1 {
+		attempts = int(matchedRoute.RetryAttempts)
+	}
 
-	// Restore body for proxying
-	r.Body = io.NopCloser(&bodyReader{data: body})
-	r.ContentLength = int64(len(body))
+	var lastErr error
+	var lastResp *http.Response
+	var lastEndpoint *Endpoint
 
-	// Custom response handler for metrics
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		duration := time.Since(start).Seconds()
-		status := "success"
-		if resp.StatusCode >= 400 {
-			status = "error"
+	for attempt := 0; attempt < attempts; attempt++ {
+		attemptStarted := time.Now()
+		endpoint := resolution.Endpoint
+		if attempt > 0 {
+			endpoint, err = p.router.RouteRequest(r.Context(), req.Model, pool, workloadType)
+		}
+		if err != nil {
+			requestsTotal.WithLabelValues(pool, req.Model, operation, "no_endpoint").Inc()
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		resp, reqErr := p.forwardRequest(r, body, endpoint, matchedRoute)
+		if reqErr != nil {
+			lastErr = reqErr
+			lastEndpoint = endpoint
 			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
 				cb.RecordFailure()
 			}
+			if attempt+1 < attempts && shouldRetryRequestError(matchedRoute, reqErr) {
+				continue
+			}
+			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "error")
+			http.Error(w, fmt.Sprintf("proxy request failed: %v", reqErr), http.StatusBadGateway)
+			return
+		}
+
+		lastResp = resp
+		lastEndpoint = endpoint
+		p.registry.RecordModelLatency(endpoint.Address, req.Model, time.Since(attemptStarted))
+		if attempt+1 < attempts && shouldRetryStatus(matchedRoute, resp.StatusCode) {
+			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
+				cb.RecordFailure()
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			continue
+		}
+
+		if resp.StatusCode >= 400 {
+			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
+				cb.RecordFailure()
+			}
+			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "error")
 		} else {
 			if cb := p.registry.GetCircuitBreaker(endpoint.Address); cb != nil {
 				cb.RecordSuccess()
 			}
+			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "success")
 		}
 
-		requestsTotal.WithLabelValues(endpoint.Pool, req.Model, operation, status).Inc()
-		requestLatency.WithLabelValues(endpoint.Pool, req.Model, operation).Observe(duration)
-		return nil
+		defer func() { _ = resp.Body.Close() }()
+		copyResponse(w, resp)
+		return
 	}
 
-	proxy.ServeHTTP(w, r) //nolint:gosec // G704: endpoint address is from trusted internal registry
-}
-
-type bodyReader struct {
-	data []byte
-	pos  int
-}
-
-func (b *bodyReader) Read(p []byte) (n int, err error) {
-	if b.pos >= len(b.data) {
-		return 0, io.EOF
+	if lastResp != nil {
+		defer func() { _ = lastResp.Body.Close() }()
+		status := "success"
+		if lastResp.StatusCode >= 400 {
+			status = "error"
+		}
+		if lastEndpoint != nil {
+			p.recordProxyMetrics(lastEndpoint.Pool, req.Model, operation, start, status)
+		}
+		copyResponse(w, lastResp)
+		return
 	}
-	n = copy(p, b.data[b.pos:])
-	b.pos += n
-	return n, nil
+
+	p.recordProxyMetrics(pool, req.Model, operation, start, "error")
+	http.Error(w, fmt.Sprintf("proxy request failed: %v", lastErr), http.StatusBadGateway)
 }
 
 func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -950,4 +983,110 @@ func (p *Proxy) RegisterEndpoint(address, pool string, workloadType WorkloadType
 // UnregisterEndpoint removes an endpoint (called from K8s watcher)
 func (p *Proxy) UnregisterEndpoint(address string) {
 	p.registry.UnregisterEndpoint(address)
+}
+
+func (p *Proxy) forwardRequest(r *http.Request, body []byte, endpoint *Endpoint, route *Route) (*http.Response, error) {
+	attemptCtx := r.Context()
+	var cancel context.CancelFunc
+	if route != nil && route.RetryTimeout > 0 {
+		attemptCtx, cancel = context.WithTimeout(attemptCtx, route.RetryTimeout)
+		defer cancel()
+	}
+
+	targetURL, err := url.Parse(endpoint.Address)
+	if err != nil {
+		return nil, err
+	}
+
+	outReq := r.Clone(attemptCtx)
+	outReq.URL = targetURL.ResolveReference(&url.URL{
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	})
+	outReq.Host = targetURL.Host
+	outReq.RequestURI = ""
+	outReq.Body = io.NopCloser(bytes.NewReader(body))
+	outReq.ContentLength = int64(len(body))
+
+	atomic.AddInt32(&endpoint.Connections, 1)
+	activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Inc()
+	defer func() {
+		atomic.AddInt32(&endpoint.Connections, -1)
+		activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Dec()
+	}()
+
+	return p.registry.client.Do(outReq)
+}
+
+func (p *Proxy) recordProxyMetrics(pool, model, operation string, started time.Time, status string) {
+	requestsTotal.WithLabelValues(pool, model, operation, status).Inc()
+	requestLatency.WithLabelValues(pool, model, operation).Observe(time.Since(started).Seconds())
+}
+
+func copyResponse(w http.ResponseWriter, resp *http.Response) {
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func shouldRetryStatus(route *Route, statusCode int) bool {
+	if route == nil || len(route.RetryOnStatuses) == 0 {
+		return false
+	}
+	return route.RetryOnStatuses[statusCode]
+}
+
+func shouldRetryRequestError(route *Route, err error) bool {
+	if route == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return route.RetryOnCanceled
+	}
+	return route.RetryOnRequestErrs || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req *RouteRequest) (string, error) {
+	maxQueueTime := route.Fallback.MaxQueueTime
+	if maxQueueTime <= 0 {
+		maxQueueTime = 30 * time.Second
+	}
+
+	deadline := time.NewTimer(maxQueueTime)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-deadline.C:
+			return "", fmt.Errorf("queue timeout exceeded")
+		case <-ticker.C:
+			req.Timestamp = time.Now()
+			dest, err := p.router.RouteManager().SelectDestination(route, req, p.registry)
+			if err != nil {
+				return "", err
+			}
+			if dest != nil {
+				return dest.Pool, nil
+			}
+		}
+	}
+}
+
+func firstHeader(r *http.Request, names ...string) string {
+	for _, name := range names {
+		if value := r.Header.Get(name); value != "" {
+			return value
+		}
+	}
+	return ""
 }

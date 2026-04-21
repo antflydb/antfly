@@ -139,6 +139,30 @@ func (r *TermiteRoute) validateMatch() error {
 		}
 	}
 
+	if match.Source != nil {
+		for i, organization := range match.Source.Organizations {
+			if strings.TrimSpace(organization) == "" {
+				return fmt.Errorf("spec.match.source.organizations[%d] cannot be empty", i)
+			}
+		}
+		for i, project := range match.Source.Projects {
+			if strings.TrimSpace(project) == "" {
+				return fmt.Errorf("spec.match.source.projects[%d] cannot be empty", i)
+			}
+		}
+		for i, apiKeyPrefix := range match.Source.APIKeyPrefixes {
+			if strings.TrimSpace(apiKeyPrefix) == "" {
+				return fmt.Errorf("spec.match.source.apiKeyPrefixes[%d] cannot be empty", i)
+			}
+		}
+		if len(match.Source.Namespaces) > 0 {
+			return fmt.Errorf("spec.match.source.namespaces is not supported until authenticated source identity is available")
+		}
+		if len(match.Source.ServiceAccounts) > 0 {
+			return fmt.Errorf("spec.match.source.serviceAccounts is not supported until authenticated source identity is available")
+		}
+	}
+
 	// Validate header matchers
 	for header, matcher := range match.Headers {
 		if header == "" {

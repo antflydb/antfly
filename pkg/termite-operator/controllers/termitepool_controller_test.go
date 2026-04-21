@@ -21,6 +21,8 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -186,6 +188,115 @@ var _ = Describe("TermitePool Controller", func() {
 			}, timeout, interval).Should(Equal(int32(3)))
 
 			// Cleanup
+			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
+		})
+
+		It("Should roll the StatefulSet when pod template labels change", func() {
+			ctx := context.Background()
+
+			pool := &antflyaiv1alpha1.TermitePool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-update-pool",
+					Namespace: poolNamespace,
+				},
+				Spec: antflyaiv1alpha1.TermitePoolSpec{
+					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
+					Models: antflyaiv1alpha1.ModelConfig{
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
+					},
+					Replicas: antflyaiv1alpha1.ReplicaConfig{
+						Min: 1,
+						Max: 3,
+					},
+					Hardware: antflyaiv1alpha1.HardwareConfig{},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, pool)).Should(Succeed())
+
+			stsLookupKey := types.NamespacedName{Name: "workload-update-pool", Namespace: poolNamespace}
+			createdSts := &appsv1.StatefulSet{}
+			Eventually(func() string {
+				if err := k8sClient.Get(ctx, stsLookupKey, createdSts); err != nil {
+					return ""
+				}
+				return createdSts.Spec.Template.Annotations["termite.antfly.io/template-hash"]
+			}, timeout, interval).ShouldNot(BeEmpty())
+
+			initialHash := createdSts.Spec.Template.Annotations["termite.antfly.io/template-hash"]
+			Expect(createdSts.Spec.Template.Labels["antfly.io/workload-type"]).To(Equal("general"))
+
+			poolLookupKey := types.NamespacedName{Name: "workload-update-pool", Namespace: poolNamespace}
+			Eventually(func() error {
+				if err := k8sClient.Get(ctx, poolLookupKey, pool); err != nil {
+					return err
+				}
+				pool.Spec.WorkloadType = antflyaiv1alpha1.WorkloadTypeReadHeavy
+				return k8sClient.Update(ctx, pool)
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, stsLookupKey, createdSts)).To(Succeed())
+				g.Expect(createdSts.Spec.Template.Labels["antfly.io/workload-type"]).To(Equal("read-heavy"))
+				g.Expect(createdSts.Spec.Template.Annotations["termite.antfly.io/template-hash"]).NotTo(Equal(initialHash))
+			}, timeout, interval).Should(Succeed())
+
+			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
+		})
+
+		It("Should delete the PodDisruptionBudget when disabled", func() {
+			ctx := context.Background()
+			maxUnavailable := int32(1)
+
+			pool := &antflyaiv1alpha1.TermitePool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pdb-toggle-pool",
+					Namespace: poolNamespace,
+				},
+				Spec: antflyaiv1alpha1.TermitePoolSpec{
+					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
+					Models: antflyaiv1alpha1.ModelConfig{
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
+					},
+					Replicas: antflyaiv1alpha1.ReplicaConfig{
+						Min: 2,
+						Max: 3,
+					},
+					Hardware: antflyaiv1alpha1.HardwareConfig{},
+					Availability: &antflyaiv1alpha1.AvailabilityConfig{
+						PodDisruptionBudget: &antflyaiv1alpha1.PDBConfig{
+							Enabled:        true,
+							MaxUnavailable: &maxUnavailable,
+						},
+					},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, pool)).Should(Succeed())
+
+			pdbLookupKey := types.NamespacedName{Name: "pdb-toggle-pool-pdb", Namespace: poolNamespace}
+			createdPDB := &policyv1.PodDisruptionBudget{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, pdbLookupKey, createdPDB)
+				return err == nil
+			}, timeout, interval).Should(BeTrue())
+
+			poolLookupKey := types.NamespacedName{Name: "pdb-toggle-pool", Namespace: poolNamespace}
+			Eventually(func() error {
+				if err := k8sClient.Get(ctx, poolLookupKey, pool); err != nil {
+					return err
+				}
+				pool.Spec.Availability.PodDisruptionBudget.Enabled = false
+				return k8sClient.Update(ctx, pool)
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, pdbLookupKey, createdPDB)
+				return apierrors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
+
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
 		})
 	})

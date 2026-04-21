@@ -124,9 +124,27 @@ spec:
                     description: Source matches the source of the request (e.g., specific
                       Antfly tables)
                     properties:
+                      apiKeyPrefixes:
+                        description: APIKeyPrefixes matches requests authenticated
+                          with specific hosted API key prefixes
+                        items:
+                          type: string
+                        type: array
                       namespaces:
                         description: Namespaces matches requests from specific Kubernetes
                           namespaces
+                        items:
+                          type: string
+                        type: array
+                      organizations:
+                        description: Organizations matches requests authenticated
+                          for specific hosted organizations
+                        items:
+                          type: string
+                        type: array
+                      projects:
+                        description: Projects matches requests authenticated for specific
+                          hosted projects
                         items:
                           type: string
                         type: array

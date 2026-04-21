@@ -568,8 +568,18 @@ func computePodTemplateHash(template *corev1.PodTemplateSpec) (string, error) {
 	templateCopy := template.DeepCopy()
 	delete(templateCopy.Annotations, "termite.antfly.io/template-hash")
 
+	hashInput := struct {
+		Labels      map[string]string `json:"labels,omitempty"`
+		Annotations map[string]string `json:"annotations,omitempty"`
+		Spec        corev1.PodSpec    `json:"spec"`
+	}{
+		Labels:      templateCopy.Labels,
+		Annotations: templateCopy.Annotations,
+		Spec:        templateCopy.Spec,
+	}
+
 	// Marshal to JSON for consistent hashing
-	data, err := json.Marshal(templateCopy.Spec)
+	data, err := json.Marshal(hashInput)
 	if err != nil {
 		return "", fmt.Errorf("marshal pod template spec: %w", err)
 	}
@@ -581,6 +591,7 @@ func computePodTemplateHash(template *corev1.PodTemplateSpec) (string, error) {
 func (r *TermitePoolReconciler) reconcilePDB(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
 	// Get PDB configuration from GKE, EKS, or Availability config
 	var pdbConfig *antflyaiv1alpha1.PDBConfig
+	pdbName := pool.Name + "-pdb"
 
 	// Prefer cloud-provider PDB config, fall back to Availability config
 	if pool.Spec.GKE != nil && pool.Spec.GKE.PodDisruptionBudget != nil {
@@ -593,10 +604,16 @@ func (r *TermitePoolReconciler) reconcilePDB(ctx context.Context, pool *antflyai
 
 	// If no PDB config or not enabled, skip
 	if pdbConfig == nil || !pdbConfig.Enabled {
-		return nil
+		existing := &policyv1.PodDisruptionBudget{}
+		err := r.Get(ctx, types.NamespacedName{Name: pdbName, Namespace: pool.Namespace}, existing)
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return r.Delete(ctx, existing)
 	}
-
-	pdbName := pool.Name + "-pdb"
 
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
