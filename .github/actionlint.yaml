@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - arc-antfly-standard
+    - arc-antfly-heavy
+    - arc-antfly-docker
+    - arc-antfly-k8s

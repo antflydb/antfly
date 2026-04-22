@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   trace-validate:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: arc-antfly-standard
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6

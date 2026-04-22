@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   tla-check:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: arc-antfly-standard
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
