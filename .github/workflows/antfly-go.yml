@@ -46,6 +46,7 @@ on:
       - ".github/workflows/termite-*.yml"
       - ".github/workflows/antfly-container.yml"
       - ".github/workflows/trigger-docs-build.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}

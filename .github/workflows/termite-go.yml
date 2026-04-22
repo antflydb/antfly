@@ -23,6 +23,7 @@ on:
       - "pkg/termite-client/**"
       - "pkg/libaf/**"
       - ".github/workflows/termite-go.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}

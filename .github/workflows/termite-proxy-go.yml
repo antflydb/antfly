@@ -14,6 +14,7 @@ on:
     paths:
       - "pkg/termite-proxy/**"
       - ".github/workflows/termite-proxy-*.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
