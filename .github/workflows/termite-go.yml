@@ -38,7 +38,7 @@ env:
 jobs:
   test:
     name: Test (${{ matrix.backend }})
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: ${{ matrix.runner }}
     # XLA/omni backends require GLIBC 2.38+ (Ubuntu 24.04)
     container: ${{ matrix.container }}
     strategy:
@@ -50,18 +50,22 @@ jobs:
             tags: ""
             cgo: "0"
             container: ""
+            runner: arc-antfly-standard
           - backend: onnx
             tags: "onnx,ORT"
             cgo: "1"
             container: ""
+            runner: arc-antfly-heavy
           - backend: xla
             tags: "xla,XLA"
             cgo: "1"
             container: "ubuntu:24.04"
+            runner: arc-antfly-heavy
           - backend: omni
             tags: "onnx,ORT,xla,XLA"
             cgo: "1"
             container: "ubuntu:24.04"
+            runner: arc-antfly-heavy
 
     steps:
       - name: Install container prerequisites
