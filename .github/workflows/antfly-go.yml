@@ -56,6 +56,9 @@ jobs:
   unit:
     runs-on: arc-antfly-standard
     steps:
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
       - uses: actions/checkout@v6
         with:
           submodules: true
@@ -162,6 +165,9 @@ jobs:
           # so the copied payload lands there too.
           rm -rf "$HOME/.termite"
           ln -sfn "$TERMITE_HOME" "$HOME/.termite"
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - uses: actions/checkout@v6
         with:
