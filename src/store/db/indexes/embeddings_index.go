@@ -480,6 +480,7 @@ func (s *EmbeddingIndex) IsChunked() bool {
 
 func (s *EmbeddingIndex) Search(ctx context.Context, query any) (any, error) {
 	queryOps.WithLabelValues(s.name).Inc()
+	defer observeQueryDuration(s.name, "vector", time.Now())
 	if query == nil {
 		return nil, storeutils.ErrEmptyRequest
 	}
