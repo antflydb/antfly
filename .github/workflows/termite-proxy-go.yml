@@ -14,6 +14,7 @@ on:
     paths:
       - "pkg/termite-proxy/**"
       - ".github/workflows/termite-proxy-*.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -21,7 +22,7 @@ concurrency:
 
 jobs:
   proxy:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: arc-antfly-standard
     steps:
       - uses: actions/checkout@v6
         with:

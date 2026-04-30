@@ -22,7 +22,7 @@ env:
 jobs:
   # Build and publish the Antfly database image
   publish-antfly-docker-image:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: arc-antfly-docker
     # Required permissions for OIDC signing and GCP Workload Identity Federation
     permissions:
       contents: read

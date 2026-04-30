@@ -13,6 +13,7 @@ on:
       - "specs/tla/**"
       - "src/tracing/**"
       - "scripts/tla-*.sh"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -20,9 +21,12 @@ concurrency:
 
 jobs:
   tla-check:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: arc-antfly-standard
     timeout-minutes: 15
     steps:
+      - name: Install make
+        run: sudo apt-get update && sudo apt-get install -y make
+
       - uses: actions/checkout@v6
 
       - name: Set up Java
