@@ -1013,12 +1013,91 @@ func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
 func TestPodLabels(t *testing.T) {
 	g := NewWithT(t)
 
-	labels := podLabels("my-cluster", "metadata")
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-cluster",
+			Labels: map[string]string{
+				"cloud.antfly.io/purpose":        "cloud-instance",
+				"cloud.antfly.io/instance-id":    "instance-123",
+				"app.kubernetes.io/managed-by":   "external-controller",
+				"app.kubernetes.io/part-of":      "cloudaf",
+				"kubernetes.io/metadata.name":    "default",
+				"operator.antfly.io/owned-label": "true",
+			},
+		},
+	}
+
+	labels := podLabels(cluster, "metadata")
 
 	g.Expect(labels).To(HaveKeyWithValue("app.kubernetes.io/name", "antfly-database"))
 	g.Expect(labels).To(HaveKeyWithValue("app.kubernetes.io/component", "metadata"))
 	g.Expect(labels).To(HaveKeyWithValue("app.kubernetes.io/instance", "my-cluster"))
 	g.Expect(labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "antfly-operator"))
+	g.Expect(labels).To(HaveKeyWithValue("cloud.antfly.io/purpose", "cloud-instance"))
+	g.Expect(labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "instance-123"))
+	g.Expect(labels).To(HaveKeyWithValue("kubernetes.io/metadata.name", "default"))
+	g.Expect(labels).To(HaveKeyWithValue("operator.antfly.io/owned-label", "true"))
+	g.Expect(labels).NotTo(HaveKey("app.kubernetes.io/part-of"))
+}
+
+func TestPodTemplateLabelsUpdateWhenClusterLabelsChange(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "label-update-cluster",
+			Namespace: "default",
+			Labels: map[string]string{
+				"cloud.antfly.io/instance-id": "instance-before",
+			},
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:latest",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI:  antflyv1.APISpec{Port: 12377},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+				Health:       antflyv1.APISpec{Port: 4200},
+			},
+			Storage: antflyv1.StorageSpec{
+				StorageClass:    "standard",
+				MetadataStorage: "1Gi",
+			},
+			Config: "{}",
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(cluster).
+		Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	g.Expect(client.Get(context.Background(), key, sts)).To(Succeed())
+	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "instance-before"))
+
+	cluster.Labels = map[string]string{
+		"cloud.antfly.io/instance-id": "instance-after",
+		"cloud.antfly.io/org-id":      "org-123",
+	}
+
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), key, sts)).To(Succeed())
+	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "instance-after"))
+	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/org-id", "org-123"))
+	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "antfly-operator"))
 }
 
 // TestSelectorLabels tests that selectorLabels includes instance but not managed-by

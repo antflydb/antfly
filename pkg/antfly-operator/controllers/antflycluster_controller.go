@@ -60,16 +60,34 @@ type AntflyClusterReconciler struct {
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 
+var reservedPodLabelPrefixes = []string{"app.kubernetes.io/"}
+
 // podLabels returns the standard labels for pod templates including the instance identifier.
 // These are a superset of serviceSelectorLabels — they include managed-by labels
 // that MUST NOT be added to StatefulSet spec.selector.matchLabels (immutable after creation).
-func podLabels(clusterName, component string) map[string]string {
-	return map[string]string{
+func podLabels(cluster *antflyv1.AntflyCluster, component string) map[string]string {
+	labels := map[string]string{
 		"app.kubernetes.io/name":       "antfly-database",
 		"app.kubernetes.io/component":  component,
-		"app.kubernetes.io/instance":   clusterName,
+		"app.kubernetes.io/instance":   cluster.Name,
 		"app.kubernetes.io/managed-by": "antfly-operator",
 	}
+
+	for k, v := range cluster.Labels {
+		reserved := false
+		for _, prefix := range reservedPodLabelPrefixes {
+			if strings.HasPrefix(k, prefix) {
+				reserved = true
+				break
+			}
+		}
+		if reserved {
+			continue
+		}
+		labels[k] = v
+	}
+
+	return labels
 }
 
 // serviceSelectorLabels returns the labels used for Service and StatefulSet selectors.
@@ -1541,7 +1559,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      podLabels(cluster.Name, "swarm"),
+				Labels:      podLabels(cluster, "swarm"),
 				Annotations: r.buildPodAnnotations(ctx, cache, cluster, envFromSources),
 			},
 			Spec: corev1.PodSpec{
@@ -1778,7 +1796,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      podLabels(cluster.Name, "metadata"),
+				Labels:      podLabels(cluster, "metadata"),
 				Annotations: r.buildPodAnnotations(ctx, cache, cluster, cluster.Spec.MetadataNodes.EnvFrom),
 			},
 			Spec: corev1.PodSpec{
@@ -1991,7 +2009,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      podLabels(cluster.Name, "data"),
+				Labels:      podLabels(cluster, "data"),
 				Annotations: r.buildPodAnnotations(ctx, cache, cluster, cluster.Spec.DataNodes.EnvFrom),
 			},
 			Spec: corev1.PodSpec{
