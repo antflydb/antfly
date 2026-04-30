@@ -80,6 +80,11 @@ jobs:
         run: |
           apt-get update
           apt-get install -y git ca-certificates curl
+          # Inside the k8s-mode step pod the workspace PVC is owned by the
+          # runner uid, but git runs as root here, so it refuses to operate
+          # without explicit trust. Without this, `go build` fails with
+          # "error obtaining VCS status: exit status 128".
+          git config --global --add safe.directory '*'
 
       - uses: actions/checkout@v6
 
