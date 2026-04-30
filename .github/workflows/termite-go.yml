@@ -56,16 +56,23 @@ jobs:
             cgo: "1"
             container: ""
             runner: arc-antfly-heavy
+          # xla/omni use job-level container: ubuntu:24.04 because XLA
+          # requires GLIBC 2.38+. ARC's actions-runner image is 22.04
+          # (GLIBC 2.35), so we route to arc-antfly-k8s, which has
+          # kubernetesMode enabled and renders `container:` as a separate
+          # step pod (no docker-in-docker required). The other scale sets
+          # don't have docker installed, so job-level containers fail
+          # with "no such file: /var/run/docker.sock" on them.
           - backend: xla
             tags: "xla,XLA"
             cgo: "1"
             container: "ubuntu:24.04"
-            runner: arc-antfly-heavy
+            runner: arc-antfly-k8s
           - backend: omni
             tags: "onnx,ORT,xla,XLA"
             cgo: "1"
             container: "ubuntu:24.04"
-            runner: arc-antfly-heavy
+            runner: arc-antfly-k8s
 
     steps:
       - name: Install container prerequisites
