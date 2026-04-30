@@ -184,6 +184,41 @@
       ],
       "title": "Embedding Persist Rate",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
+          "expr": "histogram_quantile(0.95, sum by (Name, query_type, le) (rate(antfly_indexes_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{Name}} {{query_type}} p95",
+          "refId": "A"
+        }
+      ],
+      "title": "Query Latency p95",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

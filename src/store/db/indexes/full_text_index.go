@@ -927,6 +927,7 @@ func (bb *BleveBatchV2) Commit() error {
 // The result is a JSON marshaled remoteindex.RemoteIndexSearchResponse containing the bleve.SearchResult.
 func (bi *BleveIndexV2) Search(ctx context.Context, query any) (any, error) {
 	queryOps.WithLabelValues(bi.name).Inc()
+	defer observeQueryDuration(bi.name, "search", time.Now())
 	if query == nil {
 		return nil, storeutils.ErrEmptyRequest
 	}
