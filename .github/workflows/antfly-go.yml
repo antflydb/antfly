@@ -86,9 +86,6 @@ jobs:
       - name: Verify Go modules
         run: go mod download
 
-      - name: Simulator Validate
-        run: make sim-validate
-
       - name: Build Antfly
         run: go build -v -o antfly ./cmd/antfly
 
@@ -137,6 +134,49 @@ jobs:
 
       - name: Test
         run: go test -v ./...
+
+  sim-validate:
+    runs-on: arc-antfly-heavy
+    # sim-validate runs `go test ./src/sim` under a wrapper; on the 4-cpu
+    # standard runner with no /mnt/cache, it tipped past the 10Gi ephemeral
+    # cap (or hit some pod-level cancel) ~3:30 in. Move it to heavy where
+    # GOCACHE/GOMODCACHE land on the 50Gi cache PVC and there's enough CPU
+    # for the sim's parallel scenarios.
+    env:
+      GOCACHE: /mnt/cache/go-build
+      GOMODCACHE: /mnt/cache/go-mod
+    steps:
+      - name: Prepare cache directories
+        run: |
+          set -eux
+          mkdir -p "$GOCACHE" "$GOMODCACHE"
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set Go experiment
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Configure Go for private modules
+        run: |
+          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
+          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
+
+      - name: Verify Go modules
+        run: go mod download
+
+      - name: Simulator Validate
+        run: make sim-validate
 
   e2e:
     runs-on: arc-antfly-heavy
