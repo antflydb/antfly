@@ -55,6 +55,14 @@ const (
 	TermiteAPIPort = 8080
 )
 
+var (
+	reservedPoolPodLabelPrefixes = []string{"app.kubernetes.io/"}
+	reservedPoolPodLabelKeys     = map[string]struct{}{
+		"antfly.io/pool":          {},
+		"antfly.io/workload-type": {},
+	}
+)
+
 // TermitePoolReconciler reconciles a TermitePool object
 type TermitePoolReconciler struct {
 	client.Client
@@ -442,7 +450,7 @@ func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: r.labels(pool),
+					Labels: r.podLabels(pool),
 				},
 				Spec: corev1.PodSpec{
 					InitContainers: initContainers,
@@ -812,6 +820,29 @@ func (r *TermitePoolReconciler) labels(pool *antflyaiv1alpha1.TermitePool) map[s
 		"antfly.io/pool":              pool.Name,
 		"antfly.io/workload-type":     string(pool.Spec.WorkloadType),
 	}
+}
+
+func (r *TermitePoolReconciler) podLabels(pool *antflyaiv1alpha1.TermitePool) map[string]string {
+	labels := r.labels(pool)
+	for k, v := range pool.Labels {
+		if isReservedPoolPodLabel(k) {
+			continue
+		}
+		labels[k] = v
+	}
+	return labels
+}
+
+func isReservedPoolPodLabel(key string) bool {
+	if _, ok := reservedPoolPodLabelKeys[key]; ok {
+		return true
+	}
+	for _, prefix := range reservedPoolPodLabelPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *TermitePoolReconciler) selectorLabels(pool *antflyaiv1alpha1.TermitePool) map[string]string {
