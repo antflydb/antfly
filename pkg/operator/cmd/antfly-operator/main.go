@@ -105,10 +105,11 @@ func main() {
 	autoScaler := controllers.NewAutoScaler(mgr.GetClient(), k8sClient, mgr.GetClient())
 
 	if err = (&controllers.AntflyClusterReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		AutoScaler: autoScaler,
-		Recorder:   mgr.GetEventRecorder("antfly-operator"),
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		AutoScaler:         autoScaler,
+		Recorder:           mgr.GetEventRecorder("antfly-operator"),
+		ManageTermitePools: enableTermiteControllers,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AntflyCluster")
 		os.Exit(1)

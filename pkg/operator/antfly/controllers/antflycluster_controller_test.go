@@ -7,6 +7,7 @@ import (
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/pkg/operator/antfly/api/v1"
+	termitev1alpha1 "github.com/antflydb/antfly/pkg/operator/termite/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
@@ -17,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // T004: Unit test for applyDefaults() setting ServiceMesh.Enabled=false
@@ -204,6 +206,138 @@ func TestApplyDefaults_PublicAPIDefaultsFalse(t *testing.T) {
 	reconciler.applyDefaults(clusterEnabled)
 
 	g.Expect(*clusterEnabled.Spec.PublicAPI.Enabled).To(BeTrue(), "Explicitly enabled PublicAPI should remain true")
+}
+
+func TestReconcileTermitePoolCreatesManagedPool(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:             s,
+		ManageTermitePools: true,
+	}
+	cluster := baseClusterWithTermiteSpec()
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	pool := &termitev1alpha1.TermitePool{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pool.Spec.Image).To(Equal("antfly:test"))
+	g.Expect(pool.Labels).To(HaveKeyWithValue("app.kubernetes.io/instance", "test-cluster"))
+	g.Expect(pool.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "antfly-operator"))
+	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeTrue())
+}
+
+func TestReconcileTermitePoolDeletesOnlyManagedPool(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	cluster := baseClusterWithTermiteSpec()
+	cluster.Spec.Termite = nil
+	managedPool := &termitev1alpha1.TermitePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-termite",
+			Namespace: "default",
+		},
+	}
+	g.Expect(controllerutil.SetControllerReference(cluster, managedPool, s)).To(Succeed())
+	unmanagedPool := &termitev1alpha1.TermitePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-cluster-termite",
+			Namespace: "default",
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool, unmanagedPool).Build(),
+		Scheme:             s,
+		ManageTermitePools: true,
+	}
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "other-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	g.Expect(err).NotTo(HaveOccurred())
+}
+
+func TestReconcileTermitePoolDoesNotAdoptExistingUnmanagedPool(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	cluster := baseClusterWithTermiteSpec()
+	existingPool := &termitev1alpha1.TermitePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-termite",
+			Namespace: "default",
+		},
+		Spec: termitev1alpha1.TermitePoolSpec{
+			Image: "existing:image",
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(existingPool).Build(),
+		Scheme:             s,
+		ManageTermitePools: true,
+	}
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("already exists and is not controlled")))
+
+	pool := &termitev1alpha1.TermitePool{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pool.Spec.Image).To(Equal("existing:image"))
+	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeFalse())
+}
+
+func TestReconcileTermitePoolNoopsWhenManagementDisabled(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	cluster := baseClusterWithTermiteSpec()
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:             s,
+		ManageTermitePools: false,
+	}
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
+func newOperatorTestScheme(g *WithT) *runtime.Scheme {
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(termitev1alpha1.AddToScheme(s)).To(Succeed())
+	return s
+}
+
+func baseClusterWithTermiteSpec() *antflyv1.AntflyCluster {
+	return &antflyv1.AntflyCluster{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: antflyv1.GroupVersion.String(),
+			Kind:       "AntflyCluster",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			Termite: &termitev1alpha1.TermitePoolSpec{
+				Models:   termitev1alpha1.ModelConfig{},
+				Replicas: termitev1alpha1.ReplicaConfig{Min: 1, Max: 2},
+				Hardware: termitev1alpha1.HardwareConfig{},
+			},
+		},
+	}
 }
 
 func TestApplyDefaults_SwarmDefaults(t *testing.T) {

@@ -38,9 +38,10 @@ import (
 // AntflyClusterReconciler reconciles an AntflyCluster object
 type AntflyClusterReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	AutoScaler *AutoScaler
-	Recorder   events.EventRecorder
+	Scheme             *runtime.Scheme
+	AutoScaler         *AutoScaler
+	Recorder           events.EventRecorder
+	ManageTermitePools bool
 
 	// validationAttempts tracks consecutive validation failure counts per cluster
 	// (namespace/name -> int). Reset on successful validation. Used for
@@ -1071,6 +1072,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if !r.ManageTermitePools {
+		return nil
+	}
+
 	name := cluster.Name + "-termite"
 	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
 
@@ -1097,6 +1102,15 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 			Name:      name,
 			Namespace: cluster.Namespace,
 		},
+	}
+
+	existing := &termitev1alpha1.TermitePool{}
+	if err := r.Get(ctx, key, existing); err == nil {
+		if !metav1.IsControlledBy(existing, cluster) {
+			return fmt.Errorf("TermitePool %s already exists and is not controlled by AntflyCluster %s/%s", name, cluster.Namespace, cluster.Name)
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to get managed TermitePool %s: %w", name, err)
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pool, func() error {
@@ -2911,12 +2925,14 @@ func hasAnyPrefix(name string, prefixes []string) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyCluster{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&policyv1.PodDisruptionBudget{}).
-		Owns(&termitev1alpha1.TermitePool{}).
-		Complete(r)
+		Owns(&policyv1.PodDisruptionBudget{})
+	if r.ManageTermitePools {
+		builder = builder.Owns(&termitev1alpha1.TermitePool{})
+	}
+	return builder.Complete(r)
 }
