@@ -1,12 +1,12 @@
 # Antfly Operator Release workflow
-# Builds and publishes container images on pkg/antfly-operator/v* tags
+# Builds and publishes container images on pkg/operator/v* tags
 
 name: Antfly Operator Container
 
 on:
   push:
     tags:
-      - "pkg/antfly-operator/v*"  # Triggers on pkg/antfly-operator/v1.0.0, etc. (matches Go module tag convention)
+      - "pkg/operator/v*"  # Triggers on pkg/operator/v1.0.0, etc. (matches Go module tag convention)
 
 env:
   # Google Cloud Artifact Registry configuration
@@ -60,12 +60,12 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
-      # Extract version from tag (strip pkg/antfly-operator/ prefix)
+      # Extract version from tag (strip pkg/operator/ prefix)
       - name: Extract version
         id: version
         run: |
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#pkg/antfly-operator/}"
+          VERSION="${TAG#pkg/operator/}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Extracted version: ${VERSION}"
 
