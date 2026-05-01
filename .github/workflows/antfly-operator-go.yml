@@ -7,12 +7,12 @@ on:
   push:
     branches: ["main"]
     paths:
-      - 'pkg/antfly-operator/**'
+      - 'pkg/operator/**'
       - '.github/workflows/antfly-operator-go.yml'
   pull_request:
     branches: ["main"]
     paths:
-      - 'pkg/antfly-operator/**'
+      - 'pkg/operator/**'
       - '.github/workflows/antfly-operator-go.yml'
 
 concurrency:
@@ -24,7 +24,7 @@ jobs:
     runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
     defaults:
       run:
-        working-directory: pkg/antfly-operator
+        working-directory: pkg/operator
     steps:
       - uses: actions/checkout@v6
 

@@ -1,21 +1,16 @@
 # Build the manager binary
 FROM golang:1.26-alpine AS builder
 
-WORKDIR /workspace/pkg/antfly-operator
+WORKDIR /workspace/pkg/operator
 # Copy the Go Modules manifests
-COPY pkg/antfly-operator/go.mod go.mod
-COPY pkg/antfly-operator/go.sum go.sum
+COPY pkg/operator/go.mod go.mod
+COPY pkg/operator/go.sum go.sum
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
 
 # Copy the go source
-COPY pkg/antfly-operator/cmd/ cmd/
-COPY pkg/antfly-operator/api/ api/
-COPY pkg/antfly-operator/bootstrap/ bootstrap/
-COPY pkg/antfly-operator/controllers/ controllers/
-COPY pkg/antfly-operator/internal/ internal/
-COPY pkg/antfly-operator/manifests/ manifests/
+COPY pkg/operator/ .
 
 # Declare build arguments for multi-arch support (automatically provided by Docker Buildx)
 ARG TARGETOS

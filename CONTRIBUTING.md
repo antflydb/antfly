@@ -131,7 +131,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Root | `.` |
 | E2E tests | `e2e/` |
 | Go SDK | `pkg/client/` |
-| Operator | `pkg/antfly-operator/` |
+| Operator | `pkg/operator/` |
 | libaf | `pkg/libaf/` |
 | docsaf | `pkg/docsaf/` |
 | evalaf | `pkg/evalaf/` |
@@ -140,7 +140,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Genkit OpenRouter | `pkg/genkit/openrouter/` |
 | Termite | `pkg/termite/` |
 | Termite Go client | `pkg/termite-client/` |
-| Termite operator | `pkg/termite-operator/` |
 | Termite proxy | `pkg/termite-proxy/` |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
@@ -236,7 +235,7 @@ Example configs live in `configs/`:
 Tags follow Go module conventions and trigger CI:
 
 - `v*` — root module release + container build
-- `pkg/antfly-operator/v*` — operator container build
+- `pkg/operator/v*` — operator container build
 
 ```bash
 export GITHUB_TOKEN=...

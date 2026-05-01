@@ -1,0 +1,141 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: antfly-operator-validating-webhook-configuration
+webhooks:
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: antfly-operator-webhook-service
+        namespace: system
+        path: /validate-antfly-io-v1-antflycluster
+    failurePolicy: Fail
+    name: vantflycluster.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - antfly-system
+            - termite-system
+    rules:
+      - apiGroups:
+          - antfly.io
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - antflyclusters
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: antfly-operator-webhook-service
+        namespace: system
+        path: /validate-antfly-io-v1-antflybackup
+    failurePolicy: Fail
+    name: vantflybackup.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - antfly-system
+            - termite-system
+    rules:
+      - apiGroups:
+          - antfly.io
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - antflybackups
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: antfly-operator-webhook-service
+        namespace: system
+        path: /validate-antfly-io-v1-antflyrestore
+    failurePolicy: Fail
+    name: vantflyrestore.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - antfly-system
+            - termite-system
+    rules:
+      - apiGroups:
+          - antfly.io
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - antflyrestores
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: antfly-operator-webhook-service
+        namespace: system
+        path: /validate-antfly-io-v1alpha1-termitepool
+    failurePolicy: Fail
+    name: vtermitepool.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - antfly-system
+            - termite-system
+    rules:
+      - apiGroups:
+          - antfly.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - termitepools
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: antfly-operator-webhook-service
+        namespace: system
+        path: /validate-antfly-io-v1alpha1-termiteroute
+    failurePolicy: Fail
+    name: vtermiteroute.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - antfly-system
+            - termite-system
+    rules:
+      - apiGroups:
+          - antfly.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - termiteroutes
+    sideEffects: None

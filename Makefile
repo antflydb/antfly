@@ -9,9 +9,9 @@ GO := GOEXPERIMENT=simd go
 GO_SUBMODULES := \
 	./e2e \
 	./pkg/client \
-	./pkg/antfly-operator \
 	./pkg/antfly-proxy \
 	./pkg/libaf \
+	./pkg/operator \
 	./pkg/docsaf \
 	./pkg/generating \
 	./pkg/evalaf \
@@ -20,7 +20,6 @@ GO_SUBMODULES := \
 	./pkg/genkit/openrouter \
 	./pkg/termite \
 	./pkg/termite-client \
-	./pkg/termite-operator \
 	./pkg/termite-proxy
 
 # ====================================================================================
@@ -453,37 +452,24 @@ show-ingress:
 # ====================================================================================
 
 .PHONY: operator-build operator-test operator-docker-build operator-lint proxy-docker-build \
-        termite-operator-build termite-operator-test termite-operator-lint termite-operator-docker-build \
         termite-proxy-build termite-proxy-docker-build \
         termite-build termite-test termite-lint \
         termite-client-test termite-client-lint
 
 operator-build: ## Build the antfly-operator binary
-	(cd ./pkg/antfly-operator && $(MAKE) build)
+	(cd ./pkg/operator && $(MAKE) build)
 
 operator-test: ## Run antfly-operator tests
-	(cd ./pkg/antfly-operator && $(MAKE) test)
+	(cd ./pkg/operator && $(MAKE) test)
 
 operator-lint: ## Run linter on antfly-operator
-	(cd ./pkg/antfly-operator && $(MAKE) lint)
+	(cd ./pkg/operator && $(MAKE) lint)
 
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./Dockerfile.antfly-operator .
 
 proxy-docker-build: ## Build antfly-proxy Docker image
 	docker build -t antfly-proxy:latest -f ./Dockerfile.antfly-proxy .
-
-termite-operator-build: ## Build the termite-operator binary
-	(cd ./pkg/termite-operator && $(GO) build -o ../../termite-operator ./cmd/termite-operator)
-
-termite-operator-test: ## Run termite-operator tests
-	(cd ./pkg/termite-operator && $(GO) test ./...)
-
-termite-operator-lint: ## Run linter on termite-operator
-	(cd ./pkg/termite-operator && $(GO) vet ./...)
-
-termite-operator-docker-build: ## Build termite-operator Docker image
-	docker build -t termite-operator:latest -f ./Dockerfile.termite-operator .
 
 termite-proxy-build: ## Build the termite-proxy binary
 	(cd ./pkg/termite-proxy && $(GO) build -o ../../termite-proxy ./cmd/termite-proxy)
