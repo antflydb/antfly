@@ -957,7 +957,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
-		r.reconcilePVCExpansion(ctx, workingCluster, "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster))
+		r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
+			r.reconcilePVCExpansion(ctx, workingCluster, "swarm", "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster)),
+		})
 
 		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-swarm-pdb", "swarm"); err != nil {
 			return ctrl.Result{}, err
@@ -1005,12 +1007,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// Deregister data nodes from Raft before scaling down.
+	// Block data-node scale-down until the shared drain/rebalance workflow is available.
 	// By this point, workingCluster.Spec.DataNodes.Replicas reflects the final desired
 	// count from either the CRD spec (manual) or the autoscaler.
-	// We use Status.Replicas (actual running pods) rather than Spec.Replicas (desired)
-	// because a prior failed reconcile may have already written the reduced desired
-	// count to Spec without completing deregistration.
+	// We use Status.Replicas (actual running pods) rather than Spec.Replicas (desired).
 	{
 		existingSts := &appsv1.StatefulSet{}
 		stsName := types.NamespacedName{Name: workingCluster.Name + "-data", Namespace: workingCluster.Namespace}
@@ -1025,6 +1025,15 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			if desiredReplicas == 0 {
 				desiredReplicas = 3 // default
 			}
+			if desiredReplicas < currentReplicas {
+				r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownBlocked,
+					fmt.Sprintf("Data-node scale-down from %d to %d is blocked until the safe drain workflow is available", currentReplicas, desiredReplicas))
+				if statusErr := r.Status().Update(ctx, workingCluster); statusErr != nil {
+					log.Error(statusErr, "Failed to update status with data scale-down block")
+				}
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
 			if err := r.deregisterDataNodes(ctx, workingCluster, currentReplicas, desiredReplicas); err != nil {
 				log.Error(err, "Failed to deregister data nodes, will retry")
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -1039,8 +1048,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Reconcile PVC expansion (metadata and data)
-	r.reconcilePVCExpansion(ctx, workingCluster, "metadata-storage", workingCluster.Name+"-metadata", workingCluster.Spec.Storage.MetadataStorage)
-	r.reconcilePVCExpansion(ctx, workingCluster, "data-storage", workingCluster.Name+"-data", workingCluster.Spec.Storage.DataStorage)
+	r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
+		r.reconcilePVCExpansion(ctx, workingCluster, "metadata", "metadata-storage", workingCluster.Name+"-metadata", workingCluster.Spec.Storage.MetadataStorage),
+		r.reconcilePVCExpansion(ctx, workingCluster, "data", "data-storage", workingCluster.Name+"-data", workingCluster.Spec.Storage.DataStorage),
+	})
 
 	// Reconcile PodDisruptionBudgets for GKE
 	if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-metadata-pdb", "metadata"); err != nil {
@@ -1169,6 +1180,16 @@ func (e *termitePoolNameConflictError) Error() string {
 func (r *AntflyClusterReconciler) setTermitePoolReadyCondition(cluster *antflyv1.AntflyCluster, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 		Type:               antflyv1.TypeTermitePoolReady,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: cluster.Generation,
+	})
+}
+
+func (r *AntflyClusterReconciler) setScalingCondition(cluster *antflyv1.AntflyCluster, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypeScaling,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
@@ -2490,6 +2511,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			cluster.Status.SwarmStatus.LastTransitionTime = &now
 		}
 
+		r.updateRolloutCondition(cluster, swarmSts)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
 	}
@@ -2536,10 +2558,52 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		cluster.Status.Phase = "Pending"
 	}
 
+	r.updateRolloutCondition(cluster, metadataSts, dataSts)
+
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
 
 	return r.Status().Update(ctx, cluster)
+}
+
+func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.AntflyCluster, statefulSets ...*appsv1.StatefulSet) {
+	var waiting []string
+	for _, sts := range statefulSets {
+		if sts == nil || sts.Name == "" {
+			continue
+		}
+		replicas := int32(1)
+		if sts.Spec.Replicas != nil {
+			replicas = *sts.Spec.Replicas
+		}
+		if sts.Generation > sts.Status.ObservedGeneration {
+			waiting = append(waiting, fmt.Sprintf("%s observedGeneration %d is behind generation %d", sts.Name, sts.Status.ObservedGeneration, sts.Generation))
+			continue
+		}
+		if sts.Status.UpdatedReplicas < replicas {
+			waiting = append(waiting, fmt.Sprintf("%s has %d/%d updated replicas", sts.Name, sts.Status.UpdatedReplicas, replicas))
+			continue
+		}
+		if sts.Status.ReadyReplicas < replicas {
+			waiting = append(waiting, fmt.Sprintf("%s has %d/%d ready replicas", sts.Name, sts.Status.ReadyReplicas, replicas))
+		}
+	}
+
+	condition := metav1.Condition{
+		Type:               antflyv1.TypeRollout,
+		ObservedGeneration: cluster.Generation,
+	}
+	if len(waiting) > 0 {
+		condition.Status = metav1.ConditionUnknown
+		condition.Reason = antflyv1.ReasonRolloutInProgress
+		condition.Message = strings.Join(waiting, "; ")
+	} else {
+		condition.Status = metav1.ConditionTrue
+		condition.Reason = antflyv1.ReasonRolloutComplete
+		condition.Message = "All StatefulSet replicas are updated and ready"
+	}
+
+	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
 }
 
 // updateServiceMeshReadyCondition updates the ServiceMeshReady condition based on current status
@@ -2840,11 +2904,31 @@ func (r *AntflyClusterReconciler) reconcilePodDisruptionBudget(ctx context.Conte
 	return err
 }
 
+type pvcExpansionState string
+
+const (
+	pvcExpansionSkipped    pvcExpansionState = "skipped"
+	pvcExpansionPending    pvcExpansionState = "pending"
+	pvcExpansionInProgress pvcExpansionState = "inProgress"
+	pvcExpansionComplete   pvcExpansionState = "complete"
+	pvcExpansionFailed     pvcExpansionState = "failed"
+)
+
+type pvcExpansionResult struct {
+	component string
+	state     pvcExpansionState
+	message   string
+}
+
 // reconcilePVCExpansion patches existing PVCs when the CRD specifies a larger storage size.
 // This is a best-effort operation — failures are reported as status conditions but don't block reconciliation.
-func (r *AntflyClusterReconciler) reconcilePVCExpansion(ctx context.Context, cluster *antflyv1.AntflyCluster, vctName, stsName, desiredSizeStr string) {
+func (r *AntflyClusterReconciler) reconcilePVCExpansion(ctx context.Context, cluster *antflyv1.AntflyCluster, component, vctName, stsName, desiredSizeStr string) pvcExpansionResult {
 	if desiredSizeStr == "" {
-		return // no size specified, using default
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionSkipped,
+			message:   fmt.Sprintf("%s storage uses the operator default size", component),
+		}
 	}
 
 	log := log.FromContext(ctx)
@@ -2856,28 +2940,125 @@ func (r *AntflyClusterReconciler) reconcilePVCExpansion(ctx context.Context, clu
 	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace),
 		client.MatchingLabels{"app.kubernetes.io/instance": cluster.Name}); err != nil {
 		log.Error(err, "Failed to list PVCs for expansion check")
-		return
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionFailed,
+			message:   fmt.Sprintf("Failed to list %s PVCs for expansion: %v", component, err),
+		}
 	}
 
+	matched := 0
+	updated := 0
+	waiting := 0
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
 		if !strings.HasPrefix(pvc.Name, prefix) {
 			continue // secondary guard: multiple StatefulSets share the instance label
 		}
+		matched++
 
 		currentSize := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-		if desiredSize.Cmp(currentSize) <= 0 {
-			continue // already at or above desired size
+		if desiredSize.Cmp(currentSize) > 0 {
+			log.Info("Expanding PVC", "pvc", pvc.Name, "from", currentSize.String(), "to", desiredSize.String())
+			pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
+			if err := r.Update(ctx, pvc); err != nil {
+				log.Error(err, "Failed to expand PVC", "pvc", pvc.Name)
+				return pvcExpansionResult{
+					component: component,
+					state:     pvcExpansionFailed,
+					message:   fmt.Sprintf("Failed to expand PVC %s: %v", pvc.Name, err),
+				}
+			}
+			updated++
+			waiting++
+			continue
 		}
 
-		log.Info("Expanding PVC", "pvc", pvc.Name, "from", currentSize.String(), "to", desiredSize.String())
-		pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
-		if err := r.Update(ctx, pvc); err != nil {
-			log.Error(err, "Failed to expand PVC", "pvc", pvc.Name)
-			r.setStorageCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonPVCExpansionFailed,
-				fmt.Sprintf("Failed to expand PVC %s: %v", pvc.Name, err))
+		capacity := pvc.Status.Capacity[corev1.ResourceStorage]
+		if capacity.IsZero() || desiredSize.Cmp(capacity) > 0 || pvcHasFileSystemResizePending(pvc) {
+			waiting++
 		}
 	}
+
+	switch {
+	case matched == 0:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionPending,
+			message:   fmt.Sprintf("Waiting for %s PVCs with prefix %q to be created", component, prefix),
+		}
+	case updated > 0:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionInProgress,
+			message:   fmt.Sprintf("Expansion requested for %d %s PVC(s) to %s", updated, component, desiredSize.String()),
+		}
+	case waiting > 0:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionInProgress,
+			message:   fmt.Sprintf("Waiting for %d %s PVC(s) to report capacity %s", waiting, component, desiredSize.String()),
+		}
+	default:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionComplete,
+			message:   fmt.Sprintf("All %d %s PVC(s) report requested capacity %s", matched, component, desiredSize.String()),
+		}
+	}
+}
+
+func pvcHasFileSystemResizePending(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, condition := range pvc.Status.Conditions {
+		if condition.Type == corev1.PersistentVolumeClaimFileSystemResizePending && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *AntflyClusterReconciler) setPVCExpansionCondition(cluster *antflyv1.AntflyCluster, results []pvcExpansionResult) {
+	var relevant []pvcExpansionResult
+	for _, result := range results {
+		if result.state != pvcExpansionSkipped {
+			relevant = append(relevant, result)
+		}
+	}
+	if len(relevant) == 0 {
+		return
+	}
+
+	status := metav1.ConditionTrue
+	reason := antflyv1.ReasonPVCExpansionComplete
+	for _, result := range relevant {
+		switch result.state {
+		case pvcExpansionFailed:
+			status = metav1.ConditionFalse
+			reason = antflyv1.ReasonPVCExpansionFailed
+		case pvcExpansionPending:
+			if reason != antflyv1.ReasonPVCExpansionFailed {
+				status = metav1.ConditionUnknown
+				reason = antflyv1.ReasonPVCExpansionPending
+			}
+		case pvcExpansionInProgress:
+			if reason != antflyv1.ReasonPVCExpansionFailed && reason != antflyv1.ReasonPVCExpansionPending {
+				status = metav1.ConditionUnknown
+				reason = antflyv1.ReasonPVCExpansionInProgress
+			}
+		}
+	}
+
+	messages := make([]string, 0, len(relevant))
+	for _, result := range relevant {
+		messages = append(messages, result.message)
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypePVCExpansion,
+		Status:             status,
+		Reason:             reason,
+		Message:            strings.Join(messages, "; "),
+		ObservedGeneration: cluster.Generation,
+	})
 }
 
 // checkPVCTopologyHealth detects PVC/AZ topology issues by checking for Pending pods

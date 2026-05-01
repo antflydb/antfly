@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -450,6 +451,106 @@ func TestApplyDefaults_SwarmDefaults(t *testing.T) {
 	g.Expect(cluster.Spec.Swarm.Termite).ToNot(BeNil())
 	g.Expect(cluster.Spec.Swarm.Termite.Enabled).To(BeTrue())
 	g.Expect(cluster.Spec.Swarm.Termite.APIURL).To(Equal("http://0.0.0.0:11433"))
+}
+
+func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 7},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-storage-test-cluster-data-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-cluster",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pvc).Build(),
+		Scheme: s,
+	}
+
+	result := reconciler.reconcilePVCExpansion(ctx, cluster, "data", "data-storage", "test-cluster-data", "2Gi")
+	reconciler.setPVCExpansionCondition(cluster, []pvcExpansionResult{result})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypePVCExpansion)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonPVCExpansionInProgress))
+	g.Expect(cond.ObservedGeneration).To(Equal(int64(7)))
+
+	updated := &corev1.PersistentVolumeClaim{}
+	g.Expect(reconciler.Get(ctx, types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, updated)).To(Succeed())
+	g.Expect(updated.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("2Gi")))
+}
+
+func TestSetPVCExpansionConditionReportsComplete(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 3},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.setPVCExpansionCondition(cluster, []pvcExpansionResult{
+		{component: "metadata", state: pvcExpansionComplete, message: "metadata complete"},
+		{component: "data", state: pvcExpansionComplete, message: "data complete"},
+	})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypePVCExpansion)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonPVCExpansionComplete))
+}
+
+func TestUpdateRolloutConditionReportsProgressAndComplete(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 4},
+	}
+	reconciler := &AntflyClusterReconciler{}
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-data", Generation: 2},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    1,
+			ReadyReplicas:      1,
+		},
+	}
+
+	reconciler.updateRolloutCondition(cluster, sts)
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
+
+	sts.Status.ObservedGeneration = 2
+	sts.Status.UpdatedReplicas = 3
+	sts.Status.ReadyReplicas = 3
+	reconciler.updateRolloutCondition(cluster, sts)
+	cond = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutComplete))
 }
 
 // T006: Unit test for public API service deletion when disabled

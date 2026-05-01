@@ -53,6 +53,15 @@ const (
 	// TypeStorageHealthy indicates whether PVC/storage topology is healthy
 	TypeStorageHealthy = "StorageHealthy"
 
+	// TypePVCExpansion indicates whether requested PVC expansion has completed
+	TypePVCExpansion = "PVCExpansion"
+
+	// TypeRollout indicates whether StatefulSet template changes have rolled out
+	TypeRollout = "Rollout"
+
+	// TypeScaling indicates whether replica scaling can proceed safely
+	TypeScaling = "Scaling"
+
 	// TypeTermitePoolReady indicates whether the operator-managed TermitePool is reconciled
 	TypeTermitePoolReady = "TermitePoolReady"
 
@@ -76,6 +85,30 @@ const (
 
 	// ReasonPVCExpansionFailed indicates a PVC expansion request failed
 	ReasonPVCExpansionFailed = "PVCExpansionFailed"
+
+	// ReasonPVCExpansionPending indicates PVCs have not appeared for a resize check yet
+	ReasonPVCExpansionPending = "PVCExpansionPending"
+
+	// ReasonPVCExpansionInProgress indicates requested PVC expansion is still applying
+	ReasonPVCExpansionInProgress = "PVCExpansionInProgress"
+
+	// ReasonPVCExpansionComplete indicates all observed PVCs satisfy requested storage
+	ReasonPVCExpansionComplete = "PVCExpansionComplete"
+
+	// ReasonRolloutInProgress indicates StatefulSet changes are still rolling out
+	ReasonRolloutInProgress = "RolloutInProgress"
+
+	// ReasonRolloutComplete indicates StatefulSet changes have rolled out
+	ReasonRolloutComplete = "RolloutComplete"
+
+	// ReasonRolloutFailed indicates StatefulSet rollout failed or could not be observed
+	ReasonRolloutFailed = "RolloutFailed"
+
+	// ReasonScalingReady indicates scaling is not currently blocked
+	ReasonScalingReady = "ScalingReady"
+
+	// ReasonDataScaleDownBlocked indicates data-node scale-down is blocked until drain orchestration is available
+	ReasonDataScaleDownBlocked = "DataScaleDownBlocked"
 
 	// FinalizerPVCCleanup is the finalizer used for PVC cleanup on cluster deletion
 	FinalizerPVCCleanup = "antfly.io/pvc-cleanup"

@@ -131,6 +131,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateAutoScalingConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if err := r.validateResourceQuantities(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
@@ -576,6 +580,32 @@ Attempted change: "%s"`,
 			old.Spec.Storage.StorageClass, r.Spec.Storage.StorageClass))
 	}
 
+	if newMode == ClusterModeClustered && oldMode == ClusterModeClustered {
+		if r.Spec.MetadataNodes.Replicas < old.Spec.MetadataNodes.Replicas {
+			errors = append(errors, fmt.Sprintf(
+				`field 'spec.metadataNodes.replicas' cannot be decreased yet (current: %d, attempted: %d)
+
+Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata scale-down workflow.
+
+Solution: Keep the existing metadata replica count, or recreate the cluster with the smaller topology.`,
+				old.Spec.MetadataNodes.Replicas, r.Spec.MetadataNodes.Replicas))
+		}
+
+		if r.Spec.DataNodes.Replicas < old.Spec.DataNodes.Replicas {
+			errors = append(errors, fmt.Sprintf(
+				`field 'spec.dataNodes.replicas' cannot be decreased yet (current: %d, attempted: %d)
+
+Problem: Data-node scale-down requires a database-aware drain and rebalance workflow before pods are removed.
+
+Solution: Scale data nodes up only for now. Data scale-down will be enabled after the shared drain workflow is available.`,
+				old.Spec.DataNodes.Replicas, r.Spec.DataNodes.Replicas))
+		}
+
+		if err := r.validateAutoScalingUpdate(old); err != nil {
+			errors = append(errors, err.Error())
+		}
+	}
+
 	// Check storage size decrease (increases are allowed for online expansion)
 	// Use resource.Quantity comparison instead of string comparison to handle
 	// cases like "8Gi" → "10Gi" correctly (string comparison would reject this).
@@ -605,6 +635,20 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 
 Problem: PVC storage size cannot be reduced. Kubernetes only supports volume expansion, not shrinking.`,
 				old.Spec.Storage.DataStorage, r.Spec.Storage.DataStorage))
+		}
+	}
+	if old.Spec.Storage.SwarmStorage != "" && r.Spec.Storage.SwarmStorage != "" {
+		oldQ, errOld := resource.ParseQuantity(old.Spec.Storage.SwarmStorage)
+		newQ, errNew := resource.ParseQuantity(r.Spec.Storage.SwarmStorage)
+		if errNew != nil {
+			errors = append(errors, fmt.Sprintf(
+				"spec.storage.swarmStorage: %q is not a valid storage quantity", r.Spec.Storage.SwarmStorage))
+		} else if errOld == nil && newQ.Cmp(oldQ) < 0 {
+			errors = append(errors, fmt.Sprintf(
+				`field 'spec.storage.swarmStorage' cannot be decreased (current: %s, attempted: %s)
+
+Problem: PVC storage size cannot be reduced. Kubernetes only supports volume expansion, not shrinking.`,
+				old.Spec.Storage.SwarmStorage, r.Spec.Storage.SwarmStorage))
 		}
 	}
 
@@ -768,6 +812,72 @@ Solution: Either:
   Option 2: Disable autoscaling (spec.dataNodes.autoScaling.enabled=false)`)
 	}
 
+	return nil
+}
+
+func (r *AntflyCluster) validateAutoScalingConfig() error {
+	if r.isSwarmMode() || r.Spec.DataNodes.AutoScaling == nil {
+		return nil
+	}
+
+	autoScaling := r.Spec.DataNodes.AutoScaling
+	if !autoScaling.Enabled {
+		return nil
+	}
+
+	var errors []string
+	if autoScaling.MinReplicas < 0 {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas must be >= 0, got %d", autoScaling.MinReplicas))
+	}
+	if autoScaling.MaxReplicas < 1 {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas must be >= 1, got %d", autoScaling.MaxReplicas))
+	}
+	if autoScaling.MinReplicas > autoScaling.MaxReplicas {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas (%d) cannot be greater than maxReplicas (%d)", autoScaling.MinReplicas, autoScaling.MaxReplicas))
+	}
+	if autoScaling.TargetCPUUtilizationPercentage != nil {
+		target := *autoScaling.TargetCPUUtilizationPercentage
+		if target < 1 || target > 100 {
+			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.targetCPUUtilizationPercentage must be between 1 and 100, got %d", target))
+		}
+	}
+	if autoScaling.TargetMemoryUtilizationPercentage != nil {
+		target := *autoScaling.TargetMemoryUtilizationPercentage
+		if target < 1 || target > 100 {
+			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.targetMemoryUtilizationPercentage must be between 1 and 100, got %d", target))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("autoscaling validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func (r *AntflyCluster) validateAutoScalingUpdate(old *AntflyCluster) error {
+	if r.Spec.DataNodes.AutoScaling == nil || !r.Spec.DataNodes.AutoScaling.Enabled {
+		return nil
+	}
+
+	newScaling := r.Spec.DataNodes.AutoScaling
+	oldScaling := old.Spec.DataNodes.AutoScaling
+	var errors []string
+	oldReplicas := old.Spec.DataNodes.Replicas
+	if oldReplicas > 0 && newScaling.MaxReplicas < oldReplicas {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas (%d) cannot be below existing spec.dataNodes.replicas (%d) until data scale-down is supported", newScaling.MaxReplicas, oldReplicas))
+	}
+	if oldScaling != nil && oldScaling.Enabled {
+		if newScaling.MinReplicas < oldScaling.MinReplicas {
+			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas cannot be decreased yet (current: %d, attempted: %d)", oldScaling.MinReplicas, newScaling.MinReplicas))
+		}
+		if newScaling.MaxReplicas < oldScaling.MaxReplicas {
+			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas cannot be decreased yet (current: %d, attempted: %d)", oldScaling.MaxReplicas, newScaling.MaxReplicas))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("%s", strings.Join(errors, "\n\n"))
+	}
 	return nil
 }
 
