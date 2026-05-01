@@ -1,6 +1,7 @@
 package v1
 
 import (
+	termitev1alpha1 "github.com/antflydb/antfly/pkg/operator/api/termite/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -113,7 +114,7 @@ type AntflyClusterSpec struct {
 	// When set, the Antfly operator creates or updates a TermitePool named
 	// "<cluster-name>-termite" in the same namespace and owned by this cluster.
 	// +optional
-	Termite *AntflyClusterTermiteSpec `json:"termite,omitempty"`
+	Termite *termitev1alpha1.TermitePoolSpec `json:"termite,omitempty"`
 
 	// MetadataNodes defines the configuration for metadata nodes (StatefulSet).
 	// Required for Clustered mode and must be omitted in Swarm mode.

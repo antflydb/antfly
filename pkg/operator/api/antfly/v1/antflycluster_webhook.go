@@ -152,13 +152,8 @@ func (r *AntflyCluster) validateTermiteSpec() error {
 		return nil
 	}
 
-	spec, err := r.Spec.Termite.ToTermitePoolSpec()
-	if err != nil {
-		return fmt.Errorf("spec.termite could not be converted to TermitePoolSpec: %w", err)
-	}
-
 	pool := &termitev1alpha1.TermitePool{
-		Spec: spec,
+		Spec: *r.Spec.Termite.DeepCopy(),
 	}
 	if err := pool.ValidateTermitePool(); err != nil {
 		return fmt.Errorf("spec.termite is invalid: %w", err)

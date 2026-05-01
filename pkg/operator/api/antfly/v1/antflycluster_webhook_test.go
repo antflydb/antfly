@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	termitev1alpha1 "github.com/antflydb/antfly/pkg/operator/api/termite/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -1461,10 +1462,10 @@ func TestValidateCreate_SwarmRejectsInvalidTermiteURL(t *testing.T) {
 
 func TestValidateCreate_RejectsInvalidManagedTermiteSpec(t *testing.T) {
 	cluster := baseCluster()
-	cluster.Spec.Termite = &AntflyClusterTermiteSpec{
-		Models:   TermiteModelConfig{},
-		Replicas: TermiteReplicaConfig{Min: 3, Max: 1},
-		Hardware: TermiteHardwareConfig{},
+	cluster.Spec.Termite = &termitev1alpha1.TermitePoolSpec{
+		Models:   termitev1alpha1.ModelConfig{},
+		Replicas: termitev1alpha1.ReplicaConfig{Min: 3, Max: 1},
+		Hardware: termitev1alpha1.HardwareConfig{},
 	}
 
 	err := cluster.ValidateCreate()

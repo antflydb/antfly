@@ -106,11 +106,21 @@ kubectl apply -f ./deploy/install.yaml
 
 This installs:
 - **Namespace**: `antfly-operator-namespace`
-- **Custom Resource Definitions** (CRDs): `AntflyCluster`
+- **Custom Resource Definitions** (CRDs): `AntflyCluster`, `AntflyBackup`, `AntflyRestore`, `TermitePool`, `TermiteRoute`
 - **RBAC** roles and bindings
 - **Operator Deployment**: Uses container image `ghcr.io/antflydb/antfly-operator:latest`
 
 See `deploy/example_install.yaml` for the complete installation manifest structure.
+
+For production environments that manage CRDs separately, run the operator with
+`--skip-crd-install=true` and remove the `customresourcedefinitions` verbs from
+the operator ClusterRole. The default RBAC includes CRD permissions only because
+startup CRD bootstrap is enabled by default.
+
+When `--enable-termite-controllers=false`, TermitePool/TermiteRoute controllers
+and `AntflyCluster.spec.termite` management are disabled. Existing owned
+TermitePool objects are left unchanged while the flag is disabled, including if
+`spec.termite` is removed during that window.
 
 ### RBAC Requirements
 
@@ -658,6 +668,15 @@ kubectl get storageclass managed-premium
 This guide primarily focuses on fresh installations. For operator upgrade procedures and version migration, see:
 - [GitHub Releases](https://github.com/antflydb/antfly/releases) for release notes and upgrade instructions
 - Upgrade documentation (link will be provided when available)
+
+### Consolidated Operator Breaking Changes
+
+The standalone `pkg/antfly-operator` and `pkg/termite-operator` Go modules,
+images, and release tag streams are removed. Operator releases now use
+`pkg/operator/v*` tags and the single consolidated operator image. The previous
+standalone Termite operator was not production-supported; existing TermitePool
+CRs use the same GVK and are reconciled by the consolidated operator when
+Termite controllers are enabled.
 
 ## 📄 License
 

@@ -35,6 +35,17 @@ If you use `spec.termite` and that image is not mirrored or available to your
 cluster, update the argument to an Antfly image that provides the `/antfly
 termite` runtime contract before installing.
 
+For production environments that manage CRDs through GitOps or another platform
+workflow, run the operator with `--skip-crd-install=true` and remove the
+`customresourcedefinitions` verbs from the operator ClusterRole. The default
+manifest keeps those permissions because startup CRD bootstrap is enabled by
+default.
+
+If `--enable-termite-controllers=false`, the operator disables direct
+TermitePool/TermiteRoute reconciliation and `AntflyCluster.spec.termite`
+management. It does not delete previously owned TermitePool objects while the
+flag is disabled, even if `spec.termite` is removed during that time.
+
 ## Verify Installation
 
 Check that the operator is running:
@@ -162,7 +173,7 @@ kubectl delete antflyrestores --all-namespaces --all
 kubectl delete -f https://antfly.io/antfly-operator-install.yaml
 
 # Remove CRDs (the operator self-installs these but does not remove them on deletion)
-kubectl delete crd antflyclusters.antfly.io antflybackups.antfly.io antflyrestores.antfly.io
+kubectl delete crd antflyclusters.antfly.io antflybackups.antfly.io antflyrestores.antfly.io termitepools.antfly.io termiteroutes.antfly.io
 
 # Remove PVCs left behind by StatefulSets (retained by default)
 kubectl delete pvc -l app.kubernetes.io/name=antfly-database --all-namespaces

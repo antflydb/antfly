@@ -237,6 +237,9 @@ Tags follow Go module conventions and trigger CI:
 - `v*` — root module release + container build
 - `pkg/operator/v*` — operator container build
 
+The previous standalone `pkg/antfly-operator/v*` and `pkg/termite-operator/v*`
+tag streams were consolidated into `pkg/operator/v*`.
+
 ```bash
 export GITHUB_TOKEN=...
 export AWS_ACCESS_KEY_ID=...

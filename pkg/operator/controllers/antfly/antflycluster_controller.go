@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"maps"
@@ -1113,12 +1114,7 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		},
 	}
 
-	termiteSpec, err := cluster.Spec.Termite.ToTermitePoolSpec()
-	if err != nil {
-		return fmt.Errorf("failed to convert managed TermitePool spec %s: %w", name, err)
-	}
-
-	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, pool, func() error {
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pool, func() error {
 		if pool.UID != "" && !metav1.IsControlledBy(pool, cluster) {
 			return &termitePoolNameConflictError{
 				namespacedName: key.String(),
@@ -1134,7 +1130,7 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		pool.Labels["app.kubernetes.io/instance"] = cluster.Name
 		pool.Labels["app.kubernetes.io/managed-by"] = "antfly-operator"
 
-		pool.Spec = termiteSpec
+		pool.Spec = *cluster.Spec.Termite.DeepCopy()
 		if pool.Spec.Image == "" {
 			pool.Spec.Image = r.DefaultTermiteImage
 		}
@@ -1144,7 +1140,8 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		return nil
 	})
 	if err != nil {
-		if conflictErr, ok := err.(*termitePoolNameConflictError); ok {
+		var conflictErr *termitePoolNameConflictError
+		if stderrors.As(err, &conflictErr) {
 			logger.Info("Refusing to adopt same-name TermitePool because it is not controlled by this AntflyCluster", "termitePool", key.String())
 			r.setTermitePoolReadyCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonTermitePoolNameConflict, conflictErr.Error())
 			return nil

@@ -103,6 +103,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	setupLog.Info("operator configuration",
+		"enableTermiteControllers", enableTermiteControllers,
+		"termiteAntflyImage", termiteAntflyImage,
+		"skipCRDInstall", skipCRDInstall,
+		"webhooksEnabled", webhooksEnabled(),
+	)
+
 	// Create AutoScaler
 	autoScaler := controllers.NewAutoScaler(mgr.GetClient(), k8sClient, mgr.GetClient())
 

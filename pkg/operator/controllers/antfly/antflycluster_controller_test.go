@@ -378,10 +378,10 @@ func baseClusterWithTermiteSpec() *antflyv1.AntflyCluster {
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			Image: "antfly:test",
-			Termite: &antflyv1.AntflyClusterTermiteSpec{
-				Models:   antflyv1.TermiteModelConfig{},
-				Replicas: antflyv1.TermiteReplicaConfig{Min: 1, Max: 2},
-				Hardware: antflyv1.TermiteHardwareConfig{},
+			Termite: &termitev1alpha1.TermitePoolSpec{
+				Models:   termitev1alpha1.ModelConfig{},
+				Replicas: termitev1alpha1.ReplicaConfig{Min: 1, Max: 2},
+				Hardware: termitev1alpha1.HardwareConfig{},
 			},
 		},
 	}

@@ -32,7 +32,7 @@ status:
 | `eks` | [EKSSpec](#eksspec) | No | AWS EKS-specific configuration |
 | `serviceMesh` | [ServiceMeshSpec](#servicemeshspec) | No | Service mesh configuration |
 | `publicAPI` | [PublicAPIConfig](#publicapiconfig) | No | Public API service configuration |
-| `termite` | AntflyClusterTermiteSpec | No | Operator-managed TermitePool associated with this cluster |
+| `termite` | TermitePoolSpec | No | Operator-managed TermitePool associated with this cluster |
 | `serviceAccountName` | string | No | Kubernetes ServiceAccount for pods |
 
 ### Termite Integration
