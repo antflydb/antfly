@@ -860,25 +860,26 @@ func (r *AntflyCluster) validateAutoScalingUpdate(old *AntflyCluster) error {
 	}
 
 	newScaling := r.Spec.DataNodes.AutoScaling
-	oldScaling := old.Spec.DataNodes.AutoScaling
 	var errors []string
-	oldReplicas := old.Spec.DataNodes.Replicas
-	if oldReplicas > 0 && newScaling.MaxReplicas < oldReplicas {
-		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas (%d) cannot be below existing spec.dataNodes.replicas (%d) until data scale-down is supported", newScaling.MaxReplicas, oldReplicas))
-	}
-	if oldScaling != nil && oldScaling.Enabled {
-		if newScaling.MinReplicas < oldScaling.MinReplicas {
-			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas cannot be decreased yet (current: %d, attempted: %d)", oldScaling.MinReplicas, newScaling.MinReplicas))
-		}
-		if newScaling.MaxReplicas < oldScaling.MaxReplicas {
-			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas cannot be decreased yet (current: %d, attempted: %d)", oldScaling.MaxReplicas, newScaling.MaxReplicas))
-		}
+	observedReplicas := old.observedDataReplicasForScaleSafety()
+	if observedReplicas > 0 && newScaling.MaxReplicas < observedReplicas {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas (%d) cannot be below observed data replicas (%d) until data scale-down is supported", newScaling.MaxReplicas, observedReplicas))
 	}
 
 	if len(errors) > 0 {
 		return fmt.Errorf("%s", strings.Join(errors, "\n\n"))
 	}
 	return nil
+}
+
+func (r *AntflyCluster) observedDataReplicasForScaleSafety() int32 {
+	observed := r.Spec.DataNodes.Replicas
+	if r.Status.AutoScalingStatus != nil {
+		observed = max(observed, r.Status.AutoScalingStatus.CurrentReplicas)
+		observed = max(observed, r.Status.AutoScalingStatus.DesiredReplicas)
+		observed = max(observed, r.Status.AutoScalingStatus.RecommendationReplicas)
+	}
+	return observed
 }
 
 // validateResourceQuantities validates that resource quantity strings are parseable.

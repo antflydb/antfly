@@ -666,8 +666,23 @@ type AutoScalingStatus struct {
 	// CurrentReplicas is the current number of replicas
 	CurrentReplicas int32 `json:"currentReplicas"`
 
-	// DesiredReplicas is the desired number of replicas
+	// DesiredReplicas is the replica count the operator is currently applying.
+	// When scale-down is blocked, this remains at CurrentReplicas even if
+	// RecommendationReplicas is lower.
 	DesiredReplicas int32 `json:"desiredReplicas"`
+
+	// RecommendationReplicas is the latest replica recommendation from the
+	// operator autoscaler before safety gates are applied.
+	// +optional
+	RecommendationReplicas int32 `json:"recommendationReplicas,omitempty"`
+
+	// BlockedReason explains why the autoscaler recommendation was not applied.
+	// +optional
+	BlockedReason string `json:"blockedReason,omitempty"`
+
+	// BlockedMessage provides human-readable detail for BlockedReason.
+	// +optional
+	BlockedMessage string `json:"blockedMessage,omitempty"`
 
 	// LastScaleTime is the last time scaling occurred
 	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`

@@ -1426,12 +1426,16 @@ func TestValidateCreate_DisabledAutoScalingIgnoresBounds(t *testing.T) {
 	}
 }
 
-func TestValidateUpdate_AutoScalingScaleDownBoundsRejected(t *testing.T) {
+func TestValidateUpdate_AutoScalingMaxBelowObservedReplicasRejected(t *testing.T) {
 	old := baseCluster()
 	old.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
 		Enabled:     true,
 		MinReplicas: 3,
 		MaxReplicas: 8,
+	}
+	old.Status.AutoScalingStatus = &AutoScalingStatus{
+		CurrentReplicas: 7,
+		DesiredReplicas: 7,
 	}
 
 	new := baseCluster()
@@ -1443,10 +1447,34 @@ func TestValidateUpdate_AutoScalingScaleDownBoundsRejected(t *testing.T) {
 
 	err := new.ValidateUpdate(old)
 	if err == nil {
-		t.Fatal("expected error when lowering autoscaling bounds")
+		t.Fatal("expected error when maxReplicas is below observed data replicas")
 	}
-	if !strings.Contains(err.Error(), "maxReplicas") {
+	if !strings.Contains(err.Error(), "observed data replicas") {
 		t.Fatalf("expected autoscaling maxReplicas error, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_AutoScalingBoundsCanDecreaseAboveObservedReplicas(t *testing.T) {
+	old := baseCluster()
+	old.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 3,
+		MaxReplicas: 8,
+	}
+	old.Status.AutoScalingStatus = &AutoScalingStatus{
+		CurrentReplicas: 5,
+		DesiredReplicas: 5,
+	}
+
+	new := baseCluster()
+	new.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 2,
+		MaxReplicas: 6,
+	}
+
+	if err := new.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected autoscaling bounds above observed replicas to be allowed, got: %v", err)
 	}
 }
 

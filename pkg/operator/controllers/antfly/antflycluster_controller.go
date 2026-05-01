@@ -993,53 +993,66 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// Evaluate autoscaling before creating/updating Data StatefulSet
-	if r.AutoScaler != nil && workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
-		desiredReplicas, err := r.AutoScaler.EvaluateScaling(ctx, workingCluster)
+	// Decide the data-node replica target before creating/updating the StatefulSet.
+	// In manual mode, spec.dataNodes.replicas is authoritative. In autoscaling
+	// mode, the operator autoscaler is authoritative and computes from observed
+	// StatefulSet replicas, not the manual-mode spec field.
+	dataSts := &appsv1.StatefulSet{}
+	dataStsKey := types.NamespacedName{Name: workingCluster.Name + "-data", Namespace: workingCluster.Namespace}
+	dataStsExists := true
+	if err := r.Get(ctx, dataStsKey, dataSts); err != nil {
+		if !errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		dataStsExists = false
+	}
+
+	currentDataReplicas := effectiveDataReplicas(dataSts, dataStsExists, effectiveDataNodeReplicas(workingCluster))
+	currentDataTarget := effectiveDataReplicaTarget(dataSts, dataStsExists, effectiveDataNodeReplicas(workingCluster))
+	scaleSafetyReplicas := max(currentDataReplicas, currentDataTarget)
+	desiredDataReplicas := effectiveDataNodeReplicas(workingCluster)
+	autoscalingEnabled := r.AutoScaler != nil && workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled
+	if autoscalingEnabled {
+		recommendationReplicas, err := r.AutoScaler.EvaluateScaling(ctx, workingCluster, currentDataTarget)
 		if err != nil {
 			log.Error(err, "Failed to evaluate autoscaling")
-			// Continue with current replicas on error
-		} else if desiredReplicas != workingCluster.Spec.DataNodes.Replicas {
-			// Update the desired replicas
-			workingCluster.Spec.DataNodes.Replicas = desiredReplicas
-			r.AutoScaler.UpdateScalingStatus(workingCluster, desiredReplicas)
-			log.Info("Autoscaling data nodes", "currentReplicas", antflyCluster.Spec.DataNodes.Replicas, "desiredReplicas", desiredReplicas)
+			recommendationReplicas = currentDataTarget
+		}
+
+		desiredDataReplicas = recommendationReplicas
+		blockedReason := ""
+		blockedMessage := ""
+		if recommendationReplicas < scaleSafetyReplicas {
+			blockedReason = antflyv1.ReasonDataScaleDownBlocked
+			blockedMessage = fmt.Sprintf("Autoscaler recommended data-node scale-down from %d to %d, but scale-down is blocked until the safe drain workflow is available", scaleSafetyReplicas, recommendationReplicas)
+			desiredDataReplicas = scaleSafetyReplicas
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, blockedReason, blockedMessage)
+		} else {
+			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
+		}
+
+		workingCluster.Spec.DataNodes.Replicas = desiredDataReplicas
+		r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, desiredDataReplicas, recommendationReplicas, blockedReason, blockedMessage)
+		if recommendationReplicas != currentDataReplicas {
+			log.Info("Autoscaling data nodes", "currentReplicas", currentDataReplicas, "desiredReplicas", desiredDataReplicas, "recommendationReplicas", recommendationReplicas, "blockedReason", blockedReason)
+		}
+	} else {
+		workingCluster.Status.AutoScalingStatus = nil
+		if desiredDataReplicas < scaleSafetyReplicas {
+			message := fmt.Sprintf("Data-node scale-down from %d to %d is blocked until the safe drain workflow is available", scaleSafetyReplicas, desiredDataReplicas)
+			desiredDataReplicas = scaleSafetyReplicas
+			workingCluster.Spec.DataNodes.Replicas = desiredDataReplicas
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownBlocked, message)
+		} else {
+			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
 		}
 	}
 
-	// Block data-node scale-down until the shared drain/rebalance workflow is available.
-	// By this point, workingCluster.Spec.DataNodes.Replicas reflects the final desired
-	// count from either the CRD spec (manual) or the autoscaler.
-	// We use Status.Replicas (actual running pods) rather than Spec.Replicas (desired).
-	{
-		existingSts := &appsv1.StatefulSet{}
-		stsName := types.NamespacedName{Name: workingCluster.Name + "-data", Namespace: workingCluster.Namespace}
-		if err := r.Get(ctx, stsName, existingSts); err == nil {
-			currentReplicas := existingSts.Status.Replicas
-			if currentReplicas == 0 && existingSts.Spec.Replicas != nil {
-				// Status may not be populated yet for a newly created STS;
-				// fall back to Spec in that case.
-				currentReplicas = *existingSts.Spec.Replicas
-			}
-			desiredReplicas := workingCluster.Spec.DataNodes.Replicas
-			if desiredReplicas == 0 {
-				desiredReplicas = 3 // default
-			}
-			if desiredReplicas < currentReplicas {
-				r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownBlocked,
-					fmt.Sprintf("Data-node scale-down from %d to %d is blocked until the safe drain workflow is available", currentReplicas, desiredReplicas))
-				if statusErr := r.Status().Update(ctx, workingCluster); statusErr != nil {
-					log.Error(statusErr, "Failed to update status with data scale-down block")
-				}
-				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-			}
-			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
-			if err := r.deregisterDataNodes(ctx, workingCluster, currentReplicas, desiredReplicas); err != nil {
-				log.Error(err, "Failed to deregister data nodes, will retry")
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
+	if dataStsExists && desiredDataReplicas >= scaleSafetyReplicas {
+		if err := r.deregisterDataNodes(ctx, workingCluster, scaleSafetyReplicas, desiredDataReplicas); err != nil {
+			log.Error(err, "Failed to deregister data nodes, will retry")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		// If the StatefulSet doesn't exist yet, no deregistration needed
 	}
 
 	// Create Data StatefulSet
@@ -2313,6 +2326,39 @@ func chooseSwarmStorageSize(cluster *antflyv1.AntflyCluster) string {
 	return "1Gi"
 }
 
+func effectiveDataNodeReplicas(cluster *antflyv1.AntflyCluster) int32 {
+	if cluster.Spec.DataNodes.Replicas > 0 {
+		return cluster.Spec.DataNodes.Replicas
+	}
+	return 3
+}
+
+func effectiveDataReplicas(sts *appsv1.StatefulSet, exists bool, fallback int32) int32 {
+	if !exists || sts == nil {
+		return fallback
+	}
+	if sts.Status.Replicas > 0 {
+		return sts.Status.Replicas
+	}
+	if sts.Spec.Replicas != nil {
+		return *sts.Spec.Replicas
+	}
+	return fallback
+}
+
+func effectiveDataReplicaTarget(sts *appsv1.StatefulSet, exists bool, fallback int32) int32 {
+	if !exists || sts == nil {
+		return fallback
+	}
+	if sts.Spec.Replicas != nil {
+		return *sts.Spec.Replicas
+	}
+	if sts.Status.Replicas > 0 {
+		return sts.Status.Replicas
+	}
+	return fallback
+}
+
 // buildStorageInitContainer creates an init container that waits for the PVC to be properly mounted.
 // This prevents a race condition where the main container starts before the PVC is attached,
 // which could cause Antfly to bootstrap a fresh cluster instead of recovering from existing data.
@@ -2537,7 +2583,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	// Update autoscaling status if enabled
 	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
 		if cluster.Status.AutoScalingStatus != nil {
-			cluster.Status.AutoScalingStatus.CurrentReplicas = dataSts.Status.Replicas
+			cluster.Status.AutoScalingStatus.CurrentReplicas = effectiveDataReplicas(dataSts, dataSts.Name != "", effectiveDataNodeReplicas(cluster))
 		}
 	}
 
@@ -2547,10 +2593,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if cluster.Spec.MetadataNodes.Replicas > 0 {
 		metadataReplicas = cluster.Spec.MetadataNodes.Replicas
 	}
-	dataReplicas := int32(3)
-	if cluster.Spec.DataNodes.Replicas > 0 {
-		dataReplicas = cluster.Spec.DataNodes.Replicas
-	}
+	dataReplicas := effectiveDataNodeReplicas(cluster)
 
 	if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
 		cluster.Status.Phase = "Running"

@@ -553,6 +553,21 @@ func TestUpdateRolloutConditionReportsProgressAndComplete(t *testing.T) {
 	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutComplete))
 }
 
+func TestEffectiveDataReplicaTargetPrefersStatefulSetSpec(t *testing.T) {
+	g := NewWithT(t)
+	replicas := int32(5)
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status: appsv1.StatefulSetStatus{
+			Replicas: 3,
+		},
+	}
+
+	g.Expect(effectiveDataReplicas(sts, true, 1)).To(Equal(int32(3)))
+	g.Expect(effectiveDataReplicaTarget(sts, true, 1)).To(Equal(int32(5)))
+	g.Expect(max(effectiveDataReplicas(sts, true, 1), effectiveDataReplicaTarget(sts, true, 1))).To(Equal(int32(5)))
+}
+
 // T006: Unit test for public API service deletion when disabled
 func TestReconcileServices_DeletesPublicAPIWhenDisabled(t *testing.T) {
 	g := NewWithT(t)

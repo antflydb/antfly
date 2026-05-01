@@ -5933,6 +5933,14 @@ spec:
               autoScalingStatus:
                 description: AutoScalingStatus tracks autoscaling state
                 properties:
+                  blockedMessage:
+                    description: BlockedMessage provides human-readable detail for
+                      BlockedReason.
+                    type: string
+                  blockedReason:
+                    description: BlockedReason explains why the autoscaler recommendation
+                      was not applied.
+                    type: string
                   currentCPUUtilizationPercentage:
                     description: CurrentCPUUtilizationPercentage is the current CPU
                       utilization
@@ -5948,7 +5956,10 @@ spec:
                     format: int32
                     type: integer
                   desiredReplicas:
-                    description: DesiredReplicas is the desired number of replicas
+                    description: |-
+                      DesiredReplicas is the replica count the operator is currently applying.
+                      When scale-down is blocked, this remains at CurrentReplicas even if
+                      RecommendationReplicas is lower.
                     format: int32
                     type: integer
                   lastScaleDirection:
@@ -5960,6 +5971,12 @@ spec:
                     description: LastScaleTime is the last time scaling occurred
                     format: date-time
                     type: string
+                  recommendationReplicas:
+                    description: |-
+                      RecommendationReplicas is the latest replica recommendation from the
+                      operator autoscaler before safety gates are applied.
+                    format: int32
+                    type: integer
                 required:
                 - currentReplicas
                 - desiredReplicas
