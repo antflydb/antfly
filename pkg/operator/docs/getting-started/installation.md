@@ -30,6 +30,11 @@ This installs:
 - ServiceAccount and RBAC permissions
 - Operator Deployment
 
+The default deployment passes `--termite-antfly-image=ghcr.io/antflydb/antfly:omni`.
+If you use `spec.termite` and that image is not mirrored or available to your
+cluster, update the argument to an Antfly image that provides the `/antfly
+termite` runtime contract before installing.
+
 ## Verify Installation
 
 Check that the operator is running:

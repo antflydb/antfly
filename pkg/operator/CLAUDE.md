@@ -23,9 +23,13 @@ All Go commands use `GOWORK=off` (set in Makefile).
 
 Both deployed as StatefulSets with persistent volumes. Defaults applied in `controllers/antflycluster_controller.go` `applyDefaults()`.
 
-**CRDs:** AntflyCluster, AntflyBackup, AntflyRestore, TermitePool, TermiteRoute (defined in `antfly/api/v1/` and `termite/api/v1alpha1/`).
+**CRDs:** AntflyCluster, AntflyBackup, AntflyRestore, TermitePool, TermiteRoute (defined in `api/antfly/v1/` and `api/termite/v1alpha1/`).
 Startup CRD bootstrap installs all five CRDs unless `--skip-crd-install` is set,
 even when `--enable-termite-controllers=false`.
+`--enable-termite-controllers=false` disables TermitePool/TermiteRoute controllers
+and AntflyCluster `spec.termite` management, but it does not delete previously
+owned TermitePools. Admission webhooks are independently gated by the
+`ENABLE_WEBHOOKS` environment variable.
 
 **Reconciliation order** (`controllers/antflycluster_controller.go`):
 1. Apply defaults to DeepCopy (avoids API server conflicts)
@@ -34,23 +38,25 @@ even when `--enable-termite-controllers=false`.
 ## Code Organization
 
 ```
-cmd/antfly-operator/main.go   # Integrated operator entrypoint
-antfly/api/v1/                # Antfly CRD types, webhooks, deepcopy
-antfly/controllers/           # Antfly reconcilers + autoscaler
-antfly/bootstrap/             # CRD self-installation at startup
-termite/api/v1alpha1/         # Termite CRD types, webhooks, deepcopy
-termite/controllers/          # Termite reconcilers
-manifests/                    # Shared embedded CRD/RBAC YAML (go:embed)
-config/manager/               # Deployment manifest
-examples/                     # Sample cluster YAMLs
-docs/                         # User-facing documentation
+cmd/antfly-operator/main.go    # Integrated operator entrypoint
+api/antfly/v1/                 # Antfly CRD types, webhooks, deepcopy
+api/termite/v1alpha1/          # Termite CRD types, webhooks, deepcopy
+controllers/antfly/            # Antfly reconcilers + autoscaler
+controllers/termite/           # Termite reconcilers
+bootstrap/antfly/              # CRD self-installation at startup
+webhook/{antfly,termite}/      # Webhook setup packages
+internal/webhook/{antfly,termite}/ # Webhook validator implementations
+manifests/                     # Shared embedded CRD/RBAC YAML (go:embed)
+config/manager/                # Deployment manifest
+examples/                      # Sample cluster YAMLs
+docs/                          # User-facing documentation
 ```
 
 ## Key Development Patterns
 
-**After modifying `antfly/api/v1/antflycluster_types.go`:**
+**After modifying `api/antfly/v1/antflycluster_types.go`:**
 1. `make manifests generate`
-2. Update reconciler in `antfly/controllers/antflycluster_controller.go`
+2. Update reconciler in `controllers/antfly/antflycluster_controller.go`
 3. Add/update tests
 
 **StatefulSet changes:** Use `controllerutil.CreateOrUpdate`. Only update mutable fields to avoid recreation. Preserve pod identity and PVC retention.
@@ -60,7 +66,7 @@ docs/                         # User-facing documentation
 - EKS: Spot node selectors, tolerations, IRSA annotations — triggered by `spec.eks.enabled: true`
 - Cannot enable both GKE Autopilot and EKS simultaneously (webhook-enforced)
 
-**Webhook validation** (`api/v1/antflycluster_webhook.go`): Enforces immutability, enum validation, conflict detection. Controller has fallback validation with exponential backoff if webhook disabled.
+**Webhook validation** (`api/v1/antflycluster_webhook.go`): Enforces immutability, enum validation, conflict detection, and managed `spec.termite` validation. Controller has fallback validation with exponential backoff if webhook disabled.
 
 ## Autoscaling
 
@@ -68,7 +74,7 @@ Data nodes only (metadata nodes never autoscaled). Uses Kubernetes metrics API. 
 
 ## RBAC
 
-Service account must be exactly `antfly-operator-service-account`. RBAC defined in `manifests/rbac.go` and generated `manifests/rbac/role.yaml`. The `policy/poddisruptionbudgets` permission is always required (controller watches PDBs).
+Service account must be exactly `antfly-operator-service-account`. The generated `manifests/rbac/role.yaml` is canonical; `manifests/rbac.go` parses the embedded YAML for bootstrap resources. The `policy/poddisruptionbudgets` permission is always required (controller watches PDBs).
 
 ## Backup Credentials
 

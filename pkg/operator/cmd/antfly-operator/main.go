@@ -23,13 +23,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	antflyv1 "github.com/antflydb/antfly/pkg/operator/antfly/api/v1"
-	"github.com/antflydb/antfly/pkg/operator/antfly/bootstrap"
-	"github.com/antflydb/antfly/pkg/operator/antfly/controllers"
-	webhookv1 "github.com/antflydb/antfly/pkg/operator/antfly/webhook/v1"
-	termitev1alpha1 "github.com/antflydb/antfly/pkg/operator/termite/api/v1alpha1"
-	termitecontrollers "github.com/antflydb/antfly/pkg/operator/termite/controllers"
-	termitewebhookv1alpha1 "github.com/antflydb/antfly/pkg/operator/termite/webhook/v1alpha1"
+	antflyv1 "github.com/antflydb/antfly/pkg/operator/api/antfly/v1"
+	termitev1alpha1 "github.com/antflydb/antfly/pkg/operator/api/termite/v1alpha1"
+	bootstrap "github.com/antflydb/antfly/pkg/operator/bootstrap/antfly"
+	controllers "github.com/antflydb/antfly/pkg/operator/controllers/antfly"
+	termitecontrollers "github.com/antflydb/antfly/pkg/operator/controllers/termite"
+	webhookv1 "github.com/antflydb/antfly/pkg/operator/webhook/antfly/v1"
+	termitewebhookv1alpha1 "github.com/antflydb/antfly/pkg/operator/webhook/termite/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 )
 
