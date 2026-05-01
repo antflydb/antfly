@@ -117,6 +117,7 @@ func main() {
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		AutoScaler:          autoScaler,
+		KubeClient:          k8sClient,
 		Recorder:            mgr.GetEventRecorder("antfly-operator"),
 		ManageTermitePools:  enableTermiteControllers,
 		DefaultTermiteImage: termiteAntflyImage,

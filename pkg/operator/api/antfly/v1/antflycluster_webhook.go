@@ -46,6 +46,8 @@ func (r *AntflyCluster) Default() {
 		r.Spec.Mode = ClusterModeClustered
 	}
 
+	defaultStorageAutoGrow(&r.Spec.Storage)
+
 	if r.Spec.Mode != ClusterModeSwarm || r.Spec.Swarm == nil {
 		return
 	}
@@ -128,6 +130,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 	}
 
 	if err := r.validatePVCRetentionPolicy(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
+	if err := r.validateStorageAutoGrowConfig(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
@@ -839,6 +845,63 @@ func (r *AntflyCluster) validateAutoScalingConfig() error {
 
 	if len(errors) > 0 {
 		return fmt.Errorf("autoscaling validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func defaultStorageAutoGrow(storage *StorageSpec) {
+	if storage == nil || storage.StorageAutoGrow == nil || !storage.StorageAutoGrow.Enabled {
+		return
+	}
+	if storage.StorageAutoGrow.GrowThresholdPercent == 0 {
+		storage.StorageAutoGrow.GrowThresholdPercent = 85
+	}
+	if storage.StorageAutoGrow.GrowIncrement == "" {
+		storage.StorageAutoGrow.GrowIncrement = "10Gi"
+	}
+}
+
+func (r *AntflyCluster) validateStorageAutoGrowConfig() error {
+	autoGrow := r.Spec.Storage.StorageAutoGrow
+	if autoGrow == nil || !autoGrow.Enabled {
+		return nil
+	}
+	defaulted := *autoGrow
+	storage := r.Spec.Storage
+	storage.StorageAutoGrow = &defaulted
+	defaultStorageAutoGrow(&storage)
+	autoGrow = storage.StorageAutoGrow
+
+	var errors []string
+	if autoGrow.GrowThresholdPercent < 1 || autoGrow.GrowThresholdPercent > 99 {
+		errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.growThresholdPercent must be between 1 and 99, got %d", autoGrow.GrowThresholdPercent))
+	}
+	if autoGrow.GrowIncrement == "" {
+		errors = append(errors, "spec.storage.storageAutoGrow.growIncrement is required when storage auto-grow is enabled")
+	} else if q, err := resource.ParseQuantity(autoGrow.GrowIncrement); err != nil {
+		errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.growIncrement: %q is not a valid resource quantity", autoGrow.GrowIncrement))
+	} else if q.Sign() <= 0 {
+		errors = append(errors, "spec.storage.storageAutoGrow.growIncrement must be greater than zero")
+	}
+
+	if r.isSwarmMode() {
+		maxSize := autoGrow.MaxSwarmStorage
+		if maxSize == "" {
+			maxSize = autoGrow.MaxDataStorage
+		}
+		if maxSize == "" {
+			errors = append(errors, "spec.storage.storageAutoGrow.maxSwarmStorage or maxDataStorage is required when storage auto-grow is enabled in swarm mode")
+		} else if _, err := resource.ParseQuantity(maxSize); err != nil {
+			errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxSwarmStorage: %q is not a valid resource quantity", maxSize))
+		}
+	} else if autoGrow.MaxDataStorage == "" {
+		errors = append(errors, "spec.storage.storageAutoGrow.maxDataStorage is required when storage auto-grow is enabled in clustered mode")
+	} else if _, err := resource.ParseQuantity(autoGrow.MaxDataStorage); err != nil {
+		errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxDataStorage: %q is not a valid resource quantity", autoGrow.MaxDataStorage))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("storage auto-grow validation failed:\n  - %s", strings.Join(errors, "\n  - "))
 	}
 	return nil
 }

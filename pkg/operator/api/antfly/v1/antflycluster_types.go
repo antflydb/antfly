@@ -56,6 +56,9 @@ const (
 	// TypePVCExpansion indicates whether requested PVC expansion has completed
 	TypePVCExpansion = "PVCExpansion"
 
+	// TypeStorageAutoGrow indicates whether storage auto-grow is active and healthy
+	TypeStorageAutoGrow = "StorageAutoGrow"
+
 	// TypeRollout indicates whether StatefulSet template changes have rolled out
 	TypeRollout = "Rollout"
 
@@ -94,6 +97,24 @@ const (
 
 	// ReasonPVCExpansionComplete indicates all observed PVCs satisfy requested storage
 	ReasonPVCExpansionComplete = "PVCExpansionComplete"
+
+	// ReasonStorageAutoGrowDisabled indicates storage auto-grow is not enabled
+	ReasonStorageAutoGrowDisabled = "StorageAutoGrowDisabled"
+
+	// ReasonStorageAutoGrowReady indicates storage usage is below the grow threshold
+	ReasonStorageAutoGrowReady = "StorageAutoGrowReady"
+
+	// ReasonStorageAutoGrowInProgress indicates the operator requested automatic storage growth
+	ReasonStorageAutoGrowInProgress = "StorageAutoGrowInProgress"
+
+	// ReasonStorageAutoGrowUsageUnavailable indicates PVC usage metrics are unavailable
+	ReasonStorageAutoGrowUsageUnavailable = "StorageAutoGrowUsageUnavailable"
+
+	// ReasonStorageAutoGrowMaxReached indicates a PVC is at the configured auto-grow maximum
+	ReasonStorageAutoGrowMaxReached = "StorageAutoGrowMaxReached"
+
+	// ReasonStorageAutoGrowFailed indicates storage auto-grow could not be evaluated
+	ReasonStorageAutoGrowFailed = "StorageAutoGrowFailed"
 
 	// ReasonRolloutInProgress indicates StatefulSet changes are still rolling out
 	ReasonRolloutInProgress = "RolloutInProgress"
@@ -453,6 +474,33 @@ type StorageSpec struct {
 	// the finalizer provides a fallback for WhenDeleted=Delete.
 	// +optional
 	PVCRetentionPolicy *PVCRetentionPolicy `json:"pvcRetentionPolicy,omitempty"`
+
+	// StorageAutoGrow configures operator-owned grow-only disk autoscaling.
+	// Clustered mode currently applies this policy only to data PVCs. Swarm
+	// mode applies it to the swarm PVC.
+	// +optional
+	StorageAutoGrow *StorageAutoGrowSpec `json:"storageAutoGrow,omitempty"`
+}
+
+// StorageAutoGrowSpec configures automatic grow-only PVC expansion.
+type StorageAutoGrowSpec struct {
+	// Enabled controls whether the operator automatically grows storage.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// MaxDataStorage is the maximum size for clustered data PVC auto-grow.
+	MaxDataStorage string `json:"maxDataStorage,omitempty"`
+
+	// MaxSwarmStorage is the maximum size for swarm PVC auto-grow. If omitted
+	// in swarm mode, MaxDataStorage is used as the limit.
+	MaxSwarmStorage string `json:"maxSwarmStorage,omitempty"`
+
+	// GrowThresholdPercent is the percent-used threshold that triggers growth.
+	// Defaults to 85 when omitted.
+	GrowThresholdPercent int32 `json:"growThresholdPercent,omitempty"`
+
+	// GrowIncrement is the amount added per grow step. Defaults to 10Gi when
+	// omitted.
+	GrowIncrement string `json:"growIncrement,omitempty"`
 }
 
 // PVCRetentionPolicyType defines the retention behavior for PVCs
@@ -662,6 +710,10 @@ type AntflyClusterStatus struct {
 	// +optional
 	DataScaleDownStatus *DataScaleDownStatus `json:"dataScaleDownStatus,omitempty"`
 
+	// StorageAutoGrowStatus tracks the latest operator-owned storage auto-grow evaluation.
+	// +optional
+	StorageAutoGrowStatus *StorageAutoGrowStatus `json:"storageAutoGrowStatus,omitempty"`
+
 	// SwarmStatus reports swarm-specific operational state.
 	// +optional
 	SwarmStatus *SwarmStatus `json:"swarmStatus,omitempty"`
@@ -734,6 +786,39 @@ type DataScaleDownStatus struct {
 
 	// LastTransitionTime records the last phase transition.
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
+// StorageAutoGrowStatus tracks the latest storage auto-grow decision.
+type StorageAutoGrowStatus struct {
+	// Component is the component evaluated by the latest auto-grow pass.
+	Component string `json:"component,omitempty"`
+
+	// CurrentSize is the current effective requested PVC size.
+	CurrentSize string `json:"currentSize,omitempty"`
+
+	// RecommendedSize is the size the operator selected when growth is needed.
+	RecommendedSize string `json:"recommendedSize,omitempty"`
+
+	// MaxSize is the configured maximum size for the evaluated component.
+	MaxSize string `json:"maxSize,omitempty"`
+
+	// UsedBytes is the observed used bytes across matching PVC volumes.
+	UsedBytes int64 `json:"usedBytes,omitempty"`
+
+	// CapacityBytes is the observed capacity bytes across matching PVC volumes.
+	CapacityBytes int64 `json:"capacityBytes,omitempty"`
+
+	// UsagePercent is the observed storage usage percentage.
+	UsagePercent int32 `json:"usagePercent,omitempty"`
+
+	// Reason is the reason for the latest auto-grow decision.
+	Reason string `json:"reason,omitempty"`
+
+	// Message describes the latest auto-grow decision.
+	Message string `json:"message,omitempty"`
+
+	// LastEvaluationTime records when auto-grow was last evaluated.
+	LastEvaluationTime *metav1.Time `json:"lastEvaluationTime,omitempty"`
 }
 
 // ServiceMeshStatus reports service mesh operational status

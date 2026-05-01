@@ -1352,6 +1352,37 @@ func TestValidateUpdate_SwarmStorageSizeDecreaseRejected(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_StorageAutoGrowRequiresMaxDataStorage(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Storage.StorageAutoGrow = &StorageAutoGrowSpec{
+		Enabled:              true,
+		GrowThresholdPercent: 85,
+		GrowIncrement:        "5Gi",
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected storage auto-grow max storage validation error")
+	}
+	if !strings.Contains(err.Error(), "maxDataStorage") {
+		t.Fatalf("expected maxDataStorage error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_StorageAutoGrowValid(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Storage.StorageAutoGrow = &StorageAutoGrowSpec{
+		Enabled:              true,
+		MaxDataStorage:       "20Gi",
+		GrowThresholdPercent: 85,
+		GrowIncrement:        "5Gi",
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid storage auto-grow config, got: %v", err)
+	}
+}
+
 func TestValidateUpdate_MetadataScaleDownRejected(t *testing.T) {
 	old := baseCluster()
 	old.Spec.MetadataNodes.Replicas = 5

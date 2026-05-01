@@ -503,6 +503,86 @@ func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {
 	g.Expect(updated.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("2Gi")))
 }
 
+func TestReconcileStorageAutoGrowRecommendsGrowth(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 8},
+		Spec: antflyv1.AntflyClusterSpec{
+			Storage: antflyv1.StorageSpec{
+				DataStorage: "10Gi",
+				StorageAutoGrow: &antflyv1.StorageAutoGrowSpec{
+					Enabled:              true,
+					MaxDataStorage:       "20Gi",
+					GrowThresholdPercent: 80,
+					GrowIncrement:        "5Gi",
+				},
+			},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-storage-test-cluster-data-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-cluster",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-data-0",
+			Namespace: "default",
+			Labels:    serviceSelectorLabels("test-cluster", "data"),
+		},
+		Spec: corev1.PodSpec{NodeName: "node-1"},
+	}
+	usedBytes := uint64(9 * 1024 * 1024 * 1024)
+	capacityBytes := uint64(10 * 1024 * 1024 * 1024)
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pvc, pod).Build(),
+		Scheme: s,
+		NodeStatsFetcher: func(context.Context, string) (*kubeletStatsSummary, error) {
+			return &kubeletStatsSummary{
+				Pods: []kubeletPodStats{
+					{
+						PodRef: kubeletPodReference{Name: pod.Name, Namespace: pod.Namespace},
+						Volume: []kubeletVolumeStats{
+							{
+								PVCRef:        &kubeletPVCReference{Name: pvc.Name, Namespace: pvc.Namespace},
+								UsedBytes:     &usedBytes,
+								CapacityBytes: &capacityBytes,
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	recommended := reconciler.reconcileStorageAutoGrow(ctx, cluster, "data", "data-storage", "test-cluster-data", "10Gi", "20Gi")
+
+	g.Expect(recommended).To(Equal("15Gi"))
+	g.Expect(cluster.Status.StorageAutoGrowStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.StorageAutoGrowStatus.Reason).To(Equal(antflyv1.ReasonStorageAutoGrowInProgress))
+	g.Expect(cluster.Status.StorageAutoGrowStatus.UsagePercent).To(Equal(int32(90)))
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeStorageAutoGrow)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonStorageAutoGrowInProgress))
+}
+
 func TestSetPVCExpansionConditionReportsComplete(t *testing.T) {
 	g := NewWithT(t)
 	cluster := &antflyv1.AntflyCluster{

@@ -2908,6 +2908,37 @@ spec:
                         - Delete
                         type: string
                     type: object
+                  storageAutoGrow:
+                    description: |-
+                      StorageAutoGrow configures operator-owned grow-only disk autoscaling.
+                      Clustered mode currently applies this policy only to data PVCs. Swarm
+                      mode applies it to the swarm PVC.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the operator automatically
+                          grows storage.
+                        type: boolean
+                      growIncrement:
+                        description: |-
+                          GrowIncrement is the amount added per grow step. Defaults to 10Gi when
+                          omitted.
+                        type: string
+                      growThresholdPercent:
+                        description: |-
+                          GrowThresholdPercent is the percent-used threshold that triggers growth.
+                          Defaults to 85 when omitted.
+                        format: int32
+                        type: integer
+                      maxDataStorage:
+                        description: MaxDataStorage is the maximum size for clustered
+                          data PVC auto-grow.
+                        type: string
+                      maxSwarmStorage:
+                        description: |-
+                          MaxSwarmStorage is the maximum size for swarm PVC auto-grow. If omitted
+                          in swarm mode, MaxDataStorage is used as the limit.
+                        type: string
+                    type: object
                   storageClass:
                     description: StorageClass is the storage class to use
                     type: string
@@ -6128,6 +6159,52 @@ spec:
                   totalPods:
                     description: TotalPods total expected pods (metadata + data replicas)
                     format: int32
+                    type: integer
+                type: object
+              storageAutoGrowStatus:
+                description: StorageAutoGrowStatus tracks the latest operator-owned
+                  storage auto-grow evaluation.
+                properties:
+                  capacityBytes:
+                    description: CapacityBytes is the observed capacity bytes across
+                      matching PVC volumes.
+                    format: int64
+                    type: integer
+                  component:
+                    description: Component is the component evaluated by the latest
+                      auto-grow pass.
+                    type: string
+                  currentSize:
+                    description: CurrentSize is the current effective requested PVC
+                      size.
+                    type: string
+                  lastEvaluationTime:
+                    description: LastEvaluationTime records when auto-grow was last
+                      evaluated.
+                    format: date-time
+                    type: string
+                  maxSize:
+                    description: MaxSize is the configured maximum size for the evaluated
+                      component.
+                    type: string
+                  message:
+                    description: Message describes the latest auto-grow decision.
+                    type: string
+                  reason:
+                    description: Reason is the reason for the latest auto-grow decision.
+                    type: string
+                  recommendedSize:
+                    description: RecommendedSize is the size the operator selected
+                      when growth is needed.
+                    type: string
+                  usagePercent:
+                    description: UsagePercent is the observed storage usage percentage.
+                    format: int32
+                    type: integer
+                  usedBytes:
+                    description: UsedBytes is the observed used bytes across matching
+                      PVC volumes.
+                    format: int64
                     type: integer
                 type: object
               swarmNodesReady:

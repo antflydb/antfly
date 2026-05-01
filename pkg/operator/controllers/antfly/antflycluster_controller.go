@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,6 +43,8 @@ type AntflyClusterReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
 	AutoScaler          *AutoScaler
+	KubeClient          kubernetes.Interface
+	NodeStatsFetcher    func(context.Context, string) (*kubeletStatsSummary, error)
 	Recorder            events.EventRecorder
 	ManageTermitePools  bool
 	DefaultTermiteImage string
@@ -60,6 +63,7 @@ type AntflyClusterReconciler struct {
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=nodes/proxy,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -416,6 +420,15 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 	if cluster.Spec.ServiceMesh == nil {
 		cluster.Spec.ServiceMesh = &antflyv1.ServiceMeshSpec{
 			Enabled: false,
+		}
+	}
+
+	if cluster.Spec.Storage.StorageAutoGrow != nil && cluster.Spec.Storage.StorageAutoGrow.Enabled {
+		if cluster.Spec.Storage.StorageAutoGrow.GrowThresholdPercent == 0 {
+			cluster.Spec.Storage.StorageAutoGrow.GrowThresholdPercent = 85
+		}
+		if cluster.Spec.Storage.StorageAutoGrow.GrowIncrement == "" {
+			cluster.Spec.Storage.StorageAutoGrow.GrowIncrement = "10Gi"
 		}
 	}
 
@@ -953,6 +966,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileServices(ctx, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
+		workingCluster.Spec.Storage.SwarmStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "swarm", "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster), maxSwarmAutoGrowSize(workingCluster))
 		if err := r.reconcileSwarmStatefulSet(ctx, efCache, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -975,6 +989,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
+		if storageAutoGrowEnabled(workingCluster) {
+			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -1075,6 +1092,8 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	workingCluster.Spec.Storage.DataStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "data", "data-storage", workingCluster.Name+"-data", effectiveDataStorageSize(workingCluster), maxDataAutoGrowSize(workingCluster))
+
 	// Create Data StatefulSet
 	if err := r.reconcileDataStatefulSet(ctx, efCache, workingCluster); err != nil {
 		return ctrl.Result{}, err
@@ -1110,6 +1129,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// If autoscaling is enabled, requeue for periodic evaluation
 	if workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if storageAutoGrowEnabled(workingCluster) {
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -2367,6 +2389,34 @@ func chooseSwarmStorageSize(cluster *antflyv1.AntflyCluster) string {
 	return "1Gi"
 }
 
+func effectiveDataStorageSize(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Storage.DataStorage != "" {
+		return cluster.Spec.Storage.DataStorage
+	}
+	return "1Gi"
+}
+
+func maxDataAutoGrowSize(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Storage.StorageAutoGrow == nil {
+		return ""
+	}
+	return cluster.Spec.Storage.StorageAutoGrow.MaxDataStorage
+}
+
+func maxSwarmAutoGrowSize(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Storage.StorageAutoGrow == nil {
+		return ""
+	}
+	if cluster.Spec.Storage.StorageAutoGrow.MaxSwarmStorage != "" {
+		return cluster.Spec.Storage.StorageAutoGrow.MaxSwarmStorage
+	}
+	return cluster.Spec.Storage.StorageAutoGrow.MaxDataStorage
+}
+
+func storageAutoGrowEnabled(cluster *antflyv1.AntflyCluster) bool {
+	return cluster.Spec.Storage.StorageAutoGrow != nil && cluster.Spec.Storage.StorageAutoGrow.Enabled
+}
+
 func effectiveDataNodeReplicas(cluster *antflyv1.AntflyCluster) int32 {
 	if cluster.Spec.DataNodes.Replicas > 0 {
 		return cluster.Spec.DataNodes.Replicas
@@ -2990,6 +3040,244 @@ func (r *AntflyClusterReconciler) reconcilePodDisruptionBudget(ctx context.Conte
 	})
 
 	return err
+}
+
+type pvcUsageObservation struct {
+	matched       int
+	usedBytes     int64
+	capacityBytes int64
+	maxRequest    resource.Quantity
+}
+
+type kubeletStatsSummary struct {
+	Pods []kubeletPodStats `json:"pods"`
+}
+
+type kubeletPodStats struct {
+	PodRef kubeletPodReference  `json:"podRef"`
+	Volume []kubeletVolumeStats `json:"volume"`
+}
+
+type kubeletPodReference struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+type kubeletVolumeStats struct {
+	PVCRef        *kubeletPVCReference `json:"pvcRef,omitempty"`
+	UsedBytes     *uint64              `json:"usedBytes,omitempty"`
+	CapacityBytes *uint64              `json:"capacityBytes,omitempty"`
+}
+
+type kubeletPVCReference struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+func (r *AntflyClusterReconciler) reconcileStorageAutoGrow(ctx context.Context, cluster *antflyv1.AntflyCluster, component, vctName, stsName, currentSizeStr, maxSizeStr string) string {
+	policy := cluster.Spec.Storage.StorageAutoGrow
+	if policy == nil || !policy.Enabled {
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonStorageAutoGrowDisabled, "Storage auto-grow is disabled")
+		return currentSizeStr
+	}
+
+	if maxSizeStr == "" {
+		message := fmt.Sprintf("%s storage auto-grow is enabled but no max size is configured", component)
+		r.setStorageAutoGrowStatus(cluster, component, currentSizeStr, "", "", 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+
+	currentSize, err := resource.ParseQuantity(currentSizeStr)
+	if err != nil {
+		message := fmt.Sprintf("%s current storage size %q is invalid: %v", component, currentSizeStr, err)
+		r.setStorageAutoGrowStatus(cluster, component, currentSizeStr, "", maxSizeStr, 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+	maxSize, err := resource.ParseQuantity(maxSizeStr)
+	if err != nil {
+		message := fmt.Sprintf("%s max storage size %q is invalid: %v", component, maxSizeStr, err)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSizeStr, 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+	growIncrement, err := resource.ParseQuantity(policy.GrowIncrement)
+	if err != nil || growIncrement.Sign() <= 0 {
+		message := fmt.Sprintf("%s grow increment %q is invalid", component, policy.GrowIncrement)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+
+	observation, err := r.observePVCUsage(ctx, cluster, component, vctName, stsName)
+	if observation.maxRequest.Cmp(currentSize) > 0 {
+		currentSize = observation.maxRequest
+		currentSizeStr = currentSize.String()
+	}
+	if err != nil {
+		message := fmt.Sprintf("%s storage usage is unavailable: %v", component, err)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), 0, 0, 0, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		return currentSizeStr
+	}
+	if observation.matched == 0 || observation.capacityBytes <= 0 {
+		message := fmt.Sprintf("Waiting for %s PVC usage metrics before evaluating auto-grow", component)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), observation.usedBytes, observation.capacityBytes, 0, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		return currentSizeStr
+	}
+
+	usagePercentValue := (observation.usedBytes/observation.capacityBytes)*100 + ((observation.usedBytes%observation.capacityBytes)*100)/observation.capacityBytes
+	const maxInt32 = int64(1<<31 - 1)
+	if usagePercentValue > maxInt32 {
+		usagePercentValue = maxInt32
+	}
+	usagePercent := int32(usagePercentValue)
+	threshold := policy.GrowThresholdPercent
+	if threshold == 0 {
+		threshold = 85
+	}
+	if usagePercent < threshold {
+		message := fmt.Sprintf("%s storage usage is %d%%, below auto-grow threshold %d%%", component, usagePercent, threshold)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), observation.usedBytes, observation.capacityBytes, usagePercent, antflyv1.ReasonStorageAutoGrowReady, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonStorageAutoGrowReady, message)
+		return currentSizeStr
+	}
+
+	if currentSize.Cmp(maxSize) >= 0 {
+		message := fmt.Sprintf("%s storage usage is %d%% but current size %s has reached max %s", component, usagePercent, currentSize.String(), maxSize.String())
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), currentSize.String(), maxSize.String(), observation.usedBytes, observation.capacityBytes, usagePercent, antflyv1.ReasonStorageAutoGrowMaxReached, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowMaxReached, message)
+		return currentSizeStr
+	}
+
+	recommended := resource.NewQuantity(currentSize.Value()+growIncrement.Value(), resource.BinarySI)
+	if recommended.Cmp(maxSize) > 0 {
+		maxCopy := maxSize.DeepCopy()
+		recommended = &maxCopy
+	}
+	message := fmt.Sprintf("%s storage usage is %d%%, growing from %s to %s", component, usagePercent, currentSize.String(), recommended.String())
+	r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), recommended.String(), maxSize.String(), observation.usedBytes, observation.capacityBytes, usagePercent, antflyv1.ReasonStorageAutoGrowInProgress, message)
+	r.setStorageAutoGrowCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonStorageAutoGrowInProgress, message)
+	return recommended.String()
+}
+
+func (r *AntflyClusterReconciler) observePVCUsage(ctx context.Context, cluster *antflyv1.AntflyCluster, component, vctName, stsName string) (pvcUsageObservation, error) {
+	prefix := vctName + "-" + stsName + "-"
+	var pvcList corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace), client.MatchingLabels{"app.kubernetes.io/instance": cluster.Name}); err != nil {
+		return pvcUsageObservation{}, fmt.Errorf("list PVCs: %w", err)
+	}
+
+	observation := pvcUsageObservation{}
+	pvcNames := map[string]struct{}{}
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if !strings.HasPrefix(pvc.Name, prefix) {
+			continue
+		}
+		observation.matched++
+		pvcNames[pvc.Name] = struct{}{}
+		if request := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; request.Cmp(observation.maxRequest) > 0 {
+			observation.maxRequest = request
+		}
+	}
+	if len(pvcNames) == 0 {
+		return observation, nil
+	}
+	if r.KubeClient == nil && r.NodeStatsFetcher == nil {
+		return observation, fmt.Errorf("kubernetes client is not configured")
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, component))); err != nil {
+		return observation, fmt.Errorf("list %s pods: %w", component, err)
+	}
+
+	summaries := map[string]*kubeletStatsSummary{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Spec.NodeName == "" {
+			continue
+		}
+		summary, ok := summaries[pod.Spec.NodeName]
+		if !ok {
+			fetched, err := r.fetchNodeStatsSummary(ctx, pod.Spec.NodeName)
+			if err != nil {
+				return observation, err
+			}
+			summary = fetched
+			summaries[pod.Spec.NodeName] = summary
+		}
+		for _, podStats := range summary.Pods {
+			if podStats.PodRef.Namespace != pod.Namespace || podStats.PodRef.Name != pod.Name {
+				continue
+			}
+			for _, volume := range podStats.Volume {
+				if volume.PVCRef == nil || volume.PVCRef.Namespace != cluster.Namespace {
+					continue
+				}
+				if _, matched := pvcNames[volume.PVCRef.Name]; !matched {
+					continue
+				}
+				if volume.UsedBytes != nil {
+					observation.usedBytes += int64(*volume.UsedBytes) //nolint:gosec // kubelet volume stats fit int64 byte counters in practice
+				}
+				if volume.CapacityBytes != nil {
+					observation.capacityBytes += int64(*volume.CapacityBytes) //nolint:gosec // kubelet volume stats fit int64 byte counters in practice
+				}
+			}
+		}
+	}
+
+	return observation, nil
+}
+
+func (r *AntflyClusterReconciler) fetchNodeStatsSummary(ctx context.Context, nodeName string) (*kubeletStatsSummary, error) {
+	if r.NodeStatsFetcher != nil {
+		return r.NodeStatsFetcher(ctx, nodeName)
+	}
+	raw, err := r.KubeClient.CoreV1().RESTClient().Get().
+		Resource("nodes").
+		Name(nodeName).
+		SubResource("proxy").
+		Suffix("stats/summary").
+		DoRaw(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetch node %s stats summary: %w", nodeName, err)
+	}
+	var summary kubeletStatsSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return nil, fmt.Errorf("decode node %s stats summary: %w", nodeName, err)
+	}
+	return &summary, nil
+}
+
+func (r *AntflyClusterReconciler) setStorageAutoGrowStatus(cluster *antflyv1.AntflyCluster, component, currentSize, recommendedSize, maxSize string, usedBytes, capacityBytes int64, usagePercent int32, reason, message string) {
+	now := metav1.Now()
+	cluster.Status.StorageAutoGrowStatus = &antflyv1.StorageAutoGrowStatus{
+		Component:          component,
+		CurrentSize:        currentSize,
+		RecommendedSize:    recommendedSize,
+		MaxSize:            maxSize,
+		UsedBytes:          usedBytes,
+		CapacityBytes:      capacityBytes,
+		UsagePercent:       usagePercent,
+		Reason:             reason,
+		Message:            message,
+		LastEvaluationTime: &now,
+	}
+}
+
+func (r *AntflyClusterReconciler) setStorageAutoGrowCondition(cluster *antflyv1.AntflyCluster, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypeStorageAutoGrow,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: cluster.Generation,
+	})
 }
 
 type pvcExpansionState string
