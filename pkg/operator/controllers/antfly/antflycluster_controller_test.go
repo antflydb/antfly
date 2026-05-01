@@ -568,6 +568,13 @@ func TestEffectiveDataReplicaTargetPrefersStatefulSetSpec(t *testing.T) {
 	g.Expect(max(effectiveDataReplicas(sts, true, 1), effectiveDataReplicaTarget(sts, true, 1))).To(Equal(int32(5)))
 }
 
+func TestStoreIDForDataOrdinalUsesHexID(t *testing.T) {
+	g := NewWithT(t)
+
+	g.Expect(storeIDForDataOrdinal(0)).To(Equal("1"))
+	g.Expect(storeIDForDataOrdinal(9)).To(Equal("a"))
+}
+
 // T006: Unit test for public API service deletion when disabled
 func TestReconcileServices_DeletesPublicAPIWhenDisabled(t *testing.T) {
 	g := NewWithT(t)

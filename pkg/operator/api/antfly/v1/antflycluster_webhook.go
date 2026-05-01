@@ -591,19 +591,8 @@ Solution: Keep the existing metadata replica count, or recreate the cluster with
 				old.Spec.MetadataNodes.Replicas, r.Spec.MetadataNodes.Replicas))
 		}
 
-		if r.Spec.DataNodes.Replicas < old.Spec.DataNodes.Replicas {
-			errors = append(errors, fmt.Sprintf(
-				`field 'spec.dataNodes.replicas' cannot be decreased yet (current: %d, attempted: %d)
-
-Problem: Data-node scale-down requires a database-aware drain and rebalance workflow before pods are removed.
-
-Solution: Scale data nodes up only for now. Data scale-down will be enabled after the shared drain workflow is available.`,
-				old.Spec.DataNodes.Replicas, r.Spec.DataNodes.Replicas))
-		}
-
-		if err := r.validateAutoScalingUpdate(old); err != nil {
-			errors = append(errors, err.Error())
-		}
+		// Data-node scale-down is mutable: the controller drains and deregisters
+		// one highest ordinal at a time before shrinking the StatefulSet.
 	}
 
 	// Check storage size decrease (increases are allowed for online expansion)
@@ -852,34 +841,6 @@ func (r *AntflyCluster) validateAutoScalingConfig() error {
 		return fmt.Errorf("autoscaling validation failed:\n  - %s", strings.Join(errors, "\n  - "))
 	}
 	return nil
-}
-
-func (r *AntflyCluster) validateAutoScalingUpdate(old *AntflyCluster) error {
-	if r.Spec.DataNodes.AutoScaling == nil || !r.Spec.DataNodes.AutoScaling.Enabled {
-		return nil
-	}
-
-	newScaling := r.Spec.DataNodes.AutoScaling
-	var errors []string
-	observedReplicas := old.observedDataReplicasForScaleSafety()
-	if observedReplicas > 0 && newScaling.MaxReplicas < observedReplicas {
-		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas (%d) cannot be below observed data replicas (%d) until data scale-down is supported", newScaling.MaxReplicas, observedReplicas))
-	}
-
-	if len(errors) > 0 {
-		return fmt.Errorf("%s", strings.Join(errors, "\n\n"))
-	}
-	return nil
-}
-
-func (r *AntflyCluster) observedDataReplicasForScaleSafety() int32 {
-	observed := r.Spec.DataNodes.Replicas
-	if r.Status.AutoScalingStatus != nil {
-		observed = max(observed, r.Status.AutoScalingStatus.CurrentReplicas)
-		observed = max(observed, r.Status.AutoScalingStatus.DesiredReplicas)
-		observed = max(observed, r.Status.AutoScalingStatus.RecommendationReplicas)
-	}
-	return observed
 }
 
 // validateResourceQuantities validates that resource quantity strings are parseable.

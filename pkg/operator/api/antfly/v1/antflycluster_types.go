@@ -107,8 +107,14 @@ const (
 	// ReasonScalingReady indicates scaling is not currently blocked
 	ReasonScalingReady = "ScalingReady"
 
-	// ReasonDataScaleDownBlocked indicates data-node scale-down is blocked until drain orchestration is available
+	// ReasonDataScaleDownBlocked indicates data-node scale-down is blocked by a safety gate
 	ReasonDataScaleDownBlocked = "DataScaleDownBlocked"
+
+	// ReasonDataScaleDownInProgress indicates data-node scale-down is draining one ordinal
+	ReasonDataScaleDownInProgress = "DataScaleDownInProgress"
+
+	// ReasonDataScaleDownFailed indicates data-node scale-down could not drain the selected ordinal
+	ReasonDataScaleDownFailed = "DataScaleDownFailed"
 
 	// FinalizerPVCCleanup is the finalizer used for PVC cleanup on cluster deletion
 	FinalizerPVCCleanup = "antfly.io/pvc-cleanup"
@@ -652,6 +658,10 @@ type AntflyClusterStatus struct {
 	// AutoScalingStatus tracks autoscaling state
 	AutoScalingStatus *AutoScalingStatus `json:"autoScalingStatus,omitempty"`
 
+	// DataScaleDownStatus tracks the operator-owned data-node scale-down workflow.
+	// +optional
+	DataScaleDownStatus *DataScaleDownStatus `json:"dataScaleDownStatus,omitempty"`
+
 	// SwarmStatus reports swarm-specific operational state.
 	// +optional
 	SwarmStatus *SwarmStatus `json:"swarmStatus,omitempty"`
@@ -697,6 +707,33 @@ type AutoScalingStatus struct {
 
 	// CurrentMemoryUtilizationPercentage is the current memory utilization
 	CurrentMemoryUtilizationPercentage *int32 `json:"currentMemoryUtilizationPercentage,omitempty"`
+}
+
+// DataScaleDownStatus tracks a one-ordinal-at-a-time data-node scale-down.
+type DataScaleDownStatus struct {
+	// FromReplicas is the observed/applied replica count before this scale-down step.
+	FromReplicas int32 `json:"fromReplicas,omitempty"`
+
+	// TargetReplicas is the user or autoscaler requested final replica count.
+	TargetReplicas int32 `json:"targetReplicas,omitempty"`
+
+	// AppliedReplicas is the replica count applied to the StatefulSet for this step.
+	AppliedReplicas int32 `json:"appliedReplicas,omitempty"`
+
+	// DrainingOrdinal is the StatefulSet ordinal selected for this step.
+	DrainingOrdinal int32 `json:"drainingOrdinal,omitempty"`
+
+	// DrainingStoreID is the Antfly store ID selected for this step.
+	DrainingStoreID string `json:"drainingStoreID,omitempty"`
+
+	// Phase is the current scale-down workflow phase.
+	Phase string `json:"phase,omitempty"`
+
+	// Message describes the current scale-down workflow state.
+	Message string `json:"message,omitempty"`
+
+	// LastTransitionTime records the last phase transition.
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 
 // ServiceMeshStatus reports service mesh operational status

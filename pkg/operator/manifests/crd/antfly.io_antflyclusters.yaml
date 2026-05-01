@@ -6042,6 +6042,46 @@ spec:
                 description: DataNodesReady represents the number of ready data nodes
                 format: int32
                 type: integer
+              dataScaleDownStatus:
+                description: DataScaleDownStatus tracks the operator-owned data-node
+                  scale-down workflow.
+                properties:
+                  appliedReplicas:
+                    description: AppliedReplicas is the replica count applied to the
+                      StatefulSet for this step.
+                    format: int32
+                    type: integer
+                  drainingOrdinal:
+                    description: DrainingOrdinal is the StatefulSet ordinal selected
+                      for this step.
+                    format: int32
+                    type: integer
+                  drainingStoreID:
+                    description: DrainingStoreID is the Antfly store ID selected for
+                      this step.
+                    type: string
+                  fromReplicas:
+                    description: FromReplicas is the observed/applied replica count
+                      before this scale-down step.
+                    format: int32
+                    type: integer
+                  lastTransitionTime:
+                    description: LastTransitionTime records the last phase transition.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message describes the current scale-down workflow
+                      state.
+                    type: string
+                  phase:
+                    description: Phase is the current scale-down workflow phase.
+                    type: string
+                  targetReplicas:
+                    description: TargetReplicas is the user or autoscaler requested
+                      final replica count.
+                    format: int32
+                    type: integer
+                type: object
               metadataNodesReady:
                 description: MetadataNodesReady represents the number of ready metadata
                   nodes

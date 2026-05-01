@@ -9,13 +9,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// Helper to create int32 pointers
-//
-//go:fix inline
-func int32Ptr(i int32) *int32 {
-	return new(i)
-}
-
 func TestCalculateDesiredReplicas_ScaleUp_CPUOnly(t *testing.T) {
 	g := NewWithT(t)
 	as := &AutoScaler{}

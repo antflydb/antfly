@@ -1380,19 +1380,15 @@ func TestValidateUpdate_DataScaleUpAllowed(t *testing.T) {
 	}
 }
 
-func TestValidateUpdate_DataScaleDownRejected(t *testing.T) {
+func TestValidateUpdate_DataScaleDownAllowed(t *testing.T) {
 	old := baseCluster()
 	old.Spec.DataNodes.Replicas = 5
 
 	new := baseCluster()
 	new.Spec.DataNodes.Replicas = 3
 
-	err := new.ValidateUpdate(old)
-	if err == nil {
-		t.Fatal("expected error when decreasing data replicas")
-	}
-	if !strings.Contains(err.Error(), "dataNodes.replicas") {
-		t.Fatalf("expected data replica error, got: %v", err)
+	if err := new.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected data scale-down to be admitted for controller-owned drain workflow, got: %v", err)
 	}
 }
 
@@ -1426,7 +1422,7 @@ func TestValidateCreate_DisabledAutoScalingIgnoresBounds(t *testing.T) {
 	}
 }
 
-func TestValidateUpdate_AutoScalingMaxBelowObservedReplicasRejected(t *testing.T) {
+func TestValidateUpdate_AutoScalingMaxBelowObservedReplicasAllowed(t *testing.T) {
 	old := baseCluster()
 	old.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
 		Enabled:     true,
@@ -1445,12 +1441,8 @@ func TestValidateUpdate_AutoScalingMaxBelowObservedReplicasRejected(t *testing.T
 		MaxReplicas: 6,
 	}
 
-	err := new.ValidateUpdate(old)
-	if err == nil {
-		t.Fatal("expected error when maxReplicas is below observed data replicas")
-	}
-	if !strings.Contains(err.Error(), "observed data replicas") {
-		t.Fatalf("expected autoscaling maxReplicas error, got: %v", err)
+	if err := new.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected autoscaling maxReplicas below observed replicas to be admitted for controller-owned drain workflow, got: %v", err)
 	}
 }
 
