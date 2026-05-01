@@ -1,0 +1,6 @@
+domain: antfly.io
+layout:
+- go.kubebuilder.io/v3
+projectName: operator
+repo: github.com/antflydb/antfly/pkg/operator
+version: "3"

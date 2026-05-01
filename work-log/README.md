@@ -53,8 +53,8 @@ This directory tracks major features and architectural changes in Antfly. Each d
 | Feature | Document | Summary |
 |---------|----------|---------|
 | HuggingFace Direct Pull | [huggingface-direct.md](completed/huggingface-direct.md) | `hf:` prefix support with variant auto-detection |
-| Termite Operator GKE Autopilot | [termite-operator-autopilot.md](completed/termite-operator-autopilot.md) | GKE Autopilot compute classes and spot scheduling |
-| Termite Operator TPUs | [termite-operator-tpus.md](completed/termite-operator-tpus.md) | GKE TPU node pool integration |
+| Termite Controllers GKE Autopilot | [termite-operator-autopilot.md](completed/termite-operator-autopilot.md) | GKE Autopilot compute classes and spot scheduling |
+| Termite Controllers TPUs | [termite-operator-tpus.md](completed/termite-operator-tpus.md) | GKE TPU node pool integration |
 | Reader Interface (OCR/Vision) | [reader-integration.md](completed/reader-integration.md) | TrOCR, Donut, Florence-2, multi-stage readers |
 | INT8 Fixups | [int8-fixups.md](completed/int8-fixups.md) | Worker pool and SIMD optimization for quantized inference |
 | Termite Enhancements | [../termite-enhancements.md](termite-enhancements.md) | Ollama parity: lazy loading, queuing, metrics, caching |
