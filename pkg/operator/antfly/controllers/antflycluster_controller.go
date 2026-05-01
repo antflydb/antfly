@@ -38,10 +38,11 @@ import (
 // AntflyClusterReconciler reconciles an AntflyCluster object
 type AntflyClusterReconciler struct {
 	client.Client
-	Scheme             *runtime.Scheme
-	AutoScaler         *AutoScaler
-	Recorder           events.EventRecorder
-	ManageTermitePools bool
+	Scheme              *runtime.Scheme
+	AutoScaler          *AutoScaler
+	Recorder            events.EventRecorder
+	ManageTermitePools  bool
+	DefaultTermiteImage string
 
 	// validationAttempts tracks consecutive validation failure counts per cluster
 	// (namespace/name -> int). Reset on successful validation. Used for
@@ -1076,6 +1077,7 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		return nil
 	}
 
+	logger := log.FromContext(ctx)
 	name := cluster.Name + "-termite"
 	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
 
@@ -1089,9 +1091,10 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		}
 
 		if !metav1.IsControlledBy(pool, cluster) {
+			logger.Info("Leaving same-name TermitePool unchanged because it is not controlled by this AntflyCluster", "termitePool", key.String())
 			return nil
 		}
-		if err := r.Delete(ctx, pool); err != nil && !errors.IsNotFound(err) {
+		if err := client.IgnoreNotFound(r.Delete(ctx, pool)); err != nil {
 			return fmt.Errorf("failed to delete managed TermitePool %s: %w", name, err)
 		}
 		return nil
@@ -1107,6 +1110,7 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 	existing := &termitev1alpha1.TermitePool{}
 	if err := r.Get(ctx, key, existing); err == nil {
 		if !metav1.IsControlledBy(existing, cluster) {
+			logger.Info("Refusing to adopt same-name TermitePool because it is not controlled by this AntflyCluster", "termitePool", key.String())
 			return fmt.Errorf("TermitePool %s already exists and is not controlled by AntflyCluster %s/%s", name, cluster.Namespace, cluster.Name)
 		}
 	} else if !errors.IsNotFound(err) {
@@ -1124,7 +1128,7 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 
 		pool.Spec = *cluster.Spec.Termite.DeepCopy()
 		if pool.Spec.Image == "" {
-			pool.Spec.Image = cluster.Spec.Image
+			pool.Spec.Image = r.DefaultTermiteImage
 		}
 		if err := controllerutil.SetControllerReference(cluster, pool, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set owner reference on TermitePool %s: %w", name, err)

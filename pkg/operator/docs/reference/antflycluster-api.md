@@ -32,7 +32,21 @@ status:
 | `eks` | [EKSSpec](#eksspec) | No | AWS EKS-specific configuration |
 | `serviceMesh` | [ServiceMeshSpec](#servicemeshspec) | No | Service mesh configuration |
 | `publicAPI` | [PublicAPIConfig](#publicapiconfig) | No | Public API service configuration |
+| `termite` | TermitePoolSpec | No | Operator-managed TermitePool associated with this cluster |
 | `serviceAccountName` | string | No | Kubernetes ServiceAccount for pods |
+
+### Termite Integration
+
+When `spec.termite` is set, the operator creates or updates a `TermitePool`
+named `<cluster-name>-termite` in the same namespace and owned by the
+`AntflyCluster`.
+
+If `spec.termite.image` is omitted, the operator uses the configured default
+omni Antfly image for Termite pods. The image must provide the `/antfly termite`
+runtime contract, for example `ghcr.io/antflydb/antfly:omni`.
+
+`spec.termite` does not create `TermiteRoute` resources. Direct `TermiteRoute`
+manifests remain supported for explicit routing configuration.
 
 ### MetadataNodesSpec
 

@@ -213,9 +213,10 @@ func TestReconcileTermitePoolCreatesManagedPool(t *testing.T) {
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
 	reconciler := &AntflyClusterReconciler{
-		Client:             fake.NewClientBuilder().WithScheme(s).Build(),
-		Scheme:             s,
-		ManageTermitePools: true,
+		Client:              fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:              s,
+		ManageTermitePools:  true,
+		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
 	cluster := baseClusterWithTermiteSpec()
 
@@ -225,7 +226,7 @@ func TestReconcileTermitePoolCreatesManagedPool(t *testing.T) {
 	pool := &termitev1alpha1.TermitePool{}
 	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(pool.Spec.Image).To(Equal("antfly:test"))
+	g.Expect(pool.Spec.Image).To(Equal("ghcr.io/antflydb/antfly:omni-test"))
 	g.Expect(pool.Labels).To(HaveKeyWithValue("app.kubernetes.io/instance", "test-cluster"))
 	g.Expect(pool.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "antfly-operator"))
 	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeTrue())
@@ -251,9 +252,10 @@ func TestReconcileTermitePoolDeletesOnlyManagedPool(t *testing.T) {
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool, unmanagedPool).Build(),
-		Scheme:             s,
-		ManageTermitePools: true,
+		Client:              fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool, unmanagedPool).Build(),
+		Scheme:              s,
+		ManageTermitePools:  true,
+		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
 
 	err := reconciler.reconcileTermitePool(ctx, cluster)
@@ -280,9 +282,10 @@ func TestReconcileTermitePoolDoesNotAdoptExistingUnmanagedPool(t *testing.T) {
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(existingPool).Build(),
-		Scheme:             s,
-		ManageTermitePools: true,
+		Client:              fake.NewClientBuilder().WithScheme(s).WithObjects(existingPool).Build(),
+		Scheme:              s,
+		ManageTermitePools:  true,
+		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
 
 	err := reconciler.reconcileTermitePool(ctx, cluster)

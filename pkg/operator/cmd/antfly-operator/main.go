@@ -38,6 +38,8 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+const defaultTermiteOmniImage = "ghcr.io/antflydb/antfly:omni"
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(antflyv1.AddToScheme(scheme))
@@ -61,9 +63,9 @@ func main() {
 	flag.BoolVar(&skipCRDInstall, "skip-crd-install", false,
 		"Skip automatic CRD installation (use if CRDs managed externally)")
 	flag.BoolVar(&enableTermiteControllers, "enable-termite-controllers", true,
-		"Enable TermitePool and TermiteRoute controllers in the Antfly operator manager.")
-	flag.StringVar(&termiteAntflyImage, "termite-antfly-image", "antfly/antfly:omni",
-		"Default Antfly container image for TermitePool pods.")
+		"Enable TermitePool and TermiteRoute controllers and AntflyCluster.spec.termite management. CRD installation remains unconditional unless --skip-crd-install is set.")
+	flag.StringVar(&termiteAntflyImage, "termite-antfly-image", defaultTermiteOmniImage,
+		"Default omni Antfly image for TermitePool pods. The image must provide the /antfly termite runtime contract.")
 	opts := zap.Options{
 		Development: false,
 		TimeEncoder: zapcore.RFC3339TimeEncoder,
@@ -105,11 +107,12 @@ func main() {
 	autoScaler := controllers.NewAutoScaler(mgr.GetClient(), k8sClient, mgr.GetClient())
 
 	if err = (&controllers.AntflyClusterReconciler{
-		Client:             mgr.GetClient(),
-		Scheme:             mgr.GetScheme(),
-		AutoScaler:         autoScaler,
-		Recorder:           mgr.GetEventRecorder("antfly-operator"),
-		ManageTermitePools: enableTermiteControllers,
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		AutoScaler:          autoScaler,
+		Recorder:            mgr.GetEventRecorder("antfly-operator"),
+		ManageTermitePools:  enableTermiteControllers,
+		DefaultTermiteImage: termiteAntflyImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AntflyCluster")
 		os.Exit(1)

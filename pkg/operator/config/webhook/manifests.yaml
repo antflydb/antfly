@@ -19,6 +19,7 @@ webhooks:
           operator: NotIn
           values:
             - antfly-system
+            - termite-system
     rules:
       - apiGroups:
           - antfly.io
@@ -45,6 +46,7 @@ webhooks:
           operator: NotIn
           values:
             - antfly-system
+            - termite-system
     rules:
       - apiGroups:
           - antfly.io
@@ -71,6 +73,7 @@ webhooks:
           operator: NotIn
           values:
             - antfly-system
+            - termite-system
     rules:
       - apiGroups:
           - antfly.io
@@ -97,6 +100,7 @@ webhooks:
           operator: NotIn
           values:
             - antfly-system
+            - termite-system
     rules:
       - apiGroups:
           - antfly.io
@@ -123,6 +127,7 @@ webhooks:
           operator: NotIn
           values:
             - antfly-system
+            - termite-system
     rules:
       - apiGroups:
           - antfly.io

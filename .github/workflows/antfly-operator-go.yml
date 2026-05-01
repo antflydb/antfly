@@ -47,7 +47,7 @@ jobs:
         run: make test
 
       - name: Run lint
-        run: make vet
+        run: make lint
 
       - name: Build
         run: make build

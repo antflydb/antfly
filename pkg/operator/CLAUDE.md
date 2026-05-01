@@ -24,6 +24,8 @@ All Go commands use `GOWORK=off` (set in Makefile).
 Both deployed as StatefulSets with persistent volumes. Defaults applied in `controllers/antflycluster_controller.go` `applyDefaults()`.
 
 **CRDs:** AntflyCluster, AntflyBackup, AntflyRestore, TermitePool, TermiteRoute (defined in `antfly/api/v1/` and `termite/api/v1alpha1/`).
+Startup CRD bootstrap installs all five CRDs unless `--skip-crd-install` is set,
+even when `--enable-termite-controllers=false`.
 
 **Reconciliation order** (`controllers/antflycluster_controller.go`):
 1. Apply defaults to DeepCopy (avoids API server conflicts)

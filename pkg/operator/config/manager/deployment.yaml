@@ -38,6 +38,7 @@ spec:
         args:
         - --leader-elect
         - --enable-termite-controllers=true
+        - --termite-antfly-image=ghcr.io/antflydb/antfly:omni
         resources:
           limits:
             cpu: 500m

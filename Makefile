@@ -463,7 +463,7 @@ operator-test: ## Run antfly-operator tests
 	(cd ./pkg/operator && $(MAKE) test)
 
 operator-lint: ## Run linter on antfly-operator
-	(cd ./pkg/operator && $(MAKE) vet)
+	(cd ./pkg/operator && $(MAKE) lint)
 
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./Dockerfile.antfly-operator .

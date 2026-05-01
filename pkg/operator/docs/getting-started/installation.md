@@ -52,6 +52,8 @@ kubectl get crd | grep antfly
 # antflybackups.antfly.io     2025-01-15T00:00:00Z
 # antflyclusters.antfly.io    2025-01-15T00:00:00Z
 # antflyrestores.antfly.io    2025-01-15T00:00:00Z
+# termitepools.antfly.io      2025-01-15T00:00:00Z
+# termiteroutes.antfly.io     2025-01-15T00:00:00Z
 ```
 
 ## What Gets Installed
@@ -64,6 +66,8 @@ The installation creates:
 | CRDs | `antflyclusters.antfly.io` | Cluster definition |
 | CRDs | `antflybackups.antfly.io` | Backup schedules |
 | CRDs | `antflyrestores.antfly.io` | Restore operations |
+| CRDs | `termitepools.antfly.io` | Termite ML pool definition |
+| CRDs | `termiteroutes.antfly.io` | Termite routing definition |
 | ServiceAccount | `antfly-operator-service-account` | Operator identity |
 | ClusterRole | `antfly-operator-cluster-role` | RBAC permissions |
 | ClusterRoleBinding | `antfly-operator-cluster-role-binding` | Binds role to SA |
