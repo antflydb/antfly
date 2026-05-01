@@ -54,6 +54,15 @@ When `--enable-termite-controllers=false`, `spec.termite` management is
 disabled and any previously owned TermitePool objects are left unchanged. The
 operator reports this with the `TermitePoolReady` status condition.
 
+If `spec.termite.autoscaling.enabled=true`, the Termite controller creates a
+HorizontalPodAutoscaler named `<termitepool-name>-hpa`. CPU and memory targets
+use Kubernetes resource metrics. Termite-specific metric types
+(`queue-depth`, `latency-p99`, `latency-p95`, `requests-per-second`, and
+`throughput`) require a Pods metrics adapter that exports metric names exactly
+matching those CRD values. Per-metric `scaleUp` and `scaleDown` settings are
+translated to the HPA's global behavior; when multiple metrics define behavior,
+the first setting for each direction is used.
+
 ### MetadataNodesSpec
 
 Configuration for metadata nodes (Raft consensus, API coordination).

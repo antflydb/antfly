@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"maps"
 	"reflect"
@@ -104,6 +105,7 @@ func (r *TermitePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	logger.Info("Reconciling TermitePool", "name", pool.Name)
 
 	poolKey := req.String()
+	originalConditions := slices.Clone(pool.Status.Conditions)
 
 	// 0. Validate configuration (fallback when webhook is disabled)
 	// Generation guard: skip if spec unchanged since last successful validation.
@@ -154,7 +156,18 @@ func (r *TermitePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// 4. Create, update, or remove HorizontalPodAutoscaler
 	if err := r.reconcileHPA(ctx, pool); err != nil {
-		return ctrl.Result{}, err
+		var conflictErr *hpaNameConflictError
+		if stderrors.As(err, &conflictErr) {
+			logger.Info("Refusing to adopt same-name HorizontalPodAutoscaler because it is not controlled by this TermitePool", "horizontalPodAutoscaler", conflictErr.namespacedName)
+			meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+				Type:    antflyaiv1alpha1.TypeAutoscalerReady,
+				Status:  metav1.ConditionFalse,
+				Reason:  antflyaiv1alpha1.ReasonAutoscalerError,
+				Message: conflictErr.Error(),
+			})
+		} else {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 5. Create or update PodDisruptionBudget (from Availability config or GKE config)
@@ -163,7 +176,7 @@ func (r *TermitePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// 6. Update status
-	if err := r.updateStatus(ctx, pool); err != nil {
+	if err := r.updateStatus(ctx, pool, originalConditions); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -593,6 +606,7 @@ func termiteAutoscalingEnabled(pool *antflyaiv1alpha1.TermitePool) bool {
 }
 
 func (r *TermitePoolReconciler) reconcileHPA(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
+	logger := log.FromContext(ctx)
 	name := pool.Name + "-hpa"
 	key := types.NamespacedName{Name: name, Namespace: pool.Namespace}
 
@@ -600,11 +614,36 @@ func (r *TermitePoolReconciler) reconcileHPA(ctx context.Context, pool *antflyai
 		existing := &autoscalingv2.HorizontalPodAutoscaler{}
 		if err := r.Get(ctx, key, existing); err != nil {
 			if errors.IsNotFound(err) {
+				meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+					Type:    antflyaiv1alpha1.TypeAutoscalerReady,
+					Status:  metav1.ConditionTrue,
+					Reason:  antflyaiv1alpha1.ReasonAutoscalerOff,
+					Message: "Autoscaling is disabled",
+				})
 				return nil
 			}
 			return err
 		}
-		return r.Delete(ctx, existing)
+		if !metav1.IsControlledBy(existing, pool) {
+			logger.Info("Leaving same-name HorizontalPodAutoscaler unchanged because it is not controlled by this TermitePool", "horizontalPodAutoscaler", key.String())
+			meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+				Type:    antflyaiv1alpha1.TypeAutoscalerReady,
+				Status:  metav1.ConditionTrue,
+				Reason:  antflyaiv1alpha1.ReasonAutoscalerOff,
+				Message: "Autoscaling is disabled; unmanaged same-name HorizontalPodAutoscaler left unchanged",
+			})
+			return nil
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, existing)); err != nil {
+			return err
+		}
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:    antflyaiv1alpha1.TypeAutoscalerReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  antflyaiv1alpha1.ReasonAutoscalerOff,
+			Message: "Managed HorizontalPodAutoscaler removed because autoscaling is disabled",
+		})
+		return nil
 	}
 
 	metrics, err := hpaMetrics(pool.Spec.Autoscaling.Metrics)
@@ -624,6 +663,12 @@ func (r *TermitePoolReconciler) reconcileHPA(ctx context.Context, pool *antflyai
 	}
 
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
+		if hpa.UID != "" && !metav1.IsControlledBy(hpa, pool) {
+			return &hpaNameConflictError{
+				namespacedName: key.String(),
+				pool:           types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}.String(),
+			}
+		}
 		if err := ctrl.SetControllerReference(pool, hpa, r.Scheme); err != nil {
 			return err
 		}
@@ -642,7 +687,25 @@ func (r *TermitePoolReconciler) reconcileHPA(ctx context.Context, pool *antflyai
 		}
 		return nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:    antflyaiv1alpha1.TypeAutoscalerReady,
+		Status:  metav1.ConditionTrue,
+		Reason:  antflyaiv1alpha1.ReasonAutoscalerReady,
+		Message: fmt.Sprintf("Managed HorizontalPodAutoscaler %s is reconciled", key.String()),
+	})
+	return nil
+}
+
+type hpaNameConflictError struct {
+	namespacedName string
+	pool           string
+}
+
+func (e *hpaNameConflictError) Error() string {
+	return fmt.Sprintf("HorizontalPodAutoscaler %s already exists and is not controlled by TermitePool %s", e.namespacedName, e.pool)
 }
 
 func hpaMetrics(metrics []antflyaiv1alpha1.ScalingMetric) ([]autoscalingv2.MetricSpec, error) {
@@ -1001,7 +1064,7 @@ func (r *TermitePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplateS
 	}
 }
 
-func (r *TermitePoolReconciler) updateStatus(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
+func (r *TermitePoolReconciler) updateStatus(ctx context.Context, pool *antflyaiv1alpha1.TermitePool, originalConditions []metav1.Condition) error {
 	// Get StatefulSet to read replica status
 	sts := &appsv1.StatefulSet{}
 
@@ -1029,7 +1092,8 @@ func (r *TermitePoolReconciler) updateStatus(ctx context.Context, pool *antflyai
 		pool.Status.Replicas.Ready == ready &&
 		pool.Status.Replicas.Total == total &&
 		pool.Status.Replicas.Desired == desired &&
-		pool.Status.ObservedGeneration == pool.Generation {
+		pool.Status.ObservedGeneration == pool.Generation &&
+		reflect.DeepEqual(pool.Status.Conditions, originalConditions) {
 		return nil
 	}
 
@@ -1396,5 +1460,6 @@ func (r *TermitePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Complete(r)
 }

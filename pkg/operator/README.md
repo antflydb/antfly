@@ -122,6 +122,23 @@ and `AntflyCluster.spec.termite` management are disabled. Existing owned
 TermitePool objects are left unchanged while the flag is disabled, including if
 `spec.termite` is removed during that window.
 
+TermitePool autoscaling is implemented with Kubernetes `autoscaling/v2`
+HorizontalPodAutoscalers. When `spec.autoscaling.enabled=true`, the operator
+creates `<termitepool-name>-hpa`; when autoscaling is disabled, it deletes only
+HPAs that are owned by the TermitePool and leaves any same-name unmanaged HPA
+untouched. If no metrics are configured, the HPA uses a default CPU target of
+80%.
+
+CPU and memory metric targets use Kubernetes resource metrics: percentage
+targets such as `75%` become average utilization targets, and quantity targets
+such as `500m` or `512Mi` become average value targets. Termite-specific metrics
+(`queue-depth`, `latency-p99`, `latency-p95`, `requests-per-second`, and
+`throughput`) use HPA Pods metrics with the metric name exactly matching the CRD
+value, so production clusters must install a metrics adapter that exports those
+names for Termite pods. HPA scale behavior is global; if multiple metrics define
+`scaleUp` or `scaleDown`, the operator uses the first behavior found for each
+direction.
+
 ### RBAC Requirements
 
 The operator requires specific RBAC configuration. **When deploying via infrastructure-as-code tools (Pulumi, Terraform, etc.), ensure the following:**

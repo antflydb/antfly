@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"testing"
 	"time"
 
@@ -54,8 +55,9 @@ func TestReconcileHPADeletesAutoscalerWhenDisabled(t *testing.T) {
 	pool.Spec.Autoscaling.Enabled = false
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "autoscaled-pool-hpa",
-			Namespace: "default",
+			Name:            "autoscaled-pool-hpa",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{ownerReferenceForTermitePool(pool)},
 		},
 	}
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(pool, hpa).Build()
@@ -68,6 +70,60 @@ func TestReconcileHPADeletesAutoscalerWhenDisabled(t *testing.T) {
 
 	err := client.Get(ctx, types.NamespacedName{Name: "autoscaled-pool-hpa", Namespace: "default"}, &autoscalingv2.HorizontalPodAutoscaler{})
 	g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+}
+
+func TestReconcileHPARefusesToDeleteUnmanagedAutoscaler(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newTermiteUnitTestScheme(g)
+	pool := baseAutoscaledTermitePool()
+	pool.Spec.Autoscaling.Enabled = false
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "autoscaled-pool-hpa",
+			Namespace: "default",
+			UID:       types.UID("unmanaged-hpa"),
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(pool, hpa).Build()
+	reconciler := &TermitePoolReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHPA(ctx, pool)).To(Succeed())
+
+	existing := &autoscalingv2.HorizontalPodAutoscaler{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "autoscaled-pool-hpa", Namespace: "default"}, existing)).To(Succeed())
+	g.Expect(existing.OwnerReferences).To(BeEmpty())
+}
+
+func TestReconcileHPARefusesToAdoptUnmanagedAutoscaler(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newTermiteUnitTestScheme(g)
+	pool := baseAutoscaledTermitePool()
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "autoscaled-pool-hpa",
+			Namespace: "default",
+			UID:       types.UID("unmanaged-hpa"),
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(pool, hpa).Build()
+	reconciler := &TermitePoolReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	err := reconciler.reconcileHPA(ctx, pool)
+	var conflictErr *hpaNameConflictError
+	g.Expect(stderrors.As(err, &conflictErr)).To(BeTrue())
+
+	existing := &autoscalingv2.HorizontalPodAutoscaler{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "autoscaled-pool-hpa", Namespace: "default"}, existing)).To(Succeed())
+	g.Expect(existing.OwnerReferences).To(BeEmpty())
+	g.Expect(existing.Spec.ScaleTargetRef.Name).To(BeEmpty())
 }
 
 func TestReconcileStatefulSetDoesNotResetReplicasWhenAutoscaled(t *testing.T) {
@@ -116,6 +172,7 @@ func baseAutoscaledTermitePool() *antflyaiv1alpha1.TermitePool {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "autoscaled-pool",
 			Namespace: "default",
+			UID:       types.UID("autoscaled-pool"),
 		},
 		Spec: antflyaiv1alpha1.TermitePoolSpec{
 			WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
@@ -137,5 +194,16 @@ func baseAutoscaledTermitePool() *antflyaiv1alpha1.TermitePool {
 				},
 			},
 		},
+	}
+}
+
+func ownerReferenceForTermitePool(pool *antflyaiv1alpha1.TermitePool) metav1.OwnerReference {
+	controller := true
+	return metav1.OwnerReference{
+		APIVersion: antflyaiv1alpha1.GroupVersion.String(),
+		Kind:       "TermitePool",
+		Name:       pool.Name,
+		UID:        pool.UID,
+		Controller: &controller,
 	}
 }

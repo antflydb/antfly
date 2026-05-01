@@ -15,11 +15,14 @@
 package v1alpha1
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -71,6 +74,10 @@ func (r *TermitePool) ValidateTermitePool() error {
 	}
 
 	if err := r.validateReplicaCounts(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
+	if err := r.validateAutoscalingConfig(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
@@ -272,6 +279,129 @@ func (r *TermitePool) validateReplicaCounts() error {
 			r.Spec.Replicas.Min, r.Spec.Replicas.Max)
 	}
 
+	return nil
+}
+
+// validateAutoscalingConfig validates HPA-backed autoscaling settings before
+// they reach the reconciler fallback path.
+func (r *TermitePool) validateAutoscalingConfig() error {
+	config := r.Spec.Autoscaling
+	if config == nil {
+		return nil
+	}
+
+	var allErrors []string
+	if config.WarmupReplicas != nil && *config.WarmupReplicas < 0 {
+		allErrors = append(allErrors, fmt.Sprintf("spec.autoscaling.warmupReplicas must be >= 0, got %d", *config.WarmupReplicas))
+	}
+	if config.ScaleDownStabilization != nil && config.ScaleDownStabilization.Duration < 0 {
+		allErrors = append(allErrors, "spec.autoscaling.scaleDownStabilization must be >= 0")
+	} else if config.ScaleDownStabilization != nil && config.ScaleDownStabilization.Seconds() > 3600 {
+		allErrors = append(allErrors, "spec.autoscaling.scaleDownStabilization must be <= 3600s")
+	}
+	if !config.Enabled {
+		if len(allErrors) > 0 {
+			return fmt.Errorf("invalid autoscaling configuration:\n    %s", strings.Join(allErrors, "\n    "))
+		}
+		return nil
+	}
+
+	for index, metric := range config.Metrics {
+		path := fmt.Sprintf("spec.autoscaling.metrics[%d]", index)
+		switch metric.Type {
+		case MetricTypeCPU, MetricTypeMemory:
+			if err := validateResourceAutoscalingTarget(metric.Target); err != nil {
+				allErrors = append(allErrors, fmt.Sprintf("%s.target is invalid for %s: %v", path, metric.Type, err))
+			}
+		case MetricTypeQueueDepth, MetricTypeLatencyP99, MetricTypeLatencyP95, MetricTypeRPS, MetricTypeThroughput:
+			if err := validatePodsAutoscalingTarget(metric.Target); err != nil {
+				allErrors = append(allErrors, fmt.Sprintf("%s.target is invalid for %s: %v", path, metric.Type, err))
+			}
+		default:
+			allErrors = append(allErrors, fmt.Sprintf("%s.type %q is unsupported", path, metric.Type))
+		}
+
+		if err := validateScalingBehavior(path+".scaleUp", metric.ScaleUp); err != nil {
+			allErrors = append(allErrors, err.Error())
+		}
+		if err := validateScalingBehavior(path+".scaleDown", metric.ScaleDown); err != nil {
+			allErrors = append(allErrors, err.Error())
+		}
+	}
+
+	if len(allErrors) > 0 {
+		return fmt.Errorf("invalid autoscaling configuration:\n    %s", strings.Join(allErrors, "\n    "))
+	}
+	return nil
+}
+
+func validateResourceAutoscalingTarget(target string) error {
+	if target == "" {
+		return fmt.Errorf("target is required")
+	}
+	if strings.HasSuffix(target, "%") {
+		value := strings.TrimSuffix(target, "%")
+		parsed, err := strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			return err
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("percentage must be > 0")
+		}
+		return nil
+	}
+	return validatePositiveQuantity(target)
+}
+
+func validatePodsAutoscalingTarget(target string) error {
+	if target == "" {
+		return fmt.Errorf("target is required")
+	}
+	return validatePositiveQuantity(target)
+}
+
+func validatePositiveQuantity(target string) error {
+	quantity, err := resource.ParseQuantity(target)
+	if err != nil {
+		return err
+	}
+	if quantity.Sign() <= 0 {
+		return fmt.Errorf("quantity must be > 0")
+	}
+	return nil
+}
+
+func validateScalingBehavior(path string, behavior *ScalingBehavior) error {
+	if behavior == nil {
+		return nil
+	}
+
+	var allErrors []string
+	if behavior.StabilizationWindow != nil && behavior.StabilizationWindow.Duration < 0 {
+		allErrors = append(allErrors, fmt.Sprintf("%s.stabilizationWindow must be >= 0", path))
+	} else if behavior.StabilizationWindow != nil && behavior.StabilizationWindow.Seconds() > 3600 {
+		allErrors = append(allErrors, fmt.Sprintf("%s.stabilizationWindow must be <= 3600s", path))
+	}
+	for index, policy := range behavior.Policies {
+		policyPath := fmt.Sprintf("%s.policies[%d]", path, index)
+		switch strings.ToLower(policy.Type) {
+		case "pods", "percent":
+		default:
+			allErrors = append(allErrors, fmt.Sprintf("%s.type must be Pods or Percent, got %q", policyPath, policy.Type))
+		}
+		if policy.Value <= 0 {
+			allErrors = append(allErrors, fmt.Sprintf("%s.value must be > 0, got %d", policyPath, policy.Value))
+		}
+		if policy.PeriodSeconds <= 0 {
+			allErrors = append(allErrors, fmt.Sprintf("%s.periodSeconds must be > 0, got %d", policyPath, policy.PeriodSeconds))
+		} else if policy.PeriodSeconds > 1800 {
+			allErrors = append(allErrors, fmt.Sprintf("%s.periodSeconds must be <= 1800, got %d", policyPath, policy.PeriodSeconds))
+		}
+	}
+
+	if len(allErrors) > 0 {
+		return errors.New(strings.Join(allErrors, "\n    "))
+	}
 	return nil
 }
 

@@ -455,8 +455,12 @@ const (
 // Condition type and reason constants for TermitePool and TermiteRoute status.
 const (
 	TypeConfigurationValid = "ConfigurationValid"
+	TypeAutoscalerReady    = "AutoscalerReady"
 	ReasonValidationPassed = "ValidationPassed"
 	ReasonValidationFailed = "ValidationFailed"
+	ReasonAutoscalerReady  = "AutoscalerReady"
+	ReasonAutoscalerOff    = "AutoscalerDisabled"
+	ReasonAutoscalerError  = "AutoscalerError"
 )
 
 // TermitePoolStatus defines the observed state of TermitePool

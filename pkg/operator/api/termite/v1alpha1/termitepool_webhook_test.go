@@ -17,6 +17,7 @@ package v1alpha1
 import (
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -39,6 +40,154 @@ func TestValidateTermitePool_Valid(t *testing.T) {
 	pool := validPool()
 	if err := pool.ValidateTermitePool(); err != nil {
 		t.Errorf("expected no error, got: %v", err)
+	}
+}
+
+func TestValidateTermitePool_ValidAutoscaling(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Autoscaling = &AutoscalingConfig{
+		Enabled: true,
+		Metrics: []ScalingMetric{
+			{Type: MetricTypeCPU, Target: "75%"},
+			{Type: MetricTypeMemory, Target: "512Mi"},
+			{Type: MetricTypeQueueDepth, Target: "10"},
+		},
+	}
+
+	if err := pool.ValidateTermitePool(); err != nil {
+		t.Errorf("expected no error for valid autoscaling config, got: %v", err)
+	}
+}
+
+func TestValidateTermitePool_InvalidAutoscalingTarget(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Autoscaling = &AutoscalingConfig{
+		Enabled: true,
+		Metrics: []ScalingMetric{
+			{Type: MetricTypeCPU, Target: "not-a-percent"},
+		},
+	}
+
+	err := pool.ValidateTermitePool()
+	if err == nil {
+		t.Fatal("expected error for invalid autoscaling target")
+	}
+	if !strings.Contains(err.Error(), "spec.autoscaling.metrics[0].target") {
+		t.Fatalf("expected autoscaling target error, got: %v", err)
+	}
+}
+
+func TestValidateTermitePool_InvalidAutoscalingPolicy(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Autoscaling = &AutoscalingConfig{
+		Enabled: true,
+		Metrics: []ScalingMetric{
+			{
+				Type:   MetricTypeQueueDepth,
+				Target: "10",
+				ScaleUp: &ScalingBehavior{
+					Policies: []ScalingPolicy{{Type: "Replicas", Value: 0, PeriodSeconds: 0}},
+				},
+			},
+		},
+	}
+
+	err := pool.ValidateTermitePool()
+	if err == nil {
+		t.Fatal("expected error for invalid autoscaling policy")
+	}
+	if !strings.Contains(err.Error(), "scaleUp.policies[0].type") {
+		t.Fatalf("expected autoscaling policy error, got: %v", err)
+	}
+}
+
+func TestValidateTermitePool_DisabledAutoscalingIgnoresMetricConfig(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Autoscaling = &AutoscalingConfig{
+		Enabled: false,
+		Metrics: []ScalingMetric{
+			{
+				Type:   MetricTypeCPU,
+				Target: "not-a-percent",
+				ScaleUp: &ScalingBehavior{
+					Policies: []ScalingPolicy{{Type: "Replicas", Value: 0, PeriodSeconds: 0}},
+				},
+			},
+		},
+	}
+
+	if err := pool.ValidateTermitePool(); err != nil {
+		t.Fatalf("expected disabled autoscaling to ignore nested metric config, got: %v", err)
+	}
+}
+
+func TestValidateTermitePool_DisabledAutoscalingStillRejectsImpossibleValues(t *testing.T) {
+	pool := validPool()
+	warmup := int32(-1)
+	pool.Spec.Autoscaling = &AutoscalingConfig{
+		Enabled:        false,
+		WarmupReplicas: &warmup,
+	}
+
+	err := pool.ValidateTermitePool()
+	if err == nil {
+		t.Fatal("expected error for negative warmup replicas")
+	}
+	if !strings.Contains(err.Error(), "warmupReplicas") {
+		t.Fatalf("expected warmupReplicas error, got: %v", err)
+	}
+}
+
+func TestValidateTermitePool_RejectsHPAStabilizationAboveLimit(t *testing.T) {
+	pool := validPool()
+	window := metav1.Duration{Duration: 3601 * time.Second}
+	pool.Spec.Autoscaling = &AutoscalingConfig{
+		Enabled:                true,
+		ScaleDownStabilization: &window,
+		Metrics: []ScalingMetric{
+			{
+				Type:   MetricTypeCPU,
+				Target: "75%",
+				ScaleUp: &ScalingBehavior{
+					StabilizationWindow: &window,
+				},
+			},
+		},
+	}
+
+	err := pool.ValidateTermitePool()
+	if err == nil {
+		t.Fatal("expected error for HPA stabilization windows above Kubernetes limit")
+	}
+	if !strings.Contains(err.Error(), "scaleDownStabilization") {
+		t.Fatalf("expected top-level stabilization error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "scaleUp.stabilizationWindow") {
+		t.Fatalf("expected per-metric stabilization error, got: %v", err)
+	}
+}
+
+func TestValidateTermitePool_RejectsHPAPeriodAboveLimit(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Autoscaling = &AutoscalingConfig{
+		Enabled: true,
+		Metrics: []ScalingMetric{
+			{
+				Type:   MetricTypeCPU,
+				Target: "75%",
+				ScaleUp: &ScalingBehavior{
+					Policies: []ScalingPolicy{{Type: "Pods", Value: 1, PeriodSeconds: 1801}},
+				},
+			},
+		},
+	}
+
+	err := pool.ValidateTermitePool()
+	if err == nil {
+		t.Fatal("expected error for HPA policy period above Kubernetes limit")
+	}
+	if !strings.Contains(err.Error(), "periodSeconds must be <= 1800") {
+		t.Fatalf("expected HPA period upper-bound error, got: %v", err)
 	}
 }
 
