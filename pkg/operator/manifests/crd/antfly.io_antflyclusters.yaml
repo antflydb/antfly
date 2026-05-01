@@ -2807,6 +2807,46 @@ spec:
                 - Clustered
                 - Swarm
                 type: string
+              productTier:
+                description: |-
+                  ProductTier records the CloudAF/product tier intent that was expanded
+                  into the explicit operator fields below. The operator does not resolve
+                  prices or tier catalogs; it validates that a stamped tier has concrete
+                  resources, storage, and autoscaling intent in the normal fields.
+                properties:
+                  dataTier:
+                    description: |-
+                      DataTier optionally records the data-node sub-tier name when
+                      Mode=Clustered.
+                    type: string
+                  managedBy:
+                    description: |-
+                      ManagedBy identifies the system that expanded the tier, for example
+                      "cloudaf".
+                    type: string
+                  metadataTier:
+                    description: |-
+                      MetadataTier optionally records the metadata-node sub-tier name when
+                      Mode=Clustered.
+                    type: string
+                  name:
+                    description: Name is the external product tier name, such as "starter"
+                      or "pro".
+                    type: string
+                  revision:
+                    description: Revision identifies the tier catalog revision used
+                      to expand this CR.
+                    type: string
+                  swarmTier:
+                    description: SwarmTier optionally records the swarm sub-tier name
+                      when Mode=Swarm.
+                    type: string
+                  termiteTier:
+                    description: |-
+                      TermiteTier optionally records the TermitePool sub-tier name when
+                      spec.termite is set.
+                    type: string
+                type: object
               publicAPI:
                 description: |-
                   PublicAPI defines the public API service configuration (optional)
@@ -6131,6 +6171,85 @@ spec:
               phase:
                 description: Phase represents the current phase of the cluster
                 type: string
+              productTierStatus:
+                description: ProductTierStatus reports the concrete shape observed
+                  for spec.productTier.
+                properties:
+                  dataAutoscaling:
+                    description: DataAutoscaling reports the observed data autoscaling
+                      bounds.
+                    type: string
+                  dataReplicas:
+                    description: DataReplicas is the observed data replica count.
+                    format: int32
+                    type: integer
+                  dataResources:
+                    description: DataResources summarizes data CPU/memory requests
+                      and limits.
+                    type: string
+                  dataStorage:
+                    description: DataStorage is the observed data storage size.
+                    type: string
+                  dataTier:
+                    description: DataTier records the observed data sub-tier name.
+                    type: string
+                  managedBy:
+                    description: ManagedBy is the observed tier owner.
+                    type: string
+                  metadataReplicas:
+                    description: MetadataReplicas is the observed metadata replica
+                      count.
+                    format: int32
+                    type: integer
+                  metadataResources:
+                    description: MetadataResources summarizes metadata CPU/memory
+                      requests and limits.
+                    type: string
+                  metadataStorage:
+                    description: MetadataStorage is the observed metadata storage
+                      size.
+                    type: string
+                  metadataTier:
+                    description: MetadataTier records the observed metadata sub-tier
+                      name.
+                    type: string
+                  mode:
+                    description: Mode is the topology mode for this tier shape.
+                    type: string
+                  name:
+                    description: Name is the observed tier name.
+                    type: string
+                  observedGeneration:
+                    description: ObservedGeneration is the AntflyCluster generation
+                      used for this status.
+                    format: int64
+                    type: integer
+                  revision:
+                    description: Revision is the observed tier catalog revision.
+                    type: string
+                  swarmResources:
+                    description: SwarmResources summarizes swarm CPU/memory requests
+                      and limits.
+                    type: string
+                  swarmStorage:
+                    description: SwarmStorage is the observed swarm storage size.
+                    type: string
+                  swarmTier:
+                    description: SwarmTier records the observed swarm sub-tier name.
+                    type: string
+                  termiteEnabled:
+                    description: TermiteEnabled reports whether this tier has an operator-managed
+                      TermitePool.
+                    type: boolean
+                  termiteReplicas:
+                    description: TermiteReplicas reports the observed TermitePool
+                      replica bounds.
+                    type: string
+                  termiteTier:
+                    description: TermiteTier records the observed termite sub-tier
+                      name.
+                    type: string
+                type: object
               readyReplicas:
                 description: ReadyReplicas is the total number of ready replicas across
                   the active topology.

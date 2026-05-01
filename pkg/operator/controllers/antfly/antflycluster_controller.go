@@ -2653,6 +2653,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		r.updateRolloutCondition(cluster, swarmSts)
+		r.updateProductTierStatus(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
 	}
@@ -2697,6 +2698,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	}
 
 	r.updateRolloutCondition(cluster, metadataSts, dataSts)
+	r.updateProductTierStatus(cluster)
 
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
@@ -2742,6 +2744,83 @@ func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.Antfl
 	}
 
 	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
+}
+
+func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.AntflyCluster) {
+	if cluster.Spec.ProductTier == nil {
+		cluster.Status.ProductTierStatus = nil
+		return
+	}
+
+	tier := cluster.Spec.ProductTier
+	status := &antflyv1.ProductTierStatus{
+		Name:               tier.Name,
+		Revision:           tier.Revision,
+		ManagedBy:          tier.ManagedBy,
+		Mode:               effectiveTopologyModeForAPI(cluster),
+		SwarmTier:          tier.SwarmTier,
+		MetadataTier:       tier.MetadataTier,
+		DataTier:           tier.DataTier,
+		TermiteTier:        tier.TermiteTier,
+		TermiteEnabled:     cluster.Spec.Termite != nil,
+		ObservedGeneration: cluster.Generation,
+	}
+
+	if isSwarmMode(cluster) {
+		if cluster.Spec.Swarm != nil {
+			status.SwarmResources = resourceSpecSummary(cluster.Spec.Swarm.Resources)
+		}
+		status.SwarmStorage = chooseSwarmStorageSize(cluster)
+	} else {
+		status.MetadataReplicas = cluster.Spec.MetadataNodes.Replicas
+		if status.MetadataReplicas == 0 {
+			status.MetadataReplicas = 3
+		}
+		status.MetadataResources = resourceSpecSummary(cluster.Spec.MetadataNodes.Resources)
+		status.MetadataStorage = cluster.Spec.Storage.MetadataStorage
+
+		status.DataReplicas = effectiveDataNodeReplicas(cluster)
+		status.DataResources = resourceSpecSummary(cluster.Spec.DataNodes.Resources)
+		status.DataStorage = effectiveDataStorageSize(cluster)
+		if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
+			status.DataAutoscaling = fmt.Sprintf("enabled min=%d max=%d", cluster.Spec.DataNodes.AutoScaling.MinReplicas, cluster.Spec.DataNodes.AutoScaling.MaxReplicas)
+		} else {
+			status.DataAutoscaling = "disabled"
+		}
+	}
+
+	if cluster.Spec.Termite != nil {
+		status.TermiteReplicas = fmt.Sprintf("min=%d max=%d", cluster.Spec.Termite.Replicas.Min, cluster.Spec.Termite.Replicas.Max)
+	}
+
+	cluster.Status.ProductTierStatus = status
+}
+
+func effectiveTopologyModeForAPI(cluster *antflyv1.AntflyCluster) antflyv1.ClusterMode {
+	if isSwarmMode(cluster) {
+		return antflyv1.ClusterModeSwarm
+	}
+	return antflyv1.ClusterModeClustered
+}
+
+func resourceSpecSummary(resources antflyv1.ResourceSpec) string {
+	parts := []string{}
+	if resources.CPU != "" {
+		parts = append(parts, "cpu="+resources.CPU)
+	}
+	if resources.Memory != "" {
+		parts = append(parts, "memory="+resources.Memory)
+	}
+	if resources.Limits.CPU != "" {
+		parts = append(parts, "limitCPU="+resources.Limits.CPU)
+	}
+	if resources.Limits.Memory != "" {
+		parts = append(parts, "limitMemory="+resources.Limits.Memory)
+	}
+	if resources.Limits.GPU != "" {
+		parts = append(parts, "limitGPU="+resources.Limits.GPU)
+	}
+	return strings.Join(parts, " ")
 }
 
 // updateServiceMeshReadyCondition updates the ServiceMeshReady condition based on current status

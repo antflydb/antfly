@@ -18,6 +18,8 @@ var (
 	irsaARNPattern = regexp.MustCompile(`^arn:aws(-cn|-us-gov)?:iam::\d{12}:role/.+$`)
 	// ec2InstancePattern matches AWS EC2 instance type names (e.g. m5.large, u-6tb1.56xlarge).
 	ec2InstancePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*\.[a-z0-9]+$`)
+	// productTierTokenPattern accepts stable external tier/catalog identifiers.
+	productTierTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 )
 
 // ValidateCreate validates the cluster configuration when creating a new cluster.
@@ -146,6 +148,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 	}
 
 	if err := r.validateTermiteSpec(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
+	if err := r.validateProductTierMapping(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
@@ -904,6 +910,78 @@ func (r *AntflyCluster) validateStorageAutoGrowConfig() error {
 		return fmt.Errorf("storage auto-grow validation failed:\n  - %s", strings.Join(errors, "\n  - "))
 	}
 	return nil
+}
+
+func (r *AntflyCluster) validateProductTierMapping() error {
+	tier := r.Spec.ProductTier
+	if tier == nil {
+		return nil
+	}
+
+	var errors []string
+	validateTierToken := func(path, value string, required bool) {
+		if value == "" {
+			if required {
+				errors = append(errors, fmt.Sprintf("%s is required when spec.productTier is set", path))
+			}
+			return
+		}
+		if len(value) > 128 || !productTierTokenPattern.MatchString(value) {
+			errors = append(errors, fmt.Sprintf("%s must be 1-128 characters and contain only letters, numbers, '.', '_' or '-'", path))
+		}
+	}
+
+	validateTierToken("spec.productTier.name", tier.Name, true)
+	validateTierToken("spec.productTier.revision", tier.Revision, false)
+	validateTierToken("spec.productTier.managedBy", tier.ManagedBy, false)
+	validateTierToken("spec.productTier.swarmTier", tier.SwarmTier, false)
+	validateTierToken("spec.productTier.metadataTier", tier.MetadataTier, false)
+	validateTierToken("spec.productTier.dataTier", tier.DataTier, false)
+	validateTierToken("spec.productTier.termiteTier", tier.TermiteTier, false)
+
+	if r.isSwarmMode() {
+		if r.Spec.Swarm == nil {
+			errors = append(errors, "spec.swarm is required for a swarm product tier")
+		} else {
+			if !resourceSpecHasCPUAndMemory(r.Spec.Swarm.Resources) {
+				errors = append(errors, "spec.swarm.resources must include cpu and memory requests or limits for a swarm product tier")
+			}
+			if r.Spec.Storage.SwarmStorage == "" {
+				errors = append(errors, "spec.storage.swarmStorage is required for a swarm product tier")
+			}
+		}
+	} else {
+		if !resourceSpecHasCPUAndMemory(r.Spec.MetadataNodes.Resources) {
+			errors = append(errors, "spec.metadataNodes.resources must include cpu and memory requests or limits for a clustered product tier")
+		}
+		if !resourceSpecHasCPUAndMemory(r.Spec.DataNodes.Resources) {
+			errors = append(errors, "spec.dataNodes.resources must include cpu and memory requests or limits for a clustered product tier")
+		}
+		if r.Spec.Storage.MetadataStorage == "" {
+			errors = append(errors, "spec.storage.metadataStorage is required for a clustered product tier")
+		}
+		if r.Spec.Storage.DataStorage == "" {
+			errors = append(errors, "spec.storage.dataStorage is required for a clustered product tier")
+		}
+	}
+
+	if tier.TermiteTier != "" && r.Spec.Termite == nil {
+		errors = append(errors, "spec.termite is required when spec.productTier.termiteTier is set")
+	}
+	if r.Spec.Termite != nil && tier.TermiteTier != "" && r.Spec.Termite.Resources == nil {
+		errors = append(errors, "spec.termite.resources is required when spec.productTier.termiteTier is set")
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("product tier validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func resourceSpecHasCPUAndMemory(resources ResourceSpec) bool {
+	hasCPU := resources.CPU != "" || resources.Limits.CPU != ""
+	hasMemory := resources.Memory != "" || resources.Limits.Memory != ""
+	return hasCPU && hasMemory
 }
 
 // validateResourceQuantities validates that resource quantity strings are parseable.

@@ -176,6 +176,13 @@ type AntflyClusterSpec struct {
 	// +optional
 	Termite *termitev1alpha1.TermitePoolSpec `json:"termite,omitempty"`
 
+	// ProductTier records the CloudAF/product tier intent that was expanded
+	// into the explicit operator fields below. The operator does not resolve
+	// prices or tier catalogs; it validates that a stamped tier has concrete
+	// resources, storage, and autoscaling intent in the normal fields.
+	// +optional
+	ProductTier *ProductTierSpec `json:"productTier,omitempty"`
+
 	// MetadataNodes defines the configuration for metadata nodes (StatefulSet).
 	// Required for Clustered mode and must be omitted in Swarm mode.
 	// +optional
@@ -212,6 +219,41 @@ type AntflyClusterSpec struct {
 	// If not specified, the default ServiceAccount for the namespace is used
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
+// ProductTierSpec records product-tier provenance for a CR whose concrete
+// sizing has already been expanded into explicit operator fields.
+type ProductTierSpec struct {
+	// Name is the external product tier name, such as "starter" or "pro".
+	Name string `json:"name,omitempty"`
+
+	// Revision identifies the tier catalog revision used to expand this CR.
+	// +optional
+	Revision string `json:"revision,omitempty"`
+
+	// ManagedBy identifies the system that expanded the tier, for example
+	// "cloudaf".
+	// +optional
+	ManagedBy string `json:"managedBy,omitempty"`
+
+	// SwarmTier optionally records the swarm sub-tier name when Mode=Swarm.
+	// +optional
+	SwarmTier string `json:"swarmTier,omitempty"`
+
+	// MetadataTier optionally records the metadata-node sub-tier name when
+	// Mode=Clustered.
+	// +optional
+	MetadataTier string `json:"metadataTier,omitempty"`
+
+	// DataTier optionally records the data-node sub-tier name when
+	// Mode=Clustered.
+	// +optional
+	DataTier string `json:"dataTier,omitempty"`
+
+	// TermiteTier optionally records the TermitePool sub-tier name when
+	// spec.termite is set.
+	// +optional
+	TermiteTier string `json:"termiteTier,omitempty"`
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
@@ -714,6 +756,10 @@ type AntflyClusterStatus struct {
 	// +optional
 	StorageAutoGrowStatus *StorageAutoGrowStatus `json:"storageAutoGrowStatus,omitempty"`
 
+	// ProductTierStatus reports the concrete shape observed for spec.productTier.
+	// +optional
+	ProductTierStatus *ProductTierStatus `json:"productTierStatus,omitempty"`
+
 	// SwarmStatus reports swarm-specific operational state.
 	// +optional
 	SwarmStatus *SwarmStatus `json:"swarmStatus,omitempty"`
@@ -819,6 +865,69 @@ type StorageAutoGrowStatus struct {
 
 	// LastEvaluationTime records when auto-grow was last evaluated.
 	LastEvaluationTime *metav1.Time `json:"lastEvaluationTime,omitempty"`
+}
+
+// ProductTierStatus reports the concrete operator fields produced from a tier.
+type ProductTierStatus struct {
+	// Name is the observed tier name.
+	Name string `json:"name,omitempty"`
+
+	// Revision is the observed tier catalog revision.
+	Revision string `json:"revision,omitempty"`
+
+	// ManagedBy is the observed tier owner.
+	ManagedBy string `json:"managedBy,omitempty"`
+
+	// Mode is the topology mode for this tier shape.
+	Mode ClusterMode `json:"mode,omitempty"`
+
+	// SwarmTier records the observed swarm sub-tier name.
+	SwarmTier string `json:"swarmTier,omitempty"`
+
+	// MetadataTier records the observed metadata sub-tier name.
+	MetadataTier string `json:"metadataTier,omitempty"`
+
+	// DataTier records the observed data sub-tier name.
+	DataTier string `json:"dataTier,omitempty"`
+
+	// TermiteTier records the observed termite sub-tier name.
+	TermiteTier string `json:"termiteTier,omitempty"`
+
+	// SwarmResources summarizes swarm CPU/memory requests and limits.
+	SwarmResources string `json:"swarmResources,omitempty"`
+
+	// SwarmStorage is the observed swarm storage size.
+	SwarmStorage string `json:"swarmStorage,omitempty"`
+
+	// MetadataReplicas is the observed metadata replica count.
+	MetadataReplicas int32 `json:"metadataReplicas,omitempty"`
+
+	// MetadataResources summarizes metadata CPU/memory requests and limits.
+	MetadataResources string `json:"metadataResources,omitempty"`
+
+	// MetadataStorage is the observed metadata storage size.
+	MetadataStorage string `json:"metadataStorage,omitempty"`
+
+	// DataReplicas is the observed data replica count.
+	DataReplicas int32 `json:"dataReplicas,omitempty"`
+
+	// DataResources summarizes data CPU/memory requests and limits.
+	DataResources string `json:"dataResources,omitempty"`
+
+	// DataStorage is the observed data storage size.
+	DataStorage string `json:"dataStorage,omitempty"`
+
+	// DataAutoscaling reports the observed data autoscaling bounds.
+	DataAutoscaling string `json:"dataAutoscaling,omitempty"`
+
+	// TermiteEnabled reports whether this tier has an operator-managed TermitePool.
+	TermiteEnabled bool `json:"termiteEnabled,omitempty"`
+
+	// TermiteReplicas reports the observed TermitePool replica bounds.
+	TermiteReplicas string `json:"termiteReplicas,omitempty"`
+
+	// ObservedGeneration is the AntflyCluster generation used for this status.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // ServiceMeshStatus reports service mesh operational status

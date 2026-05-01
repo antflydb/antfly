@@ -1383,6 +1383,64 @@ func TestValidateCreate_StorageAutoGrowValid(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_ProductTierRequiresExplicitClusteredShape(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.ProductTier = &ProductTierSpec{
+		Name:      "pro",
+		Revision:  "2026-05",
+		ManagedBy: "cloudaf",
+		DataTier:  "data-large",
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected product tier validation error")
+	}
+	if !strings.Contains(err.Error(), "metadataNodes.resources") {
+		t.Fatalf("expected metadata resources error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_ProductTierValidClusteredShape(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.ProductTier = &ProductTierSpec{
+		Name:         "pro",
+		Revision:     "2026-05",
+		ManagedBy:    "cloudaf",
+		MetadataTier: "metadata-small",
+		DataTier:     "data-large",
+	}
+	cluster.Spec.MetadataNodes.Resources = ResourceSpec{CPU: "500m", Memory: "1Gi"}
+	cluster.Spec.DataNodes.Resources = ResourceSpec{CPU: "2", Memory: "8Gi"}
+	cluster.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 3,
+		MaxReplicas: 8,
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid product tier shape, got: %v", err)
+	}
+}
+
+func TestValidateCreate_ProductTierTermiteTierRequiresTermiteSpec(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.ProductTier = &ProductTierSpec{
+		Name:        "pro",
+		TermiteTier: "embed-small",
+	}
+	cluster.Spec.MetadataNodes.Resources = ResourceSpec{CPU: "500m", Memory: "1Gi"}
+	cluster.Spec.DataNodes.Resources = ResourceSpec{CPU: "2", Memory: "8Gi"}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected termite tier validation error")
+	}
+	if !strings.Contains(err.Error(), "spec.termite is required") {
+		t.Fatalf("expected termite spec error, got: %v", err)
+	}
+}
+
 func TestValidateUpdate_MetadataScaleDownRejected(t *testing.T) {
 	old := baseCluster()
 	old.Spec.MetadataNodes.Replicas = 5

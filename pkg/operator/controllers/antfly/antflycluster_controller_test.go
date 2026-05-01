@@ -655,6 +655,56 @@ func TestStoreIDForDataOrdinalUsesHexID(t *testing.T) {
 	g.Expect(storeIDForDataOrdinal(9)).To(Equal("a"))
 }
 
+func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 9},
+		Spec: antflyv1.AntflyClusterSpec{
+			ProductTier: &antflyv1.ProductTierSpec{
+				Name:         "pro",
+				Revision:     "2026-05",
+				ManagedBy:    "cloudaf",
+				MetadataTier: "metadata-small",
+				DataTier:     "data-large",
+			},
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas: 3,
+				Resources: antflyv1.ResourceSpec{
+					CPU:    "500m",
+					Memory: "1Gi",
+				},
+			},
+			DataNodes: antflyv1.DataNodesSpec{
+				Replicas: 5,
+				Resources: antflyv1.ResourceSpec{
+					CPU:    "2",
+					Memory: "8Gi",
+				},
+				AutoScaling: &antflyv1.AutoScalingSpec{
+					Enabled:     true,
+					MinReplicas: 3,
+					MaxReplicas: 8,
+				},
+			},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "5Gi",
+				DataStorage:     "100Gi",
+			},
+		},
+	}
+
+	reconciler.updateProductTierStatus(cluster)
+
+	g.Expect(cluster.Status.ProductTierStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.ProductTierStatus.Name).To(Equal("pro"))
+	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeClustered))
+	g.Expect(cluster.Status.ProductTierStatus.MetadataResources).To(Equal("cpu=500m memory=1Gi"))
+	g.Expect(cluster.Status.ProductTierStatus.DataStorage).To(Equal("100Gi"))
+	g.Expect(cluster.Status.ProductTierStatus.DataAutoscaling).To(Equal("enabled min=3 max=8"))
+	g.Expect(cluster.Status.ProductTierStatus.ObservedGeneration).To(Equal(int64(9)))
+}
+
 // T006: Unit test for public API service deletion when disabled
 func TestReconcileServices_DeletesPublicAPIWhenDisabled(t *testing.T) {
 	g := NewWithT(t)
