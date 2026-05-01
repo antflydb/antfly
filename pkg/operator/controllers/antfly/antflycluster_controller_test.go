@@ -655,6 +655,23 @@ func TestStoreIDForDataOrdinalUsesHexID(t *testing.T) {
 	g.Expect(storeIDForDataOrdinal(9)).To(Equal("a"))
 }
 
+func TestSetDataScaleDownStatusRecordsAutoscalerSource(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{}
+
+	reconciler.setDataScaleDownStatus(cluster, antflyv1.DataScaleDownSourceAutoscaler, 5, 3, 4, 4, "5", "Draining", "draining")
+
+	g.Expect(cluster.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.DataScaleDownStatus.Source).To(Equal(antflyv1.DataScaleDownSourceAutoscaler))
+	g.Expect(cluster.Status.DataScaleDownStatus.FromReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.DataScaleDownStatus.TargetReplicas).To(Equal(int32(3)))
+	g.Expect(cluster.Status.DataScaleDownStatus.AppliedReplicas).To(Equal(int32(4)))
+	g.Expect(cluster.Status.DataScaleDownStatus.DrainingOrdinal).To(Equal(int32(4)))
+	g.Expect(cluster.Status.DataScaleDownStatus.DrainingStoreID).To(Equal("5"))
+	g.Expect(cluster.Status.DataScaleDownStatus.Phase).To(Equal("Draining"))
+}
+
 func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
 	g := NewWithT(t)
 	reconciler := &AntflyClusterReconciler{}

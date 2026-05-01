@@ -137,6 +137,12 @@ const (
 	// ReasonDataScaleDownFailed indicates data-node scale-down could not drain the selected ordinal
 	ReasonDataScaleDownFailed = "DataScaleDownFailed"
 
+	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
+	DataScaleDownSourceManual = "Manual"
+
+	// DataScaleDownSourceAutoscaler indicates the scale-down target came from the operator autoscaler.
+	DataScaleDownSourceAutoscaler = "Autoscaler"
+
 	// FinalizerPVCCleanup is the finalizer used for PVC cleanup on cluster deletion
 	FinalizerPVCCleanup = "antfly.io/pvc-cleanup"
 )
@@ -809,6 +815,11 @@ type AutoScalingStatus struct {
 
 // DataScaleDownStatus tracks a one-ordinal-at-a-time data-node scale-down.
 type DataScaleDownStatus struct {
+	// Source reports whether the current scale-down step was requested by the
+	// manual replica field or by the operator autoscaler.
+	// +optional
+	Source string `json:"source,omitempty"`
+
 	// FromReplicas is the observed/applied replica count before this scale-down step.
 	FromReplicas int32 `json:"fromReplicas,omitempty"`
 

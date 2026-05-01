@@ -1029,8 +1029,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	scaleSafetyReplicas := max(currentDataReplicas, currentDataTarget)
 	desiredDataReplicas := effectiveDataNodeReplicas(workingCluster)
 	requestedDataReplicas := desiredDataReplicas
+	dataScaleDownSource := antflyv1.DataScaleDownSourceManual
 	autoscalingEnabled := r.AutoScaler != nil && workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled
 	if autoscalingEnabled {
+		dataScaleDownSource = antflyv1.DataScaleDownSourceAutoscaler
 		recommendationReplicas, err := r.AutoScaler.EvaluateScaling(ctx, workingCluster, currentDataTarget)
 		if err != nil {
 			log.Error(err, "Failed to evaluate autoscaling")
@@ -1071,11 +1073,11 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		drainingOrdinal := scaleSafetyReplicas - 1
 		drainingStoreID := storeIDForDataOrdinal(drainingOrdinal)
 		message := fmt.Sprintf("Draining data ordinal %d/store %s before scaling StatefulSet from %d to %d", drainingOrdinal, drainingStoreID, scaleSafetyReplicas, desiredDataReplicas)
-		r.setDataScaleDownStatus(workingCluster, scaleSafetyReplicas, requestedDataReplicas, desiredDataReplicas, drainingOrdinal, drainingStoreID, "Draining", message)
+		r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, desiredDataReplicas, drainingOrdinal, drainingStoreID, "Draining", message)
 		r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
 		if err := r.deregisterDataNodes(ctx, workingCluster, scaleSafetyReplicas, desiredDataReplicas); err != nil {
 			failureMessage := fmt.Sprintf("Failed to drain data ordinal %d/store %s: %v", drainingOrdinal, drainingStoreID, err)
-			r.setDataScaleDownStatus(workingCluster, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingStoreID, "Failed", failureMessage)
+			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingStoreID, "Failed", failureMessage)
 			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownFailed, failureMessage)
 			if statusErr := r.Status().Update(ctx, workingCluster); statusErr != nil {
 				log.Error(statusErr, "Failed to update status with data scale-down failure")
@@ -1088,7 +1090,11 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		if workingCluster.Status.DataScaleDownStatus != nil {
-			r.setDataScaleDownStatus(workingCluster, scaleSafetyReplicas, scaleSafetyReplicas, desiredDataReplicas, 0, "", "Complete", "Data-node scale-down is complete")
+			completedSource := workingCluster.Status.DataScaleDownStatus.Source
+			if completedSource == "" {
+				completedSource = antflyv1.DataScaleDownSourceManual
+			}
+			r.setDataScaleDownStatus(workingCluster, completedSource, scaleSafetyReplicas, scaleSafetyReplicas, desiredDataReplicas, 0, "", "Complete", "Data-node scale-down is complete")
 		}
 	}
 
@@ -1252,16 +1258,18 @@ func (r *AntflyClusterReconciler) setScalingCondition(cluster *antflyv1.AntflyCl
 	})
 }
 
-func (r *AntflyClusterReconciler) setDataScaleDownStatus(cluster *antflyv1.AntflyCluster, fromReplicas, targetReplicas, appliedReplicas, drainingOrdinal int32, drainingStoreID, phase, message string) {
+func (r *AntflyClusterReconciler) setDataScaleDownStatus(cluster *antflyv1.AntflyCluster, source string, fromReplicas, targetReplicas, appliedReplicas, drainingOrdinal int32, drainingStoreID, phase, message string) {
 	now := metav1.Now()
 	if cluster.Status.DataScaleDownStatus != nil &&
 		cluster.Status.DataScaleDownStatus.LastTransitionTime != nil &&
+		cluster.Status.DataScaleDownStatus.Source == source &&
 		cluster.Status.DataScaleDownStatus.Phase == phase &&
 		cluster.Status.DataScaleDownStatus.DrainingOrdinal == drainingOrdinal &&
 		cluster.Status.DataScaleDownStatus.TargetReplicas == targetReplicas {
 		now = *cluster.Status.DataScaleDownStatus.LastTransitionTime
 	}
 	cluster.Status.DataScaleDownStatus = &antflyv1.DataScaleDownStatus{
+		Source:             source,
 		FromReplicas:       fromReplicas,
 		TargetReplicas:     targetReplicas,
 		AppliedReplicas:    appliedReplicas,

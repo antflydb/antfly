@@ -6147,6 +6147,11 @@ spec:
                   phase:
                     description: Phase is the current scale-down workflow phase.
                     type: string
+                  source:
+                    description: |-
+                      Source reports whether the current scale-down step was requested by the
+                      manual replica field or by the operator autoscaler.
+                    type: string
                   targetReplicas:
                     description: TargetReplicas is the user or autoscaler requested
                       final replica count.
