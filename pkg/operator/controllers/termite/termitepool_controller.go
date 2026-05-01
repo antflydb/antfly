@@ -24,11 +24,13 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -150,12 +152,17 @@ func (r *TermitePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// 4. Create or update PodDisruptionBudget (from Availability config or GKE config)
+	// 4. Create, update, or remove HorizontalPodAutoscaler
+	if err := r.reconcileHPA(ctx, pool); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 5. Create or update PodDisruptionBudget (from Availability config or GKE config)
 	if err := r.reconcilePDB(ctx, pool); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 5. Update status
+	// 6. Update status
 	if err := r.updateStatus(ctx, pool); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -382,7 +389,7 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 }
 
 func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
-	replicas := pool.Spec.Replicas.Min
+	replicas := initialTermiteReplicas(pool)
 
 	// Build model list for init container pull command.
 	// Group models by variant to use --variants flag.
@@ -556,16 +563,269 @@ func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *
 	// Only update if replicas or template changed.
 	// Compare template-hash annotations rather than full template specs to avoid
 	// false positives from API server defaulting (e.g. added default fields).
-	replicasChanged := !reflect.DeepEqual(existing.Spec.Replicas, sts.Spec.Replicas)
+	replicasChanged := !termiteAutoscalingEnabled(pool) && !reflect.DeepEqual(existing.Spec.Replicas, sts.Spec.Replicas)
 	existingHash := existing.Spec.Template.Annotations["termite.antfly.io/template-hash"]
 	desiredHash := sts.Spec.Template.Annotations["termite.antfly.io/template-hash"]
 	templateChanged := existingHash != desiredHash
 	if replicasChanged || templateChanged {
-		existing.Spec.Replicas = sts.Spec.Replicas
+		if replicasChanged {
+			existing.Spec.Replicas = sts.Spec.Replicas
+		}
 		existing.Spec.Template = sts.Spec.Template
 		return r.Update(ctx, existing)
 	}
 	return nil
+}
+
+func initialTermiteReplicas(pool *antflyaiv1alpha1.TermitePool) int32 {
+	replicas := pool.Spec.Replicas.Min
+	if termiteAutoscalingEnabled(pool) && pool.Spec.Autoscaling.WarmupReplicas != nil && *pool.Spec.Autoscaling.WarmupReplicas > replicas {
+		replicas = *pool.Spec.Autoscaling.WarmupReplicas
+		if pool.Spec.Replicas.Max > 0 && replicas > pool.Spec.Replicas.Max {
+			replicas = pool.Spec.Replicas.Max
+		}
+	}
+	return replicas
+}
+
+func termiteAutoscalingEnabled(pool *antflyaiv1alpha1.TermitePool) bool {
+	return pool.Spec.Autoscaling != nil && pool.Spec.Autoscaling.Enabled
+}
+
+func (r *TermitePoolReconciler) reconcileHPA(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
+	name := pool.Name + "-hpa"
+	key := types.NamespacedName{Name: name, Namespace: pool.Namespace}
+
+	if !termiteAutoscalingEnabled(pool) {
+		existing := &autoscalingv2.HorizontalPodAutoscaler{}
+		if err := r.Get(ctx, key, existing); err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		return r.Delete(ctx, existing)
+	}
+
+	metrics, err := hpaMetrics(pool.Spec.Autoscaling.Metrics)
+	if err != nil {
+		return err
+	}
+	behavior, err := hpaBehavior(pool.Spec.Autoscaling)
+	if err != nil {
+		return err
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: pool.Namespace,
+		},
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
+		if err := ctrl.SetControllerReference(pool, hpa, r.Scheme); err != nil {
+			return err
+		}
+		hpa.Labels = r.labels(pool)
+		minReplicas := pool.Spec.Replicas.Min
+		hpa.Spec = autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "StatefulSet",
+				Name:       pool.Name,
+			},
+			MinReplicas: &minReplicas,
+			MaxReplicas: pool.Spec.Replicas.Max,
+			Metrics:     metrics,
+			Behavior:    behavior,
+		}
+		return nil
+	})
+	return err
+}
+
+func hpaMetrics(metrics []antflyaiv1alpha1.ScalingMetric) ([]autoscalingv2.MetricSpec, error) {
+	if len(metrics) == 0 {
+		cpuTarget := int32(80)
+		return []autoscalingv2.MetricSpec{{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name: corev1.ResourceCPU,
+				Target: autoscalingv2.MetricTarget{
+					Type:               autoscalingv2.UtilizationMetricType,
+					AverageUtilization: &cpuTarget,
+				},
+			},
+		}}, nil
+	}
+
+	specs := make([]autoscalingv2.MetricSpec, 0, len(metrics))
+	for _, metric := range metrics {
+		switch metric.Type {
+		case antflyaiv1alpha1.MetricTypeCPU:
+			target, err := resourceMetricTarget(metric.Target)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cpu autoscaling target %q: %w", metric.Target, err)
+			}
+			specs = append(specs, autoscalingv2.MetricSpec{
+				Type: autoscalingv2.ResourceMetricSourceType,
+				Resource: &autoscalingv2.ResourceMetricSource{
+					Name:   corev1.ResourceCPU,
+					Target: target,
+				},
+			})
+		case antflyaiv1alpha1.MetricTypeMemory:
+			target, err := resourceMetricTarget(metric.Target)
+			if err != nil {
+				return nil, fmt.Errorf("invalid memory autoscaling target %q: %w", metric.Target, err)
+			}
+			specs = append(specs, autoscalingv2.MetricSpec{
+				Type: autoscalingv2.ResourceMetricSourceType,
+				Resource: &autoscalingv2.ResourceMetricSource{
+					Name:   corev1.ResourceMemory,
+					Target: target,
+				},
+			})
+		case antflyaiv1alpha1.MetricTypeQueueDepth,
+			antflyaiv1alpha1.MetricTypeLatencyP99,
+			antflyaiv1alpha1.MetricTypeLatencyP95,
+			antflyaiv1alpha1.MetricTypeRPS,
+			antflyaiv1alpha1.MetricTypeThroughput:
+			target, err := podsMetricTarget(metric.Target)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s autoscaling target %q: %w", metric.Type, metric.Target, err)
+			}
+			metricName := string(metric.Type)
+			specs = append(specs, autoscalingv2.MetricSpec{
+				Type: autoscalingv2.PodsMetricSourceType,
+				Pods: &autoscalingv2.PodsMetricSource{
+					Metric: autoscalingv2.MetricIdentifier{
+						Name: metricName,
+					},
+					Target: target,
+				},
+			})
+		default:
+			return nil, fmt.Errorf("unsupported autoscaling metric type %q", metric.Type)
+		}
+	}
+	return specs, nil
+}
+
+func resourceMetricTarget(target string) (autoscalingv2.MetricTarget, error) {
+	if target == "" {
+		return autoscalingv2.MetricTarget{}, fmt.Errorf("target is required")
+	}
+	if strings.HasSuffix(target, "%") {
+		value := strings.TrimSuffix(target, "%")
+		parsed, err := strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			return autoscalingv2.MetricTarget{}, err
+		}
+		utilization := int32(parsed)
+		return autoscalingv2.MetricTarget{
+			Type:               autoscalingv2.UtilizationMetricType,
+			AverageUtilization: &utilization,
+		}, nil
+	}
+
+	quantity, err := resource.ParseQuantity(target)
+	if err != nil {
+		return autoscalingv2.MetricTarget{}, err
+	}
+	return autoscalingv2.MetricTarget{
+		Type:         autoscalingv2.AverageValueMetricType,
+		AverageValue: &quantity,
+	}, nil
+}
+
+func podsMetricTarget(target string) (autoscalingv2.MetricTarget, error) {
+	if target == "" {
+		return autoscalingv2.MetricTarget{}, fmt.Errorf("target is required")
+	}
+	quantity, err := resource.ParseQuantity(target)
+	if err != nil {
+		return autoscalingv2.MetricTarget{}, err
+	}
+	return autoscalingv2.MetricTarget{
+		Type:         autoscalingv2.AverageValueMetricType,
+		AverageValue: &quantity,
+	}, nil
+}
+
+func hpaBehavior(config *antflyaiv1alpha1.AutoscalingConfig) (*autoscalingv2.HorizontalPodAutoscalerBehavior, error) {
+	if config == nil {
+		return nil, nil
+	}
+
+	behavior := &autoscalingv2.HorizontalPodAutoscalerBehavior{}
+	for _, metric := range config.Metrics {
+		if behavior.ScaleUp == nil && metric.ScaleUp != nil {
+			rules, err := hpaScalingRules(metric.ScaleUp)
+			if err != nil {
+				return nil, fmt.Errorf("invalid scaleUp policy for %s metric: %w", metric.Type, err)
+			}
+			behavior.ScaleUp = rules
+		}
+		if behavior.ScaleDown == nil && metric.ScaleDown != nil {
+			rules, err := hpaScalingRules(metric.ScaleDown)
+			if err != nil {
+				return nil, fmt.Errorf("invalid scaleDown policy for %s metric: %w", metric.Type, err)
+			}
+			behavior.ScaleDown = rules
+		}
+	}
+
+	if config.ScaleDownStabilization != nil {
+		if behavior.ScaleDown == nil {
+			behavior.ScaleDown = &autoscalingv2.HPAScalingRules{}
+		}
+		seconds := int32(config.ScaleDownStabilization.Seconds())
+		behavior.ScaleDown.StabilizationWindowSeconds = &seconds
+	}
+
+	if behavior.ScaleUp == nil && behavior.ScaleDown == nil {
+		return nil, nil
+	}
+	return behavior, nil
+}
+
+func hpaScalingRules(config *antflyaiv1alpha1.ScalingBehavior) (*autoscalingv2.HPAScalingRules, error) {
+	if config == nil {
+		return nil, nil
+	}
+
+	rules := &autoscalingv2.HPAScalingRules{}
+	if config.StabilizationWindow != nil {
+		seconds := int32(config.StabilizationWindow.Seconds())
+		rules.StabilizationWindowSeconds = &seconds
+	}
+
+	for _, policy := range config.Policies {
+		policyType, err := hpaPolicyType(policy.Type)
+		if err != nil {
+			return nil, err
+		}
+		rules.Policies = append(rules.Policies, autoscalingv2.HPAScalingPolicy{
+			Type:          policyType,
+			Value:         policy.Value,
+			PeriodSeconds: policy.PeriodSeconds,
+		})
+	}
+
+	return rules, nil
+}
+
+func hpaPolicyType(policyType string) (autoscalingv2.HPAScalingPolicyType, error) {
+	switch strings.ToLower(policyType) {
+	case "pods":
+		return autoscalingv2.PodsScalingPolicy, nil
+	case "percent":
+		return autoscalingv2.PercentScalingPolicy, nil
+	default:
+		return "", fmt.Errorf("unsupported HPA scaling policy type %q", policyType)
+	}
 }
 
 // computePodTemplateHash computes a hash of the pod template spec.

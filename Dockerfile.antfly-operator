@@ -9,8 +9,15 @@ COPY pkg/operator/go.sum go.sum
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
 
-# Copy the go source
-COPY pkg/operator/ .
+# Copy only source needed for `go build` so docs/examples/work-log changes do
+# not invalidate the build layer.
+COPY pkg/operator/api ./api
+COPY pkg/operator/bootstrap ./bootstrap
+COPY pkg/operator/cmd ./cmd
+COPY pkg/operator/controllers ./controllers
+COPY pkg/operator/internal ./internal
+COPY pkg/operator/manifests ./manifests
+COPY pkg/operator/hack ./hack
 
 # Declare build arguments for multi-arch support (automatically provided by Docker Buildx)
 ARG TARGETOS

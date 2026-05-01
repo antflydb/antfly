@@ -30,10 +30,11 @@ This installs:
 - ServiceAccount and RBAC permissions
 - Operator Deployment
 
-The default deployment passes `--termite-antfly-image=ghcr.io/antflydb/antfly:omni`.
-If you use `spec.termite` and that image is not mirrored or available to your
-cluster, update the argument to an Antfly image that provides the `/antfly
-termite` runtime contract before installing.
+The operator binary defaults `--termite-antfly-image` to
+`ghcr.io/antflydb/antfly:omni`. If you use `spec.termite` and that image is not
+mirrored or available to your cluster, add `--termite-antfly-image=<image>` to
+the deployment args. The image must provide the `/antfly termite` runtime
+contract.
 
 For production environments that manage CRDs through GitOps or another platform
 workflow, run the operator with `--skip-crd-install=true` and remove the

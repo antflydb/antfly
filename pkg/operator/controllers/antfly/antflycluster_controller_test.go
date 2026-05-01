@@ -233,6 +233,28 @@ func TestReconcileTermitePoolCreatesManagedPool(t *testing.T) {
 	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeTrue())
 }
 
+func TestReconcileTermitePoolPreservesCustomImage(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	reconciler := &AntflyClusterReconciler{
+		Client:              fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:              s,
+		ManageTermitePools:  true,
+		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
+	}
+	cluster := baseClusterWithTermiteSpec()
+	cluster.Spec.Termite.Image = "registry.example.com/antfly:custom-termite"
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	pool := &termitev1alpha1.TermitePool{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pool.Spec.Image).To(Equal("registry.example.com/antfly:custom-termite"))
+}
+
 func TestReconcileTermitePoolDeletesOnlyManagedPool(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()

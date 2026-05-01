@@ -28,8 +28,8 @@ import (
 	bootstrap "github.com/antflydb/antfly/pkg/operator/bootstrap/antfly"
 	controllers "github.com/antflydb/antfly/pkg/operator/controllers/antfly"
 	termitecontrollers "github.com/antflydb/antfly/pkg/operator/controllers/termite"
-	webhookv1 "github.com/antflydb/antfly/pkg/operator/webhook/antfly/v1"
-	termitewebhookv1alpha1 "github.com/antflydb/antfly/pkg/operator/webhook/termite/v1alpha1"
+	webhookv1 "github.com/antflydb/antfly/pkg/operator/internal/webhook/antfly/v1"
+	termitewebhookv1alpha1 "github.com/antflydb/antfly/pkg/operator/internal/webhook/termite/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 )
 

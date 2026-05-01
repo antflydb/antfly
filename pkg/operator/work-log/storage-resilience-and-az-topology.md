@@ -30,7 +30,7 @@ The current pod labels (`app.kubernetes.io/name: antfly-database`, `app.kubernet
 
 Expose Kubernetes `PersistentVolumeClaimRetentionPolicy` via the CRD. This feature was beta (enabled by default) in K8s 1.27 and GA in K8s 1.32. On clusters running < 1.27, the StatefulSet retention policy will be silently ignored — the finalizer (section 2) provides a fallback for those clusters.
 
-**`pkg/operator/api/v1/antflycluster_types.go`**:
+**`pkg/operator/api/antfly/v1/antflycluster_types.go`**:
 - Add `PVCRetentionPolicy` struct with `WhenDeleted` and `WhenScaled` string fields (enum: `Retain`, `Delete`)
 - Add `PVCRetentionPolicy *PVCRetentionPolicy` field to `StorageSpec`
 - Add `FinalizerPVCCleanup = "antfly.io/pvc-cleanup"` constant
@@ -98,7 +98,7 @@ This is self-healing (if someone manually removes the constraint, the operator r
 
 Surface PVC topology issues as a status condition so users can diagnose problems via `kubectl get antflycluster`.
 
-**`pkg/operator/api/v1/antflycluster_types.go`**:
+**`pkg/operator/api/antfly/v1/antflycluster_types.go`**:
 - Add condition constants: `TypeStorageHealthy`, `ReasonPVCAZMismatch`, `ReasonStalePVCDetected`, `ReasonStorageHealthy`
 
 **`pkg/operator/controllers/antflycluster_controller.go`**:
@@ -117,7 +117,7 @@ Support storage size increases (a common day-2 operation) while preventing chang
 - If the CRD requests a larger size, patches each PVC's `spec.resources.requests.storage`
 - If the patch fails (e.g., StorageClass doesn't support expansion), sets a `StorageHealthy: False` condition with `ReasonPVCExpansionFailed`
 
-**`pkg/operator/api/v1/antflycluster_webhook.go`**:
+**`pkg/operator/api/antfly/v1/antflycluster_webhook.go`**:
 - Add to `validateImmutability()`: reject changes to `spec.storage.storageClass`
 - For `spec.storage.metadataStorage` and `spec.storage.dataStorage`: allow size **increases** but reject decreases. The webhook should look up the StorageClass and check `allowVolumeExpansion: true` before admitting a size increase — if the StorageClass doesn't support expansion, reject at admission time with a clear message. This requires a client in the webhook (use the injected `Client` from the webhook handler) and an RBAC addition (see below).
 - Add `validatePVCRetentionPolicy()` for enum validation + cross-field check (reject `WhenScaled: Delete` with autoscaling enabled)
@@ -197,7 +197,7 @@ The EKS docs should also recommend Karpenter over cluster-autoscaler for multi-A
 - `TestCheckPVCTopologyHealth` (detects pending pods with volume affinity issues, uses instance label selector)
 - `TestReconcilePVCExpansion` (patches PVCs when size increases)
 
-**`pkg/operator/api/v1/antflycluster_webhook_test.go`**:
+**`pkg/operator/api/antfly/v1/antflycluster_webhook_test.go`**:
 - Storage class immutability on update
 - Storage size increase allowed when StorageClass supports expansion
 - Storage size increase rejected when StorageClass does not support expansion

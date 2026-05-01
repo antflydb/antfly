@@ -67,7 +67,7 @@ type AntflyClusterReconciler struct {
 //+kubebuilder:rbac:groups=antfly.io,resources=termitepools,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=termitepools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=antfly.io,resources=termitepools/finalizers,verbs=update
-//+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// No delete on CRDs: startup bootstrap applies CRDs but never removes them.
 //+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch
 
 var reservedPodLabelPrefixes = []string{"app.kubernetes.io/"}
@@ -1130,6 +1130,9 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		pool.Labels["app.kubernetes.io/instance"] = cluster.Name
 		pool.Labels["app.kubernetes.io/managed-by"] = "antfly-operator"
 
+		// AntflyCluster.spec.termite is authoritative for managed pools.
+		// Do not add TermitePool mutating-webhook defaults for spec fields
+		// unless the same defaults are applied before this assignment.
 		pool.Spec = *cluster.Spec.Termite.DeepCopy()
 		if pool.Spec.Image == "" {
 			pool.Spec.Image = r.DefaultTermiteImage
@@ -1170,7 +1173,6 @@ func (r *AntflyClusterReconciler) setTermitePoolReadyCondition(cluster *antflyv1
 		Reason:             reason,
 		Message:            message,
 		ObservedGeneration: cluster.Generation,
-		LastTransitionTime: metav1.Now(),
 	})
 }
 

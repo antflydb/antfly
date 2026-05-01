@@ -94,7 +94,7 @@ Follow the AntflyCluster pattern: call `obj.ValidateCreate()` during reconciliat
 
 Both operators are on controller-runtime v0.23.1. The old `webhook.Validator` interface (methods on the CRD type returning `error`) is deprecated. Use the typed `admission.Validator[T]` interface on separate structs.
 
-**File**: `internal/webhook/v1/antflycluster_validator.go`
+**File**: `internal/webhook/antfly/v1/antflycluster_validator.go`
 
 ```go
 package v1
@@ -102,7 +102,7 @@ package v1
 import (
     "context"
 
-    antflyv1 "github.com/antflydb/antfly/pkg/operator/api/v1"
+    antflyv1 "github.com/antflydb/antfly/pkg/operator/api/antfly/v1"
     "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -128,18 +128,18 @@ func (v *AntflyClusterValidator) ValidateDelete(ctx context.Context, obj *antfly
 
 Create matching validator structs for AntflyBackup and AntflyRestore following the same pattern.
 
-**File**: `internal/webhook/v1/antflybackup_validator.go`
-**File**: `internal/webhook/v1/antflyrestore_validator.go`
+**File**: `internal/webhook/antfly/v1/antflybackup_validator.go`
+**File**: `internal/webhook/antfly/v1/antflyrestore_validator.go`
 
 #### 1.2 Create Webhook Setup
 
-**File**: `internal/webhook/v1/setup.go`
+**File**: `internal/webhook/antfly/v1/setup.go`
 
 ```go
 package v1
 
 import (
-    antflyv1 "github.com/antflydb/antfly/pkg/operator/api/v1"
+    antflyv1 "github.com/antflydb/antfly/pkg/operator/api/antfly/v1"
     "sigs.k8s.io/controller-runtime/pkg/builder"
     ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -175,7 +175,7 @@ func SetupWithManager(mgr ctrl.Manager) error {
 import (
     // ... existing imports
     "sigs.k8s.io/controller-runtime/pkg/webhook"
-    webhookv1 "github.com/antflydb/antfly/pkg/operator/internal/webhook/v1"
+    webhookv1 "github.com/antflydb/antfly/pkg/operator/internal/webhook/antfly/v1"
 )
 
 func main() {
@@ -368,7 +368,7 @@ Apply the same pattern to termite controllers for TermitePool and TermiteRoute.
 
 #### 2.1 Create Validator Structs
 
-**File**: `internal/webhook/v1alpha1/termitepool_validator.go`
+**File**: `internal/webhook/termite/v1alpha1/termitepool_validator.go`
 
 ```go
 package v1alpha1
@@ -376,7 +376,7 @@ package v1alpha1
 import (
     "context"
 
-    antflyaiv1alpha1 "github.com/antflydb/antfly/termite/pkg/operator/api/v1alpha1"
+    antflyaiv1alpha1 "github.com/antflydb/antfly/pkg/operator/api/termite/v1alpha1"
     "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -400,9 +400,9 @@ func (v *TermitePoolValidator) ValidateDelete(ctx context.Context, obj *antflyai
 }
 ```
 
-**File**: `internal/webhook/v1alpha1/termiteroute_validator.go` — same pattern for TermiteRoute.
+**File**: `internal/webhook/termite/v1alpha1/termiteroute_validator.go` — same pattern for TermiteRoute.
 
-**File**: `internal/webhook/v1alpha1/setup.go` — registers both validators.
+**File**: `internal/webhook/termite/v1alpha1/setup.go` — registers both validators.
 
 #### 2.2 Update main.go, deployment, and kustomize
 
@@ -509,10 +509,10 @@ EOF
 | `api/v1/antflycluster_webhook.go` | Modify | Export core validation methods |
 | `api/v1/antflybackup_webhook.go` | Modify | Export core validation methods |
 | `api/v1/antflyrestore_webhook.go` | Modify | Export core validation methods |
-| `internal/webhook/v1/antflycluster_validator.go` | Create | Typed validator struct |
-| `internal/webhook/v1/antflybackup_validator.go` | Create | Typed validator struct |
-| `internal/webhook/v1/antflyrestore_validator.go` | Create | Typed validator struct |
-| `internal/webhook/v1/setup.go` | Create | Webhook registration |
+| `internal/webhook/antfly/v1/antflycluster_validator.go` | Create | Typed validator struct |
+| `internal/webhook/antfly/v1/antflybackup_validator.go` | Create | Typed validator struct |
+| `internal/webhook/antfly/v1/antflyrestore_validator.go` | Create | Typed validator struct |
+| `internal/webhook/antfly/v1/setup.go` | Create | Webhook registration |
 | `config/webhook/kustomization.yaml` | Create | Webhook kustomization |
 | `config/webhook/service.yaml` | Create | Webhook service |
 | `config/webhook/kustomizeconfig.yaml` | Create | Kustomize config |
@@ -529,9 +529,9 @@ EOF
 | `api/v1alpha1/termitepool_webhook.go` | Modify | Export core validation methods |
 | `api/v1alpha1/termiteroute_webhook.go` | Modify | Export core validation methods |
 | `controllers/termitepool_controller.go` | Modify | Replace inline `validatePool()` with delegation |
-| `internal/webhook/v1alpha1/termitepool_validator.go` | Create | Typed validator struct |
-| `internal/webhook/v1alpha1/termiteroute_validator.go` | Create | Typed validator struct |
-| `internal/webhook/v1alpha1/setup.go` | Create | Webhook registration |
+| `internal/webhook/termite/v1alpha1/termitepool_validator.go` | Create | Typed validator struct |
+| `internal/webhook/termite/v1alpha1/termiteroute_validator.go` | Create | Typed validator struct |
+| `internal/webhook/termite/v1alpha1/setup.go` | Create | Webhook registration |
 | `config/webhook/*` | Create | Webhook configuration |
 | `config/certmanager/*` | Create | Certificate configuration |
 | `config/default/kustomization.yaml` | Modify | Include webhook resources |

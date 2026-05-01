@@ -5,6 +5,21 @@ All notable changes to the Antfly Database Operator will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+- Consolidated the previous Antfly and Termite operator modules into
+  `pkg/operator` with one `cmd/antfly-operator` binary and one operator image.
+- Operator release tags now use `pkg/operator/v*`; the previous
+  `pkg/antfly-operator/v*` and `pkg/termite-operator/v*` tag streams are
+  removed.
+
+### Added
+- Added `AntflyCluster.spec.termite` for an AntflyCluster-owned TermitePool.
+
+### Removed
+- Removed the standalone Termite operator image and Dockerfile.
+
 ## [0.0.16] - 2026-03-16
 
 ### Changed

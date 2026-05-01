@@ -41,10 +41,10 @@ When `spec.termite` is set, the operator creates or updates a `TermitePool`
 named `<cluster-name>-termite` in the same namespace and owned by the
 `AntflyCluster`.
 
-If `spec.termite.image` is omitted, the operator uses the deployment's
-`--termite-antfly-image` value for Termite pods. The default manifest sets this
-to `ghcr.io/antflydb/antfly:omni`. Override it during deployment if that image
-is unavailable in your environment. The image must provide the `/antfly termite`
+If `spec.termite.image` is omitted, the operator uses the configured
+`--termite-antfly-image` value for Termite pods. The binary default is
+`ghcr.io/antflydb/antfly:omni`. Override it during deployment if that image is
+unavailable in your environment. The image must provide the `/antfly termite`
 runtime contract.
 
 `spec.termite` does not create `TermiteRoute` resources. Direct `TermiteRoute`
