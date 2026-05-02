@@ -27,8 +27,8 @@ import (
 	"github.com/antflydb/antfly/pkg/libaf/healthserver"
 	"github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/antflydb/antfly/pkg/libaf/logging"
-	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/pkg/termite"
+	"github.com/antflydb/antfly/src/common"
 	"github.com/go-viper/mapstructure/v2"
 	gojson "github.com/goccy/go-json"
 	"github.com/spf13/pflag"
@@ -37,6 +37,12 @@ import (
 )
 
 const defaultMaxShardSizeBytes = 64 * 1024 * 1024 // 64MB
+const defaultTermiteAPIURL = "http://0.0.0.0:8080"
+
+type parseConfigOptions struct {
+	RequireMetadata      bool
+	DefaultTermiteAPIURL string
+}
 
 // mustBindPFlag binds a pflag to viper and panics on error.
 // This is appropriate for init() functions where binding failures represent programming errors.
@@ -83,6 +89,14 @@ func JSONUnionDecodeHook() mapstructure.DecodeHookFunc {
 
 // parseConfig reads and parses the configuration using viper
 func parseConfig(v *viper.Viper) (*common.Config, error) {
+	return parseConfigWithOptions(v, parseConfigOptions{
+		RequireMetadata: true,
+	})
+}
+
+// parseConfigWithOptions reads and parses configuration using viper with
+// command-specific defaults and validation requirements.
+func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Config, error) {
 	// Set defaults before parsing
 	v.SetDefault("max_shard_size_bytes", defaultMaxShardSizeBytes)
 	if v.GetInt("max_shards_per_table") == 0 {
@@ -102,6 +116,9 @@ func parseConfig(v *viper.Viper) (*common.Config, error) {
 	v.SetDefault("storage.local.base_dir", common.DefaultDataDir())
 	v.SetDefault("storage.keyvalue", "local")
 	v.SetDefault("storage.metadatakv", "local")
+	if opts.DefaultTermiteAPIURL != "" {
+		v.SetDefault("termite.api_url", opts.DefaultTermiteAPIURL)
+	}
 
 	var config common.Config
 	if err := v.Unmarshal(&config, JSONStructTag(), viper.DecodeHook(
@@ -136,7 +153,9 @@ func parseConfig(v *viper.Viper) (*common.Config, error) {
 	}
 
 	// Validate the configuration
-	if err := config.Validate(); err != nil {
+	if err := config.ValidateWithOptions(common.ValidationOptions{
+		RequireMetadata: opts.RequireMetadata,
+	}); err != nil {
 		return nil, err
 	}
 
