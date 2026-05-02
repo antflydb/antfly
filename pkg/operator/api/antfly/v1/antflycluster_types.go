@@ -68,6 +68,21 @@ const (
 	// TypeTermitePoolReady indicates whether the operator-managed TermitePool is reconciled
 	TypeTermitePoolReady = "TermitePoolReady"
 
+	// TypeMetadataReady indicates whether metadata pods are ready.
+	TypeMetadataReady = "MetadataReady"
+
+	// TypeDataReady indicates whether data pods are ready.
+	TypeDataReady = "DataReady"
+
+	// TypeSwarmReady indicates whether swarm pods are ready.
+	TypeSwarmReady = "SwarmReady"
+
+	// TypeTermiteReady indicates whether termite is ready when managed in swarm mode.
+	TypeTermiteReady = "TermiteReady"
+
+	// TypeAvailable indicates whether the cluster is serving.
+	TypeAvailable = "Available"
+
 	// ReasonTermitePoolReady indicates the managed TermitePool reconcile completed
 	ReasonTermitePoolReady = "TermitePoolReady"
 
@@ -136,6 +151,30 @@ const (
 
 	// ReasonDataScaleDownFailed indicates data-node scale-down could not drain the selected ordinal
 	ReasonDataScaleDownFailed = "DataScaleDownFailed"
+
+	// ReasonComponentReady indicates a cluster component has enough ready replicas.
+	ReasonComponentReady = "ComponentReady"
+
+	// ReasonWaitingForPods indicates a component is waiting for ready pods.
+	ReasonWaitingForPods = "WaitingForPods"
+
+	// ReasonRuntimeDegraded indicates pod diagnostics found a runtime failure.
+	ReasonRuntimeDegraded = "RuntimeDegraded"
+
+	// ReasonUnschedulable indicates pods cannot be scheduled.
+	ReasonUnschedulable = "Unschedulable"
+
+	// ReasonImagePullFailed indicates a container image could not be pulled.
+	ReasonImagePullFailed = "ImagePullFailed"
+
+	// ReasonCrashLooping indicates a container is crashlooping.
+	ReasonCrashLooping = "CrashLooping"
+
+	// ReasonProbeFailed indicates a probe failure is preventing readiness.
+	ReasonProbeFailed = "ProbeFailed"
+
+	// ReasonAvailable indicates the cluster is available.
+	ReasonAvailable = "Available"
 
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"

@@ -32,10 +32,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	antflyv1 "github.com/antflydb/antfly/pkg/operator/api/antfly/v1"
 	termitev1alpha1 "github.com/antflydb/antfly/pkg/operator/api/termite/v1alpha1"
+	"github.com/antflydb/antfly/pkg/operator/controllers/internal/poddiagnostics"
 )
 
 // AntflyClusterReconciler reconciles an AntflyCluster object
@@ -2595,6 +2598,7 @@ func (r *AntflyClusterReconciler) reconcileServiceMeshStatus(ctx context.Context
 }
 
 func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	originalConditions := append([]metav1.Condition(nil), cluster.Status.Conditions...)
 	mode := effectiveTopologyMode(cluster)
 
 	if mode == topologyModeSwarm {
@@ -2637,14 +2641,23 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "swarm"))); err == nil {
-			for _, pod := range podList.Items {
-				if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
-					cluster.Status.SwarmStatus.PodName = pod.Name
-					cluster.Status.SwarmStatus.PodIP = pod.Status.PodIP
-					break
-				}
+		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "swarm"))); err != nil {
+			return err
+		}
+		for _, pod := range podList.Items {
+			if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
+				cluster.Status.SwarmStatus.PodName = pod.Name
+				cluster.Status.SwarmStatus.PodIP = pod.Status.PodIP
+				break
 			}
+		}
+		swarmFindings := poddiagnostics.DiagnosePods(podList.Items)
+		if len(swarmFindings) > 0 {
+			cluster.Status.Phase = "Degraded"
+			cluster.Status.SwarmStatus.Ready = false
+			cluster.Status.SwarmStatus.MetadataReady = false
+			cluster.Status.SwarmStatus.StoreReady = false
+			cluster.Status.SwarmStatus.TermiteReady = !termiteEnabled
 		}
 
 		if oldStatus.LastTransitionTime == nil ||
@@ -2661,6 +2674,22 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		r.updateRolloutCondition(cluster, swarmSts)
+		r.setComponentCondition(cluster, antflyv1.TypeSwarmReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm")
+		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm metadata")
+		r.setComponentCondition(cluster, antflyv1.TypeDataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm store")
+		if termiteEnabled {
+			r.setComponentCondition(cluster, antflyv1.TypeTermiteReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm termite")
+		} else {
+			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+				Type:               antflyv1.TypeTermiteReady,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: cluster.Generation,
+				Reason:             antflyv1.ReasonComponentReady,
+				Message:            "Termite is disabled",
+			})
+		}
+		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
+		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
@@ -2699,13 +2728,31 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	}
 	dataReplicas := effectiveDataNodeReplicas(cluster)
 
-	if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
+	metadataPods, err := r.listComponentPods(ctx, cluster, "metadata")
+	if err != nil {
+		return err
+	}
+	dataPods, err := r.listComponentPods(ctx, cluster, "data")
+	if err != nil {
+		return err
+	}
+	metadataFindings := poddiagnostics.DiagnosePods(metadataPods)
+	dataFindings := poddiagnostics.DiagnosePods(dataPods)
+	r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, cluster.Status.MetadataNodesReady, metadataReplicas, metadataFindings, "metadata")
+	r.setComponentCondition(cluster, antflyv1.TypeDataReady, cluster.Status.DataNodesReady, dataReplicas, dataFindings, "data")
+	allRuntimeFindings := append(append([]poddiagnostics.Finding{}, metadataFindings...), dataFindings...)
+
+	if len(allRuntimeFindings) > 0 {
+		cluster.Status.Phase = "Degraded"
+	} else if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
 		cluster.Status.Phase = "Running"
 	} else {
 		cluster.Status.Phase = "Pending"
 	}
 
 	r.updateRolloutCondition(cluster, metadataSts, dataSts)
+	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
+	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 	r.updateProductTierStatus(cluster)
 
 	// Update ServiceMeshReady condition
@@ -2718,6 +2765,7 @@ func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.Antfl
 	var waiting []string
 	for _, sts := range statefulSets {
 		if sts == nil || sts.Name == "" {
+			waiting = append(waiting, "StatefulSet is not observed yet")
 			continue
 		}
 		replicas := int32(1)
@@ -2752,6 +2800,101 @@ func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.Antfl
 	}
 
 	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
+}
+
+func (r *AntflyClusterReconciler) listComponentPods(ctx context.Context, cluster *antflyv1.AntflyCluster, component string) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, component))); err != nil {
+		return nil, err
+	}
+	return podList.Items, nil
+}
+
+func (r *AntflyClusterReconciler) setComponentCondition(cluster *antflyv1.AntflyCluster, conditionType string, ready, desired int32, findings []poddiagnostics.Finding, component string) {
+	status := metav1.ConditionFalse
+	reason := antflyv1.ReasonWaitingForPods
+	message := fmt.Sprintf("%s has %d/%d ready pods", component, ready, desired)
+	if finding, ok := poddiagnostics.First(findings,
+		poddiagnostics.FindingUnschedulable,
+		poddiagnostics.FindingImagePullFailed,
+		poddiagnostics.FindingCrashLooping,
+		poddiagnostics.FindingProbeFailed,
+		poddiagnostics.FindingInitFailed,
+	); ok {
+		reason = antflyReasonForFinding(finding)
+		message = poddiagnostics.Message(finding)
+	} else if ready >= desired && desired > 0 {
+		status = metav1.ConditionTrue
+		reason = antflyv1.ReasonComponentReady
+		message = fmt.Sprintf("%s is ready", component)
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		ObservedGeneration: cluster.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func (r *AntflyClusterReconciler) setAvailableCondition(cluster *antflyv1.AntflyCluster, findings []poddiagnostics.Finding, ready bool) {
+	status := metav1.ConditionTrue
+	reason := antflyv1.ReasonAvailable
+	message := "Cluster is available"
+	if len(findings) > 0 {
+		status = metav1.ConditionFalse
+		reason = antflyv1.ReasonRuntimeDegraded
+		message = poddiagnostics.Summary(findings)
+	} else if !ready {
+		status = metav1.ConditionFalse
+		reason = antflyv1.ReasonWaitingForPods
+		message = "Cluster is waiting for ready pods"
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypeAvailable,
+		Status:             status,
+		ObservedGeneration: cluster.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func antflyReasonForFinding(finding poddiagnostics.Finding) string {
+	switch finding.Type {
+	case poddiagnostics.FindingUnschedulable:
+		return antflyv1.ReasonUnschedulable
+	case poddiagnostics.FindingImagePullFailed:
+		return antflyv1.ReasonImagePullFailed
+	case poddiagnostics.FindingCrashLooping:
+		return antflyv1.ReasonCrashLooping
+	case poddiagnostics.FindingProbeFailed:
+		return antflyv1.ReasonProbeFailed
+	default:
+		return antflyv1.ReasonRuntimeDegraded
+	}
+}
+
+func (r *AntflyClusterReconciler) recordClusterRuntimeFailureEvents(cluster *antflyv1.AntflyCluster, originalConditions []metav1.Condition) {
+	if r.Recorder == nil {
+		return
+	}
+	for _, condition := range cluster.Status.Conditions {
+		if condition.Status != metav1.ConditionFalse {
+			continue
+		}
+		if condition.Type != antflyv1.TypeMetadataReady &&
+			condition.Type != antflyv1.TypeDataReady &&
+			condition.Type != antflyv1.TypeSwarmReady &&
+			condition.Type != antflyv1.TypeTermiteReady &&
+			condition.Type != antflyv1.TypeAvailable {
+			continue
+		}
+		previous := meta.FindStatusCondition(originalConditions, condition.Type)
+		if previous != nil && previous.Status == condition.Status && previous.Reason == condition.Reason && previous.Message == condition.Message {
+			continue
+		}
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, condition.Reason, condition.Reason, "%s", condition.Message)
+	}
 }
 
 func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.AntflyCluster) {
@@ -3612,9 +3755,24 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&policyv1.PodDisruptionBudget{})
+		Owns(&policyv1.PodDisruptionBudget{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod))
 	if r.ManageTermitePools {
 		builder = builder.Owns(&termitev1alpha1.TermitePool{})
 	}
 	return builder.Complete(r)
+}
+
+func (r *AntflyClusterReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {
+	clusterName := obj.GetLabels()["app.kubernetes.io/instance"]
+	component := obj.GetLabels()["app.kubernetes.io/component"]
+	if clusterName == "" || (component != "metadata" && component != "data" && component != "swarm") {
+		return nil
+	}
+	cluster := &antflyv1.AntflyCluster{}
+	key := types.NamespacedName{Name: clusterName, Namespace: obj.GetNamespace()}
+	if err := r.Get(ctx, key, cluster); err != nil {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: key}}
 }

@@ -633,6 +633,22 @@ func TestUpdateRolloutConditionReportsProgressAndComplete(t *testing.T) {
 	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutComplete))
 }
 
+func TestUpdateRolloutConditionReportsMissingStatefulSet(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 4},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateRolloutCondition(cluster, &appsv1.StatefulSet{})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
+	g.Expect(cond.Message).To(ContainSubstring("not observed"))
+}
+
 func TestEffectiveDataReplicaTargetPrefersStatefulSetSpec(t *testing.T) {
 	g := NewWithT(t)
 	replicas := int32(5)

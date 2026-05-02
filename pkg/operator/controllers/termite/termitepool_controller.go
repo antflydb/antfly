@@ -45,9 +45,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	antflyaiv1alpha1 "github.com/antflydb/antfly/pkg/operator/api/termite/v1alpha1"
+	"github.com/antflydb/antfly/pkg/operator/controllers/internal/poddiagnostics"
 )
 
 const (
@@ -1070,22 +1073,36 @@ func (r *TermitePoolReconciler) updateStatus(ctx context.Context, pool *antflyai
 
 	newPhase := antflyaiv1alpha1.TermitePoolPhasePending
 	var ready, total, desired int32
+	statefulSetFound := false
 
 	if err := r.Get(ctx, types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}, sts); err != nil {
 		if !errors.IsNotFound(err) {
 			return err
 		}
 	} else {
+		statefulSetFound = true
 		ready = sts.Status.ReadyReplicas
 		total = sts.Status.Replicas
-		desired = *sts.Spec.Replicas
-
-		if ready == desired {
-			newPhase = antflyaiv1alpha1.TermitePoolPhaseRunning
-		} else if ready > 0 {
-			newPhase = antflyaiv1alpha1.TermitePoolPhaseScaling
+		if sts.Spec.Replicas != nil {
+			desired = *sts.Spec.Replicas
 		}
 	}
+
+	pods, err := r.listPods(ctx, pool)
+	if err != nil {
+		return err
+	}
+	findings := poddiagnostics.DiagnosePods(pods)
+	if len(findings) > 0 {
+		newPhase = antflyaiv1alpha1.TermitePoolPhaseDegraded
+	} else if statefulSetFound && desired > 0 && ready == desired {
+		newPhase = antflyaiv1alpha1.TermitePoolPhaseRunning
+	} else if statefulSetFound && ready > 0 {
+		newPhase = antflyaiv1alpha1.TermitePoolPhaseScaling
+	}
+
+	r.setRuntimeConditions(pool, statefulSetFound, len(pods), ready, desired, findings)
+	r.recordRuntimeFailureEvents(pool, originalConditions)
 
 	// Skip update if nothing changed
 	if pool.Status.Phase == newPhase &&
@@ -1104,6 +1121,216 @@ func (r *TermitePoolReconciler) updateStatus(ctx context.Context, pool *antflyai
 	pool.Status.ObservedGeneration = pool.Generation
 
 	return r.Status().Update(ctx, pool)
+}
+
+func (r *TermitePoolReconciler) listPods(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.InNamespace(pool.Namespace), client.MatchingLabels(r.selectorLabels(pool))); err != nil {
+		return nil, err
+	}
+	return podList.Items, nil
+}
+
+func (r *TermitePoolReconciler) setRuntimeConditions(pool *antflyaiv1alpha1.TermitePool, statefulSetFound bool, podCount int, ready, desired int32, findings []poddiagnostics.Finding) {
+	observedGeneration := pool.Generation
+	workloadObserved := statefulSetFound && desired > 0
+	workloadReady := workloadObserved && ready == desired
+	podsObserved := workloadObserved && podCount > 0
+
+	workloadStatus := metav1.ConditionTrue
+	workloadReason := antflyaiv1alpha1.ReasonReconcileSucceeded
+	workloadMessage := "Child resources are reconciled"
+	if !statefulSetFound {
+		workloadStatus = metav1.ConditionUnknown
+		workloadReason = antflyaiv1alpha1.ReasonWaitingForPods
+		workloadMessage = "StatefulSet is not observed yet"
+	} else if desired == 0 {
+		workloadStatus = metav1.ConditionUnknown
+		workloadReason = antflyaiv1alpha1.ReasonWaitingForPods
+		workloadMessage = "StatefulSet has no desired replicas"
+	}
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:               antflyaiv1alpha1.TypeWorkloadReconciled,
+		Status:             workloadStatus,
+		ObservedGeneration: observedGeneration,
+		Reason:             workloadReason,
+		Message:            workloadMessage,
+	})
+
+	if finding, ok := poddiagnostics.First(findings, poddiagnostics.FindingUnschedulable); ok {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypePodsScheduled,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonUnschedulable,
+			Message:            poddiagnostics.Message(finding),
+		})
+	} else if podsObserved {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypePodsScheduled,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonPodsScheduled,
+			Message:            "Pods are schedulable",
+		})
+	} else {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypePodsScheduled,
+			Status:             metav1.ConditionUnknown,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonWaitingForPods,
+			Message:            "Waiting for pods to be created",
+		})
+	}
+
+	if finding, ok := poddiagnostics.First(findings, poddiagnostics.FindingImagePullFailed); ok {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypeImageAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonImagePullFailed,
+			Message:            poddiagnostics.Message(finding),
+		})
+	} else if workloadReady {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypeImageAvailable,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonImagesPulled,
+			Message:            "Container images are available",
+		})
+	} else {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypeImageAvailable,
+			Status:             metav1.ConditionUnknown,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonWaitingForPods,
+			Message:            "Waiting for ready pods before marking container images available",
+		})
+	}
+
+	if finding, ok := poddiagnostics.First(findings, poddiagnostics.FindingModelPullFailed); ok {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypeModelsReady,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonModelPullFailed,
+			Message:            poddiagnostics.Message(finding),
+		})
+	} else if workloadReady {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypeModelsReady,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonModelsReady,
+			Message:            "Model pull init containers are complete",
+		})
+	} else {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               antflyaiv1alpha1.TypeModelsReady,
+			Status:             metav1.ConditionUnknown,
+			ObservedGeneration: observedGeneration,
+			Reason:             antflyaiv1alpha1.ReasonWaitingForPods,
+			Message:            "Waiting for ready pods before marking model pull init containers complete",
+		})
+	}
+
+	podsReady := workloadReady
+	podsReadyMessage := fmt.Sprintf("%d/%d pods are ready", ready, desired)
+	podsReadyReason := antflyaiv1alpha1.ReasonPodsReady
+	if !podsReady {
+		podsReadyReason = antflyaiv1alpha1.ReasonWaitingForPods
+		if !statefulSetFound {
+			podsReadyMessage = "StatefulSet is not observed yet"
+		} else if desired == 0 {
+			podsReadyMessage = "StatefulSet has no desired replicas"
+		}
+		if finding, ok := poddiagnostics.First(findings, poddiagnostics.FindingCrashLooping, poddiagnostics.FindingProbeFailed, poddiagnostics.FindingInitFailed); ok {
+			podsReadyMessage = poddiagnostics.Message(finding)
+			podsReadyReason = termiteReasonForFinding(finding)
+		}
+	}
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:               antflyaiv1alpha1.TypePodsReady,
+		Status:             conditionStatus(podsReady),
+		ObservedGeneration: observedGeneration,
+		Reason:             podsReadyReason,
+		Message:            podsReadyMessage,
+	})
+
+	available := podsReady && !poddiagnostics.Has(findings,
+		poddiagnostics.FindingUnschedulable,
+		poddiagnostics.FindingImagePullFailed,
+		poddiagnostics.FindingModelPullFailed,
+		poddiagnostics.FindingInitFailed,
+		poddiagnostics.FindingCrashLooping,
+		poddiagnostics.FindingProbeFailed,
+	)
+	availableReason := antflyaiv1alpha1.ReasonAvailable
+	availableMessage := "TermitePool is available"
+	if !available {
+		availableReason = antflyaiv1alpha1.ReasonWaitingForPods
+		if len(findings) == 0 {
+			availableMessage = podsReadyMessage
+		} else {
+			availableReason = antflyaiv1alpha1.ReasonRuntimeDegraded
+			availableMessage = poddiagnostics.Summary(findings)
+		}
+	}
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:               antflyaiv1alpha1.TypeAvailable,
+		Status:             conditionStatus(available),
+		ObservedGeneration: observedGeneration,
+		Reason:             availableReason,
+		Message:            availableMessage,
+	})
+}
+
+func termiteReasonForFinding(finding poddiagnostics.Finding) string {
+	switch finding.Type {
+	case poddiagnostics.FindingCrashLooping:
+		return antflyaiv1alpha1.ReasonCrashLooping
+	case poddiagnostics.FindingProbeFailed:
+		return antflyaiv1alpha1.ReasonProbeFailed
+	case poddiagnostics.FindingImagePullFailed:
+		return antflyaiv1alpha1.ReasonImagePullFailed
+	case poddiagnostics.FindingModelPullFailed:
+		return antflyaiv1alpha1.ReasonModelPullFailed
+	case poddiagnostics.FindingUnschedulable:
+		return antflyaiv1alpha1.ReasonUnschedulable
+	default:
+		return antflyaiv1alpha1.ReasonRuntimeDegraded
+	}
+}
+
+func (r *TermitePoolReconciler) recordRuntimeFailureEvents(pool *antflyaiv1alpha1.TermitePool, originalConditions []metav1.Condition) {
+	if r.Recorder == nil {
+		return
+	}
+	for _, condition := range pool.Status.Conditions {
+		if condition.Status != metav1.ConditionFalse {
+			continue
+		}
+		if condition.Type != antflyaiv1alpha1.TypePodsScheduled &&
+			condition.Type != antflyaiv1alpha1.TypeImageAvailable &&
+			condition.Type != antflyaiv1alpha1.TypeModelsReady &&
+			condition.Type != antflyaiv1alpha1.TypePodsReady &&
+			condition.Type != antflyaiv1alpha1.TypeAvailable {
+			continue
+		}
+		previous := meta.FindStatusCondition(originalConditions, condition.Type)
+		if previous != nil && previous.Status == condition.Status && previous.Reason == condition.Reason && previous.Message == condition.Message {
+			continue
+		}
+		r.Recorder.Eventf(pool, nil, corev1.EventTypeWarning, condition.Reason, condition.Reason, "%s", condition.Message)
+	}
+}
+
+func conditionStatus(ok bool) metav1.ConditionStatus {
+	if ok {
+		return metav1.ConditionTrue
+	}
+	return metav1.ConditionFalse
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures.
@@ -1461,5 +1688,19 @@ func (r *TermitePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod)).
 		Complete(r)
+}
+
+func (r *TermitePoolReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {
+	poolName := obj.GetLabels()["antfly.io/pool"]
+	if poolName == "" {
+		return nil
+	}
+	pool := &antflyaiv1alpha1.TermitePool{}
+	key := types.NamespacedName{Name: poolName, Namespace: obj.GetNamespace()}
+	if err := r.Get(ctx, key, pool); err != nil {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: key}}
 }
