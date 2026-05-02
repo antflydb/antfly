@@ -134,9 +134,20 @@ func (tm *TableManager) UpdateStatuses(
 	}
 	tm.Lock()
 	defer tm.Unlock()
+	tombstones, err := tm.GetStoreTombstones(ctx)
+	if err != nil {
+		return fmt.Errorf("loading store tombstones: %w", err)
+	}
+	tombstonedStores := make(map[types.ID]struct{}, len(tombstones))
+	for _, id := range tombstones {
+		tombstonedStores[id] = struct{}{}
+	}
 	currentShards := make(map[types.ID]*store.ShardInfo)
 	updatedStores := make(map[types.ID]*StoreStatus)
 	for nodeID, status := range newStatuses {
+		if _, tombstoned := tombstonedStores[nodeID]; tombstoned {
+			status.State = store.StoreState_Terminating
+		}
 		oldStoreStatus, err := tm.GetStoreStatus(ctx, nodeID)
 		// If the store status is not found i.e. ErrNotFound, we treat it as a new store
 		if errors.Is(err, ErrNotFound) {
@@ -147,10 +158,11 @@ func (tm *TableManager) UpdateStatuses(
 			updatedStores[nodeID] = status
 		}
 
-		// Unreachable stores keep their last known shard map for observability, but
-		// they must not contribute to aggregate shard routing state. Otherwise a dead
-		// node can linger in ReportedBy / leader-adjacent metadata and misroute reads.
-		if status.State == store.StoreState_Unhealthy {
+		// Unreachable or administratively draining stores keep their last known
+		// shard map for observability, but they must not contribute to aggregate
+		// shard routing state. Otherwise a dead/draining node can linger in
+		// ReportedBy / leader-adjacent metadata and misroute reads.
+		if status.State == store.StoreState_Unhealthy || status.State == store.StoreState_Terminating {
 			continue
 		}
 
@@ -912,13 +924,33 @@ func (tm *TableManager) GetStoreTombstones(ctx context.Context) ([]types.ID, err
 	return tombstones, nil
 }
 
+func (tm *TableManager) HasStoreTombstone(ctx context.Context, id types.ID) (bool, error) {
+	_, closer, err := tm.db.Get(ctx, []byte(storeTombstonePrefix+id.String()))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking store tombstone for %s: %w", id, err)
+	}
+	defer func() { _ = closer.Close() }()
+	return true, nil
+}
+
 func (tm *TableManager) RegisterStore(
 	ctx context.Context,
 	req *store.StoreRegistrationRequest,
 ) error {
+	state := store.StoreState_Healthy
+	tombstoned, err := tm.HasStoreTombstone(ctx, req.ID)
+	if err != nil {
+		return err
+	}
+	if tombstoned {
+		state = store.StoreState_Terminating
+	}
 	storeStatus := &StoreStatus{
 		StoreInfo: req.StoreInfo,
-		State:     store.StoreState_Healthy,
+		State:     state,
 		LastSeen:  time.Now(),
 		Shards:    req.Shards,
 	}

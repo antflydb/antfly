@@ -3,6 +3,9 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +25,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // T004: Unit test for applyDefaults() setting ServiceMesh.Enabled=false
 func TestApplyDefaults_ServiceMeshDefaults(t *testing.T) {
@@ -686,6 +695,45 @@ func TestSetDataScaleDownStatusRecordsAutoscalerSource(t *testing.T) {
 	g.Expect(cluster.Status.DataScaleDownStatus.DrainingOrdinal).To(Equal(int32(4)))
 	g.Expect(cluster.Status.DataScaleDownStatus.DrainingStoreID).To(Equal("5"))
 	g.Expect(cluster.Status.DataScaleDownStatus.Phase).To(Equal("Draining"))
+}
+
+func TestRequestDataNodeShutdownUsesNodeShutdownAPI(t *testing.T) {
+	g := NewWithT(t)
+	var methods []string
+	var paths []string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			methods = append(methods, req.Method)
+			paths = append(paths, req.URL.Path)
+			body := "accepted"
+			if req.Method == http.MethodGet {
+				body = `{"node_id":"5","phase":"complete","safe_to_terminate":true}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+		},
+	}
+
+	status, err := reconciler.requestDataNodeShutdown(context.Background(), cluster, "5")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(status.SafeToTerminate).To(BeTrue())
+	g.Expect(methods).To(Equal([]string{http.MethodPut, http.MethodGet}))
+	g.Expect(paths).To(Equal([]string{
+		"/internal/v1/nodes/5/shutdown",
+		"/internal/v1/nodes/5/shutdown",
+	}))
 }
 
 func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {

@@ -423,6 +423,8 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	internalMux := http.NewServeMux()
 	internalMux.HandleFunc("POST /store", r.node.handleStoreRegistration)
 	internalMux.HandleFunc("DELETE /store/{store}", r.node.handleStoreDeregistration)
+	internalMux.HandleFunc("PUT /nodes/{node}/shutdown", r.node.handleNodeShutdownRequest)
+	internalMux.HandleFunc("GET /nodes/{node}/shutdown", r.node.handleNodeShutdownStatus)
 	internalMux.HandleFunc("POST /shard/{shardID}/txn/resolve", r.node.handleForwardResolveIntent)
 
 	api := kv.NewMetadataStoreAPI(r.logger, r.metadataStore)
