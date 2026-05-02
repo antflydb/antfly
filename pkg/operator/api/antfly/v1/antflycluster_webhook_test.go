@@ -1336,6 +1336,229 @@ func TestValidateUpdate_StorageSizeDecreaseRejected(t *testing.T) {
 	}
 }
 
+func TestValidateUpdate_SwarmStorageSizeDecreaseRejected(t *testing.T) {
+	old := baseSwarmCluster()
+	old.Spec.Storage.SwarmStorage = "2Gi"
+
+	new := baseSwarmCluster()
+	new.Spec.Storage.SwarmStorage = "1Gi"
+
+	err := new.ValidateUpdate(old)
+	if err == nil {
+		t.Fatal("expected error when decreasing swarm storage size")
+	}
+	if !strings.Contains(err.Error(), "swarmStorage") {
+		t.Fatalf("expected swarmStorage error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_StorageAutoGrowRequiresMaxDataStorage(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Storage.StorageAutoGrow = &StorageAutoGrowSpec{
+		Enabled:              true,
+		GrowThresholdPercent: 85,
+		GrowIncrement:        "5Gi",
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected storage auto-grow max storage validation error")
+	}
+	if !strings.Contains(err.Error(), "maxDataStorage") {
+		t.Fatalf("expected maxDataStorage error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_StorageAutoGrowValid(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Storage.StorageAutoGrow = &StorageAutoGrowSpec{
+		Enabled:              true,
+		MaxDataStorage:       "20Gi",
+		GrowThresholdPercent: 85,
+		GrowIncrement:        "5Gi",
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid storage auto-grow config, got: %v", err)
+	}
+}
+
+func TestValidateCreate_ProductTierRequiresExplicitClusteredShape(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.ProductTier = &ProductTierSpec{
+		Name:      "pro",
+		Revision:  "2026-05",
+		ManagedBy: "cloudaf",
+		DataTier:  "data-large",
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected product tier validation error")
+	}
+	if !strings.Contains(err.Error(), "metadataNodes.resources") {
+		t.Fatalf("expected metadata resources error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_ProductTierValidClusteredShape(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.ProductTier = &ProductTierSpec{
+		Name:         "pro",
+		Revision:     "2026-05",
+		ManagedBy:    "cloudaf",
+		MetadataTier: "metadata-small",
+		DataTier:     "data-large",
+	}
+	cluster.Spec.MetadataNodes.Resources = ResourceSpec{CPU: "500m", Memory: "1Gi"}
+	cluster.Spec.DataNodes.Resources = ResourceSpec{CPU: "2", Memory: "8Gi"}
+	cluster.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 3,
+		MaxReplicas: 8,
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid product tier shape, got: %v", err)
+	}
+}
+
+func TestValidateCreate_ProductTierTermiteTierRequiresTermiteSpec(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.ProductTier = &ProductTierSpec{
+		Name:        "pro",
+		TermiteTier: "embed-small",
+	}
+	cluster.Spec.MetadataNodes.Resources = ResourceSpec{CPU: "500m", Memory: "1Gi"}
+	cluster.Spec.DataNodes.Resources = ResourceSpec{CPU: "2", Memory: "8Gi"}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected termite tier validation error")
+	}
+	if !strings.Contains(err.Error(), "spec.termite is required") {
+		t.Fatalf("expected termite spec error, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_MetadataScaleDownRejected(t *testing.T) {
+	old := baseCluster()
+	old.Spec.MetadataNodes.Replicas = 5
+
+	new := baseCluster()
+	new.Spec.MetadataNodes.Replicas = 3
+
+	err := new.ValidateUpdate(old)
+	if err == nil {
+		t.Fatal("expected error when decreasing metadata replicas")
+	}
+	if !strings.Contains(err.Error(), "metadataNodes.replicas") {
+		t.Fatalf("expected metadata replica error, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_DataScaleUpAllowed(t *testing.T) {
+	old := baseCluster()
+	old.Spec.DataNodes.Replicas = 3
+
+	new := baseCluster()
+	new.Spec.DataNodes.Replicas = 5
+
+	if err := new.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected no error for data scale-up, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_DataScaleDownAllowed(t *testing.T) {
+	old := baseCluster()
+	old.Spec.DataNodes.Replicas = 5
+
+	new := baseCluster()
+	new.Spec.DataNodes.Replicas = 3
+
+	if err := new.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected data scale-down to be admitted for controller-owned drain workflow, got: %v", err)
+	}
+}
+
+func TestValidateCreate_AutoScalingBoundsRejected(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 5,
+		MaxReplicas: 3,
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected error for invalid autoscaling bounds")
+	}
+	if !strings.Contains(err.Error(), "minReplicas") {
+		t.Fatalf("expected autoscaling bounds error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_DisabledAutoScalingIgnoresBounds(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     false,
+		MinReplicas: 5,
+		MaxReplicas: 0,
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected disabled autoscaling bounds to be ignored, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_AutoScalingMaxBelowObservedReplicasAllowed(t *testing.T) {
+	old := baseCluster()
+	old.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 3,
+		MaxReplicas: 8,
+	}
+	old.Status.AutoScalingStatus = &AutoScalingStatus{
+		CurrentReplicas: 7,
+		DesiredReplicas: 7,
+	}
+
+	new := baseCluster()
+	new.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 2,
+		MaxReplicas: 6,
+	}
+
+	if err := new.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected autoscaling maxReplicas below observed replicas to be admitted for controller-owned drain workflow, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_AutoScalingBoundsCanDecreaseAboveObservedReplicas(t *testing.T) {
+	old := baseCluster()
+	old.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 3,
+		MaxReplicas: 8,
+	}
+	old.Status.AutoScalingStatus = &AutoScalingStatus{
+		CurrentReplicas: 5,
+		DesiredReplicas: 5,
+	}
+
+	new := baseCluster()
+	new.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 2,
+		MaxReplicas: 6,
+	}
+
+	if err := new.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected autoscaling bounds above observed replicas to be allowed, got: %v", err)
+	}
+}
+
 func TestValidateUpdate_PVCRetentionPolicyMutable(t *testing.T) {
 	old := baseCluster()
 	old.Spec.Storage.PVCRetentionPolicy = &PVCRetentionPolicy{

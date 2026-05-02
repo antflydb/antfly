@@ -336,6 +336,50 @@ replication_factor: 6
 	})
 }
 
+func TestParseConfigCommandSpecificMetadataValidation(t *testing.T) {
+	t.Run("termite_does_not_require_metadata_and_defaults_api_url", func(t *testing.T) {
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(`{}`)))
+
+		config, err := parseConfigWithOptions(v, parseConfigOptions{
+			RequireMetadata:      false,
+			DefaultTermiteAPIURL: defaultTermiteAPIURL,
+		})
+		require.NoError(t, err)
+		require.Empty(t, config.Metadata.OrchestrationUrls)
+		require.Equal(t, defaultTermiteAPIURL, config.Termite.ApiUrl)
+	})
+
+	t.Run("swarm_does_not_require_user_metadata", func(t *testing.T) {
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(`{}`)))
+
+		config, err := parseConfigWithOptions(v, parseConfigOptions{
+			RequireMetadata: false,
+		})
+		require.NoError(t, err)
+		require.Empty(t, config.Metadata.OrchestrationUrls)
+	})
+
+	t.Run("optional_metadata_is_still_validated_when_present", func(t *testing.T) {
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(`
+metadata:
+  orchestration_urls:
+    "not-a-hex-id": "http://localhost:5001"
+`)))
+
+		_, err := parseConfigWithOptions(v, parseConfigOptions{
+			RequireMetadata: false,
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid metadata node ID")
+	})
+}
+
 func TestParseConfigTermiteURL(t *testing.T) {
 	configYAML := `
 metadata:

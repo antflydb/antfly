@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -450,6 +451,291 @@ func TestApplyDefaults_SwarmDefaults(t *testing.T) {
 	g.Expect(cluster.Spec.Swarm.Termite).ToNot(BeNil())
 	g.Expect(cluster.Spec.Swarm.Termite.Enabled).To(BeTrue())
 	g.Expect(cluster.Spec.Swarm.Termite.APIURL).To(Equal("http://0.0.0.0:11433"))
+}
+
+func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 7},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-storage-test-cluster-data-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-cluster",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pvc).Build(),
+		Scheme: s,
+	}
+
+	result := reconciler.reconcilePVCExpansion(ctx, cluster, "data", "data-storage", "test-cluster-data", "2Gi")
+	reconciler.setPVCExpansionCondition(cluster, []pvcExpansionResult{result})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypePVCExpansion)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonPVCExpansionInProgress))
+	g.Expect(cond.ObservedGeneration).To(Equal(int64(7)))
+
+	updated := &corev1.PersistentVolumeClaim{}
+	g.Expect(reconciler.Get(ctx, types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, updated)).To(Succeed())
+	g.Expect(updated.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("2Gi")))
+}
+
+func TestReconcileStorageAutoGrowRecommendsGrowth(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 8},
+		Spec: antflyv1.AntflyClusterSpec{
+			Storage: antflyv1.StorageSpec{
+				DataStorage: "10Gi",
+				StorageAutoGrow: &antflyv1.StorageAutoGrowSpec{
+					Enabled:              true,
+					MaxDataStorage:       "20Gi",
+					GrowThresholdPercent: 80,
+					GrowIncrement:        "5Gi",
+				},
+			},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-storage-test-cluster-data-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-cluster",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-data-0",
+			Namespace: "default",
+			Labels:    serviceSelectorLabels("test-cluster", "data"),
+		},
+		Spec: corev1.PodSpec{NodeName: "node-1"},
+	}
+	usedBytes := uint64(9 * 1024 * 1024 * 1024)
+	capacityBytes := uint64(10 * 1024 * 1024 * 1024)
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pvc, pod).Build(),
+		Scheme: s,
+		NodeStatsFetcher: func(context.Context, string) (*kubeletStatsSummary, error) {
+			return &kubeletStatsSummary{
+				Pods: []kubeletPodStats{
+					{
+						PodRef: kubeletPodReference{Name: pod.Name, Namespace: pod.Namespace},
+						Volume: []kubeletVolumeStats{
+							{
+								PVCRef:        &kubeletPVCReference{Name: pvc.Name, Namespace: pvc.Namespace},
+								UsedBytes:     &usedBytes,
+								CapacityBytes: &capacityBytes,
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	recommended := reconciler.reconcileStorageAutoGrow(ctx, cluster, "data", "data-storage", "test-cluster-data", "10Gi", "20Gi")
+
+	g.Expect(recommended).To(Equal("15Gi"))
+	g.Expect(cluster.Status.StorageAutoGrowStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.StorageAutoGrowStatus.Reason).To(Equal(antflyv1.ReasonStorageAutoGrowInProgress))
+	g.Expect(cluster.Status.StorageAutoGrowStatus.UsagePercent).To(Equal(int32(90)))
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeStorageAutoGrow)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonStorageAutoGrowInProgress))
+}
+
+func TestSetPVCExpansionConditionReportsComplete(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 3},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.setPVCExpansionCondition(cluster, []pvcExpansionResult{
+		{component: "metadata", state: pvcExpansionComplete, message: "metadata complete"},
+		{component: "data", state: pvcExpansionComplete, message: "data complete"},
+	})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypePVCExpansion)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonPVCExpansionComplete))
+}
+
+func TestUpdateRolloutConditionReportsProgressAndComplete(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 4},
+	}
+	reconciler := &AntflyClusterReconciler{}
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-data", Generation: 2},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    1,
+			ReadyReplicas:      1,
+		},
+	}
+
+	reconciler.updateRolloutCondition(cluster, sts)
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
+
+	sts.Status.ObservedGeneration = 2
+	sts.Status.UpdatedReplicas = 3
+	sts.Status.ReadyReplicas = 3
+	reconciler.updateRolloutCondition(cluster, sts)
+	cond = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutComplete))
+}
+
+func TestUpdateRolloutConditionReportsMissingStatefulSet(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 4},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateRolloutCondition(cluster, &appsv1.StatefulSet{})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
+	g.Expect(cond.Message).To(ContainSubstring("not observed"))
+}
+
+func TestEffectiveDataReplicaTargetPrefersStatefulSetSpec(t *testing.T) {
+	g := NewWithT(t)
+	replicas := int32(5)
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status: appsv1.StatefulSetStatus{
+			Replicas: 3,
+		},
+	}
+
+	g.Expect(effectiveDataReplicas(sts, true, 1)).To(Equal(int32(3)))
+	g.Expect(effectiveDataReplicaTarget(sts, true, 1)).To(Equal(int32(5)))
+	g.Expect(max(effectiveDataReplicas(sts, true, 1), effectiveDataReplicaTarget(sts, true, 1))).To(Equal(int32(5)))
+}
+
+func TestStoreIDForDataOrdinalUsesHexID(t *testing.T) {
+	g := NewWithT(t)
+
+	g.Expect(storeIDForDataOrdinal(0)).To(Equal("1"))
+	g.Expect(storeIDForDataOrdinal(9)).To(Equal("a"))
+}
+
+func TestSetDataScaleDownStatusRecordsAutoscalerSource(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{}
+
+	reconciler.setDataScaleDownStatus(cluster, antflyv1.DataScaleDownSourceAutoscaler, 5, 3, 4, 4, "5", "Draining", "draining")
+
+	g.Expect(cluster.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.DataScaleDownStatus.Source).To(Equal(antflyv1.DataScaleDownSourceAutoscaler))
+	g.Expect(cluster.Status.DataScaleDownStatus.FromReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.DataScaleDownStatus.TargetReplicas).To(Equal(int32(3)))
+	g.Expect(cluster.Status.DataScaleDownStatus.AppliedReplicas).To(Equal(int32(4)))
+	g.Expect(cluster.Status.DataScaleDownStatus.DrainingOrdinal).To(Equal(int32(4)))
+	g.Expect(cluster.Status.DataScaleDownStatus.DrainingStoreID).To(Equal("5"))
+	g.Expect(cluster.Status.DataScaleDownStatus.Phase).To(Equal("Draining"))
+}
+
+func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 9},
+		Spec: antflyv1.AntflyClusterSpec{
+			ProductTier: &antflyv1.ProductTierSpec{
+				Name:         "pro",
+				Revision:     "2026-05",
+				ManagedBy:    "cloudaf",
+				MetadataTier: "metadata-small",
+				DataTier:     "data-large",
+			},
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas: 3,
+				Resources: antflyv1.ResourceSpec{
+					CPU:    "500m",
+					Memory: "1Gi",
+				},
+			},
+			DataNodes: antflyv1.DataNodesSpec{
+				Replicas: 5,
+				Resources: antflyv1.ResourceSpec{
+					CPU:    "2",
+					Memory: "8Gi",
+				},
+				AutoScaling: &antflyv1.AutoScalingSpec{
+					Enabled:     true,
+					MinReplicas: 3,
+					MaxReplicas: 8,
+				},
+			},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "5Gi",
+				DataStorage:     "100Gi",
+			},
+		},
+	}
+
+	reconciler.updateProductTierStatus(cluster)
+
+	g.Expect(cluster.Status.ProductTierStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.ProductTierStatus.Name).To(Equal("pro"))
+	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeClustered))
+	g.Expect(cluster.Status.ProductTierStatus.MetadataResources).To(Equal("cpu=500m memory=1Gi"))
+	g.Expect(cluster.Status.ProductTierStatus.DataStorage).To(Equal("100Gi"))
+	g.Expect(cluster.Status.ProductTierStatus.DataAutoscaling).To(Equal("enabled min=3 max=8"))
+	g.Expect(cluster.Status.ProductTierStatus.ObservedGeneration).To(Equal(int64(9)))
 }
 
 // T006: Unit test for public API service deletion when disabled

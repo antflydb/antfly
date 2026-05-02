@@ -2807,6 +2807,46 @@ spec:
                 - Clustered
                 - Swarm
                 type: string
+              productTier:
+                description: |-
+                  ProductTier records the CloudAF/product tier intent that was expanded
+                  into the explicit operator fields below. The operator does not resolve
+                  prices or tier catalogs; it validates that a stamped tier has concrete
+                  resources, storage, and autoscaling intent in the normal fields.
+                properties:
+                  dataTier:
+                    description: |-
+                      DataTier optionally records the data-node sub-tier name when
+                      Mode=Clustered.
+                    type: string
+                  managedBy:
+                    description: |-
+                      ManagedBy identifies the system that expanded the tier, for example
+                      "cloudaf".
+                    type: string
+                  metadataTier:
+                    description: |-
+                      MetadataTier optionally records the metadata-node sub-tier name when
+                      Mode=Clustered.
+                    type: string
+                  name:
+                    description: Name is the external product tier name, such as "starter"
+                      or "pro".
+                    type: string
+                  revision:
+                    description: Revision identifies the tier catalog revision used
+                      to expand this CR.
+                    type: string
+                  swarmTier:
+                    description: SwarmTier optionally records the swarm sub-tier name
+                      when Mode=Swarm.
+                    type: string
+                  termiteTier:
+                    description: |-
+                      TermiteTier optionally records the TermitePool sub-tier name when
+                      spec.termite is set.
+                    type: string
+                type: object
               publicAPI:
                 description: |-
                   PublicAPI defines the public API service configuration (optional)
@@ -2906,6 +2946,37 @@ spec:
                         enum:
                         - Retain
                         - Delete
+                        type: string
+                    type: object
+                  storageAutoGrow:
+                    description: |-
+                      StorageAutoGrow configures operator-owned grow-only disk autoscaling.
+                      Clustered mode currently applies this policy only to data PVCs. Swarm
+                      mode applies it to the swarm PVC.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the operator automatically
+                          grows storage.
+                        type: boolean
+                      growIncrement:
+                        description: |-
+                          GrowIncrement is the amount added per grow step. Defaults to 10Gi when
+                          omitted.
+                        type: string
+                      growThresholdPercent:
+                        description: |-
+                          GrowThresholdPercent is the percent-used threshold that triggers growth.
+                          Defaults to 85 when omitted.
+                        format: int32
+                        type: integer
+                      maxDataStorage:
+                        description: MaxDataStorage is the maximum size for clustered
+                          data PVC auto-grow.
+                        type: string
+                      maxSwarmStorage:
+                        description: |-
+                          MaxSwarmStorage is the maximum size for swarm PVC auto-grow. If omitted
+                          in swarm mode, MaxDataStorage is used as the limit.
                         type: string
                     type: object
                   storageClass:
@@ -5933,6 +6004,14 @@ spec:
               autoScalingStatus:
                 description: AutoScalingStatus tracks autoscaling state
                 properties:
+                  blockedMessage:
+                    description: BlockedMessage provides human-readable detail for
+                      BlockedReason.
+                    type: string
+                  blockedReason:
+                    description: BlockedReason explains why the autoscaler recommendation
+                      was not applied.
+                    type: string
                   currentCPUUtilizationPercentage:
                     description: CurrentCPUUtilizationPercentage is the current CPU
                       utilization
@@ -5948,7 +6027,10 @@ spec:
                     format: int32
                     type: integer
                   desiredReplicas:
-                    description: DesiredReplicas is the desired number of replicas
+                    description: |-
+                      DesiredReplicas is the replica count the operator is currently applying.
+                      When scale-down is blocked, this remains at CurrentReplicas even if
+                      RecommendationReplicas is lower.
                     format: int32
                     type: integer
                   lastScaleDirection:
@@ -5960,6 +6042,12 @@ spec:
                     description: LastScaleTime is the last time scaling occurred
                     format: date-time
                     type: string
+                  recommendationReplicas:
+                    description: |-
+                      RecommendationReplicas is the latest replica recommendation from the
+                      operator autoscaler before safety gates are applied.
+                    format: int32
+                    type: integer
                 required:
                 - currentReplicas
                 - desiredReplicas
@@ -6025,6 +6113,51 @@ spec:
                 description: DataNodesReady represents the number of ready data nodes
                 format: int32
                 type: integer
+              dataScaleDownStatus:
+                description: DataScaleDownStatus tracks the operator-owned data-node
+                  scale-down workflow.
+                properties:
+                  appliedReplicas:
+                    description: AppliedReplicas is the replica count applied to the
+                      StatefulSet for this step.
+                    format: int32
+                    type: integer
+                  drainingOrdinal:
+                    description: DrainingOrdinal is the StatefulSet ordinal selected
+                      for this step.
+                    format: int32
+                    type: integer
+                  drainingStoreID:
+                    description: DrainingStoreID is the Antfly store ID selected for
+                      this step.
+                    type: string
+                  fromReplicas:
+                    description: FromReplicas is the observed/applied replica count
+                      before this scale-down step.
+                    format: int32
+                    type: integer
+                  lastTransitionTime:
+                    description: LastTransitionTime records the last phase transition.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message describes the current scale-down workflow
+                      state.
+                    type: string
+                  phase:
+                    description: Phase is the current scale-down workflow phase.
+                    type: string
+                  source:
+                    description: |-
+                      Source reports whether the current scale-down step was requested by the
+                      manual replica field or by the operator autoscaler.
+                    type: string
+                  targetReplicas:
+                    description: TargetReplicas is the user or autoscaler requested
+                      final replica count.
+                    format: int32
+                    type: integer
+                type: object
               metadataNodesReady:
                 description: MetadataNodesReady represents the number of ready metadata
                   nodes
@@ -6043,6 +6176,85 @@ spec:
               phase:
                 description: Phase represents the current phase of the cluster
                 type: string
+              productTierStatus:
+                description: ProductTierStatus reports the concrete shape observed
+                  for spec.productTier.
+                properties:
+                  dataAutoscaling:
+                    description: DataAutoscaling reports the observed data autoscaling
+                      bounds.
+                    type: string
+                  dataReplicas:
+                    description: DataReplicas is the observed data replica count.
+                    format: int32
+                    type: integer
+                  dataResources:
+                    description: DataResources summarizes data CPU/memory requests
+                      and limits.
+                    type: string
+                  dataStorage:
+                    description: DataStorage is the observed data storage size.
+                    type: string
+                  dataTier:
+                    description: DataTier records the observed data sub-tier name.
+                    type: string
+                  managedBy:
+                    description: ManagedBy is the observed tier owner.
+                    type: string
+                  metadataReplicas:
+                    description: MetadataReplicas is the observed metadata replica
+                      count.
+                    format: int32
+                    type: integer
+                  metadataResources:
+                    description: MetadataResources summarizes metadata CPU/memory
+                      requests and limits.
+                    type: string
+                  metadataStorage:
+                    description: MetadataStorage is the observed metadata storage
+                      size.
+                    type: string
+                  metadataTier:
+                    description: MetadataTier records the observed metadata sub-tier
+                      name.
+                    type: string
+                  mode:
+                    description: Mode is the topology mode for this tier shape.
+                    type: string
+                  name:
+                    description: Name is the observed tier name.
+                    type: string
+                  observedGeneration:
+                    description: ObservedGeneration is the AntflyCluster generation
+                      used for this status.
+                    format: int64
+                    type: integer
+                  revision:
+                    description: Revision is the observed tier catalog revision.
+                    type: string
+                  swarmResources:
+                    description: SwarmResources summarizes swarm CPU/memory requests
+                      and limits.
+                    type: string
+                  swarmStorage:
+                    description: SwarmStorage is the observed swarm storage size.
+                    type: string
+                  swarmTier:
+                    description: SwarmTier records the observed swarm sub-tier name.
+                    type: string
+                  termiteEnabled:
+                    description: TermiteEnabled reports whether this tier has an operator-managed
+                      TermitePool.
+                    type: boolean
+                  termiteReplicas:
+                    description: TermiteReplicas reports the observed TermitePool
+                      replica bounds.
+                    type: string
+                  termiteTier:
+                    description: TermiteTier records the observed termite sub-tier
+                      name.
+                    type: string
+                type: object
               readyReplicas:
                 description: ReadyReplicas is the total number of ready replicas across
                   the active topology.
@@ -6071,6 +6283,52 @@ spec:
                   totalPods:
                     description: TotalPods total expected pods (metadata + data replicas)
                     format: int32
+                    type: integer
+                type: object
+              storageAutoGrowStatus:
+                description: StorageAutoGrowStatus tracks the latest operator-owned
+                  storage auto-grow evaluation.
+                properties:
+                  capacityBytes:
+                    description: CapacityBytes is the observed capacity bytes across
+                      matching PVC volumes.
+                    format: int64
+                    type: integer
+                  component:
+                    description: Component is the component evaluated by the latest
+                      auto-grow pass.
+                    type: string
+                  currentSize:
+                    description: CurrentSize is the current effective requested PVC
+                      size.
+                    type: string
+                  lastEvaluationTime:
+                    description: LastEvaluationTime records when auto-grow was last
+                      evaluated.
+                    format: date-time
+                    type: string
+                  maxSize:
+                    description: MaxSize is the configured maximum size for the evaluated
+                      component.
+                    type: string
+                  message:
+                    description: Message describes the latest auto-grow decision.
+                    type: string
+                  reason:
+                    description: Reason is the reason for the latest auto-grow decision.
+                    type: string
+                  recommendedSize:
+                    description: RecommendedSize is the size the operator selected
+                      when growth is needed.
+                    type: string
+                  usagePercent:
+                    description: UsagePercent is the observed storage usage percentage.
+                    format: int32
+                    type: integer
+                  usedBytes:
+                    description: UsedBytes is the observed used bytes across matching
+                      PVC volumes.
+                    format: int64
                     type: integer
                 type: object
               swarmNodesReady:

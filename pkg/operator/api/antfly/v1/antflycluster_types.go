@@ -53,8 +53,35 @@ const (
 	// TypeStorageHealthy indicates whether PVC/storage topology is healthy
 	TypeStorageHealthy = "StorageHealthy"
 
+	// TypePVCExpansion indicates whether requested PVC expansion has completed
+	TypePVCExpansion = "PVCExpansion"
+
+	// TypeStorageAutoGrow indicates whether storage auto-grow is active and healthy
+	TypeStorageAutoGrow = "StorageAutoGrow"
+
+	// TypeRollout indicates whether StatefulSet template changes have rolled out
+	TypeRollout = "Rollout"
+
+	// TypeScaling indicates whether replica scaling can proceed safely
+	TypeScaling = "Scaling"
+
 	// TypeTermitePoolReady indicates whether the operator-managed TermitePool is reconciled
 	TypeTermitePoolReady = "TermitePoolReady"
+
+	// TypeMetadataReady indicates whether metadata pods are ready.
+	TypeMetadataReady = "MetadataReady"
+
+	// TypeDataReady indicates whether data pods are ready.
+	TypeDataReady = "DataReady"
+
+	// TypeSwarmReady indicates whether swarm pods are ready.
+	TypeSwarmReady = "SwarmReady"
+
+	// TypeTermiteReady indicates whether termite is ready when managed in swarm mode.
+	TypeTermiteReady = "TermiteReady"
+
+	// TypeAvailable indicates whether the cluster is serving.
+	TypeAvailable = "Available"
 
 	// ReasonTermitePoolReady indicates the managed TermitePool reconcile completed
 	ReasonTermitePoolReady = "TermitePoolReady"
@@ -76,6 +103,84 @@ const (
 
 	// ReasonPVCExpansionFailed indicates a PVC expansion request failed
 	ReasonPVCExpansionFailed = "PVCExpansionFailed"
+
+	// ReasonPVCExpansionPending indicates PVCs have not appeared for a resize check yet
+	ReasonPVCExpansionPending = "PVCExpansionPending"
+
+	// ReasonPVCExpansionInProgress indicates requested PVC expansion is still applying
+	ReasonPVCExpansionInProgress = "PVCExpansionInProgress"
+
+	// ReasonPVCExpansionComplete indicates all observed PVCs satisfy requested storage
+	ReasonPVCExpansionComplete = "PVCExpansionComplete"
+
+	// ReasonStorageAutoGrowDisabled indicates storage auto-grow is not enabled
+	ReasonStorageAutoGrowDisabled = "StorageAutoGrowDisabled"
+
+	// ReasonStorageAutoGrowReady indicates storage usage is below the grow threshold
+	ReasonStorageAutoGrowReady = "StorageAutoGrowReady"
+
+	// ReasonStorageAutoGrowInProgress indicates the operator requested automatic storage growth
+	ReasonStorageAutoGrowInProgress = "StorageAutoGrowInProgress"
+
+	// ReasonStorageAutoGrowUsageUnavailable indicates PVC usage metrics are unavailable
+	ReasonStorageAutoGrowUsageUnavailable = "StorageAutoGrowUsageUnavailable"
+
+	// ReasonStorageAutoGrowMaxReached indicates a PVC is at the configured auto-grow maximum
+	ReasonStorageAutoGrowMaxReached = "StorageAutoGrowMaxReached"
+
+	// ReasonStorageAutoGrowFailed indicates storage auto-grow could not be evaluated
+	ReasonStorageAutoGrowFailed = "StorageAutoGrowFailed"
+
+	// ReasonRolloutInProgress indicates StatefulSet changes are still rolling out
+	ReasonRolloutInProgress = "RolloutInProgress"
+
+	// ReasonRolloutComplete indicates StatefulSet changes have rolled out
+	ReasonRolloutComplete = "RolloutComplete"
+
+	// ReasonRolloutFailed indicates StatefulSet rollout failed or could not be observed
+	ReasonRolloutFailed = "RolloutFailed"
+
+	// ReasonScalingReady indicates scaling is not currently blocked
+	ReasonScalingReady = "ScalingReady"
+
+	// ReasonDataScaleDownBlocked indicates data-node scale-down is blocked by a safety gate
+	ReasonDataScaleDownBlocked = "DataScaleDownBlocked"
+
+	// ReasonDataScaleDownInProgress indicates data-node scale-down is draining one ordinal
+	ReasonDataScaleDownInProgress = "DataScaleDownInProgress"
+
+	// ReasonDataScaleDownFailed indicates data-node scale-down could not drain the selected ordinal
+	ReasonDataScaleDownFailed = "DataScaleDownFailed"
+
+	// ReasonComponentReady indicates a cluster component has enough ready replicas.
+	ReasonComponentReady = "ComponentReady"
+
+	// ReasonWaitingForPods indicates a component is waiting for ready pods.
+	ReasonWaitingForPods = "WaitingForPods"
+
+	// ReasonRuntimeDegraded indicates pod diagnostics found a runtime failure.
+	ReasonRuntimeDegraded = "RuntimeDegraded"
+
+	// ReasonUnschedulable indicates pods cannot be scheduled.
+	ReasonUnschedulable = "Unschedulable"
+
+	// ReasonImagePullFailed indicates a container image could not be pulled.
+	ReasonImagePullFailed = "ImagePullFailed"
+
+	// ReasonCrashLooping indicates a container is crashlooping.
+	ReasonCrashLooping = "CrashLooping"
+
+	// ReasonProbeFailed indicates a probe failure is preventing readiness.
+	ReasonProbeFailed = "ProbeFailed"
+
+	// ReasonAvailable indicates the cluster is available.
+	ReasonAvailable = "Available"
+
+	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
+	DataScaleDownSourceManual = "Manual"
+
+	// DataScaleDownSourceAutoscaler indicates the scale-down target came from the operator autoscaler.
+	DataScaleDownSourceAutoscaler = "Autoscaler"
 
 	// FinalizerPVCCleanup is the finalizer used for PVC cleanup on cluster deletion
 	FinalizerPVCCleanup = "antfly.io/pvc-cleanup"
@@ -116,6 +221,13 @@ type AntflyClusterSpec struct {
 	// +optional
 	Termite *termitev1alpha1.TermitePoolSpec `json:"termite,omitempty"`
 
+	// ProductTier records the CloudAF/product tier intent that was expanded
+	// into the explicit operator fields below. The operator does not resolve
+	// prices or tier catalogs; it validates that a stamped tier has concrete
+	// resources, storage, and autoscaling intent in the normal fields.
+	// +optional
+	ProductTier *ProductTierSpec `json:"productTier,omitempty"`
+
 	// MetadataNodes defines the configuration for metadata nodes (StatefulSet).
 	// Required for Clustered mode and must be omitted in Swarm mode.
 	// +optional
@@ -152,6 +264,41 @@ type AntflyClusterSpec struct {
 	// If not specified, the default ServiceAccount for the namespace is used
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
+// ProductTierSpec records product-tier provenance for a CR whose concrete
+// sizing has already been expanded into explicit operator fields.
+type ProductTierSpec struct {
+	// Name is the external product tier name, such as "starter" or "pro".
+	Name string `json:"name,omitempty"`
+
+	// Revision identifies the tier catalog revision used to expand this CR.
+	// +optional
+	Revision string `json:"revision,omitempty"`
+
+	// ManagedBy identifies the system that expanded the tier, for example
+	// "cloudaf".
+	// +optional
+	ManagedBy string `json:"managedBy,omitempty"`
+
+	// SwarmTier optionally records the swarm sub-tier name when Mode=Swarm.
+	// +optional
+	SwarmTier string `json:"swarmTier,omitempty"`
+
+	// MetadataTier optionally records the metadata-node sub-tier name when
+	// Mode=Clustered.
+	// +optional
+	MetadataTier string `json:"metadataTier,omitempty"`
+
+	// DataTier optionally records the data-node sub-tier name when
+	// Mode=Clustered.
+	// +optional
+	DataTier string `json:"dataTier,omitempty"`
+
+	// TermiteTier optionally records the TermitePool sub-tier name when
+	// spec.termite is set.
+	// +optional
+	TermiteTier string `json:"termiteTier,omitempty"`
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
@@ -414,6 +561,33 @@ type StorageSpec struct {
 	// the finalizer provides a fallback for WhenDeleted=Delete.
 	// +optional
 	PVCRetentionPolicy *PVCRetentionPolicy `json:"pvcRetentionPolicy,omitempty"`
+
+	// StorageAutoGrow configures operator-owned grow-only disk autoscaling.
+	// Clustered mode currently applies this policy only to data PVCs. Swarm
+	// mode applies it to the swarm PVC.
+	// +optional
+	StorageAutoGrow *StorageAutoGrowSpec `json:"storageAutoGrow,omitempty"`
+}
+
+// StorageAutoGrowSpec configures automatic grow-only PVC expansion.
+type StorageAutoGrowSpec struct {
+	// Enabled controls whether the operator automatically grows storage.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// MaxDataStorage is the maximum size for clustered data PVC auto-grow.
+	MaxDataStorage string `json:"maxDataStorage,omitempty"`
+
+	// MaxSwarmStorage is the maximum size for swarm PVC auto-grow. If omitted
+	// in swarm mode, MaxDataStorage is used as the limit.
+	MaxSwarmStorage string `json:"maxSwarmStorage,omitempty"`
+
+	// GrowThresholdPercent is the percent-used threshold that triggers growth.
+	// Defaults to 85 when omitted.
+	GrowThresholdPercent int32 `json:"growThresholdPercent,omitempty"`
+
+	// GrowIncrement is the amount added per grow step. Defaults to 10Gi when
+	// omitted.
+	GrowIncrement string `json:"growIncrement,omitempty"`
 }
 
 // PVCRetentionPolicyType defines the retention behavior for PVCs
@@ -619,6 +793,18 @@ type AntflyClusterStatus struct {
 	// AutoScalingStatus tracks autoscaling state
 	AutoScalingStatus *AutoScalingStatus `json:"autoScalingStatus,omitempty"`
 
+	// DataScaleDownStatus tracks the operator-owned data-node scale-down workflow.
+	// +optional
+	DataScaleDownStatus *DataScaleDownStatus `json:"dataScaleDownStatus,omitempty"`
+
+	// StorageAutoGrowStatus tracks the latest operator-owned storage auto-grow evaluation.
+	// +optional
+	StorageAutoGrowStatus *StorageAutoGrowStatus `json:"storageAutoGrowStatus,omitempty"`
+
+	// ProductTierStatus reports the concrete shape observed for spec.productTier.
+	// +optional
+	ProductTierStatus *ProductTierStatus `json:"productTierStatus,omitempty"`
+
 	// SwarmStatus reports swarm-specific operational state.
 	// +optional
 	SwarmStatus *SwarmStatus `json:"swarmStatus,omitempty"`
@@ -633,8 +819,23 @@ type AutoScalingStatus struct {
 	// CurrentReplicas is the current number of replicas
 	CurrentReplicas int32 `json:"currentReplicas"`
 
-	// DesiredReplicas is the desired number of replicas
+	// DesiredReplicas is the replica count the operator is currently applying.
+	// When scale-down is blocked, this remains at CurrentReplicas even if
+	// RecommendationReplicas is lower.
 	DesiredReplicas int32 `json:"desiredReplicas"`
+
+	// RecommendationReplicas is the latest replica recommendation from the
+	// operator autoscaler before safety gates are applied.
+	// +optional
+	RecommendationReplicas int32 `json:"recommendationReplicas,omitempty"`
+
+	// BlockedReason explains why the autoscaler recommendation was not applied.
+	// +optional
+	BlockedReason string `json:"blockedReason,omitempty"`
+
+	// BlockedMessage provides human-readable detail for BlockedReason.
+	// +optional
+	BlockedMessage string `json:"blockedMessage,omitempty"`
 
 	// LastScaleTime is the last time scaling occurred
 	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
@@ -649,6 +850,134 @@ type AutoScalingStatus struct {
 
 	// CurrentMemoryUtilizationPercentage is the current memory utilization
 	CurrentMemoryUtilizationPercentage *int32 `json:"currentMemoryUtilizationPercentage,omitempty"`
+}
+
+// DataScaleDownStatus tracks a one-ordinal-at-a-time data-node scale-down.
+type DataScaleDownStatus struct {
+	// Source reports whether the current scale-down step was requested by the
+	// manual replica field or by the operator autoscaler.
+	// +optional
+	Source string `json:"source,omitempty"`
+
+	// FromReplicas is the observed/applied replica count before this scale-down step.
+	FromReplicas int32 `json:"fromReplicas,omitempty"`
+
+	// TargetReplicas is the user or autoscaler requested final replica count.
+	TargetReplicas int32 `json:"targetReplicas,omitempty"`
+
+	// AppliedReplicas is the replica count applied to the StatefulSet for this step.
+	AppliedReplicas int32 `json:"appliedReplicas,omitempty"`
+
+	// DrainingOrdinal is the StatefulSet ordinal selected for this step.
+	DrainingOrdinal int32 `json:"drainingOrdinal,omitempty"`
+
+	// DrainingStoreID is the Antfly store ID selected for this step.
+	DrainingStoreID string `json:"drainingStoreID,omitempty"`
+
+	// Phase is the current scale-down workflow phase.
+	Phase string `json:"phase,omitempty"`
+
+	// Message describes the current scale-down workflow state.
+	Message string `json:"message,omitempty"`
+
+	// LastTransitionTime records the last phase transition.
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
+// StorageAutoGrowStatus tracks the latest storage auto-grow decision.
+type StorageAutoGrowStatus struct {
+	// Component is the component evaluated by the latest auto-grow pass.
+	Component string `json:"component,omitempty"`
+
+	// CurrentSize is the current effective requested PVC size.
+	CurrentSize string `json:"currentSize,omitempty"`
+
+	// RecommendedSize is the size the operator selected when growth is needed.
+	RecommendedSize string `json:"recommendedSize,omitempty"`
+
+	// MaxSize is the configured maximum size for the evaluated component.
+	MaxSize string `json:"maxSize,omitempty"`
+
+	// UsedBytes is the observed used bytes across matching PVC volumes.
+	UsedBytes int64 `json:"usedBytes,omitempty"`
+
+	// CapacityBytes is the observed capacity bytes across matching PVC volumes.
+	CapacityBytes int64 `json:"capacityBytes,omitempty"`
+
+	// UsagePercent is the observed storage usage percentage.
+	UsagePercent int32 `json:"usagePercent,omitempty"`
+
+	// Reason is the reason for the latest auto-grow decision.
+	Reason string `json:"reason,omitempty"`
+
+	// Message describes the latest auto-grow decision.
+	Message string `json:"message,omitempty"`
+
+	// LastEvaluationTime records when auto-grow was last evaluated.
+	LastEvaluationTime *metav1.Time `json:"lastEvaluationTime,omitempty"`
+}
+
+// ProductTierStatus reports the concrete operator fields produced from a tier.
+type ProductTierStatus struct {
+	// Name is the observed tier name.
+	Name string `json:"name,omitempty"`
+
+	// Revision is the observed tier catalog revision.
+	Revision string `json:"revision,omitempty"`
+
+	// ManagedBy is the observed tier owner.
+	ManagedBy string `json:"managedBy,omitempty"`
+
+	// Mode is the topology mode for this tier shape.
+	Mode ClusterMode `json:"mode,omitempty"`
+
+	// SwarmTier records the observed swarm sub-tier name.
+	SwarmTier string `json:"swarmTier,omitempty"`
+
+	// MetadataTier records the observed metadata sub-tier name.
+	MetadataTier string `json:"metadataTier,omitempty"`
+
+	// DataTier records the observed data sub-tier name.
+	DataTier string `json:"dataTier,omitempty"`
+
+	// TermiteTier records the observed termite sub-tier name.
+	TermiteTier string `json:"termiteTier,omitempty"`
+
+	// SwarmResources summarizes swarm CPU/memory requests and limits.
+	SwarmResources string `json:"swarmResources,omitempty"`
+
+	// SwarmStorage is the observed swarm storage size.
+	SwarmStorage string `json:"swarmStorage,omitempty"`
+
+	// MetadataReplicas is the observed metadata replica count.
+	MetadataReplicas int32 `json:"metadataReplicas,omitempty"`
+
+	// MetadataResources summarizes metadata CPU/memory requests and limits.
+	MetadataResources string `json:"metadataResources,omitempty"`
+
+	// MetadataStorage is the observed metadata storage size.
+	MetadataStorage string `json:"metadataStorage,omitempty"`
+
+	// DataReplicas is the observed data replica count.
+	DataReplicas int32 `json:"dataReplicas,omitempty"`
+
+	// DataResources summarizes data CPU/memory requests and limits.
+	DataResources string `json:"dataResources,omitempty"`
+
+	// DataStorage is the observed data storage size.
+	DataStorage string `json:"dataStorage,omitempty"`
+
+	// DataAutoscaling reports the observed data autoscaling bounds.
+	DataAutoscaling string `json:"dataAutoscaling,omitempty"`
+
+	// TermiteEnabled reports whether this tier has an operator-managed TermitePool.
+	TermiteEnabled bool `json:"termiteEnabled,omitempty"`
+
+	// TermiteReplicas reports the observed TermitePool replica bounds.
+	TermiteReplicas string `json:"termiteReplicas,omitempty"`
+
+	// ObservedGeneration is the AntflyCluster generation used for this status.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // ServiceMeshStatus reports service mesh operational status

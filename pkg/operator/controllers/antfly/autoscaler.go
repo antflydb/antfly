@@ -43,8 +43,10 @@ type MetricsData struct {
 	PodCount                    int32
 }
 
-// EvaluateScaling evaluates if scaling is needed and returns desired replicas
-func (a *AutoScaler) EvaluateScaling(ctx context.Context, cluster *antflyv1.AntflyCluster) (int32, error) {
+// EvaluateScaling evaluates if scaling is needed and returns the autoscaler's
+// replica recommendation. The caller provides observed currentReplicas because
+// spec.dataNodes.replicas is only authoritative when autoscaling is disabled.
+func (a *AutoScaler) EvaluateScaling(ctx context.Context, cluster *antflyv1.AntflyCluster, currentReplicas int32) (int32, error) {
 	log := log.FromContext(ctx)
 
 	// Check if autoscaling is enabled
@@ -53,7 +55,6 @@ func (a *AutoScaler) EvaluateScaling(ctx context.Context, cluster *antflyv1.Antf
 	}
 
 	autoScaling := cluster.Spec.DataNodes.AutoScaling
-	currentReplicas := cluster.Spec.DataNodes.Replicas
 
 	// Check cooldown periods
 	if !a.canScale(cluster, autoScaling) {
@@ -303,14 +304,19 @@ func (a *AutoScaler) canScale(cluster *antflyv1.AntflyCluster, autoScaling *antf
 	return now.Sub(lastScaleTime) >= cooldownDuration
 }
 
-// UpdateScalingStatus updates the autoscaling status after a scaling decision
-func (a *AutoScaler) UpdateScalingStatus(cluster *antflyv1.AntflyCluster, desiredReplicas int32) {
+// UpdateScalingStatus updates the autoscaling status after a scaling decision.
+// desiredReplicas is the replica count the operator will apply after safety
+// gates; recommendationReplicas is the raw autoscaler output.
+func (a *AutoScaler) UpdateScalingStatus(cluster *antflyv1.AntflyCluster, currentReplicas, desiredReplicas, recommendationReplicas int32, blockedReason, blockedMessage string) {
 	if cluster.Status.AutoScalingStatus == nil {
 		cluster.Status.AutoScalingStatus = &antflyv1.AutoScalingStatus{}
 	}
 
-	currentReplicas := cluster.Spec.DataNodes.Replicas
+	cluster.Status.AutoScalingStatus.CurrentReplicas = currentReplicas
 	cluster.Status.AutoScalingStatus.DesiredReplicas = desiredReplicas
+	cluster.Status.AutoScalingStatus.RecommendationReplicas = recommendationReplicas
+	cluster.Status.AutoScalingStatus.BlockedReason = blockedReason
+	cluster.Status.AutoScalingStatus.BlockedMessage = blockedMessage
 
 	// Update last scale time and direction if replicas changed
 	if desiredReplicas != currentReplicas {
