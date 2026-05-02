@@ -235,7 +235,7 @@ func (r *AntflyClusterReconciler) deregisterDataNodes(ctx context.Context, clust
 	// Deregister highest ordinals first (they are removed by StatefulSet on scale-down)
 	for ordinal := currentReplicas - 1; ordinal >= desiredReplicas; ordinal-- {
 		storeIDString := storeIDForDataOrdinal(ordinal)
-		url := fmt.Sprintf("%s/_internal/v1/store/%s", metadataAddr, storeIDString)
+		url := fmt.Sprintf("%s/internal/v1/store/%s", metadataAddr, storeIDString)
 
 		log.Info("Deregistering data node before scale-down", "ordinal", ordinal, "storeID", storeIDString)
 

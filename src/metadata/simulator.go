@@ -111,7 +111,7 @@ func (ms *MetadataStore) ReconcileOnce(ctx context.Context) {
 // store shard notifier during in-process simulation.
 func (ms *MetadataStore) InternalHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /_internal/v1/shard/{shardID}/txn/resolve", ms.handleForwardResolveIntent)
+	mux.HandleFunc("POST /internal/v1/shard/{shardID}/txn/resolve", ms.handleForwardResolveIntent)
 	return mux
 }
 

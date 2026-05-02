@@ -429,8 +429,14 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	api.AddRoutes(internalMux)
 	internalMux.HandleFunc("POST /reallocate", r.node.handleReallocateShards)
 
+	metadataMux := http.NewServeMux()
+	api.AddMetadataRoutes(metadataMux)
+
 	publicMux := r.node.publicApiRoutes()
 	apiRoutes := http.NewServeMux()
+	apiRoutes.Handle("/metadata/v1/", http.StripPrefix("/metadata/v1", metadataMux))
+	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
+	// Compatibility aliases for clients using the pre-consolidation path scheme.
 	apiRoutes.Handle("/api/v1/", http.StripPrefix("/api/v1", publicMux))
 	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
 	addAntfarmRoutes(apiRoutes)

@@ -28,7 +28,7 @@ import (
 )
 
 // TestStoreRegistrationEndpoint verifies that the store registration
-// uses the correct /_internal/v1/store endpoint
+// uses the correct /internal/v1/store endpoint.
 func TestStoreRegistrationEndpoint(t *testing.T) {
 	// Track the request path
 	var requestPath string
@@ -65,8 +65,8 @@ func TestStoreRegistrationEndpoint(t *testing.T) {
 	require.NoError(t, err, "Registration failed")
 
 	// Verify the endpoint path
-	expectedPath := "/_internal/v1/store"
-	assert.Equal(t, expectedPath, requestPath, "Request path should use /_internal/v1/ prefix")
+	expectedPath := "/internal/v1/store"
+	assert.Equal(t, expectedPath, requestPath, "Request path should use /internal/v1/ prefix")
 
 	// Verify the HTTP method
 	assert.Equal(t, http.MethodPost, requestMethod, "Should use POST method")
@@ -82,17 +82,17 @@ func TestStoreRegistrationURL(t *testing.T) {
 		{
 			name:        "http URL",
 			leaderURL:   "http://127.0.0.1:12277",
-			expectedURL: "http://127.0.0.1:12277/_internal/v1/store",
+			expectedURL: "http://127.0.0.1:12277/internal/v1/store",
 		},
 		{
 			name:        "https URL",
 			leaderURL:   "https://metadata.example.com:8080",
-			expectedURL: "https://metadata.example.com:8080/_internal/v1/store",
+			expectedURL: "https://metadata.example.com:8080/internal/v1/store",
 		},
 		{
 			name:        "URL with trailing slash",
 			leaderURL:   "http://127.0.0.1:12277/",
-			expectedURL: "http://127.0.0.1:12277//_internal/v1/store", // Will still work with double slash
+			expectedURL: "http://127.0.0.1:12277//internal/v1/store", // Will still work with double slash
 		},
 	}
 
@@ -122,9 +122,9 @@ func TestStoreRegistrationURL(t *testing.T) {
 			// Use the server URL (ignore tt.leaderURL since we need to use the test server)
 			_ = registerWithLeader(context.Background(), server.Client(), server.URL, store, conf)
 
-			// Verify the path includes /_internal/v1/store
-			assert.Equal(t, "/_internal/v1/store", capturedURL,
-				"Path should be /_internal/v1/store")
+			// Verify the path includes /internal/v1/store.
+			assert.Equal(t, "/internal/v1/store", capturedURL,
+				"Path should be /internal/v1/store")
 		})
 	}
 }

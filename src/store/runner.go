@@ -60,7 +60,7 @@ func registerWithLeader(
 
 	// Send the request
 	// FIXME (ajr) Use TLS if configured
-	req, err := http.NewRequest(http.MethodPost, leaderURL+"/_internal/v1/store", buf)
+	req, err := http.NewRequest(http.MethodPost, leaderURL+"/internal/v1/store", buf)
 	if err != nil {
 		return fmt.Errorf("creating registration request: %w", err)
 	}

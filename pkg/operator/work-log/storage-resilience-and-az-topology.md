@@ -212,7 +212,7 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 
 **Background**:
 - Store ID is deterministic: `store_id = pod_ordinal + 1` (set in the data StatefulSet entrypoint command at `antflycluster_controller.go:1151-1158`)
-- Deregistration API: `DELETE /_internal/v1/store/{store_id}` on the metadata service (`src/metadata/runner.go:315`)
+- Deregistration API: `DELETE /internal/v1/store/{store_id}` on the metadata service (`src/metadata/runner.go:315`)
 - This calls `TombstoneStore()` which marks the store as `Terminating` and triggers the metadata reconciler to remove it from all Raft voter groups (`src/tablemgr/table.go:587-603`)
 - Completion: the metadata reconciler removes the store from all shard Raft groups (sync peer removal), then deletes the tombstone. Timeline: 1-30s depending on shard count.
 
@@ -220,7 +220,7 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 - Add `deregisterDataNodes(cluster, currentReplicas, desiredReplicas)` function:
   1. Calculate ordinals being removed: `desiredReplicas` to `currentReplicas - 1` (highest ordinals first)
   2. For each ordinal, compute `storeID = ordinal + 1`
-  3. Call `DELETE http://{cluster.Name}-metadata.{namespace}.svc:12377/_internal/v1/store/{storeID}`
+  3. Call `DELETE http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/store/{storeID}`
   4. If the call fails with connection refused (metadata not ready), requeue with backoff
   5. If the call succeeds, proceed — the metadata reconciler handles the rest asynchronously
 - Call `deregisterDataNodes()` in `Reconcile()` between the autoscaler evaluation and `reconcileDataStatefulSet()`. By this point, `workingCluster.Spec.DataNodes.Replicas` already reflects either the manual value (from the CRD spec) or the autoscaler's calculated value (written at line 470). This single call site handles both scaling paths.
@@ -233,7 +233,7 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 
 **Metadata service discovery**: The operator already creates the metadata headless service. The address is `{cluster.Name}-metadata.{namespace}.svc:{metadataAPIPort}`. The metadata API port (12377) is already defined in the controller's constants.
 
-**HTTP client**: Add a simple HTTP client to the reconciler struct (reuse `http.DefaultClient` or inject via controller setup). No authentication needed — the `/_internal/v1/` endpoints are cluster-internal.
+**HTTP client**: Add a simple HTTP client to the reconciler struct (reuse `http.DefaultClient` or inject via controller setup). No authentication needed — the `/internal/v1/` endpoints are cluster-internal.
 
 **Known limitation: rapid scale-down/scale-up race**: If a user scales down (triggers tombstone), then immediately scales back up before the tombstone is cleaned up (1-30s), the returning stores will conflict with the metadata reconciler that's actively removing them from Raft groups. The autoscaler's 300s cooldown prevents this in the automated case. For manual scaling, the operator should check for existing tombstones on the target ordinals before allowing scale-up and requeue if tombstones are still being cleaned up. This can be implemented as a pre-check in `deregisterDataNodes()` (or a separate `checkTombstones()` step): query the metadata service for tombstoned stores and requeue if any overlap with the ordinals being scaled up.
 
