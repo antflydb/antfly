@@ -35,7 +35,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 - **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with [Termite](pkg/termite)
 - **Auth** — built-in [user management](src/usermgr) with API keys, basic auth, and bearer tokens
 - **Backup & restore** — to local disk or S3
-- **Kubernetes operator** — deploy and manage clusters with the [operator](pkg/antfly-operator)
+- **Kubernetes operator** — deploy and manage clusters with the [operator](pkg/operator)
 - **MCP server** — [Model Context Protocol](src/mcp) so LLMs can use Antfly as a tool
 - **A2A protocol** — [Agent-to-Agent](src/a2a) support for Google's A2A standard
 - **Antfarm** — [web dashboard](ts/apps/antfarm) with playgrounds for search, RAG, knowledge graphs, embeddings, reranking, chunking, NER, OCR, and transcription

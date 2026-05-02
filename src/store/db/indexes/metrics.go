@@ -15,6 +15,8 @@
 package indexes
 
 import (
+	"time"
+
 	"github.com/antflydb/antfly/lib/inflight"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -46,6 +48,16 @@ var (
 			Help:      "The total number of queries.",
 		},
 		[]string{"Name"},
+	)
+	queryDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "antfly",
+			Subsystem: "indexes",
+			Name:      "query_duration_seconds",
+			Help:      "Index query latency in seconds.",
+			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		},
+		[]string{"Name", "query_type"},
 	)
 	embeddingCreationOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -138,6 +150,7 @@ func init() {
 	prometheus.MustRegister(writeOps)
 	prometheus.MustRegister(deleteOps)
 	prometheus.MustRegister(queryOps)
+	prometheus.MustRegister(queryDuration)
 	prometheus.MustRegister(embeddingCreationOps)
 	prometheus.MustRegister(embeddingPersistOps)
 	prometheus.MustRegister(walDequeueAttempts)
@@ -147,6 +160,10 @@ func init() {
 	prometheus.MustRegister(backfillProgress)
 	prometheus.MustRegister(backfillItemsProcessed)
 	prometheus.MustRegister(enricherWALBacklog)
+}
+
+func observeQueryDuration(name, queryType string, start time.Time) {
+	queryDuration.WithLabelValues(name, queryType).Observe(time.Since(start).Seconds())
 }
 
 // PrometheusWALMetrics implements inflight.WALBufferMetrics using Prometheus.
