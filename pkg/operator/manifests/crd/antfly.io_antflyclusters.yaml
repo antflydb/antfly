@@ -1121,9 +1121,16 @@ spec:
                         type: integer
                     type: object
                   replicas:
-                    description: 'Replicas is the number of data nodes (default: 3)'
+                    description: Replicas is the number of data nodes. Zero or omitted
+                      uses the controller default of 3; use suspend for intentional
+                      scale-to-zero.
                     format: int32
                     type: integer
+                  suspend:
+                    description: Suspend scales data nodes to zero while retaining
+                      PVCs. This is a pause/resume operation, not permanent node
+                      removal.
+                    type: boolean
                   resources:
                     description: Resources defines the resource requirements
                     properties:
@@ -6127,8 +6134,8 @@ spec:
                       for this step.
                     format: int32
                     type: integer
-                  drainingStoreID:
-                    description: DrainingStoreID is the Antfly store ID selected for
+                  drainingNodeID:
+                    description: DrainingNodeID is the Antfly node ID selected for
                       this step.
                     type: string
                   fromReplicas:

@@ -59,7 +59,11 @@ type ShardIface interface {
 	Scan(ctx context.Context, fromKey []byte, toKey []byte, opts ScanOptions) (*ScanResult, error)
 	ExportRangeChunk(ctx context.Context, startKey, endKey, afterKey []byte, limit int) ([][2][]byte, []byte, bool, error)
 	ListMergeDeltaEntriesAfter(afterSeq uint64) ([]*MergeDeltaEntry, error)
-	ProposeConfChange(cc raftpb.ConfChange) error // Using our minimal ConfChange
+	// ProposeConfChange proposes a conf change to the Raft state machine.
+	// Returns once the proposal has been accepted (or rejected) by the local
+	// Raft node. ctx cancellation unblocks the call promptly even if the
+	// shard's Raft consumer goroutine has stopped.
+	ProposeConfChange(ctx context.Context, cc raftpb.ConfChange) error
 	// ApplyConfChange proposes a conf change and waits for it to be applied to the Raft state machine.
 	ApplyConfChange(ctx context.Context, cc raftpb.ConfChange) error
 	// Direct raft node forwards
@@ -147,6 +151,7 @@ type Shard struct {
 	// cancelLeaderFactory cancels the LeaderFactory goroutine in swarm mode
 	// In raft mode, this is nil since raft manages the lifecycle
 	cancelLeaderFactory context.CancelFunc
+	leaderFactoryDone   <-chan struct{}
 	closeOnce           sync.Once
 	closeErr            error
 }
@@ -158,6 +163,7 @@ func NewShard(
 	confChangeC chan<- *raft.ConfChangeProposal,
 	errorC <-chan error,
 	cancelLeaderFactory context.CancelFunc,
+	leaderFactoryDone <-chan struct{},
 ) *Shard {
 	return &Shard{
 		storeDB:             db,
@@ -165,6 +171,7 @@ func NewShard(
 		confChangeC:         confChangeC,
 		errorC:              errorC,
 		cancelLeaderFactory: cancelLeaderFactory,
+		leaderFactoryDone:   leaderFactoryDone,
 	}
 }
 
@@ -240,6 +247,9 @@ func (s *Shard) Close() error {
 				// Drain any remaining errors
 			}
 		}
+		if s.leaderFactoryDone != nil {
+			<-s.leaderFactoryDone
+		}
 
 		// Now safe to close the database
 		if s.storeDB != nil {
@@ -307,7 +317,7 @@ func (s *Shard) TransferLeadership(ctx context.Context, target types.ID) {
 	}
 }
 
-func (s *Shard) ProposeConfChange(cc raftpb.ConfChange) error {
+func (s *Shard) ProposeConfChange(ctx context.Context, cc raftpb.ConfChange) error {
 	if s.IsInitializing() {
 		return ErrShardNotReady
 	}
@@ -316,14 +326,14 @@ func (s *Shard) ProposeConfChange(cc raftpb.ConfChange) error {
 		return fmt.Errorf("configuration changes not supported in swarm mode")
 	}
 	proposeDoneC := make(chan error, 1)
-	s.confChangeC <- &raft.ConfChangeProposal{
+	proposal := &raft.ConfChangeProposal{
 		ConfChange:   cc,
 		ProposeDoneC: proposeDoneC,
 	}
-	if err := <-proposeDoneC; err != nil {
-		return fmt.Errorf("proposing confChange to raft: %w", err)
+	if err := s.sendConfChange(ctx, proposal); err != nil {
+		return err
 	}
-	return nil
+	return s.waitProposeDone(ctx, proposeDoneC)
 }
 
 // ApplyConfChange proposes a conf change and waits for it to be applied to the Raft state machine.
@@ -341,15 +351,16 @@ func (s *Shard) ApplyConfChange(ctx context.Context, cc raftpb.ConfChange) error
 	callbackID := uuid.New()
 
 	proposeDoneC := make(chan error, 1)
-	s.confChangeC <- &raft.ConfChangeProposal{
+	proposal := &raft.ConfChangeProposal{
 		ConfChange:      cc,
 		ProposeDoneC:    proposeDoneC,
 		ApplyCallbackID: callbackID,
 	}
-
-	// Wait for the proposal to be accepted
-	if err := <-proposeDoneC; err != nil {
-		return fmt.Errorf("proposing confChange to raft: %w", err)
+	if err := s.sendConfChange(ctx, proposal); err != nil {
+		return err
+	}
+	if err := s.waitProposeDone(ctx, proposeDoneC); err != nil {
+		return err
 	}
 
 	// Wait for the conf change to be applied
@@ -361,6 +372,40 @@ func (s *Shard) ApplyConfChange(ctx context.Context, cc raftpb.ConfChange) error
 
 	select {
 	case <-appliedCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// sendConfChange writes a proposal to confChangeC, returning early if ctx is
+// cancelled. Without ctx-awareness, a stopped Raft consumer goroutine would
+// leave callers blocked on the unbuffered channel send indefinitely.
+func (s *Shard) sendConfChange(ctx context.Context, proposal *raft.ConfChangeProposal) (err error) {
+	// Recover from a "send on closed channel" panic that can happen if the
+	// shard is closed concurrently with this proposal.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("shard closed during conf change proposal: %v", r)
+		}
+	}()
+	select {
+	case s.confChangeC <- proposal:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Shard) waitProposeDone(ctx context.Context, proposeDoneC <-chan error) error {
+	select {
+	case err, ok := <-proposeDoneC:
+		if !ok {
+			return fmt.Errorf("proposing confChange to raft: channel closed")
+		}
+		if err != nil {
+			return fmt.Errorf("proposing confChange to raft: %w", err)
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

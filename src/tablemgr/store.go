@@ -41,11 +41,32 @@ type StoreStatus struct {
 	StoreClient client.StoreRPC               `json:"-"`
 }
 
+const (
+	NodeLifecycleActive   = "active"
+	NodeLifecycleDraining = "draining"
+)
+
+// NodeRecord tracks durable node-level lifecycle intent. Store health reports
+// must not clear a non-active lifecycle.
+type NodeRecord struct {
+	NodeID    types.ID  `json:"node_id"`
+	Lifecycle string    `json:"lifecycle"`
+	Reason    string    `json:"reason,omitempty"`
+	LastSeen  time.Time `json:"last_seen"`
+	// DrainingSince records when the node first entered the Draining
+	// lifecycle. Preserved across status updates so the safety net in
+	// buildNodeShutdownStatus can detect drains that have been stuck for
+	// longer than the configured threshold.
+	DrainingSince time.Time `json:"draining_since,omitempty"`
+}
+
 func (ss *StoreStatus) Equivalent(other *StoreStatus) bool {
 	if ss == nil || other == nil {
 		return ss == nil && other == nil
 	}
 	return ss.ID == other.ID &&
+		ss.RaftURL == other.RaftURL &&
+		ss.ApiURL == other.ApiURL &&
 		ss.State == other.State &&
 		maps.EqualFunc(ss.Shards, other.Shards, func(v1, v2 *store.ShardInfo) bool {
 			return v1.Equal(v2)

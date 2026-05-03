@@ -96,6 +96,9 @@ type ShardInfo struct {
 	ShardStats *DBStats           `json:"shard_stats,omitempty"`
 	Peers      common.PeerSet     `json:"peers,omitzero"`
 	RaftStatus *common.RaftStatus `json:"raft_status,omitempty"`
+	// VoterCount is the total known raft voter count when a status source reports
+	// counts rather than concrete voter IDs.
+	VoterCount int `json:"voter_count,omitempty,omitzero"`
 	// ReportedBy tracks which nodes actually reported having this shard loaded.
 	// This is distinct from Peers, which includes nodes from the Raft voter config.
 	// Used by the reconciler to detect shards that are missing on nodes.
@@ -169,6 +172,7 @@ func (s *ShardInfo) Equal(o *ShardInfo) bool {
 	return s.ShardConfig.Equal(&o.ShardConfig) &&
 		s.Peers.Equal(o.Peers) &&
 		s.RaftStatus.Equal(o.RaftStatus) &&
+		s.VoterCount == o.VoterCount &&
 		s.SplitReplayRequired == o.SplitReplayRequired &&
 		s.SplitReplayCaughtUp == o.SplitReplayCaughtUp &&
 		s.SplitCutoverReady == o.SplitCutoverReady &&
@@ -189,6 +193,7 @@ func (s *ShardInfo) DeepCopy() *ShardInfo {
 		Peers:               s.Peers.Copy(),
 		ReportedBy:          s.ReportedBy.Copy(),
 		RaftStatus:          &common.RaftStatus{},
+		VoterCount:          s.VoterCount,
 		HasSnapshot:         s.HasSnapshot,
 		Initializing:        s.Initializing,
 		Splitting:           s.Splitting,
@@ -262,6 +267,9 @@ func (s *ShardInfo) Merge(nodeID types.ID, o *ShardInfo) {
 	if s.RaftStatus == nil || s.RaftStatus.Lead == 0 {
 		s.RaftStatus = o.RaftStatus
 	}
+	if o.VoterCount > s.VoterCount {
+		s.VoterCount = o.VoterCount
+	}
 	if s.ShardStats == nil || s.ShardStats.Created.IsZero() {
 		s.ShardStats = o.ShardStats
 	}
@@ -292,6 +300,7 @@ type shardInfoJSON struct {
 	ShardStats          *DBStats           `json:"shard_stats,omitempty"`
 	Peers               common.PeerSet     `json:"peers,omitzero"`
 	RaftStatus          *common.RaftStatus `json:"raft_status,omitempty"`
+	VoterCount          int                `json:"voter_count,omitempty,omitzero"`
 	ReportedBy          common.PeerSet     `json:"reported_by,omitzero"`
 	HasSnapshot         bool               `json:"has_snapshot,omitempty,omitzero"`
 	Initializing        bool               `json:"initializing,omitempty,omitzero"`
@@ -315,6 +324,7 @@ func (s ShardInfo) MarshalJSON() ([]byte, error) {
 		ShardStats:          s.ShardStats,
 		Peers:               s.Peers,
 		RaftStatus:          s.RaftStatus,
+		VoterCount:          s.VoterCount,
 		ReportedBy:          s.ReportedBy,
 		HasSnapshot:         s.HasSnapshot,
 		Initializing:        s.Initializing,
@@ -355,6 +365,7 @@ func (s *ShardInfo) UnmarshalJSON(data []byte) error {
 	s.ShardStats = j.ShardStats
 	s.Peers = j.Peers
 	s.RaftStatus = j.RaftStatus
+	s.VoterCount = j.VoterCount
 	s.ReportedBy = j.ReportedBy
 	s.HasSnapshot = j.HasSnapshot
 	s.Initializing = j.Initializing

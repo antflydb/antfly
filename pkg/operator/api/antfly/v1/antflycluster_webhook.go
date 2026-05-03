@@ -480,6 +480,14 @@ Solution: Use an odd replica count:
 		return fmt.Errorf("spec.dataNodes.replicas must be >= 0, got %d", r.Spec.DataNodes.Replicas)
 	}
 
+	if r.Spec.DataNodes.Suspend && r.Spec.DataNodes.AutoScaling != nil && r.Spec.DataNodes.AutoScaling.Enabled {
+		return fmt.Errorf(`spec.dataNodes.suspend conflicts with spec.dataNodes.autoScaling.enabled=true
+
+Problem: Suspension is an explicit pause/resume operation, while autoscaling continuously manages the data replica target.
+
+Solution: Disable data-node autoscaling before suspending the data StatefulSet`)
+	}
+
 	return nil
 }
 
@@ -813,6 +821,14 @@ Solution: Either:
   Option 2: Disable autoscaling (spec.dataNodes.autoScaling.enabled=false)`)
 	}
 
+	if policy.WhenScaled == PVCRetentionDelete && r.Spec.DataNodes.Suspend {
+		return fmt.Errorf(`spec.storage.pvcRetentionPolicy.whenScaled=Delete conflicts with spec.dataNodes.suspend=true
+
+Problem: Suspension scales data pods to zero and relies on retained PVCs so the same ordinals can resume with their existing data.
+
+Solution: Set spec.storage.pvcRetentionPolicy.whenScaled=Retain before suspending data nodes`)
+	}
+
 	return nil
 }
 
@@ -827,8 +843,8 @@ func (r *AntflyCluster) validateAutoScalingConfig() error {
 	}
 
 	var errors []string
-	if autoScaling.MinReplicas < 0 {
-		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas must be >= 0, got %d", autoScaling.MinReplicas))
+	if autoScaling.MinReplicas < 1 {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas must be >= 1, got %d", autoScaling.MinReplicas))
 	}
 	if autoScaling.MaxReplicas < 1 {
 		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas must be >= 1, got %d", autoScaling.MaxReplicas))
@@ -1111,6 +1127,10 @@ func (r *AntflyCluster) validateSwarmTopologyIsolation() error {
 
 	if r.Spec.DataNodes.Replicas != 0 {
 		errors = append(errors, "spec.dataNodes.replicas must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.Suspend {
+		errors = append(errors, "spec.dataNodes.suspend must be unset when spec.mode=Swarm")
 	}
 
 	if r.Spec.MetadataNodes.Resources != (ResourceSpec{}) {

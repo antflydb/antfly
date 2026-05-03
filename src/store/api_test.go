@@ -206,9 +206,10 @@ func (m *MockShard) Scan(
 }
 
 func (m *MockShard) ProposeConfChange(
+	ctx context.Context,
 	cc raftpb.ConfChange,
 ) error { // Assuming raftpb is imported or not needed for this test
-	m.Called(cc)
+	m.Called(ctx, cc)
 	return nil
 }
 

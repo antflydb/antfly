@@ -982,10 +982,10 @@ func TestE2E_OnlineSplit_TimeoutRollsBack(t *testing.T) {
 	storeIDs := cluster.GetStoreNodeIDs()
 	if len(storeIDs) > 0 {
 		removedStoreID := storeIDs[len(storeIDs)-1]
-		if err := cluster.RemoveStoreNode(ctx, removedStoreID); err != nil {
-			t.Logf("Warning: Failed to remove store node: %v", err)
+		if err := cluster.CrashStoreNode(removedStoreID); err != nil {
+			t.Logf("Warning: Failed to crash store node: %v", err)
 		} else {
-			t.Logf("Removed store node %s", removedStoreID)
+			t.Logf("Crashed store node %s", removedStoreID)
 		}
 	}
 
@@ -2041,10 +2041,10 @@ func TestE2E_SplitFailureNewShardFails(t *testing.T) {
 	storeIDs := cluster.GetStoreNodeIDs()
 	if len(storeIDs) > 0 {
 		removedNode := storeIDs[len(storeIDs)-1]
-		if err := cluster.RemoveStoreNode(ctx, removedNode); err != nil {
-			t.Logf("Warning: Failed to remove store node: %v", err)
+		if err := cluster.CrashStoreNode(removedNode); err != nil {
+			t.Logf("Warning: Failed to crash store node: %v", err)
 		} else {
-			t.Logf("Removed store node %s", removedNode)
+			t.Logf("Crashed store node %s", removedNode)
 		}
 	}
 

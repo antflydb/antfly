@@ -362,8 +362,14 @@ type MetadataNodesSpec struct {
 
 // DataNodesSpec defines the configuration for data nodes
 type DataNodesSpec struct {
-	// Replicas is the number of data nodes (default: 3)
+	// Replicas is the number of data nodes. Zero or omitted uses the controller
+	// default of 3; use suspend for intentional scale-to-zero.
 	Replicas int32 `json:"replicas,omitempty"`
+
+	// Suspend scales data nodes to zero while retaining PVCs. This is a
+	// pause/resume operation, not permanent node removal.
+	// +optional
+	Suspend bool `json:"suspend,omitempty"`
 
 	// AutoScaling defines autoscaling configuration
 	AutoScaling *AutoScalingSpec `json:"autoScaling,omitempty"`
@@ -871,8 +877,8 @@ type DataScaleDownStatus struct {
 	// DrainingOrdinal is the StatefulSet ordinal selected for this step.
 	DrainingOrdinal int32 `json:"drainingOrdinal,omitempty"`
 
-	// DrainingStoreID is the Antfly store ID selected for this step.
-	DrainingStoreID string `json:"drainingStoreID,omitempty"`
+	// DrainingNodeID is the Antfly node ID selected for this step.
+	DrainingNodeID string `json:"drainingNodeID,omitempty"`
 
 	// Phase is the current scale-down workflow phase.
 	Phase string `json:"phase,omitempty"`

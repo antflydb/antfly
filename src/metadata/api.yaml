@@ -1551,7 +1551,7 @@ components:
 
             Use the internal `/reallocate` endpoint to trigger automatic shard splitting:
             ```bash
-            POST /_internal/v1/reallocate
+            POST /internal/v1/reallocate
             ```
 
             This enqueues a reallocation request that the leader processes asynchronously, splitting

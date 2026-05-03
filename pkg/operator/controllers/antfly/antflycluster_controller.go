@@ -48,6 +48,7 @@ type AntflyClusterReconciler struct {
 	AutoScaler          *AutoScaler
 	KubeClient          kubernetes.Interface
 	NodeStatsFetcher    func(context.Context, string) (*kubeletStatsSummary, error)
+	HTTPClient          *http.Client
 	Recorder            events.EventRecorder
 	ManageTermitePools  bool
 	DefaultTermiteImage string
@@ -57,6 +58,8 @@ type AntflyClusterReconciler struct {
 	// exponential backoff on repeated validation failures.
 	validationAttempts sync.Map
 }
+
+var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters/status,verbs=get;update;patch
@@ -219,52 +222,137 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	return nil, nil
 }
 
-// deregisterDataNodes calls the Antfly metadata deregistration API for data nodes
-// being removed during scale-down. This triggers Raft peer removal before the pods
-// are deleted, preventing phantom voters in Raft configurations.
-// Store ID is deterministic: store_id = pod_ordinal + 1.
-func (r *AntflyClusterReconciler) deregisterDataNodes(ctx context.Context, cluster *antflyv1.AntflyCluster, currentReplicas, desiredReplicas int32) error {
-	if desiredReplicas >= currentReplicas {
-		return nil // not scaling down
-	}
+type dataNodeShutdownStatus struct {
+	NodeID          int64  `json:"node_id"`
+	Phase           string `json:"phase"`
+	SafeToTerminate bool   `json:"safe_to_terminate"`
+	Blocked         bool   `json:"blocked,omitempty"`
+	BlockedReason   string `json:"blocked_reason,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
 
+func (r *AntflyClusterReconciler) httpClient() *http.Client {
+	if r.HTTPClient != nil {
+		return r.HTTPClient
+	}
+	return defaultOperatorHTTPClient
+}
+
+// requestDataNodeShutdown asks Antfly metadata to drain a data node and returns
+// the current runtime safety status. Node ID is deterministic:
+// node_id = pod_ordinal + 1.
+func (r *AntflyClusterReconciler) requestDataNodeShutdown(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeIDString string) (*dataNodeShutdownStatus, error) {
 	log := log.FromContext(ctx)
 	metadataAddr := fmt.Sprintf("http://%s-metadata.%s.svc:%d",
 		cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+	url := fmt.Sprintf("%s/internal/v1/nodes/%s/shutdown", metadataAddr, nodeIDString)
 
-	// Deregister highest ordinals first (they are removed by StatefulSet on scale-down)
-	for ordinal := currentReplicas - 1; ordinal >= desiredReplicas; ordinal-- {
-		storeIDString := storeIDForDataOrdinal(ordinal)
-		url := fmt.Sprintf("%s/_internal/v1/store/%s", metadataAddr, storeIDString)
+	log.Info("Requesting data node shutdown before scale-down", "nodeID", nodeIDString)
+	body := strings.NewReader(`{"type":"remove","reason":"operator scale-down"}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown request for node %s: %w", nodeIDString, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-		log.Info("Deregistering data node before scale-down", "ordinal", ordinal, "storeID", storeIDString)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create deregistration request for store %s: %w", storeIDString, err)
-		}
-
-		resp, err := http.DefaultClient.Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
-		if err != nil {
-			// Connection errors mean metadata isn't ready — requeue
-			log.Error(err, "Failed to deregister data node, will retry", "storeID", storeIDString)
-			return fmt.Errorf("failed to deregister store %s: %w", storeIDString, err)
-		}
-		statusCode := resp.StatusCode
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-
-		if statusCode >= 200 && statusCode < 300 {
-			log.Info("Successfully deregistered data node", "storeID", storeIDString)
-		} else if statusCode == http.StatusNotFound {
-			// Store already deregistered or doesn't exist — safe to proceed
-			log.Info("Data node already deregistered or not found", "storeID", storeIDString)
-		} else {
-			log.Error(nil, "Unexpected response from deregistration API", "storeID", storeIDString, "status", statusCode)
-			return fmt.Errorf("deregistration of store %s returned status %d", storeIDString, statusCode)
-		}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		log.Error(err, "Failed to request data node shutdown, will retry", "nodeID", nodeIDString)
+		return nil, fmt.Errorf("failed to request shutdown for node %s: %w", nodeIDString, err)
+	}
+	statusCode := resp.StatusCode
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("shutdown request for node %s returned status %d", nodeIDString, statusCode)
 	}
 
+	statusReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown status request for node %s: %w", nodeIDString, err)
+	}
+	statusResp, err := r.httpClient().Do(statusReq) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return nil, fmt.Errorf("failed to get shutdown status for node %s: %w", nodeIDString, err)
+	}
+	defer func() { _ = statusResp.Body.Close() }()
+	if statusResp.StatusCode < 200 || statusResp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, statusResp.Body)
+		return nil, fmt.Errorf("shutdown status for node %s returned status %d", nodeIDString, statusResp.StatusCode)
+	}
+
+	var status dataNodeShutdownStatus
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		return nil, fmt.Errorf("failed to decode shutdown status for node %s: %w", nodeIDString, err)
+	}
+	return &status, nil
+}
+
+func (r *AntflyClusterReconciler) cancelDataNodeShutdown(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeIDString string) (*dataNodeShutdownStatus, error) {
+	log := log.FromContext(ctx)
+	metadataAddr := fmt.Sprintf("http://%s-metadata.%s.svc:%d",
+		cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+	url := fmt.Sprintf("%s/internal/v1/nodes/%s/shutdown", metadataAddr, nodeIDString)
+
+	log.Info("Canceling data node shutdown", "nodeID", nodeIDString)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown cancellation request for node %s: %w", nodeIDString, err)
+	}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return nil, fmt.Errorf("failed to cancel shutdown for node %s: %w", nodeIDString, err)
+	}
+	statusCode := resp.StatusCode
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("shutdown cancellation for node %s returned status %d", nodeIDString, statusCode)
+	}
+
+	statusReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown status request after cancellation for node %s: %w", nodeIDString, err)
+	}
+	statusResp, err := r.httpClient().Do(statusReq) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return nil, fmt.Errorf("failed to get shutdown status after cancellation for node %s: %w", nodeIDString, err)
+	}
+	defer func() { _ = statusResp.Body.Close() }()
+	if statusResp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, statusResp.Body)
+		return &dataNodeShutdownStatus{Phase: "not_found"}, nil
+	}
+	if statusResp.StatusCode < 200 || statusResp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, statusResp.Body)
+		return nil, fmt.Errorf("shutdown status after cancellation for node %s returned status %d", nodeIDString, statusResp.StatusCode)
+	}
+
+	var status dataNodeShutdownStatus
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		return nil, fmt.Errorf("failed to decode shutdown status after cancellation for node %s: %w", nodeIDString, err)
+	}
+	return &status, nil
+}
+
+func (r *AntflyClusterReconciler) finalizeDataNodeShutdown(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeIDString string) error {
+	metadataAddr := fmt.Sprintf("http://%s-metadata.%s.svc:%d",
+		cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+	url := fmt.Sprintf("%s/internal/v1/nodes/%s", metadataAddr, nodeIDString)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create node shutdown finalization request for node %s: %w", nodeIDString, err)
+	}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return fmt.Errorf("failed to finalize shutdown for node %s: %w", nodeIDString, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("shutdown finalization for node %s returned status %d", nodeIDString, resp.StatusCode)
+	}
 	return nil
 }
 
@@ -293,6 +381,44 @@ func effectiveTopologyMode(cluster *antflyv1.AntflyCluster) topologyMode {
 
 func isSwarmMode(cluster *antflyv1.AntflyCluster) bool {
 	return effectiveTopologyMode(cluster) == topologyModeSwarm
+}
+
+func shouldCancelDataScaleDown(status *antflyv1.DataScaleDownStatus, currentReplicas, desiredReplicas int32) bool {
+	if status == nil || status.DrainingNodeID == "" {
+		return false
+	}
+	switch status.Phase {
+	case "Draining", "Blocked", "Failed", "Canceling", "Scaling":
+	default:
+		return false
+	}
+	return currentReplicas > status.DrainingOrdinal && desiredReplicas > status.DrainingOrdinal
+}
+
+func shouldCancelDataScaleDownForSuspend(status *antflyv1.DataScaleDownStatus, currentReplicas int32) bool {
+	if status == nil || status.DrainingNodeID == "" {
+		return false
+	}
+	switch status.Phase {
+	case "Draining", "Blocked", "Failed", "Canceling", "Scaling":
+	default:
+		return false
+	}
+	return currentReplicas > status.DrainingOrdinal
+}
+
+func shouldFinalizeDataScaleDown(status *antflyv1.DataScaleDownStatus, currentReplicas, desiredReplicas int32, dataScaleDownRequested bool) bool {
+	if status == nil || status.DrainingNodeID == "" || shouldCancelDataScaleDown(status, currentReplicas, desiredReplicas) {
+		return false
+	}
+	switch status.Phase {
+	case "Scaling":
+		return true
+	case "Failed":
+		return !dataScaleDownRequested && status.AppliedReplicas < status.FromReplicas && currentReplicas <= status.AppliedReplicas
+	default:
+		return false
+	}
 }
 
 func (r *AntflyClusterReconciler) ensureTopologyResourcesMatchMode(ctx context.Context, cluster *antflyv1.AntflyCluster, mode topologyMode) error {
@@ -1033,8 +1159,16 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	desiredDataReplicas := effectiveDataNodeReplicas(workingCluster)
 	requestedDataReplicas := desiredDataReplicas
 	dataScaleDownSource := antflyv1.DataScaleDownSourceManual
+	dataScaleDownRequested := false
 	autoscalingEnabled := r.AutoScaler != nil && workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled
-	if autoscalingEnabled {
+	dataNodesSuspended := workingCluster.Spec.DataNodes.Suspend
+	if dataNodesSuspended {
+		workingCluster.Status.AutoScalingStatus = nil
+		requestedDataReplicas = 0
+		desiredDataReplicas = 0
+		workingCluster.Spec.DataNodes.Replicas = 0
+		r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Data nodes are suspended with PVCs retained")
+	} else if autoscalingEnabled {
 		dataScaleDownSource = antflyv1.DataScaleDownSourceAutoscaler
 		recommendationReplicas, err := r.AutoScaler.EvaluateScaling(ctx, workingCluster, currentDataTarget)
 		if err != nil {
@@ -1047,9 +1181,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		blockedReason := ""
 		blockedMessage := ""
 		if recommendationReplicas < scaleSafetyReplicas {
-			desiredDataReplicas = scaleSafetyReplicas - 1
+			desiredDataReplicas = scaleSafetyReplicas
+			dataScaleDownRequested = true
 			blockedReason = antflyv1.ReasonDataScaleDownInProgress
-			blockedMessage = fmt.Sprintf("Autoscaler recommended data-node scale-down from %d to %d; applying one ordinal this reconcile", scaleSafetyReplicas, recommendationReplicas)
+			blockedMessage = fmt.Sprintf("Autoscaler recommended data-node scale-down from %d to %d; waiting for runtime drain before removing the next ordinal", scaleSafetyReplicas, recommendationReplicas)
 		} else {
 			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
 		}
@@ -1062,9 +1197,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	} else {
 		workingCluster.Status.AutoScalingStatus = nil
 		if desiredDataReplicas < scaleSafetyReplicas {
-			message := fmt.Sprintf("Data-node scale-down from %d to %d requested; applying one ordinal this reconcile", scaleSafetyReplicas, desiredDataReplicas)
+			message := fmt.Sprintf("Data-node scale-down from %d to %d requested; waiting for runtime drain before removing the next ordinal", scaleSafetyReplicas, desiredDataReplicas)
 			requestedDataReplicas = desiredDataReplicas
-			desiredDataReplicas = scaleSafetyReplicas - 1
+			desiredDataReplicas = scaleSafetyReplicas
+			dataScaleDownRequested = true
 			workingCluster.Spec.DataNodes.Replicas = desiredDataReplicas
 			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
 		} else {
@@ -1072,32 +1208,134 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	if dataStsExists && desiredDataReplicas < scaleSafetyReplicas {
+	if dataStsExists && shouldFinalizeDataScaleDown(workingCluster.Status.DataScaleDownStatus, currentDataReplicas, desiredDataReplicas, dataScaleDownRequested) {
+		scalingStatus := workingCluster.Status.DataScaleDownStatus
+		if currentDataReplicas > scalingStatus.AppliedReplicas {
+			message := fmt.Sprintf("Waiting for StatefulSet to remove data ordinal %d/node %s; current replicas=%d target replicas=%d", scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, currentDataReplicas, scalingStatus.AppliedReplicas)
+			r.setDataScaleDownStatus(workingCluster, scalingStatus.Source, scalingStatus.FromReplicas, scalingStatus.TargetReplicas, scalingStatus.AppliedReplicas, scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, "Scaling", message)
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status while waiting for data StatefulSet scale-down")
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if err := r.finalizeDataNodeShutdown(ctx, workingCluster, scalingStatus.DrainingNodeID); err != nil {
+			failureMessage := fmt.Sprintf("Failed to finalize data-node shutdown for ordinal %d/node %s after StatefulSet scale-down: %v", scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, err)
+			r.setDataScaleDownStatus(workingCluster, scalingStatus.Source, scalingStatus.FromReplicas, scalingStatus.TargetReplicas, scalingStatus.AppliedReplicas, scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, "Failed", failureMessage)
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownFailed, failureMessage)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down finalization failure")
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		message := fmt.Sprintf("Finalized data-node shutdown for ordinal %d/node %s", scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID)
+		r.setDataScaleDownStatus(workingCluster, scalingStatus.Source, scalingStatus.FromReplicas, scalingStatus.TargetReplicas, scalingStatus.AppliedReplicas, scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, "Complete", message)
+		if requestedDataReplicas < scaleSafetyReplicas {
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, "Continuing data-node scale-down after finalizing the previous ordinal")
+		} else {
+			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
+		}
+		if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+			log.Error(statusErr, "Failed to update status after data scale-down finalization")
+		}
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+
+	if dataStsExists && !dataScaleDownRequested && (shouldCancelDataScaleDown(workingCluster.Status.DataScaleDownStatus, currentDataReplicas, desiredDataReplicas) || (dataNodesSuspended && shouldCancelDataScaleDownForSuspend(workingCluster.Status.DataScaleDownStatus, currentDataReplicas))) {
+		drainingStatus := workingCluster.Status.DataScaleDownStatus
+		status, err := r.cancelDataNodeShutdown(ctx, workingCluster, drainingStatus.DrainingNodeID)
+		if err != nil {
+			failureMessage := fmt.Sprintf("Failed to cancel data-node shutdown for ordinal %d/node %s: %v", drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, err)
+			r.setDataScaleDownStatus(workingCluster, drainingStatus.Source, drainingStatus.FromReplicas, desiredDataReplicas, scaleSafetyReplicas, drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, "Failed", failureMessage)
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownFailed, failureMessage)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down cancellation failure")
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		if status.Phase != "active" && status.Phase != "not_found" {
+			message := fmt.Sprintf("Canceling data-node shutdown for ordinal %d/node %s; runtime phase is %q", drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, status.Phase)
+			r.setDataScaleDownStatus(workingCluster, drainingStatus.Source, drainingStatus.FromReplicas, desiredDataReplicas, scaleSafetyReplicas, drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, "Canceling", message)
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down cancellation progress")
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		message := fmt.Sprintf("Canceled data-node shutdown for ordinal %d/node %s; runtime phase is %q", drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, status.Phase)
+		r.setDataScaleDownStatus(workingCluster, drainingStatus.Source, drainingStatus.FromReplicas, desiredDataReplicas, scaleSafetyReplicas, drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, "Canceled", message)
+		r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
+		if r.AutoScaler != nil && workingCluster.Status.AutoScalingStatus != nil {
+			r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, desiredDataReplicas, requestedDataReplicas, "", "")
+		}
+		if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+			log.Error(statusErr, "Failed to update status with data scale-down cancellation")
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if dataNodesSuspended {
+		workingCluster.Status.DataScaleDownStatus = nil
+	} else if dataStsExists && dataScaleDownRequested {
 		drainingOrdinal := scaleSafetyReplicas - 1
-		drainingStoreID := storeIDForDataOrdinal(drainingOrdinal)
-		message := fmt.Sprintf("Draining data ordinal %d/store %s before scaling StatefulSet from %d to %d", drainingOrdinal, drainingStoreID, scaleSafetyReplicas, desiredDataReplicas)
-		r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, desiredDataReplicas, drainingOrdinal, drainingStoreID, "Draining", message)
+		drainingNodeID := nodeIDForDataOrdinal(drainingOrdinal)
+		nextReplicas := scaleSafetyReplicas - 1
+		message := fmt.Sprintf("Draining data ordinal %d/node %s before scaling StatefulSet from %d to %d", drainingOrdinal, drainingNodeID, scaleSafetyReplicas, nextReplicas)
+		r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Draining", message)
 		r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
-		if err := r.deregisterDataNodes(ctx, workingCluster, scaleSafetyReplicas, desiredDataReplicas); err != nil {
-			failureMessage := fmt.Sprintf("Failed to drain data ordinal %d/store %s: %v", drainingOrdinal, drainingStoreID, err)
-			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingStoreID, "Failed", failureMessage)
+		shutdownStatus, err := r.requestDataNodeShutdown(ctx, workingCluster, drainingNodeID)
+		if err != nil {
+			failureMessage := fmt.Sprintf("Failed to drain data ordinal %d/node %s: %v", drainingOrdinal, drainingNodeID, err)
+			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Failed", failureMessage)
 			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownFailed, failureMessage)
 			if statusErr := r.Status().Update(ctx, workingCluster); statusErr != nil {
 				log.Error(statusErr, "Failed to update status with data scale-down failure")
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
-	} else if dataStsExists {
-		if err := r.deregisterDataNodes(ctx, workingCluster, scaleSafetyReplicas, desiredDataReplicas); err != nil {
-			log.Error(err, "Failed to deregister data nodes, will retry")
+		if shutdownStatus.Blocked || shutdownStatus.Phase == "blocked" {
+			blockedMessage := shutdownStatus.Message
+			if blockedMessage == "" {
+				blockedMessage = fmt.Sprintf("Data ordinal %d/node %s cannot be drained safely; runtime reports phase %q", drainingOrdinal, drainingNodeID, shutdownStatus.Phase)
+			}
+			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Blocked", blockedMessage)
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownBlocked, blockedMessage)
+			if r.AutoScaler != nil && workingCluster.Status.AutoScalingStatus != nil {
+				r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, scaleSafetyReplicas, requestedDataReplicas, antflyv1.ReasonDataScaleDownBlocked, blockedMessage)
+			}
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with blocked data scale-down")
+			}
+			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		}
+		if !shutdownStatus.SafeToTerminate {
+			message = fmt.Sprintf("Data ordinal %d/node %s is draining in runtime phase %q; StatefulSet remains at %d replicas", drainingOrdinal, drainingNodeID, shutdownStatus.Phase, scaleSafetyReplicas)
+			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Draining", message)
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down drain progress")
+			}
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+
+		desiredDataReplicas = nextReplicas
+		workingCluster.Spec.DataNodes.Replicas = desiredDataReplicas
+		message = fmt.Sprintf("Runtime reports data ordinal %d/node %s is safe to terminate; scaling StatefulSet from %d to %d", drainingOrdinal, drainingNodeID, scaleSafetyReplicas, desiredDataReplicas)
+		r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, desiredDataReplicas, drainingOrdinal, drainingNodeID, "Scaling", message)
+		r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+		if r.AutoScaler != nil && workingCluster.Status.AutoScalingStatus != nil {
+			r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, desiredDataReplicas, requestedDataReplicas, antflyv1.ReasonDataScaleDownInProgress, message)
+		}
+	} else if dataStsExists {
 		if workingCluster.Status.DataScaleDownStatus != nil {
-			completedSource := workingCluster.Status.DataScaleDownStatus.Source
-			if completedSource == "" {
-				completedSource = antflyv1.DataScaleDownSourceManual
+			switch workingCluster.Status.DataScaleDownStatus.Phase {
+			case "Complete", "Canceled":
+				completedSource := workingCluster.Status.DataScaleDownStatus.Source
+				if completedSource == "" {
+					completedSource = antflyv1.DataScaleDownSourceManual
+				}
+				r.setDataScaleDownStatus(workingCluster, completedSource, scaleSafetyReplicas, scaleSafetyReplicas, desiredDataReplicas, 0, "", "Complete", "Data-node scale-down is complete")
 			}
-			r.setDataScaleDownStatus(workingCluster, completedSource, scaleSafetyReplicas, scaleSafetyReplicas, desiredDataReplicas, 0, "", "Complete", "Data-node scale-down is complete")
 		}
 	}
 
@@ -1261,7 +1499,7 @@ func (r *AntflyClusterReconciler) setScalingCondition(cluster *antflyv1.AntflyCl
 	})
 }
 
-func (r *AntflyClusterReconciler) setDataScaleDownStatus(cluster *antflyv1.AntflyCluster, source string, fromReplicas, targetReplicas, appliedReplicas, drainingOrdinal int32, drainingStoreID, phase, message string) {
+func (r *AntflyClusterReconciler) setDataScaleDownStatus(cluster *antflyv1.AntflyCluster, source string, fromReplicas, targetReplicas, appliedReplicas, drainingOrdinal int32, drainingNodeID, phase, message string) {
 	now := metav1.Now()
 	if cluster.Status.DataScaleDownStatus != nil &&
 		cluster.Status.DataScaleDownStatus.LastTransitionTime != nil &&
@@ -1277,7 +1515,7 @@ func (r *AntflyClusterReconciler) setDataScaleDownStatus(cluster *antflyv1.Antfl
 		TargetReplicas:     targetReplicas,
 		AppliedReplicas:    appliedReplicas,
 		DrainingOrdinal:    drainingOrdinal,
-		DrainingStoreID:    drainingStoreID,
+		DrainingNodeID:     drainingNodeID,
 		Phase:              phase,
 		Message:            message,
 		LastTransitionTime: &now,
@@ -2169,10 +2407,7 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 }
 
 func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
-	replicas := int32(3)
-	if cluster.Spec.DataNodes.Replicas > 0 {
-		replicas = cluster.Spec.DataNodes.Replicas
-	}
+	replicas := effectiveDataNodeReplicas(cluster)
 
 	storageSize := "1Gi"
 	if cluster.Spec.Storage.DataStorage != "" {
@@ -2429,6 +2664,9 @@ func storageAutoGrowEnabled(cluster *antflyv1.AntflyCluster) bool {
 }
 
 func effectiveDataNodeReplicas(cluster *antflyv1.AntflyCluster) int32 {
+	if cluster.Spec.DataNodes.Suspend {
+		return 0
+	}
 	if cluster.Spec.DataNodes.Replicas > 0 {
 		return cluster.Spec.DataNodes.Replicas
 	}
@@ -2461,8 +2699,8 @@ func effectiveDataReplicaTarget(sts *appsv1.StatefulSet, exists bool, fallback i
 	return fallback
 }
 
-func storeIDForDataOrdinal(ordinal int32) string {
-	return strconv.FormatInt(int64(ordinal+1), 16)
+func nodeIDForDataOrdinal(ordinal int32) string {
+	return strconv.FormatInt(int64(ordinal+1), 10)
 }
 
 // buildStorageInitContainer creates an init container that waits for the PVC to be properly mounted.

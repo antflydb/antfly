@@ -50,7 +50,7 @@ Default is `Retain`/`Retain` — no behavior change for existing clusters.
 
 **Raft implications of `WhenScaled: Delete`**: When a data node's PVC is deleted on scale-down and the node later rejoins (scale-up reuses the same ordinal), the node starts with empty storage. Antfly's Raft layer handles this — `startRaft()` detects an empty log directory, calls `RestartNode()` with `join=true`, and waits for the leader to send snapshots for every shard the node hosts. The happy path works, but the cost is a **full data resync via snapshot transfer for every shard** on that node. This is expensive (network + disk I/O on the leader) and temporarily reduces cluster fault tolerance while the resync is in progress. The documentation (section 7) should include a warning about this cost for manual scaling scenarios even when the webhook allows it.
 
-**Pre-existing gap (fixed in section 9)**: The operator's autoscaler previously only adjusted StatefulSet replicas without handling Raft membership removal. Section 9 adds graceful deregistration before scale-down.
+**Pre-existing gap (fixed in section 9)**: The operator's autoscaler previously only adjusted StatefulSet replicas without handling Raft membership removal. Section 9 adds runtime-gated node shutdown before scale-down.
 
 ### 2. Finalizer-Based Storage Cleanup
 
@@ -206,41 +206,46 @@ The EKS docs should also recommend Karpenter over cluster-autoscaler for multi-A
 - PVC retention policy enum validation on create
 - `WhenScaled: Delete` rejected when autoscaling enabled
 
-### 9. Graceful Data Node Deregistration Before Scale-Down
+### 9. Runtime-Gated Data Node Shutdown Before Scale-Down
 
-The operator's autoscaler and manual scaling currently reduce StatefulSet replicas without removing nodes from Raft voter groups. This leaves phantom voters in Raft configurations and causes instability when nodes rejoin. Fix this by calling the Antfly deregistration API before reducing replicas.
+The operator's autoscaler and manual scaling currently reduce StatefulSet replicas without proving that runtime placement and Raft state has left the node being removed. This leaves phantom voters in Raft configurations and causes instability when nodes rejoin. Fix this with the node shutdown API: request drain first, poll status, and only reduce StatefulSet replicas after metadata reports the node is safe to terminate.
 
 **Background**:
-- Store ID is deterministic: `store_id = pod_ordinal + 1` (set in the data StatefulSet entrypoint command at `antflycluster_controller.go:1151-1158`)
-- Deregistration API: `DELETE /_internal/v1/store/{store_id}` on the metadata service (`src/metadata/runner.go:315`)
-- This calls `TombstoneStore()` which marks the store as `Terminating` and triggers the metadata reconciler to remove it from all Raft voter groups (`src/tablemgr/table.go:587-603`)
-- Completion: the metadata reconciler removes the store from all shard Raft groups (sync peer removal), then deletes the tombstone. Timeline: 1-30s depending on shard count.
+- Data node ID is deterministic: `node_id = pod_ordinal + 1`; data-node registration keeps `store_id` equal to `node_id` for the embedded hosted store metadata.
+- Node registration API: `POST /internal/v1/nodes` records durable node lifecycle intent and, for data nodes, the hosted store metadata in the same request. `/internal/v1/stores` and `/internal/v1/store` are retired.
+- Shutdown request API: `PUT /internal/v1/nodes/{node_id}/shutdown` on the metadata service
+- Shutdown status API: `GET /internal/v1/nodes/{node_id}/shutdown`
+- Shutdown cancellation API: `DELETE /internal/v1/nodes/{node_id}/shutdown`
+- The request calls `RequestNodeShutdown()` which atomically records node lifecycle, tombstones the store, marks any existing store status as `Terminating`, and triggers the metadata reconciler to remove it from all Raft voter groups.
+- Completion: shutdown status returns `safe_to_terminate=true` only after the node has no placement intent, local group status, runtime group status, local voters, or local leaders. If a shard would be left with no voters, shutdown status reports `phase=blocked` and the operator surfaces `DataScaleDownBlocked` instead of polling forever.
 
 **`pkg/operator/controllers/antflycluster_controller.go`**:
-- Add `deregisterDataNodes(cluster, currentReplicas, desiredReplicas)` function:
-  1. Calculate ordinals being removed: `desiredReplicas` to `currentReplicas - 1` (highest ordinals first)
-  2. For each ordinal, compute `storeID = ordinal + 1`
-  3. Call `DELETE http://{cluster.Name}-metadata.{namespace}.svc:12377/_internal/v1/store/{storeID}`
-  4. If the call fails with connection refused (metadata not ready), requeue with backoff
-  5. If the call succeeds, proceed — the metadata reconciler handles the rest asynchronously
-- Call `deregisterDataNodes()` in `Reconcile()` between the autoscaler evaluation and `reconcileDataStatefulSet()`. By this point, `workingCluster.Spec.DataNodes.Replicas` already reflects either the manual value (from the CRD spec) or the autoscaler's calculated value (written at line 470). This single call site handles both scaling paths.
+- Add `requestDataNodeShutdown(cluster, nodeID)` helper:
+  1. Pick the highest ordinal Kubernetes will remove next.
+  2. Compute `nodeID = ordinal + 1`.
+  3. Call `PUT http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{nodeID}/shutdown`.
+  4. Poll `GET http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{nodeID}/shutdown`.
+  5. Keep the StatefulSet at its current replica count until `safe_to_terminate=true`.
+  6. Apply one replica of scale-down and repeat on later reconciles until the requested target is reached.
+- Add `cancelDataNodeShutdown(cluster, nodeID)` helper:
+  1. Call `DELETE http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{nodeID}/shutdown`.
+  2. Poll shutdown status once to confirm the node is no longer draining.
+  3. Use this when a previously draining ordinal becomes desired again before the StatefulSet was reduced.
+- Call `requestDataNodeShutdown()` in `Reconcile()` between autoscaler evaluation and `reconcileDataStatefulSet()`. This single call site handles manual and autoscaler-driven scale-down.
 - Compare `workingCluster.Spec.DataNodes.Replicas` (desired) against the existing StatefulSet's current replicas to detect scale-down
 
-**No need to wait for full tombstone cleanup**: The deregistration API call is sufficient — it marks the store as `Terminating` (preventing routing) and triggers Raft peer removal. The metadata reconciler handles cleanup asynchronously. The StatefulSet pod deletion can proceed because:
-- The store is already marked `Terminating` (no new requests routed to it)
-- Raft peer removal is in progress (reconciler is working on it)
-- If the pod is deleted before peer removal completes, the reconciler still removes the phantom voter in the next cycle
+**Wait before pod deletion**: The shutdown request alone is not sufficient. The operator must wait for `safe_to_terminate=true` so Kubernetes does not terminate a pod that still owns placement, local group status, runtime group status, a voter slot, or leadership.
 
 **Metadata service discovery**: The operator already creates the metadata headless service. The address is `{cluster.Name}-metadata.{namespace}.svc:{metadataAPIPort}`. The metadata API port (12377) is already defined in the controller's constants.
 
-**HTTP client**: Add a simple HTTP client to the reconciler struct (reuse `http.DefaultClient` or inject via controller setup). No authentication needed — the `/_internal/v1/` endpoints are cluster-internal.
+**HTTP client**: Add an injectable HTTP client to the reconciler struct. The default client must have a timeout so a blackholed metadata service cannot hang a controller worker. No authentication needed — the `/internal/v1/` endpoints are cluster-internal.
 
-**Known limitation: rapid scale-down/scale-up race**: If a user scales down (triggers tombstone), then immediately scales back up before the tombstone is cleaned up (1-30s), the returning stores will conflict with the metadata reconciler that's actively removing them from Raft groups. The autoscaler's 300s cooldown prevents this in the automated case. For manual scaling, the operator should check for existing tombstones on the target ordinals before allowing scale-up and requeue if tombstones are still being cleaned up. This can be implemented as a pre-check in `deregisterDataNodes()` (or a separate `checkTombstones()` step): query the metadata service for tombstoned stores and requeue if any overlap with the ordinals being scaled up.
+**Known limitation: rapid scale-down/scale-up race**: If a user scales down (triggers tombstone), then immediately scales back up before the tombstone is cleaned up (1-30s), the returning stores will remain in `Terminating` until cleanup clears the tombstone. The autoscaler's cooldown prevents most automated flapping. For manual scaling, the operator should check for existing tombstones on the target ordinals before allowing scale-up and requeue if tombstones are still being cleaned up.
 
 **Tests**:
-- `TestDeregisterDataNodes` (calls deregistration API for correct store IDs, handles connection errors with requeue)
-- `TestReconcileDataStatefulSet_ScaleDown` (deregistration called before replica reduction)
-- Integration: mock HTTP server simulating metadata deregistration endpoint
+- `TestRequestDataNodeShutdownUsesNodeShutdownAPI` (calls shutdown request/status API for the selected store ID)
+- `TestReconcileDataStatefulSet_ScaleDown` (shutdown is safe before replica reduction)
+- Integration: mock HTTP server simulating metadata shutdown request/status endpoints
 
 ## Reconciliation Order (within `Reconcile()`)
 
@@ -255,8 +260,8 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 8.  reconcileServices
 9.  reconcileMetadataStatefulSet (+ instance label, topology spread) ← MODIFIED
 10. reconcilePVCExpansion (metadata)                                 ← NEW
-11. EvaluateScaling (updates workingCluster.Spec.DataNodes.Replicas) ← EXISTING (unchanged position)
-12. deregisterDataNodes (if scaling down)                            ← NEW
+11. EvaluateScaling (updates requested data replica target)           ← EXISTING (unchanged position)
+12. requestDataNodeShutdown + poll safe_to_terminate (if scaling down)← NEW
 13. reconcileDataStatefulSet (+ instance label, topology spread)     ← MODIFIED
 14. reconcilePVCExpansion (data)                                     ← NEW
 15. checkPVCTopologyHealth                                           ← NEW
@@ -264,8 +269,8 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 ```
 
 Ordering notes:
-- The autoscaler (step 11) runs between metadata and data StatefulSet reconciliation, matching the existing code (lines 463-474). It updates `workingCluster.Spec.DataNodes.Replicas` in memory, which steps 12 and 13 then use.
-- Deregistration (step 12) is a **single call site** that handles both manual and autoscaler scaling. By this point, `workingCluster.Spec.DataNodes.Replicas` reflects the final desired count from either source. Deregistration compares this against the existing StatefulSet's current replicas.
+- The autoscaler (step 11) runs between metadata and data StatefulSet reconciliation, matching the existing code. It computes the requested replica target in memory, which steps 12 and 13 then use.
+- Runtime-gated shutdown (step 12) is a **single call site** that handles both manual and autoscaler scaling. The operator keeps the StatefulSet at its current replica count until metadata reports `safe_to_terminate=true`, then applies one ordinal of scale-down.
 - PVC expansion (steps 10, 14) must come after StatefulSet reconciliation (steps 9, 13) because the StatefulSet creates PVCs in the first place.
 - Note: newly scaled-up pods get PVCs sized from the immutable VolumeClaimTemplate (old size). `reconcilePVCExpansion()` patches them on the next reconcile cycle. For CSI drivers supporting online expansion, this is seamless.
 
@@ -274,7 +279,7 @@ Ordering notes:
 1. Instance label addition (section 0) — prerequisite for topology spread and health detection
 2. CRD types + `make manifests generate` (everything depends on this)
 3. Controller: PVC retention policy mapping + finalizer logic + `cleanupStorageResources()`
-4. Controller: Graceful data node deregistration (section 9) — HTTP client + deregister before scale-down
+4. Controller: Runtime-gated data node shutdown (section 9) — HTTP client + shutdown request/status before scale-down
 5. Controller: Default zone topology spread with annotation tracking
 6. Controller: PVC expansion + topology health check
 7. Webhook: Storage immutability + StorageClass expansion check + retention policy validation + RBAC

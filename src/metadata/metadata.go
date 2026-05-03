@@ -134,41 +134,6 @@ func (ms *MetadataStore) handleForwardResolveIntent(w http.ResponseWriter, r *ht
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleStoreDeregistration handles requests from nodes to deregister with the leader
-func (ms *MetadataStore) handleStoreDeregistration(w http.ResponseWriter, r *http.Request) {
-	storeID := r.PathValue("store")
-
-	// Extract node ID from URL path
-	id, err := types.IDFromString(storeID)
-	if err != nil {
-		errorResponse(w, "Invalid store ID", http.StatusBadRequest)
-		return
-	}
-	// FIXME (ajr) This has a race condition with health checks
-	// Maybe we should use a different tombstone mechanism to mark
-	// a node as deregistered or forward the request to the leader?
-	//
-	// This means you can't find it as a leader for removing it from the shard.
-	if err := ms.tm.TombstoneStore(r.Context(), id); err != nil {
-		ms.logger.Error("Failed to register node", zap.Stringer("storeID", id), zap.Error(err))
-		errorResponse(w, fmt.Errorf("registering node: %w", err).Error(), http.StatusBadRequest)
-		return
-	}
-	// 1. Remove shards from the deregistered store
-	// 2. This causes the store to also step down if it's a leader
-
-	ms.TriggerReconciliation()
-	ms.logger.Info("Node deregistered", zap.Stringer("storeID", id))
-
-	// Return success
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(map[string]string{
-		"status": "deregistered",
-	}); err != nil {
-		ms.logger.Error("Error encoding response", zap.Error(err))
-	}
-}
-
 // handleReallocateShards manually triggers shard reallocation (splits/merges) for a specific table
 func (ms *MetadataStore) handleReallocateShards(w http.ResponseWriter, r *http.Request) {
 	// FIXME (ajr) This should enqueue a reallocation request instead of processing immediately
@@ -182,35 +147,6 @@ func (ms *MetadataStore) handleReallocateShards(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(map[string]string{
 		"status": "reallocation enqueued",
-	}); err != nil {
-		ms.logger.Error("Error encoding response", zap.Error(err))
-	}
-}
-
-// handleStoreRegistration handles requests from nodes to register with the leader
-func (ms *MetadataStore) handleStoreRegistration(w http.ResponseWriter, r *http.Request) {
-	var req store.StoreRegistrationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errorResponse(w, "Failed to parse registration request", http.StatusBadRequest)
-		return
-	}
-	if err := ms.tm.RegisterStore(r.Context(), &req); err != nil {
-		ms.logger.Error("Failed to register node", zap.Stringer("nodeID", req.ID), zap.Error(err))
-		errorResponse(w, "Failed to register store", http.StatusInternalServerError)
-		return
-	}
-	ms.TriggerReconciliation()
-
-	ms.logger.Info("Node registered",
-		zap.Stringer("nodeID", req.ID),
-		zap.String("raftURL", req.RaftURL),
-		zap.String("apiURL", req.ApiURL),
-	)
-
-	// Return success
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(map[string]string{
-		"status": "registered",
 	}); err != nil {
 		ms.logger.Error("Error encoding response", zap.Error(err))
 	}

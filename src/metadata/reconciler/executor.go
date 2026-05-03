@@ -197,6 +197,13 @@ func (r *Reconciler) ExecutePlan(
 }
 
 // executeRemovedStorePeerRemovals removes tombstoned stores from shards where they are still voters
+// removedStorePeerRemovalTimeout bounds how long a single peer-removal RPC may
+// take. The store-side HTTP transport has a 5-minute ResponseHeaderTimeout, but
+// when the leader's local Raft group for the shard has already stopped it
+// cannot reply at all, so we cap the per-shard wait well below that to keep
+// reconciliation cycles responsive.
+const removedStorePeerRemovalTimeout = 30 * time.Second
+
 func (r *Reconciler) executeRemovedStorePeerRemovals(
 	ctx context.Context,
 	removedStores []types.ID,
@@ -227,7 +234,10 @@ func (r *Reconciler) executeRemovedStorePeerRemovals(
 
 			// Need to remove this peer from the shard
 			eg.Go(func() error {
-				leaderClient, err := r.storeOps.GetLeaderClientForShard(egCtx, shardID)
+				attemptCtx, cancel := context.WithTimeout(egCtx, removedStorePeerRemovalTimeout)
+				defer cancel()
+
+				leaderClient, err := r.storeOps.GetLeaderClientForShard(attemptCtx, shardID)
 				if err != nil {
 					r.logger.Warn(
 						"Failed to find leader for shard for removal",
@@ -246,14 +256,43 @@ func (r *Reconciler) executeRemovedStorePeerRemovals(
 				// Use sync removal (async=false) to wait for the conf change to be applied.
 				// This ensures the removed store is actually removed from the Raft voters
 				// before we proceed, preventing races in reconciliation.
-				if err := r.shardOps.RemovePeer(ctx, shardID, leaderClient, removedStore, false); err != nil {
+				err = r.shardOps.RemovePeer(attemptCtx, shardID, leaderClient, removedStore, false)
+				if err == nil {
+					return nil
+				}
+				switch {
+				case errors.Is(err, client.ErrRaftStopped),
+					errors.Is(err, client.ErrNotFound),
+					errors.Is(err, client.ErrShardNotReady):
+					// The leader's local Raft group for this shard is gone (or the
+					// shard is not yet/no longer present). The peer is effectively
+					// removed for that node; the next status report will reflect
+					// it once the surviving replicas re-elect a leader.
+					r.logger.Info(
+						"Skipping peer removal: leader cannot serve the shard",
+						zap.Stringer("removedStore", removedStore),
+						zap.Stringer("shardID", shardID),
+						zap.Stringer("leaderID", leaderClient.ID()),
+						zap.Error(err),
+					)
+				case errors.Is(err, context.Canceled),
+					errors.Is(err, context.DeadlineExceeded):
+					// Per-shard timeout expired or the parent reconciliation was
+					// cancelled. Retry on the next cycle.
+					r.logger.Warn(
+						"Peer removal timed out; will retry next reconciliation",
+						zap.Stringer("removedStore", removedStore),
+						zap.Stringer("shardID", shardID),
+						zap.Stringer("leaderID", leaderClient.ID()),
+						zap.Error(err),
+					)
+				default:
 					r.logger.Warn(
 						"Failed to remove peer from shard",
 						zap.Stringer("removedStore", removedStore),
 						zap.Stringer("shardID", shardID),
 						zap.Error(err),
 					)
-					return nil
 				}
 				return nil
 			})
