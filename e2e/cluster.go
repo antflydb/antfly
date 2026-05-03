@@ -71,11 +71,12 @@ type clusterStatusResponse struct {
 }
 
 type nodeShutdownStatusResponse struct {
-	Phase           string `json:"phase"`
-	SafeToTerminate bool   `json:"safe_to_terminate"`
-	Blocked         bool   `json:"blocked,omitempty"`
-	BlockedReason   string `json:"blocked_reason,omitempty"`
-	Message         string `json:"message,omitempty"`
+	Phase           string   `json:"phase"`
+	SafeToTerminate bool     `json:"safe_to_terminate"`
+	Blocked         bool     `json:"blocked,omitempty"`
+	BlockedReason   string   `json:"blocked_reason,omitempty"`
+	Message         string   `json:"message,omitempty"`
+	BypassedGroups  []string `json:"bypassed_groups,omitempty"`
 }
 
 // TestCluster represents a multi-node test cluster for distributed e2e testing.

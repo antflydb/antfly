@@ -989,9 +989,13 @@ func (tm *TableManager) RequestNodeShutdown(ctx context.Context, id types.ID, re
 		}
 		record = &NodeRecord{NodeID: id}
 	}
+	now := time.Now()
+	if record.Lifecycle != NodeLifecycleDraining || record.DrainingSince.IsZero() {
+		record.DrainingSince = now
+	}
 	record.Lifecycle = NodeLifecycleDraining
 	record.Reason = reason
-	record.LastSeen = time.Now()
+	record.LastSeen = now
 	nodeData, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("marshalling node record for %s: %w", id, err)
@@ -1064,6 +1068,7 @@ func (tm *TableManager) ClearStoreTombstone(ctx context.Context, id types.ID) er
 	record.Lifecycle = NodeLifecycleActive
 	record.Reason = ""
 	record.LastSeen = time.Now()
+	record.DrainingSince = time.Time{}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("marshalling node record for %s: %w", id, err)

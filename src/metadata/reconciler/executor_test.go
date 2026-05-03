@@ -217,6 +217,78 @@ func TestExecutePlan_RemovedStoreCleanup(t *testing.T) {
 		mockStoreOps.AssertNotCalled(t, "GetLeaderClientForShard")
 		mockShardOps.AssertNotCalled(t, "RemovePeer")
 	})
+
+	// When the leader's local Raft for a shard has stopped (e.g., the leader
+	// already had its peer ID removed earlier), RemovePeer returns
+	// client.ErrRaftStopped. The reconciler must classify this as a
+	// recoverable, expected condition: log it and let the next reconciliation
+	// re-evaluate, rather than retrying every cycle until the test times out.
+	t.Run("classifies raft-stopped as recoverable", func(t *testing.T) {
+		mockShardOps := &MockShardOperations{}
+		mockTableOps := &MockTableOperations{}
+		mockStoreOps := &MockStoreOperations{}
+
+		removedStore := types.ID(100)
+		shardID := types.ID(1)
+		leaderClient := &client.StoreClient{}
+
+		current := CurrentClusterState{
+			Shards: map[types.ID]*store.ShardInfo{
+				shardID: {
+					RaftStatus: &common.RaftStatus{
+						Voters: common.NewPeerSet(1, 2, removedStore),
+					},
+				},
+			},
+		}
+		plan := &ReconciliationPlan{RemovedStorePeerRemovals: []types.ID{removedStore}}
+
+		mockStoreOps.On("GetLeaderClientForShard", mock.Anything, shardID).Return(leaderClient, nil)
+		mockShardOps.On("RemovePeer", mock.Anything, shardID, leaderClient, removedStore, false).
+			Return(fmt.Errorf("removing peer: %w",
+				&client.ResponseError{StatusCode: 500, Body: "Failed to apply conf change: proposing confChange to raft: raft: stopped"}))
+
+		reconciler := NewReconciler(
+			mockShardOps, mockTableOps, mockStoreOps,
+			ReconciliationConfig{ReplicationFactor: 2}, zap.NewNop(),
+		)
+		err := reconciler.ExecutePlan(context.Background(), plan, current, DesiredClusterState{})
+		// Errors are swallowed so reconciliation can keep making progress on
+		// other shards in subsequent cycles.
+		assert.NoError(t, err)
+
+		mockStoreOps.AssertExpectations(t)
+		mockShardOps.AssertExpectations(t)
+	})
+
+	t.Run("classifies shard-not-found as recoverable", func(t *testing.T) {
+		mockShardOps := &MockShardOperations{}
+		mockTableOps := &MockTableOperations{}
+		mockStoreOps := &MockStoreOperations{}
+
+		removedStore := types.ID(100)
+		shardID := types.ID(1)
+		leaderClient := &client.StoreClient{}
+
+		current := CurrentClusterState{
+			Shards: map[types.ID]*store.ShardInfo{
+				shardID: {RaftStatus: &common.RaftStatus{Voters: common.NewPeerSet(1, 2, removedStore)}},
+			},
+		}
+		plan := &ReconciliationPlan{RemovedStorePeerRemovals: []types.ID{removedStore}}
+
+		mockStoreOps.On("GetLeaderClientForShard", mock.Anything, shardID).Return(leaderClient, nil)
+		mockShardOps.On("RemovePeer", mock.Anything, shardID, leaderClient, removedStore, false).
+			Return(fmt.Errorf("removing peer: %w",
+				&client.ResponseError{StatusCode: 404, Body: "Shard not found"}))
+
+		reconciler := NewReconciler(
+			mockShardOps, mockTableOps, mockStoreOps,
+			ReconciliationConfig{ReplicationFactor: 2}, zap.NewNop(),
+		)
+		err := reconciler.ExecutePlan(context.Background(), plan, current, DesiredClusterState{})
+		assert.NoError(t, err)
+	})
 }
 
 func TestResolveMergeSeedArchiveFile(t *testing.T) {

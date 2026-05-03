@@ -53,6 +53,11 @@ type NodeRecord struct {
 	Lifecycle string    `json:"lifecycle"`
 	Reason    string    `json:"reason,omitempty"`
 	LastSeen  time.Time `json:"last_seen"`
+	// DrainingSince records when the node first entered the Draining
+	// lifecycle. Preserved across status updates so the safety net in
+	// buildNodeShutdownStatus can detect drains that have been stuck for
+	// longer than the configured threshold.
+	DrainingSince time.Time `json:"draining_since,omitempty"`
 }
 
 func (ss *StoreStatus) Equivalent(other *StoreStatus) bool {

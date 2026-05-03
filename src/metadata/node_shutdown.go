@@ -59,7 +59,20 @@ type nodeShutdownStatus struct {
 	Message         string                    `json:"message,omitempty"`
 	Stores          []nodeShutdownStoreStatus `json:"stores,omitempty"`
 	PendingGroups   []types.ID                `json:"pending_groups,omitempty"`
+	// BypassedGroups lists shards that the safety net excluded from
+	// SafeToTerminate counters because the drain has been stuck longer than
+	// nodeShutdownStuckThreshold. Surfaced for operator visibility; these
+	// shards still have multiple voters (otherwise Blocked would be set).
+	BypassedGroups []types.ID `json:"bypassed_groups,omitempty"`
 }
+
+// nodeShutdownStuckThreshold is the duration after entering Draining beyond
+// which the safety net excludes pending shards from SafeToTerminate, provided
+// removing this node would not leave the shard without quorum. Without this
+// safety net, a single shard whose leader can no longer apply conf changes
+// (raft stopped, partitioned leader, etc.) would block node termination
+// indefinitely.
+const nodeShutdownStuckThreshold = 2 * time.Minute
 
 type nodeShutdownStoreStatus struct {
 	StoreID              uint64 `json:"store_id"`
@@ -382,10 +395,41 @@ func (ms *MetadataStore) buildNodeShutdownStatus(r *http.Request, nodeID types.I
 	if err != nil {
 		return nil, err
 	}
+
+	// Bypass shards that still reference this node once the drain has been
+	// running longer than the stuck threshold, so a single shard whose Raft
+	// leader cannot apply conf changes does not block termination forever.
+	// We only bypass shards that would retain at least one voter without
+	// this node; the InsufficientShardVoters guard below still trumps it.
+	bypassStuck := nodeRecord != nil &&
+		!nodeRecord.DrainingSince.IsZero() &&
+		time.Since(nodeRecord.DrainingSince) >= nodeShutdownStuckThreshold
+
 	for shardID, shard := range shards {
 		if shard == nil {
 			continue
 		}
+		referencesNode := shard.ReportedBy.Contains(nodeID) ||
+			shard.Peers.Contains(nodeID) ||
+			(shard.RaftStatus != nil &&
+				(shard.RaftStatus.Voters.Contains(nodeID) || shard.RaftStatus.Lead == nodeID))
+		if !referencesNode {
+			continue
+		}
+
+		// If removing this node would leave the shard without quorum, never
+		// bypass: the operator must add a replacement first. This check
+		// mirrors the per-voter guard below but applies even when only
+		// Peers/ReportedBy references the node.
+		insufficientVoters := shard.RaftStatus != nil &&
+			shard.RaftStatus.Voters.Contains(nodeID) &&
+			effectiveShardVoterCount(shard) <= 1
+
+		if bypassStuck && !insufficientVoters {
+			status.BypassedGroups = appendUniqueID(status.BypassedGroups, shardID)
+			continue
+		}
+
 		if shard.ReportedBy.Contains(nodeID) {
 			status.Stores[0].GroupStatusCount++
 			status.Stores[0].RuntimeGroupCount++
@@ -399,7 +443,7 @@ func (ms *MetadataStore) buildNodeShutdownStatus(r *http.Request, nodeID types.I
 			if shard.RaftStatus.Voters.Contains(nodeID) {
 				status.Stores[0].LocalVoterCount++
 				status.PendingGroups = appendUniqueID(status.PendingGroups, shardID)
-				if effectiveShardVoterCount(shard) <= 1 {
+				if insufficientVoters {
 					status.Blocked = true
 					status.BlockedReason = "InsufficientShardVoters"
 				}
@@ -420,6 +464,12 @@ func (ms *MetadataStore) buildNodeShutdownStatus(r *http.Request, nodeID types.I
 	switch {
 	case !storeKnown && status.SafeToTerminate:
 		status.Phase = "not_found"
+	case status.SafeToTerminate && len(status.BypassedGroups) > 0:
+		status.Phase = "complete"
+		status.Message = fmt.Sprintf(
+			"drain exceeded %s; bypassing %d shard(s) that the reconciler could not drain",
+			nodeShutdownStuckThreshold, len(status.BypassedGroups),
+		)
 	case status.SafeToTerminate:
 		status.Phase = "complete"
 	case status.Blocked:

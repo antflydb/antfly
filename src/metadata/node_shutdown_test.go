@@ -1,11 +1,13 @@
 package metadata
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/common"
@@ -518,6 +520,162 @@ func TestNodeStatusUpdatesHostedStore(t *testing.T) {
 	require.Contains(t, status.Shards, types.ID(11))
 	require.True(t, status.Shards[types.ID(11)].RaftStatus.Voters.Contains(types.ID(7)))
 	require.Equal(t, types.ID(7), status.Shards[types.ID(11)].RaftStatus.Lead)
+}
+
+// backdateDrainingSince rewrites the persisted NodeRecord so that the test
+// can simulate a drain that has been running long enough to exceed
+// nodeShutdownStuckThreshold.
+func backdateDrainingSince(t *testing.T, ms *MetadataStore, db interface {
+	Batch(ctx context.Context, writes [][2][]byte, deletes [][]byte) error
+}, nodeID types.ID, since time.Time) {
+	t.Helper()
+	record, err := ms.tm.GetNodeRecord(t.Context(), nodeID)
+	require.NoError(t, err)
+	record.DrainingSince = since
+	data, err := json.Marshal(record)
+	require.NoError(t, err)
+	require.NoError(t, db.Batch(t.Context(),
+		[][2][]byte{{[]byte("tm:nr:" + nodeID.String()), data}},
+		nil,
+	))
+}
+
+func TestNodeShutdownStatusBypassesStuckShardsAfterThreshold(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+	shardID := types.ID(10)
+	nodeID := types.ID(1)
+	otherA := types.ID(2)
+	otherB := types.ID(3)
+
+	// Three-voter shard so removing nodeID leaves quorum (2 voters >= 1).
+	require.NoError(t, ms.tm.RegisterStore(t.Context(), &store.StoreRegistrationRequest{
+		StoreInfo: store.StoreInfo{ID: nodeID},
+		Shards: map[types.ID]*store.ShardInfo{
+			shardID: {
+				Peers:      common.NewPeerSet(nodeID, otherA, otherB),
+				ReportedBy: common.NewPeerSet(nodeID, otherA, otherB),
+				RaftStatus: &common.RaftStatus{Lead: otherA, Voters: common.NewPeerSet(nodeID, otherA, otherB)},
+			},
+		},
+	}))
+	writeShardStatus(t, db, &store.ShardStatus{
+		ID: shardID, Table: "docs", State: store.ShardState_Default,
+		ShardInfo: store.ShardInfo{
+			Peers:      common.NewPeerSet(nodeID, otherA, otherB),
+			ReportedBy: common.NewPeerSet(nodeID, otherA, otherB),
+			VoterCount: 3,
+			RaftStatus: &common.RaftStatus{Lead: otherA, Voters: common.NewPeerSet(nodeID, otherA, otherB)},
+		},
+	})
+
+	// Request shutdown — node enters Draining with DrainingSince=now.
+	require.NoError(t, ms.tm.RequestNodeShutdown(t.Context(), nodeID, "test"))
+
+	// Within the threshold the shard still counts: SafeToTerminate stays false.
+	statusReq := httptest.NewRequest(http.MethodGet, "/internal/v1/nodes/1/shutdown", nil)
+	statusReq.SetPathValue("node", "1")
+	statusRec := httptest.NewRecorder()
+	ms.handleNodeShutdownStatus(statusRec, statusReq)
+	require.Equal(t, http.StatusOK, statusRec.Code)
+	var status nodeShutdownStatus
+	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &status))
+	require.False(t, status.SafeToTerminate)
+	require.Equal(t, "draining", status.Phase)
+	require.Empty(t, status.BypassedGroups)
+
+	// Backdate so the drain has exceeded the threshold.
+	backdateDrainingSince(t, ms, db, nodeID, time.Now().Add(-2*nodeShutdownStuckThreshold))
+
+	statusRec = httptest.NewRecorder()
+	ms.handleNodeShutdownStatus(statusRec, statusReq)
+	require.Equal(t, http.StatusOK, statusRec.Code)
+	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &status))
+	require.True(t, status.SafeToTerminate)
+	require.Equal(t, "complete", status.Phase)
+	require.Contains(t, status.BypassedGroups, shardID)
+	require.Equal(t, 0, status.Stores[0].PlacementIntentCount)
+	require.Equal(t, 0, status.Stores[0].LocalVoterCount)
+	require.Contains(t, status.Message, "drain exceeded")
+}
+
+func TestNodeShutdownStatusDoesNotBypassQuorumLossShards(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+	shardID := types.ID(10)
+	nodeID := types.ID(1)
+
+	// Single-voter shard: removing this node would leave 0 voters.
+	require.NoError(t, ms.tm.RegisterStore(t.Context(), &store.StoreRegistrationRequest{
+		StoreInfo: store.StoreInfo{ID: nodeID},
+		Shards: map[types.ID]*store.ShardInfo{
+			shardID: {
+				Peers:      common.NewPeerSet(nodeID),
+				ReportedBy: common.NewPeerSet(nodeID),
+				RaftStatus: &common.RaftStatus{Lead: nodeID, Voters: common.NewPeerSet(nodeID)},
+			},
+		},
+	}))
+	writeShardStatus(t, db, &store.ShardStatus{
+		ID: shardID, Table: "docs", State: store.ShardState_Default,
+		ShardInfo: store.ShardInfo{
+			Peers:      common.NewPeerSet(nodeID),
+			ReportedBy: common.NewPeerSet(nodeID),
+			VoterCount: 1,
+			RaftStatus: &common.RaftStatus{Lead: nodeID, Voters: common.NewPeerSet(nodeID)},
+		},
+	})
+
+	require.NoError(t, ms.tm.RequestNodeShutdown(t.Context(), nodeID, "test"))
+	backdateDrainingSince(t, ms, db, nodeID, time.Now().Add(-2*nodeShutdownStuckThreshold))
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/internal/v1/nodes/1/shutdown", nil)
+	statusReq.SetPathValue("node", "1")
+	statusRec := httptest.NewRecorder()
+	ms.handleNodeShutdownStatus(statusRec, statusReq)
+	require.Equal(t, http.StatusOK, statusRec.Code)
+
+	var status nodeShutdownStatus
+	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &status))
+	require.False(t, status.SafeToTerminate, "must not bypass shards that would lose quorum")
+	require.True(t, status.Blocked)
+	require.Equal(t, "InsufficientShardVoters", status.BlockedReason)
+	require.Empty(t, status.BypassedGroups)
+}
+
+func TestRequestNodeShutdownPreservesDrainingSince(t *testing.T) {
+	ms, _ := setupTestMetadataStore(t)
+	nodeID := types.ID(1)
+
+	require.NoError(t, ms.tm.RegisterStore(t.Context(), &store.StoreRegistrationRequest{
+		StoreInfo: store.StoreInfo{ID: nodeID},
+	}))
+
+	require.NoError(t, ms.tm.RequestNodeShutdown(t.Context(), nodeID, "first"))
+	first, err := ms.tm.GetNodeRecord(t.Context(), nodeID)
+	require.NoError(t, err)
+	require.False(t, first.DrainingSince.IsZero())
+
+	time.Sleep(2 * time.Millisecond)
+	require.NoError(t, ms.tm.RequestNodeShutdown(t.Context(), nodeID, "second"))
+	second, err := ms.tm.GetNodeRecord(t.Context(), nodeID)
+	require.NoError(t, err)
+	require.Equal(t, first.DrainingSince, second.DrainingSince,
+		"DrainingSince must be preserved across re-requested shutdowns")
+}
+
+func TestClearStoreTombstoneClearsDrainingSince(t *testing.T) {
+	ms, _ := setupTestMetadataStore(t)
+	nodeID := types.ID(1)
+
+	require.NoError(t, ms.tm.RegisterStore(t.Context(), &store.StoreRegistrationRequest{
+		StoreInfo: store.StoreInfo{ID: nodeID},
+	}))
+	require.NoError(t, ms.tm.RequestNodeShutdown(t.Context(), nodeID, "go"))
+	require.NoError(t, ms.tm.ClearStoreTombstone(t.Context(), nodeID))
+
+	record, err := ms.tm.GetNodeRecord(t.Context(), nodeID)
+	require.NoError(t, err)
+	require.Equal(t, tablemgr.NodeLifecycleActive, record.Lifecycle)
+	require.True(t, record.DrainingSince.IsZero())
 }
 
 func TestNodeStatusRejectsUnknownNode(t *testing.T) {
