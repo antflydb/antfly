@@ -1,0 +1,23 @@
+@import "tailwindcss";
+@import "@antfly/design-system/styles.css";
+@import "@xyflow/react/dist/style.css";
+@import "@antfly/graph/styles.css";
+
+/* Match the library's class-based dark variant. The library's own compile
+   declares this internally, but the consumer's Tailwind compile also emits
+   `dark:*` utilities (from scanned source files) and defaults to
+   `@media (prefers-color-scheme: dark)` unless we override here. Must be
+   set to keep `next-themes` class-toggling in sync with emitted CSS. */
+@custom-variant dark (&:is(.dark *));
+
+/* Scan the library's source so Tailwind picks up utility classes it uses.
+   Uses relative path since we're in a monorepo. */
+@source "../../../packages/design-system/src/**/*.{ts,tsx,js,jsx}";
+@source "../../../packages/graph/src/**/*.{ts,tsx,js,jsx}";
+@source "../app/**/*.{ts,tsx}";
+
+/* next/font's Roboto_Mono exposes --font-roboto-mono; bind it to --font-mono
+   so the library's MonoLabel / font-mono utilities resolve. */
+:root {
+  --font-mono: var(--font-roboto-mono), "Menlo", "Monaco", "Courier New", monospace;
+}

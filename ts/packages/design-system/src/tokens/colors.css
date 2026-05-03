@@ -1,0 +1,139 @@
+/**
+ * @antfly/design-system — color tokens
+ *
+ * Palette: cool-gray monochrome base, purple #9A94FF (oklch(0.7 0.15 285)) as accent.
+ * Mirrors PR #184 aesthetic: raw-industrial, restrained — purple never carries
+ * the whole surface, it anchors CTAs and single accent phrases.
+ */
+
+:root {
+  /* Core semantic colors — cool gray */
+  --background: oklch(0.98 0.003 265);
+  --foreground: oklch(0.185 0.02 275);
+
+  --card: oklch(0.995 0.001 265);
+  --card-foreground: oklch(0.185 0.02 275);
+
+  --popover: oklch(0.995 0.001 265);
+  --popover-foreground: oklch(0.185 0.02 275);
+
+  /* Purple accent — use sparingly */
+  --primary: oklch(0.7 0.15 285);
+  --primary-foreground: oklch(1 0 0);
+
+  --secondary: oklch(0.955 0.003 265);
+  --secondary-foreground: oklch(0.185 0.02 275);
+
+  --muted: oklch(0.955 0.003 265);
+  --muted-foreground: oklch(0.55 0.01 265);
+
+  --accent: oklch(0.955 0.003 265);
+  --accent-foreground: oklch(0.185 0.02 275);
+
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+
+  --success: oklch(0.7 0.17 150);
+  --success-foreground: oklch(0.985 0 0);
+
+  --warning: oklch(0.78 0.16 75);
+  --warning-foreground: oklch(0.15 0.02 75);
+
+  --info: oklch(0.72 0.13 230);
+  --info-foreground: oklch(0.985 0 0);
+
+  --border: oklch(0.91 0.005 265);
+  --input: oklch(0.91 0.005 265);
+  --ring: oklch(0.65 0.005 265);
+
+  /* Chart palette — lead with primary + muted, then amber / green / coral */
+  --chart-1: var(--primary);
+  --chart-2: var(--muted-foreground);
+  --chart-3: oklch(0.78 0.15 92);
+  --chart-4: oklch(0.58 0.12 145);
+  --chart-5: oklch(0.7 0.13 28);
+  --chart-6: oklch(0.64 0.13 225);
+
+  /* Sidebar */
+  --sidebar: var(--background);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+
+  /* Graph paper background */
+  --grid-color: oklch(0.91 0.003 265 / 50%);
+  --grid-size: 24px;
+
+  /* Mono label voice */
+  --label-color: oklch(0.55 0.01 265);
+  --label-size: 0.75rem;
+
+  /* Anty character glow — soft pastel halo behind the brand character */
+  --anty-glow-inner: linear-gradient(90deg, #c5d4ff 0%, #e0c5ff 100%);
+  --anty-glow-outer: linear-gradient(90deg, #d5e2ff 0%, #eed5ff 100%);
+}
+
+.dark {
+  --background: oklch(0.135 0.005 275);
+  --foreground: oklch(0.91 0.005 265);
+
+  --card: oklch(0.185 0.005 275);
+  --card-foreground: oklch(0.91 0.005 265);
+
+  --popover: oklch(0.185 0.005 275);
+  --popover-foreground: oklch(0.91 0.005 265);
+
+  --primary: oklch(0.7 0.15 285);
+  --primary-foreground: oklch(0.135 0.005 275);
+
+  --secondary: oklch(0.22 0.005 275);
+  --secondary-foreground: oklch(0.91 0.005 265);
+
+  --muted: oklch(0.22 0.005 275);
+  --muted-foreground: oklch(0.65 0.005 265);
+
+  --accent: oklch(0.22 0.005 275);
+  --accent-foreground: oklch(0.91 0.005 265);
+
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+
+  --success: oklch(0.72 0.17 150);
+  --success-foreground: oklch(0.135 0.005 275);
+
+  --warning: oklch(0.82 0.16 75);
+  --warning-foreground: oklch(0.135 0.005 275);
+
+  --info: oklch(0.72 0.13 230);
+  --info-foreground: oklch(0.135 0.005 275);
+
+  --border: oklch(1 0 0 / 8%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: oklch(0.5 0.005 265);
+
+  --chart-1: var(--primary);
+  --chart-2: var(--muted-foreground);
+  --chart-3: #fadf5a;
+  --chart-4: #477f4f;
+  --chart-5: #f7978d;
+
+  --sidebar: var(--background);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+
+  --grid-color: oklch(1 0 0 / 4%);
+  --label-color: oklch(0.55 0.005 265);
+
+  /* Dark-mode glow: saturated mid-purple, dimmer so it doesn't white-wash on dark bg */
+  --anty-glow-inner: linear-gradient(90deg, oklch(0.45 0.15 260) 0%, oklch(0.45 0.13 305) 100%);
+  --anty-glow-outer: linear-gradient(90deg, oklch(0.35 0.12 260) 0%, oklch(0.35 0.1 305) 100%);
+}

@@ -1,8 +1,8 @@
-import type { QueryHit } from "@antfly/sdk";
 import { fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type React from "react";
 import { describe, expect, it, vi } from "vitest";
+import type { QueryHit } from "@antfly/sdk";
 import Antfly from "./Antfly";
 import Autosuggest from "./Autosuggest";
 import QueryBox from "./QueryBox";
