@@ -1,0 +1,11 @@
+/**
+ * @antfly/design-system token entry.
+ * Consumers can `@import "@antfly/design-system/tokens"` for raw CSS vars
+ * (no Tailwind directives). Most consumers should import "./styles.css"
+ * instead to get the full Tailwind v4 theme.
+ */
+
+@import "./typography.css";
+@import "./colors.css";
+@import "./radii.css";
+@import "./shadows.css";

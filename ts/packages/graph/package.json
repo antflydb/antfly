@@ -1,0 +1,47 @@
+{
+  "name": "@antfly/graph",
+  "version": "0.0.1",
+  "private": false,
+  "description": "Force-directed graph component for the Antfly design system",
+  "type": "module",
+  "sideEffects": ["**/*.css"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./styles.css": "./dist/styles.css",
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "vite build && cp src/styles.css dist/styles.css",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "lint": "biome check src/"
+  },
+  "peerDependencies": {
+    "@antfly/design-system": "workspace:*",
+    "react": "^18 || ^19",
+    "react-dom": "^18 || ^19"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.10.2",
+    "d3-force": "^3.0.0",
+    "lucide-react": "^0.555.0"
+  },
+  "devDependencies": {
+    "@types/d3-force": "^3.0.10",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.4.1",
+    "rollup-plugin-preserve-directives": "^0.4.0",
+    "typescript": "5.9.3",
+    "vite": "^6.3.5",
+    "vite-plugin-dts": "^4.5.4",
+    "vite-tsconfig-paths": "^4.3.2"
+  }
+}

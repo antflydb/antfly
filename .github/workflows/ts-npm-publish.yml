@@ -1,10 +1,12 @@
 # Publish packages to npm when tagged
 # - ts/antfly/sdk/v* tags publish @antfly/sdk
 # - ts/antfly/components/v* tags publish @antfly/components
+# - ts/antfly/design-system/v* tags publish @antfly/design-system
 #
 # Uses npm Trusted Publishing (OIDC) - no secrets required.
 # Configure trusted publishers at: https://www.npmjs.com/package/@antfly/sdk/access
-# and https://www.npmjs.com/package/@antfly/components/access
+# https://www.npmjs.com/package/@antfly/components/access
+# and https://www.npmjs.com/package/@antfly/design-system/access
 
 name: Publish to npm
 
@@ -13,6 +15,7 @@ on:
     tags:
       - 'ts/antfly/sdk/v*'
       - 'ts/antfly/components/v*'
+      - 'ts/antfly/design-system/v*'
 
 jobs:
   publish:
@@ -60,3 +63,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/ts/antfly/components/v')
         working-directory: ts
         run: pnpm --filter @antfly/components publish --access public --no-git-checks --provenance
+
+      - name: Publish Design System
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/design-system/v')
+        working-directory: ts
+        run: pnpm --filter @antfly/design-system publish --access public --no-git-checks --provenance
