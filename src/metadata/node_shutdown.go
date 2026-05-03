@@ -46,6 +46,7 @@ type nodeGroupStatusReport struct {
 	GroupID     uint64 `json:"group_id"`
 	LocalLeader bool   `json:"local_leader,omitempty"`
 	LocalVoter  bool   `json:"local_voter,omitempty"`
+	VoterCount  int    `json:"voter_count,omitempty"`
 }
 
 type nodeShutdownStatus struct {
@@ -205,7 +206,7 @@ func (ms *MetadataStore) handleNodeRegistration(w http.ResponseWriter, r *http.R
 	}
 	if req.StoreID != 0 {
 		shards := req.Shards
-		if len(req.GroupStatus) > 0 {
+		if len(shards) == 0 && len(req.GroupStatus) > 0 {
 			shards = nodeGroupStatusReportsToShards(nodeID, req.GroupStatus)
 		}
 		storeReq := &store.StoreRegistrationRequest{
@@ -314,6 +315,11 @@ func nodeGroupStatusReportsToShards(nodeID types.ID, reports []nodeGroupStatusRe
 		if report.LocalVoter {
 			info.Peers.Add(nodeID)
 			info.RaftStatus.Voters = common.NewPeerSet(nodeID)
+			if report.VoterCount > 0 {
+				info.VoterCount = report.VoterCount
+			} else {
+				info.VoterCount = 1
+			}
 		}
 		if report.LocalLeader {
 			info.RaftStatus.Lead = nodeID
@@ -372,14 +378,6 @@ func (ms *MetadataStore) buildNodeShutdownStatus(r *http.Request, nodeID types.I
 		}
 		return status, nil
 	}
-	if storeStatus != nil {
-		status.Stores[0].GroupStatusCount = len(storeStatus.Shards)
-		status.Stores[0].RuntimeGroupCount = len(storeStatus.Shards)
-		for shardID := range storeStatus.Shards {
-			status.PendingGroups = appendUniqueID(status.PendingGroups, shardID)
-		}
-	}
-
 	shards, err := ms.tm.GetShardStatuses()
 	if err != nil {
 		return nil, err
@@ -387,6 +385,11 @@ func (ms *MetadataStore) buildNodeShutdownStatus(r *http.Request, nodeID types.I
 	for shardID, shard := range shards {
 		if shard == nil {
 			continue
+		}
+		if shard.ReportedBy.Contains(nodeID) {
+			status.Stores[0].GroupStatusCount++
+			status.Stores[0].RuntimeGroupCount++
+			status.PendingGroups = appendUniqueID(status.PendingGroups, shardID)
 		}
 		if shard.Peers.Contains(nodeID) {
 			status.Stores[0].PlacementIntentCount++
@@ -396,7 +399,7 @@ func (ms *MetadataStore) buildNodeShutdownStatus(r *http.Request, nodeID types.I
 			if shard.RaftStatus.Voters.Contains(nodeID) {
 				status.Stores[0].LocalVoterCount++
 				status.PendingGroups = appendUniqueID(status.PendingGroups, shardID)
-				if len(shard.RaftStatus.Voters) <= 1 {
+				if effectiveShardVoterCount(shard) <= 1 {
 					status.Blocked = true
 					status.BlockedReason = "InsufficientShardVoters"
 				}
@@ -426,6 +429,17 @@ func (ms *MetadataStore) buildNodeShutdownStatus(r *http.Request, nodeID types.I
 		status.Phase = "draining"
 	}
 	return status, nil
+}
+
+func effectiveShardVoterCount(shard *store.ShardStatus) int {
+	if shard == nil {
+		return 0
+	}
+	voterCount := shard.VoterCount
+	if shard.RaftStatus != nil && len(shard.RaftStatus.Voters) > voterCount {
+		voterCount = len(shard.RaftStatus.Voters)
+	}
+	return voterCount
 }
 
 func appendUniqueID(ids []types.ID, id types.ID) []types.ID {

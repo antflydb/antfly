@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/antflydb/antfly/lib/types"
+	"github.com/antflydb/antfly/src/common"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -95,6 +96,23 @@ func TestNodeRegistrationEndpoint(t *testing.T) {
 	assert.True(t, payload.Live)
 	assert.Equal(t, "http://localhost:9021", payload.RaftURL)
 	assert.Equal(t, "http://localhost:12380", payload.APIURL)
+}
+
+func TestShardInfosToNodeGroupStatusReports(t *testing.T) {
+	reports := shardInfosToNodeGroupStatusReports(types.ID(2), map[types.ID]*ShardInfo{
+		10: {
+			RaftStatus: &common.RaftStatus{
+				Lead:   2,
+				Voters: common.NewPeerSet(1, 2, 3),
+			},
+		},
+	})
+
+	require.Len(t, reports, 1)
+	assert.Equal(t, uint64(10), reports[0].GroupID)
+	assert.True(t, reports[0].LocalLeader)
+	assert.True(t, reports[0].LocalVoter)
+	assert.Equal(t, 3, reports[0].VoterCount)
 }
 
 // TestNodeRegistrationURL verifies the full URL construction.

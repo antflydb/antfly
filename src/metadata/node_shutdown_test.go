@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -61,6 +62,82 @@ func TestNodeShutdownLifecycle(t *testing.T) {
 	require.Contains(t, statusRec.Body.String(), `"blocked_reason":"InsufficientShardVoters"`)
 	require.Contains(t, statusRec.Body.String(), `"local_voter_count":1`)
 	require.Contains(t, statusRec.Body.String(), `"pending_groups"`)
+}
+
+func TestNodeShutdownStatusIgnoresFrozenTerminatingStoreShards(t *testing.T) {
+	ms, _ := setupTestMetadataStore(t)
+	shardID := types.ID(10)
+	nodeID := types.ID(1)
+
+	require.NoError(t, ms.tm.RegisterStore(t.Context(), &store.StoreRegistrationRequest{
+		StoreInfo: store.StoreInfo{ID: nodeID},
+		Shards: map[types.ID]*store.ShardInfo{
+			shardID: {Peers: common.NewPeerSet(nodeID), RaftStatus: &common.RaftStatus{Lead: nodeID, Voters: common.NewPeerSet(nodeID)}},
+		},
+	}))
+
+	req := httptest.NewRequest(http.MethodPut, "/internal/v1/nodes/1/shutdown", strings.NewReader(`{"type":"remove"}`))
+	req.SetPathValue("node", "1")
+	rec := httptest.NewRecorder()
+	ms.handleNodeShutdownRequest(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	storeStatus, err := ms.tm.GetStoreStatus(t.Context(), nodeID)
+	require.NoError(t, err)
+	require.Equal(t, store.StoreState_Terminating, storeStatus.State)
+	require.Contains(t, storeStatus.Shards, shardID)
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/internal/v1/nodes/1/shutdown", nil)
+	statusReq.SetPathValue("node", "1")
+	statusRec := httptest.NewRecorder()
+	ms.handleNodeShutdownStatus(statusRec, statusReq)
+	require.Equal(t, http.StatusOK, statusRec.Code)
+
+	var status nodeShutdownStatus
+	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &status))
+	require.Equal(t, "complete", status.Phase)
+	require.True(t, status.SafeToTerminate)
+	require.Equal(t, 0, status.Stores[0].GroupStatusCount)
+	require.Equal(t, 0, status.Stores[0].RuntimeGroupCount)
+}
+
+func TestNodeShutdownStatusUsesGroupStatusVoterCount(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+	shardID := types.ID(10)
+	nodeID := types.ID(1)
+
+	shards := nodeGroupStatusReportsToShards(nodeID, []nodeGroupStatusReport{{
+		GroupID:     uint64(shardID),
+		LocalLeader: true,
+		LocalVoter:  true,
+		VoterCount:  3,
+	}})
+	require.Equal(t, 3, shards[shardID].VoterCount)
+	writeShardStatus(t, db, &store.ShardStatus{
+		ID:        shardID,
+		Table:     "docs",
+		State:     store.ShardState_Default,
+		ShardInfo: *shards[shardID],
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/internal/v1/nodes/1/shutdown", strings.NewReader(`{"type":"remove"}`))
+	req.SetPathValue("node", "1")
+	rec := httptest.NewRecorder()
+	ms.handleNodeShutdownRequest(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/internal/v1/nodes/1/shutdown", nil)
+	statusReq.SetPathValue("node", "1")
+	statusRec := httptest.NewRecorder()
+	ms.handleNodeShutdownStatus(statusRec, statusReq)
+	require.Equal(t, http.StatusOK, statusRec.Code)
+
+	var status nodeShutdownStatus
+	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &status))
+	require.Equal(t, "draining", status.Phase)
+	require.False(t, status.Blocked)
+	require.Empty(t, status.BlockedReason)
+	require.Equal(t, 1, status.Stores[0].LocalVoterCount)
 }
 
 func TestNodeShutdownCancellationClearsDrainIntent(t *testing.T) {

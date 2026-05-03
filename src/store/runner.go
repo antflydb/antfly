@@ -56,6 +56,7 @@ func registerWithLeader(
 		RaftURL:     conf.RaftURL,
 		APIURL:      conf.ApiURL,
 		Shards:      status.Shards,
+		GroupStatus: shardInfosToNodeGroupStatusReports(conf.ID, status.Shards),
 	}
 
 	buf := bytes.NewBuffer(nil)
@@ -79,6 +80,34 @@ type nodeRegistrationRequest struct {
 	RaftURL     string                  `json:"raft_url,omitempty"`
 	APIURL      string                  `json:"api_url,omitempty"`
 	Shards      map[types.ID]*ShardInfo `json:"shards,omitempty"`
+	GroupStatus []nodeGroupStatusReport `json:"group_statuses,omitempty"`
+}
+
+type nodeGroupStatusReport struct {
+	GroupID     uint64 `json:"group_id"`
+	LocalLeader bool   `json:"local_leader,omitempty"`
+	LocalVoter  bool   `json:"local_voter,omitempty"`
+	VoterCount  int    `json:"voter_count,omitempty"`
+}
+
+func shardInfosToNodeGroupStatusReports(nodeID types.ID, shards map[types.ID]*ShardInfo) []nodeGroupStatusReport {
+	if len(shards) == 0 {
+		return nil
+	}
+	reports := make([]nodeGroupStatusReport, 0, len(shards))
+	for shardID, shard := range shards {
+		if shard == nil {
+			continue
+		}
+		report := nodeGroupStatusReport{GroupID: uint64(shardID)}
+		if shard.RaftStatus != nil {
+			report.LocalLeader = shard.RaftStatus.Lead == nodeID
+			report.LocalVoter = shard.RaftStatus.Voters.Contains(nodeID)
+			report.VoterCount = len(shard.RaftStatus.Voters)
+		}
+		reports = append(reports, report)
+	}
+	return reports
 }
 
 func sendNodeRegistration(ctx context.Context, client *http.Client, url string, body []byte) error {

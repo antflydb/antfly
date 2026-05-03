@@ -211,7 +211,7 @@ The EKS docs should also recommend Karpenter over cluster-autoscaler for multi-A
 The operator's autoscaler and manual scaling currently reduce StatefulSet replicas without proving that runtime placement and Raft state has left the node being removed. This leaves phantom voters in Raft configurations and causes instability when nodes rejoin. Fix this with the node shutdown API: request drain first, poll status, and only reduce StatefulSet replicas after metadata reports the node is safe to terminate.
 
 **Background**:
-- Store ID is deterministic: `store_id = pod_ordinal + 1` (set in the data StatefulSet entrypoint command at `antflycluster_controller.go:1151-1158`)
+- Data node ID is deterministic: `node_id = pod_ordinal + 1`; data-node registration keeps `store_id` equal to `node_id` for the embedded hosted store metadata.
 - Node registration API: `POST /internal/v1/nodes` records durable node lifecycle intent and, for data nodes, the hosted store metadata in the same request. `/internal/v1/stores` and `/internal/v1/store` are retired.
 - Shutdown request API: `PUT /internal/v1/nodes/{node_id}/shutdown` on the metadata service
 - Shutdown status API: `GET /internal/v1/nodes/{node_id}/shutdown`
@@ -222,8 +222,8 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 **`pkg/operator/controllers/antflycluster_controller.go`**:
 - Add `requestDataNodeShutdown(cluster, nodeID)` helper:
   1. Pick the highest ordinal Kubernetes will remove next.
-  2. Compute `storeID = ordinal + 1`.
-  3. Call `PUT http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{storeID}/shutdown`.
+  2. Compute `nodeID = ordinal + 1`.
+  3. Call `PUT http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{nodeID}/shutdown`.
   4. Poll `GET http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{nodeID}/shutdown`.
   5. Keep the StatefulSet at its current replica count until `safe_to_terminate=true`.
   6. Apply one replica of scale-down and repeat on later reconciles until the requested target is reached.
