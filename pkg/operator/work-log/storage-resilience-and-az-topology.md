@@ -212,19 +212,25 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 
 **Background**:
 - Store ID is deterministic: `store_id = pod_ordinal + 1` (set in the data StatefulSet entrypoint command at `antflycluster_controller.go:1151-1158`)
+- Node registration API: `POST /internal/v1/nodes` records durable node lifecycle intent and, for data nodes, the hosted store metadata in the same request. `/internal/v1/stores` and `/internal/v1/store` are retired.
 - Shutdown request API: `PUT /internal/v1/nodes/{node_id}/shutdown` on the metadata service
 - Shutdown status API: `GET /internal/v1/nodes/{node_id}/shutdown`
-- The request calls `TombstoneStore()` which marks the store as `Terminating`, preserves that drain intent across later store registration/status updates, and triggers the metadata reconciler to remove it from all Raft voter groups.
-- Completion: shutdown status returns `safe_to_terminate=true` only after the node has no placement intent, local group status, runtime group status, local voters, or local leaders.
+- Shutdown cancellation API: `DELETE /internal/v1/nodes/{node_id}/shutdown`
+- The request calls `RequestNodeShutdown()` which atomically records node lifecycle, tombstones the store, marks any existing store status as `Terminating`, and triggers the metadata reconciler to remove it from all Raft voter groups.
+- Completion: shutdown status returns `safe_to_terminate=true` only after the node has no placement intent, local group status, runtime group status, local voters, or local leaders. If a shard would be left with no voters, shutdown status reports `phase=blocked` and the operator surfaces `DataScaleDownBlocked` instead of polling forever.
 
 **`pkg/operator/controllers/antflycluster_controller.go`**:
-- Add `requestDataNodeShutdown(cluster, storeID)` helper:
+- Add `requestDataNodeShutdown(cluster, nodeID)` helper:
   1. Pick the highest ordinal Kubernetes will remove next.
   2. Compute `storeID = ordinal + 1`.
   3. Call `PUT http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{storeID}/shutdown`.
-  4. Poll `GET http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{storeID}/shutdown`.
+  4. Poll `GET http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{nodeID}/shutdown`.
   5. Keep the StatefulSet at its current replica count until `safe_to_terminate=true`.
   6. Apply one replica of scale-down and repeat on later reconciles until the requested target is reached.
+- Add `cancelDataNodeShutdown(cluster, nodeID)` helper:
+  1. Call `DELETE http://{cluster.Name}-metadata.{namespace}.svc:12377/internal/v1/nodes/{nodeID}/shutdown`.
+  2. Poll shutdown status once to confirm the node is no longer draining.
+  3. Use this when a previously draining ordinal becomes desired again before the StatefulSet was reduced.
 - Call `requestDataNodeShutdown()` in `Reconcile()` between autoscaler evaluation and `reconcileDataStatefulSet()`. This single call site handles manual and autoscaler-driven scale-down.
 - Compare `workingCluster.Spec.DataNodes.Replicas` (desired) against the existing StatefulSet's current replicas to detect scale-down
 
@@ -232,7 +238,7 @@ The operator's autoscaler and manual scaling currently reduce StatefulSet replic
 
 **Metadata service discovery**: The operator already creates the metadata headless service. The address is `{cluster.Name}-metadata.{namespace}.svc:{metadataAPIPort}`. The metadata API port (12377) is already defined in the controller's constants.
 
-**HTTP client**: Add a simple HTTP client to the reconciler struct (reuse `http.DefaultClient` or inject via controller setup). No authentication needed — the `/internal/v1/` endpoints are cluster-internal.
+**HTTP client**: Add an injectable HTTP client to the reconciler struct. The default client must have a timeout so a blackholed metadata service cannot hang a controller worker. No authentication needed — the `/internal/v1/` endpoints are cluster-internal.
 
 **Known limitation: rapid scale-down/scale-up race**: If a user scales down (triggers tombstone), then immediately scales back up before the tombstone is cleaned up (1-30s), the returning stores will remain in `Terminating` until cleanup clears the tombstone. The autoscaler's cooldown prevents most automated flapping. For manual scaling, the operator should check for existing tombstones on the target ordinals before allowing scale-up and requeue if tombstones are still being cleaned up.
 

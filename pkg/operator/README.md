@@ -351,7 +351,12 @@ kubectl patch antflycluster my-database --type='merge' -p='{"spec":{"dataNodes":
 
 # Scale metadata nodes (must be odd number for Raft consensus)
 kubectl patch antflycluster my-database --type='merge' -p='{"spec":{"metadataNodes":{"replicas":5}}}'
+
+# Pause data nodes while retaining PVCs
+kubectl patch antflycluster my-database --type='merge' -p='{"spec":{"dataNodes":{"suspend":true},"storage":{"pvcRetentionPolicy":{"whenScaled":"Retain"}}}}'
 ```
+
+Use `spec.dataNodes.suspend=true` for scale-to-zero pause/resume. Do not use `dataNodes.replicas: 0` for suspension; `0` or omitted uses the controller default. Suspension requires retained PVCs and cannot be combined with data-node autoscaling.
 
 ## 📚 Examples
 

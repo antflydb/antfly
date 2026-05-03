@@ -421,10 +421,13 @@ func newMetadataLeaderFactory(
 
 func (r *Runtime) newHTTPHandler() http.Handler {
 	internalMux := http.NewServeMux()
-	internalMux.HandleFunc("POST /store", r.node.handleStoreRegistration)
-	internalMux.HandleFunc("DELETE /store/{store}", r.node.handleStoreDeregistration)
+	internalMux.HandleFunc("POST /nodes", r.node.handleNodeRegistration)
+	internalMux.HandleFunc("GET /nodes/{node}", r.node.handleNodeRecord)
+	internalMux.HandleFunc("POST /nodes/{node}/status", r.node.handleNodeStatus)
 	internalMux.HandleFunc("PUT /nodes/{node}/shutdown", r.node.handleNodeShutdownRequest)
 	internalMux.HandleFunc("GET /nodes/{node}/shutdown", r.node.handleNodeShutdownStatus)
+	internalMux.HandleFunc("DELETE /nodes/{node}/shutdown", r.node.handleNodeShutdownCancellation)
+	internalMux.HandleFunc("DELETE /nodes/{node}", r.node.handleNodeShutdownFinalization)
 	internalMux.HandleFunc("POST /shard/{shardID}/txn/resolve", r.node.handleForwardResolveIntent)
 
 	api := kv.NewMetadataStoreAPI(r.logger, r.metadataStore)

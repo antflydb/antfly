@@ -16,9 +16,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/antflydb/antfly/lib/types"
@@ -27,24 +28,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestStoreRegistrationEndpoint verifies that the store registration
-// uses the correct /internal/v1/store endpoint.
-func TestStoreRegistrationEndpoint(t *testing.T) {
-	// Track the request path
-	var requestPath string
-	var requestMethod string
+type roundTripFunc func(*http.Request) (*http.Response, error)
 
-	// Create a test server that captures the request
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestPath = r.URL.Path
-		requestMethod = r.Method
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
-		// Read and discard body
-		_, _ = io.ReadAll(r.Body)
+// TestNodeRegistrationEndpoint verifies that data-node registration uses the
+// node resource and includes the hosted store metadata in the same request.
+func TestNodeRegistrationEndpoint(t *testing.T) {
+	var requestPaths []string
+	var requestMethods []string
+	var body []byte
 
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestPaths = append(requestPaths, req.URL.Path)
+		requestMethods = append(requestMethods, req.Method)
+
+		var err error
+		body, err = io.ReadAll(req.Body)
+		require.NoError(t, err)
+
+		return &http.Response{
+			StatusCode: http.StatusAccepted,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+			Request:    req,
+		}, nil
+	})}
 
 	// Create a minimal store for testing
 	store := &Store{
@@ -60,20 +71,34 @@ func TestStoreRegistrationEndpoint(t *testing.T) {
 	}
 
 	// Attempt registration
-	err := registerWithLeader(context.Background(), server.Client(), server.URL, store, conf)
+	err := registerWithLeader(context.Background(), client, "http://metadata.test", store, conf)
 
 	require.NoError(t, err, "Registration failed")
 
-	// Verify the endpoint path
-	expectedPath := "/internal/v1/store"
-	assert.Equal(t, expectedPath, requestPath, "Request path should use /internal/v1/ prefix")
+	assert.Equal(t, []string{"/internal/v1/nodes"}, requestPaths, "registration should use the node resource")
+	assert.Equal(t, []string{http.MethodPost}, requestMethods, "Should use POST methods")
 
-	// Verify the HTTP method
-	assert.Equal(t, http.MethodPost, requestMethod, "Should use POST method")
+	var payload struct {
+		NodeID      uint64 `json:"node_id"`
+		StoreID     uint64 `json:"store_id"`
+		Role        string `json:"role"`
+		HealthClass string `json:"health_class"`
+		Live        bool   `json:"live"`
+		RaftURL     string `json:"raft_url"`
+		APIURL      string `json:"api_url"`
+	}
+	require.NoError(t, json.Unmarshal(body, &payload))
+	assert.Equal(t, uint64(1), payload.NodeID)
+	assert.Equal(t, uint64(1), payload.StoreID)
+	assert.Equal(t, "data", payload.Role)
+	assert.Equal(t, "healthy", payload.HealthClass)
+	assert.True(t, payload.Live)
+	assert.Equal(t, "http://localhost:9021", payload.RaftURL)
+	assert.Equal(t, "http://localhost:12380", payload.APIURL)
 }
 
-// TestStoreRegistrationURL verifies the full URL construction
-func TestStoreRegistrationURL(t *testing.T) {
+// TestNodeRegistrationURL verifies the full URL construction.
+func TestNodeRegistrationURL(t *testing.T) {
 	tests := []struct {
 		name        string
 		leaderURL   string
@@ -82,31 +107,32 @@ func TestStoreRegistrationURL(t *testing.T) {
 		{
 			name:        "http URL",
 			leaderURL:   "http://127.0.0.1:12277",
-			expectedURL: "http://127.0.0.1:12277/internal/v1/store",
+			expectedURL: "http://127.0.0.1:12277/internal/v1/nodes",
 		},
 		{
 			name:        "https URL",
 			leaderURL:   "https://metadata.example.com:8080",
-			expectedURL: "https://metadata.example.com:8080/internal/v1/store",
+			expectedURL: "https://metadata.example.com:8080/internal/v1/nodes",
 		},
 		{
 			name:        "URL with trailing slash",
 			leaderURL:   "http://127.0.0.1:12277/",
-			expectedURL: "http://127.0.0.1:12277//internal/v1/store", // Will still work with double slash
+			expectedURL: "http://127.0.0.1:12277//internal/v1/nodes", // Will still work with double slash
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var capturedURL string
-
-			server := httptest.NewServer(
-				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					capturedURL = r.URL.Path
-					w.WriteHeader(http.StatusOK)
-				}),
-			)
-			defer server.Close()
+			var capturedURLs []string
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				capturedURLs = append(capturedURLs, req.URL.String())
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+					Request:    req,
+				}, nil
+			})}
 
 			store := &Store{
 				config:    &StoreInfo{ID: types.ID(1)},
@@ -119,12 +145,38 @@ func TestStoreRegistrationURL(t *testing.T) {
 				ApiURL:  "http://localhost:12380",
 			}
 
-			// Use the server URL (ignore tt.leaderURL since we need to use the test server)
-			_ = registerWithLeader(context.Background(), server.Client(), server.URL, store, conf)
+			err := registerWithLeader(context.Background(), client, tt.leaderURL, store, conf)
 
-			// Verify the path includes /internal/v1/store.
-			assert.Equal(t, "/internal/v1/store", capturedURL,
-				"Path should be /internal/v1/store")
+			require.NoError(t, err)
+			assert.Equal(t, []string{tt.expectedURL}, capturedURLs)
 		})
 	}
+}
+
+func TestNodeRegistrationFailsWhenNodeEndpointMissing(t *testing.T) {
+	var requestPaths []string
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestPaths = append(requestPaths, req.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+			Request:    req,
+		}, nil
+	})}
+
+	store := &Store{
+		config:    &StoreInfo{ID: types.ID(1)},
+		shardsMap: xsync.NewMap[types.ID, *Shard](),
+	}
+	conf := &StoreInfo{
+		ID:      types.ID(1),
+		RaftURL: "http://localhost:9021",
+		ApiURL:  "http://localhost:12380",
+	}
+
+	err := registerWithLeader(context.Background(), client, "http://metadata.test", store, conf)
+
+	require.Error(t, err)
+	assert.Equal(t, []string{"/internal/v1/nodes"}, requestPaths)
 }

@@ -94,7 +94,8 @@ Configuration for data nodes (data storage, replication).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `replicas` | int32 | No | 3 | Initial number of data nodes |
+| `replicas` | int32 | No | 3 | Running data-node count. `0` or omitted uses the default; use `suspend` for scale-to-zero |
+| `suspend` | bool | No | false | Scale data nodes to zero while retaining PVCs for pause/resume |
 | `autoScaling` | [AutoScalingSpec](#autoscalingspec) | No | - | Autoscaling configuration |
 | `resources` | [ResourceSpec](#resourcespec) | Yes | - | Resource requirements |
 | `api` | [APISpec](#apispec) | Yes | - | Data API configuration |
@@ -312,7 +313,8 @@ The operator validates configurations via admission webhook:
 - `tolerations`, `affinity`, and `topologySpreadConstraints` are allowed with all cloud providers
 
 ### General Validation
-- Metadata and data replicas must be > 0
+- Metadata replicas must be > 0
+- Data replicas use `0`/omitted as the default running size. To scale data nodes to zero, set `spec.dataNodes.suspend=true`; this requires PVCs to be retained on scale-down and cannot be combined with data-node autoscaling.
 - `publicAPI.nodePort` only valid for NodePort service type
 
 ## Example

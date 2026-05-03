@@ -272,8 +272,9 @@ spec:
 
 1. **Metadata Nodes Not Scaled**: Metadata nodes maintain a fixed replica count for Raft consensus
 2. **PVCs Retained**: PersistentVolumeClaims are retained when scaling down (data is preserved, but storage costs remain)
-3. **metrics-server Required**: Autoscaling won't work without metrics-server
-4. **Resource Requests Required**: Pods must have resource requests for accurate utilization calculation
+3. **No Scale-To-Zero Autoscaling**: Use `spec.dataNodes.suspend=true` for an explicit pause/resume scale-to-zero operation. Suspension cannot be combined with data-node autoscaling.
+4. **metrics-server Required**: Autoscaling won't work without metrics-server
+5. **Resource Requests Required**: Pods must have resource requests for accurate utilization calculation
 
 ## Troubleshooting
 

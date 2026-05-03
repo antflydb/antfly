@@ -1062,7 +1062,7 @@ func TestValidateCreate_ZeroDataReplicas(t *testing.T) {
 
 	err := cluster.ValidateCreate()
 	if err != nil {
-		t.Errorf("Expected no error for 0 data replicas, got: %v", err)
+		t.Errorf("Expected no error for 0 data replicas because it maps to the controller default, got: %v", err)
 	}
 }
 
@@ -1481,6 +1481,52 @@ func TestValidateUpdate_DataScaleDownAllowed(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_DataSuspendAllowedWithRetainedPVCs(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.DataNodes.Suspend = true
+	cluster.Spec.Storage.PVCRetentionPolicy = &PVCRetentionPolicy{
+		WhenScaled: PVCRetentionRetain,
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected data suspend with retained PVCs to be admitted, got: %v", err)
+	}
+}
+
+func TestValidateCreate_DataSuspendRejectsDeleteOnScale(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.DataNodes.Suspend = true
+	cluster.Spec.Storage.PVCRetentionPolicy = &PVCRetentionPolicy{
+		WhenScaled: PVCRetentionDelete,
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected data suspend with WhenScaled=Delete to be rejected")
+	}
+	if !strings.Contains(err.Error(), "dataNodes.suspend") {
+		t.Fatalf("expected data suspend error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_DataSuspendRejectsAutoscaling(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.DataNodes.Suspend = true
+	cluster.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 1,
+		MaxReplicas: 3,
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected data suspend with autoscaling to be rejected")
+	}
+	if !strings.Contains(err.Error(), "dataNodes.suspend") {
+		t.Fatalf("expected data suspend error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_AutoScalingBoundsRejected(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
@@ -1495,6 +1541,23 @@ func TestValidateCreate_AutoScalingBoundsRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "minReplicas") {
 		t.Fatalf("expected autoscaling bounds error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_AutoScalingMinReplicasZeroRejected(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.DataNodes.AutoScaling = &AutoScalingSpec{
+		Enabled:     true,
+		MinReplicas: 0,
+		MaxReplicas: 3,
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected error for autoscaling minReplicas zero")
+	}
+	if !strings.Contains(err.Error(), "minReplicas") {
+		t.Fatalf("expected autoscaling minReplicas error, got: %v", err)
 	}
 }
 

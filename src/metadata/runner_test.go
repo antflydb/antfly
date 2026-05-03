@@ -149,7 +149,7 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 // are not accessible without the /internal/v1/ prefix.
 func TestInternalRoutesNotAccessibleAtRoot(t *testing.T) {
 	internalMux := http.NewServeMux()
-	internalMux.HandleFunc("POST /store", func(w http.ResponseWriter, r *http.Request) {
+	internalMux.HandleFunc("POST /nodes", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -157,7 +157,7 @@ func TestInternalRoutesNotAccessibleAtRoot(t *testing.T) {
 	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
 
 	// Try to access the route without the prefix
-	req := httptest.NewRequest("POST", "/store", nil)
+	req := httptest.NewRequest("POST", "/nodes", nil)
 	rec := httptest.NewRecorder()
 
 	apiRoutes.ServeHTTP(rec, req)
@@ -166,7 +166,7 @@ func TestInternalRoutesNotAccessibleAtRoot(t *testing.T) {
 		"Expected 404 for route without prefix")
 
 	// Now try with the correct prefix
-	req = httptest.NewRequest("POST", "/internal/v1/store", nil)
+	req = httptest.NewRequest("POST", "/internal/v1/nodes", nil)
 	rec = httptest.NewRecorder()
 
 	apiRoutes.ServeHTTP(rec, req)
