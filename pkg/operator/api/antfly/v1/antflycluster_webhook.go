@@ -485,7 +485,7 @@ Solution: Use an odd replica count:
 
 Problem: Suspension is an explicit pause/resume operation, while autoscaling continuously manages the data replica target.
 
-Solution: Disable data-node autoscaling before suspending the data StatefulSet.`)
+Solution: Disable data-node autoscaling before suspending the data StatefulSet`)
 	}
 
 	return nil
@@ -826,7 +826,7 @@ Solution: Either:
 
 Problem: Suspension scales data pods to zero and relies on retained PVCs so the same ordinals can resume with their existing data.
 
-Solution: Set spec.storage.pvcRetentionPolicy.whenScaled=Retain before suspending data nodes.`)
+Solution: Set spec.storage.pvcRetentionPolicy.whenScaled=Retain before suspending data nodes`)
 	}
 
 	return nil

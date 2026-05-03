@@ -147,6 +147,7 @@ type Shard struct {
 	// cancelLeaderFactory cancels the LeaderFactory goroutine in swarm mode
 	// In raft mode, this is nil since raft manages the lifecycle
 	cancelLeaderFactory context.CancelFunc
+	leaderFactoryDone   <-chan struct{}
 	closeOnce           sync.Once
 	closeErr            error
 }
@@ -158,6 +159,7 @@ func NewShard(
 	confChangeC chan<- *raft.ConfChangeProposal,
 	errorC <-chan error,
 	cancelLeaderFactory context.CancelFunc,
+	leaderFactoryDone <-chan struct{},
 ) *Shard {
 	return &Shard{
 		storeDB:             db,
@@ -165,6 +167,7 @@ func NewShard(
 		confChangeC:         confChangeC,
 		errorC:              errorC,
 		cancelLeaderFactory: cancelLeaderFactory,
+		leaderFactoryDone:   leaderFactoryDone,
 	}
 }
 
@@ -239,6 +242,9 @@ func (s *Shard) Close() error {
 			for range s.errorC {
 				// Drain any remaining errors
 			}
+		}
+		if s.leaderFactoryDone != nil {
+			<-s.leaderFactoryDone
 		}
 
 		// Now safe to close the database

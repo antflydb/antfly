@@ -96,6 +96,7 @@ type Store struct {
 
 	errorChanC chan errorChanCItem
 	closingCh  chan struct{} // Closed when store is shutting down
+	closeOnce  sync.Once
 }
 
 // TODO (ajr)
@@ -476,33 +477,54 @@ func (m *Store) createPassThroughChannels(
 }
 
 func (m *Store) Close() {
-	// Signal that we're closing - this prevents new shard starts from sending to errorChanC
-	close(m.closingCh)
+	m.closeOnce.Do(func() {
+		// Signal that we're closing. This prevents new shard starts from sending to errorChanC
+		// or saving metadata while shutdown is closing Pebble handles.
+		close(m.closingCh)
 
-	// Close all active shards to release Pebble and Bleve resources.
-	// This is critical to prevent memory leaks when store nodes are removed.
-	m.shardsMap.Range(func(shardID types.ID, shard *Shard) bool {
-		m.logger.Debug("Closing shard during store shutdown", zap.Stringer("shardID", shardID))
+		closeShards := func() {
+			m.shardsMap.Range(func(shardID types.ID, shard *Shard) bool {
+				m.logger.Debug("Closing shard during store shutdown", zap.Stringer("shardID", shardID))
 
-		if err := shard.Close(); err != nil && !errors.Is(err, db.ErrShardNotReady) {
-			m.logger.Warn("Error closing shard database",
-				zap.Stringer("shardID", shardID),
-				zap.Error(err))
+				if err := shard.Close(); err != nil && !errors.Is(err, db.ErrShardNotReady) {
+					m.logger.Warn("Error closing shard database",
+						zap.Stringer("shardID", shardID),
+						zap.Error(err))
+				}
+
+				return true
+			})
 		}
 
-		return true
+		// Close all active shards before the store metadata DB. Shard shutdown
+		// waits for shard-owned background work before closing shard Pebble DBs.
+		closeShards()
+
+		// Cancel store-level work and wait for startup/error fan-in goroutines to stop
+		// before closing the metadata DB they may touch.
+		if m.egCancel != nil {
+			m.egCancel()
+		}
+		if m.eg != nil {
+			if err := m.eg.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+				m.logger.Warn("Error waiting for store background work during shutdown", zap.Error(err))
+			}
+		}
+
+		// A concurrent shard startup may have observed closingCh and left the
+		// shard in the map for Close to clean up. Sweep again after startup work
+		// has stopped so that no ready shard is left with open Pebble handles.
+		closeShards()
+
+		// Close store metadata database.
+		if m.db != nil {
+			if err := m.db.Close(); err != nil {
+				m.logger.Warn("Error closing store metadata Pebble database", zap.Error(err))
+			}
+		}
+
+		m.logger.Info("Store closed", zap.String("storeID", m.config.ID.String()))
 	})
-
-	// Close store metadata database
-	if err := m.db.Close(); err != nil {
-		m.logger.Warn("Error closing store metadata Pebble database", zap.Error(err))
-	}
-
-	// Cancel the store context to stop the ErrorC goroutine. This must happen
-	// after closing shards so in-flight errgroup work can complete cleanly.
-	m.egCancel()
-
-	m.logger.Info("Store closed", zap.String("storeID", m.config.ID.String()))
 }
 
 type ShardStartConfig struct {
@@ -538,9 +560,30 @@ func (m *Store) StartRaftGroup(
 	lg.Debug("Starting Raft Group")
 	// If we fail to start the shard, remove it from the map
 	removeShard := true
+	storedReadyShard := false
+	var cancelLeaderFactory context.CancelFunc
+	var leaderFactoryDone <-chan struct{}
+	var errorC <-chan error
+	var proposeC chan *raft.Proposal
 	defer func() {
 		if removeShard {
-			m.shardsMap.Delete(shardID)
+			if shard, ok := m.shardsMap.LoadAndDelete(shardID); ok {
+				if err := shard.Close(); err != nil && !errors.Is(err, db.ErrShardNotReady) {
+					lg.Warn("Error closing shard after failed start", zap.Error(err))
+				}
+			}
+			if !storedReadyShard && leaderFactoryDone != nil {
+				if cancelLeaderFactory != nil {
+					cancelLeaderFactory()
+				}
+				close(proposeC)
+				if errorC != nil {
+					for range errorC {
+						// Drain until pass-through shutdown closes errorC.
+					}
+				}
+				<-leaderFactoryDone
+			}
 		}
 	}()
 	var dbw *db.StoreDB
@@ -550,7 +593,7 @@ func (m *Store) StartRaftGroup(
 		<-storeDBReady
 		return dbw.CreateDBSnapshot(id)
 	}
-	proposeC := make(chan *raft.Proposal)
+	proposeC = make(chan *raft.Proposal)
 	confChangeC := make(chan *raft.ConfChangeProposal)
 	dataDir := m.antflyConfig.GetBaseDir()
 	snapStore, err := snapstore.NewLocalSnapStore(dataDir, shardID, m.config.ID)
@@ -592,7 +635,6 @@ func (m *Store) StartRaftGroup(
 	}
 
 	var commitC <-chan *raft.Commit
-	var errorC <-chan error
 	var raftNode raft.RaftNode
 
 	// In swarm mode, bypass Raft consensus with a pass-through channel
@@ -715,7 +757,6 @@ func (m *Store) StartRaftGroup(
 		return fmt.Errorf("creating dbwrapper: %w", err2)
 	}
 
-	var cancelLeaderFactory context.CancelFunc
 	if raftNode != nil {
 		raftNode.SetLeaderFactory(dbw.LeaderFactory)
 	} else {
@@ -724,7 +765,10 @@ func (m *Store) StartRaftGroup(
 		// can properly stop the LeaderFactory when the shard is removed.
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelLeaderFactory = cancel
+		done := make(chan struct{})
+		leaderFactoryDone = done
 		m.eg.Go(func() error {
+			defer close(done)
 			return dbw.LeaderFactory(ctx)
 		})
 	}
@@ -739,7 +783,8 @@ func (m *Store) StartRaftGroup(
 		return fmt.Errorf("store is closing")
 	}
 	lg.Info("Started Raft Group")
-	m.shardsMap.Store(shardID, db.NewShard(dbw, raftNode, confChangeC, errorC, cancelLeaderFactory))
+	m.shardsMap.Store(shardID, db.NewShard(dbw, raftNode, confChangeC, errorC, cancelLeaderFactory, leaderFactoryDone))
+	storedReadyShard = true
 	// Check again if store is closing before saving metadata to avoid
 	// race condition where Close() closes m.db between the earlier check
 	// and this point.

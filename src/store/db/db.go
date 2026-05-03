@@ -411,8 +411,8 @@ type DBImpl struct {
 
 	// traceWriter emits TLA+ trace events for transaction validation.
 	// Non-nil only when built with -tags with_tla.
-	traceWriter      tracing.AntflyTraceWriter
-	traceShardIDStr  string // cached shard ID for trace events; set lazily
+	traceWriter     tracing.AntflyTraceWriter
+	traceShardIDStr string // cached shard ID for trace events; set lazily
 
 	cache *pebbleutils.Cache // shared Pebble block cache (may be nil)
 }
@@ -1617,7 +1617,13 @@ func (db *DBImpl) getPebbleOpts() (*pebble.Options, error) {
 	cacheSize := DefaultPebbleCacheSizeMB << 20 // Convert MB to bytes
 
 	pebbleOpts := &pebble.Options{
-		Logger: &logger.NoopLoggerAndTracer{},
+		Logger:          &logger.NoopLoggerAndTracer{},
+		LoggerAndTracer: &logger.NoopLoggerAndTracer{},
+		// Shard DB lifecycle is driven by raft/split shutdown paths that can be
+		// exercised aggressively in tests. Keep table stats synchronous with
+		// foreground access so Pebble does not race async stats collection with
+		// node removal and DB close.
+		DisableTableStats: true,
 	}
 	db.cache.Apply(pebbleOpts, cacheSize)
 	if db.antflyConfig.GetKeyValueStorageType() == "s3" {
