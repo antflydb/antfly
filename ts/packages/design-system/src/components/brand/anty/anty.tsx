@@ -371,6 +371,7 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
 
   // Memoize so the idle-animation effect doesn't restart on every parent render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refsReady triggers recapture of DOM refs after mount
   const elements = useMemo(
     () => ({
       container: containerRef.current,
@@ -387,7 +388,7 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
       innerGlow: innerGlowRef.current,
       outerGlow: outerGlowRef.current,
     }),
-    []
+    [refsReady]
   );
 
   // Animation controller
