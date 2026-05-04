@@ -1,6 +1,6 @@
 {
   "name": "@antfly/design-system",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Antfly's shared shadcn/ui component library: primitives, compound components, brand blocks, design tokens, and Aeonik.",
   "author": "Antfly, Inc. <contact@antfly.io>",
   "license": "MIT",
@@ -9,10 +9,22 @@
     "url": "git+https://github.com/antflydb/antfly-ts.git",
     "directory": "packages/design-system"
   },
-  "keywords": ["antfly", "design-system", "shadcn", "ui", "react", "tailwind"],
+  "keywords": [
+    "antfly",
+    "design-system",
+    "shadcn",
+    "ui",
+    "react",
+    "tailwind"
+  ],
   "type": "module",
-  "sideEffects": ["**/*.css"],
-  "files": ["dist", "src/fonts"],
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "files": [
+    "dist",
+    "src/fonts"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

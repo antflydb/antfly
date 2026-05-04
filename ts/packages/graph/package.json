@@ -1,10 +1,12 @@
 {
   "name": "@antfly/graph",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": false,
   "description": "Force-directed graph component for the Antfly design system",
   "type": "module",
-  "sideEffects": ["**/*.css"],
+  "sideEffects": [
+    "**/*.css"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -15,7 +17,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "vite build && cp src/styles.css dist/styles.css",
     "dev": "vite build --watch",
