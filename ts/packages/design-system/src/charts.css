@@ -1,0 +1,19 @@
+/**
+ * @antfly/design-system — chart visual contract.
+ *
+ * Use these variables for custom chart renderers. React/Recharts consumers can
+ * also import from `@antfly/design-system/charts`.
+ */
+
+:root {
+  --chart-series-1: var(--chart-1);
+  --chart-series-2: var(--chart-2);
+  --chart-series-3: var(--chart-3);
+  --chart-series-4: var(--chart-4);
+  --chart-series-5: var(--chart-5);
+  --chart-series-6: var(--chart-6);
+  --chart-grid: var(--border);
+  --chart-axis: var(--muted-foreground);
+  --chart-tooltip-background: var(--background);
+  --chart-tooltip-border: var(--border);
+}

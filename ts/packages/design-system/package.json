@@ -33,7 +33,34 @@
       "import": "./dist/index.js"
     },
     "./styles.css": "./dist/index.css",
-    "./tokens": "./src/tokens/index.css",
+    "./tokens": "./dist/tokens/index.css",
+    "./theme": "./dist/theme.css",
+    "./dashboard.css": "./dist/dashboard.css",
+    "./primitives": {
+      "types": "./dist/primitives/index.d.ts",
+      "import": "./dist/primitives/index.js"
+    },
+    "./brand": {
+      "types": "./dist/brand/index.d.ts",
+      "import": "./dist/brand/index.js"
+    },
+    "./components": {
+      "types": "./dist/components/index.d.ts",
+      "import": "./dist/components/index.js"
+    },
+    "./charts": {
+      "types": "./dist/charts/index.d.ts",
+      "import": "./dist/charts/index.js"
+    },
+    "./charts.css": "./dist/charts.css",
+    "./templates": {
+      "types": "./dist/templates/index.d.ts",
+      "import": "./dist/templates/index.js"
+    },
+    "./examples": {
+      "types": "./dist/examples/index.d.ts",
+      "import": "./dist/examples/index.js"
+    },
     "./fonts/*": "./src/fonts/*",
     "./package.json": "./package.json"
   },
@@ -43,10 +70,11 @@
     "provenance": true
   },
   "scripts": {
-    "build": "pnpm run clean && pnpm run build:components && pnpm run build:fonts && pnpm run build:styles",
+    "build": "pnpm run clean && pnpm run build:components && pnpm run build:fonts && pnpm run build:styles && pnpm run build:css-assets",
     "build:components": "vite build",
     "build:fonts": "mkdir -p dist/fonts && cp -R src/fonts/aeonik dist/fonts/",
     "build:styles": "tailwindcss -i ./src/styles.css -o ./dist/index.css",
+    "build:css-assets": "mkdir -p dist/tokens/fonts && cp -R src/tokens/* dist/tokens/ && cp -R src/fonts/aeonik dist/tokens/fonts/ && cp src/theme.css dist/theme.css && cp src/charts.css dist/charts.css && cp src/dashboard.css dist/dashboard.css",
     "typecheck": "tsc --noEmit",
     "dev": "pnpm run build:styles --watch",
     "clean": "rm -rf dist",

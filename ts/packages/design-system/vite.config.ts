@@ -18,6 +18,20 @@ export default defineConfig({
     lib: {
       entry: {
         index: resolve(__dirname, "src/index.ts"),
+        "primitives/index": resolve(__dirname, "src/primitives/index.ts"),
+        "brand/index": resolve(__dirname, "src/brand/index.ts"),
+        "components/index": resolve(__dirname, "src/components/index.ts"),
+        "charts/index": resolve(__dirname, "src/charts/index.ts"),
+        "components/compound/dashboard-page": resolve(
+          __dirname,
+          "src/components/compound/dashboard-page.tsx"
+        ),
+        "components/compound/status-screen": resolve(
+          __dirname,
+          "src/components/compound/status-screen.tsx"
+        ),
+        "templates/index": resolve(__dirname, "src/templates/index.ts"),
+        "examples/index": resolve(__dirname, "src/examples/index.ts"),
       },
       formats: ["es"],
       fileName: (_format, entryName) => `${entryName}.js`,
