@@ -26,9 +26,6 @@ importers:
       '@antfly/components':
         specifier: workspace:*
         version: link:../../packages/components
-      '@antfly/design-system':
-        specifier: workspace:*
-        version: link:../../packages/design-system
       '@antfly/sdk':
         specifier: workspace:*
         version: link:../../packages/sdk
