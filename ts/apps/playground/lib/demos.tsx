@@ -51,6 +51,12 @@ import {
   ContextMenuShortcut,
   ContextMenuTrigger,
   CTA,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -134,6 +140,8 @@ import {
   Skeleton,
   Slider,
   StatCard,
+  StatusCard,
+  StatusScreen,
   Switch,
   Table,
   TableBody,
@@ -154,6 +162,7 @@ import {
   Wordmark,
 } from "@antfly/design-system";
 import {
+  AlertTriangle,
   Database,
   FileSearch,
   Inbox,
@@ -162,6 +171,7 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Table2,
   Zap,
 } from "lucide-react";
 import { AntyDemo } from "@/components/anty-demo";
@@ -942,6 +952,62 @@ demoCategories.primitives.demos = [
 
 // ——— Compound ———
 demoCategories.compound.demos = [
+  {
+    slug: "dashboard-page",
+    name: "DashboardPage",
+    description:
+      "Dashboard page scaffolding: title, description, actions, and a compact toolbar.",
+    render: () => (
+      <div className="af-dashboard w-full max-w-3xl">
+        <DashboardPage>
+          <DashboardPageHeader>
+            <div>
+              <DashboardPageTitle>Tables</DashboardPageTitle>
+              <DashboardPageDescription>
+                Manage table schemas, indexes, and ingestion state.
+              </DashboardPageDescription>
+            </div>
+            <DashboardPageActions>
+              <Button variant="outline">Import</Button>
+              <Button>
+                <Table2 /> Create table
+              </Button>
+            </DashboardPageActions>
+          </DashboardPageHeader>
+          <DashboardToolbar>
+            <Badge variant="secondary">12 tables</Badge>
+            <Badge variant="outline">3 indexing</Badge>
+            <Button variant="ghost" size="sm">
+              Refresh
+            </Button>
+          </DashboardToolbar>
+        </DashboardPage>
+      </div>
+    ),
+  },
+  {
+    slug: "status-screen",
+    name: "StatusScreen",
+    description: "Centered status surface for auth, loading, access denied, and app error states.",
+    render: () => (
+      <div className="h-[360px] w-full overflow-hidden rounded-lg border border-border">
+        <StatusScreen className="min-h-full">
+          <StatusCard>
+            <Card>
+              <CardHeader className="items-center text-center">
+                <AlertTriangle className="h-8 w-8 text-warning" />
+                <CardTitle>Backend unavailable</CardTitle>
+                <CardDescription>Check the server connection and try again.</CardDescription>
+              </CardHeader>
+              <CardContent className="flex justify-center">
+                <Button variant="outline">Retry</Button>
+              </CardContent>
+            </Card>
+          </StatusCard>
+        </StatusScreen>
+      </div>
+    ),
+  },
   {
     slug: "page-header",
     name: "PageHeader",

@@ -42,6 +42,13 @@ const SEMANTIC_COLORS: TokenDef[] = [
     dark: "oklch(0.135 0.005 275)",
   },
   {
+    name: "Background secondary",
+    varName: "--background-secondary",
+    light: "oklch(0.965 0.003 265)",
+    dark: "oklch(0.11 0.005 275)",
+    description: "Optional app-shell background used by dashboard surfaces.",
+  },
+  {
     name: "Foreground",
     varName: "--foreground",
     light: "oklch(0.185 0.02 275)",
@@ -211,6 +218,118 @@ const CHART_COLORS: TokenDef[] = [
   },
 ];
 
+interface TokenScale {
+  name: string;
+  description: string;
+  tokens: { varName: string; light: string; dark: string }[];
+}
+
+const STATUS_SCALES: TokenScale[] = [
+  {
+    name: "Danger",
+    description: "Compatibility scale for destructive health and failure states.",
+    tokens: [
+      { varName: "--danger-50", light: "#fef2f2", dark: "#1a0808" },
+      { varName: "--danger-100", light: "#fee2e2", dark: "#2a0f0f" },
+      { varName: "--danger-200", light: "#fecaca", dark: "#3d1515" },
+      { varName: "--danger-300", light: "#fca5a5", dark: "#5c1e1e" },
+      { varName: "--danger-400", light: "#f87171", dark: "#7c2626" },
+      { varName: "--danger-500", light: "#ef4444", dark: "#ef4444" },
+      { varName: "--danger-600", light: "#dc2626", dark: "#f87171" },
+      { varName: "--danger-700", light: "#b91c1c", dark: "#fca5a5" },
+      { varName: "--danger-800", light: "#991b1b", dark: "#fecaca" },
+      { varName: "--danger-900", light: "#7f1d1d", dark: "#fee2e2" },
+    ],
+  },
+  {
+    name: "Success",
+    description: "Compatibility scale for healthy, complete, and positive states.",
+    tokens: [
+      { varName: "--success-50", light: "#f0fdf4", dark: "#0a1a0c" },
+      { varName: "--success-100", light: "#dcfce7", dark: "#0f2a12" },
+      { varName: "--success-200", light: "#bbf7d0", dark: "#153d19" },
+      { varName: "--success-300", light: "#86efac", dark: "#1e5c24" },
+      { varName: "--success-400", light: "#4ade80", dark: "#267c32" },
+      { varName: "--success-500", light: "#22c55e", dark: "#22c55e" },
+      { varName: "--success-600", light: "#16a34a", dark: "#4ade80" },
+      { varName: "--success-700", light: "#15803d", dark: "#86efac" },
+      { varName: "--success-800", light: "#166534", dark: "#bbf7d0" },
+      { varName: "--success-900", light: "#14532d", dark: "#dcfce7" },
+    ],
+  },
+  {
+    name: "Info",
+    description: "Compatibility scale for informational and leader/active states.",
+    tokens: [
+      { varName: "--info-50", light: "#eff6ff", dark: "#081a2a" },
+      { varName: "--info-100", light: "#dbeafe", dark: "#0f2544" },
+      { varName: "--info-200", light: "#bfdbfe", dark: "#1e3a5f" },
+      { varName: "--info-300", light: "#93c5fd", dark: "#2c5282" },
+      { varName: "--info-400", light: "#60a5fa", dark: "#3c6cb4" },
+      { varName: "--info-500", light: "#3b82f6", dark: "#3b82f6" },
+      { varName: "--info-600", light: "#2563eb", dark: "#60a5fa" },
+      { varName: "--info-700", light: "#1d4ed8", dark: "#93c5fd" },
+      { varName: "--info-800", light: "#1e40af", dark: "#bfdbfe" },
+      { varName: "--info-900", light: "#1e3a8a", dark: "#dbeafe" },
+    ],
+  },
+  {
+    name: "Warning",
+    description: "Compatibility scale for degraded, pending, and warning states.",
+    tokens: [
+      { varName: "--warning-50", light: "#fffbeb", dark: "#1a1508" },
+      { varName: "--warning-100", light: "#fef3c7", dark: "#2a220f" },
+      { varName: "--warning-200", light: "#fde68a", dark: "#3d3015" },
+      { varName: "--warning-300", light: "#fcd34d", dark: "#5c4a1e" },
+      { varName: "--warning-400", light: "#fbbf24", dark: "#7c6426" },
+      { varName: "--warning-500", light: "#f59e0b", dark: "#f59e0b" },
+      { varName: "--warning-600", light: "#d97706", dark: "#fbbf24" },
+      { varName: "--warning-700", light: "#b45309", dark: "#fcd34d" },
+      { varName: "--warning-800", light: "#92400e", dark: "#fde68a" },
+      { varName: "--warning-900", light: "#78350f", dark: "#fef3c7" },
+    ],
+  },
+];
+
+const COMPATIBILITY_SCALES: TokenScale[] = [
+  {
+    name: "SearchAF neutral",
+    description: "Temporary compatibility scale for surfaces migrating from existing SearchAF UI.",
+    tokens: [
+      { varName: "--searchaf-1", light: "#ffffff", dark: "#0a0a0a" },
+      { varName: "--searchaf-2", light: "#fafafa", dark: "#0f0f0f" },
+      { varName: "--searchaf-3", light: "#f5f5f5", dark: "#131313" },
+      { varName: "--searchaf-4", light: "#e5e5e5", dark: "#262626" },
+      { varName: "--searchaf-5", light: "#d4d4d4", dark: "#3a3a3a" },
+      { varName: "--searchaf-6", light: "#a3a3a3", dark: "#525252" },
+      { varName: "--searchaf-7", light: "#737373", dark: "#737373" },
+      { varName: "--searchaf-8", light: "#525252", dark: "#a1a1a1" },
+      { varName: "--searchaf-9", light: "#1c2024", dark: "#e5e5e5" },
+      { varName: "--searchaf-10", light: "#18181b", dark: "#f5f5f5" },
+      { varName: "--searchaf-11", light: "#09090b", dark: "#fafafa" },
+      { varName: "--searchaf-12", light: "#000000", dark: "#ffffff" },
+    ],
+  },
+  {
+    name: "Gray",
+    description: "Compatibility gray scale used by dashboard health and fallback states.",
+    tokens: [
+      { varName: "--gray-1", light: "#fcfcfc", dark: "#0a0a0a" },
+      { varName: "--gray-2", light: "#f9f9f9", dark: "#0f0f0f" },
+      { varName: "--gray-3", light: "#f0f0f0", dark: "#131313" },
+      { varName: "--gray-4", light: "#e4e4e7", dark: "#262626" },
+      { varName: "--gray-5", light: "#d4d4d8", dark: "#3a3a3a" },
+      { varName: "--gray-6", light: "#a1a1aa", dark: "#525252" },
+      { varName: "--gray-7", light: "#71717a", dark: "#737373" },
+      { varName: "--gray-8", light: "#52525b", dark: "#a1a1a1" },
+      { varName: "--gray-9", light: "#3f3f46", dark: "#d4d4d4" },
+      { varName: "--gray-10", light: "#27272a", dark: "#e5e5e5" },
+      { varName: "--gray-11", light: "#18181b", dark: "#f5f5f5" },
+      { varName: "--gray-12", light: "#09090b", dark: "#ffffff" },
+    ],
+  },
+];
+
 const RADII = [
   { name: "sm", varName: "--radius-sm" },
   { name: "md", varName: "--radius-md" },
@@ -256,6 +375,24 @@ export default function FoundationsPage() {
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {CHART_COLORS.map((c) => (
             <ColorSwatch key={c.varName} {...c} />
+          ))}
+        </div>
+      </section>
+
+      <section className="space-y-6">
+        <SectionHeading eyebrow="Color" title="Status compatibility scales" />
+        <div className="grid gap-4 md:grid-cols-2">
+          {STATUS_SCALES.map((scale) => (
+            <TokenScaleSwatch key={scale.name} scale={scale} />
+          ))}
+        </div>
+      </section>
+
+      <section className="space-y-6">
+        <SectionHeading eyebrow="Color" title="Migration compatibility scales" />
+        <div className="grid gap-4 md:grid-cols-2">
+          {COMPATIBILITY_SCALES.map((scale) => (
+            <TokenScaleSwatch key={scale.name} scale={scale} />
           ))}
         </div>
       </section>
@@ -664,6 +801,43 @@ function Chip({ mode, color }: { mode: "light" | "dark"; color: string }) {
       >
         {mode}
       </span>
+    </div>
+  );
+}
+
+function TokenScaleSwatch({ scale }: { scale: TokenScale }) {
+  return (
+    <div className="rounded-lg border border-border p-4">
+      <div className="mb-3">
+        <p className="text-sm font-medium">{scale.name}</p>
+        <p className="text-xs text-muted-foreground">{scale.description}</p>
+      </div>
+      <div className="space-y-3">
+        {(["light", "dark"] as const).map((mode) => (
+          <div key={mode}>
+            <p className="mb-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              {mode}
+            </p>
+            <div className="grid grid-cols-5 overflow-hidden rounded-md border border-border">
+              {scale.tokens.map((token) => (
+                <div
+                  key={`${mode}-${token.varName}`}
+                  className="h-10"
+                  title={`${token.varName}: ${mode === "light" ? token.light : token.dark}`}
+                  style={{ backgroundColor: mode === "light" ? token.light : token.dark }}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex flex-wrap gap-1">
+        {scale.tokens.map((token) => (
+          <code key={token.varName} className="font-mono text-[10px] text-muted-foreground">
+            {token.varName}
+          </code>
+        ))}
+      </div>
     </div>
   );
 }

@@ -8,6 +8,7 @@ import {
   ChartTooltip,
   ChartTooltipContent,
 } from "@antfly/design-system";
+import { chartSeries } from "@antfly/design-system/charts";
 import { Bar, BarChart, CartesianGrid, XAxis } from "recharts";
 
 const data = [
@@ -20,8 +21,8 @@ const data = [
 ];
 
 const config = {
-  queries: { label: "Queries (k)", color: "var(--primary)" },
-  indexing: { label: "Indexing (k)", color: "var(--muted-foreground)" },
+  queries: { label: "Queries (k)", color: chartSeries[0] },
+  indexing: { label: "Indexing (k)", color: chartSeries[1] },
 } satisfies ChartConfig;
 
 export function ChartDemo() {

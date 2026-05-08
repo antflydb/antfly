@@ -1,0 +1,33 @@
+@layer base {
+  .af-dashboard {
+    color: var(--foreground);
+  }
+
+  .af-dashboard ::selection {
+    background: color-mix(in oklch, var(--primary) 22%, transparent);
+  }
+
+  .af-dashboard code,
+  .af-dashboard kbd,
+  .af-dashboard pre,
+  .af-dashboard samp,
+  .af-dashboard .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+@layer components {
+  .af-auth-shell,
+  .af-status-screen {
+    min-height: 100vh;
+  }
+
+  .af-status-card {
+    width: 100%;
+    max-width: 28rem;
+  }
+
+  .af-dashboard [data-slot="dashboard-page"] {
+    max-width: 100%;
+  }
+}

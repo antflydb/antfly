@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "@antfly/design-system/styles.css";
+@import "@antfly/design-system/dashboard.css";
 @import "@xyflow/react/dist/style.css";
 @import "@antfly/graph/styles.css";
 
