@@ -2235,6 +2235,68 @@ func TestPodTemplateLabelsUpdateWhenClusterLabelsChange(t *testing.T) {
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "antfly-operator"))
 }
 
+func TestMetadataStatefulSetPreparesPersistentStorageForNonRootRuntime(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "storage-security-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:latest",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI:  antflyv1.APISpec{Port: 12377},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+				Health:       antflyv1.APISpec{Port: 4200},
+			},
+			Storage: antflyv1.StorageSpec{
+				StorageClass:    "standard",
+				MetadataStorage: "1Gi",
+			},
+			Config: "{}",
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(cluster).
+		Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	g.Expect(client.Get(context.Background(), key, sts)).To(Succeed())
+
+	podSecurityContext := sts.Spec.Template.Spec.SecurityContext
+	g.Expect(podSecurityContext).NotTo(BeNil())
+	g.Expect(podSecurityContext.FSGroup).NotTo(BeNil())
+	g.Expect(*podSecurityContext.FSGroup).To(Equal(antflyRuntimeGID))
+	g.Expect(podSecurityContext.FSGroupChangePolicy).NotTo(BeNil())
+	g.Expect(*podSecurityContext.FSGroupChangePolicy).To(Equal(corev1.FSGroupChangeOnRootMismatch))
+
+	g.Expect(sts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+	initContainer := sts.Spec.Template.Spec.InitContainers[0]
+	g.Expect(initContainer.SecurityContext).NotTo(BeNil())
+	g.Expect(initContainer.SecurityContext.RunAsUser).NotTo(BeNil())
+	g.Expect(*initContainer.SecurityContext.RunAsUser).To(Equal(int64(0)))
+	g.Expect(initContainer.Args).To(HaveLen(1))
+	g.Expect(initContainer.Args[0]).To(ContainSubstring("mkdir -p /antflydb/metadata /antflydb/store"))
+	g.Expect(initContainer.Args[0]).To(ContainSubstring("chown -R 10001:10001 /antflydb"))
+	g.Expect(initContainer.Args[0]).To(ContainSubstring("chmod -R ug+rwX /antflydb"))
+}
+
 // TestSelectorLabels tests that selectorLabels includes instance but not managed-by
 // TestServiceSelectorLabels tests that serviceSelectorLabels includes instance but not managed-by
 func TestServiceSelectorLabels(t *testing.T) {
