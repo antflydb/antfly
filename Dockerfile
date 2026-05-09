@@ -26,8 +26,12 @@ LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB - Distributed document database with vector search for AI applications"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
-# Create non-root user with home directory (needed for default ~/.antfly storage)
-RUN addgroup -S antfly && adduser -S -G antfly -h /home/antfly antfly
+# Create non-root user with a stable UID/GID so Kubernetes fsGroup and init
+# container ownership fixes match the runtime user across images.
+ARG ANTFLY_UID=10001
+ARG ANTFLY_GID=10001
+RUN addgroup -S -g ${ANTFLY_GID} antfly && \
+    adduser -S -u ${ANTFLY_UID} -G antfly -h /home/antfly antfly
 
 # Copy the built binary from the builder stage
 COPY --from=builder /app/antfly /antfly

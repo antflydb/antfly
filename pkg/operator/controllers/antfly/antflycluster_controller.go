@@ -61,6 +61,11 @@ type AntflyClusterReconciler struct {
 
 var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
+const (
+	antflyRuntimeUID int64 = 10001
+	antflyRuntimeGID int64 = 10001
+)
+
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters/finalizers,verbs=update
@@ -81,6 +86,21 @@ var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 //+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch
 
 var reservedPodLabelPrefixes = []string{"app.kubernetes.io/"}
+
+func int64Ptr(v int64) *int64 {
+	return &v
+}
+
+func podFSGroupChangePolicyPtr(v corev1.PodFSGroupChangePolicy) *corev1.PodFSGroupChangePolicy {
+	return &v
+}
+
+func antflyPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		FSGroup:             int64Ptr(antflyRuntimeGID),
+		FSGroupChangePolicy: podFSGroupChangePolicyPtr(corev1.FSGroupChangeOnRootMismatch),
+	}
+}
 
 // podLabels returns the standard labels for pod templates including the instance identifier.
 // These are a superset of serviceSelectorLabels — they include managed-by labels
@@ -2029,6 +2049,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
 					r.buildStorageInitContainer("swarm-storage"),
 				},
@@ -2266,6 +2287,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
 					r.buildStorageInitContainer("metadata-storage"),
 				},
@@ -2476,6 +2498,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
 					r.buildStorageInitContainer("data-storage"),
 				},
@@ -2703,15 +2726,18 @@ func nodeIDForDataOrdinal(ordinal int32) string {
 	return strconv.FormatInt(int64(ordinal+1), 10)
 }
 
-// buildStorageInitContainer creates an init container that waits for the PVC to be properly mounted.
-// This prevents a race condition where the main container starts before the PVC is attached,
-// which could cause Antfly to bootstrap a fresh cluster instead of recovering from existing data.
+// buildStorageInitContainer creates an init container that waits for the PVC to
+// be mounted and prepares ownership for the non-root Antfly runtime user. This
+// prevents a race where the main container starts before the PVC is attached,
+// and recovers existing PVCs that were created with root-owned directories.
 func (r *AntflyClusterReconciler) buildStorageInitContainer(volumeName string) corev1.Container {
 	return corev1.Container{
 		Name:    "wait-for-storage",
 		Image:   "busybox:1.36",
 		Command: []string{"/bin/sh", "-c"},
-		Args: []string{`
+		Args: []string{fmt.Sprintf(`
+set -eu
+
 echo "Checking PVC mount status..."
 timeout=120
 while [ $timeout -gt 0 ]; do
@@ -2723,6 +2749,19 @@ while [ $timeout -gt 0 ]; do
         else
             echo "No existing data - fresh cluster"
         fi
+        marker=/antflydb/.antflydb-storage-prepared
+        echo "Preparing PVC directories for antfly runtime user %d:%d"
+        mkdir -p /antflydb/metadata /antflydb/store
+        if [ ! -f "$marker" ]; then
+            chown -R %d:%d /antflydb
+            chmod -R ug+rwX /antflydb
+            touch "$marker"
+            chown %d:%d "$marker"
+            chmod ug+rw "$marker"
+        else
+            chown %d:%d /antflydb /antflydb/metadata /antflydb/store
+            chmod ug+rwX /antflydb /antflydb/metadata /antflydb/store
+        fi
         exit 0
     fi
     echo "Waiting for PVC mount... ($timeout seconds remaining)"
@@ -2731,7 +2770,19 @@ while [ $timeout -gt 0 ]; do
 done
 echo "ERROR: PVC mount timeout after 120 seconds"
 exit 1
-`},
+`,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+		)},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser: int64Ptr(0),
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      volumeName,
