@@ -1,9 +1,9 @@
+import { Table, TableBody, TableHead, TableHeader, TableRow } from "@antfly/design-system";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import React from "react";
 import { FormProvider, useForm } from "react-hook-form";
 import { fn } from "storybook/test";
 import SchemaFieldRow from "../components/schema-builder/SchemaFieldRow";
-import { Table, TableBody, TableHead, TableHeader, TableRow } from "../components/ui/table";
 
 const meta: Meta<typeof SchemaFieldRow> = {
   title: "SchemaBuilder/SchemaFieldRow",

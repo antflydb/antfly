@@ -31,10 +31,8 @@ export const Default: Story = {
         full_text_search: {
           match_all: {},
         },
-        order_by: {
-          _score: false,
-        },
-        facets: {
+        order_by: [{ field: "_score", desc: true }],
+        aggregations: {
           tags: {
             field: "tags",
             size: 10,
@@ -54,10 +52,8 @@ export const WithoutQueryNode: Story = {
         full_text_search: {
           match_all: {},
         },
-        order_by: {
-          _score: false,
-        },
-        facets: {
+        order_by: [{ field: "_score", desc: true }],
+        aggregations: {
           tags: {
             field: "tags",
             size: 10,
@@ -78,10 +74,8 @@ export const WithoutOrderByAndFacets: Story = {
         full_text_search: {
           match_all: {},
         },
-        order_by: {
-          _score: false,
-        },
-        facets: {
+        order_by: [{ field: "_score", desc: true }],
+        aggregations: {
           tags: {
             field: "tags",
             size: 10,

@@ -1,3 +1,26 @@
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Textarea,
+} from "@antfly/design-system";
 import { type EmbedResponse, TermiteClient } from "@antfly/termite-sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
@@ -14,21 +37,9 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
@@ -285,15 +296,15 @@ const EmbeddingPlaygroundPage: React.FC = () => {
   const maxSimilarity = results ? Math.max(...results.map((r) => r.similarity)) : 1;
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Embedding Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Embedding Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Explore vector similarity between a query and documents using embedding models
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <Button variant="outline" onClick={loadSampleData}>
             <FileText className="h-4 w-4 mr-2" />
             Load Sample
@@ -302,8 +313,8 @@ const EmbeddingPlaygroundPage: React.FC = () => {
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -312,12 +323,12 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
             <div className="space-y-2">
               <Label htmlFor="model">Embedder Model</Label>
@@ -357,46 +368,43 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                 onChange={(e) => setQuery(e.target.value)}
               />
             </div>
-
-            {/* Embed Button */}
-            <div className="space-y-2 flex items-end">
-              <Button
-                onClick={handleEmbed}
-                disabled={
-                  isLoading ||
-                  !query.trim() ||
-                  !selectedModel ||
-                  documents.filter((d) => d.trim()).length === 0
-                }
-                className="w-full"
-              >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Embedding
-                  </>
-                ) : (
-                  <>
-                    <ArrowDownUp className="h-4 w-4 mr-2" />
-                    Embed &amp; Compare
-                  </>
-                )}
-              </Button>
-            </div>
           </div>
+          <FormActions>
+            <Button
+              onClick={handleEmbed}
+              disabled={
+                isLoading ||
+                !query.trim() ||
+                !selectedModel ||
+                documents.filter((d) => d.trim()).length === 0
+              }
+            >
+              {isLoading ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Embedding
+                </>
+              ) : (
+                <>
+                  <ArrowDownUp className="h-4 w-4 mr-2" />
+                  Embed &amp; Compare
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats Bar */}
       {results && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
             {results.length} documents
@@ -426,7 +434,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
             {showSparklines ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
             {showSparklines ? "Hide" : "Show"} vectors
           </Button>
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Main Content - Side by Side */}
@@ -521,11 +529,8 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                 ))}
               </div>
             ) : (
-              <div className="h-80 flex items-center justify-center text-muted-foreground">
-                <div className="text-center">
-                  <ArrowDownUp className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                  <p>Add documents and click "Embed &amp; Compare" to see similarity scores</p>
-                </div>
+              <div className="h-80 flex items-center justify-center">
+                <PlaygroundEmptyState />
               </div>
             )}
           </CardContent>
@@ -533,7 +538,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           <strong>Bi-Encoder Embeddings:</strong> Each text is independently embedded into a
           high-dimensional vector. Cosine similarity between vectors measures semantic relatedness.
@@ -545,7 +550,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
           first 60 dimensions of each embedding vector.
         </p>
       </div>
-    </div>
+    </DashboardPage>
   );
 };
 

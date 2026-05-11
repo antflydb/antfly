@@ -1283,7 +1283,7 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
-  --generator '{"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${GEMINI_API_KEY}"}' \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
   --max-context-tokens 2048 \
   --classify --reasoning --generate --followup
 ```
@@ -1300,7 +1300,7 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
-  --generator '{"provider": "openai", "model": "gpt-4.1-mini", "api_key": "${OPENAI_API_KEY}"}' \
+  --generator '{"provider": "openai", "model": "gpt-4.1-mini"}' \
   --max-context-tokens 2048 \
   --classify --reasoning --generate --followup
 ```
@@ -1343,7 +1343,7 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body,url" \
   --limit 5 \
-  --generator '{"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${GEMINI_API_KEY}"}' \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
   --streaming=false --generate
 ```
 
@@ -1357,11 +1357,11 @@ antfly agents retrieval --table wikipedia \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
-  --generator '{"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${GEMINI_API_KEY}"}' \
+  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
   --generate \
   --eval '{
     "evaluators": ["faithfulness", "relevance"],
-    "judge": {"provider": "gemini", "model": "gemini-3.0-flash", "api_key": "${GEMINI_API_KEY}"}
+    "judge": {"provider": "gemini", "model": "gemini-2.5-flash"}
   }'
 ```
 

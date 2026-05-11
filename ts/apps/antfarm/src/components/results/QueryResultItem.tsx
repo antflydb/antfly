@@ -1,11 +1,17 @@
+import {
+  Badge,
+  Button,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@antfly/design-system";
 import type { QueryHit } from "@antfly/sdk";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import type React from "react";
 import { useMemo } from "react";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import FieldValueDisplay from "./FieldValueDisplay";
 
 interface QueryResultItemProps {

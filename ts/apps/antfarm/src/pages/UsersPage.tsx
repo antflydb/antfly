@@ -1,11 +1,27 @@
-import { AntflyClient } from "@antfly/sdk";
-import { Key, Plus, Shield, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert } from "../components/ui/alert";
-import { Badge } from "../components/ui/badge";
-import { Button } from "../components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import {
+  Alert,
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  type ColumnDef,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DataTable,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -13,24 +29,18 @@ import {
   DialogHeader,
   DialogTitle,
   DialogTrigger,
-} from "../components/ui/dialog";
-import { Input } from "../components/ui/input";
-import { Label } from "../components/ui/label";
-import {
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "../components/ui/select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "../components/ui/table";
+} from "@antfly/design-system";
+import { AntflyClient } from "@antfly/sdk";
+import { Key, Plus, Shield, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { NoUsersState } from "@/components/branded-empty-state";
 import type { Permission } from "../contexts/auth-context";
 import { useApiConfig } from "../hooks/use-api-config";
 import { useAuth } from "../hooks/use-auth";
@@ -59,6 +69,10 @@ export function UsersPage() {
   const [newPermResource, setNewPermResource] = useState("");
   const [newPermResourceType, setNewPermResourceType] = useState<"table" | "user" | "*">("table");
   const [newPermType, setNewPermType] = useState<"read" | "write" | "admin">("read");
+
+  // Delete user dialog state
+  const [deleteUserDialogOpen, setDeleteUserDialogOpen] = useState(false);
+  const [userToDelete, setUserToDelete] = useState<string | null>(null);
 
   // Change password dialog state
   const [changePasswordDialogOpen, setChangePasswordDialogOpen] = useState(false);
@@ -137,21 +151,25 @@ export function UsersPage() {
   };
 
   // Delete user
-  const handleDeleteUser = async (username: string) => {
-    if (!confirm(`Are you sure you want to delete user "${username}"?`)) {
-      return;
-    }
+  const handleDeleteUser = useCallback((username: string) => {
+    setUserToDelete(username);
+    setDeleteUserDialogOpen(true);
+  }, []);
 
+  const confirmDeleteUser = async () => {
+    if (!userToDelete) return;
     try {
-      await client.users.delete(username);
-
-      if (selectedUser === username) {
+      await client.users.delete(userToDelete);
+      if (selectedUser === userToDelete) {
         setSelectedUser(null);
         setPermissions([]);
       }
       fetchUsers();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete user");
+    } finally {
+      setDeleteUserDialogOpen(false);
+      setUserToDelete(null);
     }
   };
 
@@ -192,7 +210,7 @@ export function UsersPage() {
   };
 
   // Change password
-  const handleChangePassword = async () => {
+  const handleChangePassword = useCallback(async () => {
     if (!selectedUser || !newPasswordValue) {
       setPasswordChangeError("Password is required");
       return;
@@ -207,7 +225,7 @@ export function UsersPage() {
     } catch (err) {
       setPasswordChangeError(err instanceof Error ? err.message : "Failed to change password");
     }
-  };
+  }, [client, selectedUser, newPasswordValue]);
 
   // Load users on mount
   useEffect(() => {
@@ -221,62 +239,175 @@ export function UsersPage() {
     }
   }, [selectedUser, fetchPermissions]);
 
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold">User Management</h1>
-          <p className="text-muted-foreground mt-1">Manage users and their permissions</p>
-        </div>
-        <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="mr-2 size-4" />
-              Create User
-            </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Create New User</DialogTitle>
-              <DialogDescription>
-                Create a new user account with username and password.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4">
-              {createError && (
-                <Alert variant="destructive">
-                  <p className="text-sm">{createError}</p>
-                </Alert>
-              )}
-              <div className="space-y-2">
-                <Label htmlFor="new-username">Username</Label>
-                <Input
-                  id="new-username"
-                  value={newUsername}
-                  onChange={(e) => setNewUsername(e.target.value)}
-                  placeholder="Enter username"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="new-password">Password</Label>
-                <Input
-                  id="new-password"
-                  type="password"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  placeholder="Enter password"
-                />
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setCreateDialogOpen(false)}>
-                Cancel
+  const userColumns = useMemo<ColumnDef<UserListItem>[]>(
+    () => [
+      {
+        accessorKey: "username",
+        header: "Username",
+        cell: ({ row }) => (
+          <button
+            type="button"
+            className="font-medium hover:underline text-left"
+            onClick={() => setSelectedUser(row.original.username)}
+          >
+            {row.original.username}
+            {currentUser?.username === row.original.username && (
+              <Badge variant="secondary" className="ml-2">
+                You
+              </Badge>
+            )}
+          </button>
+        ),
+      },
+      {
+        id: "actions",
+        header: "",
+        cell: ({ row }) => (
+          <div className="flex items-center justify-end gap-2">
+            <Dialog
+              open={changePasswordDialogOpen && selectedUser === row.original.username}
+              onOpenChange={(open) => {
+                if (open) setSelectedUser(row.original.username);
+                setChangePasswordDialogOpen(open);
+                if (!open) setPasswordChangeError("");
+              }}
+            >
+              <DialogTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedUser(row.original.username);
+                  }}
+                >
+                  <Key className="size-4" />
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Change Password</DialogTitle>
+                  <DialogDescription>
+                    Change password for user {row.original.username}
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-4">
+                  {passwordChangeError && (
+                    <Alert variant="destructive">
+                      <p className="text-sm">{passwordChangeError}</p>
+                    </Alert>
+                  )}
+                  <div className="space-y-2">
+                    <Label htmlFor="new-password-value">New Password</Label>
+                    <Input
+                      id="new-password-value"
+                      type="password"
+                      value={newPasswordValue}
+                      onChange={(e) => setNewPasswordValue(e.target.value)}
+                      placeholder="Enter new password"
+                    />
+                  </div>
+                </div>
+                <DialogFooter>
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setChangePasswordDialogOpen(false);
+                      setPasswordChangeError("");
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                  <Button onClick={handleChangePassword}>Change Password</Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            {currentUser?.username !== row.original.username && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDeleteUser(row.original.username);
+                }}
+                className="text-muted-foreground hover:text-destructive"
+              >
+                <Trash2 className="size-4" />
               </Button>
-              <Button onClick={handleCreateUser}>Create User</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      </div>
+            )}
+          </div>
+        ),
+      },
+    ],
+    [
+      currentUser,
+      selectedUser,
+      changePasswordDialogOpen,
+      passwordChangeError,
+      newPasswordValue,
+      handleDeleteUser,
+      handleChangePassword,
+    ]
+  );
+
+  return (
+    <DashboardPage>
+      <DashboardPageHeader>
+        <div>
+          <DashboardPageTitle className="font-aeonik">User Management</DashboardPageTitle>
+          <DashboardPageDescription>Manage users and their permissions.</DashboardPageDescription>
+        </div>
+        <DashboardPageActions>
+          <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+            <DialogTrigger asChild>
+              <Button>
+                <Plus className="mr-2 size-4" />
+                Create User
+              </Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Create New User</DialogTitle>
+                <DialogDescription>
+                  Create a new user account with username and password.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4">
+                {createError && (
+                  <Alert variant="destructive">
+                    <p className="text-sm">{createError}</p>
+                  </Alert>
+                )}
+                <div className="space-y-2">
+                  <Label htmlFor="new-username">Username</Label>
+                  <Input
+                    id="new-username"
+                    value={newUsername}
+                    onChange={(e) => setNewUsername(e.target.value)}
+                    placeholder="Enter username"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="new-password">Password</Label>
+                  <Input
+                    id="new-password"
+                    type="password"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    placeholder="Enter password"
+                  />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setCreateDialogOpen(false)}>
+                  Cancel
+                </Button>
+                <Button onClick={handleCreateUser}>Create User</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       {error && (
         <Alert variant="destructive">
@@ -284,7 +415,7 @@ export function UsersPage() {
         </Alert>
       )}
 
-      <div className="grid gap-6 md:grid-cols-2">
+      <div className="grid gap-3 md:grid-cols-2">
         {/* Users List */}
         <Card>
           <CardHeader>
@@ -295,112 +426,15 @@ export function UsersPage() {
             {isLoading ? (
               <p className="text-muted-foreground">Loading users...</p>
             ) : users.length === 0 ? (
-              <p className="text-muted-foreground">No users found</p>
+              <NoUsersState />
             ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Username</TableHead>
-                    <TableHead className="text-right">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {users.map((user) => (
-                    <TableRow
-                      key={user.username}
-                      className={
-                        selectedUser === user.username
-                          ? "bg-muted"
-                          : "cursor-pointer hover:bg-muted/50"
-                      }
-                      onClick={() => setSelectedUser(user.username)}
-                    >
-                      <TableCell className="font-medium">
-                        {user.username}
-                        {currentUser?.username === user.username && (
-                          <Badge variant="secondary" className="ml-2">
-                            You
-                          </Badge>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex items-center justify-end gap-2">
-                          <Dialog
-                            open={changePasswordDialogOpen && selectedUser === user.username}
-                            onOpenChange={(open) => {
-                              if (open) setSelectedUser(user.username);
-                              setChangePasswordDialogOpen(open);
-                              if (!open) setPasswordChangeError("");
-                            }}
-                          >
-                            <DialogTrigger asChild>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setSelectedUser(user.username);
-                                }}
-                              >
-                                <Key className="size-4" />
-                              </Button>
-                            </DialogTrigger>
-                            <DialogContent>
-                              <DialogHeader>
-                                <DialogTitle>Change Password</DialogTitle>
-                                <DialogDescription>
-                                  Change password for user {user.username}
-                                </DialogDescription>
-                              </DialogHeader>
-                              <div className="space-y-4">
-                                {passwordChangeError && (
-                                  <Alert variant="destructive">
-                                    <p className="text-sm">{passwordChangeError}</p>
-                                  </Alert>
-                                )}
-                                <div className="space-y-2">
-                                  <Label htmlFor="new-password-value">New Password</Label>
-                                  <Input
-                                    id="new-password-value"
-                                    type="password"
-                                    value={newPasswordValue}
-                                    onChange={(e) => setNewPasswordValue(e.target.value)}
-                                    placeholder="Enter new password"
-                                  />
-                                </div>
-                              </div>
-                              <DialogFooter>
-                                <Button
-                                  variant="outline"
-                                  onClick={() => {
-                                    setChangePasswordDialogOpen(false);
-                                    setPasswordChangeError("");
-                                  }}
-                                >
-                                  Cancel
-                                </Button>
-                                <Button onClick={handleChangePassword}>Change Password</Button>
-                              </DialogFooter>
-                            </DialogContent>
-                          </Dialog>
-                          {currentUser?.username !== user.username && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleDeleteUser(user.username);
-                              }}
-                            >
-                              <Trash2 className="size-4 text-destructive" />
-                            </Button>
-                          )}
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+              <DataTable
+                columns={userColumns}
+                data={users}
+                filterColumn="username"
+                filterPlaceholder="Filter users…"
+                emptyMessage="No users found."
+              />
             )}
           </CardContent>
         </Card>
@@ -526,6 +560,21 @@ export function UsersPage() {
           </CardContent>
         </Card>
       </div>
-    </div>
+
+      <AlertDialog open={deleteUserDialogOpen} onOpenChange={setDeleteUserDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete User</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete user "{userToDelete}"? This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDeleteUser}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </DashboardPage>
   );
 }

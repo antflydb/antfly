@@ -1,4 +1,25 @@
 import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  GraphPaperBg,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  StatCard,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@antfly/design-system";
+import {
   AlertTriangle,
   Database,
   GitBranch,
@@ -9,17 +30,6 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   type ShardInfoData,
   type ShardStatus,
@@ -160,15 +170,6 @@ function HealthDot({ healthy }: { healthy: boolean }) {
         healthy ? "bg-[var(--success-500)]" : "bg-[var(--danger-500)]"
       )}
     />
-  );
-}
-
-function StatValue({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="flex items-baseline gap-1.5">
-      <span className="text-xl font-semibold tabular-nums">{value}</span>
-      <span className="text-xs text-muted-foreground uppercase tracking-wide">{label}</span>
-    </div>
   );
 }
 
@@ -343,61 +344,69 @@ const ClusterPage: React.FC = () => {
 
   if (cluster.error && Object.keys(cluster.stores).length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-20 gap-4">
-        <Network className="w-10 h-10 text-muted-foreground" />
-        <p className="text-muted-foreground">Failed to load cluster status</p>
-        <p className="text-xs text-muted-foreground">{cluster.error}</p>
-        <Button variant="outline" size="sm" onClick={cluster.refresh}>
-          <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
-          Retry
-        </Button>
-      </div>
+      <DashboardPage>
+        <div className="flex flex-col items-center justify-center py-20 gap-4">
+          <Network className="w-10 h-10 text-muted-foreground" />
+          <p className="text-muted-foreground">Failed to load cluster status</p>
+          <p className="text-xs text-muted-foreground">{cluster.error}</p>
+          <Button variant="outline" size="sm" onClick={cluster.refresh}>
+            <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
+            Retry
+          </Button>
+        </div>
+      </DashboardPage>
     );
   }
 
   return (
-    <div className="space-y-6">
+    <DashboardPage>
       {/* Section A: Cluster Health Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-4">
-          <h2 className="text-2xl font-bold">Cluster</h2>
-          <HealthBadge health={cluster.health} />
-        </div>
-
-        <div className="flex items-center gap-6">
-          <div className="flex items-center gap-6">
-            <StatValue label="nodes" value={storeList.length} />
-            <StatValue label="tables" value={uniqueTables} />
-            <StatValue label="shards" value={totalShards} />
-            {totalDisk > 0 && <StatValue label="disk" value={formatBytes(totalDisk)} />}
+      <div className="relative isolate">
+        <GraphPaperBg className="absolute inset-0 -z-10 rounded-xl" />
+        <DashboardPageHeader>
+          <div>
+            <div className="flex items-center gap-3">
+              <DashboardPageTitle className="font-aeonik">Cluster</DashboardPageTitle>
+              <HealthBadge health={cluster.health} />
+            </div>
+            <DashboardPageDescription>
+              Monitor node health, shard placement, and table distribution.
+            </DashboardPageDescription>
           </div>
+          <DashboardPageActions>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={cluster.refresh}
+                disabled={cluster.isLoading}
+              >
+                <RefreshCw className={cn("w-3.5 h-3.5", cluster.isLoading && "animate-spin")} />
+              </Button>
+              <Select
+                value={refreshInterval === null ? "off" : String(refreshInterval)}
+                onValueChange={(v) => setRefreshInterval(v === "off" ? null : Number(v))}
+              >
+                <SelectTrigger className="h-7 w-[72px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="5000">5s</SelectItem>
+                  <SelectItem value="10000">10s</SelectItem>
+                  <SelectItem value="30000">30s</SelectItem>
+                  <SelectItem value="off">Off</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </DashboardPageActions>
+        </DashboardPageHeader>
+      </div>
 
-          <div className="flex items-center gap-2 border-l pl-4 border-border">
-            <Button
-              variant="outline"
-              size="icon"
-              className="h-7 w-7"
-              onClick={cluster.refresh}
-              disabled={cluster.isLoading}
-            >
-              <RefreshCw className={cn("w-3.5 h-3.5", cluster.isLoading && "animate-spin")} />
-            </Button>
-            <Select
-              value={refreshInterval === null ? "off" : String(refreshInterval)}
-              onValueChange={(v) => setRefreshInterval(v === "off" ? null : Number(v))}
-            >
-              <SelectTrigger className="h-7 w-[72px] text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="5000">5s</SelectItem>
-                <SelectItem value="10000">10s</SelectItem>
-                <SelectItem value="30000">30s</SelectItem>
-                <SelectItem value="off">Off</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <StatCard label="Nodes" value={storeList.length} icon={<Network className="w-4 h-4" />} />
+        <StatCard label="Tables" value={uniqueTables} icon={<Database className="w-4 h-4" />} />
+        <StatCard label="Shards" value={totalShards} />
+        {totalDisk > 0 && <StatCard label="Disk" value={formatBytes(totalDisk)} />}
       </div>
 
       {cluster.message && <p className="text-sm text-muted-foreground">{cluster.message}</p>}
@@ -510,7 +519,7 @@ const ClusterPage: React.FC = () => {
           </div>
         )
       )}
-    </div>
+    </DashboardPage>
   );
 };
 

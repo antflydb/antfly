@@ -1,8 +1,8 @@
 "use client";
 
+import { Button } from "@antfly/design-system";
 import type { ComponentProps, HTMLAttributes, TextareaHTMLAttributes } from "react";
 import { forwardRef } from "react";
-import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 export type InputGroupProps = HTMLAttributes<HTMLDivElement>;

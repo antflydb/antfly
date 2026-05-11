@@ -1,22 +1,31 @@
-import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
-import { Info } from "lucide-react";
-import { InputData, jsonInputForTargetLanguage, quicktype } from "quicktype-core";
-import type React from "react";
-import { useState } from "react";
-import { useFieldArray, useFormContext } from "react-hook-form";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
 import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Button,
   FormControl,
   FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
-} from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
-import { Table, TableBody, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import MultiSelect from "../MultiSelect";
+  Input,
+  MultiSelect,
+  MultiSelectContent,
+  MultiSelectItem,
+  MultiSelectTrigger,
+  Table,
+  TableBody,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@antfly/design-system";
+import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
+import { Info } from "lucide-react";
+import { InputData, jsonInputForTargetLanguage, quicktype } from "quicktype-core";
+import type React from "react";
+import { useState } from "react";
+import { useFieldArray, useFormContext } from "react-hook-form";
 import { ImportJsonDialog } from "./ImportJsonDialog";
 import SchemaFieldRow from "./SchemaFieldRow";
 import { type FieldDetectionInfo, RESERVED_FIELD_NAMES } from "./schema-utils";
@@ -180,15 +189,16 @@ const SchemaEditor: React.FC<SchemaEditorProps> = ({
             <FormItem className="mb-4">
               <FormLabel>Include in _all Field</FormLabel>
               <FormControl>
-                <MultiSelect
-                  options={textBasedFields.map((name: string) => ({
-                    label: name,
-                    value: name,
-                  }))}
-                  value={field.value || []}
-                  onChange={field.onChange}
-                  placeholder="Select fields to include in _all"
-                />
+                <MultiSelect value={field.value || []} onValueChange={field.onChange}>
+                  <MultiSelectTrigger placeholder="Select fields to include in _all" />
+                  <MultiSelectContent searchPlaceholder="Search fields…">
+                    {textBasedFields.map((name: string) => (
+                      <MultiSelectItem key={name} value={name}>
+                        {name}
+                      </MultiSelectItem>
+                    ))}
+                  </MultiSelectContent>
+                </MultiSelect>
               </FormControl>
               <FormDescription>
                 Select text-based fields to include in the _all search field for full-text search
@@ -200,7 +210,7 @@ const SchemaEditor: React.FC<SchemaEditorProps> = ({
         }}
       />
 
-      <h4 className="text-lg font-semibold mb-2">Fields</h4>
+      <h4 className="mb-2 font-semibold">Fields</h4>
 
       <Alert className="mb-4">
         <Info className="h-4 w-4" />

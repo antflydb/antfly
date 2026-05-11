@@ -1,6 +1,5 @@
+import { Badge, Collapsible, CollapsibleContent } from "@antfly/design-system";
 import type React from "react";
-import { Badge } from "@/components/ui/badge";
-import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import type {
   ClassificationStepData,
@@ -51,7 +50,11 @@ function renderStepContent(
   formatAnswer?: (text: string) => React.ReactNode
 ): React.ReactNode {
   if (step.status === "error" && typeof step.data === "string") {
-    return <div className="text-sm text-red-500 bg-red-500/5 p-2 rounded">{step.data}</div>;
+    return (
+      <div className="af-status-text-error af-status-surface-error text-sm p-2 rounded">
+        {step.data}
+      </div>
+    );
   }
 
   if (!step.data && step.status !== "running") return null;
@@ -167,10 +170,10 @@ function renderStepContent(
                 className={cn(
                   "font-medium",
                   data.generation > 0.7
-                    ? "text-green-600"
+                    ? "af-status-text-success"
                     : data.generation > 0.4
-                      ? "text-yellow-600"
-                      : "text-red-600"
+                      ? "af-status-text-warning"
+                      : "af-status-text-error"
                 )}
               >
                 {(data.generation * 100).toFixed(0)}%
@@ -181,10 +184,10 @@ function renderStepContent(
                 className={cn(
                   "h-1.5 rounded-full transition-all",
                   data.generation > 0.7
-                    ? "bg-green-500"
+                    ? "af-status-bar-success"
                     : data.generation > 0.4
-                      ? "bg-yellow-500"
-                      : "bg-red-400"
+                      ? "af-status-bar-warning"
+                      : "af-status-bar-error"
                 )}
                 style={{ width: `${data.generation * 100}%` }}
               />
@@ -197,10 +200,10 @@ function renderStepContent(
                 className={cn(
                   "font-medium",
                   data.context > 0.7
-                    ? "text-green-600"
+                    ? "af-status-text-success"
                     : data.context > 0.4
-                      ? "text-yellow-600"
-                      : "text-red-600"
+                      ? "af-status-text-warning"
+                      : "af-status-text-error"
                 )}
               >
                 {(data.context * 100).toFixed(0)}%
@@ -211,10 +214,10 @@ function renderStepContent(
                 className={cn(
                   "h-1.5 rounded-full transition-all",
                   data.context > 0.7
-                    ? "bg-green-500"
+                    ? "af-status-bar-success"
                     : data.context > 0.4
-                      ? "bg-yellow-500"
-                      : "bg-red-400"
+                      ? "af-status-bar-warning"
+                      : "af-status-bar-error"
                 )}
                 style={{ width: `${data.context * 100}%` }}
               />

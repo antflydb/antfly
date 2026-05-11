@@ -1,34 +1,43 @@
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { Clock, HelpCircle, ListPlus, MessageCircle, Plus, RotateCcw, Zap } from "lucide-react";
-import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
-import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
-import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
-import type { SamplePreset } from "@/components/playground/SamplePresets";
-import { SamplePresets } from "@/components/playground/SamplePresets";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
   Dialog,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
+  FormActions,
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
+  Skeleton,
+  Textarea,
+} from "@antfly/design-system";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { Clock, HelpCircle, ListPlus, MessageCircle, Plus, RotateCcw, Zap } from "lucide-react";
+import type React from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
+import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
+import type { SamplePreset } from "@/components/playground/SamplePresets";
+import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useEvalSets } from "@/hooks/use-eval-sets";
 import { fetchWithRetry } from "@/lib/utils";
@@ -347,22 +356,22 @@ const RewritingPlaygroundPage: React.FC = () => {
   }));
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Rewriting Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Rewriting Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Transform text using Seq2Seq models (question generation, paraphrasing, etc.)
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <SamplePresets presets={samplePresets} />
           <Button variant="outline" onClick={handleReset}>
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -371,12 +380,12 @@ const RewritingPlaygroundPage: React.FC = () => {
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 gap-4">
             {/* Model Selection */}
             <div className="space-y-2">
               <Label htmlFor="model">Model</Label>
@@ -405,41 +414,38 @@ const RewritingPlaygroundPage: React.FC = () => {
                 </SelectContent>
               </Select>
             </div>
-
-            {/* Generate Button */}
-            <div className="space-y-2 flex items-end lg:col-start-3">
-              <Button
-                onClick={handleGenerate}
-                disabled={isLoading || !context.trim() || !answer.trim() || !selectedModel}
-                className="w-full"
-              >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Generating
-                  </>
-                ) : (
-                  <>
-                    <HelpCircle className="h-4 w-4 mr-2" />
-                    Generate Question
-                  </>
-                )}
-              </Button>
-            </div>
           </div>
+          <FormActions>
+            <Button
+              onClick={handleGenerate}
+              disabled={isLoading || !context.trim() || !answer.trim() || !selectedModel}
+            >
+              {isLoading ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Generating
+                </>
+              ) : (
+                <>
+                  <HelpCircle className="h-4 w-4 mr-2" />
+                  Generate Question
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats Bar */}
       {result && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Zap className="h-3 w-3" />
             {result.model}
@@ -450,7 +456,7 @@ const RewritingPlaygroundPage: React.FC = () => {
               {processingTime.toFixed(0)}ms
             </Badge>
           )}
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Main Content */}
@@ -551,25 +557,8 @@ const RewritingPlaygroundPage: React.FC = () => {
                 </div>
               </div>
             ) : (
-              <div className="h-80 flex items-center justify-center text-muted-foreground">
-                <div className="text-center">
-                  <HelpCircle className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                  <p className="mb-3">
-                    Enter context and answer, then press{" "}
-                    <kbd className="px-1.5 py-0.5 text-xs border rounded bg-muted">Cmd+Enter</kbd>{" "}
-                    to generate
-                  </p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      setContext(SAMPLE_DATA.eiffel.context);
-                      setAnswer(SAMPLE_DATA.eiffel.answer);
-                    }}
-                  >
-                    Try a sample
-                  </Button>
-                </div>
+              <div className="h-80 flex items-center justify-center">
+                <PlaygroundEmptyState />
               </div>
             )}
           </CardContent>
@@ -577,7 +566,7 @@ const RewritingPlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           <strong>Question Generation:</strong> Uses Seq2Seq models (T5, FLAN-T5) trained for
           question generation. The model generates a question that would be answered by the
@@ -655,7 +644,7 @@ const RewritingPlaygroundPage: React.FC = () => {
           </div>
           <DialogFooter>
             {evalSetSuccess ? (
-              <div className="text-green-600 font-medium">Added successfully!</div>
+              <div className="af-status-text-success font-medium">Added successfully!</div>
             ) : (
               <>
                 <Button variant="outline" onClick={() => setShowEvalSetDialog(false)}>
@@ -672,7 +661,7 @@ const RewritingPlaygroundPage: React.FC = () => {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </DashboardPage>
   );
 };
 

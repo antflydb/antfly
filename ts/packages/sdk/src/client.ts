@@ -334,7 +334,8 @@ export class AntflyClient {
                       return;
                     case "error": {
                       const parsed = JSON.parse(data);
-                      const message = typeof parsed === "object" && parsed.error ? parsed.error : String(parsed);
+                      const message =
+                        typeof parsed === "object" && parsed.error ? parsed.error : String(parsed);
                       if (callbacks.onError) {
                         callbacks.onError(message);
                       }

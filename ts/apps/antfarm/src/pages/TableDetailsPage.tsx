@@ -1,39 +1,57 @@
-import type { Table as AntflyTable, IndexStatus, QueryRequest, QueryResult } from "@antfly/sdk";
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { ChevronRight } from "lucide-react";
-import type React from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
-} from "@/components/ui/accordion";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
+  Alert,
+  AlertDescription,
+  Badge,
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  type ColumnDef,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  DataTable,
   Dialog,
   DialogContent,
   DialogDescription,
   DialogTitle,
   DialogTrigger,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
+  Input,
+  Label,
+  MultiSelect,
+  MultiSelectContent,
+  MultiSelectItem,
+  MultiSelectTrigger,
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Textarea,
+} from "@antfly/design-system";
+import type { Table as AntflyTable, IndexStatus, QueryRequest, QueryResult } from "@antfly/sdk";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import type React from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link, useParams } from "react-router-dom";
 import { api, type TableSchema } from "../api";
 import AggregationResults from "../components/AggregationResults";
 import AIQueryAssistant from "../components/AIQueryAssistant";
@@ -42,7 +60,6 @@ import DocumentBuilder from "../components/DocumentBuilder";
 
 import BulkInsert from "../components/Insert";
 import JsonViewer from "../components/JsonViewer";
-import MultiSelect from "../components/MultiSelect";
 import FieldSelector from "../components/querybuilder/FieldSelector";
 import QueryBuilder from "../components/querybuilder/QueryBuilder";
 import { QueryResultsList } from "../components/results";
@@ -64,93 +81,135 @@ const formatBytes = (bytes: number, decimals = 2) => {
   return `${parseFloat((bytes / k ** i).toFixed(dm))} ${sizes[i]}`;
 };
 
-function Row(props: {
+function ActionsCell({
+  index,
+  onDrop,
+}: {
   index: IndexStatus;
-  handleOpenDropDialog: (index: IndexStatus) => void;
-  theme: string;
+  onDrop: (index: IndexStatus) => void;
 }) {
-  const { index, handleOpenDropDialog } = props;
-
-  // Extract version from bleve_v2 index names (e.g., "full_text_index_v0" -> "0")
-  const getVersion = (name: string) => {
-    const match = name.match(/_v(\d+)$/);
-    return match ? match[1] : null;
-  };
-
-  const version = index.config.type === "full_text" ? getVersion(index.config.name) : null;
-
-  // Extract model and provider for vector indexes
-  const getModelInfo = () => {
-    if (index.config.type === "embeddings") {
-      const embedderConfig = (index.config as { embedder?: { model?: string; provider?: string } })
-        .embedder;
-      return {
-        model: embedderConfig?.model || "N/A",
-        provider: embedderConfig?.provider || "N/A",
-      };
-    }
-    return null;
-  };
-
-  const modelInfo = getModelInfo();
-
   return (
-    <TableRow>
-      {index.config.type !== "full_text" && <TableCell>{index.config.name}</TableCell>}
-      {index.config.type === "full_text" && version && <TableCell>{version}</TableCell>}
-      {index.config.type === "embeddings" && modelInfo && (
-        <>
-          <TableCell>{modelInfo.provider}</TableCell>
-          <TableCell>{modelInfo.model}</TableCell>
-        </>
-      )}
-      {(index.config.type === "embeddings" || index.config.type === "full_text") && (
-        <TableCell>
-          {"total_indexed" in (index.status || {})
-            ? (index.status as { total_indexed?: number }).total_indexed
-            : "N/A"}
-        </TableCell>
-      )}
-      {index.config.type === "full_text" && (
-        <TableCell>
-          {"disk_usage" in (index.status || {}) &&
-          (index.status as { disk_usage?: number }).disk_usage !== undefined
-            ? formatBytes((index.status as { disk_usage: number }).disk_usage)
-            : "N/A"}
-        </TableCell>
-      )}
-      <TableCell>
-        <Sheet>
-          <SheetTrigger asChild>
-            <Button variant="outline">Details</Button>
-          </SheetTrigger>
-          <SheetContent>
-            <SheetHeader>
-              <SheetTitle>Index Details</SheetTitle>
-            </SheetHeader>
-            <div className="space-y-4">
-              <div>
-                <h3 className="text-lg font-semibold mb-2">Status</h3>
-                <JsonViewer json={index.status} />
-              </div>
-              <div>
-                <h3 className="text-lg font-semibold mb-2">Config</h3>
-                <JsonViewer json={index.config} />
-              </div>
+    <div className="flex items-center gap-2">
+      <Sheet>
+        <SheetTrigger asChild>
+          <Button variant="outline" size="sm">
+            Details
+          </Button>
+        </SheetTrigger>
+        <SheetContent>
+          <SheetHeader>
+            <SheetTitle>Index Details</SheetTitle>
+          </SheetHeader>
+          <div className="space-y-4">
+            <div>
+              <h3 className="mb-2 font-semibold">Status</h3>
+              <JsonViewer json={index.status} />
             </div>
-          </SheetContent>
-        </Sheet>
-        <Button
-          color="red"
-          onClick={() => handleOpenDropDialog(index)}
-          disabled={index.config.name.startsWith("full_text_index")}
-          className="ml-2"
-        >
-          Drop
-        </Button>
-      </TableCell>
-    </TableRow>
+            <div>
+              <h3 className="mb-2 font-semibold">Config</h3>
+              <JsonViewer json={index.config} />
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => onDrop(index)}
+        disabled={index.config.name.startsWith("full_text_index")}
+        className="text-muted-foreground hover:text-destructive"
+      >
+        Drop
+      </Button>
+    </div>
   );
+}
+
+function getIndexVersion(name: string) {
+  const match = name.match(/_v(\d+)$/);
+  return match ? match[1] : null;
+}
+
+function getModelInfo(index: IndexStatus) {
+  if (index.config.type === "embeddings") {
+    const embedderConfig = (index.config as { embedder?: { model?: string; provider?: string } })
+      .embedder;
+    return {
+      model: embedderConfig?.model || "N/A",
+      provider: embedderConfig?.provider || "N/A",
+    };
+  }
+  return null;
+}
+
+function getTotalIndexed(index: IndexStatus) {
+  if ("total_indexed" in (index.status || {})) {
+    return (index.status as { total_indexed?: number }).total_indexed ?? "N/A";
+  }
+  return "N/A";
+}
+
+function buildIndexColumns(
+  type: string,
+  onDrop: (index: IndexStatus) => void
+): ColumnDef<IndexStatus>[] {
+  const cols: ColumnDef<IndexStatus>[] = [];
+
+  if (type === "full_text") {
+    cols.push({
+      id: "version",
+      header: "Version",
+      cell: ({ row }) => getIndexVersion(row.original.config.name) ?? "-",
+    });
+    cols.push({
+      id: "total_indexed",
+      header: "Total Indexed",
+      cell: ({ row }) => getTotalIndexed(row.original),
+    });
+    cols.push({
+      id: "disk_usage",
+      header: "Disk Usage",
+      cell: ({ row }) => {
+        const status = row.original.status as { disk_usage?: number } | undefined;
+        return status?.disk_usage !== undefined ? formatBytes(status.disk_usage) : "N/A";
+      },
+    });
+  } else if (type === "embeddings") {
+    cols.push({
+      accessorFn: (row) => row.config.name,
+      id: "name",
+      header: "Name",
+    });
+    cols.push({
+      id: "provider",
+      header: "Provider",
+      cell: ({ row }) => getModelInfo(row.original)?.provider ?? "N/A",
+    });
+    cols.push({
+      id: "model",
+      header: "Model",
+      cell: ({ row }) => getModelInfo(row.original)?.model ?? "N/A",
+    });
+    cols.push({
+      id: "total_indexed",
+      header: "Total Indexed",
+      cell: ({ row }) => getTotalIndexed(row.original),
+    });
+  } else {
+    cols.push({
+      accessorFn: (row) => row.config.name,
+      id: "name",
+      header: "Name",
+    });
+  }
+
+  cols.push({
+    id: "actions",
+    header: "",
+    cell: ({ row }) => <ActionsCell index={row.original} onDrop={onDrop} />,
+  });
+
+  return cols;
 }
 
 interface TableDetailsPageProps {
@@ -533,72 +592,70 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
   };
 
   return (
-    <div>
-      {/* Breadcrumb navigation */}
-      <nav className="flex items-center gap-1.5 text-sm text-muted-foreground mb-4">
-        <Link to="/" className="hover:text-foreground transition-colors">
-          Tables
-        </Link>
-        <ChevronRight className="size-3.5" />
-        <span className="font-medium text-foreground">{tableName}</span>
-        <ChevronRight className="size-3.5" />
-        <span>{sectionLabels[currentSection] ?? currentSection}</span>
-      </nav>
+    <DashboardPage>
+      <Breadcrumb>
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            <BreadcrumbLink asChild>
+              <Link to="/">Tables</Link>
+            </BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbLink asChild>
+              <Link to={`/tables/${tableName}`}>{tableName}</Link>
+            </BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbPage>{sectionLabels[currentSection] ?? currentSection}</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+
+      <DashboardPageHeader>
+        <div>
+          <DashboardPageTitle>{tableName}</DashboardPageTitle>
+          <DashboardPageDescription>
+            {sectionLabels[currentSection] ?? currentSection} for this table.
+          </DashboardPageDescription>
+        </div>
+        {currentSection === "indexes" && (
+          <DashboardPageActions>
+            <Button onClick={handleOpenCreateDialog}>Create Index</Button>
+            <Button onClick={fetchIndexes} variant="outline" size="icon">
+              <ReloadIcon />
+            </Button>
+          </DashboardPageActions>
+        )}
+      </DashboardPageHeader>
 
       {migration && (
-        <Alert className="mb-4 border-amber-400 bg-amber-50 dark:border-amber-600 dark:bg-amber-950">
-          <AlertDescription className="text-amber-800 dark:text-amber-200">
+        <Alert className="af-status-badge-warning">
+          <AlertDescription>
             <span className="font-medium">Schema migration in progress</span> — rebuilding full-text
             indexes. Reads are served from schema v{migration.read_schema.version} while v
             {tableSchema?.version ?? "?"} is being built.
           </AlertDescription>
         </Alert>
       )}
-      {error && <p className="text-red-500">{error}</p>}
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
       <div className="space-y-6">
         {/* Indexes Section */}
         {currentSection === "indexes" && (
-          <div className="flex flex-col gap-3">
-            <div className="flex gap-2">
-              <Button onClick={handleOpenCreateDialog}>Create Index</Button>
-              <Button onClick={fetchIndexes} variant="outline" size="icon">
-                <ReloadIcon />
-              </Button>
-            </div>
+          <div className="flex flex-col gap-6">
             {sortedIndexTypes.map((type) => (
-              <div key={type}>
-                <h3 className="text-xl font-semibold mt-4 mb-2">
-                  {" "}
-                  {indexTypeDisplayNames[type] || type}
-                </h3>
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>{type === "full_text" ? "Version" : "Name"}</TableHead>
-                      {type === "embeddings" && (
-                        <>
-                          <TableHead>Provider</TableHead>
-                          <TableHead>Model</TableHead>
-                        </>
-                      )}
-                      {(type === "embeddings" || type === "full_text") && (
-                        <TableHead>Total Indexed</TableHead>
-                      )}
-                      {type === "full_text" && <TableHead>Disk Usage</TableHead>}
-                      <TableHead>Actions</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {groupedIndexes[type].map((index) => (
-                      <Row
-                        key={index.config.name}
-                        index={index}
-                        handleOpenDropDialog={handleOpenDropDialog}
-                        theme={theme}
-                      />
-                    ))}
-                  </TableBody>
-                </Table>
+              <div key={type} className="space-y-2">
+                <h3 className="font-semibold">{indexTypeDisplayNames[type] || type}</h3>
+                <DataTable
+                  columns={buildIndexColumns(type, handleOpenDropDialog)}
+                  data={groupedIndexes[type]}
+                  emptyMessage="No indexes."
+                />
               </div>
             ))}
           </div>
@@ -607,7 +664,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
         {/* Search Section */}
         {currentSection === "semantic" && (
           <div className="flex flex-col gap-6">
-            <h2 className="text-2xl font-bold">Query Builder</h2>
+            <DashboardToolbar>
+              <h2>Query Builder</h2>
+            </DashboardToolbar>
             <Tabs value={queryMode} onValueChange={(v) => handleQueryModeChange(v)}>
               <TabsList>
                 <TabsTrigger value="builder">Builder</TabsTrigger>
@@ -655,7 +714,6 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                           value={fieldInput}
                           onChange={handleFieldInputChange}
                           onKeyDown={handleFieldInputKeyDown}
-                          className="h-9"
                         />
                         {selectedFields.length > 0 && (
                           <div className="flex flex-wrap gap-1.5">
@@ -701,16 +759,23 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                               </p>
                             ) : (
                               <MultiSelect
-                                options={indexes
-                                  .filter((idx) => idx.config.type === "embeddings")
-                                  .map((index) => ({
-                                    label: index.config.name,
-                                    value: index.config.name,
-                                  }))}
                                 value={queryIndexes}
-                                onChange={handleQueryIndexChange}
-                                placeholder="Select vector index(es)"
-                              />
+                                onValueChange={handleQueryIndexChange}
+                              >
+                                <MultiSelectTrigger placeholder="Select vector index(es)" />
+                                <MultiSelectContent searchPlaceholder="Search indexes…">
+                                  {indexes
+                                    .filter((idx) => idx.config.type === "embeddings")
+                                    .map((index) => (
+                                      <MultiSelectItem
+                                        key={index.config.name}
+                                        value={index.config.name}
+                                      >
+                                        {index.config.name}
+                                      </MultiSelectItem>
+                                    ))}
+                                </MultiSelectContent>
+                              </MultiSelect>
                             )}
                           </div>
                           {queryIndexes.length > 1 && (
@@ -740,7 +805,6 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                                   handleRunQuery();
                                 }
                               }}
-                              className="h-9"
                             />
                           </div>
                         </div>
@@ -787,9 +851,11 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                     if (parseError) {
                       return (
                         <div className="flex flex-col gap-2">
-                          <p className="text-red-500">
-                            The current query is not valid JSON. Please correct it.
-                          </p>
+                          <Alert variant="destructive">
+                            <AlertDescription>
+                              The current query is not valid JSON. Please correct it.
+                            </AlertDescription>
+                          </Alert>
                           <Textarea
                             value={queryJsonString}
                             onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
@@ -808,7 +874,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
               </div>
             </Tabs>
 
-            <div className="flex gap-3 items-center mt-6">
+            <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
               <Button
                 onClick={handleRunQuery}
                 disabled={!hasSemanticQuery && !hasFilterQuery}
@@ -825,14 +891,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                       ? "Running full-text search"
                       : "Enter a query to search"}
               </span>
-            </div>
+            </DashboardToolbar>
 
             {queryResult?.aggregations && Object.keys(queryResult.aggregations).length > 0 && (
               <AggregationResults aggregations={queryResult.aggregations} className="mt-6" />
             )}
 
             {queryResult && (
-              <Card className="mt-6 shadow-sm">
+              <Card className="shadow-sm">
                 <CardHeader>
                   <CardTitle>Query Results</CardTitle>
                 </CardHeader>
@@ -864,15 +930,15 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
         {/* Schema Section */}
         {currentSection === "schema" && (
           <div className="flex flex-col gap-4">
-            <div className="flex justify-between items-center">
-              <h3 className="text-lg font-semibold">Table Schema</h3>
+            <DashboardToolbar className="justify-between">
+              <h3>Table Schema</h3>
               <Button
                 onClick={() => setIsEditingSchema(!isEditingSchema)}
                 variant={isEditingSchema ? "destructive" : "default"}
               >
                 {isEditingSchema ? "Cancel" : "Edit Schema"}
               </Button>
-            </div>
+            </DashboardToolbar>
 
             {isEditingSchema ? (
               <div>
@@ -926,7 +992,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </DashboardPage>
   );
 };
 

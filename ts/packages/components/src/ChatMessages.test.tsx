@@ -26,13 +26,7 @@ function createTurn(overrides: Partial<ChatTurn> = {}): ChatTurn {
   };
 }
 
-function TestProvider({
-  turns,
-  children,
-}: {
-  turns: ChatTurn[];
-  children: React.ReactNode;
-}) {
+function TestProvider({ turns, children }: { turns: ChatTurn[]; children: React.ReactNode }) {
   const value: ChatContextValue = {
     turns,
     isStreaming: turns.some((turn) => turn.isStreaming),

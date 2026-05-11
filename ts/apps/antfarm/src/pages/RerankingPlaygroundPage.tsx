@@ -1,25 +1,36 @@
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { ArrowUpDown, Clock, Hash, Plus, RotateCcw, Trash2, Zap } from "lucide-react";
-import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
-import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
-import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
-import type { SamplePreset } from "@/components/playground/SamplePresets";
-import { SamplePresets } from "@/components/playground/SamplePresets";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
+  Textarea,
+} from "@antfly/design-system";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { ArrowUpDown, Clock, Hash, Plus, RotateCcw, Trash2, Zap } from "lucide-react";
+import type React from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
+import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
+import type { SamplePreset } from "@/components/playground/SamplePresets";
+import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
@@ -282,7 +293,7 @@ const RerankingPlaygroundPage: React.FC = () => {
 
   // Get ranked documents sorted by score
   const getRankedDocuments = (): RankedDocument[] => {
-    if (!result || !result.scores) return [];
+    if (!result?.scores) return [];
 
     const nonEmptyDocs = documents.filter((d) => d.trim());
     const ranked = result.scores.map((score, index) => ({
@@ -305,15 +316,15 @@ const RerankingPlaygroundPage: React.FC = () => {
 
   // Get the max score for normalization
   const getMaxScore = (): number => {
-    if (!result || !result.scores || result.scores.length === 0) return 1;
+    if (!result?.scores || result.scores.length === 0) return 1;
     return Math.max(...result.scores);
   };
 
   const getScoreColor = (score: number, maxScore: number) => {
     const normalized = maxScore > 0 ? score / maxScore : 0;
-    if (normalized >= 0.7) return "bg-green-500";
-    if (normalized >= 0.4) return "bg-yellow-500";
-    return "bg-red-400";
+    if (normalized >= 0.7) return "af-status-bar-success";
+    if (normalized >= 0.4) return "af-status-bar-warning";
+    return "af-status-bar-error";
   };
 
   const samplePresets: SamplePreset[] = Object.values(SAMPLE_DATA).map((sample) => ({
@@ -327,22 +338,22 @@ const RerankingPlaygroundPage: React.FC = () => {
   }));
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Reranking Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Reranking Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Rerank documents by relevance to a query using cross-encoder models
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <SamplePresets presets={samplePresets} />
           <Button variant="outline" onClick={handleReset}>
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -351,12 +362,12 @@ const RerankingPlaygroundPage: React.FC = () => {
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
             <div className="space-y-2">
               <Label htmlFor="model">Model</Label>
@@ -396,46 +407,43 @@ const RerankingPlaygroundPage: React.FC = () => {
                 onChange={(e) => setQuery(e.target.value)}
               />
             </div>
-
-            {/* Rerank Button */}
-            <div className="space-y-2 flex items-end">
-              <Button
-                onClick={handleRerank}
-                disabled={
-                  isLoading ||
-                  !query.trim() ||
-                  !selectedModel ||
-                  documents.filter((d) => d.trim()).length === 0
-                }
-                className="w-full"
-              >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Reranking
-                  </>
-                ) : (
-                  <>
-                    <ArrowUpDown className="h-4 w-4 mr-2" />
-                    Rerank
-                  </>
-                )}
-              </Button>
-            </div>
           </div>
+          <FormActions>
+            <Button
+              onClick={handleRerank}
+              disabled={
+                isLoading ||
+                !query.trim() ||
+                !selectedModel ||
+                documents.filter((d) => d.trim()).length === 0
+              }
+            >
+              {isLoading ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Reranking
+                </>
+              ) : (
+                <>
+                  <ArrowUpDown className="h-4 w-4 mr-2" />
+                  Rerank
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats Bar */}
       {result && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
             {result.scores.length} documents
@@ -450,7 +458,7 @@ const RerankingPlaygroundPage: React.FC = () => {
               {processingTime.toFixed(0)}ms
             </Badge>
           )}
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Main Content - Side by Side */}
@@ -531,26 +539,8 @@ const RerankingPlaygroundPage: React.FC = () => {
                 })}
               </div>
             ) : (
-              <div className="h-80 flex items-center justify-center text-muted-foreground">
-                <div className="text-center">
-                  <ArrowUpDown className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                  <p className="mb-3">
-                    Add documents and press{" "}
-                    <kbd className="px-1.5 py-0.5 text-xs border rounded bg-muted">Cmd+Enter</kbd>{" "}
-                    to rerank
-                  </p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      setQuery(SAMPLE_DATA.photosynthesis.query);
-                      setDocuments(SAMPLE_DATA.photosynthesis.documents);
-                      setDocKeys(SAMPLE_DATA.photosynthesis.documents.map(() => nextDocKey()));
-                    }}
-                  >
-                    Try a sample
-                  </Button>
-                </div>
+              <div className="h-80 flex items-center justify-center">
+                <PlaygroundEmptyState />
               </div>
             )}
           </CardContent>
@@ -558,7 +548,7 @@ const RerankingPlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           <strong>Cross-Encoder Reranking:</strong> Uses a cross-encoder model to score each
           document against the query for fine-grained relevance ranking. More accurate than
@@ -569,7 +559,7 @@ const RerankingPlaygroundPage: React.FC = () => {
           are sorted by score in descending order.
         </p>
       </div>
-    </div>
+    </DashboardPage>
   );
 };
 

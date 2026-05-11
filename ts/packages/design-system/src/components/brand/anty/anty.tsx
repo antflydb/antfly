@@ -1,6 +1,14 @@
 "use client";
 
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   createLookAnimation,
   createReturnFromLookAnimation,
@@ -369,7 +377,8 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
   const effectiveFloat = float && !reducedMotion;
   const effectiveBlink = blink && !reducedMotion && !useOriginalEyes;
 
-  // Memoize so the idle-animation effect doesn't restart on every parent render.
+  // Re-capture refs once the DOM is mounted so the animation controller
+  // receives real elements instead of the initial nulls.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   // biome-ignore lint/correctness/useExhaustiveDependencies: refsReady triggers recapture of DOM refs after mount
   const elements = useMemo(
@@ -391,6 +400,22 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
     [refsReady]
   );
 
+  const handleControllerStateChange = useCallback(
+    (from: AnimationState, to: AnimationState) => {
+      onAnimationSequenceChange?.(`CONTROLLER: ${from} → ${to}`);
+    },
+    [onAnimationSequenceChange]
+  );
+
+  const animationCallbacks = useMemo(
+    () => ({
+      onEmotionMotionComplete: (emotion: string) => {
+        onEmotionComplete?.(emotion);
+      },
+    }),
+    [onEmotionComplete]
+  );
+
   // Animation controller
   const animationController = useAnimationController(elements, {
     enableLogging: ENABLE_ANIMATION_DEBUG_LOGS,
@@ -409,17 +434,9 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
     floatAmplitude,
     floatDuration,
     floatEase,
-    onStateChange: (from, to) => {
-      if (onAnimationSequenceChange) {
-        onAnimationSequenceChange(`CONTROLLER: ${from} → ${to}`);
-      }
-    },
+    onStateChange: handleControllerStateChange,
     onAnimationSequenceChange,
-    callbacks: {
-      onEmotionMotionComplete: (emotion) => {
-        onEmotionComplete?.(emotion);
-      },
-    },
+    callbacks: animationCallbacks,
   });
 
   // Expose imperative API

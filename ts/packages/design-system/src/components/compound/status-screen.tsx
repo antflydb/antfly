@@ -5,7 +5,7 @@ function AuthShell({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       className={cn(
-        "af-auth-shell flex min-h-screen items-center justify-center bg-background p-4 text-foreground",
+        "af-auth-shell relative isolate flex min-h-screen items-center justify-center bg-background p-4 text-foreground",
         className
       )}
       {...props}

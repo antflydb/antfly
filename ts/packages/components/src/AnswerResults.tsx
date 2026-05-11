@@ -592,14 +592,18 @@ export default function AnswerResults({
           ))}
         {showClassification &&
           classification &&
-          (renderClassification
-            ? <SafeRender render={renderClassification} args={[classification] as const} />
-            : defaultRenderClassification(classification))}
+          (renderClassification ? (
+            <SafeRender render={renderClassification} args={[classification] as const} />
+          ) : (
+            defaultRenderClassification(classification)
+          ))}
         {showReasoning &&
           reasoning &&
-          (renderReasoning
-            ? <SafeRender render={renderReasoning} args={[reasoning, isStreaming] as const} />
-            : defaultRenderReasoning(reasoning, isStreaming))}
+          (renderReasoning ? (
+            <SafeRender render={renderReasoning} args={[reasoning, isStreaming] as const} />
+          ) : (
+            defaultRenderReasoning(reasoning, isStreaming)
+          ))}
         {!error &&
           answer &&
           (renderAnswer ? (
@@ -630,7 +634,11 @@ export default function AnswerResults({
           ))}
         {showHits &&
           hits.length > 0 &&
-          (renderHits ? <SafeRender render={renderHits} args={[hits] as const} /> : defaultRenderHits(hits))}
+          (renderHits ? (
+            <SafeRender render={renderHits} args={[hits] as const} />
+          ) : (
+            defaultRenderHits(hits)
+          ))}
         {evalConfig &&
           evalResult &&
           !isStreaming &&

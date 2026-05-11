@@ -1,10 +1,27 @@
-import { AlertTriangle, Eye, EyeOff, KeyRound, Plus, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert } from "../components/ui/alert";
-import { Badge } from "../components/ui/badge";
-import { Button } from "../components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import {
+  Alert,
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  type ColumnDef,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DataTable,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -12,24 +29,17 @@ import {
   DialogHeader,
   DialogTitle,
   DialogTrigger,
-} from "../components/ui/dialog";
-import { Input } from "../components/ui/input";
-import { Label } from "../components/ui/label";
-import {
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "../components/ui/select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "../components/ui/table";
+} from "@antfly/design-system";
+import { AlertTriangle, Eye, EyeOff, KeyRound, Plus, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { NoSecretsState } from "@/components/branded-empty-state";
 import { useApiConfig } from "../hooks/use-api-config";
 
 interface SecretEntry {
@@ -55,23 +65,11 @@ const COMMON_SECRETS = [
 function statusBadge(status: SecretEntry["status"]) {
   switch (status) {
     case "configured_keystore":
-      return (
-        <Badge className="bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
-          Keystore
-        </Badge>
-      );
+      return <Badge className="af-status-badge-success">Keystore</Badge>;
     case "configured_env":
-      return (
-        <Badge className="bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200">
-          Env Var
-        </Badge>
-      );
+      return <Badge className="af-status-badge-info">Env Var</Badge>;
     case "configured_both":
-      return (
-        <Badge className="bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
-          Both
-        </Badge>
-      );
+      return <Badge className="af-status-badge-success">Both</Badge>;
   }
 }
 
@@ -89,6 +87,8 @@ export function SecretsPage() {
   const [showValue, setShowValue] = useState(false);
   const [addError, setAddError] = useState("");
   const [selectedPreset, setSelectedPreset] = useState("");
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [secretToDelete, setSecretToDelete] = useState<string | null>(null);
 
   // Build auth headers from stored credentials
   const authHeaders = useMemo(() => {
@@ -177,13 +177,15 @@ export function SecretsPage() {
   };
 
   // Delete secret
-  const handleDeleteSecret = async (key: string) => {
-    if (!confirm(`Are you sure you want to delete secret "${key}" from the keystore?`)) {
-      return;
-    }
+  const handleDeleteSecret = useCallback((key: string) => {
+    setSecretToDelete(key);
+    setDeleteDialogOpen(true);
+  }, []);
 
+  const confirmDeleteSecret = async () => {
+    if (!secretToDelete) return;
     try {
-      const response = await fetch(`${apiUrl}/secrets/${encodeURIComponent(key)}`, {
+      const response = await fetch(`${apiUrl}/secrets/${encodeURIComponent(secretToDelete)}`, {
         method: "DELETE",
         headers: authHeaders,
       });
@@ -194,6 +196,9 @@ export function SecretsPage() {
       fetchSecrets();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete secret");
+    } finally {
+      setDeleteDialogOpen(false);
+      setSecretToDelete(null);
     }
   };
 
@@ -212,115 +217,171 @@ export function SecretsPage() {
     fetchSecrets();
   }, [fetchSecrets]);
 
+  const secretColumns = useMemo<ColumnDef<SecretEntry>[]>(() => {
+    const cols: ColumnDef<SecretEntry>[] = [
+      {
+        accessorKey: "key",
+        header: "Key",
+        cell: ({ row }) => <span className="font-mono text-sm">{row.original.key}</span>,
+      },
+      {
+        id: "status",
+        header: "Status",
+        cell: ({ row }) => statusBadge(row.original.status),
+      },
+      {
+        accessorKey: "env_var",
+        header: "Env Var",
+        cell: ({ row }) => (
+          <span className="font-mono text-sm text-muted-foreground">
+            {row.original.env_var || "-"}
+          </span>
+        ),
+      },
+      {
+        id: "updated",
+        header: "Updated",
+        cell: ({ row }) => (
+          <span className="text-sm text-muted-foreground">
+            {row.original.updated_at ? new Date(row.original.updated_at).toLocaleDateString() : "-"}
+          </span>
+        ),
+      },
+    ];
+    if (swarmMode) {
+      cols.push({
+        id: "actions",
+        header: "",
+        cell: ({ row }) =>
+          row.original.status === "configured_keystore" ||
+          row.original.status === "configured_both" ? (
+            <div className="text-right">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => handleDeleteSecret(row.original.key)}
+                className="text-muted-foreground hover:text-destructive"
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            </div>
+          ) : null,
+      });
+    }
+    return cols;
+  }, [swarmMode, handleDeleteSecret]);
+
   const isHttpNonLocal =
     typeof window !== "undefined" &&
     window.location.protocol === "http:" &&
     !["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
+    <DashboardPage>
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-3xl font-bold">Secrets</h1>
-          <p className="text-muted-foreground mt-1">
-            Manage API keys and credentials for AI providers
-          </p>
+          <DashboardPageTitle className="font-aeonik">Secrets</DashboardPageTitle>
+          <DashboardPageDescription>
+            Manage API keys and credentials for AI providers.
+          </DashboardPageDescription>
         </div>
-        {swarmMode && (
-          <Dialog open={addDialogOpen} onOpenChange={setAddDialogOpen}>
-            <DialogTrigger asChild>
-              <Button>
-                <Plus className="mr-2 size-4" />
-                Add Secret
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Add Secret</DialogTitle>
-                <DialogDescription>
-                  Store an API key or credential. Values are encrypted at rest and never returned by
-                  the API.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="space-y-4">
-                {addError && (
-                  <Alert variant="destructive">
-                    <p className="text-sm">{addError}</p>
-                  </Alert>
-                )}
-                {isHttpNonLocal && (
-                  <Alert>
-                    <AlertTriangle className="size-4" />
-                    <p className="text-sm">
-                      You are connected over HTTP (unencrypted). Secrets will be transmitted in
-                      plaintext. Use HTTPS for production deployments.
-                    </p>
-                  </Alert>
-                )}
-                <div className="space-y-2">
-                  <Label>Provider</Label>
-                  <Select value={selectedPreset} onValueChange={handlePresetChange}>
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select a provider or enter custom..." />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {COMMON_SECRETS.map((s) => (
-                        <SelectItem key={s.key} value={s.key}>
-                          {s.label}
-                        </SelectItem>
-                      ))}
-                      <SelectItem value="custom">Custom...</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                {(selectedPreset === "custom" || !selectedPreset) && (
-                  <div className="space-y-2">
-                    <Label htmlFor="secret-key">Key</Label>
-                    <Input
-                      id="secret-key"
-                      value={newKey}
-                      onChange={(e) => setNewKey(e.target.value)}
-                      placeholder="e.g., openai.api_key"
-                    />
-                  </div>
-                )}
-                <div className="space-y-2">
-                  <Label htmlFor="secret-value">Value</Label>
-                  <div className="relative">
-                    <Input
-                      id="secret-value"
-                      type={showValue ? "text" : "password"}
-                      value={newValue}
-                      onChange={(e) => setNewValue(e.target.value)}
-                      placeholder="Enter API key or secret"
-                      className="pr-10"
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
-                      onClick={() => setShowValue(!showValue)}
-                    >
-                      {showValue ? (
-                        <EyeOff className="size-4 text-muted-foreground" />
-                      ) : (
-                        <Eye className="size-4 text-muted-foreground" />
-                      )}
-                    </Button>
-                  </div>
-                </div>
-              </div>
-              <DialogFooter>
-                <Button variant="outline" onClick={() => setAddDialogOpen(false)}>
-                  Cancel
+        <DashboardPageActions>
+          {swarmMode && (
+            <Dialog open={addDialogOpen} onOpenChange={setAddDialogOpen}>
+              <DialogTrigger asChild>
+                <Button>
+                  <Plus className="mr-2 size-4" />
+                  Add Secret
                 </Button>
-                <Button onClick={handleAddSecret}>Store Secret</Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        )}
-      </div>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Add Secret</DialogTitle>
+                  <DialogDescription>
+                    Store an API key or credential. Values are encrypted at rest and never returned
+                    by the API.
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-4">
+                  {addError && (
+                    <Alert variant="destructive">
+                      <p className="text-sm">{addError}</p>
+                    </Alert>
+                  )}
+                  {isHttpNonLocal && (
+                    <Alert>
+                      <AlertTriangle className="size-4" />
+                      <p className="text-sm">
+                        You are connected over HTTP (unencrypted). Secrets will be transmitted in
+                        plaintext. Use HTTPS for production deployments.
+                      </p>
+                    </Alert>
+                  )}
+                  <div className="space-y-2">
+                    <Label>Provider</Label>
+                    <Select value={selectedPreset} onValueChange={handlePresetChange}>
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select a provider or enter custom..." />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {COMMON_SECRETS.map((s) => (
+                          <SelectItem key={s.key} value={s.key}>
+                            {s.label}
+                          </SelectItem>
+                        ))}
+                        <SelectItem value="custom">Custom...</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {(selectedPreset === "custom" || !selectedPreset) && (
+                    <div className="space-y-2">
+                      <Label htmlFor="secret-key">Key</Label>
+                      <Input
+                        id="secret-key"
+                        value={newKey}
+                        onChange={(e) => setNewKey(e.target.value)}
+                        placeholder="e.g., openai.api_key"
+                      />
+                    </div>
+                  )}
+                  <div className="space-y-2">
+                    <Label htmlFor="secret-value">Value</Label>
+                    <div className="relative">
+                      <Input
+                        id="secret-value"
+                        type={showValue ? "text" : "password"}
+                        value={newValue}
+                        onChange={(e) => setNewValue(e.target.value)}
+                        placeholder="Enter API key or secret"
+                        className="pr-10"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
+                        onClick={() => setShowValue(!showValue)}
+                      >
+                        {showValue ? (
+                          <EyeOff className="size-4 text-muted-foreground" />
+                        ) : (
+                          <Eye className="size-4 text-muted-foreground" />
+                        )}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setAddDialogOpen(false)}>
+                    Cancel
+                  </Button>
+                  <Button onClick={handleAddSecret}>Store Secret</Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       {!swarmMode && (
         <Alert>
@@ -353,50 +414,15 @@ export function SecretsPage() {
           {isLoading ? (
             <p className="text-muted-foreground">Loading secrets...</p>
           ) : secrets.length === 0 ? (
-            <p className="text-muted-foreground">
-              No secrets configured. Add API keys for AI providers to enable embedding generation
-              and RAG features.
-            </p>
+            <NoSecretsState />
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Key</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Env Var</TableHead>
-                  <TableHead>Updated</TableHead>
-                  {swarmMode && <TableHead className="text-right">Actions</TableHead>}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {secrets.map((secret) => (
-                  <TableRow key={secret.key}>
-                    <TableCell className="font-mono text-sm">{secret.key}</TableCell>
-                    <TableCell>{statusBadge(secret.status)}</TableCell>
-                    <TableCell className="font-mono text-sm text-muted-foreground">
-                      {secret.env_var || "-"}
-                    </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">
-                      {secret.updated_at ? new Date(secret.updated_at).toLocaleDateString() : "-"}
-                    </TableCell>
-                    {swarmMode && (
-                      <TableCell className="text-right">
-                        {(secret.status === "configured_keystore" ||
-                          secret.status === "configured_both") && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleDeleteSecret(secret.key)}
-                          >
-                            <Trash2 className="size-4 text-destructive" />
-                          </Button>
-                        )}
-                      </TableCell>
-                    )}
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+            <DataTable
+              columns={secretColumns}
+              data={secrets}
+              filterColumn="key"
+              filterPlaceholder="Filter secrets by key…"
+              emptyMessage="No secrets found."
+            />
           )}
         </CardContent>
       </Card>
@@ -436,6 +462,22 @@ export function SecretsPage() {
           </CardContent>
         </Card>
       )}
-    </div>
+
+      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Secret</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete secret "{secretToDelete}" from the keystore? This
+              action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDeleteSecret}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </DashboardPage>
   );
 }

@@ -1,6 +1,6 @@
+import { Button } from "@antfly/design-system";
 import { AlertTriangle, RefreshCw, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Button } from "@/components/ui/button";
 import { isProductEnabled } from "@/config/products";
 import { useConnectionStatus } from "@/hooks/use-connection-status";
 
@@ -58,19 +58,19 @@ export function ConnectionStatusBanner() {
   }
 
   return (
-    <div className="bg-amber-50 dark:bg-amber-950/30 border-b border-amber-200 dark:border-amber-800 px-4 py-3">
+    <div className="af-connection-banner px-4 py-3">
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-start gap-3">
-          <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+          <AlertTriangle className="af-connection-banner-icon h-5 w-5 mt-0.5 flex-shrink-0" />
           <div className="space-y-1">
             {disconnectedServers.map((server) => {
               const info = SERVER_INFO[server];
               return (
                 <div key={server}>
-                  <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                  <p className="af-connection-banner-title">
                     Unable to connect to {info.name} server
                   </p>
-                  <p className="text-xs text-amber-600 dark:text-amber-400">{info.hint}</p>
+                  <p className="af-connection-banner-description">{info.hint}</p>
                 </div>
               );
             })}
@@ -81,7 +81,7 @@ export function ConnectionStatusBanner() {
             variant="outline"
             size="sm"
             onClick={retry}
-            className="h-7 px-2 text-xs border-amber-300 dark:border-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/50"
+            className="af-connection-banner-action h-7 px-2 text-xs"
           >
             <RefreshCw className="h-3.5 w-3.5 mr-1" />
             Retry
@@ -91,7 +91,7 @@ export function ConnectionStatusBanner() {
             size="sm"
             onClick={handleDismiss}
             aria-label="Dismiss"
-            className="h-7 w-7 p-0 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50"
+            className="af-connection-banner-action h-7 w-7 p-0"
           >
             <X className="h-4 w-4" />
           </Button>

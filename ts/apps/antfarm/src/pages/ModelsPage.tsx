@@ -1,5 +1,28 @@
 import {
-  AlertCircle,
+  Button,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  GraphPaperBg,
+  Input,
+  MonoLabel,
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@antfly/design-system";
+import {
   Apple,
   ArrowRight,
   ArrowUpDown,
@@ -28,18 +51,7 @@ import {
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Input } from "@/components/ui/input";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ErrorState, NoResultsState } from "@/components/branded-empty-state";
 import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
@@ -396,46 +408,30 @@ const AnimatedCounter: React.FC<{ value: number; duration?: number }> = ({
   return <span>{count}</span>;
 };
 
-// Type filter pill with visual indicator
 const TypePill: React.FC<{
   type: ModelType;
   typeName: string;
   count: number;
   selected: boolean;
   onClick: () => void;
-}> = ({ type, typeName, count, selected, onClick }) => {
-  const Icon = MODEL_TYPE_ICONS[type];
-  const accent = MODEL_TYPE_ACCENT[type];
-
+}> = ({ typeName, count, selected, onClick }) => {
   return (
     <button
       type="button"
       onClick={onClick}
       aria-pressed={selected}
       className={cn(
-        "group relative flex items-center gap-2.5 px-4 py-2.5 rounded-full transition-all duration-300",
-        "border text-sm font-medium",
+        "px-3 py-1.5 rounded-md text-sm transition-colors",
         selected
-          ? cn("bg-foreground text-background border-foreground", "shadow-lg", accent.glow)
-          : cn(
-              "bg-transparent border-border hover:border-foreground/30",
-              "text-muted-foreground hover:text-foreground"
-            )
+          ? "bg-foreground text-background"
+          : "text-muted-foreground hover:text-foreground hover:bg-muted"
       )}
     >
+      {typeName}
       <span
         className={cn(
-          "flex items-center justify-center w-5 h-5 rounded-full transition-colors",
-          selected ? "bg-background/20" : `${accent.bg}/10`
-        )}
-      >
-        <Icon className={cn("w-3 h-3", selected ? "text-background" : accent.text)} />
-      </span>
-      <span>{typeName}</span>
-      <span
-        className={cn(
-          "text-xs tabular-nums",
-          selected ? "text-background/60" : "text-muted-foreground/60"
+          "ml-1.5 tabular-nums text-xs",
+          selected ? "text-background/60" : "text-muted-foreground/50"
         )}
       >
         {count}
@@ -444,14 +440,11 @@ const TypePill: React.FC<{
   );
 };
 
-// Model card with refined design
 const ModelCard: React.FC<{
   model: TermiteModel;
   onClick: () => void;
-  index: number;
-}> = ({ model, onClick, index }) => {
+}> = ({ model, onClick }) => {
   const Icon = MODEL_TYPE_ICONS[model.type];
-  const accent = MODEL_TYPE_ACCENT[model.type];
 
   return (
     <button
@@ -459,87 +452,47 @@ const ModelCard: React.FC<{
       onClick={onClick}
       aria-label={`View details for ${model.name}`}
       className={cn(
-        "group relative text-left w-full",
+        "group text-left w-full",
         "bg-card border border-border rounded-xl p-5",
-        "transition-all duration-300 ease-out",
-        "hover:border-foreground/20 hover:shadow-lg hover:-translate-y-0.5",
+        "transition-colors duration-150",
+        "hover:bg-accent/50",
         "focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-background"
       )}
-      style={{
-        animationDelay: `${index * 50}ms`,
-      }}
     >
-      {/* Accent line */}
-      <div
-        className={cn(
-          "absolute top-0 left-5 right-5 h-px",
-          accent.bg,
-          "opacity-0 group-hover:opacity-100 transition-opacity duration-300"
-        )}
-      />
-
-      {/* Header */}
-      <div className="flex items-start justify-between gap-3 mb-3">
-        <div className="flex items-center gap-3">
-          <div
-            className={cn(
-              "flex items-center justify-center w-10 h-10 rounded-lg",
-              "bg-muted/50 border",
-              accent.border,
-              "transition-colors duration-300 group-hover:bg-muted"
-            )}
-          >
-            <Icon className={cn("w-5 h-5", accent.text)} />
-          </div>
-          <div className="min-w-0">
-            <h3 className="font-semibold text-foreground leading-tight truncate group-hover:text-foreground transition-colors">
-              {model.name}
-            </h3>
-            <p className="text-xs text-muted-foreground truncate mt-0.5 font-mono">
-              {model.source}
-            </p>
-          </div>
+      <div className="flex items-start gap-3 mb-3">
+        <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted shrink-0">
+          <Icon className="w-4 h-4 text-muted-foreground" />
         </div>
-
-        <ArrowRight
-          className={cn(
-            "w-4 h-4 text-muted-foreground/0 group-hover:text-muted-foreground",
-            "transform translate-x-0 group-hover:translate-x-1",
-            "transition-all duration-300"
-          )}
-        />
+        <div className="min-w-0">
+          <h3 className="font-semibold text-sm text-foreground leading-tight truncate">
+            {model.name}
+          </h3>
+          <p className="text-xs text-muted-foreground truncate mt-0.5 font-mono">{model.source}</p>
+        </div>
       </div>
 
-      {/* Description */}
       <p className="text-sm text-muted-foreground line-clamp-2 mb-4 leading-relaxed">
         {model.description}
       </p>
 
-      {/* Footer */}
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 flex-wrap">
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
           {model.inRegistry ? (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-success-500/10 text-success-600 dark:text-success-400 text-xs font-medium">
+            <span className="inline-flex items-center gap-1">
               <Zap className="w-3 h-3" />
               Ready
             </span>
           ) : (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-muted text-muted-foreground text-xs">
+            <span className="inline-flex items-center gap-1">
               <Package className="w-3 h-3" />
               Export
             </span>
           )}
-
           {model.capabilities?.slice(0, 2).map((cap) => (
-            <span
-              key={cap}
-              className={cn("px-2 py-0.5 rounded-md text-xs border", CAPABILITY_STYLES[cap])}
-            >
-              {CAPABILITY_LABELS[cap]}
-            </span>
+            <span key={cap}>{CAPABILITY_LABELS[cap]}</span>
           ))}
           {model.capabilities && model.capabilities.length > 2 && (
-            <span className="text-xs text-muted-foreground">+{model.capabilities.length - 2}</span>
+            <span>+{model.capabilities.length - 2}</span>
           )}
         </div>
 
@@ -914,72 +867,62 @@ const ModelDetailSheet: React.FC<{
   );
 };
 
-// Type context banner - shows when a specific type filter is selected
 const TypeContextBanner: React.FC<{
   selectedType: ModelType;
   navigate: ReturnType<typeof useNavigate>;
 }> = ({ selectedType, navigate }) => {
   const detail = MODEL_TYPE_DETAILS[selectedType];
   const Icon = MODEL_TYPE_ICONS[selectedType];
-  const accent = MODEL_TYPE_ACCENT[selectedType];
 
   return (
-    <div
-      className={cn(
-        "mb-8 rounded-xl border-l-4 p-5 bg-card border border-border",
-        accent.border.replace("/20", "/40")
-      )}
-    >
-      <div className="flex items-start gap-4">
-        <div
-          className={cn(
-            "flex items-center justify-center w-12 h-12 rounded-xl shrink-0",
-            "bg-muted border",
-            accent.border
-          )}
-        >
-          <Icon className={cn("w-6 h-6", accent.text)} />
-        </div>
-        <div className="flex-1 min-w-0">
-          <h3 className={cn("text-lg font-semibold mb-1", accent.text)}>{detail.tagline}</h3>
-          <p className="text-sm text-muted-foreground leading-relaxed mb-3">{detail.description}</p>
+    <div className="relative isolate mb-8 rounded-xl border border-border overflow-hidden">
+      <GraphPaperBg className="absolute inset-0 -z-10" />
+      <div className="p-5">
+        <div className="flex items-start gap-4">
+          <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted shrink-0">
+            <Icon className="w-4 h-4 text-muted-foreground" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="font-aeonik text-base font-semibold mb-1">{detail.tagline}</h3>
+            <p className="text-sm text-muted-foreground leading-relaxed mb-3">
+              {detail.description}
+            </p>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <h4 className="text-xs font-medium text-foreground mb-2">Use cases</h4>
-              <ul className="space-y-1">
-                {detail.useCases.map((useCase) => (
-                  <li
-                    key={useCase}
-                    className="text-xs text-muted-foreground flex items-start gap-2"
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <MonoLabel className="block mb-2">Use cases</MonoLabel>
+                <ul className="space-y-1">
+                  {detail.useCases.map((useCase) => (
+                    <li
+                      key={useCase}
+                      className="text-xs text-muted-foreground flex items-start gap-2"
+                    >
+                      <span className="mt-1.5 w-1 h-1 rounded-full shrink-0 bg-muted-foreground/40" />
+                      {useCase}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div>
+                <MonoLabel className="block mb-2">Pipeline context</MonoLabel>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {detail.pipelineNote}
+                </p>
+                {MODEL_TYPE_PLAYGROUND[detail.type] && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const path = MODEL_TYPE_PLAYGROUND[detail.type];
+                      if (path) navigate(path);
+                    }}
+                    className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium text-foreground hover:underline"
                   >
-                    <span className={cn("mt-1.5 w-1 h-1 rounded-full shrink-0", accent.bg)} />
-                    {useCase}
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div>
-              <h4 className="text-xs font-medium text-foreground mb-2">Pipeline context</h4>
-              <p className="text-xs text-muted-foreground leading-relaxed">{detail.pipelineNote}</p>
-              {MODEL_TYPE_PLAYGROUND[detail.type] && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const path = MODEL_TYPE_PLAYGROUND[detail.type];
-                    if (path) navigate(path);
-                  }}
-                  className={cn(
-                    "mt-3 inline-flex items-center gap-1.5 text-xs font-medium",
-                    accent.text,
-                    "hover:underline"
-                  )}
-                >
-                  <Sparkles className="w-3 h-3" />
-                  Try in Playground
-                  <ArrowRight className="w-3 h-3" />
-                </button>
-              )}
+                    <Sparkles className="w-3 h-3" />
+                    Try in Playground
+                    <ArrowRight className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -1092,13 +1035,13 @@ const ModelsPage: React.FC = () => {
   // Loading state
   if (loading) {
     return (
-      <div className="min-h-full">
-        <header className="relative mb-12">
-          <div className="pt-4 pb-8">
-            <div className="h-10 w-64 bg-muted animate-pulse rounded-lg mb-3" />
-            <div className="h-6 w-96 bg-muted animate-pulse rounded-lg" />
+      <DashboardPage>
+        <DashboardPageHeader>
+          <div>
+            <div className="mb-3 h-7 w-64 animate-pulse rounded-lg bg-muted" />
+            <div className="h-4 w-full max-w-md animate-pulse rounded-lg bg-muted" />
           </div>
-        </header>
+        </DashboardPageHeader>
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: skeleton placeholders are positional
@@ -1118,83 +1061,59 @@ const ModelsPage: React.FC = () => {
             </div>
           ))}
         </div>
-      </div>
+      </DashboardPage>
     );
   }
 
   // Error state
   if (error) {
     return (
-      <div className="min-h-full flex items-center justify-center">
-        <div className="text-center max-w-md">
-          <div className="w-16 h-16 rounded-2xl bg-destructive/10 flex items-center justify-center mx-auto mb-4">
-            <AlertCircle className="w-8 h-8 text-destructive" />
-          </div>
-          <h2 className="text-xl font-semibold mb-2">Unable to load models</h2>
-          <p className="text-muted-foreground mb-6">
-            Could not load the model registry. Check your network connection and try again.
-          </p>
-          <Button onClick={retry} variant="outline">
-            <RefreshCw className="w-4 h-4 mr-2" />
-            Try again
-          </Button>
-        </div>
-      </div>
+      <DashboardPage className="min-h-full items-center justify-center">
+        <ErrorState
+          message="Could not load the model registry. Check your network connection and try again."
+          onRetry={retry}
+        />
+      </DashboardPage>
     );
   }
 
   return (
-    <div className="min-h-full">
-      {/* Hero Section */}
-      <header className="relative mb-12">
-        {/* Background gradient */}
-        <div className="absolute inset-0 -z-10 overflow-hidden">
-          <div className="absolute top-0 left-1/4 w-96 h-96 bg-gradient-to-br from-blue-500/5 to-violet-500/5 dark:from-blue-500/10 dark:to-violet-500/10 rounded-full blur-3xl" />
-          <div className="absolute top-20 right-1/4 w-64 h-64 bg-gradient-to-br from-emerald-500/5 to-cyan-500/5 dark:from-emerald-500/10 dark:to-cyan-500/10 rounded-full blur-3xl" />
-        </div>
-
-        <div className="pt-4 pb-8">
-          {/* Title */}
-          <h1 className="text-4xl font-bold tracking-tight mb-3">Model Directory</h1>
-          <p className="text-muted-foreground text-lg max-w-2xl leading-relaxed">
+    <DashboardPage>
+      <DashboardPageHeader>
+        <div>
+          <DashboardPageTitle className="font-aeonik">Model Directory</DashboardPageTitle>
+          <DashboardPageDescription>
             Browse {models.length} optimized models for embeddings, NER, chunking, and more. All
             models run locally via ONNX.
-          </p>
-
-          {/* Stats */}
-          <div className="flex items-center gap-6 mt-6">
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-success-500" />
-              <span className="text-sm">
-                <span className="font-semibold text-foreground">
-                  <AnimatedCounter value={registryCount} />
-                </span>
-                <span className="text-muted-foreground"> ready to pull</span>
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-muted-foreground/50" />
-              <span className="text-sm">
-                <span className="font-semibold text-foreground">
-                  <AnimatedCounter value={models.length - registryCount} />
-                </span>
-                <span className="text-muted-foreground"> exportable</span>
-              </span>
-            </div>
-          </div>
+          </DashboardPageDescription>
         </div>
-      </header>
+        <DashboardPageActions>
+          <div className="flex items-center gap-4 text-sm text-muted-foreground">
+            <span>
+              <span className="font-medium text-foreground tabular-nums">
+                <AnimatedCounter value={registryCount} />
+              </span>{" "}
+              ready
+            </span>
+            <span>
+              <span className="font-medium text-foreground tabular-nums">
+                <AnimatedCounter value={models.length - registryCount} />
+              </span>{" "}
+              exportable
+            </span>
+          </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
-      {/* Filters */}
-      <div className="mb-8 space-y-6">
-        {/* Search */}
-        <div className="relative max-w-md">
+      {/* Search and filters */}
+      <DashboardToolbar className="md:flex-col md:items-stretch">
+        <div className="relative">
           <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <Input
             placeholder="Search models..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-10 h-11 bg-background"
+            className="pl-10 h-11 bg-background w-full"
           />
           {searchQuery && (
             <Button
@@ -1209,28 +1128,27 @@ const ModelsPage: React.FC = () => {
           )}
         </div>
 
-        {/* Type filters */}
         <div
           role="group"
           aria-label="Filter models by type"
-          className="flex flex-wrap items-center gap-2"
+          className="flex flex-wrap items-center gap-1.5"
         >
           <button
             type="button"
             onClick={() => setSelectedType("all")}
             aria-pressed={selectedType === "all"}
             className={cn(
-              "px-4 py-2.5 rounded-full text-sm font-medium transition-all duration-300 border",
+              "px-3 py-1.5 rounded-md text-sm transition-colors",
               selectedType === "all"
-                ? "bg-foreground text-background border-foreground shadow-lg"
-                : "bg-transparent border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
+                ? "bg-foreground text-background"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted"
             )}
           >
-            All models
+            All
             <span
               className={cn(
-                "ml-2 tabular-nums",
-                selectedType === "all" ? "text-background/60" : "text-muted-foreground/60"
+                "ml-1.5 tabular-nums text-xs",
+                selectedType === "all" ? "text-background/60" : "text-muted-foreground/50"
               )}
             >
               {models.length}
@@ -1248,7 +1166,7 @@ const ModelsPage: React.FC = () => {
             />
           ))}
         </div>
-      </div>
+      </DashboardToolbar>
 
       {/* Type Context Banner - shows when a specific type is selected */}
       {selectedType !== "all" && (
@@ -1257,23 +1175,7 @@ const ModelsPage: React.FC = () => {
 
       {/* Results */}
       {filteredModels.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-20 text-center">
-          <div className="w-16 h-16 rounded-2xl bg-muted flex items-center justify-center mb-4">
-            <Search className="w-7 h-7 text-muted-foreground/50" />
-          </div>
-          <h3 className="text-lg font-semibold mb-1">No models found</h3>
-          <p className="text-muted-foreground text-sm mb-4">Try adjusting your search or filters</p>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              setSearchQuery("");
-              setSelectedType("all");
-            }}
-          >
-            Clear filters
-          </Button>
-        </div>
+        <NoResultsState query={searchQuery} />
       ) : selectedType === "all" ? (
         // Grouped view
         <div className="space-y-12">
@@ -1281,39 +1183,22 @@ const ModelsPage: React.FC = () => {
             const typeModels = modelsByType[typeInfo.type];
             if (typeModels.length === 0) return null;
 
-            const Icon = MODEL_TYPE_ICONS[typeInfo.type];
-            const accent = MODEL_TYPE_ACCENT[typeInfo.type];
-
             return (
               <section key={typeInfo.type}>
-                {/* Section header */}
-                <div className="flex items-center gap-4 mb-6">
-                  <div
-                    className={cn(
-                      "flex items-center justify-center w-10 h-10 rounded-xl",
-                      "bg-muted border",
-                      accent.border
-                    )}
-                  >
-                    <Icon className={cn("w-5 h-5", accent.text)} />
-                  </div>
-                  <div className="flex-1">
-                    <h2 className="text-xl font-semibold">{typeInfo.name}s</h2>
-                    <p className="text-sm text-muted-foreground">{typeInfo.description}</p>
-                  </div>
-                  <Badge variant="secondary" className="text-xs font-medium">
+                <div className="flex items-baseline gap-3 mb-4">
+                  <h2 className="text-base font-semibold">{typeInfo.name}s</h2>
+                  <span className="text-xs text-muted-foreground tabular-nums">
                     {typeModels.length}
-                  </Badge>
+                  </span>
                 </div>
 
                 {/* Cards grid */}
                 <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
-                  {typeModels.map((model, idx) => (
+                  {typeModels.map((model) => (
                     <ModelCard
                       key={model.id}
                       model={model}
                       onClick={() => handleModelClick(model)}
-                      index={idx}
                     />
                   ))}
                 </div>
@@ -1324,13 +1209,8 @@ const ModelsPage: React.FC = () => {
       ) : (
         // Flat grid for filtered view
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
-          {filteredModels.map((model, idx) => (
-            <ModelCard
-              key={model.id}
-              model={model}
-              onClick={() => handleModelClick(model)}
-              index={idx}
-            />
+          {filteredModels.map((model) => (
+            <ModelCard key={model.id} model={model} onClick={() => handleModelClick(model)} />
           ))}
         </div>
       )}
@@ -1344,7 +1224,7 @@ const ModelsPage: React.FC = () => {
         quantizationOptions={quantizationOptions}
         allowDownloads={allowDownloads}
       />
-    </div>
+    </DashboardPage>
   );
 };
 

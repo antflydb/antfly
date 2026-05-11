@@ -1,13 +1,20 @@
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Input,
+  Textarea,
+} from "@antfly/design-system";
 import type { BatchRequest } from "@antfly/sdk";
 import { CircleAlert, CircleCheck } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useState } from "react";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Spinner } from "@/components/ui/shadcn-io/spinner";
-import { Textarea } from "@/components/ui/textarea";
+import { Spinner } from "@/components/spinner";
 import { api, type JSONSchemaProperty, type TableSchema } from "../api";
 
 interface DocumentBuilderProps {
@@ -211,14 +218,14 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
     }
   };
 
-  if (!schema || !schema.document_schemas || Object.keys(schema.document_schemas).length === 0) {
+  if (!schema?.document_schemas || Object.keys(schema.document_schemas).length === 0) {
     return (
       <Card>
         <CardHeader>
           <CardTitle>Document Builder</CardTitle>
         </CardHeader>
         <CardContent>
-          <p className="text-gray-500">
+          <p className="text-muted-foreground">
             No document schemas available for this table. Please configure a schema first.
           </p>
         </CardContent>
@@ -234,7 +241,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
         </CardHeader>
         <CardContent>
           <div className="flex flex-col gap-4">
-            <p className="text-gray-500 mb-4">
+            <p className="mb-4 text-muted-foreground">
               Create a document using the table schema as a guide.
             </p>
 
@@ -243,7 +250,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
               <select
                 value={selectedSchemaType}
                 onChange={(e) => setSelectedSchemaType(e.target.value)}
-                className="border border-gray-300 rounded-md px-3 py-2"
+                className="rounded-md border border-input bg-background px-3 py-2 text-sm"
               >
                 <option value="">Select a document type</option>
                 {Object.keys(schema.document_schemas).map((schemaName) => (
@@ -266,7 +273,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
                   />
                 </label>
 
-                <h4 className="text-lg font-semibold">Document Fields</h4>
+                <h4 className="font-semibold">Document Fields</h4>
                 {Object.entries(schema.document_schemas[selectedSchemaType].schema.properties).map(
                   ([fieldName, property]) =>
                     renderFormField(fieldName, property, documentValues[fieldName])

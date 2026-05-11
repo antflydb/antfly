@@ -26,6 +26,9 @@ importers:
       '@antfly/components':
         specifier: workspace:*
         version: link:../../packages/components
+      '@antfly/design-system':
+        specifier: workspace:*
+        version: link:../../packages/design-system
       '@antfly/sdk':
         specifier: workspace:*
         version: link:../../packages/sdk
@@ -110,6 +113,9 @@ importers:
       cmdk:
         specifier: ^1.1.1
         version: 1.1.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
+      gsap:
+        specifier: ^3.15.0
+        version: 3.15.0
       lucide-react:
         specifier: ^0.575.0
         version: 0.575.0(react@19.2.4)

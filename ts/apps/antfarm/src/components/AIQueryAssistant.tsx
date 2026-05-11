@@ -1,3 +1,17 @@
+import {
+  Alert,
+  AlertDescription,
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  Textarea,
+} from "@antfly/design-system";
 import type { GeneratorConfig, QueryBuilderResult } from "@antfly/sdk";
 import { GearIcon } from "@radix-ui/react-icons";
 import { Sparkles } from "lucide-react";
@@ -10,12 +24,6 @@ import {
   getInheritedGeneratorLabels,
   QUERY_BUILDER_PROVIDERS,
 } from "@/components/playground/GeneratorSelector";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/hooks/use-api-config";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { QueryDiffView } from "./QueryDiffView";

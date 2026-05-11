@@ -1,3 +1,4 @@
+import { Badge, Collapsible, CollapsibleContent, CollapsibleTrigger } from "@antfly/design-system";
 import type { AgentStep, SSEStepStarted } from "@antfly/sdk";
 import {
   ChevronDown,
@@ -11,8 +12,6 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useState } from "react";
-import { Badge } from "@/components/ui/badge";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 
 interface ReasoningChainCollapsibleProps {
   chain: AgentStep[];
@@ -51,13 +50,7 @@ function getStatusBadgeVariant(
   }
 }
 
-function StepItem({
-  step,
-  defaultOpen = false,
-}: {
-  step: AgentStep;
-  defaultOpen?: boolean;
-}) {
+function StepItem({ step, defaultOpen = false }: { step: AgentStep; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
   const hasDetails = step.details && Object.keys(step.details).length > 0;
 

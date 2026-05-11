@@ -1,3 +1,4 @@
+import { Badge, Collapsible, CollapsibleContent, CollapsibleTrigger } from "@antfly/design-system";
 import {
   AlertCircle,
   BookOpen,
@@ -12,8 +13,6 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useState } from "react";
-import { Badge } from "@/components/ui/badge";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import type {
   ClassificationStepData,
@@ -55,11 +54,11 @@ export const PipelineStep: React.FC<PipelineStepProps> = ({
   const statusIcon = () => {
     switch (step.status) {
       case "complete":
-        return <Check className="w-3.5 h-3.5 text-green-500" />;
+        return <Check className="af-status-icon-success w-3.5 h-3.5" />;
       case "running":
-        return <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin" />;
+        return <Loader2 className="af-status-icon-info w-3.5 h-3.5 animate-spin" />;
       case "error":
-        return <AlertCircle className="w-3.5 h-3.5 text-red-500" />;
+        return <AlertCircle className="af-status-icon-error w-3.5 h-3.5" />;
       case "pending":
         return <div className="w-3 h-3 rounded-full border-2 border-muted-foreground/30" />;
       case "skipped":
@@ -70,11 +69,11 @@ export const PipelineStep: React.FC<PipelineStepProps> = ({
   const statusColor = () => {
     switch (step.status) {
       case "complete":
-        return "border-green-500/30";
+        return "af-status-border-success";
       case "running":
-        return "border-blue-500/30 bg-blue-500/5";
+        return "af-status-border-info af-status-surface-info";
       case "error":
-        return "border-red-500/30";
+        return "af-status-border-error";
       default:
         return "border-border/50";
     }
@@ -241,10 +240,10 @@ function renderStepContent(
                 className={cn(
                   "font-medium",
                   data.generation > 0.7
-                    ? "text-green-600"
+                    ? "af-status-text-success"
                     : data.generation > 0.4
-                      ? "text-yellow-600"
-                      : "text-red-600"
+                      ? "af-status-text-warning"
+                      : "af-status-text-error"
                 )}
               >
                 {(data.generation * 100).toFixed(0)}%
@@ -255,10 +254,10 @@ function renderStepContent(
                 className={cn(
                   "h-1.5 rounded-full transition-all",
                   data.generation > 0.7
-                    ? "bg-green-500"
+                    ? "af-status-bar-success"
                     : data.generation > 0.4
-                      ? "bg-yellow-500"
-                      : "bg-red-400"
+                      ? "af-status-bar-warning"
+                      : "af-status-bar-error"
                 )}
                 style={{ width: `${data.generation * 100}%` }}
               />
@@ -271,10 +270,10 @@ function renderStepContent(
                 className={cn(
                   "font-medium",
                   data.context > 0.7
-                    ? "text-green-600"
+                    ? "af-status-text-success"
                     : data.context > 0.4
-                      ? "text-yellow-600"
-                      : "text-red-600"
+                      ? "af-status-text-warning"
+                      : "af-status-text-error"
                 )}
               >
                 {(data.context * 100).toFixed(0)}%
@@ -285,10 +284,10 @@ function renderStepContent(
                 className={cn(
                   "h-1.5 rounded-full transition-all",
                   data.context > 0.7
-                    ? "bg-green-500"
+                    ? "af-status-bar-success"
                     : data.context > 0.4
-                      ? "bg-yellow-500"
-                      : "bg-red-400"
+                      ? "af-status-bar-warning"
+                      : "af-status-bar-error"
                 )}
                 style={{ width: `${data.context * 100}%` }}
               />

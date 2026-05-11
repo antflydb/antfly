@@ -1,23 +1,37 @@
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { Clock, Copy, FileText, Hash, RotateCcw, ScanLine, Upload, X, Zap } from "lucide-react";
-import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
-import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+  Switch,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@antfly/design-system";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { Clock, Copy, FileText, Hash, RotateCcw, ScanLine, Upload, X, Zap } from "lucide-react";
+import type React from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
+import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
@@ -350,16 +364,15 @@ const ReaderPlaygroundPage: React.FC = () => {
   }, [outputTab, hasFields, hasRegions]);
 
   return (
-    <div className="h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Reader Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Reader Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Extract text, structured fields, and regions from images using vision models
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <Button variant="outline" onClick={loadSampleData}>
             <FileText className="h-4 w-4 mr-2" />
             Load Sample
@@ -368,8 +381,8 @@ const ReaderPlaygroundPage: React.FC = () => {
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -385,7 +398,7 @@ const ReaderPlaygroundPage: React.FC = () => {
             <CardTitle className="text-lg">Configuration</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="reader-model">Model</Label>
                 <Select
@@ -432,26 +445,25 @@ const ReaderPlaygroundPage: React.FC = () => {
                   onChange={(e) => setMaxTokens(e.target.value)}
                 />
               </div>
-              <div className="space-y-2 flex items-end">
-                <Button
-                  onClick={handleReadImages}
-                  disabled={isLoading || images.length === 0 || !selectedReaderModel}
-                  className="w-full"
-                >
-                  {isLoading ? (
-                    <>
-                      <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                      Reading...
-                    </>
-                  ) : (
-                    <>
-                      <ScanLine className="h-4 w-4 mr-2" />
-                      Read Images
-                    </>
-                  )}
-                </Button>
-              </div>
             </div>
+            <FormActions>
+              <Button
+                onClick={handleReadImages}
+                disabled={isLoading || images.length === 0 || !selectedReaderModel}
+              >
+                {isLoading ? (
+                  <>
+                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                    Reading...
+                  </>
+                ) : (
+                  <>
+                    <ScanLine className="h-4 w-4 mr-2" />
+                    Read Images
+                  </>
+                )}
+              </Button>
+            </FormActions>
           </CardContent>
         </Card>
 
@@ -464,7 +476,7 @@ const ReaderPlaygroundPage: React.FC = () => {
 
         {/* Stats */}
         {readResult && (
-          <div className="flex flex-wrap items-center gap-3">
+          <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
             <Badge variant="secondary" className="gap-1.5">
               <Hash className="h-3 w-3" />
               {images.length} image{images.length !== 1 ? "s" : ""}
@@ -479,7 +491,7 @@ const ReaderPlaygroundPage: React.FC = () => {
                 {processingTime.toFixed(0)}ms
               </Badge>
             )}
-          </div>
+          </DashboardToolbar>
         )}
 
         {/* Side-by-side panels */}
@@ -773,11 +785,8 @@ const ReaderPlaygroundPage: React.FC = () => {
                   </Tabs>
                 </div>
               ) : (
-                <div className="h-80 flex items-center justify-center text-muted-foreground">
-                  <div className="text-center">
-                    <ScanLine className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                    <p>Upload images and click "Read Images" to extract text</p>
-                  </div>
+                <div className="h-80 flex items-center justify-center">
+                  <PlaygroundEmptyState />
                 </div>
               )}
             </CardContent>
@@ -786,13 +795,13 @@ const ReaderPlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           Extracts text, structured fields, and text regions from images using vision models (e.g.,
           Donut, Florence, TrOCR). Set a prompt to guide extraction for specific models.
         </p>
       </div>
-    </div>
+    </DashboardPage>
   );
 };
 

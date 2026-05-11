@@ -105,26 +105,53 @@
   }
 }
 
-.container {
-  width: 100%;
-  max-width: 1280px;
-  margin-left: auto;
-  margin-right: auto;
-  padding-left: 1rem;
-  padding-right: 1rem;
-}
-
-@media (min-width: 640px) {
+@layer components {
   .container {
-    padding-left: 1.5rem;
-    padding-right: 1.5rem;
+    width: 100%;
+    max-width: 1280px;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 1rem;
+    padding-right: 1rem;
   }
-}
 
-@media (min-width: 1024px) {
-  .container {
-    padding-left: 2rem;
-    padding-right: 2rem;
+  @media (min-width: 640px) {
+    .container {
+      padding-left: 1.5rem;
+      padding-right: 1.5rem;
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .container {
+      padding-left: 2rem;
+      padding-right: 2rem;
+    }
+  }
+
+  /* Mono label — the "technical voice" of the design system.
+     Pair with Aeonik headlines. Used for section eyebrows, code annotations,
+     sidebar section headers. */
+  .mono-label {
+    font-family: var(--font-mono);
+    font-size: var(--label-size);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--label-color);
+    font-weight: 500;
+  }
+
+  /* Graph paper — subtle hexagonal honeycomb tessellation.
+     Pointy-top hexagons, circumradius 32px (64px tall). Tile = one hex + bridge.
+     Tile: 55.42 x 96. Stroke color swaps between light and dark modes. */
+  .grid-paper {
+    background-color: transparent;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%239999a030' stroke-width='0.5'/%3E%3C/svg%3E");
+    background-size: 55.42px 96px;
+  }
+
+  .dark .grid-paper {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%23ffffff14' stroke-width='0.5'/%3E%3C/svg%3E");
   }
 }
 
@@ -145,33 +172,4 @@
 }
 [data-density="comfortable"] {
   --spacing: 0.3rem;
-}
-
-/* ============================================================================
-   Mono label — the "technical voice" of the design system.
-   Pair with Aeonik headlines. Used for section eyebrows, code annotations,
-   sidebar section headers.
-   ============================================================================ */
-.mono-label {
-  font-family: var(--font-mono);
-  font-size: var(--label-size);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--label-color);
-  font-weight: 500;
-}
-
-/* ============================================================================
-   Graph paper — subtle hexagonal honeycomb tessellation.
-   Pointy-top hexagons, circumradius 32px (64px tall). Tile = one hex + bridge.
-   Tile: 55.42 x 96. Stroke color swaps between light and dark modes.
-   ============================================================================ */
-.grid-paper {
-  background-color: transparent;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%239999a030' stroke-width='0.5'/%3E%3C/svg%3E");
-  background-size: 55.42px 96px;
-}
-
-.dark .grid-paper {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%23ffffff14' stroke-width='0.5'/%3E%3C/svg%3E");
 }

@@ -1,20 +1,28 @@
-import { ChevronDownIcon, ChevronRightIcon, Cross2Icon } from "@radix-ui/react-icons";
-import type React from "react";
-import { get, useFormContext } from "react-hook-form";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
 import {
+  Badge,
+  Button,
+  Checkbox,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+  Input,
+  MultiSelect,
+  MultiSelectContent,
+  MultiSelectItem,
+  MultiSelectTrigger,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
-import { TableCell, TableRow } from "@/components/ui/table";
-import MultiSelect from "../MultiSelect";
+  TableCell,
+  TableRow,
+} from "@antfly/design-system";
+import { ChevronDownIcon, ChevronRightIcon, Cross2Icon } from "@radix-ui/react-icons";
+import type React from "react";
+import { get, useFormContext } from "react-hook-form";
 import {
   ANTFLY_TYPES,
   type FieldDetectionInfo,
@@ -185,18 +193,15 @@ const SchemaFieldRow: React.FC<SchemaFieldRowProps> = ({
                 name={`${basePath}.x-antfly-index`}
                 defaultValue={true}
                 render={({ field }) => (
-                  <FormItem>
-                    <div className="flex items-center gap-2">
-                      <FormControl>
-                        <Checkbox
-                          checked={field.value}
-                          onCheckedChange={field.onChange}
-                          onClick={(e) => e.stopPropagation()}
-                        />
-                      </FormControl>
-                      <FormLabel>Index this field</FormLabel>
-                    </div>
-                    <FormMessage />
+                  <FormItem horizontal>
+                    <FormControl>
+                      <Checkbox
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    </FormControl>
+                    <FormLabel>Index this field</FormLabel>
                   </FormItem>
                 )}
               />
@@ -210,15 +215,16 @@ const SchemaFieldRow: React.FC<SchemaFieldRowProps> = ({
                     <FormItem>
                       <FormLabel>Antfly Types</FormLabel>
                       <FormControl>
-                        <MultiSelect
-                          options={ANTFLY_TYPES.map((t) => ({
-                            label: t.label,
-                            value: t.value,
-                          }))}
-                          value={field.value}
-                          onChange={field.onChange}
-                          placeholder="Select types"
-                        />
+                        <MultiSelect value={field.value} onValueChange={field.onChange}>
+                          <MultiSelectTrigger placeholder="Select types" />
+                          <MultiSelectContent searchPlaceholder="Search types…">
+                            {ANTFLY_TYPES.map((t) => (
+                              <MultiSelectItem key={t.value} value={t.value}>
+                                {t.label}
+                              </MultiSelectItem>
+                            ))}
+                          </MultiSelectContent>
+                        </MultiSelect>
                       </FormControl>
                       <FormMessage />
                     </FormItem>

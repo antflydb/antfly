@@ -1,7 +1,6 @@
+import { Badge, Card, CardContent, CardHeader, CardTitle, StatCard } from "@antfly/design-system";
+import { chartSeries } from "@antfly/design-system/charts";
 import type React from "react";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
 
 interface AggregationResultData {
   value?: number;
@@ -30,15 +29,6 @@ interface AggregationResultsProps {
   aggregations: Record<string, AggregationResultData>;
   className?: string;
 }
-
-const StatCard: React.FC<{ label: string; value: string | number }> = ({ label, value }) => (
-  <div className="flex flex-col items-center justify-center p-3 bg-muted/30 rounded-lg border">
-    <span className="text-2xl font-bold tabular-nums">
-      {typeof value === "number" ? formatNumber(value) : value}
-    </span>
-    <span className="text-xs text-muted-foreground mt-0.5">{label}</span>
-  </div>
-);
 
 function formatNumber(n: number): string {
   if (Number.isInteger(n)) return n.toLocaleString();
@@ -74,8 +64,8 @@ const BarChart: React.FC<{
             </span>
             <div className="flex-1 h-5 bg-muted rounded-sm overflow-hidden relative">
               <div
-                className={cn("h-full rounded-sm transition-all", "bg-primary/70")}
-                style={{ width: `${pct}%` }}
+                className="h-full rounded-sm transition-all"
+                style={{ width: `${pct}%`, backgroundColor: chartSeries[0] }}
               />
             </div>
             <span className="w-12 text-right tabular-nums text-muted-foreground shrink-0">
@@ -109,11 +99,19 @@ const AggregationResults: React.FC<AggregationResultsProps> = ({ aggregations, c
               <div key={name} className="space-y-2">
                 <span className="text-sm font-medium">{name}</span>
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
-                  <StatCard label="Count" value={result.count} />
-                  {result.min !== undefined && <StatCard label="Min" value={result.min} />}
-                  {result.max !== undefined && <StatCard label="Max" value={result.max} />}
-                  {result.sum !== undefined && <StatCard label="Sum" value={result.sum} />}
-                  {result.avg !== undefined && <StatCard label="Avg" value={result.avg} />}
+                  <StatCard label="Count" value={formatNumber(result.count)} />
+                  {result.min !== undefined && (
+                    <StatCard label="Min" value={formatNumber(result.min)} />
+                  )}
+                  {result.max !== undefined && (
+                    <StatCard label="Max" value={formatNumber(result.max)} />
+                  )}
+                  {result.sum !== undefined && (
+                    <StatCard label="Sum" value={formatNumber(result.sum)} />
+                  )}
+                  {result.avg !== undefined && (
+                    <StatCard label="Avg" value={formatNumber(result.avg)} />
+                  )}
                 </div>
               </div>
             );
@@ -125,7 +123,7 @@ const AggregationResults: React.FC<AggregationResultsProps> = ({ aggregations, c
               <div key={name} className="space-y-2">
                 <span className="text-sm font-medium">{name}</span>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <StatCard label={name} value={result.value} />
+                  <StatCard label={name} value={formatNumber(result.value)} />
                 </div>
               </div>
             );

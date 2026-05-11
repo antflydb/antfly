@@ -1,3 +1,29 @@
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Separator,
+  Skeleton,
+  Switch,
+  Textarea,
+} from "@antfly/design-system";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   Clock,
@@ -17,22 +43,6 @@ import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
@@ -105,83 +115,83 @@ const DEFAULT_SCHEMA: SchemaStructure[] = [
 // Standard entity type colors (for common NER labels)
 const STANDARD_LABEL_COLORS: Record<string, { bg: string; text: string; border: string }> = {
   per: {
-    bg: "bg-blue-100 dark:bg-blue-900/30",
-    text: "text-blue-700 dark:text-blue-300",
-    border: "border-blue-300 dark:border-blue-700",
+    bg: "af-chart-surface af-chart-surface-1",
+    text: "af-chart-text af-chart-text-1",
+    border: "",
   },
   person: {
-    bg: "bg-blue-100 dark:bg-blue-900/30",
-    text: "text-blue-700 dark:text-blue-300",
-    border: "border-blue-300 dark:border-blue-700",
+    bg: "af-chart-surface af-chart-surface-1",
+    text: "af-chart-text af-chart-text-1",
+    border: "",
   },
   org: {
-    bg: "bg-green-100 dark:bg-green-900/30",
-    text: "text-green-700 dark:text-green-300",
-    border: "border-green-300 dark:border-green-700",
+    bg: "af-chart-surface af-chart-surface-4",
+    text: "af-chart-text af-chart-text-4",
+    border: "",
   },
   organization: {
-    bg: "bg-green-100 dark:bg-green-900/30",
-    text: "text-green-700 dark:text-green-300",
-    border: "border-green-300 dark:border-green-700",
+    bg: "af-chart-surface af-chart-surface-4",
+    text: "af-chart-text af-chart-text-4",
+    border: "",
   },
   loc: {
-    bg: "bg-purple-100 dark:bg-purple-900/30",
-    text: "text-purple-700 dark:text-purple-300",
-    border: "border-purple-300 dark:border-purple-700",
+    bg: "af-chart-surface af-chart-surface-2",
+    text: "af-chart-text af-chart-text-2",
+    border: "",
   },
   location: {
-    bg: "bg-purple-100 dark:bg-purple-900/30",
-    text: "text-purple-700 dark:text-purple-300",
-    border: "border-purple-300 dark:border-purple-700",
+    bg: "af-chart-surface af-chart-surface-2",
+    text: "af-chart-text af-chart-text-2",
+    border: "",
   },
   misc: {
-    bg: "bg-gray-100 dark:bg-gray-800/30",
-    text: "text-gray-700 dark:text-gray-300",
-    border: "border-gray-300 dark:border-gray-600",
+    bg: "bg-muted",
+    text: "text-muted-foreground",
+    border: "border-border",
   },
 };
 
 // Dynamic colors for custom labels (when not in standard set)
 const DYNAMIC_COLORS = [
   {
-    bg: "bg-orange-100 dark:bg-orange-900/30",
-    text: "text-orange-700 dark:text-orange-300",
-    border: "border-orange-300 dark:border-orange-700",
+    bg: "af-chart-surface af-chart-surface-3",
+    text: "af-chart-text af-chart-text-3",
+    border: "",
   },
   {
-    bg: "bg-pink-100 dark:bg-pink-900/30",
-    text: "text-pink-700 dark:text-pink-300",
-    border: "border-pink-300 dark:border-pink-700",
+    bg: "af-chart-surface af-chart-surface-5",
+    text: "af-chart-text af-chart-text-5",
+    border: "",
   },
   {
-    bg: "bg-cyan-100 dark:bg-cyan-900/30",
-    text: "text-cyan-700 dark:text-cyan-300",
-    border: "border-cyan-300 dark:border-cyan-700",
+    bg: "af-chart-surface af-chart-surface-6",
+    text: "af-chart-text af-chart-text-6",
+    border: "",
   },
   {
-    bg: "bg-yellow-100 dark:bg-yellow-900/30",
-    text: "text-yellow-700 dark:text-yellow-300",
-    border: "border-yellow-300 dark:border-yellow-700",
+    bg: "af-chart-surface af-chart-surface-1",
+    text: "af-chart-text af-chart-text-1",
+    border: "",
   },
   {
-    bg: "bg-indigo-100 dark:bg-indigo-900/30",
-    text: "text-indigo-700 dark:text-indigo-300",
-    border: "border-indigo-300 dark:border-indigo-700",
+    bg: "af-chart-surface af-chart-surface-2",
+    text: "af-chart-text af-chart-text-2",
+    border: "",
   },
   {
-    bg: "bg-rose-100 dark:bg-rose-900/30",
-    text: "text-rose-700 dark:text-rose-300",
-    border: "border-rose-300 dark:border-rose-700",
+    bg: "af-chart-surface af-chart-surface-3",
+    text: "af-chart-text af-chart-text-3",
+    border: "",
   },
   {
-    bg: "bg-teal-100 dark:bg-teal-900/30",
-    text: "text-teal-700 dark:text-teal-300",
-    border: "border-teal-300 dark:border-teal-700",
+    bg: "af-chart-surface af-chart-surface-4",
+    text: "af-chart-text af-chart-text-4",
+    border: "",
   },
   {
-    bg: "bg-amber-100 dark:bg-amber-900/30",
-    text: "text-amber-700 dark:text-amber-300",
-    border: "border-amber-300 dark:border-amber-700",
+    bg: "af-chart-surface af-chart-surface-5",
+    text: "af-chart-text af-chart-text-5",
+    border: "",
   },
 ];
 
@@ -650,7 +660,7 @@ const RecognizePlaygroundPage: React.FC = () => {
 
   // Get filtered entities based on confidence threshold
   const getFilteredEntities = (): NEREntity[] => {
-    if (!recognizeResult || !recognizeResult.entities || recognizeResult.entities.length === 0) {
+    if (!recognizeResult?.entities || recognizeResult.entities.length === 0) {
       return [];
     }
     return recognizeResult.entities[0].filter((entity) => entity.score >= confidenceThreshold);
@@ -754,7 +764,7 @@ const RecognizePlaygroundPage: React.FC = () => {
 
   // Render extract results
   const renderExtractResults = () => {
-    if (!extractResult || !extractResult.results || extractResult.results.length === 0) {
+    if (!extractResult?.results || extractResult.results.length === 0) {
       return (
         <div className="h-100 flex items-center justify-center text-muted-foreground">
           <div className="text-center">
@@ -830,22 +840,22 @@ const RecognizePlaygroundPage: React.FC = () => {
   const resultModel = mode === "recognize" ? recognizeResult?.model : extractResult?.model;
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Recognize Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle>Recognize Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Extract entities and structured data from text using GLiNER models
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <SamplePresets presets={samplePresets} />
           <Button variant="outline" onClick={handleReset}>
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -854,7 +864,7 @@ const RecognizePlaygroundPage: React.FC = () => {
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
@@ -879,7 +889,7 @@ const RecognizePlaygroundPage: React.FC = () => {
             </Button>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
             <div className="space-y-2">
               <Label htmlFor="model">Model</Label>
@@ -958,31 +968,6 @@ const RecognizePlaygroundPage: React.FC = () => {
                 </div>
               </div>
             )}
-
-            {/* Run Button */}
-            <div className="space-y-2 flex items-end">
-              <Button
-                onClick={handleRecognize}
-                disabled={isLoading || !inputText.trim() || !selectedModel}
-                className="w-full"
-              >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Processing
-                  </>
-                ) : (
-                  <>
-                    {mode === "recognize" ? (
-                      <Tag className="h-4 w-4 mr-2" />
-                    ) : (
-                      <SlidersHorizontal className="h-4 w-4 mr-2" />
-                    )}
-                    {mode === "recognize" ? "Extract Entities" : "Extract Data"}
-                  </>
-                )}
-              </Button>
-            </div>
           </div>
 
           {/* Extract mode options */}
@@ -1144,19 +1129,42 @@ const RecognizePlaygroundPage: React.FC = () => {
               </p>
             </div>
           )}
+
+          <FormActions>
+            <Button
+              onClick={handleRecognize}
+              disabled={isLoading || !inputText.trim() || !selectedModel}
+            >
+              {isLoading ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Processing
+                </>
+              ) : (
+                <>
+                  {mode === "recognize" ? (
+                    <Tag className="h-4 w-4 mr-2" />
+                  ) : (
+                    <SlidersHorizontal className="h-4 w-4 mr-2" />
+                  )}
+                  {mode === "recognize" ? "Extract Entities" : "Extract Data"}
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats Bar */}
       {hasResult && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           {mode === "recognize" && (
             <>
               <Badge variant="secondary" className="gap-1.5">
@@ -1181,7 +1189,7 @@ const RecognizePlaygroundPage: React.FC = () => {
               {processingTime.toFixed(0)}ms
             </Badge>
           )}
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Main Content - Side by Side */}
@@ -1342,7 +1350,7 @@ const RecognizePlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         {mode === "recognize" ? (
           <>
             <p>
@@ -1367,7 +1375,7 @@ const RecognizePlaygroundPage: React.FC = () => {
           </>
         )}
       </div>
-    </div>
+    </DashboardPage>
   );
 };
 

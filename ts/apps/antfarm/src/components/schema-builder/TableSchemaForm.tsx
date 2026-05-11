@@ -1,27 +1,27 @@
-import type { IndexConfig } from "@antfly/sdk";
-import { zodResolver } from "@hookform/resolvers/zod";
-import type React from "react";
-import { useState } from "react";
-import { useFieldArray, useForm } from "react-hook-form";
-import { z } from "zod";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
-} from "@/components/ui/accordion";
-import { Button } from "@/components/ui/button";
-import {
+  Button,
+  DashboardToolbar,
   Form,
+  FormActions,
   FormControl,
   FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
-} from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
+  Input,
+  Switch,
+} from "@antfly/design-system";
+import type { IndexConfig } from "@antfly/sdk";
+import { zodResolver } from "@hookform/resolvers/zod";
+import type React from "react";
+import { useState } from "react";
+import { useFieldArray, useForm } from "react-hook-form";
+import { z } from "zod";
 import type { TableSchema } from "../../api";
 import JsonViewer from "../JsonViewer";
 import DocumentSchemasForm from "./DocumentSchemasForm";
@@ -178,100 +178,98 @@ const TableSchemaForm: React.FC<TableSchemaFormProps> = ({ onSubmit }) => {
   };
 
   return (
-    <Form {...form}>
-      <form onSubmit={handleSubmit(handleFormSubmit)}>
-        <div className="flex justify-between items-center mb-4">
-          <h2 className="text-2xl font-bold">Create Table with Schema</h2>
-          <div className="flex items-center gap-2">
-            <p>Raw JSON</p>
-            <Switch checked={viewMode === "json"} onCheckedChange={handleViewChange} />
-          </div>
+    <Form form={form} onSubmit={handleSubmit(handleFormSubmit)}>
+      <DashboardToolbar className="mb-4 justify-between">
+        <h2>Create Table with Schema</h2>
+        <div className="flex items-center gap-2">
+          <p>Raw JSON</p>
+          <Switch checked={viewMode === "json"} onCheckedChange={handleViewChange} />
         </div>
-        {viewMode === "json" ? (
-          <JsonViewer json={jsonPayload} />
-        ) : (
-          <>
-            <FormField
-              control={control}
-              name="name"
-              render={({ field }) => (
-                <FormItem className="mb-4">
-                  <FormLabel>Table Name</FormLabel>
-                  <FormControl>
-                    <Input {...field} required placeholder="Required: Table Name" />
-                  </FormControl>
-                  <FormDescription>Required: Name of this Table.</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
+      </DashboardToolbar>
+      {viewMode === "json" ? (
+        <JsonViewer json={jsonPayload} />
+      ) : (
+        <>
+          <FormField
+            control={control}
+            name="name"
+            render={({ field }) => (
+              <FormItem className="mb-4">
+                <FormLabel>Table Name</FormLabel>
+                <FormControl>
+                  <Input {...field} required placeholder="Required: Table Name" />
+                </FormControl>
+                <FormDescription>Required: Name of this Table.</FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <DocumentSchemasForm
+            onSubmit={handleSchemaChange}
+            theme=""
+            title="Document Schemas"
+            renderAsForm={false}
+          />
+
+          <h3 className="mt-6 mb-2 font-semibold">Semantic Indexes</h3>
+          {indexFields.map((field, index) => (
+            <IndexField
+              key={field.id}
+              index={index}
+              onRemove={() => removeIndex(index)}
+              schemaFields={schemaFields}
             />
-
-            <DocumentSchemasForm
-              onSubmit={handleSchemaChange}
-              theme=""
-              title="Document Schemas"
-              renderAsForm={false}
-            />
-
-            <h3 className="text-xl font-semibold mt-6 mb-2">Semantic Indexes</h3>
-            {indexFields.map((field, index) => (
-              <IndexField
-                key={field.id}
-                index={index}
-                onRemove={() => removeIndex(index)}
-                schemaFields={schemaFields}
-              />
-            ))}
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() =>
-                appendIndex({
-                  name: "",
-                  type: "embeddings",
-                  sourceType: "field",
-                  field: "",
-                  dimension: 0,
-                  embedder: {
-                    provider: "ollama",
-                    model: "all-minilm",
-                  },
-                })
-              }
-              className="mt-2 mb-4"
-            >
-              Add Index
-            </Button>
-
-            <Accordion type="single" collapsible className="w-full">
-              <AccordionItem value="advanced-settings" className="border-b last:border-b-0">
-                <AccordionTrigger>Advanced</AccordionTrigger>
-                <AccordionContent>
-                  <FormField
-                    control={control}
-                    name="num_shards"
-                    render={({ field }) => (
-                      <FormItem className="mt-4">
-                        <FormLabel>Number of Shards</FormLabel>
-                        <FormControl>
-                          <Input type="number" {...field} />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                </AccordionContent>
-              </AccordionItem>
-            </Accordion>
-          </>
-        )}
-
-        <div className="mt-6">
-          <Button type="submit" variant="default">
-            Create Table
+          ))}
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              appendIndex({
+                name: "",
+                type: "embeddings",
+                sourceType: "field",
+                field: "",
+                dimension: 0,
+                embedder: {
+                  provider: "ollama",
+                  model: "all-minilm",
+                },
+              })
+            }
+            className="mt-2 mb-4"
+          >
+            Add Index
           </Button>
-        </div>
-      </form>
+
+          <Accordion type="single" collapsible className="w-full">
+            <AccordionItem value="advanced-settings" className="border-b last:border-b-0">
+              <AccordionTrigger>Advanced</AccordionTrigger>
+              <AccordionContent>
+                <FormField
+                  control={control}
+                  name="num_shards"
+                  render={({ field }) => (
+                    <FormItem className="mt-4">
+                      <FormLabel>Number of Shards</FormLabel>
+                      <FormControl>
+                        <Input type="number" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        </>
+      )}
+
+      <FormActions className="justify-start mt-2">
+        <Button type="submit" variant="default">
+          Create Table
+        </Button>
+      </FormActions>
     </Form>
   );
 };

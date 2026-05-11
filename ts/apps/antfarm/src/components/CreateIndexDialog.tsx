@@ -1,16 +1,25 @@
+import {
+  Alert,
+  AlertDescription,
+  Button,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  DialogTrigger,
+  Form,
+  FormActions,
+  Switch,
+} from "@antfly/design-system";
 import type { EmbedderConfig, GeneratorConfig, IndexConfig } from "@antfly/sdk";
 import { zodResolver } from "@hookform/resolvers/zod";
 import type React from "react";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import { Form } from "@/components/ui/form";
 import { api, type TableSchema } from "../api";
 import IndexForm from "./IndexForm";
 import JsonViewer from "./JsonViewer";
-import { Button } from "./ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogTitle, DialogTrigger } from "./ui/dialog";
-import { Switch } from "./ui/switch";
 
 interface CreateIndexDialogProps {
   open: boolean;
@@ -218,26 +227,26 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
         </div>
         <DialogDescription>Create a new vector index for your table.</DialogDescription>
 
-        {error && <p className="text-red-500">{error}</p>}
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
 
-        <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)}>
-            {viewMode === "json" ? (
-              <JsonViewer json={jsonPayload} />
-            ) : (
-              <div className="flex flex-col gap-3">
-                <IndexForm schemaFields={schemaFields} />
-              </div>
-            )}
-            <div className="flex gap-3 mt-4 justify-end">
-              <DialogTrigger asChild>
-                <Button variant="ghost" type="button">
-                  Cancel
-                </Button>
-              </DialogTrigger>
-              <Button type="submit">Create</Button>
-            </div>
-          </form>
+        <Form form={form} onSubmit={form.handleSubmit(onSubmit)}>
+          {viewMode === "json" ? (
+            <JsonViewer json={jsonPayload} />
+          ) : (
+            <IndexForm schemaFields={schemaFields} />
+          )}
+          <FormActions>
+            <DialogTrigger asChild>
+              <Button variant="ghost" type="button">
+                Cancel
+              </Button>
+            </DialogTrigger>
+            <Button type="submit">Create</Button>
+          </FormActions>
         </Form>
       </DialogContent>
     </Dialog>

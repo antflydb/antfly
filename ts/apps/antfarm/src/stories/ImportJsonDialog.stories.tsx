@@ -1,7 +1,7 @@
+import { Button } from "@antfly/design-system";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
 import { fn } from "storybook/test";
-import { Button } from "@/components/ui/button";
 import { ImportJsonDialog } from "../components/schema-builder/ImportJsonDialog";
 
 const meta = {

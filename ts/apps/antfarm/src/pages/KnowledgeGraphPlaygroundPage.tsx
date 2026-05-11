@@ -1,27 +1,41 @@
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { Clock, GitBranch, Hash, Network, Plus, RotateCcw, X, Zap } from "lucide-react";
-import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
-import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
-import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
-import type { SamplePreset } from "@/components/playground/SamplePresets";
-import { SamplePresets } from "@/components/playground/SamplePresets";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Checkbox,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Textarea,
+} from "@antfly/design-system";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { Clock, GitBranch, Hash, Network, Plus, RotateCcw, X, Zap } from "lucide-react";
+import type React from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
+import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
+import type { SamplePreset } from "@/components/playground/SamplePresets";
+import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
@@ -633,22 +647,24 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   }, [result, selectedNode, selectedEdge]);
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Knowledge Graph Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">
+            Knowledge Graph Playground
+          </DashboardPageTitle>
+          <DashboardPageDescription>
             Build knowledge graphs from text using REBEL or GLiNER models
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <SamplePresets presets={samplePresets} />
           <Button variant="outline" onClick={handleReset}>
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -661,13 +677,13 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           {/* Model and Build Button */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label htmlFor="model">Model</Label>
               <Select
@@ -717,26 +733,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   })
                 }
               />
-            </div>
-
-            <div className="space-y-2 flex items-end">
-              <Button
-                onClick={handleBuildGraph}
-                disabled={isLoading || !inputText.trim() || !selectedModel}
-                className="w-full"
-              >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Building
-                  </>
-                ) : (
-                  <>
-                    <Network className="h-4 w-4 mr-2" />
-                    Build Graph
-                  </>
-                )}
-              </Button>
             </div>
           </div>
 
@@ -868,19 +864,38 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
               Track provenance
             </label>
           </div>
+
+          <FormActions>
+            <Button
+              onClick={handleBuildGraph}
+              disabled={isLoading || !inputText.trim() || !selectedModel}
+            >
+              {isLoading ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Building
+                </>
+              ) : (
+                <>
+                  <Network className="h-4 w-4 mr-2" />
+                  Build Graph
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats Bar */}
       {result && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
             {result.nodes.length} nodes
@@ -899,7 +914,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
               {processingTime.toFixed(0)}ms
             </Badge>
           )}
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Main Content */}
@@ -1044,11 +1059,8 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 </TabsContent>
               </Tabs>
             ) : (
-              <div className="h-80 flex items-center justify-center text-muted-foreground">
-                <div className="text-center">
-                  <Network className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                  <p>Enter text and click "Build Graph" to see results</p>
-                </div>
+              <div className="h-80 flex items-center justify-center">
+                <PlaygroundEmptyState />
               </div>
             )}
           </CardContent>
@@ -1056,7 +1068,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           <strong>Knowledge Graphs:</strong> Extracts entities and relationships from text, then
           resolves co-references (e.g., "Elon Musk" and "Musk" → single entity) using similarity
@@ -1071,7 +1083,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           Requires specifying entity and relation types to extract.
         </p>
       </div>
-    </div>
+    </DashboardPage>
   );
 };
 

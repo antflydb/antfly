@@ -1,3 +1,24 @@
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Form,
+  FormActions,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+  Input,
+  Textarea,
+} from "@antfly/design-system";
 import type { BatchRequest } from "@antfly/sdk";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { CircleAlert, CircleCheck } from "lucide-react";
@@ -5,22 +26,7 @@ import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
-import { Spinner } from "@/components/ui/shadcn-io/spinner";
-import { Textarea } from "@/components/ui/textarea";
+import { Spinner } from "@/components/spinner";
 
 import { api, type TableSchema } from "../api";
 
@@ -216,96 +222,92 @@ const BulkInsert: React.FC<BulkInsertProps> = ({ tableName }) => {
           <CardTitle>Insert from File</CardTitle>
         </CardHeader>
         <CardContent>
-          <Form {...form}>
-            <form className="flex flex-col gap-4" onSubmit={form.handleSubmit(onSubmit)}>
-              <p className="text-gray-500 mb-4">
-                Upload a newline-delimited JSON file. Each line should be a valid JSON object. The
-                ID field supports Handlebars-style templates like{" "}
-                <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                  {"{{category}}-{{slug}}"}
-                </code>{" "}
-                to compose IDs from multiple fields.
-              </p>
+          <Form form={form} onSubmit={form.handleSubmit(onSubmit)}>
+            <p className="text-muted-foreground">
+              Upload a newline-delimited JSON file. Each line should be a valid JSON object. The ID
+              field supports Handlebars-style templates like{" "}
+              <code className="text-xs bg-muted px-1 py-0.5 rounded">
+                {"{{category}}-{{slug}}"}
+              </code>{" "}
+              to compose IDs from multiple fields.
+            </p>
 
-              <FormField
-                control={form.control}
-                name="jsonFile"
-                render={() => (
-                  <FormItem>
-                    <FormLabel>JSON File</FormLabel>
-                    <FormControl>
-                      <input
-                        type="file"
-                        accept=".json,.jsonl"
-                        onChange={handleFileChange}
-                        ref={fileInputRef}
-                        className="block w-full max-w-full text-sm text-gray-500 truncate file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-violet-50 file:text-violet-700 hover:file:bg-violet-100"
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-
-              {fileContent && (
-                <Textarea
-                  value={fileContent}
-                  readOnly
-                  placeholder="File content will appear here"
-                  rows={8}
-                  className="w-full max-h-64 overflow-auto break-all whitespace-pre-wrap"
-                />
+            <FormField
+              control={form.control}
+              name="jsonFile"
+              render={() => (
+                <FormItem>
+                  <FormLabel>JSON File</FormLabel>
+                  <FormControl>
+                    <input
+                      type="file"
+                      accept=".json,.jsonl"
+                      onChange={handleFileChange}
+                      ref={fileInputRef}
+                      className="block w-full max-w-full truncate text-sm text-muted-foreground file:mr-4 file:rounded-full file:border-0 file:bg-accent file:px-4 file:py-2 file:text-sm file:font-semibold file:text-accent-foreground hover:file:bg-accent/80"
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
               )}
+            />
 
-              <FormField
-                control={form.control}
-                name="idField"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>ID Field</FormLabel>
-                    <FormControl>
-                      <Input
-                        {...field}
-                        ref={(el) => {
-                          field.ref(el);
-                          (
-                            idFieldInputRef as React.MutableRefObject<HTMLInputElement | null>
-                          ).current = el;
-                        }}
-                        placeholder="e.g. id or {{category}}-{{slug}}"
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      A field name (e.g. <code className="text-xs">id</code>) or a template (e.g.{" "}
-                      <code className="text-xs">{"{{category}}-{{slug}}"}</code>).
-                    </FormDescription>
-                    {idFieldSuggestions.length > 0 && (
-                      <div className="flex flex-wrap gap-1 pt-1">
-                        {idFieldSuggestions.map((name) => (
-                          <Badge
-                            key={name}
-                            variant="secondary"
-                            className="cursor-pointer hover:bg-secondary/80"
-                            onClick={() => insertFieldAtCursor(name)}
-                          >
-                            {name}
-                          </Badge>
-                        ))}
-                      </div>
-                    )}
-                    <FormMessage />
-                  </FormItem>
-                )}
+            {fileContent && (
+              <Textarea
+                value={fileContent}
+                readOnly
+                placeholder="File content will appear here"
+                rows={8}
+                className="w-full max-h-64 overflow-auto break-all whitespace-pre-wrap"
               />
+            )}
 
-              <Button
-                type="submit"
-                disabled={!jsonFile || !idField || loading}
-                className="self-start"
-              >
+            <FormField
+              control={form.control}
+              name="idField"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>ID Field</FormLabel>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      ref={(el) => {
+                        field.ref(el);
+                        (
+                          idFieldInputRef as React.MutableRefObject<HTMLInputElement | null>
+                        ).current = el;
+                      }}
+                      placeholder="e.g. id or {{category}}-{{slug}}"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    A field name (e.g. <code className="text-xs">id</code>) or a template (e.g.{" "}
+                    <code className="text-xs">{"{{category}}-{{slug}}"}</code>).
+                  </FormDescription>
+                  {idFieldSuggestions.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {idFieldSuggestions.map((name) => (
+                        <Badge
+                          key={name}
+                          variant="secondary"
+                          className="cursor-pointer hover:bg-secondary/80"
+                          onClick={() => insertFieldAtCursor(name)}
+                        >
+                          {name}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormActions className="justify-start">
+              <Button type="submit" disabled={!jsonFile || !idField || loading}>
                 {loading ? <Spinner /> : "Upload File"}
               </Button>
-            </form>
+            </FormActions>
           </Form>
         </CardContent>
       </Card>
