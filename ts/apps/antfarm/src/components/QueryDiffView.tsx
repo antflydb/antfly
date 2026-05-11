@@ -42,7 +42,7 @@ export const QueryDiffView: React.FC<QueryDiffViewProps> = ({
       </div>
       <div className="space-y-1.5">
         <span className="text-xs font-medium text-muted-foreground">Proposed Query</span>
-        <div className="rounded-md border border-green-500/30 overflow-hidden">
+        <div className="af-status-border-success rounded-md border overflow-hidden">
           <SyntaxHighlighter
             language="json"
             style={style}

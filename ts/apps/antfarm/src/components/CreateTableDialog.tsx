@@ -1,6 +1,6 @@
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@antfly/design-system";
 import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import type { TableSchema } from "../api";
 import { api } from "../api";
 import TableSchemaForm from "./schema-builder/TableSchemaForm";

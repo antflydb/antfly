@@ -47,7 +47,18 @@ export default function ChatInput({
       <div className="react-af-chat-input">
         <SafeRender
           render={renderInput}
-          args={[{ value, onChange: setValue, onSubmit: handleSubmit, isStreaming, placeholder, abort }] as const}
+          args={
+            [
+              {
+                value,
+                onChange: setValue,
+                onSubmit: handleSubmit,
+                isStreaming,
+                placeholder,
+                abort,
+              },
+            ] as const
+          }
         />
       </div>
     );

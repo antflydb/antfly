@@ -1,17 +1,26 @@
 import { Antfly, Autosuggest, Facet, QueryBox, Results } from "@antfly/components";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardToolbar,
+  Input,
+  Label,
+  Switch,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@antfly/design-system";
 import type { IndexStatus, QueryHit } from "@antfly/sdk";
 import { CopyIcon, PlusIcon, TrashIcon } from "@radix-ui/react-icons";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useTheme } from "@/components/theme-provider";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { TableSchema } from "../api";
 import {
   type BasicField,
@@ -313,7 +322,7 @@ export default function SearchBoxBuilder({
                   {/* Thumbnail */}
                   {useThumbnails && thumbnailField && (
                     <div
-                      className={`shrink-0 ${getThumbnailSizeClass()} bg-gray-100 rounded overflow-hidden flex items-center justify-center`}
+                      className={`shrink-0 ${getThumbnailSizeClass()} bg-muted rounded overflow-hidden flex items-center justify-center`}
                     >
                       {thumbnailUrl ? (
                         <img
@@ -327,14 +336,16 @@ export default function SearchBoxBuilder({
                             if (parent && !parent.querySelector(".placeholder-text")) {
                               const placeholder = document.createElement("div");
                               placeholder.className =
-                                "placeholder-text text-gray-400 text-xs text-center p-2";
+                                "placeholder-text text-muted-foreground text-xs text-center p-2";
                               placeholder.textContent = "No image";
                               parent.appendChild(placeholder);
                             }
                           }}
                         />
                       ) : (
-                        <div className="text-gray-400 text-xs text-center p-2">No image</div>
+                        <div className="text-xs text-center text-muted-foreground p-2">
+                          No image
+                        </div>
                       )}
                     </div>
                   )}
@@ -455,7 +466,7 @@ export default function SearchBoxBuilder({
                       useThumbnails && thumbnailField
                         ? `
                       {/* Thumbnail */}
-                      <div className="shrink-0 ${thumbnailSizeClass} bg-gray-100 rounded overflow-hidden flex items-center justify-center">
+                      <div className="shrink-0 ${thumbnailSizeClass} bg-muted rounded overflow-hidden flex items-center justify-center">
                         {thumbnailUrl ? (
                           <img
                             src={String(thumbnailUrl)}
@@ -467,14 +478,14 @@ export default function SearchBoxBuilder({
                               const parent = target.parentElement;
                               if (parent && !parent.querySelector('.placeholder-text')) {
                                 const placeholder = document.createElement('div');
-                                placeholder.className = 'placeholder-text text-gray-400 text-xs text-center p-2';
+                                placeholder.className = 'placeholder-text text-muted-foreground text-xs text-center p-2';
                                 placeholder.textContent = 'No image';
                                 parent.appendChild(placeholder);
                               }
                             }}
                           />
                         ) : (
-                          <div className="text-gray-400 text-xs text-center p-2">No image</div>
+                          <div className="text-muted-foreground text-xs text-center p-2">No image</div>
                         )}
                       </div>`
                         : ""
@@ -561,9 +572,9 @@ ${facetsCode}${resultsCode}
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">SearchBox Builder</h2>
-      </div>
+      <DashboardToolbar className="justify-between">
+        <h2>SearchBox Builder</h2>
+      </DashboardToolbar>
 
       <Tabs defaultValue="config">
         <TabsList>
@@ -684,7 +695,7 @@ ${facetsCode}${resultsCode}
               {/* Search Mode Toggle */}
               <div>
                 <div className="flex items-center space-x-2 mb-3">
-                  <h3 className="text-lg font-semibold">Search Mode</h3>
+                  <h3 className="font-semibold">Search Mode</h3>
                   <Switch
                     id="search-mode"
                     checked={useSemanticSearch}
@@ -702,7 +713,7 @@ ${facetsCode}${resultsCode}
               {/* Search Fields Configuration */}
               {!useSemanticSearch && (
                 <div>
-                  <h3 className="text-lg font-semibold mb-3">Search Fields</h3>
+                  <h3 className="mb-3 font-semibold">Search Fields</h3>
                   <div className="space-y-4">
                     <div>
                       <Label>Selected Fields</Label>
@@ -779,7 +790,7 @@ ${facetsCode}${resultsCode}
               {/* Semantic Indexes Configuration */}
               {useSemanticSearch && (
                 <div>
-                  <h3 className="text-lg font-semibold mb-3">Semantic Indexes</h3>
+                  <h3 className="mb-3 font-semibold">Semantic Indexes</h3>
                   <div className="space-y-4">
                     <div>
                       <Label>Vector Indexes</Label>
@@ -866,7 +877,7 @@ ${facetsCode}${resultsCode}
                       {/* Autosuggest Mode Toggle */}
                       <div>
                         <div className="flex items-center space-x-2 mb-3">
-                          <h3 className="text-lg font-semibold">Autosuggest Mode</h3>
+                          <h3 className="font-semibold">Autosuggest Mode</h3>
                           <Switch
                             id="autosuggest-mode"
                             checked={useSemanticAutosuggest}

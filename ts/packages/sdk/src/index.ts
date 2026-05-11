@@ -59,6 +59,14 @@ export {
 } from "./query-helpers.js";
 // Type exports
 export type {
+  // Chat Agent types
+  AgentDecision,
+  AgentQuestion,
+  AgentQuestionKind,
+  AgentStatus,
+  AgentStep,
+  AgentStepKind,
+  AgentStepStatus,
   AggregationBucket,
   AggregationDateRange,
   AggregationRange,
@@ -77,14 +85,6 @@ export type {
   BackupRequest,
   BatchRequest, // Now using our custom type
   CalendarInterval,
-  // Chat Agent types
-  AgentDecision,
-  AgentQuestion,
-  AgentQuestionKind,
-  AgentStatus,
-  AgentStep,
-  AgentStepKind,
-  AgentStepStatus,
   ChatAgentConfig,
   ChatAgentTurnResult,
   ChatMessage,
@@ -172,11 +172,11 @@ export type {
   RetrievalAgentSteps,
   RetrievalAgentStreamCallbacks,
   RouteType,
-  SSEStepStarted,
   SemanticQueryMode,
   ShardsProfile,
   SignificanceAlgorithm,
   SparseEmbedding,
+  SSEStepStarted,
   // Table types
   Table,
   TableMigration,

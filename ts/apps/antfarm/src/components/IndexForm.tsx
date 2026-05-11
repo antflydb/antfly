@@ -1,24 +1,27 @@
-import type { EmbedderProvider } from "@antfly/sdk";
-import { embedderProviders } from "@antfly/sdk";
-import type React from "react";
-import { useEffect, useMemo, useState } from "react";
-import { useFormContext } from "react-hook-form";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
-} from "@/components/ui/accordion";
-import { FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import {
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+  Input,
+  RadioGroup,
+  RadioGroupItem,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@antfly/design-system";
+import type { EmbedderProvider } from "@antfly/sdk";
+import { embedderProviders } from "@antfly/sdk";
+import type React from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useFormContext } from "react-hook-form";
 import { useApiConfig } from "@/hooks/use-api-config";
 import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";

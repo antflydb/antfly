@@ -1,3 +1,12 @@
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  StatusCard,
+  StatusScreen,
+} from "@antfly/design-system";
 import type { ReactNode } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "../hooks/use-auth";
@@ -17,11 +26,15 @@ export function PrivateRoute({ children, requiredPermission }: PrivateRouteProps
 
   if (isLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="text-center">
-          <p className="text-muted-foreground">Loading...</p>
-        </div>
-      </div>
+      <StatusScreen>
+        <StatusCard>
+          <Card>
+            <CardContent className="py-6 text-center text-sm text-muted-foreground">
+              Loading...
+            </CardContent>
+          </Card>
+        </StatusCard>
+      </StatusScreen>
     );
   }
 
@@ -43,12 +56,16 @@ export function PrivateRoute({ children, requiredPermission }: PrivateRouteProps
     )
   ) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="text-center">
-          <h2 className="text-2xl font-bold mb-2">Access Denied</h2>
-          <p className="text-muted-foreground">You don't have permission to access this page.</p>
-        </div>
-      </div>
+      <StatusScreen>
+        <StatusCard>
+          <Card>
+            <CardHeader className="text-center">
+              <CardTitle>Access Denied</CardTitle>
+              <CardDescription>You don't have permission to access this page.</CardDescription>
+            </CardHeader>
+          </Card>
+        </StatusCard>
+      </StatusScreen>
     );
   }
 

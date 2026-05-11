@@ -1,29 +1,29 @@
-import type { Table as AntflyTable, TableStatus } from "@antfly/sdk";
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { Trash2, X } from "lucide-react";
-import type React from "react";
-import { useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import {
+  Alert,
+  AlertDescription,
+  Badge,
+  Button,
+  type ColumnDef,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DataTable,
   Dialog,
   DialogContent,
   DialogDescription,
   DialogTitle,
   DialogTrigger,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  GraphPaperBg,
+} from "@antfly/design-system";
+import type { Table as AntflyTable, TableStatus } from "@antfly/sdk";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { Trash2 } from "lucide-react";
+import type React from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { NoTablesState } from "@/components/branded-empty-state";
 import { api } from "../api";
 
 const formatBytes = (bytes: number, decimals = 2) => {
@@ -35,58 +35,49 @@ const formatBytes = (bytes: number, decimals = 2) => {
   return `${parseFloat((bytes / k ** i).toFixed(dm))} ${sizes[i]}`;
 };
 
+const normalizeTablesResponse = (response: unknown): TableStatus[] => {
+  if (Array.isArray(response)) return response as TableStatus[];
+  if (
+    response &&
+    typeof response === "object" &&
+    "tables" in response &&
+    Array.isArray((response as { tables?: unknown }).tables)
+  ) {
+    return (response as { tables: TableStatus[] }).tables;
+  }
+  return [];
+};
+
 const TablesListPage: React.FC = () => {
+  const navigate = useNavigate();
   const [tables, setTables] = useState<TableStatus[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [openDropDialog, setOpenDropDialog] = useState(false);
   const [selectedTable, setSelectedTable] = useState<AntflyTable | null>(null);
   const [isDropping, setIsDropping] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [filterMode, setFilterMode] = useState<"prefix" | "regex">("prefix");
-  const [filterValue, setFilterValue] = useState("");
 
   const fetchTables = useCallback(async () => {
     setIsLoading(true);
     try {
-      const params: { prefix?: string; pattern?: string } = {};
-      if (filterValue) {
-        if (filterMode === "prefix") {
-          params.prefix = filterValue;
-        } else {
-          params.pattern = filterValue;
-        }
-      }
-      const response = await api.tables.list(params);
-      setTables(response as TableStatus[]);
+      const response = await api.tables.list();
+      setTables(normalizeTablesResponse(response));
     } catch (e) {
       setError("Failed to fetch tables. Make sure the Antfly server is running.");
       console.error(e);
     } finally {
       setIsLoading(false);
     }
-  }, [filterValue, filterMode]);
-
-  useEffect(() => {
-    // Only fetch on initial load, not when filter changes
-    const initialFetch = async () => {
-      setIsLoading(true);
-      try {
-        const response = await api.tables.list();
-        setTables(response as TableStatus[]);
-      } catch (e) {
-        setError("Failed to fetch tables. Make sure the Antfly server is running.");
-        console.error(e);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    initialFetch();
   }, []);
 
-  const handleOpenDropDialog = (table: AntflyTable) => {
+  useEffect(() => {
+    fetchTables();
+  }, [fetchTables]);
+
+  const handleOpenDropDialog = useCallback((table: AntflyTable) => {
     setSelectedTable(table);
     setOpenDropDialog(true);
-  };
+  }, []);
 
   const handleCloseDropDialog = () => {
     setSelectedTable(null);
@@ -110,153 +101,120 @@ const TablesListPage: React.FC = () => {
     }
   };
 
-  const handleClearFilter = () => {
-    setFilterValue("");
-    setFilterMode("prefix");
-  };
-
-  const handleApplyFilter = () => {
-    fetchTables();
-  };
-
-  return (
-    <div>
-      <div className="flex items-center gap-2 mb-4">
-        <h2 className="text-2xl font-bold">Tables</h2>
-        <Button size="icon" onClick={fetchTables} disabled={isLoading}>
-          <ReloadIcon />
-        </Button>
-      </div>
-      {error && <p className="text-red-500">{error}</p>}
-
-      <div className="mb-4 p-4 border rounded-lg bg-muted/50">
-        <div className="space-y-4">
-          <div>
-            <Label className="text-sm font-medium mb-2 block">Filter Mode</Label>
-            <RadioGroup
-              value={filterMode}
-              onValueChange={(value) => setFilterMode(value as "prefix" | "regex")}
-              className="flex gap-4"
-            >
-              <div className="flex items-center space-x-2">
-                <RadioGroupItem value="prefix" id="prefix" />
-                <Label htmlFor="prefix" className="cursor-pointer">
-                  Prefix
-                </Label>
-              </div>
-              <div className="flex items-center space-x-2">
-                <RadioGroupItem value="regex" id="regex" />
-                <Label htmlFor="regex" className="cursor-pointer">
-                  Regex
-                </Label>
-              </div>
-            </RadioGroup>
-          </div>
-          <div className="flex gap-2">
-            <div className="flex-1">
-              <Label htmlFor="filter" className="text-sm font-medium mb-2 block">
-                {filterMode === "prefix" ? "Filter by Prefix" : "Filter by Regex Pattern"}
-              </Label>
-              <Input
-                id="filter"
-                placeholder={
-                  filterMode === "prefix" ? 'e.g., "prod_"' : 'e.g., "^prod_.*_v[0-9]+$"'
-                }
-                value={filterValue}
-                onChange={(e) => setFilterValue(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    handleApplyFilter();
-                  }
-                }}
-              />
-            </div>
-            <div className="flex items-end gap-2">
-              <Button onClick={handleApplyFilter} disabled={isLoading}>
-                Apply
-              </Button>
-              {filterValue && (
-                <Button
-                  variant="outline"
-                  size="icon"
-                  onClick={handleClearFilter}
-                  disabled={isLoading}
-                  title="Clear filter"
-                >
-                  <X className="h-4 w-4" />
-                </Button>
+  const tableColumns = useMemo<ColumnDef<TableStatus>[]>(
+    () => [
+      {
+        accessorKey: "name",
+        header: "Name",
+        cell: ({ row }) => (
+          <Link to={`/tables/${row.original.name}`} className="font-medium hover:underline">
+            {row.original.name}
+          </Link>
+        ),
+      },
+      {
+        accessorKey: "description",
+        header: "Description",
+        cell: ({ row }) =>
+          row.original.description ? (
+            <span className="text-muted-foreground">{row.original.description}</span>
+          ) : (
+            <span className="text-muted-foreground/50 italic">No description</span>
+          ),
+      },
+      {
+        id: "shards",
+        header: "Shards",
+        cell: ({ row }) => Object.keys(row.original.shards).length,
+      },
+      {
+        id: "indexes",
+        header: "Indexes",
+        cell: ({ row }) => Object.keys(row.original.indexes).length,
+      },
+      {
+        id: "status",
+        header: "Status",
+        cell: ({ row }) => {
+          const table = row.original;
+          return (
+            <div className="flex items-center gap-2">
+              {table.migration && (
+                <Badge variant="outline" className="af-status-badge-warning">
+                  Rebuilding v{table.migration.read_schema.version} → v
+                  {table.schema?.version ?? "?"}
+                </Badge>
+              )}
+              {table.storage_status ? (
+                <>
+                  {table.storage_status.empty && <span>Empty</span>}
+                  {table.storage_status.disk_usage !== undefined && (
+                    <span>{formatBytes(table.storage_status.disk_usage)}</span>
+                  )}
+                </>
+              ) : (
+                "N/A"
               )}
             </div>
+          );
+        },
+      },
+      {
+        id: "actions",
+        header: "",
+        cell: ({ row }) => (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => handleOpenDropDialog(row.original)}
+            className="text-muted-foreground hover:text-destructive"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        ),
+      },
+    ],
+    [handleOpenDropDialog]
+  );
+
+  return (
+    <DashboardPage>
+      <div className="relative isolate">
+        <GraphPaperBg className="absolute inset-0 -z-10 rounded-xl" />
+        <DashboardPageHeader>
+          <div>
+            <DashboardPageTitle className="font-aeonik">Tables</DashboardPageTitle>
+            <DashboardPageDescription>
+              Browse tables, inspect index coverage, and manage table lifecycle.
+            </DashboardPageDescription>
           </div>
-        </div>
+          <DashboardPageActions>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="icon" onClick={fetchTables} disabled={isLoading}>
+                <ReloadIcon />
+              </Button>
+            </div>
+          </DashboardPageActions>
+        </DashboardPageHeader>
       </div>
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Description</TableHead>
-            <TableHead>Shards</TableHead>
-            <TableHead>Indexes</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Actions</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {tables.map((table) => (
-            <TableRow key={table.name}>
-              <TableCell>
-                <Link
-                  to={`/tables/${table.name}`}
-                  className="hover:underline text-blue-600 dark:text-blue-400"
-                >
-                  {table.name}
-                </Link>
-              </TableCell>
-              <TableCell>
-                {table.description ? (
-                  <span className="text-muted-foreground">{table.description}</span>
-                ) : (
-                  <span className="text-muted-foreground italic">No description</span>
-                )}
-              </TableCell>
-              <TableCell>{Object.keys(table.shards).length}</TableCell>
-              <TableCell>{Object.keys(table.indexes).length}</TableCell>
-              <TableCell>
-                <div className="flex items-center gap-2">
-                  {table.migration && (
-                    <Badge
-                      variant="outline"
-                      className="text-amber-600 border-amber-400 bg-amber-50 dark:text-amber-400 dark:border-amber-600 dark:bg-amber-950"
-                    >
-                      Rebuilding v{table.migration.read_schema.version} → v
-                      {table.schema?.version ?? "?"}
-                    </Badge>
-                  )}
-                  {table.storage_status ? (
-                    <>
-                      {table.storage_status.empty && <span>Empty</span>}
-                      {table.storage_status.disk_usage !== undefined && (
-                        <span>{formatBytes(table.storage_status.disk_usage)}</span>
-                      )}
-                    </>
-                  ) : (
-                    "N/A"
-                  )}
-                </div>
-              </TableCell>
-              <TableCell>
-                <Button
-                  variant="destructive"
-                  size="icon"
-                  onClick={() => handleOpenDropDialog(table)}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </Button>
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      {!isLoading && tables.length === 0 ? (
+        <NoTablesState onCreate={() => navigate("/create")} />
+      ) : (
+        <DataTable
+          columns={tableColumns}
+          data={tables}
+          filterColumn="name"
+          filterPlaceholder="Filter tables by name…"
+          emptyMessage="No tables found."
+          pageSize={20}
+        />
+      )}
       <Dialog open={openDropDialog} onOpenChange={setOpenDropDialog}>
         <DialogContent className="max-w-[450px]">
           <DialogTitle>Drop Table</DialogTitle>
@@ -278,7 +236,7 @@ const TablesListPage: React.FC = () => {
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </DashboardPage>
   );
 };
 

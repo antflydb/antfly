@@ -1,11 +1,10 @@
+import { Button, Popover, PopoverContent, PopoverTrigger } from "@antfly/design-system";
 import { Sparkles } from "lucide-react";
 import {
   formatGeneratorSummary,
   GENERATOR_DEFAULT_CONFIG,
   GeneratorSelector,
 } from "@/components/playground/GeneratorSelector";
-import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 
 export function DashboardGeneratorControl() {

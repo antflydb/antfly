@@ -1,29 +1,30 @@
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
-  ArrowDownUp,
-  Clock,
-  Database,
-  Hash,
-  Maximize2,
-  Minimize2,
-  RotateCcw,
-  Search,
-  Zap,
-} from "lucide-react";
-import type React from "react";
-import { useRef, useState } from "react";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@antfly/design-system";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { Clock, Database, Hash, Maximize2, Minimize2, RotateCcw, Search, Zap } from "lucide-react";
+import type React from "react";
+import { useRef, useState } from "react";
+import { NoResultsState, PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTable } from "@/hooks/use-table";
 
@@ -164,41 +165,41 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
   const maxScore = results && results.length > 0 ? Math.max(...results.map((r) => r.score)) : 1;
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Embedding Explorer</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Embedding Explorer</DashboardPageTitle>
+          <DashboardPageDescription>
             Search your table with vector similarity and understand how documents rank
-          </p>
+          </DashboardPageDescription>
         </div>
-        <Button variant="outline" onClick={handleReset}>
-          <RotateCcw className="h-4 w-4 mr-2" />
-          Reset
-        </Button>
-      </div>
+        <DashboardPageActions>
+          <Button variant="outline" onClick={handleReset}>
+            <RotateCcw className="h-4 w-4 mr-2" />
+            Reset
+          </Button>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       {!selectedTable && (
-        <div className="mb-6 p-4 bg-muted/50 border border-dashed rounded-lg text-muted-foreground text-sm text-center">
+        <DashboardToolbar className="items-center justify-center border-dashed text-center text-sm text-muted-foreground md:items-center">
           <Database className="h-8 w-8 mx-auto mb-2 opacity-30" />
           Select a table from the sidebar to start exploring embeddings
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-            {/* Table (read-only, from context) */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div className="space-y-2">
               <Label>Table</Label>
               <Input value={selectedTable || "No table selected"} disabled />
             </div>
 
-            {/* Embedding Index Selection */}
             <div className="space-y-2">
               <Label htmlFor="index">Embedding Index</Label>
               <Select
@@ -223,7 +224,6 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
               </Select>
             </div>
 
-            {/* Limit */}
             <div className="space-y-2">
               <Label htmlFor="limit">Result Limit</Label>
               <Input
@@ -235,30 +235,8 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
                 onChange={(e) => setLimit(parseInt(e.target.value, 10) || 10)}
               />
             </div>
-
-            {/* Search Button */}
-            <div className="space-y-2 flex items-end">
-              <Button
-                onClick={handleSearch}
-                disabled={isLoading || !query.trim() || !selectedTable || !selectedIndex}
-                className="w-full"
-              >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Searching
-                  </>
-                ) : (
-                  <>
-                    <Search className="h-4 w-4 mr-2" />
-                    Search &amp; Analyze
-                  </>
-                )}
-              </Button>
-            </div>
           </div>
 
-          {/* Query Input (full width) */}
           <div className="space-y-2">
             <Label htmlFor="query">Semantic Query</Label>
             <Input
@@ -274,19 +252,38 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
               }}
             />
           </div>
+
+          <FormActions>
+            <Button
+              onClick={handleSearch}
+              disabled={isLoading || !query.trim() || !selectedTable || !selectedIndex}
+            >
+              {isLoading ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Searching
+                </>
+              ) : (
+                <>
+                  <Search className="h-4 w-4 mr-2" />
+                  Search &amp; Analyze
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats Bar */}
       {results && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
             {results.length} hits
@@ -310,17 +307,14 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
             {showRawScores ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
             {showRawScores ? "Hide" : "Show"} raw scores
           </Button>
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Results */}
       {results ? (
         <div className="space-y-3">
           {results.length === 0 ? (
-            <div className="p-8 text-center text-muted-foreground">
-              <Search className="h-12 w-12 mx-auto mb-3 opacity-20" />
-              <p>No results found for this query</p>
-            </div>
+            <NoResultsState />
           ) : (
             results.map((hit, rank) => (
               <Card key={hit.id} className="overflow-hidden">
@@ -351,18 +345,12 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
           )}
         </div>
       ) : (
-        !error &&
-        selectedTable && (
-          <div className="p-12 text-center text-muted-foreground">
-            <ArrowDownUp className="h-12 w-12 mx-auto mb-3 opacity-20" />
-            <p>Enter a query and click "Search &amp; Analyze" to explore vector similarity</p>
-          </div>
-        )
+        !error && selectedTable && <PlaygroundEmptyState />
       )}
 
       {/* Help text */}
       {results && (
-        <div className="mt-6 text-xs text-muted-foreground space-y-1">
+        <div className="text-xs text-muted-foreground space-y-1">
           <p>
             <strong>Similarity Scores:</strong> Documents are ranked by cosine similarity to your
             query's embedding vector. Higher scores indicate stronger semantic match. The score bar
@@ -375,7 +363,7 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
           </p>
         </div>
       )}
-    </div>
+    </DashboardPage>
   );
 };
 

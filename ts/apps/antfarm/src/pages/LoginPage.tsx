@@ -1,11 +1,20 @@
+import {
+  Alert,
+  Anty,
+  AuthShell,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  GraphPaperBg,
+  Input,
+  Label,
+} from "@antfly/design-system";
 import type { FormEvent } from "react";
 import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Alert } from "../components/ui/alert";
-import { Button } from "../components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
-import { Input } from "../components/ui/input";
-import { Label } from "../components/ui/label";
 import { useAuth } from "../hooks/use-auth";
 
 interface LocationState {
@@ -42,10 +51,14 @@ export function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-4">
-      <Card className="w-full max-w-md">
+    <AuthShell>
+      <GraphPaperBg className="absolute inset-0 -z-10" />
+      <div className="flex flex-col items-center gap-4">
+        <Anty size={64} expression="excited" float={false} showGlow />
+      </div>
+      <Card>
         <CardHeader className="space-y-1">
-          <CardTitle className="text-2xl font-bold">Sign in to Antfly</CardTitle>
+          <CardTitle className="font-aeonik">Sign in to Antfly</CardTitle>
           <CardDescription>Enter your credentials to access the dashboard</CardDescription>
         </CardHeader>
         <CardContent>
@@ -93,6 +106,6 @@ export function LoginPage() {
           </form>
         </CardContent>
       </Card>
-    </div>
+    </AuthShell>
   );
 }

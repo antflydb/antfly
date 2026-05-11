@@ -1,3 +1,43 @@
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Separator,
+  Textarea,
+} from "@antfly/design-system";
 import type { GeneratorConfig } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
@@ -20,35 +60,13 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import {
   formatGeneratorSummary,
   GENERATOR_DEFAULT_CONFIG,
   GeneratorSelector,
   getInheritedGeneratorLabels,
 } from "@/components/playground/GeneratorSelector";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
-import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/hooks/use-api-config";
 import { useEvalSets } from "@/hooks/use-eval-sets";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
@@ -125,6 +143,7 @@ const EvalsPlaygroundPage: React.FC = () => {
   const [importSetName, setImportSetName] = useState("");
   const [importFormat, setImportFormat] = useState<"native" | "promptfoo" | "unknown">("unknown");
   const [expandedResults, setExpandedResults] = useState<Set<string>>(new Set());
+  const [showDeleteSetDialog, setShowDeleteSetDialog] = useState(false);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -157,13 +176,15 @@ const EvalsPlaygroundPage: React.FC = () => {
 
   const handleDeleteSet = () => {
     if (!selectedSetName) return;
-    if (!confirm(`Delete eval set "${selectedSetName}"?`)) return;
-    const deletedName = selectedSetName;
-    deleteEvalSet(deletedName);
-    // deleteEvalSet triggers async state update, so getEvalSetNames() would return stale data.
-    // Reset selection and let the useEffect at line 137 pick the new first set.
+    setShowDeleteSetDialog(true);
+  };
+
+  const confirmDeleteSet = () => {
+    if (!selectedSetName) return;
+    deleteEvalSet(selectedSetName);
     setSelectedSetName("");
     setResults(null);
+    setShowDeleteSetDialog(false);
   };
 
   const handleAddItem = () => {
@@ -445,16 +466,15 @@ const EvalsPlaygroundPage: React.FC = () => {
   ]);
 
   return (
-    <div className="h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Evals Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Evals Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Build eval sets and test RAG answers against reference answers
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <Button variant="outline" onClick={loadSampleSet}>
             <FileText className="h-4 w-4 mr-2" />
             Load Sample
@@ -463,23 +483,23 @@ const EvalsPlaygroundPage: React.FC = () => {
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       {/* Active Table/Index Indicator */}
       {selectedTable ? (
-        <div className="mb-4 flex items-center gap-2 text-sm text-muted-foreground">
+        <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
           <Badge variant="secondary">{selectedTable}</Badge>
           {selectedIndex && <Badge variant="outline">{selectedIndex}</Badge>}
-        </div>
+        </DashboardToolbar>
       ) : (
-        <div className="mb-4 p-3 rounded-lg border border-dashed text-sm text-muted-foreground">
+        <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
           Select a table from the sidebar to get started.
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
@@ -538,7 +558,9 @@ const EvalsPlaygroundPage: React.FC = () => {
             {/* Run Button */}
             <div className="space-y-2 flex flex-col items-stretch">
               {!selectedIndex && selectedTable && (
-                <p className="text-sm text-amber-600">No embedding index found for this table</p>
+                <p className="text-sm af-status-text-warning">
+                  No embedding index found for this table
+                </p>
               )}
               <Button
                 onClick={runEvals}
@@ -603,7 +625,7 @@ const EvalsPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -658,11 +680,8 @@ const EvalsPlaygroundPage: React.FC = () => {
           </CardHeader>
           <CardContent className="flex-1 overflow-auto">
             {!results ? (
-              <div className="h-48 flex items-center justify-center text-muted-foreground">
-                <div className="text-center">
-                  <Play className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                  <p>Run evals to see results</p>
-                </div>
+              <div className="h-48 flex items-center justify-center">
+                <PlaygroundEmptyState />
               </div>
             ) : (
               <div className="space-y-4">
@@ -672,16 +691,16 @@ const EvalsPlaygroundPage: React.FC = () => {
                     <Percent className="h-3 w-3" />
                     Avg: {(results.summary.averageScore * 100).toFixed(0)}%
                   </Badge>
-                  <Badge variant="outline" className="gap-1.5 text-green-600">
+                  <Badge variant="outline" className="gap-1.5 af-status-text-success">
                     <CheckCircle className="h-3 w-3" />
                     Passed: {results.summary.passed}
                   </Badge>
-                  <Badge variant="outline" className="gap-1.5 text-red-600">
+                  <Badge variant="outline" className="gap-1.5 af-status-text-error">
                     <XCircle className="h-3 w-3" />
                     Failed: {results.summary.failed}
                   </Badge>
                   {results.summary.errors > 0 && (
-                    <Badge variant="outline" className="gap-1.5 text-yellow-600">
+                    <Badge variant="outline" className="gap-1.5 af-status-text-warning">
                       Errors: {results.summary.errors}
                     </Badge>
                   )}
@@ -712,9 +731,9 @@ const EvalsPlaygroundPage: React.FC = () => {
                           {result.error ? (
                             <span title={result.error}>❗</span>
                           ) : result.pass ? (
-                            <Check className="h-4 w-4 text-green-600" />
+                            <Check className="h-4 w-4 af-status-icon-success" />
                           ) : (
-                            <X className="h-4 w-4 text-red-600" />
+                            <X className="h-4 w-4 af-status-icon-error" />
                           )}
                           <span className="flex-1 truncate text-sm">{result.question}</span>
                           <Badge variant="secondary" className="text-xs">
@@ -725,7 +744,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                       <CollapsibleContent>
                         <div className="ml-6 mt-2 p-3 rounded-lg bg-muted/30 space-y-3 text-sm">
                           {result.error ? (
-                            <div className="text-yellow-600">
+                            <div className="af-status-text-warning">
                               <span className="font-medium">Error:</span> {result.error}
                             </div>
                           ) : (
@@ -926,9 +945,9 @@ const EvalsPlaygroundPage: React.FC = () => {
                         </div>
                       );
                     }
-                    return <p className="text-yellow-600">Unknown format</p>;
+                    return <p className="af-status-text-warning">Unknown format</p>;
                   } catch {
-                    return <p className="text-red-600">Invalid JSON</p>;
+                    return <p className="af-status-text-error">Invalid JSON</p>;
                   }
                 })()}
               </div>
@@ -1002,14 +1021,28 @@ const EvalsPlaygroundPage: React.FC = () => {
       </Dialog>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           <strong>Evals Playground:</strong> Build evaluation sets with Q+A pairs, then run them
           against your RAG system. Configure the answer generator and the judge independently when
           you want to compare one model's answers against another model's scoring.
         </p>
       </div>
-    </div>
+      <AlertDialog open={showDeleteSetDialog} onOpenChange={setShowDeleteSetDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Eval Set</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete "{selectedSetName}"? This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDeleteSet}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </DashboardPage>
   );
 };
 

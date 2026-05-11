@@ -1,8 +1,7 @@
+import { Badge, Button } from "@antfly/design-system";
 import { Check, Copy, Download, ExternalLink } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import {
   getDownloadCommand,
   getModelsByType,
@@ -29,7 +28,7 @@ function CopyCommandButton({ command }: { command: string }) {
       title="Copy command"
     >
       {copied ? (
-        <Check className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+        <Check className="h-3.5 w-3.5 af-status-icon-success" />
       ) : (
         <Copy className="h-3.5 w-3.5 text-muted-foreground" />
       )}
@@ -67,21 +66,17 @@ export function NoModelsGuide({
 
   const containerClasses = soft
     ? "mb-4 p-4 rounded-lg border bg-muted/30 border-border"
-    : "mb-4 p-4 rounded-lg border bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800";
+    : "mb-4 p-4 rounded-lg border af-status-badge-warning";
 
-  const titleClasses = soft
-    ? "text-sm font-medium text-foreground"
-    : "text-sm font-medium text-amber-900 dark:text-amber-100";
+  const titleClasses = soft ? "text-sm font-medium text-foreground" : "text-sm font-medium";
 
-  const descClasses = soft
-    ? "text-xs text-muted-foreground"
-    : "text-xs text-amber-800 dark:text-amber-200";
+  const descClasses = soft ? "text-xs text-muted-foreground" : "text-xs opacity-80";
 
   return (
     <div className={containerClasses}>
       <div className="flex items-start gap-3">
         <Download
-          className={`h-4 w-4 mt-0.5 shrink-0 ${soft ? "text-muted-foreground" : "text-amber-600 dark:text-amber-400"}`}
+          className={`h-4 w-4 mt-0.5 shrink-0 ${soft ? "text-muted-foreground" : "af-status-icon-warning"}`}
         />
         <div className="flex-1 min-w-0">
           <p className={titleClasses}>No {typeName} models installed</p>

@@ -1,39 +1,19 @@
 "use client";
 
 import {
-  Button,
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
+  SidebarProvider,
+  SidebarSwitcher,
+  SidebarSwitcherContent,
+  SidebarSwitcherItem,
+  SidebarSwitcherTrigger,
+  Switcher,
+  SwitcherContent,
+  SwitcherFooter,
+  SwitcherItem,
+  SwitcherTrigger,
 } from "@antfly/design-system";
-import { Book, ChevronDown, Layers, Plus, ShoppingBag } from "lucide-react";
+import { Book, Database, Layers, Plus, ShoppingBag } from "lucide-react";
 import * as React from "react";
-
-/**
- * Switcher — header entity-switcher pattern.
- *
- * Recipe:
- *   outline sm Button (name + ChevronDown)
- *   → DropdownMenu w/ align="start"
- *     → DropdownMenuLabel styled with .mono-label
- *     → items; current marked with a left-side primary-colored dot
- *     → DropdownMenuSeparator
- *     → "Create X" action with <Plus />
- *
- * Two flavors below: plain (org-style) and rich (project-style with
- * per-item type icon).
- */
-
-type Org = { id: string; name: string };
-
-const orgs: Org[] = [
-  { id: "acme", name: "Acme Inc." },
-  { id: "antfly", name: "Antfly" },
-  { id: "seafront", name: "Seafront Labs" },
-];
 
 type ProjectType = "shopify" | "docs" | "generic";
 type Project = { id: string; name: string; type: ProjectType };
@@ -48,90 +28,94 @@ const projects: Project[] = [
   { id: "p-1", name: "Storefront", type: "shopify" },
   { id: "p-2", name: "Developer docs", type: "docs" },
   { id: "p-3", name: "Marketing site", type: "generic" },
+  { id: "p-4", name: "Help center", type: "docs" },
+  { id: "p-5", name: "Product catalog", type: "shopify" },
 ];
 
-/** Left-side active indicator: small purple dot for current, otherwise transparent. */
-function CurrentDot({ active }: { active: boolean }) {
-  return (
-    <span
-      aria-hidden
-      className={`size-1.5 shrink-0 rounded-full ${active ? "bg-primary" : "bg-transparent"}`}
-    />
-  );
-}
+const products = [
+  { id: "antfarm", name: "Antfarm", description: "Database management dashboard" },
+  { id: "searchaf", name: "SearchAF", description: "Managed search & answer engines" },
+  { id: "termite", name: "Termite", description: "Local ML inference service" },
+];
 
 export function SwitcherDemo() {
-  const [orgId, setOrgId] = React.useState("antfly");
   const [projectId, setProjectId] = React.useState("p-2");
+  const [selectedProduct, setSelectedProduct] = React.useState("antfarm");
 
-  const currentOrg = orgs.find((o) => o.id === orgId);
   const currentProject = projects.find((p) => p.id === projectId);
   const CurrentProjectIcon = currentProject ? projectIcons[currentProject.type] : null;
+  const currentProduct = products.find((p) => p.id === selectedProduct);
 
   return (
-    <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-background/60 p-4">
-      {/* Plain switcher — org-style */}
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="gap-2">
-            {currentOrg?.name ?? "Select organization"}
-            <ChevronDown className="size-3.5 opacity-50" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-60">
-          <DropdownMenuLabel className="mono-label px-2 py-1.5">Organizations</DropdownMenuLabel>
-          {orgs.map((org) => (
-            <DropdownMenuItem
-              key={org.id}
-              onClick={() => setOrgId(org.id)}
-              className="flex items-center gap-2.5 p-2"
+    <div className="flex flex-wrap items-start gap-8">
+      {/* Switcher — searchable popover with icons, footer */}
+      <div className="space-y-2">
+        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Switcher (searchable, icons, footer)
+        </p>
+        <div className="w-60">
+          <Switcher>
+            <SwitcherTrigger placeholder="Select a project…">
+              {CurrentProjectIcon && (
+                <CurrentProjectIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              )}
+              {currentProject?.name}
+            </SwitcherTrigger>
+            <SwitcherContent
+              searchPlaceholder="Search projects…"
+              emptyMessage="No project found."
+              heading="Projects"
+              footer={
+                <SwitcherFooter>
+                  <Plus className="size-4" />
+                  <span>Create project</span>
+                </SwitcherFooter>
+              }
             >
-              <CurrentDot active={org.id === orgId} />
-              <span className="flex-1 truncate">{org.name}</span>
-            </DropdownMenuItem>
-          ))}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem className="flex items-center gap-2 p-2 text-muted-foreground">
-            <Plus className="size-4" />
-            <span>Create organization</span>
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+              {projects.map((project) => {
+                const Icon = projectIcons[project.type];
+                return (
+                  <SwitcherItem
+                    key={project.id}
+                    value={project.id}
+                    selected={projectId === project.id}
+                    icon={<Icon />}
+                    onSelect={setProjectId}
+                  >
+                    {project.name}
+                  </SwitcherItem>
+                );
+              })}
+            </SwitcherContent>
+          </Switcher>
+        </div>
+      </div>
 
-      {/* Rich switcher — project-style with per-item type icon */}
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="gap-2">
-            {CurrentProjectIcon && (
-              <CurrentProjectIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            )}
-            {currentProject?.name ?? "Select a project"}
-            <ChevronDown className="size-3.5 opacity-50" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-60">
-          <DropdownMenuLabel className="mono-label px-2 py-1.5">Projects</DropdownMenuLabel>
-          {projects.map((project) => {
-            const Icon = projectIcons[project.type];
-            return (
-              <DropdownMenuItem
-                key={project.id}
-                onClick={() => setProjectId(project.id)}
-                className="flex items-center gap-2.5 p-2"
-              >
-                <CurrentDot active={project.id === projectId} />
-                <Icon className="size-4 shrink-0 text-muted-foreground" />
-                <span className="flex-1 truncate">{project.name}</span>
-              </DropdownMenuItem>
-            );
-          })}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem className="flex items-center gap-2 p-2 text-muted-foreground">
-            <Plus className="size-4" />
-            <span>Create project</span>
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      {/* SidebarSwitcher — dropdown menu for sidebar header */}
+      <div className="space-y-2">
+        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          SidebarSwitcher (dropdown)
+        </p>
+        <SidebarProvider defaultOpen className="w-64 rounded-lg border border-sidebar-border bg-sidebar p-2 [&>*]:!min-h-0">
+          <SidebarSwitcher>
+            <SidebarSwitcherTrigger
+              icon={<Database className="size-4" />}
+              label={currentProduct?.name ?? "Select product"}
+            />
+            <SidebarSwitcherContent label="Products">
+              {products.map((product) => (
+                <SidebarSwitcherItem
+                  key={product.id}
+                  name={product.name}
+                  description={product.description}
+                  selected={selectedProduct === product.id}
+                  onSelect={() => setSelectedProduct(product.id)}
+                />
+              ))}
+            </SidebarSwitcherContent>
+          </SidebarSwitcher>
+        </SidebarProvider>
+      </div>
     </div>
   );
 }

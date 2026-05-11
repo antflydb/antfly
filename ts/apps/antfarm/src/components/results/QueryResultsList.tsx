@@ -1,14 +1,14 @@
-import type { QueryResult } from "@antfly/sdk";
-import React, { useCallback, useMemo, useState } from "react";
-import { Badge } from "@/components/ui/badge";
 import {
+  Badge,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table";
+} from "@antfly/design-system";
+import type { QueryResult } from "@antfly/sdk";
+import React, { useCallback, useMemo, useState } from "react";
 import JsonViewer from "../JsonViewer";
 import FieldValueDisplay from "./FieldValueDisplay";
 import QueryResultItem from "./QueryResultItem";

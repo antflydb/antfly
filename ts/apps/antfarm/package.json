@@ -9,7 +9,6 @@
     "typecheck": "tsc --noEmit",
     "update-deps": "npx npm-check-updates -u && npm install",
     "lint": "biome check . --write --unsafe",
-
     "preview": "vite preview",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
@@ -17,6 +16,7 @@
   },
   "dependencies": {
     "@antfly/components": "workspace:*",
+    "@antfly/design-system": "workspace:*",
     "@antfly/sdk": "workspace:*",
     "@antfly/termite-sdk": "workspace:*",
     "@hookform/resolvers": "^5.2.2",
@@ -45,6 +45,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
+    "gsap": "^3.15.0",
     "lucide-react": "^0.575.0",
     "nanoid": "^5.1.6",
     "quicktype-core": "^23.2.6",

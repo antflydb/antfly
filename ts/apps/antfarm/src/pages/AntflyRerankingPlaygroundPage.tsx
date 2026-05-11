@@ -1,3 +1,25 @@
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@antfly/design-system";
 import { TermiteClient } from "@antfly/termite-sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
@@ -12,18 +34,7 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTable } from "@/hooks/use-table";
 import { fetchWithRetry } from "@/lib/utils";
@@ -284,41 +295,41 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
       : 1;
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Reranking Explorer</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Reranking Explorer</DashboardPageTitle>
+          <DashboardPageDescription>
             Search your table then rerank results with a cross-encoder to compare rankings
-          </p>
+          </DashboardPageDescription>
         </div>
-        <Button variant="outline" onClick={handleReset}>
-          <RotateCcw className="h-4 w-4 mr-2" />
-          Reset
-        </Button>
-      </div>
+        <DashboardPageActions>
+          <Button variant="outline" onClick={handleReset}>
+            <RotateCcw className="h-4 w-4 mr-2" />
+            Reset
+          </Button>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       {!selectedTable && (
-        <div className="mb-6 p-4 bg-muted/50 border border-dashed rounded-lg text-muted-foreground text-sm text-center">
+        <DashboardToolbar className="items-center justify-center border-dashed text-center text-sm text-muted-foreground md:items-center">
           <Database className="h-8 w-8 mx-auto mb-2 opacity-30" />
           Select a table from the sidebar to start exploring reranking
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-            {/* Table */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="space-y-2">
               <Label>Table</Label>
               <Input value={selectedTable || "No table selected"} disabled />
             </div>
 
-            {/* Index */}
             <div className="space-y-2">
               <Label htmlFor="index">Search Index</Label>
               <Select
@@ -339,7 +350,6 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
               </Select>
             </div>
 
-            {/* Reranker Model */}
             <div className="space-y-2">
               <Label htmlFor="reranker">Reranker Model</Label>
               <Select
@@ -368,7 +378,6 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
               </Select>
             </div>
 
-            {/* Limit */}
             <div className="space-y-2">
               <Label htmlFor="limit">Limit</Label>
               <Input
@@ -380,30 +389,8 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
                 onChange={(e) => setLimit(parseInt(e.target.value, 10) || 10)}
               />
             </div>
-
-            {/* Search Button */}
-            <div className="space-y-2 flex items-end">
-              <Button
-                onClick={handleSearch}
-                disabled={isSearching || !query.trim() || !selectedTable}
-                className="w-full"
-              >
-                {isSearching ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Searching
-                  </>
-                ) : (
-                  <>
-                    <Search className="h-4 w-4 mr-2" />
-                    Search
-                  </>
-                )}
-              </Button>
-            </div>
           </div>
 
-          {/* Query Input */}
           <div className="space-y-2">
             <Label htmlFor="query">Query</Label>
             <Input
@@ -419,19 +406,38 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
               }}
             />
           </div>
+
+          <FormActions>
+            <Button
+              onClick={handleSearch}
+              disabled={isSearching || !query.trim() || !selectedTable}
+            >
+              {isSearching ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Searching
+                </>
+              ) : (
+                <>
+                  <Search className="h-4 w-4 mr-2" />
+                  Search
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats + Rerank Button */}
       {searchResults && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
             {searchResults.length} results
@@ -476,7 +482,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
               )}
             </Button>
           )}
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Side-by-Side Results */}
@@ -562,18 +568,11 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
       )}
 
       {/* Empty state */}
-      {!searchResults && !error && selectedTable && (
-        <div className="p-12 text-center text-muted-foreground">
-          <ArrowDownUp className="h-12 w-12 mx-auto mb-3 opacity-20" />
-          <p>
-            Search your table, then rerank results to compare retrieval vs. cross-encoder ranking
-          </p>
-        </div>
-      )}
+      {!searchResults && !error && selectedTable && <PlaygroundEmptyState />}
 
       {/* Help text */}
       {rerankedResults && (
-        <div className="mt-6 text-xs text-muted-foreground space-y-1">
+        <div className="text-xs text-muted-foreground space-y-1">
           <p>
             <strong>Two-Stage Retrieval:</strong> Initial search uses fast bi-encoder similarity (or
             BM25) to retrieve candidates. Cross-encoder reranking then scores each document against
@@ -586,7 +585,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
           </p>
         </div>
       )}
-    </div>
+    </DashboardPage>
   );
 };
 

@@ -181,6 +181,7 @@ import { ClusterTableDemo } from "@/components/cluster-table-demo";
 import { CollapsibleDemo } from "@/components/collapsible-demo";
 import { FormDemo } from "@/components/form-demo";
 import { GraphDemo } from "@/components/graph-demo";
+import { MultiSelectDemo } from "@/components/multi-select-demo";
 import { SidebarDemo } from "@/components/sidebar-demo";
 import { SwitcherDemo } from "@/components/switcher-demo";
 import { ToastDemo } from "@/components/toast-demo";
@@ -888,7 +889,8 @@ demoCategories.primitives.demos = [
   {
     slug: "form",
     name: "Form",
-    description: "React Hook Form integration with validation and accessible error messages.",
+    description:
+      "Opinionated form system with sections, multi-column rows, inline toggles, and standardized actions.",
     render: () => <FormDemo />,
   },
   {
@@ -1084,10 +1086,17 @@ demoCategories.compound.demos = [
     render: () => <SidebarDemo />,
   },
   {
+    slug: "multi-select",
+    name: "MultiSelect",
+    description:
+      "Searchable multi-select with checkboxes, badge trigger, and Command/cmdk filtering.",
+    render: () => <MultiSelectDemo />,
+  },
+  {
     slug: "switcher",
     name: "Switcher",
     description:
-      "Header entity-switcher pattern: small outline button + chevron → dropdown with label, items (check on current), separator, and a create action. Composed from Button + DropdownMenu primitives.",
+      "Two compound switcher patterns. Switcher: searchable Popover + cmdk with dot indicator and optional footer. SidebarSwitcher: DropdownMenu-based picker for sidebar headers with name + description items.",
     render: () => <SwitcherDemo />,
   },
   {

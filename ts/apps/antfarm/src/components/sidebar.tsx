@@ -1,7 +1,29 @@
 import {
+  Anty,
+  Button,
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  Switcher,
+  SwitcherContent,
+  SwitcherFooter,
+  SwitcherItem,
+  SwitcherTrigger,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+  useSidebar,
+} from "@antfly/design-system";
+import {
   ArrowUpDown,
-  Check,
-  ChevronsUpDown,
   ClipboardCheck,
   Database,
   FileInput,
@@ -13,7 +35,7 @@ import {
   Mic,
   Network,
   PanelLeft,
-  PanelLeftOpen,
+  Plus,
   Repeat2,
   ScanLine,
   Scissors,
@@ -23,38 +45,12 @@ import {
   Tag,
   Upload,
   Waypoints,
-  Wrench,
   X,
 } from "lucide-react";
 import * as React from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ProductSwitcher } from "@/components/product-switcher";
 import { SidebarUser } from "@/components/sidebar-user";
-import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  Sidebar,
-  SidebarContent,
-  SidebarFooter,
-  SidebarGroup,
-  SidebarGroupContent,
-  SidebarGroupLabel,
-  SidebarHeader,
-  SidebarMenu,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  useSidebar,
-} from "@/components/ui/sidebar";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ProductId } from "@/config/products";
 import { useAuth } from "@/hooks/use-auth";
 import { useTable } from "@/hooks/use-table";
@@ -88,10 +84,6 @@ export function AppSidebar({
     setIsMounted(true);
   }, []);
 
-  const handleExpandClick = () => {
-    toggleSidebar();
-  };
-
   const handleSectionClick = (section: string) => {
     if (!selectedTable) return;
 
@@ -108,37 +100,45 @@ export function AppSidebar({
 
   return (
     <Sidebar collapsible="icon" {...props}>
-      {/* Hover overlay expand button for collapsed state */}
-      {sidebarState === "collapsed" && !isMobile && (
-        <div className="absolute top-4 left-2 z-40 opacity-0 hover:opacity-100 transition-opacity duration-200 pointer-events-none">
-          <TooltipProvider delayDuration={0}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  size="icon"
-                  className="size-8 bg-sidebar hover:bg-sidebar-accent text-sidebar-foreground hover:text-sidebar-accent-foreground pointer-events-auto cursor-e-resize transition-colors border-0"
-                  onClick={handleExpandClick}
-                >
-                  <PanelLeftOpen className="size-4" />
-                  <span className="sr-only">Open sidebar</span>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="right" align="center">
-                Open sidebar
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        </div>
-      )}
       <SidebarHeader className="border-r border-b-0 group-data-[collapsible=icon]:border-r-0 gap-0 pb-0">
         <SidebarMenu>
           <SidebarMenuItem>
             <div className="flex items-center justify-between gap-2">
-              <ProductSwitcher
-                currentProduct={currentProduct}
-                onProductChange={onProductChange}
-                collapsed={sidebarState === "collapsed"}
-              />
+              {sidebarState === "collapsed" && !isMobile ? (
+                <TooltipProvider delayDuration={0}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <SidebarMenuButton
+                        size="lg"
+                        className="cursor-e-resize"
+                        onClick={toggleSidebar}
+                      >
+                        <div
+                          className="flex items-center justify-center"
+                          style={{ minWidth: 32, height: 32 }}
+                        >
+                          <Anty
+                            size={32}
+                            eyeStyle="original"
+                            float={false}
+                            showShadow={false}
+                            showGlow
+                            style={{ height: 32 }}
+                          />
+                        </div>
+                      </SidebarMenuButton>
+                    </TooltipTrigger>
+                    <TooltipContent side="right" align="center">
+                      Open sidebar
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ) : (
+                <ProductSwitcher
+                  currentProduct={currentProduct}
+                  onProductChange={onProductChange}
+                />
+              )}
               {isMounted && (isMobile || sidebarState !== "collapsed") && (
                 <TooltipProvider delayDuration={0}>
                   <Tooltip open={tooltipOpen} onOpenChange={setTooltipOpen}>
@@ -175,7 +175,7 @@ export function AppSidebar({
         {/* Antfly Management */}
         {currentProduct === "antfly" && (
           <SidebarGroup>
-            <SidebarGroupLabel>Management</SidebarGroupLabel>
+            <SidebarGroupLabel className="mono-label">Management</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 <SidebarMenuItem>
@@ -267,56 +267,41 @@ export function AppSidebar({
         {/* Antfly Table-Scoped Items - always visible */}
         {currentProduct === "antfly" && (
           <SidebarGroup>
-            <SidebarGroupLabel>Table</SidebarGroupLabel>
+            <SidebarGroupLabel className="mono-label">Table</SidebarGroupLabel>
             <SidebarGroupContent>
               {/* Table Selector */}
               <div className="px-2 pb-2 group-data-[collapsible=icon]:hidden">
-                <Popover open={comboboxOpen} onOpenChange={setComboboxOpen}>
-                  <PopoverTrigger asChild>
-                    <Button
-                      variant="outline"
-                      role="combobox"
-                      aria-expanded={comboboxOpen}
-                      className="w-full justify-between"
-                      disabled={tables.length === 0}
-                    >
-                      <span className="truncate">{selectedTable || "Select a table..."}</span>
-                      <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent className="w-[--radix-popover-trigger-width] p-0">
-                    <Command>
-                      <CommandInput placeholder="Search tables..." />
-                      <CommandList>
-                        <CommandEmpty>No table found.</CommandEmpty>
-                        <CommandGroup>
-                          {tables.map((table) => (
-                            <CommandItem
-                              key={table.name}
-                              value={table.name}
-                              onSelect={(currentValue) => {
-                                setSelectedTable(currentValue);
-                                setComboboxOpen(false);
-                              }}
-                            >
-                              <Check
-                                className={cn(
-                                  "mr-2 h-4 w-4",
-                                  selectedTable === table.name ? "opacity-100" : "opacity-0"
-                                )}
-                              />
-                              {table.name}
-                            </CommandItem>
-                          ))}
-                        </CommandGroup>
-                      </CommandList>
-                    </Command>
-                  </PopoverContent>
-                </Popover>
+                <Switcher open={comboboxOpen} onOpenChange={setComboboxOpen}>
+                  <SwitcherTrigger disabled={tables.length === 0} placeholder="Select a table...">
+                    {selectedTable}
+                  </SwitcherTrigger>
+                  <SwitcherContent
+                    searchPlaceholder="Search tables..."
+                    emptyMessage="No table found."
+                    heading="Tables"
+                    footer={
+                      <SwitcherFooter onClick={() => navigate("/create")}>
+                        <Plus className="size-4" />
+                        <span>Create table</span>
+                      </SwitcherFooter>
+                    }
+                  >
+                    {tables.map((table) => (
+                      <SwitcherItem
+                        key={table.name}
+                        value={table.name}
+                        selected={selectedTable === table.name}
+                        onSelect={(value) => setSelectedTable(value)}
+                      >
+                        {table.name}
+                      </SwitcherItem>
+                    ))}
+                  </SwitcherContent>
+                </Switcher>
               </div>
               <SidebarMenu>
                 {/* Configure subgroup */}
-                <div className="px-2 py-1.5 text-xs font-medium text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
+                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
                   Configure
                 </div>
                 <SidebarMenuItem>
@@ -345,7 +330,7 @@ export function AppSidebar({
                 </SidebarMenuItem>
 
                 {/* Ingest subgroup */}
-                <div className="px-2 py-1.5 text-xs font-medium text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
+                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
                   Ingest
                 </div>
                 <SidebarMenuItem>
@@ -374,7 +359,7 @@ export function AppSidebar({
                 </SidebarMenuItem>
 
                 {/* Explore subgroup */}
-                <div className="px-2 py-1.5 text-xs font-medium text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
+                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
                   Explore
                 </div>
                 <SidebarMenuItem>
@@ -550,197 +535,187 @@ export function AppSidebar({
           </SidebarGroup>
         )}
 
-        {/* Termite Tools Section */}
+        {/* Termite Management */}
         {currentProduct === "termite" && (
-          <SidebarGroup>
-            <SidebarGroupLabel>Tools</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {/* Models Directory */}
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={location.pathname === "/models"}
-                    tooltip="Model Directory"
-                  >
-                    <a
-                      href="/models"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        navigate("/models");
-                      }}
-                    >
-                      <Library className="size-4" />
-                      <span>Models</span>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-
-                <Collapsible defaultOpen>
+          <>
+            <SidebarGroup>
+              <SidebarGroupLabel className="mono-label">Management</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
                   <SidebarMenuItem>
-                    <CollapsibleTrigger asChild>
-                      <SidebarMenuButton
-                        isActive={
-                          location.pathname === "/playground/chunk" ||
-                          location.pathname === "/playground/recognize" ||
-                          location.pathname === "/playground/rewrite" ||
-                          location.pathname === "/playground/rerank" ||
-                          location.pathname === "/playground/kg" ||
-                          location.pathname === "/playground/embed" ||
-                          location.pathname === "/playground/read" ||
-                          location.pathname === "/playground/transcribe"
-                        }
-                        tooltip="Playgrounds"
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/models"}
+                      tooltip="Models"
+                    >
+                      <a
+                        href="/models"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/models");
+                        }}
                       >
-                        <Wrench className="size-4" />
-                        <span>Playgrounds</span>
-                      </SidebarMenuButton>
-                    </CollapsibleTrigger>
-                    <CollapsibleContent>
-                      <SidebarMenu className="ml-4 border-l pl-2">
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/chunk"}
-                          >
-                            <a
-                              href="/playground/chunk"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/chunk");
-                              }}
-                            >
-                              <Scissors className="size-4" />
-                              <span>Chunking</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/recognize"}
-                          >
-                            <a
-                              href="/playground/recognize"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/recognize");
-                              }}
-                            >
-                              <Tag className="size-4" />
-                              <span>Recognize</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/rewrite"}
-                          >
-                            <a
-                              href="/playground/rewrite"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/rewrite");
-                              }}
-                            >
-                              <Repeat2 className="size-4" />
-                              <span>Rewriting</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/rerank"}
-                          >
-                            <a
-                              href="/playground/rerank"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/rerank");
-                              }}
-                            >
-                              <ArrowUpDown className="size-4" />
-                              <span>Reranking</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/kg"}
-                          >
-                            <a
-                              href="/playground/kg"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/kg");
-                              }}
-                            >
-                              <Network className="size-4" />
-                              <span>Knowledge Graph</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/embed"}
-                          >
-                            <a
-                              href="/playground/embed"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/embed");
-                              }}
-                            >
-                              <Waypoints className="size-4" />
-                              <span>Embedding</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/read"}
-                          >
-                            <a
-                              href="/playground/read"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/read");
-                              }}
-                            >
-                              <ScanLine className="size-4" />
-                              <span>Reader</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            asChild
-                            isActive={location.pathname === "/playground/transcribe"}
-                          >
-                            <a
-                              href="/playground/transcribe"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                navigate("/playground/transcribe");
-                              }}
-                            >
-                              <Mic className="size-4" />
-                              <span>Transcribe</span>
-                            </a>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                      </SidebarMenu>
-                    </CollapsibleContent>
+                        <Library className="size-4" />
+                        <span>Models</span>
+                      </a>
+                    </SidebarMenuButton>
                   </SidebarMenuItem>
-                </Collapsible>
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+
+            <SidebarGroup>
+              <SidebarGroupLabel className="mono-label">Playgrounds</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/chunk"}
+                      tooltip="Chunking"
+                    >
+                      <a
+                        href="/playground/chunk"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/chunk");
+                        }}
+                      >
+                        <Scissors className="size-4" />
+                        <span>Chunking</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/recognize"}
+                      tooltip="Recognize"
+                    >
+                      <a
+                        href="/playground/recognize"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/recognize");
+                        }}
+                      >
+                        <Tag className="size-4" />
+                        <span>Recognize</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/rewrite"}
+                      tooltip="Rewriting"
+                    >
+                      <a
+                        href="/playground/rewrite"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/rewrite");
+                        }}
+                      >
+                        <Repeat2 className="size-4" />
+                        <span>Rewriting</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/rerank"}
+                      tooltip="Reranking"
+                    >
+                      <a
+                        href="/playground/rerank"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/rerank");
+                        }}
+                      >
+                        <ArrowUpDown className="size-4" />
+                        <span>Reranking</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/kg"}
+                      tooltip="Knowledge Graph"
+                    >
+                      <a
+                        href="/playground/kg"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/kg");
+                        }}
+                      >
+                        <Network className="size-4" />
+                        <span>Knowledge Graph</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/embed"}
+                      tooltip="Embedding"
+                    >
+                      <a
+                        href="/playground/embed"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/embed");
+                        }}
+                      >
+                        <Waypoints className="size-4" />
+                        <span>Embedding</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/read"}
+                      tooltip="Reader"
+                    >
+                      <a
+                        href="/playground/read"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/read");
+                        }}
+                      >
+                        <ScanLine className="size-4" />
+                        <span>Reader</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={location.pathname === "/playground/transcribe"}
+                      tooltip="Transcribe"
+                    >
+                      <a
+                        href="/playground/transcribe"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          navigate("/playground/transcribe");
+                        }}
+                      >
+                        <Mic className="size-4" />
+                        <span>Transcribe</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          </>
         )}
       </SidebarContent>
 

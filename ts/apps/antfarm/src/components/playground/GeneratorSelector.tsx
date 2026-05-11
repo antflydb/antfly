@@ -1,16 +1,17 @@
-import type { GeneratorConfig, GeneratorProvider } from "@antfly/sdk";
-import { generatorProviders } from "@antfly/sdk";
-import { useId } from "react";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
+  Input,
+  Label,
+  RadioGroup,
+  RadioGroupItem,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@antfly/design-system";
+import type { GeneratorConfig, GeneratorProvider } from "@antfly/sdk";
+import { generatorProviders } from "@antfly/sdk";
+import { useId } from "react";
 import { cn } from "@/lib/utils";
 
 export const GENERATOR_PROVIDER_DEFAULTS: Record<GeneratorProvider, string> = {

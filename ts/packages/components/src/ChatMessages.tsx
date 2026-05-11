@@ -85,10 +85,7 @@ function defaultRenderFollowUpQuestions(questions: string[], onSelect: (q: strin
   );
 }
 
-function defaultRenderClarification(
-  clarification: AgentQuestion,
-  onRespond: (r: string) => void
-) {
+function defaultRenderClarification(clarification: AgentQuestion, onRespond: (r: string) => void) {
   return (
     <div className="react-af-chat-clarification">
       <p>{clarification.question}</p>
@@ -154,9 +151,11 @@ export default function ChatMessages({
       {turns.map((turn, index) => (
         <div key={turn.id} className="react-af-chat-turn">
           {/* User message */}
-          {renderUserMessage
-            ? <SafeRender render={renderUserMessage} args={[turn.userMessage, turn] as const} />
-            : defaultRenderUserMessage(turn.userMessage)}
+          {renderUserMessage ? (
+            <SafeRender render={renderUserMessage} args={[turn.userMessage, turn] as const} />
+          ) : (
+            defaultRenderUserMessage(turn.userMessage)
+          )}
 
           {/* Error */}
           {turn.error &&

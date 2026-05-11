@@ -9,6 +9,7 @@ import {
   type FieldPath,
   type FieldValues,
   FormProvider,
+  type UseFormReturn,
   useFormContext,
   useFormState,
 } from "react-hook-form";
@@ -16,7 +17,23 @@ import {
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 
-const Form = FormProvider;
+function Form<T extends FieldValues>({
+  form,
+  className,
+  children,
+  ...formProps
+}: Omit<React.ComponentProps<"form">, "children"> & {
+  form: UseFormReturn<T>;
+  children: React.ReactNode;
+}) {
+  return (
+    <FormProvider {...form}>
+      <form className={cn("flex flex-col gap-4", className)} {...formProps}>
+        {children}
+      </form>
+    </FormProvider>
+  );
+}
 
 type FormFieldContextValue<
   TFieldValues extends FieldValues = FieldValues,
@@ -69,12 +86,20 @@ type FormItemContextValue = {
 
 const FormItemContext = React.createContext<FormItemContextValue>({} as FormItemContextValue);
 
-function FormItem({ className, ...props }: React.ComponentProps<"div">) {
+function FormItem({
+  horizontal,
+  className,
+  ...props
+}: React.ComponentProps<"div"> & { horizontal?: boolean }) {
   const id = React.useId();
 
   return (
     <FormItemContext.Provider value={{ id }}>
-      <div data-slot="form-item" className={cn("grid gap-2", className)} {...props} />
+      <div
+        data-slot="form-item"
+        className={cn(horizontal ? "flex items-start gap-3" : "grid gap-2", className)}
+        {...props}
+      />
     </FormItemContext.Provider>
   );
 }
@@ -140,13 +165,58 @@ function FormMessage({ className, ...props }: React.ComponentProps<"p">) {
   );
 }
 
+function FormSection({
+  title,
+  description,
+  className,
+  children,
+}: {
+  title: string;
+  description?: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <fieldset data-slot="form-section" className={cn("flex flex-col gap-4", className)}>
+      <div className="flex flex-col gap-1">
+        <legend className="mono-label">{title}</legend>
+        {description && <p className="text-sm text-muted-foreground">{description}</p>}
+      </div>
+      {children}
+    </fieldset>
+  );
+}
+
+function FormRow({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="form-row"
+      className={cn("grid grid-cols-1 gap-4 sm:grid-cols-2", className)}
+      {...props}
+    />
+  );
+}
+
+function FormActions({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="form-actions"
+      className={cn("flex justify-end gap-2 pt-2", className)}
+      {...props}
+    />
+  );
+}
+
 export {
   Form,
+  FormActions,
   FormControl,
   FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
+  FormRow,
+  FormSection,
   useFormField,
 };

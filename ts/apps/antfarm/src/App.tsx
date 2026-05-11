@@ -1,16 +1,15 @@
+import { SidebarInset, SidebarProvider } from "@antfly/design-system";
 import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiConfigProvider } from "@/components/api-config-provider";
 import { AuthProvider } from "@/components/auth-provider";
 import { CommandPaletteProvider } from "@/components/command-palette-provider";
 import { ConnectionStatusBanner } from "@/components/connection-status-banner";
-import { ContentWidthProvider, useContentWidth } from "@/components/content-width-provider";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { GeneratorPreferenceProvider } from "@/components/generator-preference-provider";
 import { PrivateRoute } from "@/components/private-route";
 import { AppSidebar } from "@/components/sidebar";
 import { TableProvider } from "@/components/table-provider";
-import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { WorkspaceHeader } from "@/components/workspace-header";
 import {
   defaultProduct,
@@ -20,7 +19,6 @@ import {
   productForPath,
 } from "@/config/products";
 import { ThemeProvider } from "@/hooks/use-theme";
-import { cn } from "@/lib/utils";
 import AntflyChunkingPlaygroundPage from "./pages/AntflyChunkingPlaygroundPage";
 import AntflyEmbeddingPlaygroundPage from "./pages/AntflyEmbeddingPlaygroundPage";
 import AntflyRerankingPlaygroundPage from "./pages/AntflyRerankingPlaygroundPage";
@@ -47,7 +45,6 @@ import { UsersPage } from "./pages/UsersPage";
 function AppContent() {
   const [currentSection, setCurrentSection] = useState("indexes");
   const [currentProduct, setCurrentProduct] = useState<ProductId>(defaultProduct);
-  const { contentWidth } = useContentWidth();
   const location = useLocation();
 
   // Sync currentProduct with the current route so direct navigation
@@ -66,7 +63,7 @@ function AppContent() {
         path="/*"
         element={
           <PrivateRoute>
-            <SidebarProvider>
+            <SidebarProvider className="af-dashboard">
               <AppSidebar
                 currentSection={currentSection}
                 onSectionChange={setCurrentSection}
@@ -76,12 +73,7 @@ function AppContent() {
               <SidebarInset>
                 <WorkspaceHeader />
                 <ConnectionStatusBanner />
-                <div
-                  className={cn(
-                    "flex-1 p-4 transition-all",
-                    contentWidth === "restricted" ? "container mx-auto max-w-7xl" : "w-full"
-                  )}
-                >
+                <div className="af-workspace-content flex-1 px-6 pt-4 pb-6">
                   <Routes>
                     {/* Antfly routes */}
                     {isProductEnabled("antfly") && (
@@ -151,13 +143,11 @@ function App() {
         <ApiConfigProvider>
           <AuthProvider>
             <GeneratorPreferenceProvider>
-              <ContentWidthProvider>
-                <CommandPaletteProvider>
-                  <TableProvider>
-                    <AppContent />
-                  </TableProvider>
-                </CommandPaletteProvider>
-              </ContentWidthProvider>
+              <CommandPaletteProvider>
+                <TableProvider>
+                  <AppContent />
+                </TableProvider>
+              </CommandPaletteProvider>
             </GeneratorPreferenceProvider>
           </AuthProvider>
         </ApiConfigProvider>

@@ -1,3 +1,10 @@
+import {
+  DashboardPage,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  GraphPaperBg,
+} from "@antfly/design-system";
 import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
 import { useNavigate } from "react-router-dom";
@@ -34,11 +41,20 @@ const CreateTablePage: React.FC = () => {
   };
 
   return (
-    <div>
-      <h2 className="text-2xl font-bold mb-4">Create New Table</h2>
-      <p className="text-muted-foreground mb-6">Define the schema for your new table.</p>
+    <DashboardPage>
+      <div className="relative isolate">
+        <GraphPaperBg className="absolute inset-0 -z-10 rounded-xl" />
+        <DashboardPageHeader>
+          <div>
+            <DashboardPageTitle className="font-aeonik">Create New Table</DashboardPageTitle>
+            <DashboardPageDescription>
+              Define the schema for your new table.
+            </DashboardPageDescription>
+          </div>
+        </DashboardPageHeader>
+      </div>
       <TableSchemaForm onSubmit={handleCreateTable} theme={theme} />
-    </div>
+    </DashboardPage>
   );
 };
 
