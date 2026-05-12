@@ -61,9 +61,9 @@ func DefaultRegistry(opts ...RegistryOption) ProcessorRegistry {
 		opt(&cfg)
 	}
 
-	capacity := 6
+	capacity := 7
 	if cfg.imageReader != nil {
-		capacity = 7
+		capacity = 8
 	}
 	r := &registry{
 		processors: make([]ContentProcessor, 0, capacity),
@@ -71,6 +71,7 @@ func DefaultRegistry(opts ...RegistryOption) ProcessorRegistry {
 	r.Register(&MarkdownProcessor{})
 	r.Register(&OpenAPIProcessor{})
 	r.Register(&HTMLProcessor{})
+	r.Register(&XMLProcessor{})
 	r.Register(&PDFProcessor{OCR: cfg.ocr})
 	r.Register(&DocxProcessor{})
 	r.Register(&PptxProcessor{})
