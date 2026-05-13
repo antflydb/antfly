@@ -44,12 +44,26 @@ jobs:
 
       - name: Build and push GAR image with Cloud Build
         run: |
+          submit_cloud_build() {
+            local attempt sleep_seconds
+            for attempt in 1 2 3; do
+              if gcloud builds submit "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                return 1
+              fi
+              sleep_seconds=$((attempt * 15))
+              echo "gcloud builds submit failed; retrying in ${sleep_seconds}s"
+              sleep "${sleep_seconds}"
+            done
+          }
           VERSION="${{ steps.version.outputs.version }}"
           ALIAS_TAG=latest
           if [[ "$VERSION" == *-* ]]; then
             ALIAS_TAG=__skip_alias__
           fi
-          gcloud builds submit . \
+          submit_cloud_build . \
             --project="${GCP_PROJECT}" \
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
