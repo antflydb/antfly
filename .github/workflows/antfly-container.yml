@@ -55,22 +55,30 @@ jobs:
       - name: Build and push GAR antfly image with Cloud Build
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          ALIAS_TAG=latest
+          if [[ "$VERSION" == *-* ]]; then
+            ALIAS_TAG=__skip_alias__
+          fi
           gcloud builds submit . \
             --project="${GAR_PROJECT}" \
             --region="${GAR_LOCATION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile,_CONTEXT=.,_ALIAS_TAG=latest,_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=AntflyDB - Distributed document database with vector search for AI applications multi-arch image"
+            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=AntflyDB - Distributed document database with vector search for AI applications multi-arch image"
 
       - name: Build and push GAR antfly omni image with Cloud Build
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          ALIAS_TAG=omni
+          if [[ "$VERSION" == *-* ]]; then
+            ALIAS_TAG=__skip_alias__
+          fi
           gcloud builds submit . \
             --project="${GAR_PROJECT}" \
             --region="${GAR_LOCATION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile.omni,_CONTEXT=.,_ALIAS_TAG=omni,_VERSION_TAG=omni-${VERSION},_CACHE_TAG=omni-buildcache,_PLATFORMS=linux/amd64,_DESCRIPTION=AntflyDB omni image"
+            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile.omni,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=omni-${VERSION},_CACHE_TAG=omni-buildcache,_PLATFORMS=linux/amd64,_DESCRIPTION=AntflyDB omni image"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
@@ -80,7 +88,11 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "${GAR_LOCATION}-docker.pkg.dev" -u oauth2accesstoken --password-stdin
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          for tag in latest "${VERSION}" omni "omni-${VERSION}"; do
+          TAGS=("${VERSION}" "omni-${VERSION}")
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS=(latest "${VERSION}" omni "omni-${VERSION}")
+          fi
+          for tag in "${TAGS[@]}"; do
             crane copy \
               "${GAR_LOCATION}-docker.pkg.dev/${GAR_PROJECT}/${GAR_REPOSITORY}/${GAR_IMAGE}:${tag}" \
               "ghcr.io/antflydb/antfly:${tag}"
@@ -91,7 +103,11 @@ jobs:
       - name: Sign container images with annotations (keyless)
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          for tag in latest "${VERSION}" omni "omni-${VERSION}"; do
+          TAGS=("${VERSION}" "omni-${VERSION}")
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS=(latest "${VERSION}" omni "omni-${VERSION}")
+          fi
+          for tag in "${TAGS[@]}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \

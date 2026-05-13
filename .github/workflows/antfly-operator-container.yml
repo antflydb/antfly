@@ -45,12 +45,16 @@ jobs:
       - name: Build and push GAR image with Cloud Build
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          ALIAS_TAG=latest
+          if [[ "$VERSION" == *-* ]]; then
+            ALIAS_TAG=__skip_alias__
+          fi
           gcloud builds submit . \
             --project="${GCP_PROJECT}" \
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=${IMAGE_NAME},_DOCKERFILE=Dockerfile.antfly-operator,_CONTEXT=.,_ALIAS_TAG=latest,_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image"
+            --substitutions="_IMAGE_NAME=${IMAGE_NAME},_DOCKERFILE=Dockerfile.antfly-operator,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
@@ -60,7 +64,11 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "${GCP_REGION}-docker.pkg.dev" -u oauth2accesstoken --password-stdin
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          for tag in latest "${VERSION}"; do
+          TAGS=("${VERSION}")
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS=(latest "${TAGS[@]}")
+          fi
+          for tag in "${TAGS[@]}"; do
             crane copy \
               "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPOSITORY}/${IMAGE_NAME}:${tag}" \
               "ghcr.io/antflydb/antfly-operator:${tag}"
@@ -71,7 +79,11 @@ jobs:
       - name: Sign container images with annotations (keyless)
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          for tag in latest "${VERSION}"; do
+          TAGS=("${VERSION}")
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS=(latest "${TAGS[@]}")
+          fi
+          for tag in "${TAGS[@]}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \

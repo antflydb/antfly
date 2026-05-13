@@ -4,7 +4,7 @@
 #   _IMAGE_NAME: image name in the antfly-labs repo
 #   _DOCKERFILE: Dockerfile path relative to repo root
 #   _CONTEXT: build context path
-#   _ALIAS_TAG: stable tag, such as latest or omni
+#   _ALIAS_TAG: optional stable tag, such as latest or omni
 #   _VERSION_TAG: versioned tag, such as v1.0.0 or omni-v1.0.0
 #   _CACHE_TAG: registry cache tag
 #   _PLATFORMS: build platforms
@@ -28,12 +28,15 @@ steps:
       - |
         set -eux
         IMAGE_BASE="us-east5-docker.pkg.dev/$PROJECT_ID/antfly-labs/${_IMAGE_NAME}"
+        TAG_ARGS=(-t "$${IMAGE_BASE}:${_VERSION_TAG}")
+        if [ -n "${_ALIAS_TAG}" ] && [ "${_ALIAS_TAG}" != "__skip_alias__" ]; then
+          TAG_ARGS=(-t "$${IMAGE_BASE}:${_ALIAS_TAG}" "$${TAG_ARGS[@]}")
+        fi
         docker buildx build \
           --platform="${_PLATFORMS}" \
           --push \
           -f "${_DOCKERFILE}" \
-          -t "$${IMAGE_BASE}:${_ALIAS_TAG}" \
-          -t "$${IMAGE_BASE}:${_VERSION_TAG}" \
+          "$${TAG_ARGS[@]}" \
           --annotation "index:org.opencontainers.image.description=${_DESCRIPTION}" \
           --cache-from "type=registry,ref=$${IMAGE_BASE}:${_CACHE_TAG}" \
           --cache-to "type=registry,ref=$${IMAGE_BASE}:${_CACHE_TAG},mode=max" \
