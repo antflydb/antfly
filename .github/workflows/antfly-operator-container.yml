@@ -17,7 +17,8 @@ env:
 
 jobs:
   publish:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: arc-antfly-publish
+    environment: container-publish
     # Required permissions for OIDC signing and GCP authentication
     permissions:
       contents: read
@@ -36,29 +37,26 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
 
-      # Set up QEMU for multi-architecture emulation (enables building for arm64 on amd64)
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      # Set up Docker Buildx for advanced build features (multi-platform builds, caching)
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Authenticate with GitHub Container Registry using the workflow's built-in token
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       # Authenticate with Google Artifact Registry
       - name: Login to Google Artifact Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.GCP_REGION }}-docker.pkg.dev
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up remote BuildKit
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: remote
+          endpoint: tcp://buildkitd.buildkit-system.svc.cluster.local:1234
+          driver-opts: |
+            servername=buildkitd.buildkit-system.svc
+        env:
+          BUILDER_NODE_0_AUTH_TLS_CACERT: ${{ secrets.BUILDKIT_CA_CERT }}
+          BUILDER_NODE_0_AUTH_TLS_CERT: ${{ secrets.BUILDKIT_CLIENT_CERT }}
+          BUILDER_NODE_0_AUTH_TLS_KEY: ${{ secrets.BUILDKIT_CLIENT_KEY }}
 
       # Extract version from tag (strip pkg/operator/ prefix)
       - name: Extract version
@@ -71,20 +69,34 @@ jobs:
 
       # Build the Docker image for multiple architectures and push to both registries
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: ./Dockerfile.antfly-operator
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/antflydb/antfly-operator:latest
-            ghcr.io/antflydb/antfly-operator:${{ steps.version.outputs.version }}
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-          outputs: type=image,name=target,annotation-index.org.opencontainers.image.description=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          annotations: |
+            index:org.opencontainers.image.description=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image
+          cache-from: type=registry,ref=${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Mirror image GAR -> GHCR
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "${GCP_REGION}-docker.pkg.dev" -u oauth2accesstoken --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for tag in latest "${VERSION}"; do
+            crane copy \
+              "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPOSITORY}/${IMAGE_NAME}:${tag}" \
+              "ghcr.io/antflydb/antfly-operator:${tag}"
+          done
 
       # Install cosign for container image signing
       - uses: sigstore/cosign-installer@v3
