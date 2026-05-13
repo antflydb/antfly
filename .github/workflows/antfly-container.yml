@@ -1,10 +1,8 @@
 name: Container
 
 on:
-  # Trigger when a new release is published directly
   release:
     types: [published]
-  # Allow the release workflow to call this workflow
   workflow_call:
     inputs:
       tag_name:
@@ -13,109 +11,66 @@ on:
         type: string
 
 env:
-  # Google Artifact Registry configuration
   GAR_LOCATION: us-east5
   GAR_PROJECT: antfly-image-artifacts
   GAR_REPOSITORY: antfly-labs
   GAR_IMAGE: antfly
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
 
 jobs:
-  # Build and publish the Antfly database image
   publish-antfly-docker-image:
     runs-on: arc-antfly-publish
     environment: container-publish
-    # Required permissions for OIDC signing and GCP Workload Identity Federation
     permissions:
       contents: read
       packages: write
-      id-token: write # Required for keyless signing with OIDC and GCP WIF
+      id-token: write
 
     steps:
-      # Checkout the repository code
       - uses: actions/checkout@v6
         with:
           submodules: true
 
-      # Authenticate with Docker Hub to avoid rate limits when pulling base images
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Initialize submodules
-        run: |
-          git submodule update --init termite
+        run: git submodule update --init termite
 
-      # Authenticate to Google Cloud using Workload Identity Federation (keyless)
-      # This is the recommended approach for GitHub Actions
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          token_format: "access_token"
+          token_format: access_token
 
-      # Login to Google Artifact Registry
-      - name: Login to Google Artifact Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.GAR_LOCATION }}-docker.pkg.dev
-          username: oauth2accesstoken
-          password: ${{ steps.auth.outputs.access_token }}
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
 
-      - name: Set up remote BuildKit
-        id: buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.buildkit-system.svc.cluster.local:1234
-          driver-opts: |
-            servername=buildkitd.buildkit-system.svc
-        env:
-          BUILDER_NODE_0_AUTH_TLS_CACERT: ${{ secrets.BUILDKIT_CA_CERT }}
-          BUILDER_NODE_0_AUTH_TLS_CERT: ${{ secrets.BUILDKIT_CLIENT_CERT }}
-          BUILDER_NODE_0_AUTH_TLS_KEY: ${{ secrets.BUILDKIT_CLIENT_KEY }}
-
-      # Extract version from tag (e.g., v0.1.0)
       - name: Extract version
         id: version
         run: |
           VERSION="${{ inputs.tag_name || github.event.release.tag_name }}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${VERSION}"
 
-      # Build the Docker image for multiple architectures and push to both registries
-      - name: Build and push GAR Docker image
-        uses: docker/build-push-action@v7
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:latest
-            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:${{ steps.version.outputs.version }}
-          annotations: |
-            index:org.opencontainers.image.description=AntflyDB - Distributed document database with vector search for AI applications multi-arch image
-          cache-from: type=registry,ref=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:buildcache,mode=max
+      - name: Build and push GAR antfly image with Cloud Build
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gcloud builds submit . \
+            --project="${GAR_PROJECT}" \
+            --region="${GAR_LOCATION}" \
+            --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
+            --config=cloudbuild.yaml \
+            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile,_CONTEXT=.,_ALIAS_TAG=latest,_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=AntflyDB - Distributed document database with vector search for AI applications multi-arch image"
 
-      # Build antfly:omni (ONNX + XLA backends, amd64 only)
-      - name: Build and push GAR antfly:omni
-        uses: docker/build-push-action@v7
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: .
-          file: ./Dockerfile.omni
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:omni
-            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:omni-${{ steps.version.outputs.version }}
-          cache-from: type=registry,ref=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:omni-buildcache
-          cache-to: type=registry,ref=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:omni-buildcache,mode=max
+      - name: Build and push GAR antfly omni image with Cloud Build
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gcloud builds submit . \
+            --project="${GAR_PROJECT}" \
+            --region="${GAR_LOCATION}" \
+            --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
+            --config=cloudbuild.yaml \
+            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile.omni,_CONTEXT=.,_ALIAS_TAG=omni,_VERSION_TAG=omni-${VERSION},_CACHE_TAG=omni-buildcache,_PLATFORMS=linux/amd64,_DESCRIPTION=AntflyDB omni image"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
@@ -131,48 +86,20 @@ jobs:
               "ghcr.io/antflydb/antfly:${tag}"
           done
 
-      # Install cosign for container image signing
       - uses: sigstore/cosign-installer@v3
 
-      # Sign all image tags (latest and release version) with keyless OIDC
-      # Uses GitHub's OIDC provider - no keys needed!
-      # Annotations include repository, workflow, and commit information for verification
       - name: Sign container images with annotations (keyless)
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-
-          # Sign GHCR images
-          for tag in latest "${VERSION}"; do
+          for tag in latest "${VERSION}" omni "omni-${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
               -a "ref=${{ github.sha }}" \
               ghcr.io/antflydb/antfly:${tag}
-          done
-
-          # Sign GHCR omni images
-          for tag in omni "omni-${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
               -a "ref=${{ github.sha }}" \
-              ghcr.io/antflydb/antfly:${tag}
-          done
-
-          # Sign GAR images
-          for tag in latest "${VERSION}"; do
-            cosign sign --yes \
-              -a "repo=${{ github.repository }}" \
-              -a "workflow=${{ github.workflow }}" \
-              -a "ref=${{ github.sha }}" \
-              ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:${tag}
-          done
-
-          # Sign GAR omni images
-          for tag in omni "omni-${VERSION}"; do
-            cosign sign --yes \
-              -a "repo=${{ github.repository }}" \
-              -a "workflow=${{ github.workflow }}" \
-              -a "ref=${{ github.sha }}" \
-              ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:${tag}
+              "${GAR_LOCATION}-docker.pkg.dev/${GAR_PROJECT}/${GAR_REPOSITORY}/${GAR_IMAGE}:${tag}"
           done

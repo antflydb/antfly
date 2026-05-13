@@ -1,0 +1,55 @@
+# Cloud Build config for Antfly container images.
+#
+# Substitutions:
+#   _IMAGE_NAME: image name in the antfly-labs repo
+#   _DOCKERFILE: Dockerfile path relative to repo root
+#   _CONTEXT: build context path
+#   _ALIAS_TAG: stable tag, such as latest or omni
+#   _VERSION_TAG: versioned tag, such as v1.0.0 or omni-v1.0.0
+#   _CACHE_TAG: registry cache tag
+#   _PLATFORMS: build platforms
+#   _DESCRIPTION: OCI image description
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: setup-buildx
+    args:
+      - buildx
+      - create
+      - --use
+      - --name=multiarch
+      - --driver=docker-container
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-push
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -eux
+        IMAGE_BASE="us-east5-docker.pkg.dev/$PROJECT_ID/antfly-labs/${_IMAGE_NAME}"
+        docker buildx build \
+          --platform="${_PLATFORMS}" \
+          --push \
+          -f "${_DOCKERFILE}" \
+          -t "$${IMAGE_BASE}:${_ALIAS_TAG}" \
+          -t "$${IMAGE_BASE}:${_VERSION_TAG}" \
+          --annotation "index:org.opencontainers.image.description=${_DESCRIPTION}" \
+          --cache-from "type=registry,ref=$${IMAGE_BASE}:${_CACHE_TAG}" \
+          --cache-to "type=registry,ref=$${IMAGE_BASE}:${_CACHE_TAG},mode=max" \
+          "${_CONTEXT}"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 2400s
+
+substitutions:
+  _IMAGE_NAME: antfly
+  _DOCKERFILE: Dockerfile
+  _CONTEXT: "."
+  _ALIAS_TAG: latest
+  _VERSION_TAG: latest
+  _CACHE_TAG: buildcache
+  _PLATFORMS: linux/amd64,linux/arm64
+  _DESCRIPTION: AntflyDB container image

@@ -1,34 +1,28 @@
-# Antfly Operator Release workflow
-# Builds and publishes container images on pkg/operator/v* tags
-
 name: Antfly Operator Container
 
 on:
   push:
     tags:
-      - "pkg/operator/v*"  # Triggers on pkg/operator/v1.0.0, etc. (matches Go module tag convention)
+      - "pkg/operator/v*"
 
 env:
-  # Google Cloud Artifact Registry configuration
   GCP_REGION: us-east5
   GCP_PROJECT: antfly-image-artifacts
   GCP_REPOSITORY: antfly-labs
   IMAGE_NAME: antfly-operator
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
 
 jobs:
   publish:
     runs-on: arc-antfly-publish
     environment: container-publish
-    # Required permissions for OIDC signing and GCP authentication
     permissions:
       contents: read
       packages: write
-      id-token: write  # Required for keyless signing with OIDC and GCP Workload Identity
+      id-token: write
     steps:
-      # Checkout the repository code
       - uses: actions/checkout@v6
 
-      # Authenticate to Google Cloud using Workload Identity Federation
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v3
@@ -37,52 +31,26 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
 
-      # Authenticate with Google Artifact Registry
-      - name: Login to Google Artifact Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.GCP_REGION }}-docker.pkg.dev
-          username: oauth2accesstoken
-          password: ${{ steps.auth.outputs.access_token }}
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
 
-      - name: Set up remote BuildKit
-        id: buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.buildkit-system.svc.cluster.local:1234
-          driver-opts: |
-            servername=buildkitd.buildkit-system.svc
-        env:
-          BUILDER_NODE_0_AUTH_TLS_CACERT: ${{ secrets.BUILDKIT_CA_CERT }}
-          BUILDER_NODE_0_AUTH_TLS_CERT: ${{ secrets.BUILDKIT_CLIENT_CERT }}
-          BUILDER_NODE_0_AUTH_TLS_KEY: ${{ secrets.BUILDKIT_CLIENT_KEY }}
-
-      # Extract version from tag (strip pkg/operator/ prefix)
       - name: Extract version
         id: version
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#pkg/operator/}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Extracted version: ${VERSION}"
 
-      # Build the Docker image for multiple architectures and push to both registries
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v7
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: .
-          file: ./Dockerfile.antfly-operator
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-          annotations: |
-            index:org.opencontainers.image.description=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image
-          cache-from: type=registry,ref=${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+      - name: Build and push GAR image with Cloud Build
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gcloud builds submit . \
+            --project="${GCP_PROJECT}" \
+            --region="${GCP_REGION}" \
+            --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
+            --config=cloudbuild.yaml \
+            --substitutions="_IMAGE_NAME=${IMAGE_NAME},_DOCKERFILE=Dockerfile.antfly-operator,_CONTEXT=.,_ALIAS_TAG=latest,_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
@@ -98,13 +66,9 @@ jobs:
               "ghcr.io/antflydb/antfly-operator:${tag}"
           done
 
-      # Install cosign for container image signing
       - uses: sigstore/cosign-installer@v3
 
-      # Sign GitHub Container Registry images with keyless OIDC
-      # Uses GitHub's OIDC provider - no keys needed!
-      # Annotations include repository, workflow, and commit information for verification
-      - name: Sign GHCR container images with annotations (keyless)
+      - name: Sign container images with annotations (keyless)
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           for tag in latest "${VERSION}"; do
@@ -113,16 +77,9 @@ jobs:
               -a "workflow=${{ github.workflow }}" \
               -a "ref=${{ github.sha }}" \
               ghcr.io/antflydb/antfly-operator:${tag}
-          done
-
-      # Sign Google Artifact Registry images with keyless OIDC
-      - name: Sign GAR container images with annotations (keyless)
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          for tag in latest "${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
               -a "ref=${{ github.sha }}" \
-              ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/${{ env.IMAGE_NAME }}:${tag}
+              "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPOSITORY}/${IMAGE_NAME}:${tag}"
           done
