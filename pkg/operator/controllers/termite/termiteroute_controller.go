@@ -44,6 +44,7 @@ type TermiteRouteReconciler struct {
 // +kubebuilder:rbac:groups=antfly.io,resources=termiteroutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=antfly.io,resources=termiteroutes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=antfly.io,resources=termiteroutes/finalizers,verbs=update
+// +kubebuilder:rbac:groups=antfly.io,resources=externaltermitepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile handles TermiteRoute reconciliation
@@ -91,16 +92,15 @@ func (r *TermiteRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 		// Validate referenced pools exist
 		for _, dest := range route.Spec.Route {
-			pool := &antflyaiv1alpha1.TermitePool{}
-			if err := r.Get(ctx, client.ObjectKey{Name: dest.Pool, Namespace: route.Namespace}, pool); err != nil {
-				if errors.IsNotFound(err) {
-					logger.Error(err, "Referenced pool not found", "pool", dest.Pool)
+			if err := r.validatePoolReference(ctx, route.Namespace, dest.Pool); err != nil {
+				if errors.IsNotFound(err) || errors.IsAlreadyExists(err) {
+					logger.Error(err, "Referenced pool is invalid", "pool", dest.Pool)
 					attempt := r.incrementValidationAttempts(key)
 					meta.SetStatusCondition(&route.Status.Conditions, metav1.Condition{
 						Type:    antflyaiv1alpha1.TypeConfigurationValid,
 						Status:  metav1.ConditionFalse,
 						Reason:  antflyaiv1alpha1.ReasonValidationFailed,
-						Message: fmt.Sprintf("Referenced pool %q not found", dest.Pool),
+						Message: err.Error(),
 					})
 					if route.Status.Active {
 						route.Status.Active = false
@@ -108,7 +108,7 @@ func (r *TermiteRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 					if err := r.Status().Update(ctx, route); err != nil {
 						return ctrl.Result{}, err
 					}
-					r.Recorder.Eventf(route, nil, corev1.EventTypeWarning, antflyaiv1alpha1.ReasonValidationFailed, antflyaiv1alpha1.ReasonValidationFailed, "Referenced pool %q not found", dest.Pool)
+					r.Recorder.Eventf(route, nil, corev1.EventTypeWarning, antflyaiv1alpha1.ReasonValidationFailed, antflyaiv1alpha1.ReasonValidationFailed, "Referenced pool %q is invalid: %s", dest.Pool, err.Error())
 					return ctrl.Result{RequeueAfter: calculateBackoff(attempt - 1)}, nil
 				}
 				return ctrl.Result{}, err
@@ -144,6 +144,32 @@ func (r *TermiteRouteReconciler) incrementValidationAttempts(key string) int {
 	count := val.(int) + 1
 	r.validationAttempts.Store(key, count)
 	return count
+}
+
+func (r *TermiteRouteReconciler) validatePoolReference(ctx context.Context, namespace, name string) error {
+	key := client.ObjectKey{Name: name, Namespace: namespace}
+
+	managedPool := &antflyaiv1alpha1.TermitePool{}
+	managedErr := r.Get(ctx, key, managedPool)
+	if managedErr != nil && !errors.IsNotFound(managedErr) {
+		return managedErr
+	}
+
+	externalPool := &antflyaiv1alpha1.ExternalTermitePool{}
+	externalErr := r.Get(ctx, key, externalPool)
+	if externalErr != nil && !errors.IsNotFound(externalErr) {
+		return externalErr
+	}
+
+	managedFound := managedErr == nil
+	externalFound := externalErr == nil
+	if managedFound && externalFound {
+		return errors.NewAlreadyExists(antflyaiv1alpha1.GroupVersion.WithResource("termitepools").GroupResource(), name)
+	}
+	if !managedFound && !externalFound {
+		return errors.NewNotFound(antflyaiv1alpha1.GroupVersion.WithResource("termitepools").GroupResource(), fmt.Sprintf("%s or external %s", name, name))
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager

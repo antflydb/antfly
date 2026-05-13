@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1194,6 +1195,26 @@ func TestReadyRequiresRoutableEndpoint(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected readiness to fail when all endpoints are open-circuit, got %d", resp.StatusCode)
+	}
+}
+
+func TestExtractModelNamesSupportsCategorizedResponses(t *testing.T) {
+	body := strings.NewReader(`{
+		"object": "list",
+		"data": [{"id": "openai-compatible"}],
+		"embedders": {"embedder-a": {"backend": "metal"}},
+		"generators": {"generator-a": {"backend": "metal"}},
+		"rerankers": ["reranker-a"]
+	}`)
+
+	models, err := extractModelNames(body)
+	if err != nil {
+		t.Fatalf("extractModelNames() error = %v", err)
+	}
+
+	want := []string{"embedder-a", "generator-a", "openai-compatible", "reranker-a"}
+	if !slices.Equal(models, want) {
+		t.Fatalf("extractModelNames() = %#v, want %#v", models, want)
 	}
 }
 

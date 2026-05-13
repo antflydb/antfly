@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,6 +101,7 @@ const (
 // Endpoint represents a single Termite instance
 type Endpoint struct {
 	Address      string
+	HealthURL    string
 	Pool         string
 	WorkloadType WorkloadType
 	Models       map[string]*ModelInfo
@@ -260,19 +262,36 @@ type PoolConditionStats struct {
 
 // RegisterEndpoint adds or updates an endpoint
 func (r *ModelRegistry) RegisterEndpoint(address, pool string, workloadType WorkloadType) {
+	r.RegisterEndpointWithHealth(address, "", pool, workloadType)
+}
+
+// RegisterEndpointWithHealth adds or updates an endpoint with a distinct operational health URL.
+func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool string, workloadType WorkloadType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if _, exists := r.endpoints[address]; !exists {
-		r.endpoints[address] = &Endpoint{
+	ep, exists := r.endpoints[address]
+	if !exists {
+		ep = &Endpoint{
 			Address:      address,
+			HealthURL:    healthURL,
 			Pool:         pool,
 			WorkloadType: workloadType,
 			Models:       make(map[string]*ModelInfo),
 			Healthy:      true,
 			LastSeen:     time.Now(),
 		}
+		r.endpoints[address] = ep
 		r.circuitBreakers[address] = NewCircuitBreaker(5, 30*time.Second)
+	} else {
+		oldPool := ep.Pool
+		ep.HealthURL = healthURL
+		ep.Pool = pool
+		ep.WorkloadType = workloadType
+		ep.LastSeen = time.Now()
+		if oldPool != pool {
+			r.removeEndpointFromPoolLocked(address, oldPool)
+		}
 	}
 
 	// Add to pool index
@@ -280,15 +299,41 @@ func (r *ModelRegistry) RegisterEndpoint(address, pool string, workloadType Work
 		r.pools[pool] = make([]*Endpoint, 0)
 	}
 	found := false
-	for _, ep := range r.pools[pool] {
-		if ep.Address == address {
+	for _, indexed := range r.pools[pool] {
+		if indexed.Address == address {
 			found = true
 			break
 		}
 	}
 	if !found {
-		r.pools[pool] = append(r.pools[pool], r.endpoints[address])
+		r.pools[pool] = append(r.pools[pool], ep)
 	}
+}
+
+func (r *ModelRegistry) removeEndpointFromPoolLocked(address, pool string) {
+	newPoolEndpoints := make([]*Endpoint, 0, len(r.pools[pool]))
+	for _, e := range r.pools[pool] {
+		if e.Address != address {
+			newPoolEndpoints = append(newPoolEndpoints, e)
+		}
+	}
+	r.pools[pool] = newPoolEndpoints
+}
+
+func (r *ModelRegistry) registerBootstrapModels(address string, models []string) {
+	if len(models) == 0 {
+		return
+	}
+	r.UpdateModels(address, models)
+}
+
+func (r *ModelRegistry) endpointHealthURL(address string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if ep, exists := r.endpoints[address]; exists {
+		return ep.HealthURL
+	}
+	return ""
 }
 
 // UnregisterEndpoint removes an endpoint
@@ -302,14 +347,7 @@ func (r *ModelRegistry) UnregisterEndpoint(address string) {
 	}
 
 	// Remove from pool index
-	pool := ep.Pool
-	newPoolEndpoints := make([]*Endpoint, 0)
-	for _, e := range r.pools[pool] {
-		if e.Address != address {
-			newPoolEndpoints = append(newPoolEndpoints, e)
-		}
-	}
-	r.pools[pool] = newPoolEndpoints
+	r.removeEndpointFromPoolLocked(address, ep.Pool)
 
 	// Remove from model index
 	for model := range ep.Models {
@@ -529,6 +567,24 @@ func (r *ModelRegistry) isEndpointAvailableLocked(ep *Endpoint) bool {
 
 // RefreshEndpoint fetches current model list and health from an endpoint
 func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) error {
+	if healthURL := r.endpointHealthURL(address); healthURL != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		if err != nil {
+			r.markUnhealthy(address)
+			return err
+		}
+		resp, err := r.client.Do(req)
+		if err != nil {
+			r.markUnhealthy(address)
+			return err
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+			r.markUnhealthy(address)
+			return fmt.Errorf("health check returned %d", resp.StatusCode)
+		}
+	}
+
 	resp, err := r.client.Get(address + "/ml/v1/models")
 	if err != nil {
 		r.markUnhealthy(address)
@@ -541,23 +597,68 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
-	var modelsResp struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&modelsResp); err != nil {
+	models, err := extractModelNames(resp.Body)
+	if err != nil {
 		return err
-	}
-
-	models := make([]string, len(modelsResp.Models))
-	for i, m := range modelsResp.Models {
-		models[i] = m.Name
 	}
 
 	r.UpdateModels(address, models)
 	r.markHealthy(address)
 	return nil
+}
+
+func extractModelNames(r io.Reader) ([]string, error) {
+	var doc map[string]json.RawMessage
+	if err := json.NewDecoder(r).Decode(&doc); err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			seen[name] = true
+		}
+	}
+	addFromCollection := func(raw json.RawMessage) {
+		var entries []map[string]any
+		if err := json.Unmarshal(raw, &entries); err == nil {
+			for _, entry := range entries {
+				for _, key := range []string{"name", "id"} {
+					if value, ok := entry[key].(string); ok {
+						add(value)
+					}
+				}
+			}
+			return
+		}
+		var stringsList []string
+		if err := json.Unmarshal(raw, &stringsList); err == nil {
+			for _, name := range stringsList {
+				add(name)
+			}
+			return
+		}
+		var objectMap map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &objectMap); err == nil {
+			for name := range objectMap {
+				add(name)
+			}
+		}
+	}
+
+	for _, key := range []string{"models", "data", "embedders", "generators", "rerankers", "chunkers", "recognizers", "extractors", "rewriters", "classifiers", "readers", "transcribers"} {
+		if raw, ok := doc[key]; ok {
+			addFromCollection(raw)
+		}
+	}
+
+	models := make([]string, 0, len(seen))
+	for model := range seen {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models, nil
 }
 
 func (r *ModelRegistry) markHealthy(address string) {
@@ -872,8 +973,13 @@ func (p *Proxy) Start(ctx context.Context) error {
 	// Main API mux
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("/ml/v1/embed", p.handleEmbed)
+	apiMux.HandleFunc("/ml/v1/embeddings", p.handleEmbeddings)
 	apiMux.HandleFunc("/ml/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ml/v1/rerank", p.handleRerank)
+	apiMux.HandleFunc("/ml/v1/recognize", p.handleRecognize)
+	apiMux.HandleFunc("/ml/v1/extract", p.handleExtract)
+	apiMux.HandleFunc("/ml/v1/generate", p.handleGenerate)
+	apiMux.HandleFunc("/ml/v1/chat/completions", p.handleChatCompletions)
 	apiMux.HandleFunc("/healthz", p.handleHealth)
 	apiMux.HandleFunc("/readyz", p.handleReady)
 
@@ -923,6 +1029,11 @@ func (p *Proxy) handleEmbed(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "embed")
 }
 
+// handleEmbeddings routes OpenAI-compatible embedding requests.
+func (p *Proxy) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "embeddings")
+}
+
 // handleChunk routes chunking requests
 func (p *Proxy) handleChunk(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "chunk")
@@ -931,6 +1042,22 @@ func (p *Proxy) handleChunk(w http.ResponseWriter, r *http.Request) {
 // handleRerank routes reranking requests
 func (p *Proxy) handleRerank(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rerank")
+}
+
+func (p *Proxy) handleRecognize(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "recognize")
+}
+
+func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "extract")
+}
+
+func (p *Proxy) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "generate")
+}
+
+func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "chat.completions")
 }
 
 func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation string) {
@@ -1155,6 +1282,11 @@ func (p *Proxy) Router() *Router {
 // RegisterEndpoint adds an endpoint (called from K8s watcher)
 func (p *Proxy) RegisterEndpoint(address, pool string, workloadType WorkloadType) {
 	p.registry.RegisterEndpoint(address, pool, workloadType)
+}
+
+// RegisterEndpointWithHealth adds an endpoint with a distinct operational health URL.
+func (p *Proxy) RegisterEndpointWithHealth(address, healthURL, pool string, workloadType WorkloadType) {
+	p.registry.RegisterEndpointWithHealth(address, healthURL, pool, workloadType)
 }
 
 // UnregisterEndpoint removes an endpoint (called from K8s watcher)
