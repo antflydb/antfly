@@ -668,16 +668,14 @@ func (n *TermiteNode) APIHandler() http.Handler {
 	return corsMiddleware(rootMux)
 }
 
-// APIMLHandler returns a handler that serves only the /ml/v1/* surface
-// (plus /healthz, /readyz). Intended for embedding in an antfly metadata
-// HTTP server where OpenAI/Anthropic-compat and dashboard surfaces are
+// APIMLHandler returns a handler that serves only the /ml/v1/* surface.
+// Intended for embedding in an antfly metadata HTTP server where
+// OpenAI/Anthropic-compat, dashboard, and operational probe surfaces are
 // undesirable.
 func (n *TermiteNode) APIMLHandler() http.Handler {
 	apiHandler := NewTermiteAPI(n.logger, n)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", n.handleHealthz)
-	mux.HandleFunc("GET /readyz", n.handleReadyz)
 	mux.HandleFunc("POST /ml/v1/generate", n.handleApiGenerate)
 	mux.Handle("/ml/v1/", apiHandler)
 

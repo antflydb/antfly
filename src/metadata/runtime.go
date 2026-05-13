@@ -73,8 +73,8 @@ type Runtime struct {
 type RuntimeOptions struct {
 	ExecutionProvider ExecutionProvider
 	// TermiteMLHandler is an optional in-process Termite handler. When set, it
-	// is mounted at /ml/v1/ (and also handles /healthz, /readyz, and
-	// /ml/v1/generate as exposed by pkg/termite.TermiteNode.APIMLHandler).
+	// is mounted at /ml/v1/ and also handles /ml/v1/generate as exposed by
+	// pkg/termite.TermiteNode.APIMLHandler.
 	// When nil and config.Termite.ApiUrl is set, the metadata server instead
 	// reverse-proxies /termite/* to that URL.
 	TermiteMLHandler http.Handler
