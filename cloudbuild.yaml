@@ -33,6 +33,7 @@ steps:
           TAG_ARGS=(-t "$${IMAGE_BASE}:${_ALIAS_TAG}" "$${TAG_ARGS[@]}")
         fi
         docker buildx build \
+          --progress=plain \
           --platform="${_PLATFORMS}" \
           --push \
           -f "${_DOCKERFILE}" \
