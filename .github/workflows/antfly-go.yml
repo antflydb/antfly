@@ -14,14 +14,11 @@ on:
       - "py/**"
       - "pkg/antfly-proxy/**"
       - "pkg/operator/**"
-      - "pkg/termite/**"
-      - "pkg/termite-client/**"
       - "pkg/termite-proxy/**"
       - ".github/workflows/ts-*.yml"
       - ".github/workflows/py-*.yml"
       - ".github/workflows/antfly-operator-*.yml"
       - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/termite-*.yml"
       - ".github/workflows/antfly-container.yml"
       - ".github/workflows/trigger-docs-build.yml"
   pull_request:
@@ -34,25 +31,44 @@ on:
       - "py/**"
       - "pkg/antfly-proxy/**"
       - "pkg/operator/**"
-      - "pkg/termite/**"
-      - "pkg/termite-client/**"
       - "pkg/termite-proxy/**"
       - ".github/workflows/ts-*.yml"
       - ".github/workflows/py-*.yml"
       - ".github/workflows/antfly-operator-*.yml"
       - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/termite-*.yml"
       - ".github/workflows/antfly-container.yml"
       - ".github/workflows/trigger-docs-build.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+env:
+  TOKENIZERS_VERSION: "1.26.0"
+  ONNXRUNTIME_VERSION: "1.24.3"
+  GENAI_VERSION: "0.12.1"
+  PJRT_CPU_VERSION: "0.83.1"
+
 jobs:
   unit:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    # Runs on heavy because the standard runner's 10Gi ephemeral cap was
+    # being exhausted by go build + module cache + workspace + Pebble dbs
+    # written during "Test swarm startup", leading to silent SIGTERM.
+    # Heavy provides /mnt/cache (50Gi PVC) for GOCACHE/GOMODCACHE.
+    runs-on: arc-antfly-heavy
+    env:
+      GOCACHE: /mnt/cache/go-build
+      GOMODCACHE: /mnt/cache/go-mod
     steps:
+      - name: Prepare cache directories
+        run: |
+          set -eux
+          mkdir -p "$GOCACHE" "$GOMODCACHE"
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
       - uses: actions/checkout@v6
         with:
           submodules: true
@@ -70,7 +86,6 @@ jobs:
         run: go version
 
       - name: Configure Go for private modules
-        # git config --global url."https://oauth2:${{ secrets.GH_TOKEN }}@github.com".insteadOf "https://github.com"
         run: |
           echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
           echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
@@ -78,27 +93,19 @@ jobs:
       - name: Verify Go module tidiness
         run: make tidy-check
 
-      - name: Clean Go module cache
-        run: go clean -modcache
-
       - name: Verify Go modules
         run: go mod download
-
-      - name: Simulator Validate
-        run: make sim-validate
 
       - name: Build Antfly
         run: go build -v -o antfly ./cmd/antfly
 
       - name: Test swarm startup
         run: |
-          # Start swarm mode in background
           ./antfly swarm &
           SWARM_PID=$!
 
           echo "Waiting for swarm to start (PID: $SWARM_PID)..."
 
-          # Wait for healthz endpoint (liveness)
           HEALTHZ_OK=false
           for i in {1..30}; do
             if curl -sf http://localhost:4200/healthz > /dev/null 2>&1; then
@@ -115,7 +122,6 @@ jobs:
             exit 1
           fi
 
-          # Wait for readyz endpoint (readiness)
           READYZ_OK=false
           for i in {1..30}; do
             if curl -sf http://localhost:4200/readyz > /dev/null 2>&1; then
@@ -134,16 +140,108 @@ jobs:
 
           echo "Swarm startup test passed!"
           kill $SWARM_PID 2>/dev/null || true
-
-          # Wait for process to exit and clean up
           wait $SWARM_PID 2>/dev/null || true
 
       - name: Test
-        run: go test -v ./...
+        run: |
+          packages=()
+          while IFS= read -r pkg; do
+            if [ "$pkg" != "github.com/antflydb/antfly/src/sim" ]; then
+              packages+=("$pkg")
+            fi
+          done < <(go list ./...)
+          go test -v "${packages[@]}"
+
+      - name: Build termite (pure Go)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for mod in pkg/termite pkg/termite-client; do
+            (cd $mod && GOWORK=off go build -v ./...)
+          done
+
+      - name: Test termite (pure Go)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for mod in pkg/termite pkg/termite-client; do
+            (cd $mod && GOWORK=off go test -v ./...)
+          done
+
+  sim-validate:
+    runs-on: arc-antfly-heavy
+    # sim-validate runs `go test ./src/sim` under a wrapper; on the 4-cpu
+    # standard runner with no /mnt/cache, it tipped past the 10Gi ephemeral
+    # cap (or hit some pod-level cancel) ~3:30 in. Move it to heavy where
+    # GOCACHE/GOMODCACHE land on the 50Gi cache PVC and there's enough CPU
+    # for the sim's parallel scenarios.
+    env:
+      GOCACHE: /mnt/cache/go-build
+      GOMODCACHE: /mnt/cache/go-mod
+    steps:
+      - name: Prepare cache directories
+        run: |
+          set -eux
+          mkdir -p "$GOCACHE" "$GOMODCACHE"
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set Go experiment
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Configure Go for private modules
+        run: |
+          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
+          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
+
+      - name: Verify Go modules
+        run: go mod download
+
+      - name: Simulator Validate
+        run: make sim-validate
 
   e2e:
-    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: arc-antfly-heavy
+    needs: unit
+    # The heavy profile mounts a 50Gi ephemeral PVC at /mnt/cache so large
+    # caches (Go build/module cache, HuggingFace downloads, Termite models)
+    # live outside the pod's 10Gi Autopilot ephemeral-storage allotment.
+    env:
+      GOCACHE: /mnt/cache/go-build
+      GOMODCACHE: /mnt/cache/go-mod
+      HF_HOME: /mnt/cache/huggingface
+      TERMITE_HOME: /mnt/cache/termite-home
     steps:
+      - name: Prepare cache directories
+        run: |
+          set -eux
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$HF_HOME" "$TERMITE_HOME"
+          # HuggingFace downloader falls back to $HOME/.cache/huggingface;
+          # symlink $HOME/.cache to the cache volume to keep the ~5Gi ONNX
+          # downloads off the runner's 10Gi root ephemeral disk.
+          mkdir -p /mnt/cache/home-cache
+          rm -rf "$HOME/.cache"
+          ln -sfn /mnt/cache/home-cache "$HOME/.cache"
+          # Termite copies final models into $HOME/.termite/models by
+          # default; redirect the whole $HOME/.termite onto the cache volume
+          # so the copied payload lands there too.
+          rm -rf "$HOME/.termite"
+          ln -sfn "$TERMITE_HOME" "$HOME/.termite"
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
       - uses: actions/checkout@v6
         with:
           submodules: true
@@ -160,62 +258,131 @@ jobs:
       - name: Verify Go version
         run: go version
 
+      # Install PostgreSQL 18 natively on the runner pod. `services:` blocks
+      # would normally handle this, but they require ARC containerMode:
+      # kubernetes, which on GKE Autopilot runs the runner and the job
+      # container in separate co-located pods sharing an RWO PVC. The node
+      # co-location + Autopilot's privileged-container restriction + the 1TB
+      # minimum for RWX Filestore make that path impractical here, so we
+      # install postgres locally instead.
+      - name: Install and start PostgreSQL 18
+        run: |
+          set -eux
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-18
+          sudo pg_ctlcluster 18 main start
+          sudo -u postgres psql -c "CREATE USER antfly WITH PASSWORD 'antfly_dev';"
+          sudo -u postgres psql -c "CREATE DATABASE antfly_test OWNER antfly;"
+          pg_isready -h 127.0.0.1 -U antfly -d antfly_test
+
       - name: Verify Go modules
         run: go mod download
 
-      - name: Start PostgreSQL
+      - name: Disk usage before E2E
         run: |
-          # Clean up any existing postgres-test container from previous runs
-          docker rm -f postgres-test 2>/dev/null || true
-
-          RUNNER_CONTAINER=$(docker ps --filter "label=com.amazonaws.ecs.container-name" --format "{{.ID}}" | head -1)
-
-          if [ -n "$RUNNER_CONTAINER" ]; then
-            echo "Found runner container: $RUNNER_CONTAINER"
-            RUNNER_NETWORK=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$RUNNER_CONTAINER" | head -1)
-            echo "Runner network: $RUNNER_NETWORK"
-          fi
-
-          if [ -n "$RUNNER_NETWORK" ]; then
-            echo "Starting postgres on runner network: $RUNNER_NETWORK"
-            docker run -d --name postgres-test \
-              --network "$RUNNER_NETWORK" \
-              -e POSTGRES_USER=antfly \
-              -e POSTGRES_PASSWORD=antfly_dev \
-              -e POSTGRES_DB=antfly_test \
-              postgres:18-alpine
-
-            sleep 5
-            POSTGRES_IP=$(docker inspect -f "{{.NetworkSettings.Networks.${RUNNER_NETWORK}.IPAddress}}" postgres-test)
-            echo "PostgreSQL IP: $POSTGRES_IP"
-            echo "POSTGRES_HOST=$POSTGRES_IP" >> $GITHUB_ENV
-          else
-            echo "No runner container found, using host network"
-            docker run -d --name postgres-test \
-              --network host \
-              -e POSTGRES_USER=antfly \
-              -e POSTGRES_PASSWORD=antfly_dev \
-              -e POSTGRES_DB=antfly_test \
-              postgres:18-alpine
-            echo "POSTGRES_HOST=127.0.0.1" >> $GITHUB_ENV
-          fi
-
-          echo "Waiting for PostgreSQL to be ready..."
-          for i in {1..30}; do
-            if docker exec postgres-test pg_isready -U antfly -d antfly_test 2>/dev/null; then
-              echo "PostgreSQL is ready"
-              break
-            fi
-            echo "Waiting for PostgreSQL... ($i/30)"
-            sleep 2
-          done
-
-          docker exec postgres-test psql -U antfly -d antfly_test -c "SELECT 1" || exit 1
-          echo "PostgreSQL connection verified"
+          set -x
+          df -h / /mnt/cache || true
+          du -xh -d 1 "$HOME" 2>/dev/null | sort -hr | head -20 || true
 
       - name: E2E Tests
         env:
           RUN_PG_TESTS: "true"
-          ANTFLY_E2E_PG_DSN: postgres://antfly:antfly_dev@${{ env.POSTGRES_HOST }}:5432/antfly_test?sslmode=disable
+          ANTFLY_E2E_PG_DSN: postgres://antfly:antfly_dev@127.0.0.1:5432/antfly_test?sslmode=disable
         run: |
           make e2e E2E_TIMEOUT=45m
+
+  omni:
+    # Omni combines ONNX (CGO) and XLA (CGO) backends; requires GLIBC 2.38+,
+    # so it runs in an Ubuntu 24.04 container. ARC's default actions-runner
+    # image is 22.04 (GLIBC 2.35), and `container:` requires kubernetesMode
+    # to render the container as a separate step pod (the other scale sets
+    # don't have docker installed, so DinD isn't an option). Hence
+    # arc-antfly-k8s, which has kubernetesMode enabled.
+    runs-on: arc-antfly-k8s
+    container: ubuntu:24.04
+    steps:
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y git ca-certificates curl
+
+      - uses: actions/checkout@v6
+
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set GOEXPERIMENT
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential pkg-config curl git ca-certificates
+
+      - name: Download libtokenizers
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "amd64")
+          curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
+            | tar -xzf - -C /usr/local/lib
+          ldconfig
+
+      # Heavy downloads land under $RUNNER_TEMP rather than /tmp because in
+      # kubernetesMode the step pod's root filesystem is capped at ~1Gi by
+      # Autopilot defaults, and the 350MB onnxruntime tarballs (plus go
+      # cache) blow past it. $RUNNER_TEMP resolves to the workspace PVC
+      # (20Gi) in k8s mode.
+      - name: Download ONNX Runtime
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
+          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
+            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime"
+          echo "CGO_CFLAGS=-I$RUNNER_TEMP/onnxruntime/include" >> $GITHUB_ENV
+          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/onnxruntime/lib -lonnxruntime" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
+
+      - name: Download ONNX Runtime GenAI
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "x64")
+          mkdir -p "$RUNNER_TEMP/onnxruntime-genai"
+          curl -fsSL "https://github.com/microsoft/onnxruntime-genai/releases/download/v${GENAI_VERSION}/onnxruntime-genai-${GENAI_VERSION}-linux-${ARCH}.tar.gz" \
+            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime-genai"
+          cp "$RUNNER_TEMP/onnxruntime-genai/lib"/libonnxruntime-genai*.so* "$RUNNER_TEMP/onnxruntime/lib/" 2>/dev/null || true
+          echo "ORTGENAI_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime-genai.so" >> $GITHUB_ENV
+
+      - name: Download PJRT CPU plugin
+        run: |
+          mkdir -p /usr/local/lib/go-xla
+          curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/download/v${PJRT_CPU_VERSION}/pjrt_cpu_linux_amd64.tar.gz" \
+            | tar -xzf - -C /usr/local/lib/go-xla
+          ldconfig
+          echo "LD_LIBRARY_PATH=/usr/local/lib/go-xla:$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "GOMLX_BACKEND=xla:cpu" >> $GITHUB_ENV
+
+      - name: Download dependencies
+        run: cd pkg/termite && GOWORK=off go mod download
+
+      - name: Build termite (omni)
+        env:
+          CGO_ENABLED: "1"
+        run: cd pkg/termite && GOWORK=off go build -v -tags="onnx,ORT,xla,XLA" ./...
+
+      - name: Test termite (omni)
+        env:
+          CGO_ENABLED: "1"
+        run: cd pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...

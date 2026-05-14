@@ -913,9 +913,24 @@ func (r *Reconciler) executeMergeSeal(
 	if err != nil {
 		return err
 	}
+	donorLeaderClient, err := r.storeOps.GetLeaderClientForShard(ctx, donorShardID)
+	if err != nil {
+		return fmt.Errorf("loading donor leader client: %w", err)
+	}
+	donorLeaderStatus, err := donorLeaderClient.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("loading donor leader status: %w", err)
+	}
+	liveDonorStatus := donorLeaderStatus.Shards[donorShardID]
+	if liveDonorStatus == nil {
+		return fmt.Errorf("donor shard %s missing from leader status", donorShardID)
+	}
 	receiverState := proto.Clone(receiverStatus.MergeState).(*db.MergeState)
 	donorState := proto.Clone(donorStatus.MergeState).(*db.MergeState)
-	finalSeq := donorStatus.MergeDeltaSeq
+	finalSeq := liveDonorStatus.MergeDeltaSeq
+	if finalSeq < receiverState.GetReplaySeq() {
+		finalSeq = receiverState.GetReplaySeq()
+	}
 	receiverState.SetPhase(db.MergeState_PHASE_FINALIZING)
 	receiverState.SetFinalSeq(finalSeq)
 	donorState.SetPhase(db.MergeState_PHASE_FINALIZING)
