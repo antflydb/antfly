@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -20,7 +20,7 @@ ARG TARGETARCH
 RUN GOEXPERIMENT=simd CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o antfly ./cmd/antfly
 
 # Stage 2: Create the final, minimal image
-FROM alpine:3.21
+FROM --platform=$TARGETPLATFORM alpine:3.21
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB - Distributed document database with vector search for AI applications"
