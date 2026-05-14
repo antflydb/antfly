@@ -2051,6 +2051,93 @@ func TestExecuteMergeRollback_ResetsMetadata(t *testing.T) {
 	assert.True(t, reconciler.IsShardInCooldown(donorID))
 }
 
+func TestExecuteMergeSeal_UsesLiveDonorLeaderSequence(t *testing.T) {
+	mockShardOps := &MockShardOperations{}
+	mockTableOps := &MockTableOperations{}
+	mockStoreOps := &MockStoreOperations{}
+
+	receiverID := types.ID(1)
+	donorID := types.ID(2)
+
+	receiverMergeState := &db.MergeState{}
+	receiverMergeState.SetPhase(db.MergeState_PHASE_CATCHUP)
+	receiverMergeState.SetDonorShardId(uint64(donorID))
+	receiverMergeState.SetReceiverShardId(uint64(receiverID))
+	receiverMergeState.SetAcceptDonorRange(true)
+	receiverMergeState.SetCopyCompleted(true)
+
+	donorMergeState := &db.MergeState{}
+	donorMergeState.SetPhase(db.MergeState_PHASE_CATCHUP)
+	donorMergeState.SetDonorShardId(uint64(donorID))
+	donorMergeState.SetReceiverShardId(uint64(receiverID))
+	donorMergeState.SetCaptureDeltas(true)
+
+	mockStoreOps.On("GetShardStatuses").Return(map[types.ID]*store.ShardStatus{
+		receiverID: {
+			ID:    receiverID,
+			Table: "users",
+			State: store.ShardState_PreMerge,
+			ShardInfo: store.ShardInfo{
+				MergeState: receiverMergeState,
+			},
+		},
+		donorID: {
+			ID:    donorID,
+			Table: "users",
+			ShardInfo: store.ShardInfo{
+				MergeDeltaSeq: 5,
+				MergeState:    donorMergeState,
+			},
+		},
+	}, nil)
+	mockStoreOps.On("GetLeaderClientForShard", mock.Anything, donorID).Return(&stubStoreRPC{
+		status: &store.StoreStatus{
+			Shards: map[types.ID]*store.ShardInfo{
+				donorID: {MergeDeltaSeq: 2},
+			},
+		},
+	}, nil)
+	mockShardOps.On(
+		"SetMergeState",
+		mock.Anything,
+		donorID,
+		mock.MatchedBy(func(state *db.MergeState) bool {
+			return state != nil &&
+				state.GetPhase() == db.MergeState_PHASE_FINALIZING &&
+				state.GetFinalSeq() == 2 &&
+				!state.GetCaptureDeltas() &&
+				state.GetDenyDonorWrites()
+		}),
+	).Return(nil)
+	mockShardOps.On(
+		"SetMergeState",
+		mock.Anything,
+		receiverID,
+		mock.MatchedBy(func(state *db.MergeState) bool {
+			return state != nil &&
+				state.GetPhase() == db.MergeState_PHASE_FINALIZING &&
+				state.GetFinalSeq() == 2 &&
+				state.GetAcceptDonorRange()
+		}),
+	).Return(nil)
+	mockStoreOps.On("UpdateShardMergeState", mock.Anything, donorID, mock.Anything).Return(nil)
+	mockStoreOps.On("UpdateShardMergeState", mock.Anything, receiverID, mock.Anything).Return(nil)
+
+	reconciler := NewReconciler(
+		mockShardOps,
+		mockTableOps,
+		mockStoreOps,
+		ReconciliationConfig{ReplicationFactor: 1},
+		zap.NewNop(),
+	)
+
+	err := reconciler.executeMergeSeal(context.Background(), receiverID, donorID)
+
+	assert.NoError(t, err)
+	mockStoreOps.AssertExpectations(t)
+	mockShardOps.AssertExpectations(t)
+}
+
 func TestExecuteSplitRollback_ResetsMetadata(t *testing.T) {
 	mockShardOps := &MockShardOperations{}
 	mockTableOps := &MockTableOperations{}

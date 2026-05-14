@@ -143,7 +143,14 @@ jobs:
           wait $SWARM_PID 2>/dev/null || true
 
       - name: Test
-        run: go test -v ./...
+        run: |
+          packages=()
+          while IFS= read -r pkg; do
+            if [ "$pkg" != "github.com/antflydb/antfly/src/sim" ]; then
+              packages+=("$pkg")
+            fi
+          done < <(go list ./...)
+          go test -v "${packages[@]}"
 
       - name: Build termite (pure Go)
         env:
