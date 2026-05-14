@@ -1,19 +1,22 @@
-# Antfly Proxy CI workflow
-# Runs focused proxy checks and smoke-builds Dockerfile.proxy on PRs/pushes.
+# Combined proxy CI: tests, builds, and smoke-runs the antfly-proxy and
+# termite-proxy modules. Both are pure-Go submodules with no native deps,
+# so they share one runner pod.
 
-name: Antfly Proxy Tests
+name: Proxy Tests
 
 on:
   push:
     branches: ["main"]
     paths:
       - "pkg/antfly-proxy/**"
-      - ".github/workflows/antfly-proxy-*.yml"
+      - "pkg/termite-proxy/**"
+      - ".github/workflows/antfly-proxy-go.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "pkg/antfly-proxy/**"
-      - ".github/workflows/antfly-proxy-*.yml"
+      - "pkg/termite-proxy/**"
+      - ".github/workflows/antfly-proxy-go.yml"
   workflow_dispatch:
 
 concurrency:
@@ -21,7 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  proxy:
+  proxies:
     runs-on: arc-antfly-standard
     steps:
       - uses: actions/checkout@v6
@@ -34,11 +37,20 @@ jobs:
           go-version: "1.26"
           cache: false
 
-      - name: Run proxy unit tests
-        run: cd pkg/antfly-proxy && go test ./...
+      - name: Test antfly-proxy
+        run: cd pkg/antfly-proxy && GOWORK=off go test ./...
 
       - name: Build antfly-proxy
-        run: cd pkg/antfly-proxy && go build -v -o ../../antfly-proxy ./cmd/antfly-proxy
+        run: cd pkg/antfly-proxy && GOWORK=off go build -v -o ../../antfly-proxy ./cmd/antfly-proxy
 
       - name: Smoke test antfly-proxy
         run: timeout 2 ./antfly-proxy || [ $? -eq 124 ]
+
+      - name: Test termite-proxy
+        run: cd pkg/termite-proxy && GOWORK=off go test ./...
+
+      - name: Build termite-proxy
+        run: cd pkg/termite-proxy && GOWORK=off go build -v -o ../../termite-proxy ./cmd/termite-proxy
+
+      - name: Smoke test termite-proxy
+        run: timeout 2 ./termite-proxy || [ $? -eq 124 ]

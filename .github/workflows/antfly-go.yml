@@ -14,14 +14,11 @@ on:
       - "py/**"
       - "pkg/antfly-proxy/**"
       - "pkg/operator/**"
-      - "pkg/termite/**"
-      - "pkg/termite-client/**"
       - "pkg/termite-proxy/**"
       - ".github/workflows/ts-*.yml"
       - ".github/workflows/py-*.yml"
       - ".github/workflows/antfly-operator-*.yml"
       - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/termite-*.yml"
       - ".github/workflows/antfly-container.yml"
       - ".github/workflows/trigger-docs-build.yml"
   pull_request:
@@ -34,14 +31,11 @@ on:
       - "py/**"
       - "pkg/antfly-proxy/**"
       - "pkg/operator/**"
-      - "pkg/termite/**"
-      - "pkg/termite-client/**"
       - "pkg/termite-proxy/**"
       - ".github/workflows/ts-*.yml"
       - ".github/workflows/py-*.yml"
       - ".github/workflows/antfly-operator-*.yml"
       - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/termite-*.yml"
       - ".github/workflows/antfly-container.yml"
       - ".github/workflows/trigger-docs-build.yml"
   workflow_dispatch:
@@ -49,6 +43,12 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
+
+env:
+  TOKENIZERS_VERSION: "1.26.0"
+  ONNXRUNTIME_VERSION: "1.24.3"
+  GENAI_VERSION: "0.12.1"
+  PJRT_CPU_VERSION: "0.83.1"
 
 jobs:
   unit:
@@ -144,6 +144,22 @@ jobs:
 
       - name: Test
         run: go test -v ./...
+
+      - name: Build termite (pure Go)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for mod in pkg/termite pkg/termite-client; do
+            (cd $mod && GOWORK=off go build -v ./...)
+          done
+
+      - name: Test termite (pure Go)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for mod in pkg/termite pkg/termite-client; do
+            (cd $mod && GOWORK=off go test -v ./...)
+          done
 
   sim-validate:
     runs-on: arc-antfly-heavy
@@ -272,3 +288,91 @@ jobs:
           ANTFLY_E2E_PG_DSN: postgres://antfly:antfly_dev@127.0.0.1:5432/antfly_test?sslmode=disable
         run: |
           make e2e E2E_TIMEOUT=45m
+
+  omni:
+    # Omni combines ONNX (CGO) and XLA (CGO) backends; requires GLIBC 2.38+,
+    # so it runs in an Ubuntu 24.04 container. ARC's default actions-runner
+    # image is 22.04 (GLIBC 2.35), and `container:` requires kubernetesMode
+    # to render the container as a separate step pod (the other scale sets
+    # don't have docker installed, so DinD isn't an option). Hence
+    # arc-antfly-k8s, which has kubernetesMode enabled.
+    runs-on: arc-antfly-k8s
+    container: ubuntu:24.04
+    steps:
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y git ca-certificates curl
+
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set GOEXPERIMENT
+        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential pkg-config curl git ca-certificates
+
+      - name: Download libtokenizers
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "amd64")
+          curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
+            | tar -xzf - -C /usr/local/lib
+          ldconfig
+
+      # Heavy downloads land under $RUNNER_TEMP rather than /tmp because in
+      # kubernetesMode the step pod's root filesystem is capped at ~1Gi by
+      # Autopilot defaults, and the 350MB onnxruntime tarballs (plus go
+      # cache) blow past it. $RUNNER_TEMP resolves to the workspace PVC
+      # (20Gi) in k8s mode.
+      - name: Download ONNX Runtime
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
+          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
+            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime"
+          echo "CGO_CFLAGS=-I$RUNNER_TEMP/onnxruntime/include" >> $GITHUB_ENV
+          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/onnxruntime/lib -lonnxruntime" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
+
+      - name: Download ONNX Runtime GenAI
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "x64")
+          mkdir -p "$RUNNER_TEMP/onnxruntime-genai"
+          curl -fsSL "https://github.com/microsoft/onnxruntime-genai/releases/download/v${GENAI_VERSION}/onnxruntime-genai-${GENAI_VERSION}-linux-${ARCH}.tar.gz" \
+            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime-genai"
+          cp "$RUNNER_TEMP/onnxruntime-genai/lib"/libonnxruntime-genai*.so* "$RUNNER_TEMP/onnxruntime/lib/" 2>/dev/null || true
+          echo "ORTGENAI_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime-genai.so" >> $GITHUB_ENV
+
+      - name: Download PJRT CPU plugin
+        run: |
+          mkdir -p /usr/local/lib/go-xla
+          curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/download/v${PJRT_CPU_VERSION}/pjrt_cpu_linux_amd64.tar.gz" \
+            | tar -xzf - -C /usr/local/lib/go-xla
+          ldconfig
+          echo "LD_LIBRARY_PATH=/usr/local/lib/go-xla:$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "GOMLX_BACKEND=xla:cpu" >> $GITHUB_ENV
+
+      - name: Download dependencies
+        run: cd pkg/termite && GOWORK=off go mod download
+
+      - name: Build termite (omni)
+        env:
+          CGO_ENABLED: "1"
+        run: cd pkg/termite && GOWORK=off go build -v -tags="onnx,ORT,xla,XLA" ./...
+
+      - name: Test termite (omni)
+        env:
+          CGO_ENABLED: "1"
+        run: cd pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...
