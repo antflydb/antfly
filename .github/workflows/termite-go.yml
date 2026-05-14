@@ -1,10 +1,8 @@
-# Build and test Termite with different inference backends
+# Build and test Termite with the pure Go and omni inference backends
 #
 # Uses matrix strategy to test:
-# - pure-go: Pure Go backend (full tests)
-# - onnx: ONNX Runtime backend (build + tests)
-# - xla: GoMLX XLA backend with PJRT CPU plugin (build + tests)
-# - omni: Both ONNX + XLA backends (build + tests)
+# - go: Pure Go backend (full tests)
+# - omni: Combined ONNX + XLA backend (build + tests)
 
 name: Termite Go
 
@@ -38,25 +36,17 @@ jobs:
   test:
     name: Test (${{ matrix.backend }})
     runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
-    # XLA/omni backends require GLIBC 2.38+ (Ubuntu 24.04)
+    # Omni backend requires GLIBC 2.38+ (Ubuntu 24.04)
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
-        backend: [pure-go, onnx, xla, omni]
+        backend: [go, omni]
         include:
-          - backend: pure-go
+          - backend: go
             tags: ""
             cgo: "0"
             container: ""
-          - backend: onnx
-            tags: "onnx,ORT"
-            cgo: "1"
-            container: ""
-          - backend: xla
-            tags: "xla,XLA"
-            cgo: "1"
-            container: "ubuntu:24.04"
           - backend: omni
             tags: "onnx,ORT,xla,XLA"
             cgo: "1"
@@ -116,7 +106,7 @@ jobs:
           fi
 
       - name: Download ONNX Runtime
-        if: matrix.backend == 'onnx' || matrix.backend == 'omni'
+        if: matrix.backend == 'omni'
         run: |
           ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
           mkdir -p /tmp/onnxruntime
@@ -128,7 +118,7 @@ jobs:
           echo "ORT_DYLIB_PATH=/tmp/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
 
       - name: Download ONNX Runtime GenAI
-        if: matrix.backend == 'onnx' || matrix.backend == 'omni'
+        if: matrix.backend == 'omni'
         run: |
           ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "x64")
           mkdir -p /tmp/onnxruntime-genai
@@ -138,7 +128,7 @@ jobs:
           echo "ORTGENAI_DYLIB_PATH=/tmp/onnxruntime/lib/libonnxruntime-genai.so" >> $GITHUB_ENV
 
       - name: Download PJRT CPU plugin
-        if: matrix.backend == 'xla' || matrix.backend == 'omni'
+        if: matrix.backend == 'omni'
         run: |
           if [ -n "${{ matrix.container }}" ]; then
             mkdir -p /usr/local/lib/go-xla
@@ -172,7 +162,7 @@ jobs:
             # Backend-specific builds only need pkg/termite
             cd pkg/termite && GOWORK=off go build -v -tags="${{ matrix.tags }}" ./...
           else
-            # Pure-go builds both modules
+            # Go-only builds both modules
             for mod in pkg/termite pkg/termite-client; do
               (cd $mod && GOWORK=off go build -v ./...)
             done
@@ -189,5 +179,5 @@ jobs:
           fi
 
       - name: Test termite-client
-        if: matrix.backend == 'pure-go'
+        if: matrix.backend == 'go'
         run: cd pkg/termite-client && GOWORK=off go test -v ./...
