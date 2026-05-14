@@ -297,19 +297,29 @@ jobs:
           make e2e E2E_TIMEOUT=45m
 
   omni:
-    # Omni combines ONNX (CGO) and XLA (CGO) backends; requires GLIBC 2.38+,
-    # so it runs in an Ubuntu 24.04 container. ARC's default actions-runner
-    # image is 22.04 (GLIBC 2.35), and `container:` requires kubernetesMode
-    # to render the container as a separate step pod (the other scale sets
-    # don't have docker installed, so DinD isn't an option). Hence
-    # arc-antfly-k8s, which has kubernetesMode enabled.
-    runs-on: arc-antfly-k8s
-    container: ubuntu:24.04
+    # Omni combines ONNX (CGO) and XLA (CGO) backends and needs GLIBC 2.38+.
+    # ARC's actions-runner image now runs on Ubuntu 24.04, so this can run
+    # directly on the heavy runner without a kubernetesMode job container.
+    runs-on: arc-antfly-heavy
+    env:
+      GOCACHE: /mnt/cache/go-build
+      GOMODCACHE: /mnt/cache/go-mod
     steps:
+      - name: Prepare cache directories
+        run: |
+          set -eux
+          mkdir -p "$GOCACHE" "$GOMODCACHE"
+
+      - name: Verify runner image
+        run: |
+          cat /etc/os-release
+          ldd --version
+          sudo -n true
+
       - name: Install container prerequisites
         run: |
-          apt-get update
-          apt-get install -y git ca-certificates curl
+          sudo apt-get update
+          sudo apt-get install -y git ca-certificates curl
 
       - uses: actions/checkout@v6
 
@@ -330,21 +340,16 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          apt-get update
-          apt-get install -y build-essential pkg-config curl git ca-certificates
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config curl git ca-certificates
 
       - name: Download libtokenizers
         run: |
           ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "amd64")
           curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
-            | tar -xzf - -C /usr/local/lib
-          ldconfig
+            | sudo tar -xzf - -C /usr/local/lib
+          sudo ldconfig
 
-      # Heavy downloads land under $RUNNER_TEMP rather than /tmp because in
-      # kubernetesMode the step pod's root filesystem is capped at ~1Gi by
-      # Autopilot defaults, and the 350MB onnxruntime tarballs (plus go
-      # cache) blow past it. $RUNNER_TEMP resolves to the workspace PVC
-      # (20Gi) in k8s mode.
       - name: Download ONNX Runtime
         run: |
           ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
@@ -367,10 +372,10 @@ jobs:
 
       - name: Download PJRT CPU plugin
         run: |
-          mkdir -p /usr/local/lib/go-xla
+          sudo mkdir -p /usr/local/lib/go-xla
           curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/download/v${PJRT_CPU_VERSION}/pjrt_cpu_linux_amd64.tar.gz" \
-            | tar -xzf - -C /usr/local/lib/go-xla
-          ldconfig
+            | sudo tar -xzf - -C /usr/local/lib/go-xla
+          sudo ldconfig
           echo "LD_LIBRARY_PATH=/usr/local/lib/go-xla:$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
           echo "GOMLX_BACKEND=xla:cpu" >> $GITHUB_ENV
 
