@@ -106,14 +106,15 @@ func (r *TermiteRoute) validateMatch() error {
 	match := r.Spec.Match
 
 	// Validate operations
-	validOps := map[OperationType]bool{
-		OperationEmbed:  true,
-		OperationChunk:  true,
-		OperationRerank: true,
+	validOps := make(map[OperationType]bool, len(ValidOperationTypes))
+	validOpNames := make([]string, 0, len(ValidOperationTypes))
+	for _, op := range ValidOperationTypes {
+		validOps[op] = true
+		validOpNames = append(validOpNames, string(op))
 	}
 	for _, op := range match.Operations {
 		if !validOps[op] {
-			return fmt.Errorf("invalid operation '%s'. Must be one of: embed, chunk, rerank", op)
+			return fmt.Errorf("invalid operation '%s'. Must be one of: %s", op, strings.Join(validOpNames, ", "))
 		}
 	}
 

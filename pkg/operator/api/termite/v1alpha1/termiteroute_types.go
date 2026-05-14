@@ -72,10 +72,27 @@ type RouteMatch struct {
 type OperationType string
 
 const (
-	OperationEmbed  OperationType = "embed"
-	OperationChunk  OperationType = "chunk"
-	OperationRerank OperationType = "rerank"
+	OperationEmbed           OperationType = "embed"
+	OperationEmbeddings      OperationType = "embeddings"
+	OperationChunk           OperationType = "chunk"
+	OperationRerank          OperationType = "rerank"
+	OperationRecognize       OperationType = "recognize"
+	OperationExtract         OperationType = "extract"
+	OperationGenerate        OperationType = "generate"
+	OperationChatCompletions OperationType = "chat.completions"
 )
+
+// ValidOperationTypes contains all routable Termite API operation values.
+var ValidOperationTypes = []OperationType{
+	OperationEmbed,
+	OperationEmbeddings,
+	OperationChunk,
+	OperationRerank,
+	OperationRecognize,
+	OperationExtract,
+	OperationGenerate,
+	OperationChatCompletions,
+}
 
 // StringMatch defines how to match a string value
 type StringMatch struct {
