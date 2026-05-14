@@ -232,8 +232,9 @@ type ModelRegistry struct {
 
 	circuitBreakers map[string]*CircuitBreaker
 
-	refreshInterval time.Duration
-	client          *http.Client
+	refreshInterval       time.Duration
+	client                *http.Client
+	upstreamAuthorization string
 
 	mu sync.RWMutex
 }
@@ -250,6 +251,19 @@ func NewModelRegistry(refreshInterval time.Duration) *ModelRegistry {
 			Timeout: 5 * time.Second,
 		},
 	}
+}
+
+// SetUpstreamAuthorization configures the Authorization header used for upstream refreshes and requests.
+func (r *ModelRegistry) SetUpstreamAuthorization(value string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upstreamAuthorization = strings.TrimSpace(value)
+}
+
+func (r *ModelRegistry) upstreamAuthorizationValue() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.upstreamAuthorization
 }
 
 type PoolConditionStats struct {
@@ -567,11 +581,15 @@ func (r *ModelRegistry) isEndpointAvailableLocked(ep *Endpoint) bool {
 
 // RefreshEndpoint fetches current model list and health from an endpoint
 func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) error {
+	authorization := r.upstreamAuthorizationValue()
 	if healthURL := r.endpointHealthURL(address); healthURL != "" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 		if err != nil {
 			r.markUnhealthy(address)
 			return err
+		}
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
 		}
 		resp, err := r.client.Do(req)
 		if err != nil {
@@ -585,7 +603,16 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		}
 	}
 
-	resp, err := r.client.Get(address + "/ml/v1/models")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address+"/ml/v1/models", nil)
+	if err != nil {
+		r.markUnhealthy(address)
+		return err
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+
+	resp, err := r.client.Do(req)
 	if err != nil {
 		r.markUnhealthy(address)
 		return err
@@ -925,18 +952,20 @@ type Proxy struct {
 
 // Config holds proxy configuration
 type Config struct {
-	ListenAddr           string
-	DefaultPool          string
-	RefreshInterval      time.Duration
-	EnableRouteWatching  bool        // Enable watching TermiteRoute CRs
-	RouteWatchNamespace  string      // Namespace to watch for routes (empty for all)
-	RouteWatchKubeconfig string      // Optional kubeconfig path for route watching
-	Logger               *zap.Logger // Optional logger (defaults to production logger)
+	ListenAddr            string
+	DefaultPool           string
+	RefreshInterval       time.Duration
+	EnableRouteWatching   bool        // Enable watching TermiteRoute CRs
+	RouteWatchNamespace   string      // Namespace to watch for routes (empty for all)
+	RouteWatchKubeconfig  string      // Optional kubeconfig path for route watching
+	UpstreamAuthorization string      // Optional Authorization header value for upstream refreshes and requests
+	Logger                *zap.Logger // Optional logger (defaults to production logger)
 }
 
 // NewProxy creates a new Proxy
 func NewProxy(cfg Config) *Proxy {
 	registry := NewModelRegistry(cfg.RefreshInterval)
+	registry.SetUpstreamAuthorization(cfg.UpstreamAuthorization)
 	router := NewRouter(registry)
 
 	logger := cfg.Logger
@@ -1317,6 +1346,9 @@ func (p *Proxy) forwardRequest(r *http.Request, body []byte, endpoint *Endpoint,
 	outReq.RequestURI = ""
 	outReq.Body = io.NopCloser(bytes.NewReader(body))
 	outReq.ContentLength = int64(len(body))
+	if authorization := p.registry.upstreamAuthorizationValue(); authorization != "" {
+		outReq.Header.Set("Authorization", authorization)
+	}
 
 	return p.registry.client.Do(outReq)
 }

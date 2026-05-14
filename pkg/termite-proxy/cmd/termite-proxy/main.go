@@ -40,6 +40,7 @@ func main() {
 	viper.SetDefault("health_port", 4200)
 	viper.SetDefault("default_pool", "default")
 	viper.SetDefault("refresh_interval", "10s")
+	viper.SetDefault("upstream_authorization", "")
 	viper.SetDefault("namespace", "")
 	viper.SetDefault("selector", "app.kubernetes.io/name=termite")
 	viper.SetDefault("log.level", "info")
@@ -108,6 +109,7 @@ Examples:
 	cmd.Flags().Int("health-port", 4200, "Health/readiness/metrics server port")
 	cmd.Flags().String("default-pool", "default", "Default pool for routing")
 	cmd.Flags().Duration("refresh-interval", 10*time.Second, "Interval to refresh endpoint models")
+	cmd.Flags().String("upstream-authorization", "", "Authorization header value to send to upstream Termite endpoints")
 
 	// Kubernetes flags
 	cmd.Flags().String("kubeconfig", "", "Path to kubeconfig (uses in-cluster config if empty)")
@@ -127,6 +129,7 @@ Examples:
 	mustBindFlag(cmd, "health-port", "health_port")
 	mustBindFlag(cmd, "default-pool", "default_pool")
 	mustBindFlag(cmd, "refresh-interval", "refresh_interval")
+	mustBindFlag(cmd, "upstream-authorization", "upstream_authorization")
 	mustBindFlag(cmd, "kubeconfig", "kubeconfig")
 	mustBindFlag(cmd, "namespace", "namespace")
 	mustBindFlag(cmd, "selector", "selector")
@@ -156,6 +159,7 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	healthPort := viper.GetInt("health_port")
 	defaultPool := viper.GetString("default_pool")
 	refreshInterval := viper.GetDuration("refresh_interval")
+	upstreamAuthorization := viper.GetString("upstream_authorization")
 	kubeconfig := viper.GetString("kubeconfig")
 	namespace := viper.GetString("namespace")
 	labelSelector := viper.GetString("selector")
@@ -167,13 +171,14 @@ func runProxy(cmd *cobra.Command, args []string) error {
 
 	// Create proxy
 	cfg := proxy.Config{
-		ListenAddr:           listenAddr,
-		DefaultPool:          defaultPool,
-		RefreshInterval:      refreshInterval,
-		EnableRouteWatching:  enableRouteWatching && inKubernetes,
-		RouteWatchNamespace:  routeNamespace,
-		RouteWatchKubeconfig: kubeconfig,
-		Logger:               logger,
+		ListenAddr:            listenAddr,
+		DefaultPool:           defaultPool,
+		RefreshInterval:       refreshInterval,
+		EnableRouteWatching:   enableRouteWatching && inKubernetes,
+		RouteWatchNamespace:   routeNamespace,
+		RouteWatchKubeconfig:  kubeconfig,
+		UpstreamAuthorization: upstreamAuthorization,
+		Logger:                logger,
 	}
 	p := proxy.NewProxy(cfg)
 
