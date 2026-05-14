@@ -1,14 +1,14 @@
-import type { TableStatus } from "@antfly/sdk";
-import { Database } from "lucide-react";
-import type React from "react";
-import { Label } from "@/components/ui/label";
 import {
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@antfly/design-system";
+import type { TableStatus } from "@antfly/sdk";
+import { Database } from "lucide-react";
+import type React from "react";
 
 interface TableIndexSelectorProps {
   tables: TableStatus[];
@@ -70,7 +70,7 @@ export const TableIndexSelector: React.FC<TableIndexSelectorProps> = ({
           </Select>
         )}
         {selectedTable && embeddingIndexes.length === 0 && (
-          <span className="text-xs text-amber-600">No embedding index</span>
+          <span className="text-xs af-status-text-warning">No embedding index</span>
         )}
       </div>
     );

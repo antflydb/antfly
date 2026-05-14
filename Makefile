@@ -451,8 +451,8 @@ show-ingress:
 # Operator Commands
 # ====================================================================================
 
-.PHONY: operator-build operator-test operator-docker-build operator-lint proxy-docker-build \
-        termite-proxy-build termite-proxy-docker-build \
+.PHONY: operator-build operator-test operator-docker-build operator-lint \
+        termite-proxy-build \
         termite-build termite-test termite-lint \
         termite-client-test termite-client-lint
 
@@ -468,14 +468,8 @@ operator-lint: ## Run linter on antfly-operator
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./Dockerfile.antfly-operator .
 
-proxy-docker-build: ## Build antfly-proxy Docker image
-	docker build -t antfly-proxy:latest -f ./Dockerfile.antfly-proxy .
-
 termite-proxy-build: ## Build the termite-proxy binary
 	(cd ./pkg/termite-proxy && $(GO) build -o ../../termite-proxy ./cmd/termite-proxy)
-
-termite-proxy-docker-build: ## Build termite-proxy Docker image
-	docker build -t termite-proxy:latest -f ./Dockerfile.termite-proxy .
 
 termite-build: ## Build the termite binary (pure Go)
 	(cd ./pkg/termite && $(GO) build -o ../../termite ./cmd)

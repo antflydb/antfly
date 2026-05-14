@@ -159,7 +159,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       if (!user) return false;
 
       // Check for exact match or wildcard permissions
-      return user.permissions.some((perm: Permission) => {
+      return (user.permissions ?? []).some((perm: Permission) => {
         const resourceMatch = perm.resource === resource || perm.resource === "*";
         const typeMatch = perm.resource_type === resourceType || perm.resource_type === "*";
         const permMatch = perm.type === permissionType || perm.type === "admin";

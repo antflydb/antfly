@@ -1,0 +1,175 @@
+/**
+ * @antfly/design-system — styles.css
+ * Consumer-facing CSS entry. Bundles:
+ *   - Aeonik @font-face
+ *   - Cool-gray / purple-accent tokens (light + dark)
+ *   - Radii, shadows
+ *   - Tailwind v4 theme mapping
+ *   - Class-based dark mode variant
+ *   - .mono-label (Roboto Mono, uppercase, technical voice)
+ *   - .grid-paper (subtle hexagonal background)
+ *   - Animation keyframes for shadcn primitives
+ *
+ * Consumers should load Roboto Mono separately (next/font, Google Fonts, etc.)
+ * so font-mono resolves; otherwise the stack falls back to Menlo/Monaco.
+ */
+
+@import "./tokens/index.css";
+@import "tailwindcss";
+@import "./theme.css";
+@import "./charts.css";
+
+@source "src/**/*.{js,ts,jsx,tsx}";
+
+@custom-variant dark (&:is(.dark *));
+
+@layer base {
+  html,
+  body,
+  :root {
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+
+  * {
+    @apply border-border outline-ring/60;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+  }
+
+  /* Aeonik headlines — applied to every heading element by default */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  .font-display {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-feature-settings:
+      "liga" 1,
+      "calt" 1;
+    letter-spacing: 0;
+  }
+}
+
+/* Keyframes */
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@layer utilities {
+  .animate-accordion-down {
+    animation: accordion-down 0.2s ease-out;
+  }
+  .animate-accordion-up {
+    animation: accordion-up 0.2s ease-out;
+  }
+  .animate-fade-in {
+    animation: fade-in 0.3s ease-out;
+  }
+  .font-aeonik {
+    font-family: var(--font-display);
+  }
+  .logo-text {
+    font-family: var(--font-display);
+  }
+}
+
+@layer components {
+  .container {
+    width: 100%;
+    max-width: 1280px;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  @media (min-width: 640px) {
+    .container {
+      padding-left: 1.5rem;
+      padding-right: 1.5rem;
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .container {
+      padding-left: 2rem;
+      padding-right: 2rem;
+    }
+  }
+
+  /* Mono label — the "technical voice" of the design system.
+     Pair with Aeonik headlines. Used for section eyebrows, code annotations,
+     sidebar section headers. */
+  .mono-label {
+    font-family: var(--font-mono);
+    font-size: var(--label-size);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--label-color);
+    font-weight: 500;
+  }
+
+  /* Graph paper — subtle hexagonal honeycomb tessellation.
+     Pointy-top hexagons, circumradius 32px (64px tall). Tile = one hex + bridge.
+     Tile: 55.42 x 96. Stroke color swaps between light and dark modes. */
+  .grid-paper {
+    background-color: transparent;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%239999a030' stroke-width='0.5'/%3E%3C/svg%3E");
+    background-size: 55.42px 96px;
+  }
+
+  .dark .grid-paper {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%23ffffff14' stroke-width='0.5'/%3E%3C/svg%3E");
+  }
+}
+
+/* ============================================================================
+   Density scope
+   Apply `data-density="compact"` or `data-density="comfortable"` to any
+   ancestor (html, body, a container div) to rescale every spacing utility
+   underneath it. Tailwind v4 compiles h-*, p-*, m-*, gap-*, etc. to
+   `calc(var(--spacing) * N)`, so overriding --spacing in a scoped selector
+   cascades to every descendant without any component changes.
+
+   - compact       ~12% tighter than default — for dense dashboards/data
+   - default       Tailwind's 0.25rem — unset attribute uses this
+   - comfortable   ~20% airier — for marketing pages, SearchAF-style breathing room
+   ============================================================================ */
+[data-density="compact"] {
+  --spacing: 0.22rem;
+}
+[data-density="comfortable"] {
+  --spacing: 0.3rem;
+}

@@ -1,5 +1,14 @@
 "use client";
 
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+} from "@antfly/design-system";
 import { TermiteClient } from "@antfly/termite-sdk";
 import {
   ArrowUpDown,
@@ -7,9 +16,7 @@ import {
   HelpCircle,
   Library,
   Loader2,
-  Maximize2,
   MessageSquare,
-  Minimize2,
   Moon,
   Network,
   Plus,
@@ -22,16 +29,6 @@ import {
 } from "lucide-react";
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
-import { useContentWidth } from "@/components/content-width-provider";
-import {
-  CommandDialog,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-  CommandSeparator,
-} from "@/components/ui/command";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTheme } from "@/hooks/use-theme";
 import { type SemanticResult, semanticSearch } from "@/lib/semantic-search";
@@ -50,8 +47,6 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   MessageSquare,
   Moon,
   Sun,
-  Maximize2,
-  Minimize2,
 };
 
 interface CommandPaletteContextType {
@@ -71,7 +66,6 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const navigate = useNavigate();
 
   const { theme, setTheme } = useTheme();
-  const { contentWidth, toggleContentWidth } = useContentWidth();
   const { termiteApiUrl } = useApiConfig();
 
   // Create TermiteClient for semantic search
@@ -117,10 +111,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     { icon: ClipboardCheck, label: "Evals", href: "/playground/evals" },
   ];
 
-  const quickActionCommands = [
-    { icon: Moon, label: "Toggle Theme", action: "toggle-theme" },
-    { icon: Maximize2, label: "Toggle Content Width", action: "toggle-width" },
-  ];
+  const quickActionCommands = [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }];
 
   // All command items for string matching check
   const allItems = React.useMemo(
@@ -176,13 +167,11 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
       if (action === "toggle-theme") {
         setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system");
-      } else if (action === "toggle-width") {
-        toggleContentWidth();
       } else if (href) {
         navigate(href);
       }
     },
-    [navigate, theme, setTheme, toggleContentWidth]
+    [navigate, theme, setTheme]
   );
 
   return (
@@ -244,12 +233,6 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
                 if (command.action === "toggle-theme") {
                   DynamicIcon = theme === "dark" ? Sun : Moon;
                   DynamicLabel = theme === "dark" ? "Switch to Light Mode" : "Switch to Dark Mode";
-                } else if (command.action === "toggle-width") {
-                  DynamicIcon = contentWidth === "restricted" ? Maximize2 : Minimize2;
-                  DynamicLabel =
-                    contentWidth === "restricted"
-                      ? "Expand Content Width"
-                      : "Restrict Content Width";
                 }
               }
 

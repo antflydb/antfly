@@ -3,6 +3,7 @@ packages:
   - apps/*
 
 onlyBuiltDependencies:
+  - "@tailwindcss/oxide"
   - canvas
   - core-js
   - esbuild

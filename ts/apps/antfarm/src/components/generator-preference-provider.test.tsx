@@ -65,7 +65,9 @@ describe("GeneratorPreferenceProvider", () => {
     });
 
     renderWithProvider(<Consumer />);
-    expect(() => fireEvent.click(screen.getByRole("button", { name: "Set Generator" }))).not.toThrow();
+    expect(() =>
+      fireEvent.click(screen.getByRole("button", { name: "Set Generator" }))
+    ).not.toThrow();
     expect(screen.getByTestId("generator").textContent).toBe("gpt-4.1");
   });
 });

@@ -1,0 +1,245 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: externaltermitepools.antfly.io
+spec:
+  group: antfly.io
+  names:
+    kind: ExternalTermitePool
+    listKind: ExternalTermitePoolList
+    plural: externaltermitepools
+    singular: externaltermitepool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.workloadType
+      name: Workload
+      type: string
+    - jsonPath: .spec.endpoints[*].name
+      name: Endpoints
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ExternalTermitePool is the Schema for externally managed Termite
+          pools.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ExternalTermitePoolSpec defines externally managed Termite-compatible
+              endpoints.
+            properties:
+              endpoints:
+                description: |-
+                  Endpoints are Kubernetes Service-backed Termite API endpoints.
+                  The proxy resolves these service names inside the cluster.
+                items:
+                  description: ExternalTermiteEndpoint defines one externally managed
+                    Termite service endpoint.
+                  properties:
+                    apiPort:
+                      default: 11433
+                      description: APIPort is the Termite ML API port.
+                      format: int32
+                      maximum: 65535
+                      minimum: 1
+                      type: integer
+                    apiServiceRef:
+                      description: APIServiceRef is the Kubernetes Service name for
+                        the Termite ML API.
+                      minLength: 1
+                      type: string
+                    healthPort:
+                      default: 4200
+                      description: HealthPort is the operational health server port.
+                        Health is checked at /readyz.
+                      format: int32
+                      maximum: 65535
+                      minimum: 1
+                      type: integer
+                    healthServiceRef:
+                      description: |-
+                        HealthServiceRef is the Kubernetes Service name for the operational health server.
+                        Defaults to APIServiceRef when omitted.
+                      type: string
+                    name:
+                      description: Name is a stable identifier for this endpoint within
+                        the pool.
+                      minLength: 1
+                      type: string
+                  required:
+                  - apiServiceRef
+                  - name
+                  type: object
+                minItems: 1
+                type: array
+              models:
+                description: |-
+                  Models optionally declares expected models before runtime discovery completes.
+                  Runtime /ml/v1/models discovery remains authoritative.
+                items:
+                  description: ModelSpec defines a single model to load
+                  properties:
+                    name:
+                      description: Name is the model name (e.g., "bge-small-en-v1.5")
+                      type: string
+                    priority:
+                      default: medium
+                      description: Priority determines loading order and eviction
+                        priority
+                      enum:
+                      - high
+                      - medium
+                      - low
+                      type: string
+                    strategy:
+                      description: |-
+                        Strategy overrides the pool-level loading strategy for this model.
+                        If not specified, uses the pool's loadingStrategy.
+                      enum:
+                      - eager
+                      - lazy
+                      - bounded
+                      type: string
+                    variant:
+                      description: Variant specifies a model variant (e.g., "quantized")
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              workloadType:
+                default: general
+                description: WorkloadType classifies this pool for routing decisions.
+                enum:
+                - read-heavy
+                - write-heavy
+                - burst
+                - general
+                type: string
+            required:
+            - endpoints
+            type: object
+          status:
+            description: |-
+              ExternalTermitePoolStatus defines the observed state of ExternalTermitePool.
+              Reserved for a future controller; the embedded CloudAF proxy reads spec directly.
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              endpoints:
+                description: Endpoints mirrors the resolved endpoint URLs observed
+                  by the proxy/operator.
+                items:
+                  description: ExternalTermiteEndpointStatus reports one resolved
+                    external endpoint.
+                  properties:
+                    apiURL:
+                      type: string
+                    checkedAt:
+                      format: date-time
+                      type: string
+                    healthURL:
+                      type: string
+                    message:
+                      type: string
+                    name:
+                      type: string
+                    ready:
+                      type: boolean
+                  type: object
+                type: array
+              observedGeneration:
+                description: ObservedGeneration is the most recent generation observed
+                  by a controller.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is a coarse summary of pool availability.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

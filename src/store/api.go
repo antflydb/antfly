@@ -1515,7 +1515,7 @@ func (h *StoreAPI) handleConfChange(w http.ResponseWriter, r *http.Request) {
 			zap.Uint64("nodeID", nodeID),
 			zap.Stringer("shardID", shardID),
 			zap.String("context", req.PeerURL))
-		if err := shard.ProposeConfChange(cc); err != nil {
+		if err := shard.ProposeConfChange(r.Context(), cc); err != nil {
 			h.logger.Error("Failed to propose conf change for adding node",
 				zap.Uint64("nodeID", nodeID),
 				zap.Stringer("shardID", shardID),
@@ -1589,7 +1589,7 @@ func (h *StoreAPI) handleConfChange(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			if err := shard.ProposeConfChange(cc); err != nil {
+			if err := shard.ProposeConfChange(r.Context(), cc); err != nil {
 				h.logger.Error("Failed to propose conf change for removing node",
 					zap.Uint64("nodeID", nodeID),
 					zap.Stringer("shardID", shardID),

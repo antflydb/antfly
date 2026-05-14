@@ -1,6 +1,28 @@
 import type { ChatTurn } from "@antfly/components";
 import { Antfly, ChatBar } from "@antfly/components";
 import { createAIElementsRenderers, turnToStatus } from "@antfly/components/adapters";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  Input,
+  Label,
+  Separator,
+  Switch,
+  Textarea,
+} from "@antfly/design-system";
 import type { ChatToolName, GeneratorConfig } from "@antfly/sdk";
 import {
   Bot,
@@ -29,15 +51,6 @@ import {
   getInheritedGeneratorLabels,
 } from "@/components/playground/GeneratorSelector";
 import { ReasoningChainCollapsible } from "@/components/playground/ReasoningChainCollapsible";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { useTable } from "@/hooks/use-table";
@@ -130,39 +143,38 @@ const ChatPlaygroundPage: React.FC = () => {
 
   return (
     <Antfly url={apiUrl} table={selectedTable || ""}>
-      <div className="h-full">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6">
+      <DashboardPage className="h-full space-y-3">
+        <DashboardPageHeader>
           <div>
-            <h1 className="text-2xl font-bold">Chat Playground</h1>
-            <p className="text-muted-foreground text-sm mt-1">
+            <DashboardPageTitle className="font-aeonik">Chat Playground</DashboardPageTitle>
+            <DashboardPageDescription>
               Multi-turn conversation with AI-powered retrieval
-            </p>
+            </DashboardPageDescription>
           </div>
-          <Button variant="outline" onClick={handleReset}>
-            <RotateCcw className="h-4 w-4 mr-2" />
-            Reset
-          </Button>
-        </div>
+          <DashboardPageActions>
+            <Button variant="outline" onClick={handleReset}>
+              <RotateCcw className="h-4 w-4 mr-2" />
+              Reset
+            </Button>
+          </DashboardPageActions>
+        </DashboardPageHeader>
 
         {/* Active Table/Index Indicator */}
         {selectedTable ? (
-          <div className="mb-4 flex items-center gap-2 text-sm text-muted-foreground">
+          <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
             <Badge variant="secondary">{selectedTable}</Badge>
             {chatIndexes.length > 0 ? (
               <Badge variant="outline">
                 {chatIndexes.length} index{chatIndexes.length !== 1 ? "es" : ""}
               </Badge>
             ) : (
-              <span className="text-amber-600 dark:text-amber-400 text-xs">
-                No searchable index found
-              </span>
+              <span className="af-status-text-warning text-xs">No searchable index found</span>
             )}
-          </div>
+          </DashboardToolbar>
         ) : (
-          <div className="mb-4 p-3 rounded-lg border border-dashed text-sm text-muted-foreground">
+          <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
             Select a table from the sidebar to get started.
-          </div>
+          </DashboardToolbar>
         )}
 
         {/* Main Grid — asymmetric: narrow settings, wide chat */}
@@ -494,7 +506,7 @@ const ChatPlaygroundPage: React.FC = () => {
             </CardContent>
           </Card>
         </div>
-      </div>
+      </DashboardPage>
     </Antfly>
   );
 };

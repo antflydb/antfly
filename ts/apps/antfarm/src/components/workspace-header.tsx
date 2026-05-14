@@ -1,11 +1,11 @@
+import { Button } from "@antfly/design-system";
 import { MoonIcon, SunIcon } from "@radix-ui/react-icons";
-import { Maximize2, Minimize2, Monitor, Search } from "lucide-react";
+import { Monitor, Rows3, Rows4, Search } from "lucide-react";
 import type * as React from "react";
 import { useCommandPalette } from "@/components/command-palette-provider";
-import { useContentWidth } from "@/components/content-width-provider";
 import { DashboardGeneratorControl } from "@/components/playground/DashboardGeneratorControl";
 import { SettingsDialog } from "@/components/SettingsDialog";
-import { Button } from "@/components/ui/button";
+import { useDensity } from "@/hooks/use-density";
 import { useTheme } from "@/hooks/use-theme";
 import { cn } from "@/lib/utils";
 
@@ -15,7 +15,7 @@ interface WorkspaceHeaderProps extends React.HTMLAttributes<HTMLDivElement> {
 
 export function WorkspaceHeader({ title, className, ...props }: WorkspaceHeaderProps) {
   const { toggle: toggleCommandPalette } = useCommandPalette();
-  const { contentWidth, toggleContentWidth } = useContentWidth();
+  const { density, toggleDensity } = useDensity();
   const { theme, setTheme } = useTheme();
 
   const toggleTheme = () => {
@@ -25,7 +25,10 @@ export function WorkspaceHeader({ title, className, ...props }: WorkspaceHeaderP
 
   return (
     <header
-      className={cn("sticky top-0 z-10 flex h-14 items-center gap-4 bg-background px-4", className)}
+      className={cn(
+        "af-workspace-header sticky top-0 z-10 flex shrink-0 h-14 items-center gap-4 border-b border-border bg-background px-4",
+        className
+      )}
       {...props}
     >
       {title && <h1 className="text-lg font-semibold">{title}</h1>}
@@ -64,18 +67,14 @@ export function WorkspaceHeader({ title, className, ...props }: WorkspaceHeaderP
           )}
         </Button>
 
-        {/* Content Width Toggle */}
+        {/* Density Toggle */}
         <Button
           variant="ghost"
           size="icon"
-          onClick={toggleContentWidth}
-          title={contentWidth === "restricted" ? "Expand Content Width" : "Restrict Content Width"}
+          onClick={toggleDensity}
+          title={density === "compact" ? "Switch to Comfortable" : "Switch to Compact"}
         >
-          {contentWidth === "restricted" ? (
-            <Maximize2 className="size-4" />
-          ) : (
-            <Minimize2 className="size-4" />
-          )}
+          {density === "compact" ? <Rows3 className="size-4" /> : <Rows4 className="size-4" />}
         </Button>
       </div>
     </header>

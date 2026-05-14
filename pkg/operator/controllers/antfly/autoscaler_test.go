@@ -9,13 +9,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// Helper to create int32 pointers
-//
-//go:fix inline
-func int32Ptr(i int32) *int32 {
-	return new(i)
-}
-
 func TestCalculateDesiredReplicas_ScaleUp_CPUOnly(t *testing.T) {
 	g := NewWithT(t)
 	as := &AutoScaler{}
@@ -24,7 +17,7 @@ func TestCalculateDesiredReplicas_ScaleUp_CPUOnly(t *testing.T) {
 		Enabled:                        true,
 		MinReplicas:                    3,
 		MaxReplicas:                    10,
-		TargetCPUUtilizationPercentage: int32Ptr(70),
+		TargetCPUUtilizationPercentage: new(int32(70)),
 	}
 
 	// Current: 3 replicas at 100% CPU utilization
@@ -46,7 +39,7 @@ func TestCalculateDesiredReplicas_ScaleDown_CPUOnly(t *testing.T) {
 		Enabled:                        true,
 		MinReplicas:                    3,
 		MaxReplicas:                    10,
-		TargetCPUUtilizationPercentage: int32Ptr(70),
+		TargetCPUUtilizationPercentage: new(int32(70)),
 	}
 
 	// Current: 6 replicas at 30% CPU utilization
@@ -70,7 +63,7 @@ func TestCalculateDesiredReplicas_ScaleUp_MemoryOnly(t *testing.T) {
 		Enabled:                           true,
 		MinReplicas:                       3,
 		MaxReplicas:                       10,
-		TargetMemoryUtilizationPercentage: int32Ptr(80),
+		TargetMemoryUtilizationPercentage: new(int32(80)),
 	}
 
 	// Current: 3 replicas at 120% memory utilization
@@ -92,7 +85,7 @@ func TestCalculateDesiredReplicas_ScaleDown_MemoryOnly(t *testing.T) {
 		Enabled:                           true,
 		MinReplicas:                       3,
 		MaxReplicas:                       10,
-		TargetMemoryUtilizationPercentage: int32Ptr(80),
+		TargetMemoryUtilizationPercentage: new(int32(80)),
 	}
 
 	// Current: 8 replicas at 40% memory utilization
@@ -116,8 +109,8 @@ func TestCalculateDesiredReplicas_BothMetrics_ScaleUpOnHigherResource(t *testing
 		Enabled:                           true,
 		MinReplicas:                       3,
 		MaxReplicas:                       10,
-		TargetCPUUtilizationPercentage:    int32Ptr(70),
-		TargetMemoryUtilizationPercentage: int32Ptr(80),
+		TargetCPUUtilizationPercentage:    new(int32(70)),
+		TargetMemoryUtilizationPercentage: new(int32(80)),
 	}
 
 	// CPU wants to scale to ceil(3 * 100/70) = 5
@@ -141,8 +134,8 @@ func TestCalculateDesiredReplicas_BothMetrics_ScaleDownWhenBothLow(t *testing.T)
 		Enabled:                           true,
 		MinReplicas:                       3,
 		MaxReplicas:                       10,
-		TargetCPUUtilizationPercentage:    int32Ptr(70),
-		TargetMemoryUtilizationPercentage: int32Ptr(80),
+		TargetCPUUtilizationPercentage:    new(int32(70)),
+		TargetMemoryUtilizationPercentage: new(int32(80)),
 	}
 
 	// CPU wants to scale to ceil(6 * 30/70) = 3
@@ -166,8 +159,8 @@ func TestCalculateDesiredReplicas_BothMetrics_NoScaleDownWhenOneHigh(t *testing.
 		Enabled:                           true,
 		MinReplicas:                       3,
 		MaxReplicas:                       10,
-		TargetCPUUtilizationPercentage:    int32Ptr(70),
-		TargetMemoryUtilizationPercentage: int32Ptr(80),
+		TargetCPUUtilizationPercentage:    new(int32(70)),
+		TargetMemoryUtilizationPercentage: new(int32(80)),
 	}
 
 	// CPU wants to scale to ceil(6 * 30/70) = 3 (scale down)
@@ -212,7 +205,7 @@ func TestCalculateDesiredReplicas_ZeroPodCount(t *testing.T) {
 		Enabled:                        true,
 		MinReplicas:                    3,
 		MaxReplicas:                    10,
-		TargetCPUUtilizationPercentage: int32Ptr(70),
+		TargetCPUUtilizationPercentage: new(int32(70)),
 	}
 
 	metrics := &MetricsData{
@@ -505,10 +498,13 @@ func TestUpdateScalingStatus_ScaleUp(t *testing.T) {
 		Status: antflyv1.AntflyClusterStatus{},
 	}
 
-	as.UpdateScalingStatus(cluster, 5)
+	as.UpdateScalingStatus(cluster, 3, 5, 5, "", "")
 
 	g.Expect(cluster.Status.AutoScalingStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.AutoScalingStatus.CurrentReplicas).To(Equal(int32(3)))
 	g.Expect(cluster.Status.AutoScalingStatus.DesiredReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.AutoScalingStatus.RecommendationReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.AutoScalingStatus.BlockedReason).To(BeEmpty())
 	g.Expect(cluster.Status.AutoScalingStatus.LastScaleTime).NotTo(BeNil())
 	g.Expect(cluster.Status.AutoScalingStatus.LastScaleDirection).To(Equal(ScaleDirectionUp))
 }
@@ -526,10 +522,12 @@ func TestUpdateScalingStatus_ScaleDown(t *testing.T) {
 		Status: antflyv1.AntflyClusterStatus{},
 	}
 
-	as.UpdateScalingStatus(cluster, 3)
+	as.UpdateScalingStatus(cluster, 5, 3, 3, "", "")
 
 	g.Expect(cluster.Status.AutoScalingStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.AutoScalingStatus.CurrentReplicas).To(Equal(int32(5)))
 	g.Expect(cluster.Status.AutoScalingStatus.DesiredReplicas).To(Equal(int32(3)))
+	g.Expect(cluster.Status.AutoScalingStatus.RecommendationReplicas).To(Equal(int32(3)))
 	g.Expect(cluster.Status.AutoScalingStatus.LastScaleTime).NotTo(BeNil())
 	g.Expect(cluster.Status.AutoScalingStatus.LastScaleDirection).To(Equal(ScaleDirectionDown))
 }
@@ -547,10 +545,12 @@ func TestUpdateScalingStatus_NoChange(t *testing.T) {
 		Status: antflyv1.AntflyClusterStatus{},
 	}
 
-	as.UpdateScalingStatus(cluster, 5)
+	as.UpdateScalingStatus(cluster, 5, 5, 5, "", "")
 
 	g.Expect(cluster.Status.AutoScalingStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.AutoScalingStatus.CurrentReplicas).To(Equal(int32(5)))
 	g.Expect(cluster.Status.AutoScalingStatus.DesiredReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.AutoScalingStatus.RecommendationReplicas).To(Equal(int32(5)))
 	g.Expect(cluster.Status.AutoScalingStatus.LastScaleTime).To(BeNil(), "Should not update scale time when no change")
 	g.Expect(cluster.Status.AutoScalingStatus.LastScaleDirection).To(BeEmpty(), "Should not update direction when no change")
 }
@@ -582,7 +582,7 @@ func TestUpdateScalingStatus_PreservesExistingStatus(t *testing.T) {
 	}
 
 	// Update with new desired replicas
-	as.UpdateScalingStatus(cluster, 7)
+	as.UpdateScalingStatus(cluster, 5, 7, 7, "", "")
 
 	// Should update scale time and direction
 	g.Expect(cluster.Status.AutoScalingStatus.DesiredReplicas).To(Equal(int32(7)))
@@ -592,4 +592,22 @@ func TestUpdateScalingStatus_PreservesExistingStatus(t *testing.T) {
 	// Should preserve utilization percentages
 	g.Expect(cluster.Status.AutoScalingStatus.CurrentCPUUtilizationPercentage).To(Equal(&cpuUtil))
 	g.Expect(cluster.Status.AutoScalingStatus.CurrentMemoryUtilizationPercentage).To(Equal(&memUtil))
+}
+
+func TestUpdateScalingStatus_RecordsBlockedRecommendation(t *testing.T) {
+	g := NewWithT(t)
+	as := &AutoScaler{}
+
+	cluster := &antflyv1.AntflyCluster{}
+
+	as.UpdateScalingStatus(cluster, 5, 5, 4, antflyv1.ReasonDataScaleDownBlocked, "blocked")
+
+	g.Expect(cluster.Status.AutoScalingStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.AutoScalingStatus.CurrentReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.AutoScalingStatus.DesiredReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.AutoScalingStatus.RecommendationReplicas).To(Equal(int32(4)))
+	g.Expect(cluster.Status.AutoScalingStatus.BlockedReason).To(Equal(antflyv1.ReasonDataScaleDownBlocked))
+	g.Expect(cluster.Status.AutoScalingStatus.BlockedMessage).To(Equal("blocked"))
+	g.Expect(cluster.Status.AutoScalingStatus.LastScaleTime).To(BeNil())
+	g.Expect(cluster.Status.AutoScalingStatus.LastScaleDirection).To(BeEmpty())
 }

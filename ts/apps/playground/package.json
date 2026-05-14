@@ -1,0 +1,39 @@
+{
+  "name": "@antfly/design-system-playground",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf .next"
+  },
+  "dependencies": {
+    "@antfly/design-system": "workspace:*",
+    "@antfly/graph": "workspace:*",
+    "@xyflow/react": "^12.10.2",
+    "@tanstack/react-table": "^8.21.3",
+    "input-otp": "^1.4.2",
+    "lucide-react": "^0.555.0",
+    "next": "^16.0.10",
+    "next-themes": "^0.4.6",
+    "react": "^19.2.4",
+    "react-day-picker": "^9.14.0",
+    "react-dom": "^19.2.4",
+    "react-hook-form": "7.74.0",
+    "recharts": "^3.8.1",
+    "sonner": "^1.7.4",
+    "vaul": "^1.1.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.1",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.1",
+    "typescript": "5.9.3"
+  }
+}

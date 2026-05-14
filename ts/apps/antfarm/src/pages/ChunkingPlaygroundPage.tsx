@@ -1,28 +1,39 @@
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Separator,
+  Skeleton,
+  Textarea,
+} from "@antfly/design-system";
 import { type Chunk, type ChunkResponse, TermiteClient } from "@antfly/termite-sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Database, Hash, RotateCcw, Scissors, Zap } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
 import { useApiConfig } from "@/hooks/use-api-config";
 
 // Configuration state (extends SDK config with UI-specific fields)
@@ -54,25 +65,21 @@ const STORAGE_KEY = "antfarm-playground-chunking";
 
 // Color palette for chunk visualization
 const CHUNK_COLORS = [
-  "bg-blue-100 dark:bg-blue-900/30 border-blue-300 dark:border-blue-700",
-  "bg-green-100 dark:bg-green-900/30 border-green-300 dark:border-green-700",
-  "bg-purple-100 dark:bg-purple-900/30 border-purple-300 dark:border-purple-700",
-  "bg-orange-100 dark:bg-orange-900/30 border-orange-300 dark:border-orange-700",
-  "bg-pink-100 dark:bg-pink-900/30 border-pink-300 dark:border-pink-700",
-  "bg-cyan-100 dark:bg-cyan-900/30 border-cyan-300 dark:border-cyan-700",
-  "bg-yellow-100 dark:bg-yellow-900/30 border-yellow-300 dark:border-yellow-700",
-  "bg-indigo-100 dark:bg-indigo-900/30 border-indigo-300 dark:border-indigo-700",
+  "af-chart-surface af-chart-surface-1",
+  "af-chart-surface af-chart-surface-2",
+  "af-chart-surface af-chart-surface-3",
+  "af-chart-surface af-chart-surface-4",
+  "af-chart-surface af-chart-surface-5",
+  "af-chart-surface af-chart-surface-6",
 ];
 
 const CHUNK_TEXT_COLORS = [
-  "text-blue-700 dark:text-blue-300",
-  "text-green-700 dark:text-green-300",
-  "text-purple-700 dark:text-purple-300",
-  "text-orange-700 dark:text-orange-300",
-  "text-pink-700 dark:text-pink-300",
-  "text-cyan-700 dark:text-cyan-300",
-  "text-yellow-700 dark:text-yellow-300",
-  "text-indigo-700 dark:text-indigo-300",
+  "af-chart-text af-chart-text-1",
+  "af-chart-text af-chart-text-2",
+  "af-chart-text af-chart-text-3",
+  "af-chart-text af-chart-text-4",
+  "af-chart-text af-chart-text-5",
+  "af-chart-text af-chart-text-6",
 ];
 
 const SAMPLE_TEXTS = {
@@ -327,22 +334,22 @@ const ChunkingPlaygroundPage: React.FC = () => {
   };
 
   return (
-    <div className="h-full">
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Chunking Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Chunking Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Experiment with different chunking models and configurations
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <SamplePresets presets={samplePresets} />
           <Button variant="outline" onClick={handleReset}>
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -351,12 +358,12 @@ const ChunkingPlaygroundPage: React.FC = () => {
       )}
 
       {/* Configuration Panel */}
-      <Card className="mb-6">
+      <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg">Configuration</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
             <div className="space-y-2 col-span-2">
               <Label htmlFor="model">Model</Label>
               <Select
@@ -504,40 +511,35 @@ const ChunkingPlaygroundPage: React.FC = () => {
                 }
               />
             </div>
-
-            <div className="space-y-2 flex items-end">
-              <Button
-                onClick={handleChunk}
-                disabled={isLoading || !inputText.trim()}
-                className="w-full"
-              >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Processing
-                  </>
-                ) : (
-                  <>
-                    <Scissors className="h-4 w-4 mr-2" />
-                    Chunk
-                  </>
-                )}
-              </Button>
-            </div>
           </div>
+          <FormActions>
+            <Button onClick={handleChunk} disabled={isLoading || !inputText.trim()}>
+              {isLoading ? (
+                <>
+                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  Processing
+                </>
+              ) : (
+                <>
+                  <Scissors className="h-4 w-4 mr-2" />
+                  Chunk
+                </>
+              )}
+            </Button>
+          </FormActions>
         </CardContent>
       </Card>
 
       {/* Error Display */}
       {error && (
-        <div className="mb-6 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
 
       {/* Results Stats Bar */}
       {result && (
-        <div className="mb-6 flex flex-wrap items-center gap-3">
+        <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
             {result.chunks.length} chunks
@@ -558,7 +560,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
               {processingTime.toFixed(0)}ms
             </Badge>
           )}
-        </div>
+        </DashboardToolbar>
       )}
 
       {/* Main Content - Side by Side */}
@@ -637,22 +639,8 @@ const ChunkingPlaygroundPage: React.FC = () => {
                 </div>
               </div>
             ) : (
-              <div className="h-100 flex items-center justify-center text-muted-foreground">
-                <div className="text-center">
-                  <Scissors className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                  <p className="mb-3">
-                    Enter text and press{" "}
-                    <kbd className="px-1.5 py-0.5 text-xs border rounded bg-muted">Cmd+Enter</kbd>{" "}
-                    to chunk
-                  </p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setInputText(SAMPLE_TEXTS.technical.text)}
-                  >
-                    Try a sample
-                  </Button>
-                </div>
+              <div className="h-100 flex items-center justify-center">
+                <PlaygroundEmptyState />
               </div>
             )}
           </CardContent>
@@ -660,7 +648,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           <strong>Models:</strong> Fixed uses simple token-count splitting with BERT tokenization
           (configure with target tokens, overlap, separator). ONNX models use neural networks for
@@ -674,7 +662,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
           </p>
         )}
       </div>
-    </div>
+    </DashboardPage>
   );
 };
 

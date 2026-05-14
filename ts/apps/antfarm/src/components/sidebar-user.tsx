@@ -1,22 +1,22 @@
-import { ChevronsUpDown, LogOut, Settings } from "lucide-react";
-import * as React from "react";
-import { useNavigate } from "react-router-dom";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
+  Avatar,
+  AvatarFallback,
+  AvatarImage,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  Skeleton,
   useSidebar,
-} from "@/components/ui/sidebar";
-import { Skeleton } from "@/components/ui/skeleton";
+} from "@antfly/design-system";
+import { ChevronsUpDown, LogOut, Settings } from "lucide-react";
+import * as React from "react";
+import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
 

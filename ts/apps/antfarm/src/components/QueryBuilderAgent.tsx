@@ -1,3 +1,19 @@
+import {
+  Alert,
+  AlertDescription,
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  Label,
+  Textarea,
+} from "@antfly/design-system";
 import type { GeneratorConfig, QueryBuilderRequest, QueryBuilderResult } from "@antfly/sdk";
 import { ChevronDownIcon, ChevronUpIcon, GearIcon } from "@radix-ui/react-icons";
 import type React from "react";
@@ -9,13 +25,6 @@ import {
   getInheritedGeneratorLabels,
   QUERY_BUILDER_PROVIDERS,
 } from "@/components/playground/GeneratorSelector";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/hooks/use-api-config";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import JsonViewer from "./JsonViewer";

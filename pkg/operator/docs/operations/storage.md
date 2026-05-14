@@ -41,6 +41,23 @@ spec:
 The validating webhook enforces these safety rules:
 
 - **`whenScaled: Delete` is rejected when autoscaling is enabled**: The autoscaler could trigger scale-down events that permanently destroy PVCs, requiring expensive full resyncs on every scale-up.
+- **`whenScaled: Delete` is rejected when data nodes are suspended**: `spec.dataNodes.suspend=true` scales the data StatefulSet to zero as a pause/resume operation. PVCs must be retained so the same ordinals can resume with their existing data.
+
+### Scale Data Nodes To Zero
+
+To pause data nodes while keeping disks, retain PVCs and enable suspension:
+
+```yaml
+spec:
+  dataNodes:
+    replicas: 3      # running size used when resumed
+    suspend: true    # scale data StatefulSet to 0
+  storage:
+    pvcRetentionPolicy:
+      whenScaled: Retain
+```
+
+Set `spec.dataNodes.suspend=false` to resume. Do not use `replicas: 0` for suspension; `0`/omitted is treated as the default running size because the CRD field is a non-pointer integer.
 
 ### Kubernetes Version Compatibility
 

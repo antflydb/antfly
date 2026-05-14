@@ -64,6 +64,54 @@ func (m *MockEmbedder) GetCallCount() int32 {
 	return m.callCount.Load()
 }
 
+func TestAPIHandlerServesRootOperationalRoutesOutsideMLPrefix(t *testing.T) {
+	node := &TermiteNode{
+		logger: zaptest.NewLogger(t),
+	}
+	handler := node.APIHandler()
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.True(t, w.Code == http.StatusOK || w.Code == http.StatusServiceUnavailable, "%s returned %d", path, w.Code)
+	}
+
+	for _, path := range []string{"/ml/v1/healthz", "/ml/v1/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusNotFound, w.Code, path)
+	}
+}
+
+func TestAPIMLHandlerDoesNotExposeOperationalRoutes(t *testing.T) {
+	node := &TermiteNode{
+		logger: zaptest.NewLogger(t),
+	}
+	handler := node.APIMLHandler()
+
+	versionReq := httptest.NewRequest(http.MethodGet, "/ml/v1/version", nil)
+	versionRec := httptest.NewRecorder()
+	handler.ServeHTTP(versionRec, versionReq)
+	require.Equal(t, http.StatusOK, versionRec.Code)
+
+	for _, path := range []string{"/healthz", "/readyz", "/ml/v1/healthz", "/ml/v1/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusNotFound, w.Code, path)
+	}
+
+	termiteMount := http.StripPrefix("/termite", handler)
+	for _, path := range []string{"/termite/healthz", "/termite/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		termiteMount.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusNotFound, w.Code, path)
+	}
+}
+
 func TestTermiteNode_HandleApiEmbed_NoRegistry(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 

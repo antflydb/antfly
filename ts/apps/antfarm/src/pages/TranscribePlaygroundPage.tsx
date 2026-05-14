@@ -1,3 +1,26 @@
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  FormActions,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Switch,
+} from "@antfly/design-system";
 import { TermiteClient } from "@antfly/termite-sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
@@ -15,21 +38,9 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useApiConfig } from "@/hooks/use-api-config";
 import {
   arrayBufferToBase64,
@@ -560,23 +571,22 @@ const TranscribePlaygroundPage: React.FC = () => {
   );
 
   return (
-    <div className="h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+    <DashboardPage className="h-full space-y-3">
+      <DashboardPageHeader>
         <div>
-          <h1 className="text-2xl font-bold">Transcribe Playground</h1>
-          <p className="text-muted-foreground text-sm mt-1">
+          <DashboardPageTitle className="font-aeonik">Transcribe Playground</DashboardPageTitle>
+          <DashboardPageDescription>
             Record or upload audio, transcribe with Whisper, optionally chunk with VAD and clean up
             with an LLM
-          </p>
+          </DashboardPageDescription>
         </div>
-        <div className="flex gap-2">
+        <DashboardPageActions>
           <Button variant="outline" onClick={handleReset}>
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
-        </div>
-      </div>
+        </DashboardPageActions>
+      </DashboardPageHeader>
 
       <BackendInfoBar />
 
@@ -592,7 +602,7 @@ const TranscribePlaygroundPage: React.FC = () => {
           </CardHeader>
           <CardContent className="space-y-4">
             {/* Row 1: Core config */}
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="transcriber-model">Transcriber Model</Label>
                 <Select
@@ -654,49 +664,31 @@ const TranscribePlaygroundPage: React.FC = () => {
                   </button>
                 </div>
               </div>
-
-              <div className="space-y-2 flex items-end">
-                <Button
-                  onClick={handleTranscribe}
-                  disabled={isLoading || !audioFile || !selectedTranscriberModel}
-                  className="w-full"
-                >
-                  {isLoading ? (
-                    <>
-                      <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                      Processing...
-                    </>
-                  ) : (
-                    <>
-                      <Zap className="h-4 w-4 mr-2" />
-                      Transcribe
-                    </>
-                  )}
-                </Button>
-              </div>
             </div>
 
-            {/* Row 2: Pipeline options */}
-            <div className="space-y-3 pt-2 border-t">
-              <div className="flex flex-wrap gap-x-8 gap-y-3">
-                <div className="flex items-center gap-6">
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      id="use-vad"
-                      checked={useVAD}
-                      onCheckedChange={(v) => setUseVAD(v === true)}
-                    />
-                    <Label htmlFor="use-vad" className="text-sm font-normal cursor-pointer">
-                      VAD chunking
-                    </Label>
-                  </div>
-                  {useVAD && (
+            {/* Pipeline options */}
+            <div className="space-y-4 pt-2 border-t">
+              <div className="flex items-start gap-3">
+                <Switch id="use-vad" checked={useVAD} onCheckedChange={setUseVAD} />
+                <div className="grid gap-1">
+                  <Label htmlFor="use-vad" className="text-sm font-normal cursor-pointer">
+                    VAD chunking
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    Split long recordings into speech segments using Silero VAD
+                  </p>
+                </div>
+              </div>
+              {useVAD && (
+                <div className="space-y-4 pl-12">
+                  <div className="space-y-2">
+                    <Label>VAD Model</Label>
                     <Select
                       value={selectedChunkerModel}
                       onValueChange={setSelectedChunkerModel}
                       disabled={availableChunkers.length === 0}
                     >
-                      <SelectTrigger className="w-56 h-8 text-xs">
+                      <SelectTrigger>
                         <SelectValue
                           placeholder={selectPlaceholder(
                             true,
@@ -713,27 +705,130 @@ const TranscribePlaygroundPage: React.FC = () => {
                         ))}
                       </SelectContent>
                     </Select>
-                  )}
-                </div>
-
-                <div className="flex items-center gap-6">
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      id="use-llm"
-                      checked={useLLMCleanup}
-                      onCheckedChange={(v) => setUseLLMCleanup(v === true)}
-                    />
-                    <Label htmlFor="use-llm" className="text-sm font-normal cursor-pointer">
-                      LLM cleanup
-                    </Label>
                   </div>
-                  {useLLMCleanup && (
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div className="space-y-1">
+                      <Label
+                        htmlFor="vad-threshold"
+                        className="text-xs"
+                        title="Speech probability threshold (0-1). Higher values require stronger speech signals."
+                      >
+                        Threshold
+                      </Label>
+                      <Input
+                        id="vad-threshold"
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        className="h-8 text-xs"
+                        value={vadConfig.threshold}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value);
+                          if (!Number.isNaN(val) && val >= 0 && val <= 1) {
+                            setVadConfig({ ...vadConfig, threshold: val });
+                          }
+                        }}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label
+                        htmlFor="vad-min-silence"
+                        className="text-xs"
+                        title="Minimum silence duration (ms) to split segments. Longer values produce fewer, larger segments."
+                      >
+                        Min Silence (ms)
+                      </Label>
+                      <Input
+                        id="vad-min-silence"
+                        type="number"
+                        min={100}
+                        max={10000}
+                        step={100}
+                        className="h-8 text-xs"
+                        value={vadConfig.minSilenceDurationMs}
+                        onChange={(e) =>
+                          setVadConfig({
+                            ...vadConfig,
+                            minSilenceDurationMs: parseInt(e.target.value, 10) || 2000,
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label
+                        htmlFor="vad-min-speech"
+                        className="text-xs"
+                        title="Minimum speech duration (ms). Segments shorter than this are discarded."
+                      >
+                        Min Speech (ms)
+                      </Label>
+                      <Input
+                        id="vad-min-speech"
+                        type="number"
+                        min={50}
+                        max={5000}
+                        step={50}
+                        className="h-8 text-xs"
+                        value={vadConfig.minSpeechDurationMs}
+                        onChange={(e) =>
+                          setVadConfig({
+                            ...vadConfig,
+                            minSpeechDurationMs: parseInt(e.target.value, 10) || 500,
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label
+                        htmlFor="vad-speech-pad"
+                        className="text-xs"
+                        title="Padding (ms) added before and after each speech segment."
+                      >
+                        Speech Pad (ms)
+                      </Label>
+                      <Input
+                        id="vad-speech-pad"
+                        type="number"
+                        min={0}
+                        max={2000}
+                        step={50}
+                        className="h-8 text-xs"
+                        value={vadConfig.speechPadMs}
+                        onChange={(e) =>
+                          setVadConfig({
+                            ...vadConfig,
+                            speechPadMs: parseInt(e.target.value, 10) || 200,
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-start gap-3">
+                <Switch id="use-llm" checked={useLLMCleanup} onCheckedChange={setUseLLMCleanup} />
+                <div className="grid gap-1">
+                  <Label htmlFor="use-llm" className="text-sm font-normal cursor-pointer">
+                    LLM cleanup
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    Post-process transcripts to remove filler words, fix grammar, and handle
+                    self-corrections
+                  </p>
+                </div>
+              </div>
+              {useLLMCleanup && (
+                <div className="pl-12">
+                  <div className="space-y-2">
+                    <Label>Generator Model</Label>
                     <Select
                       value={selectedGeneratorModel}
                       onValueChange={setSelectedGeneratorModel}
                       disabled={availableGenerators.length === 0}
                     >
-                      <SelectTrigger className="w-56 h-8 text-xs">
+                      <SelectTrigger>
                         <SelectValue
                           placeholder={selectPlaceholder(
                             true,
@@ -750,112 +845,29 @@ const TranscribePlaygroundPage: React.FC = () => {
                         ))}
                       </SelectContent>
                     </Select>
-                  )}
-                </div>
-              </div>
-
-              {/* VAD configuration options */}
-              {useVAD && (
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pl-6">
-                  <div className="space-y-1">
-                    <Label
-                      htmlFor="vad-threshold"
-                      className="text-xs"
-                      title="Speech probability threshold (0-1). Higher values require stronger speech signals."
-                    >
-                      Threshold
-                    </Label>
-                    <Input
-                      id="vad-threshold"
-                      type="number"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      className="h-8 text-xs"
-                      value={vadConfig.threshold}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value);
-                        if (!Number.isNaN(val) && val >= 0 && val <= 1) {
-                          setVadConfig({ ...vadConfig, threshold: val });
-                        }
-                      }}
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label
-                      htmlFor="vad-min-silence"
-                      className="text-xs"
-                      title="Minimum silence duration (ms) to split segments. Longer values produce fewer, larger segments."
-                    >
-                      Min Silence (ms)
-                    </Label>
-                    <Input
-                      id="vad-min-silence"
-                      type="number"
-                      min={100}
-                      max={10000}
-                      step={100}
-                      className="h-8 text-xs"
-                      value={vadConfig.minSilenceDurationMs}
-                      onChange={(e) =>
-                        setVadConfig({
-                          ...vadConfig,
-                          minSilenceDurationMs: parseInt(e.target.value, 10) || 2000,
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label
-                      htmlFor="vad-min-speech"
-                      className="text-xs"
-                      title="Minimum speech duration (ms). Segments shorter than this are discarded."
-                    >
-                      Min Speech (ms)
-                    </Label>
-                    <Input
-                      id="vad-min-speech"
-                      type="number"
-                      min={50}
-                      max={5000}
-                      step={50}
-                      className="h-8 text-xs"
-                      value={vadConfig.minSpeechDurationMs}
-                      onChange={(e) =>
-                        setVadConfig({
-                          ...vadConfig,
-                          minSpeechDurationMs: parseInt(e.target.value, 10) || 500,
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label
-                      htmlFor="vad-speech-pad"
-                      className="text-xs"
-                      title="Padding (ms) added before and after each speech segment."
-                    >
-                      Speech Pad (ms)
-                    </Label>
-                    <Input
-                      id="vad-speech-pad"
-                      type="number"
-                      min={0}
-                      max={2000}
-                      step={50}
-                      className="h-8 text-xs"
-                      value={vadConfig.speechPadMs}
-                      onChange={(e) =>
-                        setVadConfig({
-                          ...vadConfig,
-                          speechPadMs: parseInt(e.target.value, 10) || 200,
-                        })
-                      }
-                    />
                   </div>
                 </div>
               )}
             </div>
+
+            <FormActions>
+              <Button
+                onClick={handleTranscribe}
+                disabled={isLoading || !audioFile || !selectedTranscriberModel}
+              >
+                {isLoading ? (
+                  <>
+                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <Zap className="h-4 w-4 mr-2" />
+                    Transcribe
+                  </>
+                )}
+              </Button>
+            </FormActions>
           </CardContent>
         </Card>
 
@@ -868,7 +880,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
         {/* Stats */}
         {doneSegments.length > 0 && (
-          <div className="flex flex-wrap items-center gap-3">
+          <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
             <Badge variant="secondary" className="gap-1.5">
               <Zap className="h-3 w-3" />
               {selectedTranscriberModel}
@@ -891,7 +903,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                 {processingTime.toFixed(0)}ms
               </Badge>
             )}
-          </div>
+          </DashboardToolbar>
         )}
 
         {/* Side-by-side panels */}
@@ -1119,11 +1131,8 @@ const TranscribePlaygroundPage: React.FC = () => {
                   ))}
                 </div>
               ) : (
-                <div className="h-80 flex items-center justify-center text-muted-foreground">
-                  <div className="text-center">
-                    <Mic className="h-12 w-12 mx-auto mb-3 opacity-20" />
-                    <p>Record or upload audio and click &ldquo;Transcribe&rdquo;</p>
-                  </div>
+                <div className="h-80 flex items-center justify-center">
+                  <PlaygroundEmptyState />
                 </div>
               )}
             </CardContent>
@@ -1132,7 +1141,7 @@ const TranscribePlaygroundPage: React.FC = () => {
       </div>
 
       {/* Help text */}
-      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+      <div className="text-xs text-muted-foreground space-y-1">
         <p>
           Record from your microphone or upload an audio file, then transcribe with a Whisper model.
           Enable <strong>VAD chunking</strong> to split long recordings into speech segments using
@@ -1140,7 +1149,7 @@ const TranscribePlaygroundPage: React.FC = () => {
           filler words, fixing grammar, and handling self-corrections.
         </p>
       </div>
-    </div>
+    </DashboardPage>
   );
 };
 

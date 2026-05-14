@@ -19,6 +19,9 @@ var antflyRestoreCRDYAML []byte
 //go:embed crd/antfly.io_termitepools.yaml
 var termitePoolCRDYAML []byte
 
+//go:embed crd/antfly.io_externaltermitepools.yaml
+var externalTermitePoolCRDYAML []byte
+
 //go:embed crd/antfly.io_termiteroutes.yaml
 var termiteRouteCRDYAML []byte
 
@@ -79,6 +82,20 @@ func TermitePoolCRDYAML() string {
 	return string(termitePoolCRDYAML)
 }
 
+// ExternalTermitePoolCRD returns the parsed CustomResourceDefinition for ExternalTermitePool.
+func ExternalTermitePoolCRD() (*apiextv1.CustomResourceDefinition, error) {
+	var crd apiextv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(externalTermitePoolCRDYAML, &crd); err != nil {
+		return nil, err
+	}
+	return &crd, nil
+}
+
+// ExternalTermitePoolCRDYAML returns the raw CRD YAML for ExternalTermitePool.
+func ExternalTermitePoolCRDYAML() string {
+	return string(externalTermitePoolCRDYAML)
+}
+
 // TermiteRouteCRD returns the parsed CustomResourceDefinition for TermiteRoute.
 func TermiteRouteCRD() (*apiextv1.CustomResourceDefinition, error) {
 	var crd apiextv1.CustomResourceDefinition
@@ -111,6 +128,10 @@ func AllCRDs() ([]*apiextv1.CustomResourceDefinition, error) {
 	if err != nil {
 		return nil, err
 	}
+	externalTermitePoolCRD, err := ExternalTermitePoolCRD()
+	if err != nil {
+		return nil, err
+	}
 	termiteRouteCRD, err := TermiteRouteCRD()
 	if err != nil {
 		return nil, err
@@ -120,6 +141,7 @@ func AllCRDs() ([]*apiextv1.CustomResourceDefinition, error) {
 		backupCRD,
 		restoreCRD,
 		termitePoolCRD,
+		externalTermitePoolCRD,
 		termiteRouteCRD,
 	}, nil
 }
@@ -131,6 +153,7 @@ func AllCRDYAMLBytes() [][]byte {
 		antflyBackupCRDYAML,
 		antflyRestoreCRDYAML,
 		termitePoolCRDYAML,
+		externalTermitePoolCRDYAML,
 		termiteRouteCRDYAML,
 	}
 }
@@ -142,5 +165,6 @@ func AllCRDsYAML() string {
 		"---\n" + AntflyBackupCRDYAML() +
 		"---\n" + AntflyRestoreCRDYAML() +
 		"---\n" + TermitePoolCRDYAML() +
+		"---\n" + ExternalTermitePoolCRDYAML() +
 		"---\n" + TermiteRouteCRDYAML()
 }

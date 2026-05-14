@@ -1,15 +1,17 @@
-import { Check, ChevronsUpDown } from "lucide-react";
-import * as React from "react";
-import { Button } from "@/components/ui/button";
 import {
+  Button,
   Command,
   CommandEmpty,
   CommandGroup,
   CommandInput,
   CommandItem,
   CommandList,
-} from "@/components/ui/command";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@antfly/design-system";
+import { Check, ChevronsUpDown } from "lucide-react";
+import * as React from "react";
 import { cn } from "@/lib/utils";
 
 interface ComboboxOption {

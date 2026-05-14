@@ -1,11 +1,15 @@
+import {
+  Badge,
+  Button,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@antfly/design-system";
 import { Check, ChevronDown, ChevronRight, Copy, ExternalLink } from "lucide-react";
 import type React from "react";
 import { useMemo, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { useTheme } from "@/hooks/use-theme";
 
 interface FieldValueDisplayProps {
@@ -112,7 +116,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
             href={value}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-blue-600 dark:text-blue-400 hover:underline text-sm flex items-center gap-1"
+            className="text-primary hover:underline text-sm flex items-center gap-1"
           >
             <img
               src={value}
@@ -144,7 +148,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
             href={value}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-blue-600 dark:text-blue-400 hover:underline text-sm flex items-center gap-1 truncate max-w-md"
+            className="text-primary hover:underline text-sm flex items-center gap-1 truncate max-w-md"
           >
             {value}
             <ExternalLink className="h-3 w-3 shrink-0" />

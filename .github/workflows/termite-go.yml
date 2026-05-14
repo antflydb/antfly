@@ -1,10 +1,8 @@
-# Build and test Termite with different inference backends
+# Build and test Termite with the pure Go and omni inference backends
 #
 # Uses matrix strategy to test:
-# - pure-go: Pure Go backend (full tests)
-# - onnx: ONNX Runtime backend (build + tests)
-# - xla: GoMLX XLA backend with PJRT CPU plugin (build + tests)
-# - omni: Both ONNX + XLA backends (build + tests)
+# - go: Pure Go backend (full tests)
+# - omni: Combined ONNX + XLA backend (build + tests)
 
 name: Termite Go
 
@@ -23,7 +21,6 @@ on:
       - "pkg/termite-client/**"
       - "pkg/libaf/**"
       - ".github/workflows/termite-go.yml"
-  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -38,41 +35,22 @@ env:
 jobs:
   test:
     name: Test (${{ matrix.backend }})
-    runs-on: ${{ matrix.runner }}
-    # XLA/omni backends require GLIBC 2.38+ (Ubuntu 24.04)
+    runs-on: codebuild-GitHubActionsRunnerAntflyAntflyDB-${{ github.run_id }}-${{ github.run_attempt }}
+    # Omni backend requires GLIBC 2.38+ (Ubuntu 24.04)
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
-        backend: [pure-go, onnx, xla, omni]
+        backend: [go, omni]
         include:
-          - backend: pure-go
+          - backend: go
             tags: ""
             cgo: "0"
             container: ""
-            runner: arc-antfly-standard
-          - backend: onnx
-            tags: "onnx,ORT"
-            cgo: "1"
-            container: ""
-            runner: arc-antfly-heavy
-          # xla/omni use job-level container: ubuntu:24.04 because XLA
-          # requires GLIBC 2.38+. ARC's actions-runner image is 22.04
-          # (GLIBC 2.35), so we route to arc-antfly-k8s, which has
-          # kubernetesMode enabled and renders `container:` as a separate
-          # step pod (no docker-in-docker required). The other scale sets
-          # don't have docker installed, so job-level containers fail
-          # with "no such file: /var/run/docker.sock" on them.
-          - backend: xla
-            tags: "xla,XLA"
-            cgo: "1"
-            container: "ubuntu:24.04"
-            runner: arc-antfly-k8s
           - backend: omni
             tags: "onnx,ORT,xla,XLA"
             cgo: "1"
             container: "ubuntu:24.04"
-            runner: arc-antfly-k8s
 
     steps:
       - name: Install container prerequisites
@@ -80,11 +58,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y git ca-certificates curl
-          # Inside the k8s-mode step pod the workspace PVC is owned by the
-          # runner uid, but git runs as root here, so it refuses to operate
-          # without explicit trust. Without this, `go build` fails with
-          # "error obtaining VCS status: exit status 128".
-          git config --global --add safe.directory '*'
 
       - uses: actions/checkout@v6
 
@@ -96,14 +69,6 @@ jobs:
 
       - name: Set GOEXPERIMENT
         run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
-
-      # Keep Go's caches off the step pod's tiny root FS in k8s mode.
-      # $RUNNER_TEMP lives on the workspace PVC there, on _work elsewhere.
-      - name: Redirect Go caches
-        run: |
-          mkdir -p "$RUNNER_TEMP/go-build" "$RUNNER_TEMP/go-mod"
-          echo "GOCACHE=$RUNNER_TEMP/go-build" >> $GITHUB_ENV
-          echo "GOMODCACHE=$RUNNER_TEMP/go-mod" >> $GITHUB_ENV
 
       - name: Verify Go version
         run: go version
@@ -140,36 +105,30 @@ jobs:
             sudo ldconfig
           fi
 
-      # Heavy downloads land under $RUNNER_TEMP rather than /tmp because in
-      # k8s mode (xla, omni) the step pod's root filesystem is capped at
-      # ~1Gi by Autopilot defaults, and the 350MB onnxruntime tarballs
-      # (plus go cache) blew past it. $RUNNER_TEMP resolves to the
-      # workspace PVC (20Gi) in k8s mode, and to the runner pod's _work
-      # tree on non-container backends — both have plenty of room.
       - name: Download ONNX Runtime
-        if: matrix.backend == 'onnx' || matrix.backend == 'omni'
+        if: matrix.backend == 'omni'
         run: |
           ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
-          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          mkdir -p /tmp/onnxruntime
           curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
-            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime"
-          echo "CGO_CFLAGS=-I$RUNNER_TEMP/onnxruntime/include" >> $GITHUB_ENV
-          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/onnxruntime/lib -lonnxruntime" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
-          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
+            | tar -xzf - --strip-components=1 -C /tmp/onnxruntime
+          echo "CGO_CFLAGS=-I/tmp/onnxruntime/include" >> $GITHUB_ENV
+          echo "CGO_LDFLAGS=-L/tmp/onnxruntime/lib -lonnxruntime" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/tmp/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
 
       - name: Download ONNX Runtime GenAI
-        if: matrix.backend == 'onnx' || matrix.backend == 'omni'
+        if: matrix.backend == 'omni'
         run: |
           ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "x64")
-          mkdir -p "$RUNNER_TEMP/onnxruntime-genai"
+          mkdir -p /tmp/onnxruntime-genai
           curl -fsSL "https://github.com/microsoft/onnxruntime-genai/releases/download/v${GENAI_VERSION}/onnxruntime-genai-${GENAI_VERSION}-linux-${ARCH}.tar.gz" \
-            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime-genai"
-          cp "$RUNNER_TEMP/onnxruntime-genai/lib"/libonnxruntime-genai*.so* "$RUNNER_TEMP/onnxruntime/lib/" 2>/dev/null || true
-          echo "ORTGENAI_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime-genai.so" >> $GITHUB_ENV
+            | tar -xzf - --strip-components=1 -C /tmp/onnxruntime-genai
+          cp /tmp/onnxruntime-genai/lib/libonnxruntime-genai*.so* /tmp/onnxruntime/lib/ 2>/dev/null || true
+          echo "ORTGENAI_DYLIB_PATH=/tmp/onnxruntime/lib/libonnxruntime-genai.so" >> $GITHUB_ENV
 
       - name: Download PJRT CPU plugin
-        if: matrix.backend == 'xla' || matrix.backend == 'omni'
+        if: matrix.backend == 'omni'
         run: |
           if [ -n "${{ matrix.container }}" ]; then
             mkdir -p /usr/local/lib/go-xla
@@ -203,7 +162,7 @@ jobs:
             # Backend-specific builds only need pkg/termite
             cd pkg/termite && GOWORK=off go build -v -tags="${{ matrix.tags }}" ./...
           else
-            # Pure-go builds both modules
+            # Go-only builds both modules
             for mod in pkg/termite pkg/termite-client; do
               (cd $mod && GOWORK=off go build -v ./...)
             done
@@ -220,5 +179,5 @@ jobs:
           fi
 
       - name: Test termite-client
-        if: matrix.backend == 'pure-go'
+        if: matrix.backend == 'go'
         run: cd pkg/termite-client && GOWORK=off go test -v ./...

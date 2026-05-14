@@ -1,7 +1,6 @@
+import { Badge, Button } from "@antfly/design-system";
 import { Pencil1Icon, TrashIcon } from "@radix-ui/react-icons";
 import type React from "react";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 
 interface AggregationCardProps {
   name: string;
@@ -20,18 +19,18 @@ interface AggregationCardProps {
 }
 
 const TYPE_COLORS: Record<string, string> = {
-  terms: "bg-blue-500/10 text-blue-600 border-blue-500/20",
-  range: "bg-orange-500/10 text-orange-600 border-orange-500/20",
-  date_range: "bg-orange-500/10 text-orange-600 border-orange-500/20",
-  histogram: "bg-purple-500/10 text-purple-600 border-purple-500/20",
-  date_histogram: "bg-purple-500/10 text-purple-600 border-purple-500/20",
-  sum: "bg-green-500/10 text-green-600 border-green-500/20",
-  avg: "bg-green-500/10 text-green-600 border-green-500/20",
-  min: "bg-green-500/10 text-green-600 border-green-500/20",
-  max: "bg-green-500/10 text-green-600 border-green-500/20",
-  count: "bg-green-500/10 text-green-600 border-green-500/20",
-  stats: "bg-green-500/10 text-green-600 border-green-500/20",
-  cardinality: "bg-green-500/10 text-green-600 border-green-500/20",
+  terms: "af-chart-badge af-chart-badge-1",
+  range: "af-chart-badge af-chart-badge-4",
+  date_range: "af-chart-badge af-chart-badge-4",
+  histogram: "af-chart-badge af-chart-badge-2",
+  date_histogram: "af-chart-badge af-chart-badge-2",
+  sum: "af-chart-badge af-chart-badge-3",
+  avg: "af-chart-badge af-chart-badge-3",
+  min: "af-chart-badge af-chart-badge-3",
+  max: "af-chart-badge af-chart-badge-3",
+  count: "af-chart-badge af-chart-badge-3",
+  stats: "af-chart-badge af-chart-badge-3",
+  cardinality: "af-chart-badge af-chart-badge-3",
 };
 
 const AggregationCard: React.FC<AggregationCardProps> = ({
@@ -41,7 +40,7 @@ const AggregationCard: React.FC<AggregationCardProps> = ({
   onEdit,
 }) => {
   const type = aggregation.type || "terms";
-  const colorClass = TYPE_COLORS[type] || "bg-muted text-muted-foreground";
+  const colorClass = TYPE_COLORS[type] || "bg-muted text-muted-foreground border-border";
 
   const details = (() => {
     const parts: string[] = [];

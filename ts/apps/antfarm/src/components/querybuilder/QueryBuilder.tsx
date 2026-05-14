@@ -1,25 +1,26 @@
-import type { bleve_components, components } from "@antfly/sdk";
-import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
-import type React from "react";
-import AggregationBuilder, { type AggregationConfig } from "@/components/AggregationBuilder";
-import AggregationCard from "@/components/AggregationCard";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
-} from "@/components/ui/accordion";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
+  Badge,
+  Button,
+  Input,
+  Label,
+  Switch,
+} from "@antfly/design-system";
+import type { bleve_components, components } from "@antfly/sdk";
+import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
+import type React from "react";
+import AggregationBuilder, { type AggregationConfig } from "@/components/AggregationBuilder";
+import AggregationCard from "@/components/AggregationCard";
 import type { BasicField, SearchableField } from "../../utils/fieldUtils";
 import FieldSelector from "./FieldSelector";
 import QueryNode from "./QueryNode";
 
 type Query = bleve_components["schemas"]["Query"];
 type QueryRequest = components["schemas"]["QueryRequest"];
+type SortField = NonNullable<QueryRequest["order_by"]>[number];
 
 interface QueryBuilderProps {
   value: string;
@@ -62,6 +63,15 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
     }
   }
 
+  const orderBy: SortField[] = Array.isArray(queryRequest.order_by)
+    ? queryRequest.order_by
+    : queryRequest.order_by && typeof queryRequest.order_by === "object"
+      ? Object.entries(queryRequest.order_by as Record<string, boolean>).map(([field, asc]) => ({
+          field,
+          desc: !asc,
+        }))
+      : [];
+
   const handleQueryChange = (newQuery: Query) => {
     if (showQueryNode && !showOrderByAndFacets) {
       // For filter queries, just return the query itself
@@ -84,20 +94,20 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
   };
 
   const handleOrderByChange = (index: number, field: string, asc: boolean) => {
-    const newOrderBy = [...(queryRequest.order_by || [])];
+    const newOrderBy = [...orderBy];
     newOrderBy[index] = { field, desc: !asc };
     const newQueryRequest = { ...queryRequest, order_by: newOrderBy };
     onChange(JSON.stringify(newQueryRequest, null, 2));
   };
 
   const addOrderBy = () => {
-    const newOrderBy = [...(queryRequest.order_by || []), { field: "", desc: false }];
+    const newOrderBy = [...orderBy, { field: "", desc: false }];
     const newQueryRequest = { ...queryRequest, order_by: newOrderBy };
     onChange(JSON.stringify(newQueryRequest, null, 2));
   };
 
   const removeOrderBy = (index: number) => {
-    const newOrderBy = [...(queryRequest.order_by || [])];
+    const newOrderBy = [...orderBy];
     newOrderBy.splice(index, 1);
     const newQueryRequest = { ...queryRequest, order_by: newOrderBy };
     onChange(JSON.stringify(newQueryRequest, null, 2));
@@ -137,7 +147,6 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
               type="number"
               value={queryRequest.limit}
               onChange={(e) => handleLimitChange(parseInt(e.target.value, 10))}
-              className="h-9"
             />
           </div>
           {showOrderByAndFacets && (
@@ -151,7 +160,6 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
                   handleOffsetChange(e.target.value === "" ? 0 : parseInt(e.target.value, 10))
                 }
                 disabled={disableOffset}
-                className="h-9"
               />
             </div>
           )}
@@ -164,7 +172,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
               <span className="font-medium text-sm">Order By</span>
             </AccordionTrigger>
             <AccordionContent className="pb-3 pt-1 space-y-2">
-              {queryRequest.order_by?.map((sortField, index) => (
+              {orderBy.map((sortField, index) => (
                 <div
                   key={`orderby-${sortField.field}-${sortField.desc}`}
                   className="flex items-center gap-2 p-2 bg-muted/30 rounded border"
@@ -201,10 +209,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
               <FieldSelector
                 availableFields={availableBasicFields}
                 onFieldSelect={(fieldName) => {
-                  const newOrderBy = {
-                    ...queryRequest.order_by,
-                    [fieldName]: true,
-                  };
+                  const newOrderBy = [...orderBy, { field: fieldName, desc: false }];
                   onChange(JSON.stringify({ ...queryRequest, order_by: newOrderBy }, null, 2));
                 }}
               />

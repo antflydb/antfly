@@ -73,8 +73,8 @@ type Runtime struct {
 type RuntimeOptions struct {
 	ExecutionProvider ExecutionProvider
 	// TermiteMLHandler is an optional in-process Termite handler. When set, it
-	// is mounted at /ml/v1/ (and also handles /healthz, /readyz, and
-	// /ml/v1/generate as exposed by pkg/termite.TermiteNode.APIMLHandler).
+	// is mounted at /ml/v1/ and also handles /ml/v1/generate as exposed by
+	// pkg/termite.TermiteNode.APIMLHandler.
 	// When nil and config.Termite.ApiUrl is set, the metadata server instead
 	// reverse-proxies /termite/* to that URL.
 	TermiteMLHandler http.Handler
@@ -421,16 +421,27 @@ func newMetadataLeaderFactory(
 
 func (r *Runtime) newHTTPHandler() http.Handler {
 	internalMux := http.NewServeMux()
-	internalMux.HandleFunc("POST /store", r.node.handleStoreRegistration)
-	internalMux.HandleFunc("DELETE /store/{store}", r.node.handleStoreDeregistration)
+	internalMux.HandleFunc("POST /nodes", r.node.handleNodeRegistration)
+	internalMux.HandleFunc("GET /nodes/{node}", r.node.handleNodeRecord)
+	internalMux.HandleFunc("POST /nodes/{node}/status", r.node.handleNodeStatus)
+	internalMux.HandleFunc("PUT /nodes/{node}/shutdown", r.node.handleNodeShutdownRequest)
+	internalMux.HandleFunc("GET /nodes/{node}/shutdown", r.node.handleNodeShutdownStatus)
+	internalMux.HandleFunc("DELETE /nodes/{node}/shutdown", r.node.handleNodeShutdownCancellation)
+	internalMux.HandleFunc("DELETE /nodes/{node}", r.node.handleNodeShutdownFinalization)
 	internalMux.HandleFunc("POST /shard/{shardID}/txn/resolve", r.node.handleForwardResolveIntent)
 
 	api := kv.NewMetadataStoreAPI(r.logger, r.metadataStore)
 	api.AddRoutes(internalMux)
 	internalMux.HandleFunc("POST /reallocate", r.node.handleReallocateShards)
 
+	metadataMux := http.NewServeMux()
+	api.AddMetadataRoutes(metadataMux)
+
 	publicMux := r.node.publicApiRoutes()
 	apiRoutes := http.NewServeMux()
+	apiRoutes.Handle("/metadata/v1/", http.StripPrefix("/metadata/v1", metadataMux))
+	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
+	// Compatibility aliases for clients using the pre-consolidation path scheme.
 	apiRoutes.Handle("/api/v1/", http.StripPrefix("/api/v1", publicMux))
 	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
 	addAntfarmRoutes(apiRoutes)

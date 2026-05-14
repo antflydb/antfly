@@ -1,0 +1,28 @@
+/**
+ * Aeonik typeface — bundled with the package.
+ * URLs resolve relative to the emitted CSS (dist/index.css).
+ * The Vite build copies src/fonts/ → dist/fonts/.
+ */
+
+@font-face {
+  font-family: "Aeonik";
+  src: url("./fonts/aeonik/Aeonik-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Aeonik";
+  src: url("./fonts/aeonik/Aeonik-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Aeonik", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Roboto Mono", "Menlo", "Monaco", "Courier New", monospace;
+}

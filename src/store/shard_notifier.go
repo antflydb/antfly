@@ -78,7 +78,7 @@ func (n *HTTPShardNotifier) NotifyResolveIntent(
 
 	// Send request to metadata server's forwarding endpoint
 	// The metadata server will look up which node hosts the shard and forward the request
-	url := fmt.Sprintf("%s/_internal/v1/shard/%s/txn/resolve", n.metadataURL, shardID)
+	url := fmt.Sprintf("%s/internal/v1/shard/%s/txn/resolve", n.metadataURL, shardID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(body))
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)

@@ -69,15 +69,30 @@ func (m *MetadataInfo) GetOrchestrationURLs() (map[types.ID]string, error) {
 	return ext.parsed, nil
 }
 
-// Validate performs comprehensive validation of the configuration
+// ValidationOptions controls command-specific config validation.
+type ValidationOptions struct {
+	// RequireMetadata requires metadata.orchestration_urls to be configured.
+	// Commands that do not contact an external metadata cluster can leave this
+	// false; malformed metadata is still rejected when metadata URLs are present.
+	RequireMetadata bool
+}
+
+// Validate performs comprehensive validation of the configuration.
 func (c *Config) Validate() error {
+	return c.ValidateWithOptions(ValidationOptions{RequireMetadata: true})
+}
+
+// ValidateWithOptions performs comprehensive validation of the configuration.
+func (c *Config) ValidateWithOptions(opts ValidationOptions) error {
 	if c == nil {
 		return errors.New("config cannot be nil")
 	}
 
 	// Validate metadata configuration
-	if err := c.validateMetadata(); err != nil {
-		return fmt.Errorf("metadata config validation failed: %w", err)
+	if opts.RequireMetadata || len(c.Metadata.OrchestrationUrls) > 0 {
+		if err := c.validateMetadata(); err != nil {
+			return fmt.Errorf("metadata config validation failed: %w", err)
+		}
 	}
 
 	// Validate TLS configuration

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -494,6 +495,91 @@ func TestBurstRoutingDistributesAcrossEligibleEndpoints(t *testing.T) {
 
 	if !seenA || !seenB {
 		t.Fatalf("expected burst routing to distribute across both endpoints, sawA=%t sawB=%t", seenA, seenB)
+	}
+}
+
+func TestRefreshEndpointSendsUpstreamAuthorization(t *testing.T) {
+	t.Parallel()
+
+	const authToken = "Bearer bridge-token"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != authToken {
+			http.Error(w, "missing auth", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/readyz":
+			w.WriteHeader(http.StatusOK)
+		case "/ml/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"model-a"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	p := NewProxy(Config{
+		RefreshInterval:       time.Minute,
+		UpstreamAuthorization: authToken,
+		Logger:                zap.NewNop(),
+	})
+	p.RegisterEndpointWithHealth(server.URL, server.URL+"/readyz", "bridge", WorkloadTypeGeneral)
+
+	if err := p.registry.RefreshEndpoint(context.Background(), server.URL); err != nil {
+		t.Fatalf("RefreshEndpoint returned error: %v", err)
+	}
+
+	endpoint, err := p.router.RouteRequest(context.Background(), "model-a", "bridge", WorkloadTypeGeneral, nil)
+	if err != nil {
+		t.Fatalf("RouteRequest returned error: %v", err)
+	}
+	if endpoint.Address != server.URL {
+		t.Fatalf("expected endpoint %q, got %q", server.URL, endpoint.Address)
+	}
+}
+
+func TestForwardRequestSendsUpstreamAuthorization(t *testing.T) {
+	t.Parallel()
+
+	const authorization = "Bearer bridge-token"
+	var gotAuthorization atomic.Value
+
+	p := NewProxy(Config{
+		DefaultPool:           "default",
+		RefreshInterval:       time.Minute,
+		UpstreamAuthorization: authorization,
+		Logger:                zap.NewNop(),
+	})
+	p.registry.client = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotAuthorization.Store(req.Header.Get("Authorization"))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewBufferString(`{"ok":true}`)),
+				Request:    req,
+			}, nil
+		}),
+	}
+	p.RegisterEndpoint("http://termite.internal", "default", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://termite.internal", []string{"model-a"})
+
+	req := httptest.NewRequest(http.MethodPost, "/ml/v1/embed", bytes.NewBufferString(`{"model":"model-a"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer caller-token")
+	recorder := httptest.NewRecorder()
+
+	p.handleEmbed(recorder, req)
+
+	resp := recorder.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected OK, got %d", resp.StatusCode)
+	}
+	if got := gotAuthorization.Load(); got != authorization {
+		t.Fatalf("expected upstream Authorization %q, got %q", authorization, got)
 	}
 }
 
@@ -1194,6 +1280,26 @@ func TestReadyRequiresRoutableEndpoint(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected readiness to fail when all endpoints are open-circuit, got %d", resp.StatusCode)
+	}
+}
+
+func TestExtractModelNamesSupportsCategorizedResponses(t *testing.T) {
+	body := strings.NewReader(`{
+		"object": "list",
+		"data": [{"id": "openai-compatible"}],
+		"embedders": {"embedder-a": {"backend": "metal"}},
+		"generators": {"generator-a": {"backend": "metal"}},
+		"rerankers": ["reranker-a"]
+	}`)
+
+	models, err := extractModelNames(body)
+	if err != nil {
+		t.Fatalf("extractModelNames() error = %v", err)
+	}
+
+	want := []string{"embedder-a", "generator-a", "openai-compatible", "reranker-a"}
+	if !slices.Equal(models, want) {
+		t.Fatalf("extractModelNames() = %#v, want %#v", models, want)
 	}
 }
 

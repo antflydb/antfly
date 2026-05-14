@@ -24,9 +24,8 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/registry/, ""),
       },
       "/termite": {
-        target: "http://localhost:11433",
+        target: "http://localhost:8080",
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/termite/, ""),
       },
     },
   },

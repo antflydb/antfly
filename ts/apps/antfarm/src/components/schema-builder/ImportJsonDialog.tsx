@@ -1,8 +1,16 @@
+import {
+  Button,
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogTrigger,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Textarea,
+} from "@antfly/design-system";
 import { type ChangeEvent, useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
 
 interface ImportJsonDialogProps {
   open: boolean;
@@ -60,13 +68,12 @@ export function ImportJsonDialog({ open, onClose, onImport }: ImportJsonDialogPr
                   type="file"
                   accept=".json,.jsonl"
                   onChange={handleFileChange}
-                  className="w-full max-w-full text-sm text-grey-500 truncate
+                  className="w-full max-w-full truncate text-sm text-muted-foreground
                     file:mr-5 file:py-2 file:px-6
                     file:rounded-full file:border-0
                     file:text-sm file:font-medium
-                    file:bg-blue-50 file:text-blue-700
-                    hover:file:cursor-pointer hover:file:bg-amber-50
-                    hover:file:text-amber-700"
+                    file:bg-accent file:text-accent-foreground
+                    hover:file:cursor-pointer hover:file:bg-accent/80"
                 />
                 <Textarea
                   value={fileContent}

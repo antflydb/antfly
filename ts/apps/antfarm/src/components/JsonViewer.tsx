@@ -1,9 +1,8 @@
+import { Button, Card, CardContent } from "@antfly/design-system";
 import type React from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useTheme } from "@/components/theme-provider";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 
 interface JsonViewerProps {
   json: object;

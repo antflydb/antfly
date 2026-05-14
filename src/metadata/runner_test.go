@@ -55,6 +55,13 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 	// Add metadata store API routes
 	api := kv.NewMetadataStoreAPI(logger, nil)
 	api.AddRoutes(internalMux)
+	metadataMux := http.NewServeMux()
+	metadataMux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("metadata")); err != nil {
+			logger.Error("failed to write response", zap.Error(err))
+		}
+	})
 
 	// Create public API routes
 	publicMux := http.NewServeMux()
@@ -67,6 +74,9 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 
 	// Combined router (mimicking the structure in runner.go)
 	apiRoutes := http.NewServeMux()
+	apiRoutes.Handle("/metadata/v1/", http.StripPrefix("/metadata/v1", metadataMux))
+	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
+	// Compatibility aliases.
 	apiRoutes.Handle("/api/v1/", http.StripPrefix("/api/v1", publicMux))
 	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
 
@@ -76,14 +86,20 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 		path           string
 		expectedStatus int
 		expectedBody   string
-		skipExecution  bool // Skip actual handler execution (would panic with nil store)
 	}{
 		{
-			name:           "internal route accessible at /_internal/v1/",
+			name:           "internal route accessible at /internal/v1/",
 			method:         "POST",
-			path:           "/_internal/v1/test-internal",
+			path:           "/internal/v1/test-internal",
 			expectedStatus: http.StatusOK,
 			expectedBody:   "internal",
+		},
+		{
+			name:           "metadata route accessible at /metadata/v1/",
+			method:         "GET",
+			path:           "/metadata/v1/status",
+			expectedStatus: http.StatusOK,
+			expectedBody:   "metadata",
 		},
 		{
 			name:           "public route accessible at /api/v1/",
@@ -93,10 +109,17 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 			expectedBody:   "public",
 		},
 		{
-			name:           "metadata store batch endpoint at /_internal/v1/batch",
+			name:           "metadata store batch endpoint at /internal/v1/batch",
 			method:         "POST",
-			path:           "/_internal/v1/batch",
+			path:           "/internal/v1/batch",
 			expectedStatus: http.StatusBadRequest, // No body, so will fail parsing
+		},
+		{
+			name:           "legacy internal route accessible at /_internal/v1/",
+			method:         "POST",
+			path:           "/_internal/v1/test-internal",
+			expectedStatus: http.StatusOK,
+			expectedBody:   "internal",
 		},
 		{
 			name:           "non-existent route returns 404",
@@ -123,18 +146,18 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 }
 
 // TestInternalRoutesNotAccessibleAtRoot verifies that internal routes
-// are not accessible without the /_internal/v1/ prefix
+// are not accessible without the /internal/v1/ prefix.
 func TestInternalRoutesNotAccessibleAtRoot(t *testing.T) {
 	internalMux := http.NewServeMux()
-	internalMux.HandleFunc("POST /store", func(w http.ResponseWriter, r *http.Request) {
+	internalMux.HandleFunc("POST /nodes", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
 	apiRoutes := http.NewServeMux()
-	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
+	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
 
 	// Try to access the route without the prefix
-	req := httptest.NewRequest("POST", "/store", nil)
+	req := httptest.NewRequest("POST", "/nodes", nil)
 	rec := httptest.NewRecorder()
 
 	apiRoutes.ServeHTTP(rec, req)
@@ -143,11 +166,11 @@ func TestInternalRoutesNotAccessibleAtRoot(t *testing.T) {
 		"Expected 404 for route without prefix")
 
 	// Now try with the correct prefix
-	req = httptest.NewRequest("POST", "/_internal/v1/store", nil)
+	req = httptest.NewRequest("POST", "/internal/v1/nodes", nil)
 	rec = httptest.NewRecorder()
 
 	apiRoutes.ServeHTTP(rec, req)
 
 	assert.NotEqual(t, http.StatusNotFound, rec.Code,
-		"Expected route to be found with /_internal/v1/ prefix")
+		"Expected route to be found with /internal/v1/ prefix")
 }

@@ -1,47 +1,58 @@
-import { Settings } from "lucide-react";
-import type { ReactNode } from "react";
-import { useState } from "react";
-import { Button } from "@/components/ui/button";
 import {
+  Button,
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+  Form,
+  FormActions,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  Input,
+} from "@antfly/design-system";
+import { Settings } from "lucide-react";
+import type { ReactNode } from "react";
+import { useState } from "react";
+import { useForm } from "react-hook-form";
 import { useApiConfig } from "@/hooks/use-api-config";
 
 interface SettingsDialogProps {
   trigger?: ReactNode;
 }
 
+interface SettingsFormValues {
+  apiUrl: string;
+  termiteUrl: string;
+}
+
 export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
   const { apiUrl, setApiUrl, resetToDefault, termiteApiUrl, setTermiteApiUrl, resetTermiteApiUrl } =
     useApiConfig();
-  const [tempUrl, setTempUrl] = useState(apiUrl);
-  const [tempTermiteUrl, setTempTermiteUrl] = useState(termiteApiUrl);
   const [isOpen, setIsOpen] = useState(false);
 
-  const handleSave = () => {
-    setApiUrl(tempUrl);
-    setTermiteApiUrl(tempTermiteUrl);
+  const form = useForm<SettingsFormValues>({
+    defaultValues: { apiUrl, termiteUrl: termiteApiUrl },
+  });
+
+  const handleSave = (data: SettingsFormValues) => {
+    setApiUrl(data.apiUrl);
+    setTermiteApiUrl(data.termiteUrl);
     setIsOpen(false);
   };
 
   const handleReset = () => {
     resetToDefault();
     resetTermiteApiUrl();
-    setTempUrl(apiUrl);
-    setTempTermiteUrl(termiteApiUrl);
+    form.reset({ apiUrl, termiteUrl: termiteApiUrl });
   };
 
   const handleCancel = () => {
-    setTempUrl(apiUrl);
-    setTempTermiteUrl(termiteApiUrl);
+    form.reset({ apiUrl, termiteUrl: termiteApiUrl });
     setIsOpen(false);
   };
 
@@ -62,53 +73,60 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
             the dashboard remotely or connecting to different servers.
           </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-6 py-4">
-          {/* Antfly API URL */}
-          <div className="grid gap-2">
-            <Label htmlFor="api-url">Antfly API URL</Label>
-            <Input
-              id="api-url"
-              value={tempUrl}
-              onChange={(e) => setTempUrl(e.target.value)}
-              placeholder="http://localhost:8082/api/v1"
-            />
-            <p className="text-sm text-muted-foreground">
-              Current: <code className="text-xs bg-muted px-1 py-0.5 rounded">{apiUrl}</code>
-            </p>
-            <div className="text-xs text-muted-foreground">
-              Examples: <code className="bg-muted px-1 py-0.5 rounded">/api/v1</code> (default),{" "}
-              <code className="bg-muted px-1 py-0.5 rounded">http://server:8082/api/v1</code>
-            </div>
-          </div>
+        <Form form={form} onSubmit={form.handleSubmit(handleSave)} className="gap-6 py-4">
+          <FormField
+            control={form.control}
+            name="apiUrl"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Antfly API URL</FormLabel>
+                <FormControl>
+                  <Input placeholder="http://localhost:8082/api/v1" {...field} />
+                </FormControl>
+                <FormDescription>
+                  Current: <code className="text-xs bg-muted px-1 py-0.5 rounded">{apiUrl}</code>
+                </FormDescription>
+                <FormDescription className="text-xs">
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded">/api/v1</code> (default),{" "}
+                  <code className="bg-muted px-1 py-0.5 rounded">http://server:8082/api/v1</code>
+                </FormDescription>
+              </FormItem>
+            )}
+          />
 
-          {/* Termite API URL */}
-          <div className="grid gap-2">
-            <Label htmlFor="termite-url">Termite API URL</Label>
-            <Input
-              id="termite-url"
-              value={tempTermiteUrl}
-              onChange={(e) => setTempTermiteUrl(e.target.value)}
-              placeholder="http://localhost:11433"
-            />
-            <p className="text-sm text-muted-foreground">
-              Current: <code className="text-xs bg-muted px-1 py-0.5 rounded">{termiteApiUrl}</code>
-            </p>
-            <div className="text-xs text-muted-foreground">
-              Examples: <code className="bg-muted px-1 py-0.5 rounded">http://localhost:11433</code>{" "}
-              (default),{" "}
-              <code className="bg-muted px-1 py-0.5 rounded">https://termite.company.com</code>
-            </div>
-          </div>
-        </div>
-        <DialogFooter className="gap-2">
-          <Button variant="outline" onClick={handleReset}>
-            Reset to Default
-          </Button>
-          <Button variant="outline" onClick={handleCancel}>
-            Cancel
-          </Button>
-          <Button onClick={handleSave}>Save</Button>
-        </DialogFooter>
+          <FormField
+            control={form.control}
+            name="termiteUrl"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Termite API URL</FormLabel>
+                <FormControl>
+                  <Input placeholder="http://localhost:11433" {...field} />
+                </FormControl>
+                <FormDescription>
+                  Current:{" "}
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded">{termiteApiUrl}</code>
+                </FormDescription>
+                <FormDescription className="text-xs">
+                  Examples:{" "}
+                  <code className="bg-muted px-1 py-0.5 rounded">http://localhost:11433</code>{" "}
+                  (default),{" "}
+                  <code className="bg-muted px-1 py-0.5 rounded">https://termite.company.com</code>
+                </FormDescription>
+              </FormItem>
+            )}
+          />
+
+          <FormActions>
+            <Button variant="outline" type="button" onClick={handleReset}>
+              Reset to Default
+            </Button>
+            <Button variant="outline" type="button" onClick={handleCancel}>
+              Cancel
+            </Button>
+            <Button type="submit">Save</Button>
+          </FormActions>
+        </Form>
       </DialogContent>
     </Dialog>
   );

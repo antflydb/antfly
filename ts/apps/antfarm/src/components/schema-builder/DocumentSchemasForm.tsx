@@ -1,27 +1,26 @@
-import { zodResolver } from "@hookform/resolvers/zod";
-import { MagnifyingGlassIcon, ReloadIcon } from "@radix-ui/react-icons";
-import type React from "react";
-import { useCallback, useEffect, useState } from "react";
-import { useFieldArray, useForm } from "react-hook-form";
-import { z } from "zod";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
 import {
+  Alert,
+  AlertDescription,
+  Button,
   Form,
   FormControl,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
-} from "@/components/ui/form";
-import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
+  Switch,
+} from "@antfly/design-system";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { MagnifyingGlassIcon, ReloadIcon } from "@radix-ui/react-icons";
+import type React from "react";
+import { useCallback, useEffect, useState } from "react";
+import { FormProvider, useFieldArray, useForm } from "react-hook-form";
+import { z } from "zod";
 import { useFieldDetection } from "@/hooks/use-field-detection";
 import type { JSONSchema, JSONSchemaProperty, TableSchema } from "../../api";
 import JsonViewer from "../JsonViewer";
@@ -353,12 +352,12 @@ const DocumentSchemasForm: React.FC<DocumentSchemasFormProps> = ({
           default_type: data.default_type,
           document_schemas: (data.document_schemas || []).reduce(
             (acc, schema) => {
-              if (!schema || !schema.name) return acc;
+              if (!schema?.name) return acc;
               const jsonSchema: JSONSchema = {
                 type: "object",
                 properties: (schema.properties || []).reduce(
                   (propAcc, prop) => {
-                    if (!prop || !prop.name) return propAcc;
+                    if (!prop?.name) return propAcc;
                     const { name, ...rest } = prop;
                     propAcc[name] = rest as JSONSchemaProperty;
                     return propAcc;
@@ -476,7 +475,7 @@ const DocumentSchemasForm: React.FC<DocumentSchemasFormProps> = ({
   const content = (
     <>
       <div className="flex justify-between items-center mb-4">
-        <h3 className="text-xl font-semibold">{title}</h3>
+        <h3 className="font-semibold">{title}</h3>
         {renderAsForm && (
           <div className="flex items-center gap-2">
             <p>Raw JSON</p>
@@ -488,7 +487,7 @@ const DocumentSchemasForm: React.FC<DocumentSchemasFormProps> = ({
         <JsonViewer json={jsonPayload.schema} />
       ) : (
         <>
-          <h4 className="text-lg font-semibold mb-2">Document Schemas</h4>
+          <h4 className="mb-2 font-semibold">Document Schemas</h4>
 
           <div className="flex gap-2 mb-4">
             {tableName && (
@@ -602,11 +601,11 @@ const DocumentSchemasForm: React.FC<DocumentSchemasFormProps> = ({
   );
 
   return renderAsForm ? (
-    <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleFormSubmit)}>{content}</form>
+    <Form form={form} onSubmit={form.handleSubmit(handleFormSubmit)}>
+      {content}
     </Form>
   ) : (
-    <Form {...form}>{content}</Form>
+    <FormProvider {...form}>{content}</FormProvider>
   );
 };
 

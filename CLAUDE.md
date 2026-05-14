@@ -101,9 +101,7 @@ Tags follow Go module conventions and trigger CI:
 
 - `v*` — root module release + container build
 - `pkg/operator/v*` — integrated Antfly/Termite operator container build
-- `pkg/antfly-proxy/v*` — antfly-proxy container build
 - `pkg/termite/v*` — termite container build (both pure-Go and omni images)
-- `pkg/termite-proxy/v*` — termite-proxy container build
 
 ## Secrets Management
 

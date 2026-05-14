@@ -31,6 +31,14 @@ interface RegistryResponse {
   models: RegistryModelResponse[];
 }
 
+function isRegistryResponse(value: unknown): value is RegistryResponse {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Array.isArray((value as Partial<RegistryResponse>).models)
+  );
+}
+
 // Static model type metadata (not provided by registry)
 const MODEL_TYPES: ModelTypeInfo[] = [
   {
@@ -196,9 +204,13 @@ export function useTermiteRegistry(): TermiteRegistryState {
         throw new Error(`Failed to fetch registry: ${response.status}`);
       }
 
-      const data: RegistryResponse = await response.json();
+      const data: unknown = await response.json();
 
       if (!isMountedRef.current) return;
+
+      if (!isRegistryResponse(data)) {
+        throw new Error("Model registry response is missing a models array");
+      }
 
       const transformedModels = data.models.map(transformModel);
 

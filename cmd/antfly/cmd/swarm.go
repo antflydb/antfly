@@ -31,9 +31,9 @@ import (
 	libtermite "github.com/antflydb/antfly/lib/termite"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/pkg/libaf/healthserver"
+	"github.com/antflydb/antfly/pkg/termite"
 	"github.com/antflydb/antfly/src/metadata"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/pkg/termite"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -88,13 +88,19 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	viper.SetDefault("cors.enabled", true)
 	viper.SetDefault("replication_factor", 1)
 	viper.SetDefault("default_shards_per_table", 1)
-	viper.SetDefault("metadata.orchestration_urls", map[string]string{
+	defaultOrchestrationURLs := map[string]string{
 		types.ID(id).String(): viper.GetString("swarm.metadata-api"),
-	})
+	}
+	viper.SetDefault("metadata.orchestration_urls", defaultOrchestrationURLs)
 
-	config, err := parseConfig(viper.GetViper())
+	config, err := parseConfigWithOptions(viper.GetViper(), parseConfigOptions{
+		RequireMetadata: false,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
+	}
+	if len(config.Metadata.OrchestrationUrls) == 0 {
+		config.Metadata.OrchestrationUrls = defaultOrchestrationURLs
 	}
 	logger := getLogger(config)
 	defer func() { _ = logger.Sync() }()

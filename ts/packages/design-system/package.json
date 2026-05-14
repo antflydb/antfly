@@ -1,0 +1,147 @@
+{
+  "name": "@antfly/design-system",
+  "version": "0.0.7",
+  "description": "Antfly's shared shadcn/ui component library: primitives, compound components, brand blocks, design tokens, and Aeonik.",
+  "author": "Antfly, Inc. <contact@antfly.io>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly-ts.git",
+    "directory": "packages/design-system"
+  },
+  "keywords": [
+    "antfly",
+    "design-system",
+    "shadcn",
+    "ui",
+    "react",
+    "tailwind"
+  ],
+  "type": "module",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "files": [
+    "dist",
+    "src/fonts"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./styles.css": "./dist/index.css",
+    "./tokens": "./dist/tokens/index.css",
+    "./theme": "./dist/theme.css",
+    "./dashboard.css": "./dist/dashboard.css",
+    "./primitives": {
+      "types": "./dist/primitives/index.d.ts",
+      "import": "./dist/primitives/index.js"
+    },
+    "./brand": {
+      "types": "./dist/brand/index.d.ts",
+      "import": "./dist/brand/index.js"
+    },
+    "./components": {
+      "types": "./dist/components/index.d.ts",
+      "import": "./dist/components/index.js"
+    },
+    "./charts": {
+      "types": "./dist/charts/index.d.ts",
+      "import": "./dist/charts/index.js"
+    },
+    "./charts.css": "./dist/charts.css",
+    "./templates": {
+      "types": "./dist/templates/index.d.ts",
+      "import": "./dist/templates/index.js"
+    },
+    "./examples": {
+      "types": "./dist/examples/index.d.ts",
+      "import": "./dist/examples/index.js"
+    },
+    "./fonts/*": "./src/fonts/*",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "pnpm run clean && pnpm run build:components && pnpm run build:fonts && pnpm run build:styles && pnpm run build:css-assets",
+    "build:components": "vite build",
+    "build:fonts": "mkdir -p dist/fonts && cp -R src/fonts/aeonik dist/fonts/",
+    "build:styles": "tailwindcss -i ./src/styles.css -o ./dist/index.css",
+    "build:css-assets": "mkdir -p dist/tokens/fonts && cp -R src/tokens/* dist/tokens/ && cp -R src/fonts/aeonik dist/tokens/fonts/ && cp src/theme.css dist/theme.css && cp src/charts.css dist/charts.css && cp src/dashboard.css dist/dashboard.css",
+    "typecheck": "tsc --noEmit",
+    "dev": "pnpm run build:styles --watch",
+    "clean": "rm -rf dist",
+    "lint": "biome lint src"
+  },
+  "dependencies": {
+    "@radix-ui/react-accordion": "^1.2.12",
+    "@radix-ui/react-alert-dialog": "^1.1.15",
+    "@radix-ui/react-aspect-ratio": "^1.1.8",
+    "@radix-ui/react-avatar": "^1.1.11",
+    "@radix-ui/react-checkbox": "^1.3.3",
+    "@radix-ui/react-collapsible": "^1.1.12",
+    "@radix-ui/react-context-menu": "^2.2.16",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-hover-card": "^1.1.15",
+    "@radix-ui/react-label": "^2.1.8",
+    "@radix-ui/react-menubar": "^1.1.16",
+    "@radix-ui/react-navigation-menu": "^1.2.14",
+    "@radix-ui/react-popover": "^1.1.15",
+    "@radix-ui/react-progress": "^1.1.8",
+    "@radix-ui/react-radio-group": "^1.3.8",
+    "@radix-ui/react-scroll-area": "^1.2.10",
+    "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-slider": "^1.3.6",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-switch": "^1.2.6",
+    "@radix-ui/react-tabs": "^1.1.13",
+    "@radix-ui/react-toggle": "^1.1.10",
+    "@radix-ui/react-toggle-group": "^1.1.11",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@tanstack/react-table": "^8.21.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "date-fns": "^4.1.0",
+    "embla-carousel-react": "^8.6.0",
+    "gsap": "^3.13.0",
+    "input-otp": "^1.4.2",
+    "lucide-react": "^0.555.0",
+    "next-themes": "^0.4.6",
+    "radix-ui": "^1.4.3",
+    "react-day-picker": "^9.14.0",
+    "react-hook-form": "^7.71.2",
+    "react-resizable-panels": "^4",
+    "recharts": "^3.8.0",
+    "sonner": "^1.7.4",
+    "tailwind-merge": "^3.5.0",
+    "vaul": "^1.1.2"
+  },
+  "peerDependencies": {
+    "react": "^18 || ^19",
+    "react-dom": "^18 || ^19",
+    "tailwindcss": "^4"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.2.1",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "rollup-plugin-preserve-directives": "^0.4.0",
+    "tailwindcss": "^4.2.1",
+    "typescript": "5.9.3",
+    "vite": "^7.3.1",
+    "vite-plugin-dts": "^4.5.4",
+    "vite-tsconfig-paths": "^5.1.4"
+  }
+}

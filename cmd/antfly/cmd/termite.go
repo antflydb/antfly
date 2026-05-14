@@ -21,10 +21,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/pkg/termite"
 	"github.com/antflydb/antfly/pkg/termite/lib/cli"
 	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
+	"github.com/antflydb/antfly/src/common"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -173,7 +173,10 @@ func runTermite(cmd *cobra.Command, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	config, err := parseConfig(viper.GetViper())
+	config, err := parseConfigWithOptions(viper.GetViper(), parseConfigOptions{
+		RequireMetadata:      false,
+		DefaultTermiteAPIURL: defaultTermiteAPIURL,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}

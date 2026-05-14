@@ -1,17 +1,17 @@
-import type { bleve_components } from "@antfly/sdk";
-import { Cross2Icon } from "@radix-ui/react-icons";
-import type React from "react";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
+  Button,
+  Checkbox,
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@antfly/design-system";
+import type { bleve_components } from "@antfly/sdk";
+import { Cross2Icon } from "@radix-ui/react-icons";
+import type React from "react";
 import type { SearchableField } from "../../utils/fieldUtils";
 import FieldSelector from "./FieldSelector";
 
@@ -359,7 +359,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         <div className="shrink-0 w-44">
           <Label className="text-xs mb-1 block">Query Type</Label>
           <Select value={queryType} onValueChange={handleTypeChange}>
-            <SelectTrigger className="h-8">
+            <SelectTrigger size="sm">
               <SelectValue placeholder="Query Type" />
             </SelectTrigger>
             <SelectContent>

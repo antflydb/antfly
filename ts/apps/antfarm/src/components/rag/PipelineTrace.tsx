@@ -1,7 +1,7 @@
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@antfly/design-system";
 import { GitGraph, MessageSquare, Text } from "lucide-react";
 import type React from "react";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PipelineDetailPanel } from "./PipelineDetailPanel";
 import { PipelineGraph } from "./PipelineGraph";
 import type { PipelineState } from "./pipeline-types";
@@ -35,15 +35,17 @@ export const PipelineTrace: React.FC<PipelineTraceProps> = ({
   const statusIndicator = (
     <div className="flex items-center gap-2">
       {pipeline.overallStatus === "running" && (
-        <span className="flex items-center gap-1.5 text-xs text-blue-500">
-          <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
+        <span className="af-status-text-info flex items-center gap-1.5 text-xs">
+          <span className="af-status-dot-info w-1.5 h-1.5 rounded-full animate-pulse" />
           Running
         </span>
       )}
       {pipeline.overallStatus === "complete" && (
-        <span className="text-xs text-green-500">Complete</span>
+        <span className="af-status-text-success text-xs">Complete</span>
       )}
-      {pipeline.overallStatus === "error" && <span className="text-xs text-red-500">Error</span>}
+      {pipeline.overallStatus === "error" && (
+        <span className="af-status-text-error text-xs">Error</span>
+      )}
     </div>
   );
 

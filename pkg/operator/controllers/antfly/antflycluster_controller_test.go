@@ -3,6 +3,9 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,13 +17,21 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // T004: Unit test for applyDefaults() setting ServiceMesh.Enabled=false
 func TestApplyDefaults_ServiceMeshDefaults(t *testing.T) {
@@ -450,6 +461,927 @@ func TestApplyDefaults_SwarmDefaults(t *testing.T) {
 	g.Expect(cluster.Spec.Swarm.Termite).ToNot(BeNil())
 	g.Expect(cluster.Spec.Swarm.Termite.Enabled).To(BeTrue())
 	g.Expect(cluster.Spec.Swarm.Termite.APIURL).To(Equal("http://0.0.0.0:11433"))
+}
+
+func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 7},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-storage-test-cluster-data-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-cluster",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pvc).Build(),
+		Scheme: s,
+	}
+
+	result := reconciler.reconcilePVCExpansion(ctx, cluster, "data", "data-storage", "test-cluster-data", "2Gi")
+	reconciler.setPVCExpansionCondition(cluster, []pvcExpansionResult{result})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypePVCExpansion)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonPVCExpansionInProgress))
+	g.Expect(cond.ObservedGeneration).To(Equal(int64(7)))
+
+	updated := &corev1.PersistentVolumeClaim{}
+	g.Expect(reconciler.Get(ctx, types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, updated)).To(Succeed())
+	g.Expect(updated.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("2Gi")))
+}
+
+func TestReconcileStorageAutoGrowRecommendsGrowth(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 8},
+		Spec: antflyv1.AntflyClusterSpec{
+			Storage: antflyv1.StorageSpec{
+				DataStorage: "10Gi",
+				StorageAutoGrow: &antflyv1.StorageAutoGrowSpec{
+					Enabled:              true,
+					MaxDataStorage:       "20Gi",
+					GrowThresholdPercent: 80,
+					GrowIncrement:        "5Gi",
+				},
+			},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-storage-test-cluster-data-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-cluster",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-data-0",
+			Namespace: "default",
+			Labels:    serviceSelectorLabels("test-cluster", "data"),
+		},
+		Spec: corev1.PodSpec{NodeName: "node-1"},
+	}
+	usedBytes := uint64(9 * 1024 * 1024 * 1024)
+	capacityBytes := uint64(10 * 1024 * 1024 * 1024)
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pvc, pod).Build(),
+		Scheme: s,
+		NodeStatsFetcher: func(context.Context, string) (*kubeletStatsSummary, error) {
+			return &kubeletStatsSummary{
+				Pods: []kubeletPodStats{
+					{
+						PodRef: kubeletPodReference{Name: pod.Name, Namespace: pod.Namespace},
+						Volume: []kubeletVolumeStats{
+							{
+								PVCRef:        &kubeletPVCReference{Name: pvc.Name, Namespace: pvc.Namespace},
+								UsedBytes:     &usedBytes,
+								CapacityBytes: &capacityBytes,
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	recommended := reconciler.reconcileStorageAutoGrow(ctx, cluster, "data", "data-storage", "test-cluster-data", "10Gi", "20Gi")
+
+	g.Expect(recommended).To(Equal("15Gi"))
+	g.Expect(cluster.Status.StorageAutoGrowStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.StorageAutoGrowStatus.Reason).To(Equal(antflyv1.ReasonStorageAutoGrowInProgress))
+	g.Expect(cluster.Status.StorageAutoGrowStatus.UsagePercent).To(Equal(int32(90)))
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeStorageAutoGrow)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonStorageAutoGrowInProgress))
+}
+
+func TestSetPVCExpansionConditionReportsComplete(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 3},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.setPVCExpansionCondition(cluster, []pvcExpansionResult{
+		{component: "metadata", state: pvcExpansionComplete, message: "metadata complete"},
+		{component: "data", state: pvcExpansionComplete, message: "data complete"},
+	})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypePVCExpansion)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonPVCExpansionComplete))
+}
+
+func TestUpdateRolloutConditionReportsProgressAndComplete(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 4},
+	}
+	reconciler := &AntflyClusterReconciler{}
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-data", Generation: 2},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    1,
+			ReadyReplicas:      1,
+		},
+	}
+
+	reconciler.updateRolloutCondition(cluster, sts)
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
+
+	sts.Status.ObservedGeneration = 2
+	sts.Status.UpdatedReplicas = 3
+	sts.Status.ReadyReplicas = 3
+	reconciler.updateRolloutCondition(cluster, sts)
+	cond = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutComplete))
+}
+
+func TestUpdateRolloutConditionReportsMissingStatefulSet(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 4},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateRolloutCondition(cluster, &appsv1.StatefulSet{})
+
+	cond := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeRollout)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
+	g.Expect(cond.Message).To(ContainSubstring("not observed"))
+}
+
+func TestEffectiveDataReplicaTargetPrefersStatefulSetSpec(t *testing.T) {
+	g := NewWithT(t)
+	replicas := int32(5)
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status: appsv1.StatefulSetStatus{
+			Replicas: 3,
+		},
+	}
+
+	g.Expect(effectiveDataReplicas(sts, true, 1)).To(Equal(int32(3)))
+	g.Expect(effectiveDataReplicaTarget(sts, true, 1)).To(Equal(int32(5)))
+	g.Expect(max(effectiveDataReplicas(sts, true, 1), effectiveDataReplicaTarget(sts, true, 1))).To(Equal(int32(5)))
+}
+
+func TestEffectiveDataNodeReplicasSuspendScalesToZero(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			DataNodes: antflyv1.DataNodesSpec{
+				Replicas: 5,
+				Suspend:  true,
+			},
+		},
+	}
+
+	g.Expect(effectiveDataNodeReplicas(cluster)).To(Equal(int32(0)))
+}
+
+func TestShouldCancelDataScaleDownForSuspend(t *testing.T) {
+	g := NewWithT(t)
+	status := &antflyv1.DataScaleDownStatus{
+		Phase:           "Draining",
+		DrainingOrdinal: 4,
+		DrainingNodeID:  "5",
+	}
+
+	g.Expect(shouldCancelDataScaleDownForSuspend(status, 5)).To(BeTrue())
+	g.Expect(shouldCancelDataScaleDownForSuspend(status, 4)).To(BeFalse())
+	status.Phase = "Complete"
+	g.Expect(shouldCancelDataScaleDownForSuspend(status, 5)).To(BeFalse())
+}
+
+func TestNodeIDForDataOrdinalUsesDecimalID(t *testing.T) {
+	g := NewWithT(t)
+
+	g.Expect(nodeIDForDataOrdinal(0)).To(Equal("1"))
+	g.Expect(nodeIDForDataOrdinal(9)).To(Equal("10"))
+}
+
+func TestSetDataScaleDownStatusRecordsAutoscalerSource(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{}
+
+	reconciler.setDataScaleDownStatus(cluster, antflyv1.DataScaleDownSourceAutoscaler, 5, 3, 4, 4, "5", "Draining", "draining")
+
+	g.Expect(cluster.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.DataScaleDownStatus.Source).To(Equal(antflyv1.DataScaleDownSourceAutoscaler))
+	g.Expect(cluster.Status.DataScaleDownStatus.FromReplicas).To(Equal(int32(5)))
+	g.Expect(cluster.Status.DataScaleDownStatus.TargetReplicas).To(Equal(int32(3)))
+	g.Expect(cluster.Status.DataScaleDownStatus.AppliedReplicas).To(Equal(int32(4)))
+	g.Expect(cluster.Status.DataScaleDownStatus.DrainingOrdinal).To(Equal(int32(4)))
+	g.Expect(cluster.Status.DataScaleDownStatus.DrainingNodeID).To(Equal("5"))
+	g.Expect(cluster.Status.DataScaleDownStatus.Phase).To(Equal("Draining"))
+}
+
+func TestRequestDataNodeShutdownUsesNodeShutdownAPI(t *testing.T) {
+	g := NewWithT(t)
+	var methods []string
+	var paths []string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			methods = append(methods, req.Method)
+			paths = append(paths, req.URL.Path)
+			body := "accepted"
+			if req.Method == http.MethodGet {
+				body = `{"node_id":5,"phase":"complete","safe_to_terminate":true}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+		},
+	}
+
+	status, err := reconciler.requestDataNodeShutdown(context.Background(), cluster, "5")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(status.SafeToTerminate).To(BeTrue())
+	g.Expect(methods).To(Equal([]string{http.MethodPut, http.MethodGet}))
+	g.Expect(paths).To(Equal([]string{
+		"/internal/v1/nodes/5/shutdown",
+		"/internal/v1/nodes/5/shutdown",
+	}))
+}
+
+func TestRequestDataNodeShutdownDecodesBlockedStatus(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body := "accepted"
+			if req.Method == http.MethodGet {
+				body = `{"node_id":5,"phase":"blocked","safe_to_terminate":false,"blocked":true,"blocked_reason":"InsufficientShardVoters","message":"cannot safely remove voter"}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+		},
+	}
+
+	status, err := reconciler.requestDataNodeShutdown(context.Background(), cluster, "5")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(status.SafeToTerminate).To(BeFalse())
+	g.Expect(status.Blocked).To(BeTrue())
+	g.Expect(status.BlockedReason).To(Equal("InsufficientShardVoters"))
+	g.Expect(status.Message).To(Equal("cannot safely remove voter"))
+}
+
+func TestCancelDataNodeShutdownUsesNodeShutdownAPI(t *testing.T) {
+	g := NewWithT(t)
+	var methods []string
+	var paths []string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			methods = append(methods, req.Method)
+			paths = append(paths, req.URL.Path)
+			body := `{"status":"canceled"}`
+			if req.Method == http.MethodGet {
+				body = `{"node_id":5,"phase":"active","safe_to_terminate":false}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+		},
+	}
+
+	status, err := reconciler.cancelDataNodeShutdown(context.Background(), cluster, "5")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(status.Phase).To(Equal("active"))
+	g.Expect(methods).To(Equal([]string{http.MethodDelete, http.MethodGet}))
+	g.Expect(paths).To(Equal([]string{
+		"/internal/v1/nodes/5/shutdown",
+		"/internal/v1/nodes/5/shutdown",
+	}))
+}
+
+func TestFinalizeDataNodeShutdownUsesNodeAPI(t *testing.T) {
+	g := NewWithT(t)
+	var methods []string
+	var paths []string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			methods = append(methods, req.Method)
+			paths = append(paths, req.URL.Path)
+			return &http.Response{
+				StatusCode: http.StatusAccepted,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"status":"finalized"}`)),
+				Request:    req,
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+		},
+	}
+
+	err := reconciler.finalizeDataNodeShutdown(context.Background(), cluster, "5")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(methods).To(Equal([]string{http.MethodDelete}))
+	g.Expect(paths).To(Equal([]string{"/internal/v1/nodes/5"}))
+}
+
+func TestShouldCancelDataScaleDownWhenOrdinalDesiredAgain(t *testing.T) {
+	g := NewWithT(t)
+	status := &antflyv1.DataScaleDownStatus{
+		Phase:           "Draining",
+		DrainingOrdinal: 4,
+		DrainingNodeID:  "5",
+	}
+
+	g.Expect(shouldCancelDataScaleDown(status, 5, 5)).To(BeTrue())
+	g.Expect(shouldCancelDataScaleDown(status, 5, 4)).To(BeFalse())
+	g.Expect(shouldCancelDataScaleDown(status, 4, 5)).To(BeFalse(), "Once the StatefulSet removed the ordinal, finalization owns the transition")
+	status.Phase = "Canceling"
+	g.Expect(shouldCancelDataScaleDown(status, 5, 5)).To(BeTrue())
+	status.Phase = "Scaling"
+	g.Expect(shouldCancelDataScaleDown(status, 5, 5)).To(BeTrue())
+	status.Phase = "Complete"
+	g.Expect(shouldCancelDataScaleDown(status, 5, 5)).To(BeFalse())
+}
+
+func TestShouldFinalizeDataScaleDownRetriesOnlyPostShrinkFailures(t *testing.T) {
+	g := NewWithT(t)
+	status := &antflyv1.DataScaleDownStatus{
+		Phase:           "Failed",
+		FromReplicas:    5,
+		TargetReplicas:  4,
+		AppliedReplicas: 4,
+		DrainingOrdinal: 4,
+		DrainingNodeID:  "5",
+	}
+
+	g.Expect(shouldFinalizeDataScaleDown(status, 4, 4, false)).To(BeTrue())
+	g.Expect(shouldFinalizeDataScaleDown(status, 5, 4, false)).To(BeFalse(), "StatefulSet has not removed the ordinal yet")
+	g.Expect(shouldFinalizeDataScaleDown(status, 4, 3, true)).To(BeFalse(), "A new scale-down step should retry drain, not finalize an old failed state")
+	g.Expect(shouldFinalizeDataScaleDown(status, 4, 5, false)).To(BeTrue(), "Once the StatefulSet removed the ordinal, finalization owns the transition")
+
+	status.AppliedReplicas = 5
+	g.Expect(shouldFinalizeDataScaleDown(status, 5, 5, false)).To(BeFalse(), "Drain failures before StatefulSet shrink are not finalization failures")
+}
+
+func TestReconcileCancelsDataScaleDownWhenOrdinalDesiredAgain(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: antflyv1.GroupVersion.String(),
+			Kind:       "AntflyCluster",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "cancel-scale",
+			Namespace:  "default",
+			Generation: 3,
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:    1,
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{
+				Replicas: 5,
+			},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "1Gi",
+				DataStorage:     "1Gi",
+			},
+			Config: "{}",
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			ObservedGeneration: 3,
+			Conditions: []metav1.Condition{
+				{Type: antflyv1.TypeConfigurationValid, Status: metav1.ConditionTrue, Reason: antflyv1.ReasonValidationPassed, ObservedGeneration: 3},
+			},
+			DataScaleDownStatus: &antflyv1.DataScaleDownStatus{
+				Source:          antflyv1.DataScaleDownSourceManual,
+				FromReplicas:    5,
+				TargetReplicas:  3,
+				AppliedReplicas: 5,
+				DrainingOrdinal: 4,
+				DrainingNodeID:  "5",
+				Phase:           "Draining",
+			},
+		},
+	}
+	dataReplicas := int32(5)
+	dataSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "cancel-scale-data", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &dataReplicas,
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas: 5,
+		},
+	}
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(cluster).
+		WithObjects(cluster, dataSts).
+		Build()
+
+	var methods []string
+	var paths []string
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			methods = append(methods, req.Method)
+			paths = append(paths, req.URL.Path)
+			body := `{"status":"canceled"}`
+			if req.Method == http.MethodGet {
+				body = `{"node_id":5,"phase":"active","safe_to_terminate":false}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "cancel-scale", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+	g.Expect(methods).To(Equal([]string{http.MethodDelete, http.MethodGet}))
+	g.Expect(paths).To(Equal([]string{"/internal/v1/nodes/5/shutdown", "/internal/v1/nodes/5/shutdown"}))
+
+	updated := &antflyv1.AntflyCluster{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "cancel-scale", Namespace: "default"}, updated)).To(Succeed())
+	g.Expect(updated.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(updated.Status.DataScaleDownStatus.Phase).To(Equal("Canceled"))
+	cond := meta.FindStatusCondition(updated.Status.Conditions, antflyv1.TypeScaling)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+}
+
+func TestReconcileWaitsForDataScaleDownCancellationRecovery(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
+		ObjectMeta: metav1.ObjectMeta{Name: "cancel-recovering", Namespace: "default", Generation: 3},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:    1,
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{Replicas: 5},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "1Gi",
+				DataStorage:     "1Gi",
+			},
+			Config: "{}",
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			ObservedGeneration: 3,
+			Conditions: []metav1.Condition{
+				{Type: antflyv1.TypeConfigurationValid, Status: metav1.ConditionTrue, Reason: antflyv1.ReasonValidationPassed, ObservedGeneration: 3},
+			},
+			DataScaleDownStatus: &antflyv1.DataScaleDownStatus{
+				Source:          antflyv1.DataScaleDownSourceManual,
+				FromReplicas:    5,
+				TargetReplicas:  3,
+				AppliedReplicas: 5,
+				DrainingOrdinal: 4,
+				DrainingNodeID:  "5",
+				Phase:           "Draining",
+			},
+		},
+	}
+	dataReplicas := int32(5)
+	dataSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "cancel-recovering-data", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
+		Status:     appsv1.StatefulSetStatus{Replicas: 5},
+	}
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(cluster).
+		WithObjects(cluster, dataSts).
+		Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body := `{"status":"canceled"}`
+			if req.Method == http.MethodGet {
+				body = `{"node_id":5,"phase":"recovering","safe_to_terminate":false}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "cancel-recovering", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+	updated := &antflyv1.AntflyCluster{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "cancel-recovering", Namespace: "default"}, updated)).To(Succeed())
+	g.Expect(updated.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(updated.Status.DataScaleDownStatus.Phase).To(Equal("Canceling"))
+	cond := meta.FindStatusCondition(updated.Status.Conditions, antflyv1.TypeScaling)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+}
+
+func TestReconcileFinalizesDataScaleDownAfterStatefulSetShrinks(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
+		ObjectMeta: metav1.ObjectMeta{Name: "finalize-scale", Namespace: "default", Generation: 3},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:    1,
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{Replicas: 5},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "1Gi",
+				DataStorage:     "1Gi",
+			},
+			Config: "{}",
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			ObservedGeneration: 3,
+			Conditions: []metav1.Condition{
+				{Type: antflyv1.TypeConfigurationValid, Status: metav1.ConditionTrue, Reason: antflyv1.ReasonValidationPassed, ObservedGeneration: 3},
+			},
+			DataScaleDownStatus: &antflyv1.DataScaleDownStatus{
+				Source:          antflyv1.DataScaleDownSourceManual,
+				FromReplicas:    5,
+				TargetReplicas:  4,
+				AppliedReplicas: 4,
+				DrainingOrdinal: 4,
+				DrainingNodeID:  "5",
+				Phase:           "Scaling",
+			},
+		},
+	}
+	dataReplicas := int32(4)
+	dataSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "finalize-scale-data", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
+		Status:     appsv1.StatefulSetStatus{Replicas: 4},
+	}
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(cluster).
+		WithObjects(cluster, dataSts).
+		Build()
+
+	var methods []string
+	var paths []string
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			methods = append(methods, req.Method)
+			paths = append(paths, req.URL.Path)
+			return &http.Response{
+				StatusCode: http.StatusAccepted,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"status":"finalized"}`)),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "finalize-scale", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(1 * time.Second))
+	g.Expect(methods).To(Equal([]string{http.MethodDelete}))
+	g.Expect(paths).To(Equal([]string{"/internal/v1/nodes/5"}))
+
+	updated := &antflyv1.AntflyCluster{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "finalize-scale", Namespace: "default"}, updated)).To(Succeed())
+	g.Expect(updated.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(updated.Status.DataScaleDownStatus.Phase).To(Equal("Complete"))
+}
+
+func TestReconcileRetriesFailedDataScaleDownFinalization(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
+		ObjectMeta: metav1.ObjectMeta{Name: "retry-finalize-scale", Namespace: "default", Generation: 3},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:    1,
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{Replicas: 4},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "1Gi",
+				DataStorage:     "1Gi",
+			},
+			Config: "{}",
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			ObservedGeneration: 3,
+			Conditions: []metav1.Condition{
+				{Type: antflyv1.TypeConfigurationValid, Status: metav1.ConditionTrue, Reason: antflyv1.ReasonValidationPassed, ObservedGeneration: 3},
+			},
+			DataScaleDownStatus: &antflyv1.DataScaleDownStatus{
+				Source:          antflyv1.DataScaleDownSourceManual,
+				FromReplicas:    5,
+				TargetReplicas:  4,
+				AppliedReplicas: 4,
+				DrainingOrdinal: 4,
+				DrainingNodeID:  "5",
+				Phase:           "Failed",
+				Message:         "previous finalization failed",
+			},
+		},
+	}
+	dataReplicas := int32(4)
+	dataSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "retry-finalize-scale-data", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
+		Status:     appsv1.StatefulSetStatus{Replicas: 4},
+	}
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(cluster).
+		WithObjects(cluster, dataSts).
+		Build()
+
+	var methods []string
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			methods = append(methods, req.Method)
+			return &http.Response{
+				StatusCode: http.StatusAccepted,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"status":"finalized"}`)),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "retry-finalize-scale", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(1 * time.Second))
+	g.Expect(methods).To(Equal([]string{http.MethodDelete}))
+
+	updated := &antflyv1.AntflyCluster{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "retry-finalize-scale", Namespace: "default"}, updated)).To(Succeed())
+	g.Expect(updated.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(updated.Status.DataScaleDownStatus.Phase).To(Equal("Complete"))
+}
+
+func TestReconcileKeepsFailedDataScaleDownFinalizationFailure(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-finalize-scale", Namespace: "default", Generation: 3},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:    1,
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{Replicas: 4},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "1Gi",
+				DataStorage:     "1Gi",
+			},
+			Config: "{}",
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			ObservedGeneration: 3,
+			Conditions: []metav1.Condition{
+				{Type: antflyv1.TypeConfigurationValid, Status: metav1.ConditionTrue, Reason: antflyv1.ReasonValidationPassed, ObservedGeneration: 3},
+			},
+			DataScaleDownStatus: &antflyv1.DataScaleDownStatus{
+				Source:          antflyv1.DataScaleDownSourceManual,
+				FromReplicas:    5,
+				TargetReplicas:  4,
+				AppliedReplicas: 4,
+				DrainingOrdinal: 4,
+				DrainingNodeID:  "5",
+				Phase:           "Failed",
+				Message:         "previous finalization failed",
+			},
+		},
+	}
+	dataReplicas := int32(4)
+	dataSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-finalize-scale-data", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
+		Status:     appsv1.StatefulSetStatus{Replicas: 4},
+	}
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(cluster).
+		WithObjects(cluster, dataSts).
+		Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("boom")),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "failed-finalize-scale", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+	updated := &antflyv1.AntflyCluster{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "failed-finalize-scale", Namespace: "default"}, updated)).To(Succeed())
+	g.Expect(updated.Status.DataScaleDownStatus).NotTo(BeNil())
+	g.Expect(updated.Status.DataScaleDownStatus.Phase).To(Equal("Failed"))
+	g.Expect(updated.Status.DataScaleDownStatus.Message).To(ContainSubstring("Failed to finalize data-node shutdown"))
+}
+
+func TestHTTPClientDefaultHasTimeout(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+
+	g.Expect(reconciler.httpClient().Timeout).To(Equal(10 * time.Second))
+}
+
+func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 9},
+		Spec: antflyv1.AntflyClusterSpec{
+			ProductTier: &antflyv1.ProductTierSpec{
+				Name:         "pro",
+				Revision:     "2026-05",
+				ManagedBy:    "cloudaf",
+				MetadataTier: "metadata-small",
+				DataTier:     "data-large",
+			},
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas: 3,
+				Resources: antflyv1.ResourceSpec{
+					CPU:    "500m",
+					Memory: "1Gi",
+				},
+			},
+			DataNodes: antflyv1.DataNodesSpec{
+				Replicas: 5,
+				Resources: antflyv1.ResourceSpec{
+					CPU:    "2",
+					Memory: "8Gi",
+				},
+				AutoScaling: &antflyv1.AutoScalingSpec{
+					Enabled:     true,
+					MinReplicas: 3,
+					MaxReplicas: 8,
+				},
+			},
+			Storage: antflyv1.StorageSpec{
+				MetadataStorage: "5Gi",
+				DataStorage:     "100Gi",
+			},
+		},
+	}
+
+	reconciler.updateProductTierStatus(cluster)
+
+	g.Expect(cluster.Status.ProductTierStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.ProductTierStatus.Name).To(Equal("pro"))
+	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeClustered))
+	g.Expect(cluster.Status.ProductTierStatus.MetadataResources).To(Equal("cpu=500m memory=1Gi"))
+	g.Expect(cluster.Status.ProductTierStatus.DataStorage).To(Equal("100Gi"))
+	g.Expect(cluster.Status.ProductTierStatus.DataAutoscaling).To(Equal("enabled min=3 max=8"))
+	g.Expect(cluster.Status.ProductTierStatus.ObservedGeneration).To(Equal(int64(9)))
 }
 
 // T006: Unit test for public API service deletion when disabled
@@ -1301,6 +2233,68 @@ func TestPodTemplateLabelsUpdateWhenClusterLabelsChange(t *testing.T) {
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "instance-after"))
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/org-id", "org-123"))
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "antfly-operator"))
+}
+
+func TestMetadataStatefulSetPreparesPersistentStorageForNonRootRuntime(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "storage-security-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:latest",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI:  antflyv1.APISpec{Port: 12377},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+				Health:       antflyv1.APISpec{Port: 4200},
+			},
+			Storage: antflyv1.StorageSpec{
+				StorageClass:    "standard",
+				MetadataStorage: "1Gi",
+			},
+			Config: "{}",
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(cluster).
+		Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	g.Expect(client.Get(context.Background(), key, sts)).To(Succeed())
+
+	podSecurityContext := sts.Spec.Template.Spec.SecurityContext
+	g.Expect(podSecurityContext).NotTo(BeNil())
+	g.Expect(podSecurityContext.FSGroup).NotTo(BeNil())
+	g.Expect(*podSecurityContext.FSGroup).To(Equal(antflyRuntimeGID))
+	g.Expect(podSecurityContext.FSGroupChangePolicy).NotTo(BeNil())
+	g.Expect(*podSecurityContext.FSGroupChangePolicy).To(Equal(corev1.FSGroupChangeOnRootMismatch))
+
+	g.Expect(sts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+	initContainer := sts.Spec.Template.Spec.InitContainers[0]
+	g.Expect(initContainer.SecurityContext).NotTo(BeNil())
+	g.Expect(initContainer.SecurityContext.RunAsUser).NotTo(BeNil())
+	g.Expect(*initContainer.SecurityContext.RunAsUser).To(Equal(int64(0)))
+	g.Expect(initContainer.Args).To(HaveLen(1))
+	g.Expect(initContainer.Args[0]).To(ContainSubstring("mkdir -p /antflydb/metadata /antflydb/store"))
+	g.Expect(initContainer.Args[0]).To(ContainSubstring("chown -R 10001:10001 /antflydb"))
+	g.Expect(initContainer.Args[0]).To(ContainSubstring("chmod -R ug+rwX /antflydb"))
 }
 
 // TestSelectorLabels tests that selectorLabels includes instance but not managed-by

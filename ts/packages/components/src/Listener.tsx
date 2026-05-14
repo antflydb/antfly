@@ -391,11 +391,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
                     }
                     fields
                       .map((f: string) => {
-                        if (
-                          !result.aggregations ||
-                          !result.aggregations[f] ||
-                          !result.aggregations[f].buckets
-                        ) {
+                        if (!result.aggregations?.[f]?.buckets) {
                           return [];
                         }
                         // Only use filterValue for legacy mode (non-custom queries)

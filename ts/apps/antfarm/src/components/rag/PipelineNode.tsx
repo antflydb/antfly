@@ -48,11 +48,11 @@ export const PipelineNode: React.FC<PipelineNodeProps> = ({
   const statusIcon = () => {
     switch (status) {
       case "complete":
-        return <Check className="w-3.5 h-3.5 text-green-500" />;
+        return <Check className="af-status-icon-success w-3.5 h-3.5" />;
       case "running":
-        return <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin" />;
+        return <Loader2 className="af-status-icon-info w-3.5 h-3.5 animate-spin" />;
       case "error":
-        return <AlertCircle className="w-3.5 h-3.5 text-red-500" />;
+        return <AlertCircle className="af-status-icon-error w-3.5 h-3.5" />;
       case "pending":
       case "skipped":
         return <div className="w-3 h-3 rounded-full border-2 border-muted-foreground/30" />;
@@ -67,12 +67,14 @@ export const PipelineNode: React.FC<PipelineNodeProps> = ({
         "absolute flex items-center gap-2 rounded-xl border px-3 transition-all cursor-pointer select-none",
         // Status-dependent styles
         status === "pending" && "border-border/50 bg-muted/30 opacity-50",
-        status === "running" && "border-blue-500 bg-blue-500/5 pipeline-node-running",
-        status === "complete" && "border-green-500/30 bg-background pipeline-node-complete-flash",
-        status === "error" && "border-red-500/30 bg-background pipeline-node-error-shake",
+        status === "running" &&
+          "af-status-border-info af-status-surface-info pipeline-node-running",
+        status === "complete" &&
+          "af-status-border-success bg-background pipeline-node-complete-flash",
+        status === "error" && "af-status-border-error bg-background pipeline-node-error-shake",
         status === "skipped" && "border-border/50 bg-muted/30 opacity-50",
         // Selected state
-        selected && "ring-2 ring-blue-500/50 border-blue-500",
+        selected && "af-status-selected",
         // Hover
         status !== "pending" && status !== "skipped" && "hover:bg-muted/50"
       )}
@@ -90,7 +92,7 @@ export const PipelineNode: React.FC<PipelineNodeProps> = ({
       {duration && (
         <span className="text-[10px] text-muted-foreground tabular-nums shrink-0">{duration}</span>
       )}
-      {selected && <ChevronDown className="w-3 h-3 text-blue-500 shrink-0" />}
+      {selected && <ChevronDown className="af-status-icon-info w-3 h-3 shrink-0" />}
     </button>
   );
 };

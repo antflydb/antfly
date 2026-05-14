@@ -36,6 +36,10 @@ var (
 	ErrShardNotReady     = errors.New("shard not ready")
 	ErrNoHealthyPeer     = errors.New("no healthy peer")
 	ErrNoRaftStatus      = errors.New("no raft status")
+	// ErrRaftStopped indicates the targeted peer's local Raft group for the
+	// shard has stopped, so it cannot accept conf changes. The peer is
+	// effectively gone for that shard even if metadata still lists it.
+	ErrRaftStopped = errors.New("raft stopped")
 )
 
 // ResponseError represents an error response from a store node.
@@ -78,6 +82,8 @@ func (e *ResponseError) Is(target error) bool {
 		return strings.Contains(bodyLower, "no healthy peer")
 	case errors.Is(target, ErrNoRaftStatus):
 		return strings.Contains(bodyLower, "no raft status")
+	case errors.Is(target, ErrRaftStopped):
+		return strings.Contains(bodyLower, "raft: stopped") || strings.Contains(bodyLower, "raft stopped")
 	}
 	return false
 }

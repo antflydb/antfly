@@ -46,11 +46,17 @@ func registerWithLeader(
 	m *Store,
 	conf *StoreInfo,
 ) error {
-	// Prepare the registration request
 	status := m.Status()
-	regReq := StoreRegistrationRequest{
-		StoreInfo: *conf,
-		Shards:    status.Shards,
+	regReq := nodeRegistrationRequest{
+		NodeID:      uint64(conf.ID),
+		StoreID:     uint64(conf.ID),
+		Role:        "data",
+		HealthClass: "healthy",
+		Live:        true,
+		RaftURL:     conf.RaftURL,
+		APIURL:      conf.ApiURL,
+		Shards:      status.Shards,
+		GroupStatus: shardInfosToNodeGroupStatusReports(conf.ID, status.Shards),
 	}
 
 	buf := bytes.NewBuffer(nil)
@@ -58,9 +64,54 @@ func registerWithLeader(
 		return fmt.Errorf("failed to encode registration request: %w", err)
 	}
 
-	// Send the request
-	// FIXME (ajr) Use TLS if configured
-	req, err := http.NewRequest(http.MethodPost, leaderURL+"/_internal/v1/store", buf)
+	if err := sendNodeRegistration(ctx, client, leaderURL+"/internal/v1/nodes", buf.Bytes()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type nodeRegistrationRequest struct {
+	NodeID      uint64                  `json:"node_id"`
+	StoreID     uint64                  `json:"store_id"`
+	Role        string                  `json:"role,omitempty"`
+	HealthClass string                  `json:"health_class,omitempty"`
+	Live        bool                    `json:"live"`
+	RaftURL     string                  `json:"raft_url,omitempty"`
+	APIURL      string                  `json:"api_url,omitempty"`
+	Shards      map[types.ID]*ShardInfo `json:"shards,omitempty"`
+	GroupStatus []nodeGroupStatusReport `json:"group_statuses,omitempty"`
+}
+
+type nodeGroupStatusReport struct {
+	GroupID     uint64 `json:"group_id"`
+	LocalLeader bool   `json:"local_leader,omitempty"`
+	LocalVoter  bool   `json:"local_voter,omitempty"`
+	VoterCount  int    `json:"voter_count,omitempty"`
+}
+
+func shardInfosToNodeGroupStatusReports(nodeID types.ID, shards map[types.ID]*ShardInfo) []nodeGroupStatusReport {
+	if len(shards) == 0 {
+		return nil
+	}
+	reports := make([]nodeGroupStatusReport, 0, len(shards))
+	for shardID, shard := range shards {
+		if shard == nil {
+			continue
+		}
+		report := nodeGroupStatusReport{GroupID: uint64(shardID)}
+		if shard.RaftStatus != nil {
+			report.LocalLeader = shard.RaftStatus.Lead == nodeID
+			report.LocalVoter = shard.RaftStatus.Voters.Contains(nodeID)
+			report.VoterCount = len(shard.RaftStatus.Voters)
+		}
+		reports = append(reports, report)
+	}
+	return reports
+}
+
+func sendNodeRegistration(ctx context.Context, client *http.Client, url string, body []byte) error {
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("creating registration request: %w", err)
 	}
@@ -72,10 +123,9 @@ func registerWithLeader(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("leader returned error status: %s", resp.Status)
 	}
-
 	return nil
 }
 

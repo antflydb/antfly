@@ -3,6 +3,8 @@ node_modules/
 
 # Build output
 dist/
+.next/
+tsconfig.tsbuildinfo
 # Generated declaration files at package root (not src/types/)
 packages/*/types/
 

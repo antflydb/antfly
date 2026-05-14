@@ -27,14 +27,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	antflyv1 "github.com/antflydb/antfly/pkg/operator/api/antfly/v1"
 	termitev1alpha1 "github.com/antflydb/antfly/pkg/operator/api/termite/v1alpha1"
+	"github.com/antflydb/antfly/pkg/operator/controllers/internal/poddiagnostics"
 )
 
 // AntflyClusterReconciler reconciles an AntflyCluster object
@@ -42,6 +46,9 @@ type AntflyClusterReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
 	AutoScaler          *AutoScaler
+	KubeClient          kubernetes.Interface
+	NodeStatsFetcher    func(context.Context, string) (*kubeletStatsSummary, error)
+	HTTPClient          *http.Client
 	Recorder            events.EventRecorder
 	ManageTermitePools  bool
 	DefaultTermiteImage string
@@ -52,6 +59,13 @@ type AntflyClusterReconciler struct {
 	validationAttempts sync.Map
 }
 
+var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+const (
+	antflyRuntimeUID int64 = 10001
+	antflyRuntimeGID int64 = 10001
+)
+
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters/finalizers,verbs=update
@@ -60,6 +74,7 @@ type AntflyClusterReconciler struct {
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=nodes/proxy,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -71,6 +86,21 @@ type AntflyClusterReconciler struct {
 //+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch
 
 var reservedPodLabelPrefixes = []string{"app.kubernetes.io/"}
+
+func int64Ptr(v int64) *int64 {
+	return &v
+}
+
+func podFSGroupChangePolicyPtr(v corev1.PodFSGroupChangePolicy) *corev1.PodFSGroupChangePolicy {
+	return &v
+}
+
+func antflyPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		FSGroup:             int64Ptr(antflyRuntimeGID),
+		FSGroupChangePolicy: podFSGroupChangePolicyPtr(corev1.FSGroupChangeOnRootMismatch),
+	}
+}
 
 // podLabels returns the standard labels for pod templates including the instance identifier.
 // These are a superset of serviceSelectorLabels — they include managed-by labels
@@ -212,52 +242,137 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	return nil, nil
 }
 
-// deregisterDataNodes calls the Antfly metadata deregistration API for data nodes
-// being removed during scale-down. This triggers Raft peer removal before the pods
-// are deleted, preventing phantom voters in Raft configurations.
-// Store ID is deterministic: store_id = pod_ordinal + 1.
-func (r *AntflyClusterReconciler) deregisterDataNodes(ctx context.Context, cluster *antflyv1.AntflyCluster, currentReplicas, desiredReplicas int32) error {
-	if desiredReplicas >= currentReplicas {
-		return nil // not scaling down
-	}
+type dataNodeShutdownStatus struct {
+	NodeID          int64  `json:"node_id"`
+	Phase           string `json:"phase"`
+	SafeToTerminate bool   `json:"safe_to_terminate"`
+	Blocked         bool   `json:"blocked,omitempty"`
+	BlockedReason   string `json:"blocked_reason,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
 
+func (r *AntflyClusterReconciler) httpClient() *http.Client {
+	if r.HTTPClient != nil {
+		return r.HTTPClient
+	}
+	return defaultOperatorHTTPClient
+}
+
+// requestDataNodeShutdown asks Antfly metadata to drain a data node and returns
+// the current runtime safety status. Node ID is deterministic:
+// node_id = pod_ordinal + 1.
+func (r *AntflyClusterReconciler) requestDataNodeShutdown(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeIDString string) (*dataNodeShutdownStatus, error) {
 	log := log.FromContext(ctx)
 	metadataAddr := fmt.Sprintf("http://%s-metadata.%s.svc:%d",
 		cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+	url := fmt.Sprintf("%s/internal/v1/nodes/%s/shutdown", metadataAddr, nodeIDString)
 
-	// Deregister highest ordinals first (they are removed by StatefulSet on scale-down)
-	for ordinal := currentReplicas - 1; ordinal >= desiredReplicas; ordinal-- {
-		storeID := ordinal + 1
-		url := fmt.Sprintf("%s/_internal/v1/store/%d", metadataAddr, storeID)
+	log.Info("Requesting data node shutdown before scale-down", "nodeID", nodeIDString)
+	body := strings.NewReader(`{"type":"remove","reason":"operator scale-down"}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown request for node %s: %w", nodeIDString, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-		log.Info("Deregistering data node before scale-down", "ordinal", ordinal, "storeID", storeID)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create deregistration request for store %d: %w", storeID, err)
-		}
-
-		resp, err := http.DefaultClient.Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
-		if err != nil {
-			// Connection errors mean metadata isn't ready — requeue
-			log.Error(err, "Failed to deregister data node, will retry", "storeID", storeID)
-			return fmt.Errorf("failed to deregister store %d: %w", storeID, err)
-		}
-		statusCode := resp.StatusCode
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-
-		if statusCode >= 200 && statusCode < 300 {
-			log.Info("Successfully deregistered data node", "storeID", storeID)
-		} else if statusCode == http.StatusNotFound {
-			// Store already deregistered or doesn't exist — safe to proceed
-			log.Info("Data node already deregistered or not found", "storeID", storeID)
-		} else {
-			log.Error(nil, "Unexpected response from deregistration API", "storeID", storeID, "status", statusCode)
-			return fmt.Errorf("deregistration of store %d returned status %d", storeID, statusCode)
-		}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		log.Error(err, "Failed to request data node shutdown, will retry", "nodeID", nodeIDString)
+		return nil, fmt.Errorf("failed to request shutdown for node %s: %w", nodeIDString, err)
+	}
+	statusCode := resp.StatusCode
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("shutdown request for node %s returned status %d", nodeIDString, statusCode)
 	}
 
+	statusReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown status request for node %s: %w", nodeIDString, err)
+	}
+	statusResp, err := r.httpClient().Do(statusReq) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return nil, fmt.Errorf("failed to get shutdown status for node %s: %w", nodeIDString, err)
+	}
+	defer func() { _ = statusResp.Body.Close() }()
+	if statusResp.StatusCode < 200 || statusResp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, statusResp.Body)
+		return nil, fmt.Errorf("shutdown status for node %s returned status %d", nodeIDString, statusResp.StatusCode)
+	}
+
+	var status dataNodeShutdownStatus
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		return nil, fmt.Errorf("failed to decode shutdown status for node %s: %w", nodeIDString, err)
+	}
+	return &status, nil
+}
+
+func (r *AntflyClusterReconciler) cancelDataNodeShutdown(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeIDString string) (*dataNodeShutdownStatus, error) {
+	log := log.FromContext(ctx)
+	metadataAddr := fmt.Sprintf("http://%s-metadata.%s.svc:%d",
+		cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+	url := fmt.Sprintf("%s/internal/v1/nodes/%s/shutdown", metadataAddr, nodeIDString)
+
+	log.Info("Canceling data node shutdown", "nodeID", nodeIDString)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown cancellation request for node %s: %w", nodeIDString, err)
+	}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return nil, fmt.Errorf("failed to cancel shutdown for node %s: %w", nodeIDString, err)
+	}
+	statusCode := resp.StatusCode
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("shutdown cancellation for node %s returned status %d", nodeIDString, statusCode)
+	}
+
+	statusReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node shutdown status request after cancellation for node %s: %w", nodeIDString, err)
+	}
+	statusResp, err := r.httpClient().Do(statusReq) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return nil, fmt.Errorf("failed to get shutdown status after cancellation for node %s: %w", nodeIDString, err)
+	}
+	defer func() { _ = statusResp.Body.Close() }()
+	if statusResp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, statusResp.Body)
+		return &dataNodeShutdownStatus{Phase: "not_found"}, nil
+	}
+	if statusResp.StatusCode < 200 || statusResp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, statusResp.Body)
+		return nil, fmt.Errorf("shutdown status after cancellation for node %s returned status %d", nodeIDString, statusResp.StatusCode)
+	}
+
+	var status dataNodeShutdownStatus
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		return nil, fmt.Errorf("failed to decode shutdown status after cancellation for node %s: %w", nodeIDString, err)
+	}
+	return &status, nil
+}
+
+func (r *AntflyClusterReconciler) finalizeDataNodeShutdown(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeIDString string) error {
+	metadataAddr := fmt.Sprintf("http://%s-metadata.%s.svc:%d",
+		cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+	url := fmt.Sprintf("%s/internal/v1/nodes/%s", metadataAddr, nodeIDString)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create node shutdown finalization request for node %s: %w", nodeIDString, err)
+	}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is constructed from cluster-internal service address, not external user input
+	if err != nil {
+		return fmt.Errorf("failed to finalize shutdown for node %s: %w", nodeIDString, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("shutdown finalization for node %s returned status %d", nodeIDString, resp.StatusCode)
+	}
 	return nil
 }
 
@@ -286,6 +401,44 @@ func effectiveTopologyMode(cluster *antflyv1.AntflyCluster) topologyMode {
 
 func isSwarmMode(cluster *antflyv1.AntflyCluster) bool {
 	return effectiveTopologyMode(cluster) == topologyModeSwarm
+}
+
+func shouldCancelDataScaleDown(status *antflyv1.DataScaleDownStatus, currentReplicas, desiredReplicas int32) bool {
+	if status == nil || status.DrainingNodeID == "" {
+		return false
+	}
+	switch status.Phase {
+	case "Draining", "Blocked", "Failed", "Canceling", "Scaling":
+	default:
+		return false
+	}
+	return currentReplicas > status.DrainingOrdinal && desiredReplicas > status.DrainingOrdinal
+}
+
+func shouldCancelDataScaleDownForSuspend(status *antflyv1.DataScaleDownStatus, currentReplicas int32) bool {
+	if status == nil || status.DrainingNodeID == "" {
+		return false
+	}
+	switch status.Phase {
+	case "Draining", "Blocked", "Failed", "Canceling", "Scaling":
+	default:
+		return false
+	}
+	return currentReplicas > status.DrainingOrdinal
+}
+
+func shouldFinalizeDataScaleDown(status *antflyv1.DataScaleDownStatus, currentReplicas, desiredReplicas int32, dataScaleDownRequested bool) bool {
+	if status == nil || status.DrainingNodeID == "" || shouldCancelDataScaleDown(status, currentReplicas, desiredReplicas) {
+		return false
+	}
+	switch status.Phase {
+	case "Scaling":
+		return true
+	case "Failed":
+		return !dataScaleDownRequested && status.AppliedReplicas < status.FromReplicas && currentReplicas <= status.AppliedReplicas
+	default:
+		return false
+	}
 }
 
 func (r *AntflyClusterReconciler) ensureTopologyResourcesMatchMode(ctx context.Context, cluster *antflyv1.AntflyCluster, mode topologyMode) error {
@@ -416,6 +569,15 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 	if cluster.Spec.ServiceMesh == nil {
 		cluster.Spec.ServiceMesh = &antflyv1.ServiceMeshSpec{
 			Enabled: false,
+		}
+	}
+
+	if cluster.Spec.Storage.StorageAutoGrow != nil && cluster.Spec.Storage.StorageAutoGrow.Enabled {
+		if cluster.Spec.Storage.StorageAutoGrow.GrowThresholdPercent == 0 {
+			cluster.Spec.Storage.StorageAutoGrow.GrowThresholdPercent = 85
+		}
+		if cluster.Spec.Storage.StorageAutoGrow.GrowIncrement == "" {
+			cluster.Spec.Storage.StorageAutoGrow.GrowIncrement = "10Gi"
 		}
 	}
 
@@ -953,11 +1115,14 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileServices(ctx, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
+		workingCluster.Spec.Storage.SwarmStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "swarm", "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster), maxSwarmAutoGrowSize(workingCluster))
 		if err := r.reconcileSwarmStatefulSet(ctx, efCache, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
 
-		r.reconcilePVCExpansion(ctx, workingCluster, "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster))
+		r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
+			r.reconcilePVCExpansion(ctx, workingCluster, "swarm", "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster)),
+		})
 
 		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-swarm-pdb", "swarm"); err != nil {
 			return ctrl.Result{}, err
@@ -973,6 +1138,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
+		if storageAutoGrowEnabled(workingCluster) {
+			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -991,47 +1159,207 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// Evaluate autoscaling before creating/updating Data StatefulSet
-	if r.AutoScaler != nil && workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
-		desiredReplicas, err := r.AutoScaler.EvaluateScaling(ctx, workingCluster)
+	// Decide the data-node replica target before creating/updating the StatefulSet.
+	// In manual mode, spec.dataNodes.replicas is authoritative. In autoscaling
+	// mode, the operator autoscaler is authoritative and computes from observed
+	// StatefulSet replicas, not the manual-mode spec field.
+	dataSts := &appsv1.StatefulSet{}
+	dataStsKey := types.NamespacedName{Name: workingCluster.Name + "-data", Namespace: workingCluster.Namespace}
+	dataStsExists := true
+	if err := r.Get(ctx, dataStsKey, dataSts); err != nil {
+		if !errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		dataStsExists = false
+	}
+
+	currentDataReplicas := effectiveDataReplicas(dataSts, dataStsExists, effectiveDataNodeReplicas(workingCluster))
+	currentDataTarget := effectiveDataReplicaTarget(dataSts, dataStsExists, effectiveDataNodeReplicas(workingCluster))
+	scaleSafetyReplicas := max(currentDataReplicas, currentDataTarget)
+	desiredDataReplicas := effectiveDataNodeReplicas(workingCluster)
+	requestedDataReplicas := desiredDataReplicas
+	dataScaleDownSource := antflyv1.DataScaleDownSourceManual
+	dataScaleDownRequested := false
+	autoscalingEnabled := r.AutoScaler != nil && workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled
+	dataNodesSuspended := workingCluster.Spec.DataNodes.Suspend
+	if dataNodesSuspended {
+		workingCluster.Status.AutoScalingStatus = nil
+		requestedDataReplicas = 0
+		desiredDataReplicas = 0
+		workingCluster.Spec.DataNodes.Replicas = 0
+		r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Data nodes are suspended with PVCs retained")
+	} else if autoscalingEnabled {
+		dataScaleDownSource = antflyv1.DataScaleDownSourceAutoscaler
+		recommendationReplicas, err := r.AutoScaler.EvaluateScaling(ctx, workingCluster, currentDataTarget)
 		if err != nil {
 			log.Error(err, "Failed to evaluate autoscaling")
-			// Continue with current replicas on error
-		} else if desiredReplicas != workingCluster.Spec.DataNodes.Replicas {
-			// Update the desired replicas
-			workingCluster.Spec.DataNodes.Replicas = desiredReplicas
-			r.AutoScaler.UpdateScalingStatus(workingCluster, desiredReplicas)
-			log.Info("Autoscaling data nodes", "currentReplicas", antflyCluster.Spec.DataNodes.Replicas, "desiredReplicas", desiredReplicas)
+			recommendationReplicas = currentDataTarget
+		}
+
+		requestedDataReplicas = recommendationReplicas
+		desiredDataReplicas = recommendationReplicas
+		blockedReason := ""
+		blockedMessage := ""
+		if recommendationReplicas < scaleSafetyReplicas {
+			desiredDataReplicas = scaleSafetyReplicas
+			dataScaleDownRequested = true
+			blockedReason = antflyv1.ReasonDataScaleDownInProgress
+			blockedMessage = fmt.Sprintf("Autoscaler recommended data-node scale-down from %d to %d; waiting for runtime drain before removing the next ordinal", scaleSafetyReplicas, recommendationReplicas)
+		} else {
+			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
+		}
+
+		workingCluster.Spec.DataNodes.Replicas = desiredDataReplicas
+		r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, desiredDataReplicas, recommendationReplicas, blockedReason, blockedMessage)
+		if recommendationReplicas != currentDataReplicas {
+			log.Info("Autoscaling data nodes", "currentReplicas", currentDataReplicas, "desiredReplicas", desiredDataReplicas, "recommendationReplicas", recommendationReplicas, "blockedReason", blockedReason)
+		}
+	} else {
+		workingCluster.Status.AutoScalingStatus = nil
+		if desiredDataReplicas < scaleSafetyReplicas {
+			message := fmt.Sprintf("Data-node scale-down from %d to %d requested; waiting for runtime drain before removing the next ordinal", scaleSafetyReplicas, desiredDataReplicas)
+			requestedDataReplicas = desiredDataReplicas
+			desiredDataReplicas = scaleSafetyReplicas
+			dataScaleDownRequested = true
+			workingCluster.Spec.DataNodes.Replicas = desiredDataReplicas
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+		} else {
+			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
 		}
 	}
 
-	// Deregister data nodes from Raft before scaling down.
-	// By this point, workingCluster.Spec.DataNodes.Replicas reflects the final desired
-	// count from either the CRD spec (manual) or the autoscaler.
-	// We use Status.Replicas (actual running pods) rather than Spec.Replicas (desired)
-	// because a prior failed reconcile may have already written the reduced desired
-	// count to Spec without completing deregistration.
-	{
-		existingSts := &appsv1.StatefulSet{}
-		stsName := types.NamespacedName{Name: workingCluster.Name + "-data", Namespace: workingCluster.Namespace}
-		if err := r.Get(ctx, stsName, existingSts); err == nil {
-			currentReplicas := existingSts.Status.Replicas
-			if currentReplicas == 0 && existingSts.Spec.Replicas != nil {
-				// Status may not be populated yet for a newly created STS;
-				// fall back to Spec in that case.
-				currentReplicas = *existingSts.Spec.Replicas
+	if dataStsExists && shouldFinalizeDataScaleDown(workingCluster.Status.DataScaleDownStatus, currentDataReplicas, desiredDataReplicas, dataScaleDownRequested) {
+		scalingStatus := workingCluster.Status.DataScaleDownStatus
+		if currentDataReplicas > scalingStatus.AppliedReplicas {
+			message := fmt.Sprintf("Waiting for StatefulSet to remove data ordinal %d/node %s; current replicas=%d target replicas=%d", scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, currentDataReplicas, scalingStatus.AppliedReplicas)
+			r.setDataScaleDownStatus(workingCluster, scalingStatus.Source, scalingStatus.FromReplicas, scalingStatus.TargetReplicas, scalingStatus.AppliedReplicas, scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, "Scaling", message)
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status while waiting for data StatefulSet scale-down")
 			}
-			desiredReplicas := workingCluster.Spec.DataNodes.Replicas
-			if desiredReplicas == 0 {
-				desiredReplicas = 3 // default
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if err := r.finalizeDataNodeShutdown(ctx, workingCluster, scalingStatus.DrainingNodeID); err != nil {
+			failureMessage := fmt.Sprintf("Failed to finalize data-node shutdown for ordinal %d/node %s after StatefulSet scale-down: %v", scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, err)
+			r.setDataScaleDownStatus(workingCluster, scalingStatus.Source, scalingStatus.FromReplicas, scalingStatus.TargetReplicas, scalingStatus.AppliedReplicas, scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, "Failed", failureMessage)
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownFailed, failureMessage)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down finalization failure")
 			}
-			if err := r.deregisterDataNodes(ctx, workingCluster, currentReplicas, desiredReplicas); err != nil {
-				log.Error(err, "Failed to deregister data nodes, will retry")
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		message := fmt.Sprintf("Finalized data-node shutdown for ordinal %d/node %s", scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID)
+		r.setDataScaleDownStatus(workingCluster, scalingStatus.Source, scalingStatus.FromReplicas, scalingStatus.TargetReplicas, scalingStatus.AppliedReplicas, scalingStatus.DrainingOrdinal, scalingStatus.DrainingNodeID, "Complete", message)
+		if requestedDataReplicas < scaleSafetyReplicas {
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, "Continuing data-node scale-down after finalizing the previous ordinal")
+		} else {
+			r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
+		}
+		if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+			log.Error(statusErr, "Failed to update status after data scale-down finalization")
+		}
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+
+	if dataStsExists && !dataScaleDownRequested && (shouldCancelDataScaleDown(workingCluster.Status.DataScaleDownStatus, currentDataReplicas, desiredDataReplicas) || (dataNodesSuspended && shouldCancelDataScaleDownForSuspend(workingCluster.Status.DataScaleDownStatus, currentDataReplicas))) {
+		drainingStatus := workingCluster.Status.DataScaleDownStatus
+		status, err := r.cancelDataNodeShutdown(ctx, workingCluster, drainingStatus.DrainingNodeID)
+		if err != nil {
+			failureMessage := fmt.Sprintf("Failed to cancel data-node shutdown for ordinal %d/node %s: %v", drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, err)
+			r.setDataScaleDownStatus(workingCluster, drainingStatus.Source, drainingStatus.FromReplicas, desiredDataReplicas, scaleSafetyReplicas, drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, "Failed", failureMessage)
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownFailed, failureMessage)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down cancellation failure")
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		if status.Phase != "active" && status.Phase != "not_found" {
+			message := fmt.Sprintf("Canceling data-node shutdown for ordinal %d/node %s; runtime phase is %q", drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, status.Phase)
+			r.setDataScaleDownStatus(workingCluster, drainingStatus.Source, drainingStatus.FromReplicas, desiredDataReplicas, scaleSafetyReplicas, drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, "Canceling", message)
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down cancellation progress")
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		message := fmt.Sprintf("Canceled data-node shutdown for ordinal %d/node %s; runtime phase is %q", drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, status.Phase)
+		r.setDataScaleDownStatus(workingCluster, drainingStatus.Source, drainingStatus.FromReplicas, desiredDataReplicas, scaleSafetyReplicas, drainingStatus.DrainingOrdinal, drainingStatus.DrainingNodeID, "Canceled", message)
+		r.setScalingCondition(workingCluster, metav1.ConditionTrue, antflyv1.ReasonScalingReady, "Scaling is not blocked")
+		if r.AutoScaler != nil && workingCluster.Status.AutoScalingStatus != nil {
+			r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, desiredDataReplicas, requestedDataReplicas, "", "")
+		}
+		if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+			log.Error(statusErr, "Failed to update status with data scale-down cancellation")
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if dataNodesSuspended {
+		workingCluster.Status.DataScaleDownStatus = nil
+	} else if dataStsExists && dataScaleDownRequested {
+		drainingOrdinal := scaleSafetyReplicas - 1
+		drainingNodeID := nodeIDForDataOrdinal(drainingOrdinal)
+		nextReplicas := scaleSafetyReplicas - 1
+		message := fmt.Sprintf("Draining data ordinal %d/node %s before scaling StatefulSet from %d to %d", drainingOrdinal, drainingNodeID, scaleSafetyReplicas, nextReplicas)
+		r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Draining", message)
+		r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+		shutdownStatus, err := r.requestDataNodeShutdown(ctx, workingCluster, drainingNodeID)
+		if err != nil {
+			failureMessage := fmt.Sprintf("Failed to drain data ordinal %d/node %s: %v", drainingOrdinal, drainingNodeID, err)
+			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Failed", failureMessage)
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownFailed, failureMessage)
+			if statusErr := r.Status().Update(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down failure")
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		if shutdownStatus.Blocked || shutdownStatus.Phase == "blocked" {
+			blockedMessage := shutdownStatus.Message
+			if blockedMessage == "" {
+				blockedMessage = fmt.Sprintf("Data ordinal %d/node %s cannot be drained safely; runtime reports phase %q", drainingOrdinal, drainingNodeID, shutdownStatus.Phase)
+			}
+			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Blocked", blockedMessage)
+			r.setScalingCondition(workingCluster, metav1.ConditionFalse, antflyv1.ReasonDataScaleDownBlocked, blockedMessage)
+			if r.AutoScaler != nil && workingCluster.Status.AutoScalingStatus != nil {
+				r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, scaleSafetyReplicas, requestedDataReplicas, antflyv1.ReasonDataScaleDownBlocked, blockedMessage)
+			}
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with blocked data scale-down")
+			}
+			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		}
+		if !shutdownStatus.SafeToTerminate {
+			message = fmt.Sprintf("Data ordinal %d/node %s is draining in runtime phase %q; StatefulSet remains at %d replicas", drainingOrdinal, drainingNodeID, shutdownStatus.Phase, scaleSafetyReplicas)
+			r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, scaleSafetyReplicas, drainingOrdinal, drainingNodeID, "Draining", message)
+			r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+			if statusErr := r.updateStatus(ctx, workingCluster); statusErr != nil {
+				log.Error(statusErr, "Failed to update status with data scale-down drain progress")
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		desiredDataReplicas = nextReplicas
+		workingCluster.Spec.DataNodes.Replicas = desiredDataReplicas
+		message = fmt.Sprintf("Runtime reports data ordinal %d/node %s is safe to terminate; scaling StatefulSet from %d to %d", drainingOrdinal, drainingNodeID, scaleSafetyReplicas, desiredDataReplicas)
+		r.setDataScaleDownStatus(workingCluster, dataScaleDownSource, scaleSafetyReplicas, requestedDataReplicas, desiredDataReplicas, drainingOrdinal, drainingNodeID, "Scaling", message)
+		r.setScalingCondition(workingCluster, metav1.ConditionUnknown, antflyv1.ReasonDataScaleDownInProgress, message)
+		if r.AutoScaler != nil && workingCluster.Status.AutoScalingStatus != nil {
+			r.AutoScaler.UpdateScalingStatus(workingCluster, currentDataReplicas, desiredDataReplicas, requestedDataReplicas, antflyv1.ReasonDataScaleDownInProgress, message)
+		}
+	} else if dataStsExists {
+		if workingCluster.Status.DataScaleDownStatus != nil {
+			switch workingCluster.Status.DataScaleDownStatus.Phase {
+			case "Complete", "Canceled":
+				completedSource := workingCluster.Status.DataScaleDownStatus.Source
+				if completedSource == "" {
+					completedSource = antflyv1.DataScaleDownSourceManual
+				}
+				r.setDataScaleDownStatus(workingCluster, completedSource, scaleSafetyReplicas, scaleSafetyReplicas, desiredDataReplicas, 0, "", "Complete", "Data-node scale-down is complete")
 			}
 		}
-		// If the StatefulSet doesn't exist yet, no deregistration needed
 	}
+
+	workingCluster.Spec.Storage.DataStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "data", "data-storage", workingCluster.Name+"-data", effectiveDataStorageSize(workingCluster), maxDataAutoGrowSize(workingCluster))
 
 	// Create Data StatefulSet
 	if err := r.reconcileDataStatefulSet(ctx, efCache, workingCluster); err != nil {
@@ -1039,8 +1367,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Reconcile PVC expansion (metadata and data)
-	r.reconcilePVCExpansion(ctx, workingCluster, "metadata-storage", workingCluster.Name+"-metadata", workingCluster.Spec.Storage.MetadataStorage)
-	r.reconcilePVCExpansion(ctx, workingCluster, "data-storage", workingCluster.Name+"-data", workingCluster.Spec.Storage.DataStorage)
+	r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
+		r.reconcilePVCExpansion(ctx, workingCluster, "metadata", "metadata-storage", workingCluster.Name+"-metadata", workingCluster.Spec.Storage.MetadataStorage),
+		r.reconcilePVCExpansion(ctx, workingCluster, "data", "data-storage", workingCluster.Name+"-data", workingCluster.Spec.Storage.DataStorage),
+	})
 
 	// Reconcile PodDisruptionBudgets for GKE
 	if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-metadata-pdb", "metadata"); err != nil {
@@ -1066,6 +1396,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// If autoscaling is enabled, requeue for periodic evaluation
 	if workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if storageAutoGrowEnabled(workingCluster) {
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -1174,6 +1507,39 @@ func (r *AntflyClusterReconciler) setTermitePoolReadyCondition(cluster *antflyv1
 		Message:            message,
 		ObservedGeneration: cluster.Generation,
 	})
+}
+
+func (r *AntflyClusterReconciler) setScalingCondition(cluster *antflyv1.AntflyCluster, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypeScaling,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: cluster.Generation,
+	})
+}
+
+func (r *AntflyClusterReconciler) setDataScaleDownStatus(cluster *antflyv1.AntflyCluster, source string, fromReplicas, targetReplicas, appliedReplicas, drainingOrdinal int32, drainingNodeID, phase, message string) {
+	now := metav1.Now()
+	if cluster.Status.DataScaleDownStatus != nil &&
+		cluster.Status.DataScaleDownStatus.LastTransitionTime != nil &&
+		cluster.Status.DataScaleDownStatus.Source == source &&
+		cluster.Status.DataScaleDownStatus.Phase == phase &&
+		cluster.Status.DataScaleDownStatus.DrainingOrdinal == drainingOrdinal &&
+		cluster.Status.DataScaleDownStatus.TargetReplicas == targetReplicas {
+		now = *cluster.Status.DataScaleDownStatus.LastTransitionTime
+	}
+	cluster.Status.DataScaleDownStatus = &antflyv1.DataScaleDownStatus{
+		Source:             source,
+		FromReplicas:       fromReplicas,
+		TargetReplicas:     targetReplicas,
+		AppliedReplicas:    appliedReplicas,
+		DrainingOrdinal:    drainingOrdinal,
+		DrainingNodeID:     drainingNodeID,
+		Phase:              phase,
+		Message:            message,
+		LastTransitionTime: &now,
+	}
 }
 
 func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
@@ -1683,6 +2049,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
 					r.buildStorageInitContainer("swarm-storage"),
 				},
@@ -1920,6 +2287,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
 					r.buildStorageInitContainer("metadata-storage"),
 				},
@@ -2061,10 +2429,7 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 }
 
 func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
-	replicas := int32(3)
-	if cluster.Spec.DataNodes.Replicas > 0 {
-		replicas = cluster.Spec.DataNodes.Replicas
-	}
+	replicas := effectiveDataNodeReplicas(cluster)
 
 	storageSize := "1Gi"
 	if cluster.Spec.Storage.DataStorage != "" {
@@ -2133,6 +2498,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
 					r.buildStorageInitContainer("data-storage"),
 				},
@@ -2292,15 +2658,86 @@ func chooseSwarmStorageSize(cluster *antflyv1.AntflyCluster) string {
 	return "1Gi"
 }
 
-// buildStorageInitContainer creates an init container that waits for the PVC to be properly mounted.
-// This prevents a race condition where the main container starts before the PVC is attached,
-// which could cause Antfly to bootstrap a fresh cluster instead of recovering from existing data.
+func effectiveDataStorageSize(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Storage.DataStorage != "" {
+		return cluster.Spec.Storage.DataStorage
+	}
+	return "1Gi"
+}
+
+func maxDataAutoGrowSize(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Storage.StorageAutoGrow == nil {
+		return ""
+	}
+	return cluster.Spec.Storage.StorageAutoGrow.MaxDataStorage
+}
+
+func maxSwarmAutoGrowSize(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Storage.StorageAutoGrow == nil {
+		return ""
+	}
+	if cluster.Spec.Storage.StorageAutoGrow.MaxSwarmStorage != "" {
+		return cluster.Spec.Storage.StorageAutoGrow.MaxSwarmStorage
+	}
+	return cluster.Spec.Storage.StorageAutoGrow.MaxDataStorage
+}
+
+func storageAutoGrowEnabled(cluster *antflyv1.AntflyCluster) bool {
+	return cluster.Spec.Storage.StorageAutoGrow != nil && cluster.Spec.Storage.StorageAutoGrow.Enabled
+}
+
+func effectiveDataNodeReplicas(cluster *antflyv1.AntflyCluster) int32 {
+	if cluster.Spec.DataNodes.Suspend {
+		return 0
+	}
+	if cluster.Spec.DataNodes.Replicas > 0 {
+		return cluster.Spec.DataNodes.Replicas
+	}
+	return 3
+}
+
+func effectiveDataReplicas(sts *appsv1.StatefulSet, exists bool, fallback int32) int32 {
+	if !exists || sts == nil {
+		return fallback
+	}
+	if sts.Status.Replicas > 0 {
+		return sts.Status.Replicas
+	}
+	if sts.Spec.Replicas != nil {
+		return *sts.Spec.Replicas
+	}
+	return fallback
+}
+
+func effectiveDataReplicaTarget(sts *appsv1.StatefulSet, exists bool, fallback int32) int32 {
+	if !exists || sts == nil {
+		return fallback
+	}
+	if sts.Spec.Replicas != nil {
+		return *sts.Spec.Replicas
+	}
+	if sts.Status.Replicas > 0 {
+		return sts.Status.Replicas
+	}
+	return fallback
+}
+
+func nodeIDForDataOrdinal(ordinal int32) string {
+	return strconv.FormatInt(int64(ordinal+1), 10)
+}
+
+// buildStorageInitContainer creates an init container that waits for the PVC to
+// be mounted and prepares ownership for the non-root Antfly runtime user. This
+// prevents a race where the main container starts before the PVC is attached,
+// and recovers existing PVCs that were created with root-owned directories.
 func (r *AntflyClusterReconciler) buildStorageInitContainer(volumeName string) corev1.Container {
 	return corev1.Container{
 		Name:    "wait-for-storage",
 		Image:   "busybox:1.36",
 		Command: []string{"/bin/sh", "-c"},
-		Args: []string{`
+		Args: []string{fmt.Sprintf(`
+set -eu
+
 echo "Checking PVC mount status..."
 timeout=120
 while [ $timeout -gt 0 ]; do
@@ -2312,6 +2749,19 @@ while [ $timeout -gt 0 ]; do
         else
             echo "No existing data - fresh cluster"
         fi
+        marker=/antflydb/.antflydb-storage-prepared
+        echo "Preparing PVC directories for antfly runtime user %d:%d"
+        mkdir -p /antflydb/metadata /antflydb/store
+        if [ ! -f "$marker" ]; then
+            chown -R %d:%d /antflydb
+            chmod -R ug+rwX /antflydb
+            touch "$marker"
+            chown %d:%d "$marker"
+            chmod ug+rw "$marker"
+        else
+            chown %d:%d /antflydb /antflydb/metadata /antflydb/store
+            chmod ug+rwX /antflydb /antflydb/metadata /antflydb/store
+        fi
         exit 0
     fi
     echo "Waiting for PVC mount... ($timeout seconds remaining)"
@@ -2320,7 +2770,19 @@ while [ $timeout -gt 0 ]; do
 done
 echo "ERROR: PVC mount timeout after 120 seconds"
 exit 1
-`},
+`,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+		)},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser: int64Ptr(0),
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      volumeName,
@@ -2425,6 +2887,7 @@ func (r *AntflyClusterReconciler) reconcileServiceMeshStatus(ctx context.Context
 }
 
 func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	originalConditions := append([]metav1.Condition(nil), cluster.Status.Conditions...)
 	mode := effectiveTopologyMode(cluster)
 
 	if mode == topologyModeSwarm {
@@ -2467,14 +2930,23 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "swarm"))); err == nil {
-			for _, pod := range podList.Items {
-				if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
-					cluster.Status.SwarmStatus.PodName = pod.Name
-					cluster.Status.SwarmStatus.PodIP = pod.Status.PodIP
-					break
-				}
+		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "swarm"))); err != nil {
+			return err
+		}
+		for _, pod := range podList.Items {
+			if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
+				cluster.Status.SwarmStatus.PodName = pod.Name
+				cluster.Status.SwarmStatus.PodIP = pod.Status.PodIP
+				break
 			}
+		}
+		swarmFindings := poddiagnostics.DiagnosePods(podList.Items)
+		if len(swarmFindings) > 0 {
+			cluster.Status.Phase = "Degraded"
+			cluster.Status.SwarmStatus.Ready = false
+			cluster.Status.SwarmStatus.MetadataReady = false
+			cluster.Status.SwarmStatus.StoreReady = false
+			cluster.Status.SwarmStatus.TermiteReady = !termiteEnabled
 		}
 
 		if oldStatus.LastTransitionTime == nil ||
@@ -2490,6 +2962,24 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			cluster.Status.SwarmStatus.LastTransitionTime = &now
 		}
 
+		r.updateRolloutCondition(cluster, swarmSts)
+		r.setComponentCondition(cluster, antflyv1.TypeSwarmReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm")
+		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm metadata")
+		r.setComponentCondition(cluster, antflyv1.TypeDataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm store")
+		if termiteEnabled {
+			r.setComponentCondition(cluster, antflyv1.TypeTermiteReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm termite")
+		} else {
+			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+				Type:               antflyv1.TypeTermiteReady,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: cluster.Generation,
+				Reason:             antflyv1.ReasonComponentReady,
+				Message:            "Termite is disabled",
+			})
+		}
+		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
+		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
+		r.updateProductTierStatus(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
 	}
@@ -2515,7 +3005,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	// Update autoscaling status if enabled
 	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
 		if cluster.Status.AutoScalingStatus != nil {
-			cluster.Status.AutoScalingStatus.CurrentReplicas = dataSts.Status.Replicas
+			cluster.Status.AutoScalingStatus.CurrentReplicas = effectiveDataReplicas(dataSts, dataSts.Name != "", effectiveDataNodeReplicas(cluster))
 		}
 	}
 
@@ -2525,21 +3015,252 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if cluster.Spec.MetadataNodes.Replicas > 0 {
 		metadataReplicas = cluster.Spec.MetadataNodes.Replicas
 	}
-	dataReplicas := int32(3)
-	if cluster.Spec.DataNodes.Replicas > 0 {
-		dataReplicas = cluster.Spec.DataNodes.Replicas
-	}
+	dataReplicas := effectiveDataNodeReplicas(cluster)
 
-	if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
+	metadataPods, err := r.listComponentPods(ctx, cluster, "metadata")
+	if err != nil {
+		return err
+	}
+	dataPods, err := r.listComponentPods(ctx, cluster, "data")
+	if err != nil {
+		return err
+	}
+	metadataFindings := poddiagnostics.DiagnosePods(metadataPods)
+	dataFindings := poddiagnostics.DiagnosePods(dataPods)
+	r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, cluster.Status.MetadataNodesReady, metadataReplicas, metadataFindings, "metadata")
+	r.setComponentCondition(cluster, antflyv1.TypeDataReady, cluster.Status.DataNodesReady, dataReplicas, dataFindings, "data")
+	allRuntimeFindings := append(append([]poddiagnostics.Finding{}, metadataFindings...), dataFindings...)
+
+	if len(allRuntimeFindings) > 0 {
+		cluster.Status.Phase = "Degraded"
+	} else if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
 		cluster.Status.Phase = "Running"
 	} else {
 		cluster.Status.Phase = "Pending"
 	}
 
+	r.updateRolloutCondition(cluster, metadataSts, dataSts)
+	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
+	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
+	r.updateProductTierStatus(cluster)
+
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
 
 	return r.Status().Update(ctx, cluster)
+}
+
+func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.AntflyCluster, statefulSets ...*appsv1.StatefulSet) {
+	var waiting []string
+	for _, sts := range statefulSets {
+		if sts == nil || sts.Name == "" {
+			waiting = append(waiting, "StatefulSet is not observed yet")
+			continue
+		}
+		replicas := int32(1)
+		if sts.Spec.Replicas != nil {
+			replicas = *sts.Spec.Replicas
+		}
+		if sts.Generation > sts.Status.ObservedGeneration {
+			waiting = append(waiting, fmt.Sprintf("%s observedGeneration %d is behind generation %d", sts.Name, sts.Status.ObservedGeneration, sts.Generation))
+			continue
+		}
+		if sts.Status.UpdatedReplicas < replicas {
+			waiting = append(waiting, fmt.Sprintf("%s has %d/%d updated replicas", sts.Name, sts.Status.UpdatedReplicas, replicas))
+			continue
+		}
+		if sts.Status.ReadyReplicas < replicas {
+			waiting = append(waiting, fmt.Sprintf("%s has %d/%d ready replicas", sts.Name, sts.Status.ReadyReplicas, replicas))
+		}
+	}
+
+	condition := metav1.Condition{
+		Type:               antflyv1.TypeRollout,
+		ObservedGeneration: cluster.Generation,
+	}
+	if len(waiting) > 0 {
+		condition.Status = metav1.ConditionUnknown
+		condition.Reason = antflyv1.ReasonRolloutInProgress
+		condition.Message = strings.Join(waiting, "; ")
+	} else {
+		condition.Status = metav1.ConditionTrue
+		condition.Reason = antflyv1.ReasonRolloutComplete
+		condition.Message = "All StatefulSet replicas are updated and ready"
+	}
+
+	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
+}
+
+func (r *AntflyClusterReconciler) listComponentPods(ctx context.Context, cluster *antflyv1.AntflyCluster, component string) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, component))); err != nil {
+		return nil, err
+	}
+	return podList.Items, nil
+}
+
+func (r *AntflyClusterReconciler) setComponentCondition(cluster *antflyv1.AntflyCluster, conditionType string, ready, desired int32, findings []poddiagnostics.Finding, component string) {
+	status := metav1.ConditionFalse
+	reason := antflyv1.ReasonWaitingForPods
+	message := fmt.Sprintf("%s has %d/%d ready pods", component, ready, desired)
+	if finding, ok := poddiagnostics.First(findings,
+		poddiagnostics.FindingUnschedulable,
+		poddiagnostics.FindingImagePullFailed,
+		poddiagnostics.FindingCrashLooping,
+		poddiagnostics.FindingProbeFailed,
+		poddiagnostics.FindingInitFailed,
+	); ok {
+		reason = antflyReasonForFinding(finding)
+		message = poddiagnostics.Message(finding)
+	} else if ready >= desired && desired > 0 {
+		status = metav1.ConditionTrue
+		reason = antflyv1.ReasonComponentReady
+		message = fmt.Sprintf("%s is ready", component)
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		ObservedGeneration: cluster.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func (r *AntflyClusterReconciler) setAvailableCondition(cluster *antflyv1.AntflyCluster, findings []poddiagnostics.Finding, ready bool) {
+	status := metav1.ConditionTrue
+	reason := antflyv1.ReasonAvailable
+	message := "Cluster is available"
+	if len(findings) > 0 {
+		status = metav1.ConditionFalse
+		reason = antflyv1.ReasonRuntimeDegraded
+		message = poddiagnostics.Summary(findings)
+	} else if !ready {
+		status = metav1.ConditionFalse
+		reason = antflyv1.ReasonWaitingForPods
+		message = "Cluster is waiting for ready pods"
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypeAvailable,
+		Status:             status,
+		ObservedGeneration: cluster.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func antflyReasonForFinding(finding poddiagnostics.Finding) string {
+	switch finding.Type {
+	case poddiagnostics.FindingUnschedulable:
+		return antflyv1.ReasonUnschedulable
+	case poddiagnostics.FindingImagePullFailed:
+		return antflyv1.ReasonImagePullFailed
+	case poddiagnostics.FindingCrashLooping:
+		return antflyv1.ReasonCrashLooping
+	case poddiagnostics.FindingProbeFailed:
+		return antflyv1.ReasonProbeFailed
+	default:
+		return antflyv1.ReasonRuntimeDegraded
+	}
+}
+
+func (r *AntflyClusterReconciler) recordClusterRuntimeFailureEvents(cluster *antflyv1.AntflyCluster, originalConditions []metav1.Condition) {
+	if r.Recorder == nil {
+		return
+	}
+	for _, condition := range cluster.Status.Conditions {
+		if condition.Status != metav1.ConditionFalse {
+			continue
+		}
+		if condition.Type != antflyv1.TypeMetadataReady &&
+			condition.Type != antflyv1.TypeDataReady &&
+			condition.Type != antflyv1.TypeSwarmReady &&
+			condition.Type != antflyv1.TypeTermiteReady &&
+			condition.Type != antflyv1.TypeAvailable {
+			continue
+		}
+		previous := meta.FindStatusCondition(originalConditions, condition.Type)
+		if previous != nil && previous.Status == condition.Status && previous.Reason == condition.Reason && previous.Message == condition.Message {
+			continue
+		}
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, condition.Reason, condition.Reason, "%s", condition.Message)
+	}
+}
+
+func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.AntflyCluster) {
+	if cluster.Spec.ProductTier == nil {
+		cluster.Status.ProductTierStatus = nil
+		return
+	}
+
+	tier := cluster.Spec.ProductTier
+	status := &antflyv1.ProductTierStatus{
+		Name:               tier.Name,
+		Revision:           tier.Revision,
+		ManagedBy:          tier.ManagedBy,
+		Mode:               effectiveTopologyModeForAPI(cluster),
+		SwarmTier:          tier.SwarmTier,
+		MetadataTier:       tier.MetadataTier,
+		DataTier:           tier.DataTier,
+		TermiteTier:        tier.TermiteTier,
+		TermiteEnabled:     cluster.Spec.Termite != nil,
+		ObservedGeneration: cluster.Generation,
+	}
+
+	if isSwarmMode(cluster) {
+		if cluster.Spec.Swarm != nil {
+			status.SwarmResources = resourceSpecSummary(cluster.Spec.Swarm.Resources)
+		}
+		status.SwarmStorage = chooseSwarmStorageSize(cluster)
+	} else {
+		status.MetadataReplicas = cluster.Spec.MetadataNodes.Replicas
+		if status.MetadataReplicas == 0 {
+			status.MetadataReplicas = 3
+		}
+		status.MetadataResources = resourceSpecSummary(cluster.Spec.MetadataNodes.Resources)
+		status.MetadataStorage = cluster.Spec.Storage.MetadataStorage
+
+		status.DataReplicas = effectiveDataNodeReplicas(cluster)
+		status.DataResources = resourceSpecSummary(cluster.Spec.DataNodes.Resources)
+		status.DataStorage = effectiveDataStorageSize(cluster)
+		if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
+			status.DataAutoscaling = fmt.Sprintf("enabled min=%d max=%d", cluster.Spec.DataNodes.AutoScaling.MinReplicas, cluster.Spec.DataNodes.AutoScaling.MaxReplicas)
+		} else {
+			status.DataAutoscaling = "disabled"
+		}
+	}
+
+	if cluster.Spec.Termite != nil {
+		status.TermiteReplicas = fmt.Sprintf("min=%d max=%d", cluster.Spec.Termite.Replicas.Min, cluster.Spec.Termite.Replicas.Max)
+	}
+
+	cluster.Status.ProductTierStatus = status
+}
+
+func effectiveTopologyModeForAPI(cluster *antflyv1.AntflyCluster) antflyv1.ClusterMode {
+	if isSwarmMode(cluster) {
+		return antflyv1.ClusterModeSwarm
+	}
+	return antflyv1.ClusterModeClustered
+}
+
+func resourceSpecSummary(resources antflyv1.ResourceSpec) string {
+	parts := []string{}
+	if resources.CPU != "" {
+		parts = append(parts, "cpu="+resources.CPU)
+	}
+	if resources.Memory != "" {
+		parts = append(parts, "memory="+resources.Memory)
+	}
+	if resources.Limits.CPU != "" {
+		parts = append(parts, "limitCPU="+resources.Limits.CPU)
+	}
+	if resources.Limits.Memory != "" {
+		parts = append(parts, "limitMemory="+resources.Limits.Memory)
+	}
+	if resources.Limits.GPU != "" {
+		parts = append(parts, "limitGPU="+resources.Limits.GPU)
+	}
+	return strings.Join(parts, " ")
 }
 
 // updateServiceMeshReadyCondition updates the ServiceMeshReady condition based on current status
@@ -2840,11 +3561,269 @@ func (r *AntflyClusterReconciler) reconcilePodDisruptionBudget(ctx context.Conte
 	return err
 }
 
+type pvcUsageObservation struct {
+	matched       int
+	usedBytes     int64
+	capacityBytes int64
+	maxRequest    resource.Quantity
+}
+
+type kubeletStatsSummary struct {
+	Pods []kubeletPodStats `json:"pods"`
+}
+
+type kubeletPodStats struct {
+	PodRef kubeletPodReference  `json:"podRef"`
+	Volume []kubeletVolumeStats `json:"volume"`
+}
+
+type kubeletPodReference struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+type kubeletVolumeStats struct {
+	PVCRef        *kubeletPVCReference `json:"pvcRef,omitempty"`
+	UsedBytes     *uint64              `json:"usedBytes,omitempty"`
+	CapacityBytes *uint64              `json:"capacityBytes,omitempty"`
+}
+
+type kubeletPVCReference struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+func (r *AntflyClusterReconciler) reconcileStorageAutoGrow(ctx context.Context, cluster *antflyv1.AntflyCluster, component, vctName, stsName, currentSizeStr, maxSizeStr string) string {
+	policy := cluster.Spec.Storage.StorageAutoGrow
+	if policy == nil || !policy.Enabled {
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonStorageAutoGrowDisabled, "Storage auto-grow is disabled")
+		return currentSizeStr
+	}
+
+	if maxSizeStr == "" {
+		message := fmt.Sprintf("%s storage auto-grow is enabled but no max size is configured", component)
+		r.setStorageAutoGrowStatus(cluster, component, currentSizeStr, "", "", 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+
+	currentSize, err := resource.ParseQuantity(currentSizeStr)
+	if err != nil {
+		message := fmt.Sprintf("%s current storage size %q is invalid: %v", component, currentSizeStr, err)
+		r.setStorageAutoGrowStatus(cluster, component, currentSizeStr, "", maxSizeStr, 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+	maxSize, err := resource.ParseQuantity(maxSizeStr)
+	if err != nil {
+		message := fmt.Sprintf("%s max storage size %q is invalid: %v", component, maxSizeStr, err)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSizeStr, 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+	growIncrement, err := resource.ParseQuantity(policy.GrowIncrement)
+	if err != nil || growIncrement.Sign() <= 0 {
+		message := fmt.Sprintf("%s grow increment %q is invalid", component, policy.GrowIncrement)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), 0, 0, 0, antflyv1.ReasonStorageAutoGrowFailed, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowFailed, message)
+		return currentSizeStr
+	}
+
+	observation, err := r.observePVCUsage(ctx, cluster, component, vctName, stsName)
+	if observation.maxRequest.Cmp(currentSize) > 0 {
+		currentSize = observation.maxRequest
+		currentSizeStr = currentSize.String()
+	}
+	if err != nil {
+		message := fmt.Sprintf("%s storage usage is unavailable: %v", component, err)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), 0, 0, 0, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		return currentSizeStr
+	}
+	if observation.matched == 0 || observation.capacityBytes <= 0 {
+		message := fmt.Sprintf("Waiting for %s PVC usage metrics before evaluating auto-grow", component)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), observation.usedBytes, observation.capacityBytes, 0, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
+		return currentSizeStr
+	}
+
+	usagePercentValue := (observation.usedBytes/observation.capacityBytes)*100 + ((observation.usedBytes%observation.capacityBytes)*100)/observation.capacityBytes
+	const maxInt32 = int64(1<<31 - 1)
+	if usagePercentValue > maxInt32 {
+		usagePercentValue = maxInt32
+	}
+	usagePercent := int32(usagePercentValue)
+	threshold := policy.GrowThresholdPercent
+	if threshold == 0 {
+		threshold = 85
+	}
+	if usagePercent < threshold {
+		message := fmt.Sprintf("%s storage usage is %d%%, below auto-grow threshold %d%%", component, usagePercent, threshold)
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), observation.usedBytes, observation.capacityBytes, usagePercent, antflyv1.ReasonStorageAutoGrowReady, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonStorageAutoGrowReady, message)
+		return currentSizeStr
+	}
+
+	if currentSize.Cmp(maxSize) >= 0 {
+		message := fmt.Sprintf("%s storage usage is %d%% but current size %s has reached max %s", component, usagePercent, currentSize.String(), maxSize.String())
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), currentSize.String(), maxSize.String(), observation.usedBytes, observation.capacityBytes, usagePercent, antflyv1.ReasonStorageAutoGrowMaxReached, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonStorageAutoGrowMaxReached, message)
+		return currentSizeStr
+	}
+
+	recommended := resource.NewQuantity(currentSize.Value()+growIncrement.Value(), resource.BinarySI)
+	if recommended.Cmp(maxSize) > 0 {
+		maxCopy := maxSize.DeepCopy()
+		recommended = &maxCopy
+	}
+	message := fmt.Sprintf("%s storage usage is %d%%, growing from %s to %s", component, usagePercent, currentSize.String(), recommended.String())
+	r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), recommended.String(), maxSize.String(), observation.usedBytes, observation.capacityBytes, usagePercent, antflyv1.ReasonStorageAutoGrowInProgress, message)
+	r.setStorageAutoGrowCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonStorageAutoGrowInProgress, message)
+	return recommended.String()
+}
+
+func (r *AntflyClusterReconciler) observePVCUsage(ctx context.Context, cluster *antflyv1.AntflyCluster, component, vctName, stsName string) (pvcUsageObservation, error) {
+	prefix := vctName + "-" + stsName + "-"
+	var pvcList corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace), client.MatchingLabels{"app.kubernetes.io/instance": cluster.Name}); err != nil {
+		return pvcUsageObservation{}, fmt.Errorf("list PVCs: %w", err)
+	}
+
+	observation := pvcUsageObservation{}
+	pvcNames := map[string]struct{}{}
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if !strings.HasPrefix(pvc.Name, prefix) {
+			continue
+		}
+		observation.matched++
+		pvcNames[pvc.Name] = struct{}{}
+		if request := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; request.Cmp(observation.maxRequest) > 0 {
+			observation.maxRequest = request
+		}
+	}
+	if len(pvcNames) == 0 {
+		return observation, nil
+	}
+	if r.KubeClient == nil && r.NodeStatsFetcher == nil {
+		return observation, fmt.Errorf("kubernetes client is not configured")
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, component))); err != nil {
+		return observation, fmt.Errorf("list %s pods: %w", component, err)
+	}
+
+	summaries := map[string]*kubeletStatsSummary{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Spec.NodeName == "" {
+			continue
+		}
+		summary, ok := summaries[pod.Spec.NodeName]
+		if !ok {
+			fetched, err := r.fetchNodeStatsSummary(ctx, pod.Spec.NodeName)
+			if err != nil {
+				return observation, err
+			}
+			summary = fetched
+			summaries[pod.Spec.NodeName] = summary
+		}
+		for _, podStats := range summary.Pods {
+			if podStats.PodRef.Namespace != pod.Namespace || podStats.PodRef.Name != pod.Name {
+				continue
+			}
+			for _, volume := range podStats.Volume {
+				if volume.PVCRef == nil || volume.PVCRef.Namespace != cluster.Namespace {
+					continue
+				}
+				if _, matched := pvcNames[volume.PVCRef.Name]; !matched {
+					continue
+				}
+				if volume.UsedBytes != nil {
+					observation.usedBytes += int64(*volume.UsedBytes) //nolint:gosec // kubelet volume stats fit int64 byte counters in practice
+				}
+				if volume.CapacityBytes != nil {
+					observation.capacityBytes += int64(*volume.CapacityBytes) //nolint:gosec // kubelet volume stats fit int64 byte counters in practice
+				}
+			}
+		}
+	}
+
+	return observation, nil
+}
+
+func (r *AntflyClusterReconciler) fetchNodeStatsSummary(ctx context.Context, nodeName string) (*kubeletStatsSummary, error) {
+	if r.NodeStatsFetcher != nil {
+		return r.NodeStatsFetcher(ctx, nodeName)
+	}
+	raw, err := r.KubeClient.CoreV1().RESTClient().Get().
+		Resource("nodes").
+		Name(nodeName).
+		SubResource("proxy").
+		Suffix("stats/summary").
+		DoRaw(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetch node %s stats summary: %w", nodeName, err)
+	}
+	var summary kubeletStatsSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return nil, fmt.Errorf("decode node %s stats summary: %w", nodeName, err)
+	}
+	return &summary, nil
+}
+
+func (r *AntflyClusterReconciler) setStorageAutoGrowStatus(cluster *antflyv1.AntflyCluster, component, currentSize, recommendedSize, maxSize string, usedBytes, capacityBytes int64, usagePercent int32, reason, message string) {
+	now := metav1.Now()
+	cluster.Status.StorageAutoGrowStatus = &antflyv1.StorageAutoGrowStatus{
+		Component:          component,
+		CurrentSize:        currentSize,
+		RecommendedSize:    recommendedSize,
+		MaxSize:            maxSize,
+		UsedBytes:          usedBytes,
+		CapacityBytes:      capacityBytes,
+		UsagePercent:       usagePercent,
+		Reason:             reason,
+		Message:            message,
+		LastEvaluationTime: &now,
+	}
+}
+
+func (r *AntflyClusterReconciler) setStorageAutoGrowCondition(cluster *antflyv1.AntflyCluster, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypeStorageAutoGrow,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: cluster.Generation,
+	})
+}
+
+type pvcExpansionState string
+
+const (
+	pvcExpansionSkipped    pvcExpansionState = "skipped"
+	pvcExpansionPending    pvcExpansionState = "pending"
+	pvcExpansionInProgress pvcExpansionState = "inProgress"
+	pvcExpansionComplete   pvcExpansionState = "complete"
+	pvcExpansionFailed     pvcExpansionState = "failed"
+)
+
+type pvcExpansionResult struct {
+	component string
+	state     pvcExpansionState
+	message   string
+}
+
 // reconcilePVCExpansion patches existing PVCs when the CRD specifies a larger storage size.
 // This is a best-effort operation — failures are reported as status conditions but don't block reconciliation.
-func (r *AntflyClusterReconciler) reconcilePVCExpansion(ctx context.Context, cluster *antflyv1.AntflyCluster, vctName, stsName, desiredSizeStr string) {
+func (r *AntflyClusterReconciler) reconcilePVCExpansion(ctx context.Context, cluster *antflyv1.AntflyCluster, component, vctName, stsName, desiredSizeStr string) pvcExpansionResult {
 	if desiredSizeStr == "" {
-		return // no size specified, using default
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionSkipped,
+			message:   fmt.Sprintf("%s storage uses the operator default size", component),
+		}
 	}
 
 	log := log.FromContext(ctx)
@@ -2856,28 +3835,125 @@ func (r *AntflyClusterReconciler) reconcilePVCExpansion(ctx context.Context, clu
 	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace),
 		client.MatchingLabels{"app.kubernetes.io/instance": cluster.Name}); err != nil {
 		log.Error(err, "Failed to list PVCs for expansion check")
-		return
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionFailed,
+			message:   fmt.Sprintf("Failed to list %s PVCs for expansion: %v", component, err),
+		}
 	}
 
+	matched := 0
+	updated := 0
+	waiting := 0
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
 		if !strings.HasPrefix(pvc.Name, prefix) {
 			continue // secondary guard: multiple StatefulSets share the instance label
 		}
+		matched++
 
 		currentSize := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-		if desiredSize.Cmp(currentSize) <= 0 {
-			continue // already at or above desired size
+		if desiredSize.Cmp(currentSize) > 0 {
+			log.Info("Expanding PVC", "pvc", pvc.Name, "from", currentSize.String(), "to", desiredSize.String())
+			pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
+			if err := r.Update(ctx, pvc); err != nil {
+				log.Error(err, "Failed to expand PVC", "pvc", pvc.Name)
+				return pvcExpansionResult{
+					component: component,
+					state:     pvcExpansionFailed,
+					message:   fmt.Sprintf("Failed to expand PVC %s: %v", pvc.Name, err),
+				}
+			}
+			updated++
+			waiting++
+			continue
 		}
 
-		log.Info("Expanding PVC", "pvc", pvc.Name, "from", currentSize.String(), "to", desiredSize.String())
-		pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
-		if err := r.Update(ctx, pvc); err != nil {
-			log.Error(err, "Failed to expand PVC", "pvc", pvc.Name)
-			r.setStorageCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonPVCExpansionFailed,
-				fmt.Sprintf("Failed to expand PVC %s: %v", pvc.Name, err))
+		capacity := pvc.Status.Capacity[corev1.ResourceStorage]
+		if capacity.IsZero() || desiredSize.Cmp(capacity) > 0 || pvcHasFileSystemResizePending(pvc) {
+			waiting++
 		}
 	}
+
+	switch {
+	case matched == 0:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionPending,
+			message:   fmt.Sprintf("Waiting for %s PVCs with prefix %q to be created", component, prefix),
+		}
+	case updated > 0:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionInProgress,
+			message:   fmt.Sprintf("Expansion requested for %d %s PVC(s) to %s", updated, component, desiredSize.String()),
+		}
+	case waiting > 0:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionInProgress,
+			message:   fmt.Sprintf("Waiting for %d %s PVC(s) to report capacity %s", waiting, component, desiredSize.String()),
+		}
+	default:
+		return pvcExpansionResult{
+			component: component,
+			state:     pvcExpansionComplete,
+			message:   fmt.Sprintf("All %d %s PVC(s) report requested capacity %s", matched, component, desiredSize.String()),
+		}
+	}
+}
+
+func pvcHasFileSystemResizePending(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, condition := range pvc.Status.Conditions {
+		if condition.Type == corev1.PersistentVolumeClaimFileSystemResizePending && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *AntflyClusterReconciler) setPVCExpansionCondition(cluster *antflyv1.AntflyCluster, results []pvcExpansionResult) {
+	var relevant []pvcExpansionResult
+	for _, result := range results {
+		if result.state != pvcExpansionSkipped {
+			relevant = append(relevant, result)
+		}
+	}
+	if len(relevant) == 0 {
+		return
+	}
+
+	status := metav1.ConditionTrue
+	reason := antflyv1.ReasonPVCExpansionComplete
+	for _, result := range relevant {
+		switch result.state {
+		case pvcExpansionFailed:
+			status = metav1.ConditionFalse
+			reason = antflyv1.ReasonPVCExpansionFailed
+		case pvcExpansionPending:
+			if reason != antflyv1.ReasonPVCExpansionFailed {
+				status = metav1.ConditionUnknown
+				reason = antflyv1.ReasonPVCExpansionPending
+			}
+		case pvcExpansionInProgress:
+			if reason != antflyv1.ReasonPVCExpansionFailed && reason != antflyv1.ReasonPVCExpansionPending {
+				status = metav1.ConditionUnknown
+				reason = antflyv1.ReasonPVCExpansionInProgress
+			}
+		}
+	}
+
+	messages := make([]string, 0, len(relevant))
+	for _, result := range relevant {
+		messages = append(messages, result.message)
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               antflyv1.TypePVCExpansion,
+		Status:             status,
+		Reason:             reason,
+		Message:            strings.Join(messages, "; "),
+		ObservedGeneration: cluster.Generation,
+	})
 }
 
 // checkPVCTopologyHealth detects PVC/AZ topology issues by checking for Pending pods
@@ -2968,9 +4044,24 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&policyv1.PodDisruptionBudget{})
+		Owns(&policyv1.PodDisruptionBudget{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod))
 	if r.ManageTermitePools {
 		builder = builder.Owns(&termitev1alpha1.TermitePool{})
 	}
 	return builder.Complete(r)
+}
+
+func (r *AntflyClusterReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {
+	clusterName := obj.GetLabels()["app.kubernetes.io/instance"]
+	component := obj.GetLabels()["app.kubernetes.io/component"]
+	if clusterName == "" || (component != "metadata" && component != "data" && component != "swarm") {
+		return nil
+	}
+	cluster := &antflyv1.AntflyCluster{}
+	key := types.NamespacedName{Name: clusterName, Namespace: obj.GetNamespace()}
+	if err := r.Get(ctx, key, cluster); err != nil {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: key}}
 }

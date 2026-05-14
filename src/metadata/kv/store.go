@@ -448,6 +448,11 @@ func (h *MetadataStoreAPI) AddRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /status", h.handleStatus)
 }
 
+// AddMetadataRoutes adds read-only metadata control-plane routes.
+func (h *MetadataStoreAPI) AddMetadataRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /status", h.handleStatus)
+}
+
 func (m *MetadataStore) ServeAPI(
 	ctx context.Context,
 	mux *http.ServeMux,

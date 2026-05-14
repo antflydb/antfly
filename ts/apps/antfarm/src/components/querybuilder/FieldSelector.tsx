@@ -1,6 +1,5 @@
+import { Badge, Label } from "@antfly/design-system";
 import type React from "react";
-import { Badge } from "@/components/ui/badge";
-import { Label } from "@/components/ui/label";
 import type { BasicField, SearchableField } from "../../utils/fieldUtils";
 
 interface FieldSelectorProps {

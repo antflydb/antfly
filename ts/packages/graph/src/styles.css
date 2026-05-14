@@ -1,0 +1,50 @@
+.antfly-graph {
+  --graph-bg: var(--background);
+  --graph-fg: var(--foreground);
+  --graph-edge-stroke: var(--muted-foreground);
+  --graph-node-label: var(--foreground);
+  --graph-search-bg: var(--background);
+}
+
+.antfly-graph .react-flow__background pattern circle {
+  fill: var(--muted-foreground);
+  opacity: 0.25;
+}
+
+.dark .antfly-graph .react-flow__background pattern circle {
+  opacity: 0.15;
+}
+
+.antfly-graph .react-flow__minimap {
+  background-color: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.antfly-graph .react-flow__controls {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+
+.antfly-graph .react-flow__controls button {
+  background-color: var(--background);
+  border-bottom: 1px solid var(--border);
+  color: var(--foreground);
+  width: 28px;
+  height: 28px;
+}
+
+.antfly-graph .react-flow__controls button:hover {
+  background-color: var(--accent);
+}
+
+.antfly-graph .react-flow__controls button svg {
+  fill: var(--foreground);
+}
+
+.antfly-graph .react-flow__controls button:last-child {
+  border-bottom: none;
+}

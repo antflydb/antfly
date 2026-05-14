@@ -1,11 +1,11 @@
-import { FileText } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import {
+  Button,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+} from "@antfly/design-system";
+import { FileText } from "lucide-react";
 
 export interface SamplePreset {
   name: string;

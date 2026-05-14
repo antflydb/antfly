@@ -1,9 +1,8 @@
 "use client";
 
+import { Button, ScrollArea, ScrollBar } from "@antfly/design-system";
 import type { ComponentProps, HTMLAttributes } from "react";
 import { useCallback } from "react";
-import { Button } from "@/components/ui/button";
-import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 
 export type SuggestionsProps = HTMLAttributes<HTMLDivElement>;

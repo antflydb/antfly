@@ -1,5 +1,27 @@
 import type { CustomInputProps } from "@antfly/components";
 import { AnswerResults, Antfly, QueryBox } from "@antfly/components";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  DashboardPage,
+  DashboardPageActions,
+  DashboardPageDescription,
+  DashboardPageHeader,
+  DashboardPageTitle,
+  DashboardToolbar,
+  Input,
+  Label,
+  Separator,
+  Switch,
+  Textarea,
+} from "@antfly/design-system";
 import type {
   ClassificationTransformationResult,
   GenerationConfidence,
@@ -39,15 +61,6 @@ import {
   pipelineReducer,
   type SearchStepData,
 } from "@/components/rag/pipeline-types";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { useTable } from "@/hooks/use-table";
@@ -84,7 +97,8 @@ const ERROR_TRUNCATE_LENGTH = 150;
 function ErrorDisplay({ message }: { message: string }) {
   const [expanded, setExpanded] = useState(false);
   const isLong = message.length > ERROR_TRUNCATE_LENGTH;
-  const displayText = isLong && !expanded ? `${message.slice(0, ERROR_TRUNCATE_LENGTH)}...` : message;
+  const displayText =
+    isLong && !expanded ? `${message.slice(0, ERROR_TRUNCATE_LENGTH)}...` : message;
 
   return (
     <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
@@ -384,10 +398,10 @@ const RagPlaygroundPage: React.FC = () => {
                 className={cn(
                   "gap-1.5",
                   confidenceData.generation > 0.7
-                    ? "text-green-600"
+                    ? "af-status-text-success"
                     : confidenceData.generation > 0.4
-                      ? "text-yellow-600"
-                      : "text-red-600"
+                      ? "af-status-text-warning"
+                      : "af-status-text-error"
                 )}
               >
                 <Target className="h-3 w-3" />
@@ -558,31 +572,32 @@ const RagPlaygroundPage: React.FC = () => {
 
   return (
     <Antfly url={apiUrl} table={selectedTable || ""}>
-      <div className="h-full">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6">
+      <DashboardPage className="h-full space-y-3">
+        <DashboardPageHeader>
           <div>
-            <h1 className="text-2xl font-bold">RAG Playground</h1>
-            <p className="text-muted-foreground text-sm mt-1">
+            <DashboardPageTitle className="font-aeonik">RAG Playground</DashboardPageTitle>
+            <DashboardPageDescription>
               Query your documents with AI-powered retrieval and generation
-            </p>
+            </DashboardPageDescription>
           </div>
-          <Button variant="outline" onClick={handleReset}>
-            <RotateCcw className="h-4 w-4 mr-2" />
-            Reset
-          </Button>
-        </div>
+          <DashboardPageActions>
+            <Button variant="outline" onClick={handleReset}>
+              <RotateCcw className="h-4 w-4 mr-2" />
+              Reset
+            </Button>
+          </DashboardPageActions>
+        </DashboardPageHeader>
 
         {/* Active Table/Index Indicator */}
         {selectedTable ? (
-          <div className="mb-4 flex items-center gap-2 text-sm text-muted-foreground">
+          <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
             <Badge variant="secondary">{selectedTable}</Badge>
             {selectedIndex && <Badge variant="outline">{selectedIndex}</Badge>}
-          </div>
+          </DashboardToolbar>
         ) : (
-          <div className="mb-4 p-3 rounded-lg border border-dashed text-sm text-muted-foreground">
+          <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
             Select a table from the sidebar to get started.
-          </div>
+          </DashboardToolbar>
         )}
 
         {/* Main Grid */}
@@ -856,9 +871,7 @@ const RagPlaygroundPage: React.FC = () => {
             </CardHeader>
             <CardContent className="flex-1 overflow-auto">
               {/* Error Display */}
-              {error && (
-                <ErrorDisplay message={error} />
-              )}
+              {error && <ErrorDisplay message={error} />}
 
               <PipelineTrace
                 pipeline={pipeline}
@@ -871,14 +884,14 @@ const RagPlaygroundPage: React.FC = () => {
         </div>
 
         {/* Help text */}
-        <div className="mt-6 text-xs text-muted-foreground">
+        <div className="text-xs text-muted-foreground">
           <p>
             <strong>RAG Playground:</strong> Enter a natural language question to search your
             documents and generate an AI-powered answer with citations. Configure classification,
             follow-up questions, and confidence scoring in Settings.
           </p>
         </div>
-      </div>
+      </DashboardPage>
     </Antfly>
   );
 };

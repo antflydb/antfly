@@ -1,10 +1,7 @@
-import { PlusIcon } from "@radix-ui/react-icons";
-import type React from "react";
-import { useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
+  Button,
+  Input,
+  Label,
   Select,
   SelectContent,
   SelectGroup,
@@ -12,7 +9,10 @@ import {
   SelectLabel,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@antfly/design-system";
+import { PlusIcon } from "@radix-ui/react-icons";
+import type React from "react";
+import { useState } from "react";
 import type { BasicField, SearchableField } from "@/utils/fieldUtils";
 import FieldSelector from "./querybuilder/FieldSelector";
 
@@ -153,7 +153,7 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
         <div>
           <Label className="text-xs mb-1 block">Type</Label>
           <Select value={type} onValueChange={(v) => setType(v as AggregationType)}>
-            <SelectTrigger className="h-8">
+            <SelectTrigger size="sm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -274,7 +274,7 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
         <div>
           <Label className="text-xs mb-1 block">Calendar Interval</Label>
           <Select value={calendarInterval} onValueChange={setCalendarInterval}>
-            <SelectTrigger className="h-8 w-40">
+            <SelectTrigger size="sm" className="w-40">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>

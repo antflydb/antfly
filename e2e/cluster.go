@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -66,6 +68,15 @@ type clusterStatusResponse struct {
 	Shards struct {
 		Statuses map[string]*store.ShardStatus `json:"statuses"`
 	} `json:"shards"`
+}
+
+type nodeShutdownStatusResponse struct {
+	Phase           string   `json:"phase"`
+	SafeToTerminate bool     `json:"safe_to_terminate"`
+	Blocked         bool     `json:"blocked,omitempty"`
+	BlockedReason   string   `json:"blocked_reason,omitempty"`
+	Message         string   `json:"message,omitempty"`
+	BypassedGroups  []string `json:"bypassed_groups,omitempty"`
 }
 
 // TestCluster represents a multi-node test cluster for distributed e2e testing.
@@ -312,42 +323,133 @@ func (c *TestCluster) AddStoreNode(ctx context.Context) *StoreNode {
 	return node
 }
 
-// RemoveStoreNode removes a store node from the cluster by deregistering it
+// RemoveStoreNode gracefully removes a store node from the cluster. It requests
+// runtime drain, waits until metadata reports that the node is safe to
+// terminate, stops the local process, and finalizes the node lifecycle record.
 func (c *TestCluster) RemoveStoreNode(ctx context.Context, nodeID types.ID) error {
-	c.mu.Lock()
+	c.mu.RLock()
 	node, exists := c.StoreNodes[nodeID]
 	if !exists {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return fmt.Errorf("store node %d not found", nodeID)
 	}
-	delete(c.StoreNodes, nodeID)
-	c.mu.Unlock()
+	c.mu.RUnlock()
 
 	c.Logger.Info("Removing store node", zap.Stringer("nodeID", nodeID))
 
-	// Deregister the store from metadata (this will trigger shard reallocation)
-	// Note: The URL path parameter is parsed as a hex string by IDFromString,
-	// so we must use nodeID.String() which returns the hex representation.
-	deregisterURL := fmt.Sprintf("%s/_internal/v1/store/%s", c.MetadataNode.APIURL, nodeID.String())
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deregisterURL, nil)
+	// Request node shutdown in metadata before stopping the store node. Node
+	// lifecycle APIs use decimal path IDs to match the Zig runtime contract.
+	nodeIDString := strconv.FormatUint(uint64(nodeID), 10)
+	nodeURL := fmt.Sprintf("%s/_internal/v1/nodes/%s", c.MetadataNode.APIURL, nodeIDString)
+	shutdownURL := nodeURL + "/shutdown"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, shutdownURL, bytes.NewBufferString(`{"type":"remove","reason":"e2e graceful removal"}`))
 	if err != nil {
-		return fmt.Errorf("creating deregister request: %w", err)
+		return fmt.Errorf("creating node shutdown request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req) //nolint:gosec // G704: HTTP client calling configured endpoint
 	if err != nil {
-		return fmt.Errorf("deregistering store: %w", err)
+		return fmt.Errorf("requesting node shutdown: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("deregister returned status %d", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("node shutdown returned status %d", resp.StatusCode)
 	}
 
-	// Stop the store node after deregistration so the cluster exercises real node removal.
-	node.Cancel()
+	shutdownRequested := true
+	nodeStopped := false
+	defer func() {
+		if !shutdownRequested || nodeStopped {
+			return
+		}
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cancelReq, cancelErr := http.NewRequestWithContext(cancelCtx, http.MethodDelete, shutdownURL, nil)
+		if cancelErr != nil {
+			c.Logger.Warn("Failed to create node shutdown cancellation request", zap.Stringer("nodeID", nodeID), zap.Error(cancelErr))
+			return
+		}
+		cancelResp, cancelErr := http.DefaultClient.Do(cancelReq) //nolint:gosec // G704: HTTP client calling configured endpoint
+		if cancelErr != nil {
+			c.Logger.Warn("Failed to cancel node shutdown after removal failure", zap.Stringer("nodeID", nodeID), zap.Error(cancelErr))
+			return
+		}
+		_, _ = io.Copy(io.Discard, cancelResp.Body)
+		_ = cancelResp.Body.Close()
+		if cancelResp.StatusCode < 200 || cancelResp.StatusCode >= 300 {
+			c.Logger.Warn("Node shutdown cancellation returned non-success status", zap.Stringer("nodeID", nodeID), zap.Int("status", cancelResp.StatusCode))
+		}
+	}()
 
-	c.Logger.Info("Store node removed and deregistered", zap.Stringer("nodeID", nodeID))
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		statusReq, err := http.NewRequestWithContext(ctx, http.MethodGet, shutdownURL, nil)
+		if err != nil {
+			return fmt.Errorf("creating node shutdown status request: %w", err)
+		}
+		statusResp, err := http.DefaultClient.Do(statusReq) //nolint:gosec // G704: HTTP client calling configured endpoint
+		if err != nil {
+			return fmt.Errorf("getting node shutdown status: %w", err)
+		}
+		if statusResp.StatusCode < 200 || statusResp.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, statusResp.Body)
+			_ = statusResp.Body.Close()
+			return fmt.Errorf("node shutdown status returned status %d", statusResp.StatusCode)
+		}
+		var status nodeShutdownStatusResponse
+		if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+			_ = statusResp.Body.Close()
+			return fmt.Errorf("decoding node shutdown status: %w", err)
+		}
+		_ = statusResp.Body.Close()
+		if status.Blocked {
+			message := status.Message
+			if message == "" {
+				message = status.BlockedReason
+			}
+			if message == "" {
+				message = "metadata reported blocked node shutdown"
+			}
+			return fmt.Errorf("node shutdown blocked in phase %q: %s", status.Phase, message)
+		}
+		if status.SafeToTerminate {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for node shutdown safety: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+
+	// Stop the store node only after metadata reports that no local runtime
+	// ownership remains.
+	node.Cancel()
+	nodeStopped = true
+
+	c.mu.Lock()
+	delete(c.StoreNodes, nodeID)
+	c.mu.Unlock()
+
+	finalizeReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, nodeURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating node shutdown finalization request: %w", err)
+	}
+	finalizeResp, err := http.DefaultClient.Do(finalizeReq) //nolint:gosec // G704: HTTP client calling configured endpoint
+	if err != nil {
+		return fmt.Errorf("finalizing node shutdown: %w", err)
+	}
+	defer func() { _ = finalizeResp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, finalizeResp.Body)
+	if finalizeResp.StatusCode < 200 || finalizeResp.StatusCode >= 300 {
+		return fmt.Errorf("node shutdown finalization returned status %d", finalizeResp.StatusCode)
+	}
+
+	c.Logger.Info("Store node removed after graceful shutdown", zap.Stringer("nodeID", nodeID))
 	return nil
 }
 

@@ -47,6 +47,7 @@ import (
 const (
 	tablePrefix                = "tm:t:"
 	storeStatusPrefix          = "tm:sts:"
+	nodeRecordPrefix           = "tm:nr:"
 	shardStatusPrefix          = "tm:shs:"
 	storeTombstonePrefix       = "tm:stb:"
 	tableReallocationReqPrefix = "tm:rar:"
@@ -129,14 +130,32 @@ func (tm *TableManager) UpdateStatuses(
 	ctx context.Context,
 	newStatuses map[types.ID]*StoreStatus,
 ) error {
+	tm.Lock()
+	defer tm.Unlock()
+	return tm.updateStatusesLocked(ctx, newStatuses)
+}
+
+func (tm *TableManager) updateStatusesLocked(
+	ctx context.Context,
+	newStatuses map[types.ID]*StoreStatus,
+) error {
 	if len(newStatuses) == 0 {
 		return nil // No new statuses to set
 	}
-	tm.Lock()
-	defer tm.Unlock()
+	tombstones, err := tm.GetStoreTombstones(ctx)
+	if err != nil {
+		return fmt.Errorf("loading store tombstones: %w", err)
+	}
+	tombstonedStores := make(map[types.ID]struct{}, len(tombstones))
+	for _, id := range tombstones {
+		tombstonedStores[id] = struct{}{}
+	}
 	currentShards := make(map[types.ID]*store.ShardInfo)
 	updatedStores := make(map[types.ID]*StoreStatus)
 	for nodeID, status := range newStatuses {
+		if _, tombstoned := tombstonedStores[nodeID]; tombstoned {
+			status.State = store.StoreState_Terminating
+		}
 		oldStoreStatus, err := tm.GetStoreStatus(ctx, nodeID)
 		// If the store status is not found i.e. ErrNotFound, we treat it as a new store
 		if errors.Is(err, ErrNotFound) {
@@ -147,10 +166,11 @@ func (tm *TableManager) UpdateStatuses(
 			updatedStores[nodeID] = status
 		}
 
-		// Unreachable stores keep their last known shard map for observability, but
-		// they must not contribute to aggregate shard routing state. Otherwise a dead
-		// node can linger in ReportedBy / leader-adjacent metadata and misroute reads.
-		if status.State == store.StoreState_Unhealthy {
+		// Unreachable or administratively draining stores keep their last known
+		// shard map for observability, but they must not contribute to aggregate
+		// shard routing state. Otherwise a dead/draining node can linger in
+		// ReportedBy / leader-adjacent metadata and misroute reads.
+		if status.State == store.StoreState_Unhealthy || status.State == store.StoreState_Terminating {
 			continue
 		}
 
@@ -771,7 +791,10 @@ func (tm *TableManager) GetShardStatuses() (map[types.ID]*store.ShardStatus, err
 	return resp, nil
 }
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound                   = errors.New("not found")
+	ErrActiveNodeFinalizeRejected = errors.New("active node cannot be finalized")
+)
 
 func (tm *TableManager) GetShardStatus(shardID types.ID) (*store.ShardStatus, error) {
 	b, closer, err := tm.db.Get(context.Background(), []byte(shardStatusPrefix+shardID.String()))
@@ -858,15 +881,148 @@ func (tm *TableManager) DeleteTombstones(ctx context.Context, ids []types.ID) er
 	if len(ids) == 0 {
 		return nil
 	}
-	deletes := make([][]byte, 0, len(ids)*2)
+	tm.Lock()
+	defer tm.Unlock()
+
+	deletes := make([][]byte, 0, len(ids)*3)
 	for _, id := range ids {
+		_, closer, err := tm.db.Get(ctx, []byte(storeTombstonePrefix+id.String()))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return fmt.Errorf("checking store tombstone for %s before deletion: %w", id, err)
+		}
+		if closer != nil {
+			_ = closer.Close()
+		}
+		nodeRecord, err := tm.GetNodeRecord(ctx, id)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("checking node record for %s before tombstone deletion: %w", id, err)
+		}
+		if nodeRecord != nil && nodeRecord.Lifecycle == NodeLifecycleDraining {
+			continue
+		}
 		deletes = append(deletes, []byte(storeStatusPrefix+id.String()))
 		deletes = append(deletes, []byte(storeTombstonePrefix+id.String()))
+		deletes = append(deletes, []byte(nodeRecordPrefix+id.String()))
 	}
 	return tm.db.Batch(ctx, nil, deletes)
 }
 
+func (tm *TableManager) RegisterNode(ctx context.Context, record *NodeRecord) error {
+	tm.Lock()
+	defer tm.Unlock()
+	return tm.registerNodeLocked(ctx, record)
+}
+
+func (tm *TableManager) registerNodeLocked(ctx context.Context, record *NodeRecord) error {
+	if record == nil {
+		return fmt.Errorf("node record is required")
+	}
+	if record.NodeID == 0 {
+		return fmt.Errorf("node_id is required")
+	}
+
+	lifecycle := record.Lifecycle
+	if lifecycle == "" {
+		lifecycle = NodeLifecycleActive
+	}
+	existing, err := tm.GetNodeRecord(ctx, record.NodeID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	reason := record.Reason
+	if existing != nil && existing.Lifecycle != "" && existing.Lifecycle != NodeLifecycleActive {
+		lifecycle = existing.Lifecycle
+		if reason == "" {
+			reason = existing.Reason
+		}
+	}
+
+	next := *record
+	next.Lifecycle = lifecycle
+	next.Reason = reason
+	next.LastSeen = time.Now()
+	data, err := json.Marshal(&next)
+	if err != nil {
+		return fmt.Errorf("marshalling node record for %s: %w", record.NodeID, err)
+	}
+	return tm.db.Batch(ctx, [][2][]byte{{[]byte(nodeRecordPrefix + record.NodeID.String()), data}}, nil)
+}
+
+func (tm *TableManager) SetNodeLifecycle(ctx context.Context, id types.ID, lifecycle, reason string) error {
+	tm.Lock()
+	defer tm.Unlock()
+
+	if id == 0 {
+		return fmt.Errorf("node_id is required")
+	}
+	record, err := tm.GetNodeRecord(ctx, id)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		record = &NodeRecord{NodeID: id}
+	}
+	record.Lifecycle = lifecycle
+	record.Reason = reason
+	record.LastSeen = time.Now()
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshalling node record for %s: %w", id, err)
+	}
+	return tm.db.Batch(ctx, [][2][]byte{{[]byte(nodeRecordPrefix + id.String()), data}}, nil)
+}
+
+func (tm *TableManager) RequestNodeShutdown(ctx context.Context, id types.ID, reason string) error {
+	tm.Lock()
+	defer tm.Unlock()
+
+	if id == 0 {
+		return fmt.Errorf("node_id is required")
+	}
+	record, err := tm.GetNodeRecord(ctx, id)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		record = &NodeRecord{NodeID: id}
+	}
+	now := time.Now()
+	if record.Lifecycle != NodeLifecycleDraining || record.DrainingSince.IsZero() {
+		record.DrainingSince = now
+	}
+	record.Lifecycle = NodeLifecycleDraining
+	record.Reason = reason
+	record.LastSeen = now
+	nodeData, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshalling node record for %s: %w", id, err)
+	}
+
+	writes := [][2][]byte{
+		{[]byte(nodeRecordPrefix + id.String()), nodeData},
+		{[]byte(storeTombstonePrefix + id.String()), nil},
+	}
+	if status, err := tm.GetStoreStatus(ctx, id); err == nil {
+		status.State = store.StoreState_Terminating
+		storeData, err := json.Marshal(status)
+		if err != nil {
+			return fmt.Errorf("marshalling store status for %s: %w", id, err)
+		}
+		writes = append(writes, [2][]byte{[]byte(storeStatusPrefix + id.String()), storeData})
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+
+	return tm.db.Batch(ctx, writes, nil)
+}
+
 func (tm *TableManager) TombstoneStore(ctx context.Context, id types.ID) error {
+	tm.Lock()
+	defer tm.Unlock()
+
 	// TODO (ajr) Remove a shard altogether after reconciliation has happened
 	writes := [][2][]byte{{[]byte(storeTombstonePrefix + id.String()), nil}}
 
@@ -882,6 +1038,81 @@ func (tm *TableManager) TombstoneStore(ctx context.Context, id types.ID) error {
 	}
 
 	return tm.db.Batch(ctx, writes, nil)
+}
+
+func (tm *TableManager) ClearStoreTombstone(ctx context.Context, id types.ID) error {
+	tm.Lock()
+	defer tm.Unlock()
+
+	writes := make([][2][]byte, 0, 2)
+	record, err := tm.GetNodeRecord(ctx, id)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+	}
+	tombstoned, err := tm.HasStoreTombstone(ctx, id)
+	if err != nil {
+		return err
+	}
+	storeStatus, err := tm.GetStoreStatus(ctx, id)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if record == nil && !tombstoned && storeStatus == nil {
+		return nil
+	}
+	if record == nil {
+		record = &NodeRecord{NodeID: id}
+	}
+	record.Lifecycle = NodeLifecycleActive
+	record.Reason = ""
+	record.LastSeen = time.Now()
+	record.DrainingSince = time.Time{}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshalling node record for %s: %w", id, err)
+	}
+	writes = append(writes, [2][]byte{[]byte(nodeRecordPrefix + id.String()), data})
+
+	return tm.db.Batch(ctx, writes, [][]byte{[]byte(storeTombstonePrefix + id.String())})
+}
+
+func (tm *TableManager) FinalizeNodeShutdown(ctx context.Context, id types.ID) error {
+	tm.Lock()
+	defer tm.Unlock()
+
+	tombstoned, err := tm.HasStoreTombstone(ctx, id)
+	if err != nil {
+		return err
+	}
+	record, err := tm.GetNodeRecord(ctx, id)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	status, err := tm.GetStoreStatus(ctx, id)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if !tombstoned && record == nil && status == nil {
+		return nil
+	}
+	if record != nil && record.Lifecycle != NodeLifecycleDraining {
+		return fmt.Errorf("%w: node %s is %q, not %q", ErrActiveNodeFinalizeRejected, id, record.Lifecycle, NodeLifecycleDraining)
+	}
+	if !tombstoned && record == nil && status != nil {
+		return fmt.Errorf("%w: node %s has active store status but no shutdown intent", ErrActiveNodeFinalizeRejected, id)
+	}
+	if !tombstoned && (record == nil || record.Lifecycle != NodeLifecycleDraining) {
+		return fmt.Errorf("node %s has no shutdown intent to finalize", id)
+	}
+
+	deletes := [][]byte{
+		[]byte(storeStatusPrefix + id.String()),
+		[]byte(storeTombstonePrefix + id.String()),
+		[]byte(nodeRecordPrefix + id.String()),
+	}
+	return tm.db.Batch(ctx, nil, deletes)
 }
 
 func (tm *TableManager) GetStoreTombstones(ctx context.Context) ([]types.ID, error) {
@@ -912,13 +1143,56 @@ func (tm *TableManager) GetStoreTombstones(ctx context.Context) ([]types.ID, err
 	return tombstones, nil
 }
 
+func (tm *TableManager) HasStoreTombstone(ctx context.Context, id types.ID) (bool, error) {
+	_, closer, err := tm.db.Get(ctx, []byte(storeTombstonePrefix+id.String()))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking store tombstone for %s: %w", id, err)
+	}
+	defer func() { _ = closer.Close() }()
+	return true, nil
+}
+
+func (tm *TableManager) GetNodeRecord(ctx context.Context, id types.ID) (*NodeRecord, error) {
+	b, closer, err := tm.db.Get(ctx, []byte(nodeRecordPrefix+id.String()))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("getting node record for %s: %w", id, err)
+	}
+	defer func() { _ = closer.Close() }()
+	record := &NodeRecord{}
+	if err := json.Unmarshal(b, record); err != nil {
+		return nil, fmt.Errorf("unmarshalling node record for %s: %w", id, err)
+	}
+	return record, nil
+}
+
 func (tm *TableManager) RegisterStore(
 	ctx context.Context,
 	req *store.StoreRegistrationRequest,
 ) error {
+	tm.Lock()
+	defer tm.Unlock()
+
+	if err := tm.registerNodeLocked(ctx, &NodeRecord{NodeID: req.ID}); err != nil {
+		return err
+	}
+
+	state := store.StoreState_Healthy
+	tombstoned, err := tm.HasStoreTombstone(ctx, req.ID)
+	if err != nil {
+		return err
+	}
+	if tombstoned {
+		state = store.StoreState_Terminating
+	}
 	storeStatus := &StoreStatus{
 		StoreInfo: req.StoreInfo,
-		State:     store.StoreState_Healthy,
+		State:     state,
 		LastSeen:  time.Now(),
 		Shards:    req.Shards,
 	}
@@ -927,7 +1201,7 @@ func (tm *TableManager) RegisterStore(
 	}
 	// If the request contains shards, we need to update the shard status
 	if len(req.Shards) > 0 {
-		return tm.UpdateStatuses(ctx, newStatus)
+		return tm.updateStatusesLocked(ctx, newStatus)
 	}
 	if err := tm.saveStoreStatuses(newStatus); err != nil {
 		return fmt.Errorf("saving node status: %w", err)

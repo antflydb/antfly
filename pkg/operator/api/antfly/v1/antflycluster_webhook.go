@@ -18,6 +18,8 @@ var (
 	irsaARNPattern = regexp.MustCompile(`^arn:aws(-cn|-us-gov)?:iam::\d{12}:role/.+$`)
 	// ec2InstancePattern matches AWS EC2 instance type names (e.g. m5.large, u-6tb1.56xlarge).
 	ec2InstancePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*\.[a-z0-9]+$`)
+	// productTierTokenPattern accepts stable external tier/catalog identifiers.
+	productTierTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 )
 
 // ValidateCreate validates the cluster configuration when creating a new cluster.
@@ -45,6 +47,8 @@ func (r *AntflyCluster) Default() {
 	if r.Spec.Mode == "" {
 		r.Spec.Mode = ClusterModeClustered
 	}
+
+	defaultStorageAutoGrow(&r.Spec.Storage)
 
 	if r.Spec.Mode != ClusterModeSwarm || r.Spec.Swarm == nil {
 		return
@@ -131,11 +135,23 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateStorageAutoGrowConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
+	if err := r.validateAutoScalingConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if err := r.validateResourceQuantities(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
 	if err := r.validateTermiteSpec(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
+	if err := r.validateProductTierMapping(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
@@ -464,6 +480,14 @@ Solution: Use an odd replica count:
 		return fmt.Errorf("spec.dataNodes.replicas must be >= 0, got %d", r.Spec.DataNodes.Replicas)
 	}
 
+	if r.Spec.DataNodes.Suspend && r.Spec.DataNodes.AutoScaling != nil && r.Spec.DataNodes.AutoScaling.Enabled {
+		return fmt.Errorf(`spec.dataNodes.suspend conflicts with spec.dataNodes.autoScaling.enabled=true
+
+Problem: Suspension is an explicit pause/resume operation, while autoscaling continuously manages the data replica target.
+
+Solution: Disable data-node autoscaling before suspending the data StatefulSet`)
+	}
+
 	return nil
 }
 
@@ -576,6 +600,21 @@ Attempted change: "%s"`,
 			old.Spec.Storage.StorageClass, r.Spec.Storage.StorageClass))
 	}
 
+	if newMode == ClusterModeClustered && oldMode == ClusterModeClustered {
+		if r.Spec.MetadataNodes.Replicas < old.Spec.MetadataNodes.Replicas {
+			errors = append(errors, fmt.Sprintf(
+				`field 'spec.metadataNodes.replicas' cannot be decreased yet (current: %d, attempted: %d)
+
+Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata scale-down workflow.
+
+Solution: Keep the existing metadata replica count, or recreate the cluster with the smaller topology.`,
+				old.Spec.MetadataNodes.Replicas, r.Spec.MetadataNodes.Replicas))
+		}
+
+		// Data-node scale-down is mutable: the controller drains and deregisters
+		// one highest ordinal at a time before shrinking the StatefulSet.
+	}
+
 	// Check storage size decrease (increases are allowed for online expansion)
 	// Use resource.Quantity comparison instead of string comparison to handle
 	// cases like "8Gi" → "10Gi" correctly (string comparison would reject this).
@@ -605,6 +644,20 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 
 Problem: PVC storage size cannot be reduced. Kubernetes only supports volume expansion, not shrinking.`,
 				old.Spec.Storage.DataStorage, r.Spec.Storage.DataStorage))
+		}
+	}
+	if old.Spec.Storage.SwarmStorage != "" && r.Spec.Storage.SwarmStorage != "" {
+		oldQ, errOld := resource.ParseQuantity(old.Spec.Storage.SwarmStorage)
+		newQ, errNew := resource.ParseQuantity(r.Spec.Storage.SwarmStorage)
+		if errNew != nil {
+			errors = append(errors, fmt.Sprintf(
+				"spec.storage.swarmStorage: %q is not a valid storage quantity", r.Spec.Storage.SwarmStorage))
+		} else if errOld == nil && newQ.Cmp(oldQ) < 0 {
+			errors = append(errors, fmt.Sprintf(
+				`field 'spec.storage.swarmStorage' cannot be decreased (current: %s, attempted: %s)
+
+Problem: PVC storage size cannot be reduced. Kubernetes only supports volume expansion, not shrinking.`,
+				old.Spec.Storage.SwarmStorage, r.Spec.Storage.SwarmStorage))
 		}
 	}
 
@@ -768,7 +821,183 @@ Solution: Either:
   Option 2: Disable autoscaling (spec.dataNodes.autoScaling.enabled=false)`)
 	}
 
+	if policy.WhenScaled == PVCRetentionDelete && r.Spec.DataNodes.Suspend {
+		return fmt.Errorf(`spec.storage.pvcRetentionPolicy.whenScaled=Delete conflicts with spec.dataNodes.suspend=true
+
+Problem: Suspension scales data pods to zero and relies on retained PVCs so the same ordinals can resume with their existing data.
+
+Solution: Set spec.storage.pvcRetentionPolicy.whenScaled=Retain before suspending data nodes`)
+	}
+
 	return nil
+}
+
+func (r *AntflyCluster) validateAutoScalingConfig() error {
+	if r.isSwarmMode() || r.Spec.DataNodes.AutoScaling == nil {
+		return nil
+	}
+
+	autoScaling := r.Spec.DataNodes.AutoScaling
+	if !autoScaling.Enabled {
+		return nil
+	}
+
+	var errors []string
+	if autoScaling.MinReplicas < 1 {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas must be >= 1, got %d", autoScaling.MinReplicas))
+	}
+	if autoScaling.MaxReplicas < 1 {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.maxReplicas must be >= 1, got %d", autoScaling.MaxReplicas))
+	}
+	if autoScaling.MinReplicas > autoScaling.MaxReplicas {
+		errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.minReplicas (%d) cannot be greater than maxReplicas (%d)", autoScaling.MinReplicas, autoScaling.MaxReplicas))
+	}
+	if autoScaling.TargetCPUUtilizationPercentage != nil {
+		target := *autoScaling.TargetCPUUtilizationPercentage
+		if target < 1 || target > 100 {
+			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.targetCPUUtilizationPercentage must be between 1 and 100, got %d", target))
+		}
+	}
+	if autoScaling.TargetMemoryUtilizationPercentage != nil {
+		target := *autoScaling.TargetMemoryUtilizationPercentage
+		if target < 1 || target > 100 {
+			errors = append(errors, fmt.Sprintf("spec.dataNodes.autoScaling.targetMemoryUtilizationPercentage must be between 1 and 100, got %d", target))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("autoscaling validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func defaultStorageAutoGrow(storage *StorageSpec) {
+	if storage == nil || storage.StorageAutoGrow == nil || !storage.StorageAutoGrow.Enabled {
+		return
+	}
+	if storage.StorageAutoGrow.GrowThresholdPercent == 0 {
+		storage.StorageAutoGrow.GrowThresholdPercent = 85
+	}
+	if storage.StorageAutoGrow.GrowIncrement == "" {
+		storage.StorageAutoGrow.GrowIncrement = "10Gi"
+	}
+}
+
+func (r *AntflyCluster) validateStorageAutoGrowConfig() error {
+	autoGrow := r.Spec.Storage.StorageAutoGrow
+	if autoGrow == nil || !autoGrow.Enabled {
+		return nil
+	}
+	defaulted := *autoGrow
+	storage := r.Spec.Storage
+	storage.StorageAutoGrow = &defaulted
+	defaultStorageAutoGrow(&storage)
+	autoGrow = storage.StorageAutoGrow
+
+	var errors []string
+	if autoGrow.GrowThresholdPercent < 1 || autoGrow.GrowThresholdPercent > 99 {
+		errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.growThresholdPercent must be between 1 and 99, got %d", autoGrow.GrowThresholdPercent))
+	}
+	if autoGrow.GrowIncrement == "" {
+		errors = append(errors, "spec.storage.storageAutoGrow.growIncrement is required when storage auto-grow is enabled")
+	} else if q, err := resource.ParseQuantity(autoGrow.GrowIncrement); err != nil {
+		errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.growIncrement: %q is not a valid resource quantity", autoGrow.GrowIncrement))
+	} else if q.Sign() <= 0 {
+		errors = append(errors, "spec.storage.storageAutoGrow.growIncrement must be greater than zero")
+	}
+
+	if r.isSwarmMode() {
+		maxSize := autoGrow.MaxSwarmStorage
+		if maxSize == "" {
+			maxSize = autoGrow.MaxDataStorage
+		}
+		if maxSize == "" {
+			errors = append(errors, "spec.storage.storageAutoGrow.maxSwarmStorage or maxDataStorage is required when storage auto-grow is enabled in swarm mode")
+		} else if _, err := resource.ParseQuantity(maxSize); err != nil {
+			errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxSwarmStorage: %q is not a valid resource quantity", maxSize))
+		}
+	} else if autoGrow.MaxDataStorage == "" {
+		errors = append(errors, "spec.storage.storageAutoGrow.maxDataStorage is required when storage auto-grow is enabled in clustered mode")
+	} else if _, err := resource.ParseQuantity(autoGrow.MaxDataStorage); err != nil {
+		errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxDataStorage: %q is not a valid resource quantity", autoGrow.MaxDataStorage))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("storage auto-grow validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func (r *AntflyCluster) validateProductTierMapping() error {
+	tier := r.Spec.ProductTier
+	if tier == nil {
+		return nil
+	}
+
+	var errors []string
+	validateTierToken := func(path, value string, required bool) {
+		if value == "" {
+			if required {
+				errors = append(errors, fmt.Sprintf("%s is required when spec.productTier is set", path))
+			}
+			return
+		}
+		if len(value) > 128 || !productTierTokenPattern.MatchString(value) {
+			errors = append(errors, fmt.Sprintf("%s must be 1-128 characters and contain only letters, numbers, '.', '_' or '-'", path))
+		}
+	}
+
+	validateTierToken("spec.productTier.name", tier.Name, true)
+	validateTierToken("spec.productTier.revision", tier.Revision, false)
+	validateTierToken("spec.productTier.managedBy", tier.ManagedBy, false)
+	validateTierToken("spec.productTier.swarmTier", tier.SwarmTier, false)
+	validateTierToken("spec.productTier.metadataTier", tier.MetadataTier, false)
+	validateTierToken("spec.productTier.dataTier", tier.DataTier, false)
+	validateTierToken("spec.productTier.termiteTier", tier.TermiteTier, false)
+
+	if r.isSwarmMode() {
+		if r.Spec.Swarm == nil {
+			errors = append(errors, "spec.swarm is required for a swarm product tier")
+		} else {
+			if !resourceSpecHasCPUAndMemory(r.Spec.Swarm.Resources) {
+				errors = append(errors, "spec.swarm.resources must include cpu and memory requests or limits for a swarm product tier")
+			}
+			if r.Spec.Storage.SwarmStorage == "" {
+				errors = append(errors, "spec.storage.swarmStorage is required for a swarm product tier")
+			}
+		}
+	} else {
+		if !resourceSpecHasCPUAndMemory(r.Spec.MetadataNodes.Resources) {
+			errors = append(errors, "spec.metadataNodes.resources must include cpu and memory requests or limits for a clustered product tier")
+		}
+		if !resourceSpecHasCPUAndMemory(r.Spec.DataNodes.Resources) {
+			errors = append(errors, "spec.dataNodes.resources must include cpu and memory requests or limits for a clustered product tier")
+		}
+		if r.Spec.Storage.MetadataStorage == "" {
+			errors = append(errors, "spec.storage.metadataStorage is required for a clustered product tier")
+		}
+		if r.Spec.Storage.DataStorage == "" {
+			errors = append(errors, "spec.storage.dataStorage is required for a clustered product tier")
+		}
+	}
+
+	if tier.TermiteTier != "" && r.Spec.Termite == nil {
+		errors = append(errors, "spec.termite is required when spec.productTier.termiteTier is set")
+	}
+	if r.Spec.Termite != nil && tier.TermiteTier != "" && r.Spec.Termite.Resources == nil {
+		errors = append(errors, "spec.termite.resources is required when spec.productTier.termiteTier is set")
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("product tier validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func resourceSpecHasCPUAndMemory(resources ResourceSpec) bool {
+	hasCPU := resources.CPU != "" || resources.Limits.CPU != ""
+	hasMemory := resources.Memory != "" || resources.Limits.Memory != ""
+	return hasCPU && hasMemory
 }
 
 // validateResourceQuantities validates that resource quantity strings are parseable.
@@ -898,6 +1127,10 @@ func (r *AntflyCluster) validateSwarmTopologyIsolation() error {
 
 	if r.Spec.DataNodes.Replicas != 0 {
 		errors = append(errors, "spec.dataNodes.replicas must be unset when spec.mode=Swarm")
+	}
+
+	if r.Spec.DataNodes.Suspend {
+		errors = append(errors, "spec.dataNodes.suspend must be unset when spec.mode=Swarm")
 	}
 
 	if r.Spec.MetadataNodes.Resources != (ResourceSpec{}) {

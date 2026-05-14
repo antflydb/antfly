@@ -12,12 +12,17 @@
     "clean": "turbo run clean"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.7",
+    "@biomejs/biome": "^2.4.14",
     "turbo": "^2.8.17",
     "typescript": "~5.9.3"
   },
   "packageManager": "pnpm@10.32.1",
   "engines": {
     "node": ">=20.19"
+  },
+  "pnpm": {
+    "overrides": {
+      "react-hook-form": "7.74.0"
+    }
   }
 }

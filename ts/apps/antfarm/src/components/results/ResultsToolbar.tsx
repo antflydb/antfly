@@ -1,7 +1,22 @@
+import {
+  Badge,
+  Button,
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@antfly/design-system";
 import { ChevronDown, ChevronUp, Code2, Download, LayoutGrid, Table2 } from "lucide-react";
 import type React from "react";
 import { useMemo } from "react";
-import { Badge } from "@/components/ui/badge";
 
 /**
  * Formats query time from nanoseconds to a human-readable string.
@@ -13,24 +28,6 @@ export function formatQueryTime(nanoseconds: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
 }
-
-import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuCheckboxItem,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 
 export type ViewMode = "cards" | "table" | "json";
 export type SortMode = "relevance" | "id" | "none";
@@ -176,7 +173,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
 
             {/* Sort */}
             <Select value={sortMode} onValueChange={(value) => onSortModeChange(value as SortMode)}>
-              <SelectTrigger className="w-32 h-8">
+              <SelectTrigger size="sm" className="w-32">
                 <SelectValue placeholder="Sort by" />
               </SelectTrigger>
               <SelectContent>
