@@ -298,6 +298,12 @@ jobs:
     # arc-antfly-k8s, which has kubernetesMode enabled.
     runs-on: arc-antfly-k8s
     container: ubuntu:24.04
+    env:
+      # TODO(ci): Remove when omni runs on Ubuntu 24 runner images instead of
+      # ARC kubernetesMode. The workspace PVC is owned by the runner pod uid,
+      # while the Ubuntu container pod runs as root; Go's default VCS stamping
+      # shells out to git status, which trips git's dubious-ownership check.
+      GOFLAGS: -buildvcs=false
     steps:
       - name: Install container prerequisites
         run: |
@@ -306,8 +312,14 @@ jobs:
 
       - uses: actions/checkout@v6
 
-      - name: Configure Git safe directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Trust workspace for git in k8s-mode container
+        run: |
+          # TODO(ci): Remove with GOFLAGS=-buildvcs=false above when omni moves
+          # off ARC kubernetesMode. The runner pod and root container pod see
+          # different owners for the shared workspace PVC, so git otherwise
+          # rejects the checkout as dubious.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory /__w/antfly/antfly
 
       - name: Set up Go
         uses: actions/setup-go@v6
