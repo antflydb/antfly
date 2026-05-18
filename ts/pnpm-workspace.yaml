@@ -2,6 +2,13 @@ packages:
   - packages/*
   - apps/*
 
+allowBuilds:
+  '@parcel/watcher': true
+  core-js: true
+  esbuild: true
+  msw: true
+  sharp: true
+
 onlyBuiltDependencies:
   - "@tailwindcss/oxide"
   - canvas

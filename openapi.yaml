@@ -2267,6 +2267,9 @@ tags:
   - name: ApiKey
     x-displayName: API Key
     description: Operations related to API key management
+  - name: RowFilter
+    x-displayName: Row Filter
+    description: Operations related to row-level security filters
 paths:
   /status:
     get:
@@ -3359,6 +3362,29 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/LinearMergeRequest'
+            examples:
+              plain:
+                summary: Uncompressed JSON merge request
+                value:
+                  records:
+                    product:001:
+                      name: Laptop
+                      price: 999.99
+                    product:002:
+                      name: Mouse
+                      price: 29.99
+                  last_merged_id: ''
+              gzip:
+                summary: Same JSON body with Content-Encoding gzip
+                value:
+                  records:
+                    product:001:
+                      name: Laptop
+                      price: 999.99
+                    product:002:
+                      name: Mouse
+                      price: 29.99
+                  last_merged_id: ''
       responses:
         '200':
           description: Merge completed successfully
@@ -3370,6 +3396,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -4072,6 +4102,149 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /users/{userName}/row-filters:
+    parameters:
+      - $ref: '#/components/parameters/UserNamePathParameter'
+    get:
+      tags:
+        - RowFilter
+      summary: List row filters for a user
+      description: Returns all row filter policies for the specified user.
+      operationId: listRowFilters
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RowFilterEntry'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /users/{userName}/row-filters/{table}:
+    parameters:
+      - $ref: '#/components/parameters/UserNamePathParameter'
+      - name: table
+        in: path
+        required: true
+        description: Table name (or '*' for all tables).
+        schema:
+          type: string
+          example: orders
+    get:
+      tags:
+        - RowFilter
+      summary: Get row filter for a user on a table
+      description: Returns the row filter policy for the specified user and table.
+      operationId: getRowFilter
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowFilterEntry'
+        '404':
+          description: User or row filter not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - RowFilter
+      summary: Set row filter for a user on a table
+      description: >-
+        Sets or replaces the row filter policy for the specified user and table.
+        The request body is the bleve query JSON.
+      operationId: setRowFilter
+      requestBody:
+        description: Bleve query JSON for filtering documents
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: {}
+      responses:
+        '200':
+          description: Row filter set successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowFilterEntry'
+        '400':
+          description: Bad Request (e.g., invalid filter JSON)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      tags:
+        - RowFilter
+      summary: Remove row filter for a user on a table
+      description: Removes the row filter policy for the specified user and table.
+      operationId: removeRowFilter
+      responses:
+        '204':
+          description: Row filter removed successfully
+        '404':
+          description: User or row filter not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /users/{userName}/api-keys:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
@@ -4383,7 +4556,7 @@ components:
 
             ```bash
 
-            POST /_internal/v1/reallocate
+            POST /internal/v1/reallocate
 
             ```
 
@@ -5418,6 +5591,25 @@ components:
             The backup includes all table data, indexes, and metadata for the
             specified table.
           example: s3://mybucket/antfly-backups/users-table/2025-01-15
+        format:
+          type: string
+          enum:
+            - native
+            - portable
+          default: portable
+          description: >
+            Backup format to use:
+
+            - `native`: Engine-specific physical snapshot (fast backup and
+            restore, same-backend only)
+
+            - `portable`: Cross-backend logical backup in AFB format (slower
+            restore due to index rebuild, but can be restored by any Antfly
+            backend)
+
+
+            On restore, the format is auto-detected from file magic bytes.
+          example: portable
     RestoreRequest:
       allOf:
         - $ref: '#/components/schemas/BackupRequest'
@@ -5444,6 +5636,25 @@ components:
 
             The backup includes all table data, indexes, and metadata.
           example: s3://mybucket/antfly-backups/cluster/2025-01-15
+        format:
+          type: string
+          enum:
+            - native
+            - portable
+          default: portable
+          description: >
+            Backup format to use:
+
+            - `native`: Engine-specific physical snapshot (fast backup and
+            restore, same-backend only)
+
+            - `portable`: Cross-backend logical backup in AFB format (slower
+            restore due to index rebuild, but can be restored by any Antfly
+            backend)
+
+
+            On restore, the format is auto-detected from file magic bytes.
+          example: portable
         table_names:
           type: array
           items:
@@ -5611,6 +5822,13 @@ components:
           type: string
           description: Antfly version that created the backup
           example: v1.0.0
+        format:
+          type: string
+          enum:
+            - native
+            - portable
+          description: Backup format used
+          example: portable
     BackupListResponse:
       type: object
       required:
@@ -7717,6 +7935,16 @@ components:
         source.
 
 
+        Requests may be sent as plain JSON or gzip-compressed JSON
+
+        (`Content-Encoding: gzip`).
+
+
+        Request bodies are limited to 64 MiB after decompression. Requests that
+
+        exceed this limit return HTTP 413.
+
+
         **How it works:**
 
         1. Send sorted records from your external source
@@ -7742,9 +7970,7 @@ components:
 
             Requirements:
 
-            - Keys must be sorted lexicographically by your client
-
-            - Server will process keys in sorted order
+            - The server processes keys in lexicographic order
 
             - Use consistent key naming (e.g., all start with same prefix)
 
@@ -9398,6 +9624,14 @@ components:
           items:
             $ref: '#/components/schemas/PathEdge'
           description: Edges in path from start to this node
+        provenance:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: >-
+            Algebraic provenance labels folded into this result, when requested
+            by an algebraic graph executor
         edges:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -9869,6 +10103,7 @@ components:
         - anthropic
         - cohere
         - termite
+        - antfly
         - mock
       description: The generative AI provider to use.
     GeneratorConfig:
@@ -12005,12 +12240,26 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           description: Maximum number of edges per document (0 = unlimited)
+    AlgebraicIndexConfig:
+      type: object
+      description: >-
+        Schema-derived algebraic sidecar configuration. Public requests may opt
+        into schema derivation, while materializations remain engine-owned.
+      properties:
+        derive_from_schema:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: >-
+            When true, derive the algebraic capability sidecar from the table
+            schema. Internal fields and materialization definitions are not
+            public API.
     IndexType:
       type: string
       enum:
         - full_text
         - embeddings
         - graph
+        - algebraic
       description: The type of the index.
     IndexConfig:
       type: object
@@ -12019,6 +12268,7 @@ components:
         - $ref: '#/components/schemas/FullTextIndexConfig'
         - $ref: '#/components/schemas/EmbeddingsIndexConfig'
         - $ref: '#/components/schemas/GraphIndexConfig'
+        - $ref: '#/components/schemas/AlgebraicIndexConfig'
       required:
         - name
         - type
@@ -12061,7 +12311,7 @@ components:
           description: |
             A valid JSON Schema defining the document's structure.
             This is used to infer indexing rules and field types.
-    schemas-AntflyType:
+    AntflyType-2:
       type: string
       description: Field type annotations for schema fields
       enum:
@@ -12082,7 +12332,7 @@ components:
       description: Field mapping to apply when a dynamic template matches
       properties:
         type:
-          $ref: '#/components/schemas/schemas-AntflyType'
+          $ref: '#/components/schemas/AntflyType-2'
         analyzer:
           type: string
           description: |
@@ -12205,7 +12455,15 @@ components:
             evaluated in order to determine how those fields should be indexed.
     FullTextIndexStats:
       type: object
+      required:
+        - index_type
       properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - full_text
+          description: Discriminator for the index stats variant.
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -12237,7 +12495,15 @@ components:
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
+      required:
+        - index_type
       properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - embeddings
+          description: Discriminator for the index stats variant.
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -12284,7 +12550,15 @@ components:
     GraphIndexStats:
       type: object
       description: Statistics for graph index
+      required:
+        - index_type
       properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - graph
+          description: Discriminator for the index stats variant.
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -12314,13 +12588,180 @@ components:
           type: integer
           format: uint64
           description: Number of edges indexed during current rebuild
+        algebraic_graph:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          description: Algebraic graph execution health for bounded semiring traversal.
+          properties:
+            traversal:
+              type: object
+              properties:
+                attempted:
+                  type: integer
+                  format: uint64
+                proven:
+                  type: integer
+                  format: uint64
+                rejected:
+                  type: integer
+                  format: uint64
+                fallback:
+                  type: integer
+                  format: uint64
+                result_nodes:
+                  type: integer
+                  format: uint64
+    AlgebraicIndexStats:
+      type: object
+      description: >-
+        Compact public statistics for an algebraic sidecar index. Detailed
+        runtime, adaptive, and materialization records remain internal
+        diagnostics.
+      required:
+        - index_type
+      properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - algebraic
+          description: Discriminator for the index stats variant.
+        error:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Error message if stats could not be retrieved
+        total_indexed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents reflected in the algebraic sidecar
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Size of the index in bytes
+        rebuilding:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether the sidecar is currently rebuilding
+        backfill_progress:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: Backfill progress as a ratio from 0.0 to 1.0
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents processed during current backfill
+        healthy:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        parse_error_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        schema_version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        capability_lifecycle_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: >-
+            Schema-derived algebraic capability lifecycle, for example current,
+            stale, or rebuild_required.
+        planner_selected:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        planner_fallback_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        planner_last_decision:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - selected
+            - fallback
+        planner_last_fallback_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        planner_last_estimated_scan_rows:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: >-
+            Latest algebraic planner scan-row estimate for the last selected or
+            fallback decision.
+        planner_last_estimated_result_buckets:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: >-
+            Latest algebraic planner result-bucket estimate for the last
+            selected or fallback decision.
+        planner_lifecycle_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        planner_lifecycle_blocking_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        adaptive_progress_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        recommendation_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of currently recommended algebraic shapes.
+        adaptive_backfilling_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        adaptive_ready_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        adaptive_stale_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        adaptive_cleanup_recommended_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        last_error_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        active_progress_lifecycle:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        active_progress_rows_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        active_progress_target_rows:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
     IndexStats:
       type: object
       description: Statistics for an index
+      discriminator:
+        propertyName: index_type
+        mapping:
+          full_text: '#/components/schemas/FullTextIndexStats'
+          embeddings: '#/components/schemas/EmbeddingsIndexStats'
+          graph: '#/components/schemas/GraphIndexStats'
+          algebraic: '#/components/schemas/AlgebraicIndexStats'
       oneOf:
         - $ref: '#/components/schemas/FullTextIndexStats'
         - $ref: '#/components/schemas/EmbeddingsIndexStats'
         - $ref: '#/components/schemas/GraphIndexStats'
+        - $ref: '#/components/schemas/AlgebraicIndexStats'
     User:
       type: object
       properties:
@@ -12430,6 +12871,14 @@ components:
           description: >-
             Optional permission scoping. If empty, inherits owner's full
             permissions.
+        row_filter:
+          type: object
+          additionalProperties: {}
+          nullable: true
+          description: >
+            Per-table row filter. Keys are table names (or '*' for all tables).
+            Values are bleve query JSON objects. Documents must match this query
+            to be visible through this API key.
         created_at:
           type: string
           format: date-time
@@ -12465,6 +12914,24 @@ components:
           required:
             - key_secret
             - encoded
+    RowFilterEntry:
+      type: object
+      description: A row filter policy for a user on a specific table.
+      properties:
+        table:
+          type: string
+          description: Table name (or '*' for all tables).
+          example: orders
+        filter:
+          type: object
+          additionalProperties: {}
+          description: Bleve query JSON that documents must match to be visible.
+          example:
+            term:
+              department: engineering
+      required:
+        - table
+        - filter
     CreateApiKeyRequest:
       type: object
       description: Request to create a new API key.
@@ -12487,6 +12954,14 @@ components:
           description: >-
             Optional permission scoping. Each permission must be a subset of the
             creator's permissions.
+        row_filter:
+          type: object
+          additionalProperties: {}
+          nullable: true
+          description: >
+            Per-table row filter. Keys are table names (or '*' for all tables).
+            Values are bleve query JSON objects. Documents must match this query
+            to be visible through this API key.
       required:
         - name
   responses:
@@ -12496,8 +12971,20 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: Request body exceeds the configured size limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     NotFound:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedMediaType:
+      description: Unsupported request media or content encoding
       content:
         application/json:
           schema:
@@ -12539,3 +13026,4 @@ x-tagGroups:
       - User
       - Permission
       - ApiKey
+      - RowFilter

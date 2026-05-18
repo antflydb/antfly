@@ -31,6 +31,7 @@ const (
 	ChainConditionOnError       = generating.ChainConditionOnError
 	ChainConditionOnRateLimit   = generating.ChainConditionOnRateLimit
 	ChainConditionOnTimeout     = generating.ChainConditionOnTimeout
+	GeneratorProviderAntfly     = generating.GeneratorProviderAntfly
 	GeneratorProviderAnthropic  = generating.GeneratorProviderAnthropic
 	GeneratorProviderBedrock    = generating.GeneratorProviderBedrock
 	GeneratorProviderCohere     = generating.GeneratorProviderCohere

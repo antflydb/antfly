@@ -148,6 +148,11 @@ func IsGraphType(t IndexType) bool {
 	return t == IndexTypeGraph || t == IndexTypeGraphV0
 }
 
+// IsAlgebraicType returns true if the IndexType is the algebraic sidecar type.
+func IsAlgebraicType(t IndexType) bool {
+	return t == IndexTypeAlgebraic
+}
+
 // NormalizeIndexType converts legacy type names to their canonical forms.
 func NormalizeIndexType(t IndexType) IndexType {
 	switch t {

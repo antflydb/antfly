@@ -177,4 +177,16 @@ func TestIndexConfig_Equal(t *testing.T) {
 		b := NewFullTextIndexConfig("idx", false)
 		assert.False(t, a.Equal(*b))
 	})
+
+	t.Run("same algebraic config", func(t *testing.T) {
+		a := NewAlgebraicIndexConfig("alg", true)
+		b := NewAlgebraicIndexConfig("alg", true)
+		assert.True(t, a.Equal(*b))
+	})
+
+	t.Run("different algebraic config", func(t *testing.T) {
+		a := NewAlgebraicIndexConfig("alg", true)
+		b := NewAlgebraicIndexConfig("alg", false)
+		assert.False(t, a.Equal(*b))
+	})
 }

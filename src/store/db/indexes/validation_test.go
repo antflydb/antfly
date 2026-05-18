@@ -40,6 +40,11 @@ func TestIndexTypeValidate(t *testing.T) {
 			wantErr:   false,
 		},
 		{
+			name:      "valid algebraic",
+			indexType: IndexTypeAlgebraic,
+			wantErr:   false,
+		},
+		{
 			name:      "legacy aknn_v0",
 			indexType: IndexTypeAknnV0,
 			wantErr:   false,
@@ -101,6 +106,7 @@ func TestValidIndexTypes(t *testing.T) {
 		IndexTypeEmbeddings,
 		IndexTypeFullText,
 		IndexTypeGraph,
+		IndexTypeAlgebraic,
 	}
 
 	typeSet := make(map[IndexType]bool)

@@ -17,6 +17,7 @@ package indexes
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"reflect"
 
@@ -46,6 +47,9 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 	case GraphIndexConfig:
 		t = IndexTypeGraph
 		_ = idxConfig.FromGraphIndexConfig(v)
+	case AlgebraicIndexConfig:
+		t = IndexTypeAlgebraic
+		_ = idxConfig.FromAlgebraicIndexConfig(v)
 	default:
 		return nil, fmt.Errorf("unsupported index config type: %T", config)
 	}
@@ -74,8 +78,23 @@ func NewFullTextIndexConfig(name string, memOnly bool) *IndexConfig {
 	return ic
 }
 
+func NewAlgebraicIndexConfig(name string, deriveFromSchema bool) *IndexConfig {
+	ic := &IndexConfig{
+		Name: name,
+		Type: IndexTypeAlgebraic,
+	}
+	_ = ic.FromAlgebraicIndexConfig(AlgebraicIndexConfig{
+		DeriveFromSchema: deriveFromSchema,
+	})
+	return ic
+}
+
 func (bc FullTextIndexConfig) Equal(oc FullTextIndexConfig) bool {
 	return bc.MemOnly == oc.MemOnly
+}
+
+func (ac AlgebraicIndexConfig) Equal(oc AlgebraicIndexConfig) bool {
+	return ac.DeriveFromSchema == oc.DeriveFromSchema
 }
 
 // normalizeDistanceMetric treats the zero value ("") as the default "l2_squared"
@@ -129,6 +148,10 @@ func (ic IndexConfig) Equal(oc IndexConfig) bool {
 		i, _ := ic.AsGraphIndexConfig()
 		o, _ := oc.AsGraphIndexConfig()
 		return i.Equal(o)
+	case IndexTypeAlgebraic:
+		i, _ := ic.AsAlgebraicIndexConfig()
+		o, _ := oc.AsAlgebraicIndexConfig()
+		return i.Equal(o)
 	}
 
 	return true
@@ -144,13 +167,28 @@ func (ic IndexConfig) GetEmbedderConfig() (*embeddings.EmbedderConfig, error) {
 
 func (b FullTextIndexStats) AsIndexStats() IndexStats {
 	var is IndexStats
+	if b.IndexType == "" {
+		b.IndexType = FullTextIndexStatsIndexTypeFullText
+	}
 	_ = is.FromFullTextIndexStats(b)
 	return is
 }
 
 func (e EmbeddingsIndexStats) AsIndexStats() IndexStats {
 	var is IndexStats
+	if e.IndexType == "" {
+		e.IndexType = EmbeddingsIndexStatsIndexTypeEmbeddings
+	}
 	_ = is.FromEmbeddingsIndexStats(e)
+	return is
+}
+
+func (a AlgebraicIndexStats) AsIndexStats() IndexStats {
+	var is IndexStats
+	if a.IndexType == "" {
+		a.IndexType = AlgebraicIndexStatsIndexTypeAlgebraic
+	}
+	_ = is.FromAlgebraicIndexStats(a)
 	return is
 }
 
@@ -193,8 +231,42 @@ func (gc GraphIndexStats) Equal(oc GraphIndexStats) bool {
 
 func (g GraphIndexStats) AsIndexStats() IndexStats {
 	var is IndexStats
+	if g.IndexType == "" {
+		g.IndexType = GraphIndexStatsIndexTypeGraph
+	}
 	_ = is.FromGraphIndexStats(g)
 	return is
+}
+
+func (ac AlgebraicIndexStats) Equal(oc AlgebraicIndexStats) bool {
+	return ac.Error == oc.Error &&
+		ac.TotalIndexed == oc.TotalIndexed &&
+		ac.DiskUsage == oc.DiskUsage &&
+		ac.Rebuilding == oc.Rebuilding &&
+		ac.BackfillProgress == oc.BackfillProgress &&
+		ac.BackfillItemsProcessed == oc.BackfillItemsProcessed &&
+		ac.Healthy == oc.Healthy &&
+		ac.ParseErrorCount == oc.ParseErrorCount &&
+		ac.SchemaVersion == oc.SchemaVersion &&
+		ac.CapabilityLifecycleStatus == oc.CapabilityLifecycleStatus &&
+		ac.PlannerSelected == oc.PlannerSelected &&
+		ac.PlannerFallbackCount == oc.PlannerFallbackCount &&
+		ac.PlannerLastDecision == oc.PlannerLastDecision &&
+		ac.PlannerLastFallbackReason == oc.PlannerLastFallbackReason &&
+		ac.PlannerLastEstimatedScanRows == oc.PlannerLastEstimatedScanRows &&
+		ac.PlannerLastEstimatedResultBuckets == oc.PlannerLastEstimatedResultBuckets &&
+		ac.PlannerLifecycleReady == oc.PlannerLifecycleReady &&
+		ac.PlannerLifecycleBlockingReason == oc.PlannerLifecycleBlockingReason &&
+		ac.AdaptiveProgressCount == oc.AdaptiveProgressCount &&
+		ac.RecommendationCount == oc.RecommendationCount &&
+		ac.AdaptiveBackfillingCount == oc.AdaptiveBackfillingCount &&
+		ac.AdaptiveReadyCount == oc.AdaptiveReadyCount &&
+		ac.AdaptiveStaleCount == oc.AdaptiveStaleCount &&
+		ac.AdaptiveCleanupRecommendedCount == oc.AdaptiveCleanupRecommendedCount &&
+		ac.ActiveProgressLifecycle == oc.ActiveProgressLifecycle &&
+		ac.ActiveProgressRowsProcessed == oc.ActiveProgressRowsProcessed &&
+		ac.ActiveProgressTargetRows == oc.ActiveProgressTargetRows &&
+		ac.LastErrorReason == oc.LastErrorReason
 }
 
 // indexStatsKind identifies the concrete type inside an IndexStats union.
@@ -207,9 +279,28 @@ const (
 	indexStatsFullText                  // has "total_indexed" but not "total_edges" or "wal_backlog"/"total_nodes"
 	indexStatsEmbeddings                // has "wal_backlog" or "total_nodes" or "total_terms"
 	indexStatsGraph                     // has "total_edges" or "edge_types"
+	indexStatsAlgebraic                 // has index_type "algebraic" or algebraic-specific planner/adaptive keys
 )
 
 func detectIndexStatsKind(union []byte) indexStatsKind {
+	var discriminator struct {
+		IndexType string `json:"index_type"`
+	}
+	if err := json.Unmarshal(union, &discriminator); err == nil {
+		switch discriminator.IndexType {
+		case string(FullTextIndexStatsIndexTypeFullText):
+			return indexStatsFullText
+		case string(EmbeddingsIndexStatsIndexTypeEmbeddings):
+			return indexStatsEmbeddings
+		case string(GraphIndexStatsIndexTypeGraph):
+			return indexStatsGraph
+		case string(AlgebraicIndexStatsIndexTypeAlgebraic):
+			return indexStatsAlgebraic
+		}
+	}
+	if bytes.Contains(union, []byte(`"planner_selected"`)) || bytes.Contains(union, []byte(`"adaptive_progress_count"`)) {
+		return indexStatsAlgebraic
+	}
 	// Graph-unique keys
 	if bytes.Contains(union, []byte(`"total_edges"`)) || bytes.Contains(union, []byte(`"edge_types"`)) {
 		return indexStatsGraph
@@ -325,6 +416,56 @@ func MergeIndexStats(dst *IndexStats, src IndexStats) {
 		}
 		mergeErrors(&dstGraph.Error, srcGraph.Error)
 		_ = dst.FromGraphIndexStats(dstGraph)
+
+	case indexStatsAlgebraic:
+		dstAlg, _ := dst.AsAlgebraicIndexStats()
+		srcAlg, _ := src.AsAlgebraicIndexStats()
+		dstAlg.TotalIndexed += srcAlg.TotalIndexed
+		dstAlg.DiskUsage += srcAlg.DiskUsage
+		dstAlg.ParseErrorCount += srcAlg.ParseErrorCount
+		dstAlg.PlannerSelected += srcAlg.PlannerSelected
+		dstAlg.PlannerFallbackCount += srcAlg.PlannerFallbackCount
+		dstAlg.AdaptiveProgressCount += srcAlg.AdaptiveProgressCount
+		dstAlg.RecommendationCount += srcAlg.RecommendationCount
+		dstAlg.AdaptiveBackfillingCount += srcAlg.AdaptiveBackfillingCount
+		dstAlg.AdaptiveReadyCount += srcAlg.AdaptiveReadyCount
+		dstAlg.AdaptiveStaleCount += srcAlg.AdaptiveStaleCount
+		dstAlg.AdaptiveCleanupRecommendedCount += srcAlg.AdaptiveCleanupRecommendedCount
+		dstAlg.ActiveProgressRowsProcessed += srcAlg.ActiveProgressRowsProcessed
+		dstAlg.ActiveProgressTargetRows += srcAlg.ActiveProgressTargetRows
+		dstAlg.Healthy = dstAlg.Healthy && srcAlg.Healthy
+		mergeBackfillFields(&dstAlg.Rebuilding, &dstAlg.BackfillProgress, &dstAlg.BackfillItemsProcessed,
+			srcAlg.Rebuilding, srcAlg.BackfillProgress, srcAlg.BackfillItemsProcessed)
+		if srcAlg.SchemaVersion > dstAlg.SchemaVersion {
+			dstAlg.SchemaVersion = srcAlg.SchemaVersion
+		}
+		if srcAlg.CapabilityLifecycleStatus != "" {
+			dstAlg.CapabilityLifecycleStatus = srcAlg.CapabilityLifecycleStatus
+		}
+		if srcAlg.PlannerLastDecision != "" {
+			dstAlg.PlannerLastDecision = srcAlg.PlannerLastDecision
+		}
+		if srcAlg.PlannerLastFallbackReason != "" {
+			dstAlg.PlannerLastFallbackReason = srcAlg.PlannerLastFallbackReason
+		}
+		if srcAlg.PlannerLastEstimatedScanRows != 0 {
+			dstAlg.PlannerLastEstimatedScanRows = srcAlg.PlannerLastEstimatedScanRows
+		}
+		if srcAlg.PlannerLastEstimatedResultBuckets != 0 {
+			dstAlg.PlannerLastEstimatedResultBuckets = srcAlg.PlannerLastEstimatedResultBuckets
+		}
+		if srcAlg.PlannerLifecycleBlockingReason != "" {
+			dstAlg.PlannerLifecycleBlockingReason = srcAlg.PlannerLifecycleBlockingReason
+		}
+		dstAlg.PlannerLifecycleReady = dstAlg.PlannerLifecycleReady && srcAlg.PlannerLifecycleReady
+		if srcAlg.ActiveProgressLifecycle != "" {
+			dstAlg.ActiveProgressLifecycle = srcAlg.ActiveProgressLifecycle
+		}
+		if srcAlg.LastErrorReason != "" {
+			dstAlg.LastErrorReason = srcAlg.LastErrorReason
+		}
+		mergeErrors(&dstAlg.Error, srcAlg.Error)
+		_ = dst.FromAlgebraicIndexStats(dstAlg)
 
 	default:
 		zap.L().Warn("MergeIndexStats: unknown stat type",
