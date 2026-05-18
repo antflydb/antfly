@@ -104,6 +104,9 @@ func TestHarness_MetadataLeaderFailover_DuringSplitReconciliation(t *testing.T) 
 		require.NoError(t, h.Close())
 	})
 
+	_, err = h.WaitForMetadataLeader(20 * time.Second)
+	require.NoError(t, err)
+
 	table, err := h.CreateTable("docs", tablemgr.TableConfig{
 		NumShards: 1,
 		StartID:   0x2600,
