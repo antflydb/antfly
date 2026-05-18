@@ -1018,6 +1018,10 @@ pub fn build(b: *std.Build) void {
     const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
+    const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
+    if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
+        @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
+    }
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
@@ -5411,8 +5415,8 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
-    b.installArtifact(antfly_main);
-    const install_antfly = b.addInstallArtifact(antfly_main, .{});
+    const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
+    b.getInstallStep().dependOn(&install_antfly.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
