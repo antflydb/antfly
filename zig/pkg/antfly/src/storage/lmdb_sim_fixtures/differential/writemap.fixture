@@ -1,0 +1,22 @@
+storage-sim-fixture-v1
+mode differential
+label writemap
+case_label diff-writemap
+origin_seed 0xA17F2EED
+expectation expected C and Zig snapshots to stay aligned across reopen cycles
+max_dbs 4
+write_map true
+map_async false
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend sync
+expected_main_count 0
+expected_docs_count 1
+expected_dups_count 0
+
+action direct put_main 0 111
+action direct put_dup 2 222
+action direct put_docs 1 333
+action direct delete_main 0
+action direct delete_dup_value 2 222

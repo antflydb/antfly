@@ -1,0 +1,24 @@
+[
+  {
+    "name": "ft_chunks",
+    "kind": "full_text",
+    "config": {
+      "chunk_name": "body_chunks_v1"
+    }
+  },
+  {
+    "name": "dv_v1",
+    "kind": "dense_vector",
+    "config": {
+      "field": "embedding",
+      "dims": 3,
+      "generator": {
+        "kind": "dense_embedding",
+        "source_field": "body",
+        "chunk_name": "body_chunks_v1",
+        "chunk_size": 8,
+        "chunk_overlap": 2
+      }
+    }
+  }
+]

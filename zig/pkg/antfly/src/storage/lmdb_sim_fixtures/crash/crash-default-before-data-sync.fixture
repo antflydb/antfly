@@ -1,0 +1,20 @@
+storage-sim-fixture-v1
+mode crash
+label crash-default-before-data-sync
+case_label crash-default
+origin_seed 0xBEEF0D00
+phase before_data_sync
+expectation expected reopen to preserve the previous committed snapshot
+max_dbs 4
+write_map false
+map_async false
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend sync
+expected_outcome previous
+
+action put_main 1 701
+action put_docs 2 702
+action put_dup 3 703
+crash_action put_main 1 8701

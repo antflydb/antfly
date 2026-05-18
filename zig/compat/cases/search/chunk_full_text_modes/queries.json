@@ -1,0 +1,30 @@
+[
+  {
+    "name": "chunk_mode",
+    "request": {
+      "index_name": "ft_chunks",
+      "full_text": {
+        "match": {
+          "field": "body",
+          "text": "abcdefgh"
+        }
+      },
+      "return_mode": "chunk",
+      "limit": 1
+    }
+  },
+  {
+    "name": "parent_mode",
+    "request": {
+      "index_name": "ft_chunks",
+      "full_text": {
+        "match": {
+          "field": "body",
+          "text": "abcdefgh"
+        }
+      },
+      "return_mode": "parent",
+      "limit": 1
+    }
+  }
+]

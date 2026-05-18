@@ -1,0 +1,2 @@
+{"prompt_idx":0,"tokens":[10,11],"old_logps":[-0.4,-0.6],"ref_logps":[-0.5,-0.7],"new_logps":[-0.35,-0.65],"reward":1.0}
+{"prompt_idx":0,"tokens":[12,13],"old_logps":[-0.3,-0.8],"ref_logps":[-0.4,-0.9],"new_logps":[-0.25,-0.82],"reward":3.0}

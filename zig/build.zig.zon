@@ -1,0 +1,56 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+.{
+    .name = .antfly_zig,
+    .version = "0.0.1",
+    .fingerprint = 0xaf6720431d9566e1,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .handlebars = .{
+            .path = "lib/handlebars",
+        },
+        .openapi = .{
+            .path = "lib/openapi",
+        },
+        .protobuf = .{
+            .path = "lib/protobuf",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "e2e/antfly",
+        "e2e/termite",
+        "lib/audio",
+        "lib/chunker",
+        "lib/httpx",
+        "lib/jinja",
+        "lib/json",
+        "lib/linalg",
+        "lib/ml",
+        "lib/onnx",
+        "lib/openapi",
+        "lib/objectstore",
+        "lib/pjrt",
+        "lib/platform",
+        "lib/prometheus",
+        "lib/protobuf",
+        "lib/structlog",
+        "lib/tokenizer",
+        "pkg/antfly",
+        "pkg/termite",
+        "pkg/termite-client",
+    },
+}

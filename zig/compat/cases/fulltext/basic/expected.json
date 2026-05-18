@@ -1,0 +1,26 @@
+{
+  "title_term_alpha": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:a",
+        "stored_data": {
+          "title": "alpha",
+          "body": "first body"
+        }
+      }
+    ]
+  },
+  "body_match_alpha": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:b",
+        "stored_data": {
+          "title": "beta",
+          "body": "second alpha"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "visible_term": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:live",
+        "stored_data": {
+          "title": "alpha live",
+          "body": "alpha keep"
+        }
+      }
+    ]
+  },
+  "timestamp_old": {
+    "timestamp_ns": 1
+  }
+}

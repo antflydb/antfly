@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>httpx.zig Multi-page Demo</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="hero">
+    <img src="/static/images/httpx.zig-transparent.png" alt="httpx.zig" class="logo">
+    <h1>httpx.zig Multi-page Demo</h1>
+    <p>A sample site served fully by the httpx.zig example server.</p>
+  </header>
+
+  <nav class="nav">
+    <a href="/">Home</a>
+    <a href="/about">About</a>
+    <a href="/contact">Contact</a>
+    <a href="/go-home">Redirect Demo</a>
+  </nav>
+
+  <main class="card">
+    <h2>Home</h2>
+    <p>This page, its CSS, JavaScript, and images are served via httpx.zig routes.</p>
+    <button id="ping-btn">Click Me</button>
+    <p id="ping-output"></p>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

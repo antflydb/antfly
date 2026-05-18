@@ -1,0 +1,384 @@
+{
+  "version": 1,
+  "peers": [
+    1,
+    2,
+    3
+  ],
+  "config": {
+    "election_tick": 3,
+    "heartbeat_tick": 1,
+    "check_quorum": true,
+    "pre_vote": false,
+    "step_down_on_removal": false,
+    "initial_conf_state": {
+      "voters": [
+        1
+      ],
+      "voters_outgoing": [],
+      "learners": [],
+      "learners_next": [],
+      "auto_leave": false
+    }
+  },
+  "steps": [
+    {
+      "action": {
+        "kind": "campaign_settle",
+        "node_id": 1
+      },
+      "nodes": [
+        {
+          "node_id": 1,
+          "role": "leader",
+          "leader_id": 1,
+          "term": 1,
+          "voted_for": 1,
+          "commit_index": 1
+        },
+        {
+          "node_id": 2,
+          "role": "follower",
+          "leader_id": null,
+          "term": 0,
+          "voted_for": null,
+          "commit_index": 0
+        },
+        {
+          "node_id": 3,
+          "role": "follower",
+          "leader_id": null,
+          "term": 0,
+          "voted_for": null,
+          "commit_index": 0
+        }
+      ],
+      "messages": [],
+      "committed": [
+        {
+          "node_id": 1,
+          "count": 1,
+          "first_index": 1,
+          "last_index": 1
+        }
+      ],
+      "read_states": [],
+      "conf_states": [
+        {
+          "node_id": 1,
+          "voters": [
+            1
+          ],
+          "voters_outgoing": [],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 2,
+          "voters": [
+            1
+          ],
+          "voters_outgoing": [],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 3,
+          "voters": [
+            1
+          ],
+          "voters_outgoing": [],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        }
+      ]
+    },
+    {
+      "action": {
+        "kind": "propose_conf_change_v2",
+        "node_id": 1,
+        "transition": "joint_explicit",
+        "changes": [
+          {
+            "change_type": "add_node",
+            "target_node_id": 2
+          },
+          {
+            "change_type": "add_node",
+            "target_node_id": 3
+          }
+        ]
+      },
+      "nodes": [
+        {
+          "node_id": 1,
+          "role": "leader",
+          "leader_id": 1,
+          "term": 1,
+          "voted_for": 1,
+          "commit_index": 2
+        },
+        {
+          "node_id": 2,
+          "role": "follower",
+          "leader_id": null,
+          "term": 0,
+          "voted_for": null,
+          "commit_index": 0
+        },
+        {
+          "node_id": 3,
+          "role": "follower",
+          "leader_id": null,
+          "term": 0,
+          "voted_for": null,
+          "commit_index": 0
+        }
+      ],
+      "messages": [],
+      "committed": [
+        {
+          "node_id": 1,
+          "count": 2,
+          "first_index": 1,
+          "last_index": 2
+        }
+      ],
+      "read_states": [],
+      "conf_states": [
+        {
+          "node_id": 1,
+          "voters": [
+            1,
+            2,
+            3
+          ],
+          "voters_outgoing": [
+            1
+          ],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 2,
+          "voters": [
+            1
+          ],
+          "voters_outgoing": [],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 3,
+          "voters": [
+            1
+          ],
+          "voters_outgoing": [],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        }
+      ]
+    },
+    {
+      "action": {
+        "kind": "deliver_all"
+      },
+      "nodes": [
+        {
+          "node_id": 1,
+          "role": "leader",
+          "leader_id": 1,
+          "term": 1,
+          "voted_for": 1,
+          "commit_index": 2
+        },
+        {
+          "node_id": 2,
+          "role": "follower",
+          "leader_id": 1,
+          "term": 1,
+          "voted_for": null,
+          "commit_index": 2
+        },
+        {
+          "node_id": 3,
+          "role": "follower",
+          "leader_id": 1,
+          "term": 1,
+          "voted_for": null,
+          "commit_index": 2
+        }
+      ],
+      "messages": [],
+      "committed": [
+        {
+          "node_id": 1,
+          "count": 2,
+          "first_index": 1,
+          "last_index": 2
+        },
+        {
+          "node_id": 2,
+          "count": 2,
+          "first_index": 1,
+          "last_index": 2
+        },
+        {
+          "node_id": 3,
+          "count": 2,
+          "first_index": 1,
+          "last_index": 2
+        }
+      ],
+      "read_states": [],
+      "conf_states": [
+        {
+          "node_id": 1,
+          "voters": [
+            1,
+            2,
+            3
+          ],
+          "voters_outgoing": [
+            1
+          ],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 2,
+          "voters": [
+            1,
+            2,
+            3
+          ],
+          "voters_outgoing": [
+            1
+          ],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 3,
+          "voters": [
+            1,
+            2,
+            3
+          ],
+          "voters_outgoing": [
+            1
+          ],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        }
+      ]
+    },
+    {
+      "action": {
+        "kind": "restart_node",
+        "node_id": 1
+      },
+      "nodes": [
+        {
+          "node_id": 1,
+          "role": "follower",
+          "leader_id": null,
+          "term": 1,
+          "voted_for": 1,
+          "commit_index": 2
+        },
+        {
+          "node_id": 2,
+          "role": "follower",
+          "leader_id": 1,
+          "term": 1,
+          "voted_for": null,
+          "commit_index": 2
+        },
+        {
+          "node_id": 3,
+          "role": "follower",
+          "leader_id": 1,
+          "term": 1,
+          "voted_for": null,
+          "commit_index": 2
+        }
+      ],
+      "messages": [],
+      "committed": [
+        {
+          "node_id": 1,
+          "count": 4,
+          "first_index": 1,
+          "last_index": 2
+        },
+        {
+          "node_id": 2,
+          "count": 2,
+          "first_index": 1,
+          "last_index": 2
+        },
+        {
+          "node_id": 3,
+          "count": 2,
+          "first_index": 1,
+          "last_index": 2
+        }
+      ],
+      "read_states": [],
+      "conf_states": [
+        {
+          "node_id": 1,
+          "voters": [
+            1,
+            2,
+            3
+          ],
+          "voters_outgoing": [
+            1
+          ],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 2,
+          "voters": [
+            1,
+            2,
+            3
+          ],
+          "voters_outgoing": [
+            1
+          ],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        },
+        {
+          "node_id": 3,
+          "voters": [
+            1,
+            2,
+            3
+          ],
+          "voters_outgoing": [
+            1
+          ],
+          "learners": [],
+          "learners_next": [],
+          "auto_leave": false
+        }
+      ]
+    }
+  ]
+}

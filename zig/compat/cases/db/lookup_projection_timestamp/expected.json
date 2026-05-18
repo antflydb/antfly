@@ -1,0 +1,42 @@
+{
+  "lookup_full": {
+    "found": true,
+    "json": {
+      "title": "alpha",
+      "body": "omit",
+      "user": {
+        "name": "ann",
+        "age": 42
+      },
+      "tags": [
+        {
+          "name": "x",
+          "score": 1
+        },
+        {
+          "name": "y",
+          "score": 2
+        }
+      ]
+    }
+  },
+  "lookup_projected": {
+    "found": true,
+    "json": {
+      "user": {
+        "name": "ann"
+      },
+      "tags": [
+        {
+          "name": "x"
+        },
+        {
+          "name": "y"
+        }
+      ]
+    }
+  },
+  "get_timestamp": {
+    "timestamp_ns": 123456789
+  }
+}

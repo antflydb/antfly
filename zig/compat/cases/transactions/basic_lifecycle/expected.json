@@ -1,0 +1,17 @@
+{
+  "status_t1": {
+    "status": "committed"
+  },
+  "status_t2": {
+    "status": "aborted"
+  },
+  "lookup_a": {
+    "found": true,
+    "json": {
+      "title": "alpha"
+    }
+  },
+  "lookup_b": {
+    "found": false
+  }
+}

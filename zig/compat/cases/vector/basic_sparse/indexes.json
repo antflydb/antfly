@@ -1,0 +1,9 @@
+[
+  {
+    "name": "sp_v1",
+    "kind": "sparse_vector",
+    "config": {
+      "field": "sparse"
+    }
+  }
+]

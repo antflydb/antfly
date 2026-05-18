@@ -73,6 +73,10 @@ e2e/backups/*.afb
 !pkg/antfly-operator/manifests/crd/antfly.io_*.yaml
 !pkg/termite-operator/manifests/crd/antfly.io_*.yaml
 !.github/workflows/antfly-operator-container.yml
+!zig/lib/openapi/test/fixtures/*-metadata.json
+!zig/lib/pjrt/
+!zig/lib/pjrt/**
+!zig/testdata/image/gif/**/*.gif
 
 .specify/
 scripts/__pycache__/

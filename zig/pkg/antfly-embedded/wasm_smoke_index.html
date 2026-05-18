@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Antfly Embedded Shared WASM Example</title>
+  <style>
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin: 2rem;
+      background: #f6f3ea;
+      color: #1f2937;
+    }
+    #status[data-status="ok"] { color: #166534; }
+    #status[data-status="error"] { color: #991b1b; }
+    pre {
+      background: #fffdf7;
+      border: 1px solid #d6d3cb;
+      border-radius: 8px;
+      padding: 1rem;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>Antfly Embedded Shared WASM Example</h1>
+  <p id="status">Running…</p>
+  <pre id="output"></pre>
+  <script type="module" src="./browser.mjs"></script>
+</body>
+</html>

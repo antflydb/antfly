@@ -1,0 +1,27 @@
+[
+  {
+    "name": "chunk_mode",
+    "request": {
+      "index_name": "dv_v1",
+      "dense": {
+        "vector": [0.98973068, 0.63161669, 0.84254215],
+        "k": 3
+      },
+      "return_mode": "chunk",
+      "limit": 1
+    }
+  },
+  {
+    "name": "parent_with_chunks",
+    "request": {
+      "index_name": "dv_v1",
+      "dense": {
+        "vector": [0.98973068, 0.63161669, 0.84254215],
+        "k": 3
+      },
+      "return_mode": "parent_with_chunks",
+      "max_chunks_per_parent": 1,
+      "limit": 1
+    }
+  }
+]

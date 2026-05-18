@@ -1,0 +1,33 @@
+[
+  {
+    "name": "full_text_to_graph",
+    "request": {
+      "index_name": "ft_v1",
+      "full_text": {
+        "match": {
+          "field": "body",
+          "text": "machine learning"
+        }
+      },
+      "graph_queries": {
+        "citations": {
+          "type": "neighbors",
+          "index_name": "gr_v1",
+          "include_documents": true,
+          "start_nodes": {
+            "result_ref": "$full_text_results",
+            "limit": 5
+          },
+          "params": {
+            "direction": "out",
+            "edge_types": ["cites"],
+            "max_results": 5
+          }
+        }
+      },
+      "limit": 10,
+      "offset": 0,
+      "include_stored": true
+    }
+  }
+]

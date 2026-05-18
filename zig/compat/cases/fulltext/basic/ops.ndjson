@@ -1,0 +1,1 @@
+{"op":"batch","writes":[{"key":"doc:a","value":{"title":"alpha","body":"first body"}},{"key":"doc:b","value":{"title":"beta","body":"second alpha"}}],"deletes":[],"sync_level":"write"}

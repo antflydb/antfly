@@ -1,0 +1,16 @@
+storage-sim-fixture-v1
+mode wal_crash
+label crash-async-io-after-meta
+case_label crash-async-io-after-meta
+origin_seed 0xA17F3004
+phase after_meta_write_before_meta_sync
+expectation expected WAL reopen to match either the previous or newly committed snapshot
+no_sync false
+commit_backend async_io
+expected_outcome previous_or_committed
+
+action append
+action append_batch 2
+action reopen_and_verify_from 1
+action verify_from 2
+crash_action append_batch 2

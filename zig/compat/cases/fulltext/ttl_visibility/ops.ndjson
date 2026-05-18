@@ -1,0 +1,2 @@
+{"op":"batch","writes":[{"key":"doc:live","value":{"title":"alpha live","body":"alpha keep"}}],"deletes":[],"sync_level":"write","timestamp_ns":1893456000000000000}
+{"op":"batch","writes":[{"key":"doc:old","value":{"title":"alpha old","body":"alpha drop"}}],"deletes":[],"sync_level":"write","timestamp_ns":1}

@@ -1,0 +1,29 @@
+{
+  "recipe": "lora-sft",
+  "model": {
+    "path": "/tmp/termite-models/gemma4",
+    "family": "gemma4"
+  },
+  "dataset": {
+    "path": "/tmp/termite-data/chat.jsonl",
+    "train_split": "train",
+    "max_examples": 4,
+    "max_seq_len": 128
+  },
+  "adapter": {
+    "rank": 4,
+    "alpha": 8
+  },
+  "optimizer": {
+    "learning_rate": 0.0002,
+    "epochs": 1
+  },
+  "eval": {
+    "max_examples": 2
+  },
+  "artifacts": {
+    "root": "/tmp/termite-recipe-gemma4",
+    "manifest_path": "/tmp/termite-recipe-gemma4/recipe_run_manifest.json"
+  },
+  "backend": "auto"
+}

@@ -1,0 +1,17 @@
+storage-sim-fixture-v1
+mode persistent
+label async-io
+case_label async-io
+origin_seed 0x2
+expectation expected persistent index replay to preserve WAL-backed segments across reopen cycles
+main_commit_backend async_io
+wal_commit_backend worker_thread
+expected_doc_count 3
+expected_segment_count 2
+expected_alpha_hits 1
+expected_beta_hits 2
+expected_gamma_hits 0
+
+action index_segment alpha_beta_pair
+action reopen
+action index_segment beta

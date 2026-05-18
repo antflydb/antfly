@@ -1,0 +1,32 @@
+[
+  {
+    "name": "lookup_full",
+    "request": {
+      "lookup": {
+        "key": "doc:a"
+      }
+    }
+  },
+  {
+    "name": "lookup_projected",
+    "request": {
+      "lookup": {
+        "key": "doc:a",
+        "fields": [
+          "user.name",
+          "tags.name",
+          "-body"
+        ],
+        "include_all_fields": false
+      }
+    }
+  },
+  {
+    "name": "get_timestamp",
+    "request": {
+      "get_timestamp": {
+        "key": "doc:a"
+      }
+    }
+  }
+]

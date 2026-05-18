@@ -1,0 +1,1 @@
+{"op":"batch","writes":[{"key":"doc:a","value":{"title":"alpha","body":"omit","user":{"name":"ann","age":42},"tags":[{"name":"x","score":1},{"name":"y","score":2}]}}],"deletes":[],"sync_level":"write","timestamp_ns":123456789}

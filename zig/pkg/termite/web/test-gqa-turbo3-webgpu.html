@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Termite turbo3 WebGPU attention test</title>
+  <style>
+    body {
+      font: 14px/1.5 system-ui, sans-serif;
+      margin: 24px;
+      max-width: 880px;
+    }
+
+    button {
+      border-radius: 6px;
+      padding: 8px 12px;
+    }
+
+    pre {
+      background: #111;
+      color: #eee;
+      overflow: auto;
+      padding: 12px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>turbo3 WebGPU cached attention</h1>
+  <p>Serve this directory over HTTP, then open this page in a browser with WebGPU enabled.</p>
+  <button id="run">Run numeric check</button>
+  <pre id="log"></pre>
+
+  <script type="module">
+    const batch = 1;
+    const qLen = 2;
+    const kvLen = 5;
+    const numHeads = 4;
+    const numKvHeads = 2;
+    const headDim = 64;
+    const scale = 1 / Math.sqrt(headDim);
+    const tolerance = 1e-3;
+    const residualBitsPerHead = 32;
+    const residualScale = 0.125;
+
+    const logEl = document.getElementById('log');
+    document.getElementById('run').addEventListener('click', run);
+    window.addEventListener('load', run);
+
+    function log(line) {
+      logEl.textContent += `${line}\n`;
+    }
+
+    function resetLog() {
+      logEl.textContent = '';
+    }
+
+    function align4(value) {
+      return (value + 3) & ~3;
+    }
+
+    function signal(index, period, bias = 0) {
+      return Math.sin((index + 1 + bias) * period) * 0.7
+        + Math.cos((index + 3 + bias) * period * 0.37) * 0.2;
+    }
+
+    function encodeTurbo3Scalar(value) {
+      const clipped = Math.min(1, Math.max(-1, value));
+      return Math.min(7, Math.max(0, Math.round((clipped + 1) * 3.5)));
+    }
+
+    function decodeTurbo3Scalar(code) {
+      return (code & 0x07) / 3.5 - 1.0;
+    }
+
+    function baseKeyRowBytes() {
+      return Math.ceil(numKvHeads * headDim * 3 / 8);
+    }
+
+    function residualKeyRowBytes() {
+      return Math.ceil(numKvHeads * residualBitsPerHead / 8);
+    }
+
+    function keyRowBytes() {
+      return baseKeyRowBytes() + residualKeyRowBytes();
+    }
+
+    function setPacked3(encoded, rowByteBase, valueIndex, code) {
+      const bitOffset = valueIndex * 3;
+      const byteIndex = rowByteBase + (bitOffset >> 3);
+      const shift = bitOffset & 7;
+      encoded[byteIndex] |= (code << shift) & 0xff;
+      if (shift > 5) encoded[byteIndex + 1] |= code >> (8 - shift);
+    }
+
+    function getPacked3(encoded, rowByteBase, valueIndex) {
+      const bitOffset = valueIndex * 3;
+      const byteIndex = rowByteBase + (bitOffset >> 3);
+      const shift = bitOffset & 7;
+      let bits = encoded[byteIndex] >> shift;
+      if (shift > 5) bits |= encoded[byteIndex + 1] << (8 - shift);
+      return bits & 0x07;
+    }
+
+    function setBit(encoded, byteBase, bitIndex, value) {
+      const byteIndex = byteBase + (bitIndex >> 3);
+      const mask = 1 << (bitIndex & 7);
+      if (value) encoded[byteIndex] |= mask;
+      else encoded[byteIndex] &= ~mask;
+    }
+
+    function getBit(encoded, byteBase, bitIndex) {
+      const byteIndex = byteBase + (bitIndex >> 3);
+      return ((encoded[byteIndex] >> (bitIndex & 7)) & 1) !== 0;
+    }
+
+    function randomSign(head, projection, dim) {
+      const mask = (1n << 64n) - 1n;
+      let x = (BigInt(head + 1) * 0x9e3779b97f4a7c15n) & mask;
+      x ^= (BigInt(projection + 1) * 0xbf58476d1ce4e5b9n) & mask;
+      x ^= (BigInt(dim + 1) * 0x94d049bb133111ebn) & mask;
+      x ^= x >> 30n;
+      x = (x * 0xbf58476d1ce4e5b9n) & mask;
+      x ^= x >> 27n;
+      x = (x * 0x94d049bb133111ebn) & mask;
+      x ^= x >> 31n;
+      return (x & 1n) === 0n ? 1 : -1;
+    }
+
+    function encodeTurbo3(values) {
+      const hkv = numKvHeads * headDim;
+      const rows = batch * kvLen;
+      const baseBytes = baseKeyRowBytes();
+      const rowBytes = keyRowBytes();
+      const encoded = new Uint8Array(rows * rowBytes);
+      for (let row = 0; row < rows; row++) {
+        const rowByteBase = row * rowBytes;
+        const valueBase = row * hkv;
+        for (let i = 0; i < hkv; i++) {
+          setPacked3(encoded, rowByteBase, i, encodeTurbo3Scalar(values[valueBase + i]));
+        }
+        const residualByteBase = rowByteBase + baseBytes;
+        for (let head = 0; head < numKvHeads; head++) {
+          const headValueBase = head * headDim;
+          for (let projection = 0; projection < residualBitsPerHead; projection++) {
+            let projectedResidual = 0;
+            for (let d = 0; d < headDim; d++) {
+              const valueIndex = headValueBase + d;
+              const decoded = decodeTurbo3At(encoded, rowByteBase, valueIndex);
+              projectedResidual += randomSign(head, projection, d) * (values[valueBase + valueIndex] - decoded);
+            }
+            setBit(encoded, residualByteBase, head * residualBitsPerHead + projection, projectedResidual >= 0);
+          }
+        }
+      }
+      return encoded;
+    }
+
+    function decodeTurbo3At(encoded, rowByteBase, valueIndex) {
+      return decodeTurbo3Scalar(getPacked3(encoded, rowByteBase, valueIndex));
+    }
+
+    function dotTurbo3Residual(q, qBase, encoded, rowByteBase, kvHead) {
+      const residualByteBase = rowByteBase + baseKeyRowBytes();
+      let acc = 0;
+      for (let projection = 0; projection < residualBitsPerHead; projection++) {
+        let projectedQuery = 0;
+        for (let d = 0; d < headDim; d++) {
+          projectedQuery += randomSign(kvHead, projection, d) * q[qBase + d];
+        }
+        const residualSign = getBit(encoded, residualByteBase, kvHead * residualBitsPerHead + projection) ? 1 : -1;
+        acc += residualSign * projectedQuery;
+      }
+      return acc / residualBitsPerHead;
+    }
+
+    function makeInputs() {
+      const q = new Float32Array(batch * qLen * numHeads * headDim);
+      const k = new Float32Array(batch * kvLen * numKvHeads * headDim);
+      const v = new Float32Array(batch * kvLen * numKvHeads * headDim);
+
+      for (let i = 0; i < q.length; i++) q[i] = signal(i, 0.071);
+      for (let i = 0; i < k.length; i++) k[i] = signal(i, 0.053, 11);
+      for (let i = 0; i < v.length; i++) v[i] = signal(i, 0.041, 29);
+
+      return { q, kEncoded: encodeTurbo3(k), v };
+    }
+
+    function reference(q, kEncoded, v) {
+      const out = new Float32Array(batch * qLen * numHeads * headDim);
+      const hq = numHeads * headDim;
+      const hkv = numKvHeads * headDim;
+      const headsPerGroup = numHeads / numKvHeads;
+
+      for (let b = 0; b < batch; b++) {
+        for (let qi = 0; qi < qLen; qi++) {
+          const absPos = kvLen - qLen + qi;
+          for (let h = 0; h < numHeads; h++) {
+            const kvHead = Math.floor(h / headsPerGroup);
+            const kvHeadOffset = kvHead * headDim;
+            const qBase = (b * qLen + qi) * hq + h * headDim;
+            const scores = new Float32Array(kvLen);
+            let rowMax = -Infinity;
+
+            for (let ki = 0; ki < kvLen; ki++) {
+              let score = -Infinity;
+              if (ki <= absPos) {
+                const kRowByteBase = (b * kvLen + ki) * keyRowBytes();
+                let baseDot = 0;
+                for (let d = 0; d < headDim; d++) {
+                  baseDot += q[qBase + d] * decodeTurbo3At(kEncoded, kRowByteBase, kvHeadOffset + d);
+                }
+                const residualDot = dotTurbo3Residual(q, qBase, kEncoded, kRowByteBase, kvHead);
+                const dot = baseDot + residualScale * residualDot;
+                score = dot * scale;
+              }
+              scores[ki] = score;
+              rowMax = Math.max(rowMax, score);
+            }
+
+            let denom = 0;
+            for (let ki = 0; ki < kvLen; ki++) {
+              const weight = Math.exp(scores[ki] - rowMax);
+              scores[ki] = weight;
+              denom += weight;
+            }
+
+            const outBase = (b * qLen + qi) * hq + h * headDim;
+            for (let d = 0; d < headDim; d++) {
+              let acc = 0;
+              for (let ki = 0; ki < kvLen; ki++) {
+                const weight = scores[ki] / denom;
+                acc += weight * v[(b * kvLen + ki) * hkv + kvHeadOffset + d];
+              }
+              out[outBase + d] = acc;
+            }
+          }
+        }
+      }
+      return out;
+    }
+
+    function makeBuffer(device, data, usage) {
+      const byteLength = typeof data === 'number' ? data : data.byteLength;
+      const buffer = device.createBuffer({
+        size: align4(byteLength),
+        usage,
+      });
+      if (typeof data !== 'number') {
+        device.queue.writeBuffer(buffer, 0, data);
+      }
+      return buffer;
+    }
+
+    function makeParamsBuffer(device) {
+      const bytes = new ArrayBuffer(24);
+      const view = new DataView(bytes);
+      view.setUint32(0, qLen, true);
+      view.setUint32(4, kvLen, true);
+      view.setUint32(8, numHeads, true);
+      view.setUint32(12, numKvHeads, true);
+      view.setUint32(16, headDim, true);
+      view.setFloat32(20, scale, true);
+      return makeBuffer(device, bytes, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    }
+
+    function compare(actual, expected) {
+      let maxAbs = 0;
+      let sumSq = 0;
+      let worst = 0;
+      for (let i = 0; i < actual.length; i++) {
+        const diff = Math.abs(actual[i] - expected[i]);
+        if (diff > maxAbs) {
+          maxAbs = diff;
+          worst = i;
+        }
+        sumSq += diff * diff;
+      }
+      return { maxAbs, rms: Math.sqrt(sumSq / actual.length), worst };
+    }
+
+    async function run() {
+      resetLog();
+      if (!navigator.gpu) {
+        log('FAIL: WebGPU is not available in this browser.');
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) {
+        log('FAIL: no WebGPU adapter.');
+        return;
+      }
+
+      const device = await adapter.requestDevice();
+      const shaderSource = await fetch('./shaders/gqa_cached_attention_turbo3.wgsl').then((r) => {
+        if (!r.ok) throw new Error(`failed to fetch shader: HTTP ${r.status}`);
+        return r.text();
+      });
+
+      const { q, kEncoded, v } = makeInputs();
+      const expected = reference(q, kEncoded, v);
+      const outputBytes = expected.byteLength;
+
+      const module = device.createShaderModule({ code: shaderSource });
+      const pipeline = await device.createComputePipelineAsync({
+        layout: 'auto',
+        compute: { module, entryPoint: 'gqa_cached_attention_turbo3' },
+      });
+
+      const qBuffer = makeBuffer(device, q, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      const kBuffer = makeBuffer(device, kEncoded, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      const vBuffer = makeBuffer(device, v, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      const outBuffer = makeBuffer(device, outputBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const paramsBuffer = makeParamsBuffer(device);
+
+      const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: qBuffer } },
+          { binding: 1, resource: { buffer: kBuffer } },
+          { binding: 2, resource: { buffer: vBuffer } },
+          { binding: 3, resource: { buffer: outBuffer } },
+          { binding: 4, resource: { buffer: paramsBuffer } },
+        ],
+      });
+
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(numHeads, batch, qLen);
+      pass.end();
+
+      const staging = device.createBuffer({
+        size: outputBytes,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      encoder.copyBufferToBuffer(outBuffer, 0, staging, 0, outputBytes);
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await staging.mapAsync(GPUMapMode.READ);
+
+      const gpuOut = new Float32Array(staging.getMappedRange().slice(0));
+      staging.unmap();
+
+      const result = compare(gpuOut, expected);
+      log(`shape: batch=${batch} qLen=${qLen} kvLen=${kvLen} heads=${numHeads}/${numKvHeads} headDim=${headDim}`);
+      log(`turbo3 rows: baseBytes=${baseKeyRowBytes()} residualBytes=${residualKeyRowBytes()} totalBytes=${keyRowBytes()}`);
+      log(`maxAbs=${result.maxAbs.toExponential(6)} rms=${result.rms.toExponential(6)} worstIndex=${result.worst}`);
+      log(result.maxAbs <= tolerance ? 'PASS' : `FAIL: maxAbs exceeds ${tolerance}`);
+
+      qBuffer.destroy();
+      kBuffer.destroy();
+      vBuffer.destroy();
+      outBuffer.destroy();
+      paramsBuffer.destroy();
+      device.destroy?.();
+    }
+  </script>
+</body>
+</html>

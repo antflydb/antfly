@@ -1,0 +1,23 @@
+[
+  {
+    "name": "ft_v1",
+    "kind": "full_text",
+    "config": {}
+  },
+  {
+    "name": "dv_v1",
+    "kind": "dense_vector",
+    "config": {
+      "field": "embedding",
+      "dims": 2,
+      "metric": "l2_squared"
+    }
+  },
+  {
+    "name": "sv_v1",
+    "kind": "sparse_vector",
+    "config": {
+      "field": "sparse_embedding"
+    }
+  }
+]

@@ -1,0 +1,15 @@
+{
+  "projected_match": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:a",
+        "stored_data": {
+          "author": {
+            "name": "ann"
+          }
+        }
+      }
+    ]
+  }
+}

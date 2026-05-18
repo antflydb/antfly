@@ -1,0 +1,148 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Modular API", "version": "1.0.0" },
+  "paths": {
+    "/tables": {
+      "get": {
+        "operationId": "listTables",
+        "summary": "List all tables",
+        "responses": {
+          "200": {
+            "description": "Table list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["tables"],
+                  "properties": {
+                    "tables": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/TableInfo" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tables/{tableName}": {
+      "post": {
+        "operationId": "createTable",
+        "summary": "Create a new table",
+        "parameters": [
+          {
+            "name": "tableName",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateTableRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Table created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TableInfo" }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateSchema",
+        "summary": "Update table schema",
+        "parameters": [
+          {
+            "name": "tableName",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "schema.json#/components/schemas/TableSchema" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Schema updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TableInfo" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tables/{tableName}/embeddings": {
+      "post": {
+        "operationId": "configureEmbeddings",
+        "summary": "Configure embeddings for a table",
+        "parameters": [
+          {
+            "name": "tableName",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "embeddings.json#/components/schemas/EmbedderConfig" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Embeddings configured",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TableInfo" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "TableInfo": {
+        "type": "object",
+        "required": ["name", "schema"],
+        "properties": {
+          "name": { "type": "string", "description": "Table name" },
+          "schema": { "$ref": "schema.json#/components/schemas/TableSchema" },
+          "embedder": { "$ref": "embeddings.json#/components/schemas/EmbedderConfig" },
+          "document_count": { "type": "integer", "format": "int64" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateTableRequest": {
+        "type": "object",
+        "required": ["schema"],
+        "properties": {
+          "schema": { "$ref": "schema.json#/components/schemas/TableSchema" },
+          "embedder": { "$ref": "embeddings.json#/components/schemas/EmbedderConfig" }
+        }
+      }
+    }
+  }
+}

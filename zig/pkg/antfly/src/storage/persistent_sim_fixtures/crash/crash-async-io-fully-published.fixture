@@ -1,0 +1,12 @@
+storage-sim-fixture-v1
+mode persistent_crash
+label crash-async-io-fully-published
+case_label crash-async-io-fully-published
+origin_seed 0x4
+phase fully_published
+expectation expected persistent reopen to recover the committed snapshot once the WAL append has completed
+main_commit_backend async_io
+expected_outcome committed
+
+action index_segment gamma_pair
+crash_action index_segment alpha_beta_pair

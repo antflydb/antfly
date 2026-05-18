@@ -1,0 +1,67 @@
+:root {
+  --bg: #f7fafc;
+  --text: #0f172a;
+  --accent: #0ea5e9;
+  --card: #ffffff;
+  --line: #dbe4ee;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  background: radial-gradient(circle at top left, #e0f2fe, var(--bg));
+  color: var(--text);
+}
+
+.hero {
+  text-align: center;
+  padding: 2rem 1rem 1rem;
+}
+
+.logo {
+  width: min(340px, 80vw);
+  height: auto;
+}
+
+.nav {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+.nav a {
+  text-decoration: none;
+  color: #0c4a6e;
+  font-weight: 600;
+}
+
+.nav a[aria-current="page"] {
+  color: var(--accent);
+}
+
+.card {
+  width: min(860px, calc(100% - 2rem));
+  margin: 1.5rem auto;
+  padding: 1.25rem;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: 0 6px 24px rgba(15, 23, 42, 0.06);
+}
+
+button {
+  border: 0;
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  font-weight: 700;
+  color: #fff;
+  background: var(--accent);
+  cursor: pointer;
+}

@@ -1,0 +1,4 @@
+[submodule "zig/deps/snowball"]
+	path = zig/deps/snowball
+	url = https://github.com/antflydb/snowball.git
+	branch = feat/zig-support

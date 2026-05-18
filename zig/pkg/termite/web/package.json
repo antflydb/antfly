@@ -1,0 +1,11 @@
+{
+  "name": "termite-web-tests",
+  "private": true,
+  "description": "Test harnesses that exercise the WGSL shaders and WASM bridge from Node.",
+  "scripts": {
+    "test:quant-kernels": "node test-quant-kernels-webgpu.cjs"
+  },
+  "devDependencies": {
+    "@kmamal/gpu": "^0.2.1"
+  }
+}

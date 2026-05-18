@@ -1,0 +1,446 @@
+.version 7.5
+.target sm_61
+.address_size 64
+
+.visible .entry termite_fill_f32(
+    .param .u64 termite_fill_f32_param_0,
+    .param .u32 termite_fill_f32_param_1,
+    .param .f32 termite_fill_f32_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [termite_fill_f32_param_0];
+    ld.param.u32 %r1, [termite_fill_f32_param_1];
+    ld.param.f32 %f1, [termite_fill_f32_param_2];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra DONE;
+    mul.wide.u32 %rd2, %r5, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    st.global.f32 [%rd3], %f1;
+DONE:
+    ret;
+}
+
+.visible .entry termite_linear_f32(
+    .param .u64 termite_linear_f32_param_0,
+    .param .u64 termite_linear_f32_param_1,
+    .param .u64 termite_linear_f32_param_2,
+    .param .u32 termite_linear_f32_param_3,
+    .param .u32 termite_linear_f32_param_4,
+    .param .u32 termite_linear_f32_param_5
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<5>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<14>;
+
+    ld.param.u64 %rd1, [termite_linear_f32_param_0];
+    ld.param.u64 %rd2, [termite_linear_f32_param_1];
+    ld.param.u64 %rd3, [termite_linear_f32_param_2];
+    ld.param.u32 %r1, [termite_linear_f32_param_3];
+    ld.param.u32 %r2, [termite_linear_f32_param_4];
+    ld.param.u32 %r3, [termite_linear_f32_param_5];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;
+    mul.lo.u32 %r8, %r1, %r3;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra LINEAR_DONE;
+
+    div.u32 %r9, %r7, %r3;
+    rem.u32 %r10, %r7, %r3;
+    mov.u32 %r11, 0;
+    mov.f32 %f1, 0f00000000;
+
+LINEAR_LOOP:
+    setp.ge.u32 %p2, %r11, %r2;
+    @%p2 bra LINEAR_STORE;
+    mad.lo.u32 %r12, %r9, %r2, %r11;
+    mul.wide.u32 %rd4, %r12, 4;
+    add.s64 %rd5, %rd2, %rd4;
+    ld.global.f32 %f2, [%rd5];
+    mad.lo.u32 %r13, %r10, %r2, %r11;
+    mul.wide.u32 %rd6, %r13, 4;
+    add.s64 %rd7, %rd3, %rd6;
+    ld.global.f32 %f3, [%rd7];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u32 %r11, %r11, 1;
+    bra LINEAR_LOOP;
+
+LINEAR_STORE:
+    mul.wide.u32 %rd8, %r7, 4;
+    add.s64 %rd9, %rd1, %rd8;
+    st.global.f32 [%rd9], %f1;
+LINEAR_DONE:
+    ret;
+}
+
+.visible .entry termite_linear_bias_f32(
+    .param .u64 termite_linear_bias_f32_param_0,
+    .param .u64 termite_linear_bias_f32_param_1,
+    .param .u64 termite_linear_bias_f32_param_2,
+    .param .u64 termite_linear_bias_f32_param_3,
+    .param .u32 termite_linear_bias_f32_param_4,
+    .param .u32 termite_linear_bias_f32_param_5,
+    .param .u32 termite_linear_bias_f32_param_6
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<6>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [termite_linear_bias_f32_param_0];
+    ld.param.u64 %rd2, [termite_linear_bias_f32_param_1];
+    ld.param.u64 %rd3, [termite_linear_bias_f32_param_2];
+    ld.param.u64 %rd4, [termite_linear_bias_f32_param_3];
+    ld.param.u32 %r1, [termite_linear_bias_f32_param_4];
+    ld.param.u32 %r2, [termite_linear_bias_f32_param_5];
+    ld.param.u32 %r3, [termite_linear_bias_f32_param_6];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;
+    mul.lo.u32 %r8, %r1, %r3;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra LINEAR_BIAS_DONE;
+
+    div.u32 %r9, %r7, %r3;
+    rem.u32 %r10, %r7, %r3;
+    mul.wide.u32 %rd5, %r10, 4;
+    add.s64 %rd6, %rd4, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mov.u32 %r11, 0;
+
+LINEAR_BIAS_LOOP:
+    setp.ge.u32 %p2, %r11, %r2;
+    @%p2 bra LINEAR_BIAS_STORE;
+    mad.lo.u32 %r12, %r9, %r2, %r11;
+    mul.wide.u32 %rd7, %r12, 4;
+    add.s64 %rd8, %rd2, %rd7;
+    ld.global.f32 %f2, [%rd8];
+    mad.lo.u32 %r13, %r10, %r2, %r11;
+    mul.wide.u32 %rd9, %r13, 4;
+    add.s64 %rd10, %rd3, %rd9;
+    ld.global.f32 %f3, [%rd10];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u32 %r11, %r11, 1;
+    bra LINEAR_BIAS_LOOP;
+
+LINEAR_BIAS_STORE:
+    mul.wide.u32 %rd11, %r7, 4;
+    add.s64 %rd12, %rd1, %rd11;
+    st.global.f32 [%rd12], %f1;
+LINEAR_BIAS_DONE:
+    ret;
+}
+
+.visible .entry termite_rms_norm_f32(
+    .param .u64 termite_rms_norm_f32_param_0,
+    .param .u64 termite_rms_norm_f32_param_1,
+    .param .u64 termite_rms_norm_f32_param_2,
+    .param .u32 termite_rms_norm_f32_param_3,
+    .param .u32 termite_rms_norm_f32_param_4,
+    .param .f32 termite_rms_norm_f32_param_5
+)
+{
+    .reg .pred %p<4>;
+    .reg .f32 %f<10>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+
+    ld.param.u64 %rd1, [termite_rms_norm_f32_param_0];
+    ld.param.u64 %rd2, [termite_rms_norm_f32_param_1];
+    ld.param.u64 %rd3, [termite_rms_norm_f32_param_2];
+    ld.param.u32 %r1, [termite_rms_norm_f32_param_3];
+    ld.param.u32 %r2, [termite_rms_norm_f32_param_4];
+    ld.param.f32 %f8, [termite_rms_norm_f32_param_5];
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra RMS_DONE;
+
+    mov.u32 %r4, 0;
+    mov.f32 %f1, 0f00000000;
+RMS_SUM_LOOP:
+    setp.ge.u32 %p2, %r4, %r2;
+    @%p2 bra RMS_SCALE;
+    mad.lo.u32 %r5, %r3, %r2, %r4;
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd5, %rd2, %rd4;
+    ld.global.f32 %f2, [%rd5];
+    fma.rn.f32 %f1, %f2, %f2, %f1;
+    add.u32 %r4, %r4, 1;
+    bra RMS_SUM_LOOP;
+
+RMS_SCALE:
+    cvt.rn.f32.u32 %f3, %r2;
+    div.rn.f32 %f4, %f1, %f3;
+    add.rn.f32 %f5, %f4, %f8;
+    sqrt.rn.f32 %f9, %f5;
+    div.rn.f32 %f6, 0f3f800000, %f9;
+    mov.u32 %r6, 0;
+RMS_WRITE_LOOP:
+    setp.ge.u32 %p3, %r6, %r2;
+    @%p3 bra RMS_DONE;
+    mad.lo.u32 %r7, %r3, %r2, %r6;
+    mul.wide.u32 %rd6, %r7, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    ld.global.f32 %f2, [%rd7];
+    mul.wide.u32 %rd8, %r6, 4;
+    add.s64 %rd9, %rd3, %rd8;
+    ld.global.f32 %f7, [%rd9];
+    mul.rn.f32 %f9, %f2, %f6;
+    mul.rn.f32 %f9, %f9, %f7;
+    add.s64 %rd10, %rd1, %rd6;
+    st.global.f32 [%rd10], %f9;
+    add.u32 %r6, %r6, 1;
+    bra RMS_WRITE_LOOP;
+RMS_DONE:
+    ret;
+}
+
+.visible .entry termite_elementwise_f32(
+    .param .u64 termite_elementwise_f32_param_0,
+    .param .u64 termite_elementwise_f32_param_1,
+    .param .u64 termite_elementwise_f32_param_2,
+    .param .u32 termite_elementwise_f32_param_3,
+    .param .u32 termite_elementwise_f32_param_4
+)
+{
+    .reg .pred %p<5>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<10>;
+
+    ld.param.u64 %rd1, [termite_elementwise_f32_param_0];
+    ld.param.u64 %rd2, [termite_elementwise_f32_param_1];
+    ld.param.u64 %rd3, [termite_elementwise_f32_param_2];
+    ld.param.u32 %r1, [termite_elementwise_f32_param_3];
+    ld.param.u32 %r2, [termite_elementwise_f32_param_4];
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r6, %r3, %r4, %r5;
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra ELEM_DONE;
+
+    mul.wide.u32 %rd4, %r6, 4;
+    add.s64 %rd5, %rd2, %rd4;
+    ld.global.f32 %f1, [%rd5];
+    setp.eq.u32 %p2, %r2, 2;
+    @%p2 bra ELEM_SILU;
+
+    add.s64 %rd6, %rd3, %rd4;
+    ld.global.f32 %f2, [%rd6];
+    setp.eq.u32 %p3, %r2, 1;
+    @%p3 bra ELEM_MUL;
+    add.rn.f32 %f3, %f1, %f2;
+    bra ELEM_STORE;
+
+ELEM_MUL:
+    mul.rn.f32 %f3, %f1, %f2;
+    bra ELEM_STORE;
+
+ELEM_SILU:
+    neg.f32 %f4, %f1;
+    mul.rn.f32 %f5, %f4, 0f3fb8aa3b;
+    ex2.approx.ftz.f32 %f6, %f5;
+    add.rn.f32 %f7, %f6, 0f3f800000;
+    div.rn.f32 %f3, %f1, %f7;
+
+ELEM_STORE:
+    add.s64 %rd7, %rd1, %rd4;
+    st.global.f32 [%rd7], %f3;
+ELEM_DONE:
+    ret;
+}
+
+.visible .entry termite_linear_q8_0_f32(
+    .param .u64 termite_linear_q8_0_f32_param_0,
+    .param .u64 termite_linear_q8_0_f32_param_1,
+    .param .u64 termite_linear_q8_0_f32_param_2,
+    .param .u32 termite_linear_q8_0_f32_param_3,
+    .param .u32 termite_linear_q8_0_f32_param_4,
+    .param .u32 termite_linear_q8_0_f32_param_5
+)
+{
+    .reg .pred %p<4>;
+    .reg .b16 %h<2>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [termite_linear_q8_0_f32_param_0];
+    ld.param.u64 %rd2, [termite_linear_q8_0_f32_param_1];
+    ld.param.u64 %rd3, [termite_linear_q8_0_f32_param_2];
+    ld.param.u32 %r1, [termite_linear_q8_0_f32_param_3];
+    ld.param.u32 %r2, [termite_linear_q8_0_f32_param_4];
+    ld.param.u32 %r3, [termite_linear_q8_0_f32_param_5];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;
+    mul.lo.u32 %r8, %r1, %r3;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra Q8_DONE;
+
+    div.u32 %r9, %r7, %r3;
+    rem.u32 %r10, %r7, %r3;
+    shr.u32 %r11, %r2, 5;
+    mov.u32 %r12, 0;
+    mov.f32 %f1, 0f00000000;
+
+Q8_BLOCK_LOOP:
+    setp.ge.u32 %p2, %r12, %r11;
+    @%p2 bra Q8_STORE;
+    mad.lo.u32 %r13, %r10, %r11, %r12;
+    mul.wide.u32 %rd4, %r13, 34;
+    add.s64 %rd5, %rd3, %rd4;
+    ld.global.u16 %h1, [%rd5];
+    cvt.f32.f16 %f2, %h1;
+    mov.u32 %r14, 0;
+    mov.f32 %f3, 0f00000000;
+
+Q8_INNER_LOOP:
+    setp.ge.u32 %p3, %r14, 32;
+    @%p3 bra Q8_BLOCK_ACCUM;
+    shl.b32 %r15, %r12, 5;
+    add.u32 %r16, %r15, %r14;
+    mad.lo.u32 %r17, %r9, %r2, %r16;
+    mul.wide.u32 %rd6, %r17, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    ld.global.f32 %f4, [%rd7];
+    add.u32 %r18, %r14, 2;
+    cvt.u64.u32 %rd8, %r18;
+    add.s64 %rd9, %rd5, %rd8;
+    ld.global.s8 %r19, [%rd9];
+    cvt.rn.f32.s32 %f5, %r19;
+    fma.rn.f32 %f3, %f4, %f5, %f3;
+    add.u32 %r14, %r14, 1;
+    bra Q8_INNER_LOOP;
+
+Q8_BLOCK_ACCUM:
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u32 %r12, %r12, 1;
+    bra Q8_BLOCK_LOOP;
+
+Q8_STORE:
+    mul.wide.u32 %rd10, %r7, 4;
+    add.s64 %rd11, %rd1, %rd10;
+    st.global.f32 [%rd11], %f1;
+Q8_DONE:
+    ret;
+}
+
+.visible .entry termite_linear_q4_0_f32(
+    .param .u64 termite_linear_q4_0_f32_param_0,
+    .param .u64 termite_linear_q4_0_f32_param_1,
+    .param .u64 termite_linear_q4_0_f32_param_2,
+    .param .u32 termite_linear_q4_0_f32_param_3,
+    .param .u32 termite_linear_q4_0_f32_param_4,
+    .param .u32 termite_linear_q4_0_f32_param_5
+)
+{
+    .reg .pred %p<5>;
+    .reg .b16 %h<2>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [termite_linear_q4_0_f32_param_0];
+    ld.param.u64 %rd2, [termite_linear_q4_0_f32_param_1];
+    ld.param.u64 %rd3, [termite_linear_q4_0_f32_param_2];
+    ld.param.u32 %r1, [termite_linear_q4_0_f32_param_3];
+    ld.param.u32 %r2, [termite_linear_q4_0_f32_param_4];
+    ld.param.u32 %r3, [termite_linear_q4_0_f32_param_5];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;
+    mul.lo.u32 %r8, %r1, %r3;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra Q4_DONE;
+
+    div.u32 %r9, %r7, %r3;
+    rem.u32 %r10, %r7, %r3;
+    shr.u32 %r11, %r2, 5;
+    mov.u32 %r12, 0;
+    mov.f32 %f1, 0f00000000;
+
+Q4_BLOCK_LOOP:
+    setp.ge.u32 %p2, %r12, %r11;
+    @%p2 bra Q4_STORE;
+    mad.lo.u32 %r13, %r10, %r11, %r12;
+    mul.wide.u32 %rd4, %r13, 18;
+    add.s64 %rd5, %rd3, %rd4;
+    ld.global.u16 %h1, [%rd5];
+    cvt.f32.f16 %f2, %h1;
+    mov.u32 %r14, 0;
+    mov.f32 %f3, 0f00000000;
+
+Q4_LOW_LOOP:
+    setp.ge.u32 %p3, %r14, 16;
+    @%p3 bra Q4_HIGH_INIT;
+    shl.b32 %r15, %r12, 5;
+    add.u32 %r16, %r15, %r14;
+    mad.lo.u32 %r17, %r9, %r2, %r16;
+    mul.wide.u32 %rd6, %r17, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    ld.global.f32 %f4, [%rd7];
+    add.u32 %r18, %r14, 2;
+    cvt.u64.u32 %rd8, %r18;
+    add.s64 %rd9, %rd5, %rd8;
+    ld.global.u8 %r19, [%rd9];
+    and.b32 %r20, %r19, 15;
+    add.s32 %r21, %r20, -8;
+    cvt.rn.f32.s32 %f5, %r21;
+    fma.rn.f32 %f3, %f4, %f5, %f3;
+    add.u32 %r14, %r14, 1;
+    bra Q4_LOW_LOOP;
+
+Q4_HIGH_INIT:
+    mov.u32 %r14, 0;
+Q4_HIGH_LOOP:
+    setp.ge.u32 %p4, %r14, 16;
+    @%p4 bra Q4_BLOCK_ACCUM;
+    shl.b32 %r15, %r12, 5;
+    add.u32 %r16, %r15, 16;
+    add.u32 %r16, %r16, %r14;
+    mad.lo.u32 %r17, %r9, %r2, %r16;
+    mul.wide.u32 %rd6, %r17, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    ld.global.f32 %f4, [%rd7];
+    add.u32 %r18, %r14, 2;
+    cvt.u64.u32 %rd8, %r18;
+    add.s64 %rd9, %rd5, %rd8;
+    ld.global.u8 %r19, [%rd9];
+    shr.u32 %r20, %r19, 4;
+    and.b32 %r20, %r20, 15;
+    add.s32 %r21, %r20, -8;
+    cvt.rn.f32.s32 %f5, %r21;
+    fma.rn.f32 %f3, %f4, %f5, %f3;
+    add.u32 %r14, %r14, 1;
+    bra Q4_HIGH_LOOP;
+
+Q4_BLOCK_ACCUM:
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u32 %r12, %r12, 1;
+    bra Q4_BLOCK_LOOP;
+
+Q4_STORE:
+    mul.wide.u32 %rd10, %r7, 4;
+    add.s64 %rd11, %rd1, %rd10;
+    st.global.f32 [%rd11], %f1;
+Q4_DONE:
+    ret;
+}

@@ -1,0 +1,56 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 32 >>
+stream
+BT
+/F1 20 Tf
+10 10 Td
+(A) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /TestT1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /A] >> /FontDescriptor 6 0 R >>
+endobj
+6 0 obj
+<< /Type /FontDescriptor /FontName /TestT1 /FontFile 7 0 R >>
+endobj
+7 0 obj
+<< /Length 246 >>
+stream
+%!PS-AdobeFont-1.0: TestT1 1.0
+/FontName /TestT1 def
+/lenIV -1 def
+/Private 1 dict dup begin
+/Subrs 0 array def
+end readonly def
+/CharStrings 2 dict dup begin
+/.notdef <8B8B150E> def
+/A <8B8B15F77C8B05FB7CFA7C05FB7CFB7C050E> def
+end readonly def
+endstream
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000322 00000 n 
+0000000490 00000 n 
+0000000567 00000 n 
+trailer
+<< /Root 1 0 R /Size 8 >>
+startxref
+863
+%%EOF

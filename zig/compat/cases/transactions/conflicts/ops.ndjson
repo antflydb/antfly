@@ -1,0 +1,8 @@
+{"op":"batch","writes":[{"key":"doc:cas","value":{"title":"v1"}}],"deletes":[],"timestamp_ns":10000}
+{"op":"begin_transaction","txn":"t1","timestamp_ns":1000}
+{"op":"write_transaction","txn":"t1","writes":[{"key":"doc:shared","value":{"title":"from1"}}],"deletes":[]}
+{"op":"begin_transaction","txn":"t2","timestamp_ns":1001}
+{"op":"write_transaction","txn":"t2","writes":[{"key":"doc:shared","value":{"title":"from2"}}],"deletes":[],"predicates":[{"key":"doc:shared","expected_version":0}],"expect_error":"intent_conflict"}
+{"op":"commit_transaction","txn":"t1","timestamp_ns":1002}
+{"op":"begin_transaction","txn":"t3","timestamp_ns":11000}
+{"op":"write_transaction","txn":"t3","writes":[{"key":"doc:cas","value":{"title":"v2"}}],"deletes":[],"predicates":[{"key":"doc:cas","expected_version":0}],"expect_error":"version_conflict"}

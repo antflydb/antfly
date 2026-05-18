@@ -1,0 +1,18 @@
+{
+  "require_labels": true,
+  "text_any": [
+    "This is a heading"
+  ],
+  "labels_any": [
+    "Text",
+    "Title"
+  ],
+  "region_texts": [
+    "This is a heading",
+    "This is content"
+  ],
+  "region_labels": [
+    "Title",
+    "Text"
+  ]
+}

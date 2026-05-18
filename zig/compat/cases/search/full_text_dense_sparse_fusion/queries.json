@@ -1,0 +1,43 @@
+[
+  {
+    "name": "fused_primary",
+    "request": {
+      "index_name": "ft_v1",
+      "full_text_queries": {
+        "ft_body": {
+          "query": {
+            "match": {
+              "field": "body",
+              "text": "machine learning"
+            }
+          }
+        }
+      },
+      "dense_queries": {
+        "dv_v1": {
+          "vector": [1.0, 0.0],
+          "k": 1
+        }
+      },
+      "sparse_queries": {
+        "sv_v1": {
+          "indices": [1],
+          "values": [1.0],
+          "k": 1
+        }
+      },
+      "merge_config": {
+        "strategy": "rrf",
+        "rank_constant": 60.0,
+        "weights": {
+          "ft_body": 1.0,
+          "dv_v1": 3.0,
+          "sv_v1": 2.0
+        }
+      },
+      "limit": 1,
+      "offset": 0,
+      "include_stored": true
+    }
+  }
+]

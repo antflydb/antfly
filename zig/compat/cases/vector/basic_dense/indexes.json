@@ -1,0 +1,11 @@
+[
+  {
+    "name": "dv_v1",
+    "kind": "dense_vector",
+    "config": {
+      "field": "embedding",
+      "dims": 3,
+      "metric": "l2_squared"
+    }
+  }
+]

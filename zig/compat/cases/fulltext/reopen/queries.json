@@ -1,0 +1,32 @@
+[
+  {
+    "name": "title_term_after_reopen",
+    "request": {
+      "index_name": "ft_v1",
+      "query": {
+        "term": {
+          "field": "title",
+          "term": "alpha"
+        }
+      },
+      "limit": 10,
+      "offset": 0,
+      "include_stored": true
+    }
+  },
+  {
+    "name": "body_match_after_reopen",
+    "request": {
+      "index_name": "ft_v1",
+      "query": {
+        "match": {
+          "field": "body",
+          "text": "beta"
+        }
+      },
+      "limit": 10,
+      "offset": 0,
+      "include_stored": true
+    }
+  }
+]

@@ -1,0 +1,20396 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const ml = @import("ml");
+const build_options = @import("build_options");
+const ops = @import("ops.zig");
+const gpu_hosted_store_mod = @import("gpu_hosted_store.zig");
+const native_compute_mod = @import("native_compute.zig");
+const native = @import("../backends/native.zig");
+// mlx.zig is only compiled under `-Dmlx=true`; the stub keeps `getWeightOp`'s
+// MLX fallback branch buildable when MLX is disabled.
+const mlx = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {
+    pub const c = struct {
+        pub const mlx_array = *anyopaque;
+        pub fn mlx_array_free(_: *anyopaque) callconv(.c) c_int {
+            unreachable;
+        }
+    };
+    pub fn getWeight(_: anytype, _: anytype) ?*anyopaque {
+        return null;
+    }
+    pub fn readFloat32(_: anytype, _: anytype) ![]f32 {
+        unreachable;
+    }
+};
+const activations_mod = @import("../backends/activations.zig");
+const metal_tensor_mod = if (build_options.enable_metal) @import("../backends/metal_tensor.zig") else struct {
+    pub const max_dims: usize = 8;
+    pub const StorageMode = enum(c_int) {
+        shared = 0,
+        private = 1,
+    };
+    pub const MetalTensor = opaque {};
+};
+const tensor_mod = @import("../backends/tensor.zig");
+const weight_source_mod = @import("../models/weight_source.zig");
+const runtime_root = @import("../runtime/root.zig");
+const model_runtime = @import("../graph/model_runtime.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
+const metal_command_planner = @import("../graph/metal_command_planner.zig");
+const graph_quant_matmul = @import("../graph/quant_matmul.zig");
+const quant_codec = @import("../gguf/quant_codec.zig");
+const linalg = @import("termite_linalg");
+
+const WeightStore = gpu_hosted_store_mod.WeightStore;
+const NativeWeightStore = native_compute_mod.WeightStore;
+const CT = ops.CT;
+const MetalTensor = metal_tensor_mod.MetalTensor;
+const QuantizedStorage = weight_source_mod.QuantizedStorage;
+
+fn concreteShapeElementCount(shape: []const i32) ?usize {
+    var count: usize = 1;
+    for (shape) |dim| {
+        if (dim <= 0) return null;
+        count = std.math.mul(usize, count, @intCast(dim)) catch return null;
+    }
+    return count;
+}
+
+fn shouldUploadFloat32ShapeToMetal(data_len: usize, shape: []const i32) bool {
+    if (shape.len == 0 or shape.len > metal_tensor_mod.max_dims) return false;
+    return concreteShapeElementCount(shape) == data_len;
+}
+
+fn metalPagedAttentionKvFormatSupported(format: u32) bool {
+    // Keep this aligned with `termite_paged_attention_key_scalar` in
+    // metal_kernels.m: polar4, turbo3, raw_f32, f16, and int8_per_head.
+    return format <= 4;
+}
+
+test "metal_compute: upload boundary accepts only concrete matching shapes" {
+    try std.testing.expect(shouldUploadFloat32ShapeToMetal(6, &.{ 2, 3 }));
+    try std.testing.expect(!shouldUploadFloat32ShapeToMetal(5, &.{ 2, 3 }));
+    try std.testing.expect(!shouldUploadFloat32ShapeToMetal(6, &.{ -1, 3 }));
+    try std.testing.expect(!shouldUploadFloat32ShapeToMetal(1, &.{}));
+    if (build_options.enable_metal) {
+        try std.testing.expectEqual(metal_tensor_mod.StorageMode.shared, uploadStorageMode(64 * 1024));
+        try std.testing.expectEqual(metal_tensor_mod.StorageMode.private, uploadStorageMode(64 * 1024 + 1));
+    }
+}
+
+test "metal_compute paged slot attention accepts kernel supported kv formats" {
+    inline for (.{ 0, 1, 2, 3, 4 }) |format| {
+        try std.testing.expect(metalPagedAttentionKvFormatSupported(format));
+    }
+    try std.testing.expect(!metalPagedAttentionKvFormatSupported(5));
+}
+
+fn getenvBool(comptime name: [*:0]const u8) bool {
+    if (comptime @import("builtin").os.tag == .freestanding) return false;
+    const c = @cImport(@cInclude("stdlib.h"));
+    const value = c.getenv(name) orelse return false;
+    const slice = std.mem.span(value);
+    return std.mem.eql(u8, slice, "1") or
+        std.ascii.eqlIgnoreCase(slice, "true") or
+        std.ascii.eqlIgnoreCase(slice, "yes") or
+        std.ascii.eqlIgnoreCase(slice, "on");
+}
+
+fn getenvUsize(comptime name: [*:0]const u8) ?usize {
+    if (comptime @import("builtin").os.tag == .freestanding) return null;
+    const c = @cImport(@cInclude("stdlib.h"));
+    const value = c.getenv(name) orelse return null;
+    const slice = std.mem.span(value);
+    if (slice.len == 0) return null;
+    return std.fmt.parseUnsigned(usize, slice, 10) catch null;
+}
+
+fn denseBlockTraceRequested() bool {
+    return getenvBool("TERMITE_METAL_DENSE_BLOCK_TRACE");
+}
+
+fn metalPrefillTraceRequested() bool {
+    return getenvBool("TERMITE_METAL_PREFILL_TRACE");
+}
+
+fn traceMetalPrefillFramePlan(comptime fmt: []const u8, args: anytype) void {
+    if (!metalPrefillTraceRequested()) return;
+    std.debug.print("prefill-trace: metal-prefill-frame-plan " ++ fmt ++ "\n", args);
+}
+
+fn traceGatedDeviceRequested() bool {
+    return getenvBool("TERMITE_METAL_TRACE_GATED_DEVICE");
+}
+
+fn disableRuntimeEmbeddingLookup() bool {
+    return getenvBool("TERMITE_METAL_DISABLE_RUNTIME_EMBEDDING_LOOKUP");
+}
+
+fn disableRuntimeAttentionF32() bool {
+    return getenvBool("TERMITE_METAL_DISABLE_RUNTIME_ATTENTION_F32");
+}
+
+fn disableRuntimeElementwise() bool {
+    return getenvBool("TERMITE_METAL_DISABLE_RUNTIME_ELEMENTWISE");
+}
+
+fn preferHostLoadedWeightsDebug() bool {
+    return getenvBool("TERMITE_METAL_PREFER_HOST_LOADED_WEIGHTS");
+}
+
+fn traceMissingWeightDebug() bool {
+    return getenvBool("TERMITE_METAL_TRACE_MISSING_WEIGHT");
+}
+
+fn prepareDecodeInputsDebug() bool {
+    return getenvBool("TERMITE_METAL_PREPARE_DECODE_INPUTS_DEBUG");
+}
+
+fn traceDecoderRuntimeDecode() bool {
+    return getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
+}
+
+fn traceCloneTensorShape() bool {
+    return getenvBool("TERMITE_METAL_TRACE_CLONE_TENSOR_SHAPE");
+}
+
+fn traceHostMaterializeLimit() usize {
+    return getenvUsize("TERMITE_METAL_TRACE_HOST_MATERIALIZE_LIMIT") orelse 0;
+}
+
+fn debugDecoderRuntimeFinite() bool {
+    return getenvBool("TERMITE_METAL_DEBUG_DECODER_RUNTIME_FINITE");
+}
+
+fn disableDeviceKvWriteHookDebug() bool {
+    return getenvBool("TERMITE_METAL_DISABLE_DEVICE_KV_WRITE_HOOK");
+}
+
+fn enableActiveDecodeFrame() bool {
+    return !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_DECODE_FRAME");
+}
+
+fn enableActiveCompressedQuantBlock() bool {
+    return !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_COMPRESSED_QUANT_BLOCK") and
+        !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_COMPRESSED_Q80_BLOCK");
+}
+
+fn compareMonolithicQuantBlock() bool {
+    return getenvBool("TERMITE_METAL_COMPARE_MONOLITHIC_QUANT_BLOCK") or
+        getenvBool("TERMITE_METAL_COMPARE_MONOLITHIC_Q80_BLOCK");
+}
+
+fn traceQuantBlockRequested() bool {
+    return getenvBool("TERMITE_METAL_TRACE_QUANT_BLOCK") or
+        getenvBool("TERMITE_METAL_TRACE_Q80_BLOCK");
+}
+
+fn referenceQuantLinearDebug() bool {
+    return getenvBool("TERMITE_METAL_REFERENCE_QUANT_LINEAR");
+}
+
+fn uploadFloat32InputsToDevice() bool {
+    return getenvBool("TERMITE_METAL_UPLOAD_FLOAT32_INPUTS");
+}
+
+fn sharedUploadMaxBytes() usize {
+    return getenvUsize("TERMITE_METAL_SHARED_UPLOAD_MAX_BYTES") orelse 64 * 1024;
+}
+
+fn uploadStorageMode(byte_len: usize) metal_tensor_mod.StorageMode {
+    return if (byte_len <= sharedUploadMaxBytes()) .shared else .private;
+}
+
+fn dumpDecodeKvLayerTarget() ?usize {
+    return getenvUsize("TERMITE_METAL_DUMP_DECODE_KV_LAYER");
+}
+
+fn traceAttentionResidualNullRequested() bool {
+    return getenvBool("TERMITE_METAL_TRACE_ATTN_RESIDUAL_NULL");
+}
+
+fn traceAttentionResidualNullLayerTarget() ?usize {
+    return getenvUsize("TERMITE_METAL_TRACE_ATTN_RESIDUAL_NULL_LAYER");
+}
+
+fn enableContiguousSliceDeviceView() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_CONTIGUOUS_SLICE_DEVICE_VIEW");
+}
+
+pub const MetalCompute = if (build_options.enable_metal) struct {
+    // mlx_quant.zig is MLX-only; stub out the types we reference when MLX is off.
+    const mlx_quant = if (build_options.enable_mlx) @import("../backends/mlx_quant.zig") else struct {
+        pub const Provider = void;
+        pub const MetalProvider = void;
+    };
+    const metal_runtime = @import("../backends/metal_runtime.zig");
+    const metal_native_provider_mod = @import("../backends/metal_native_provider.zig");
+    const MetalNativeProvider = metal_native_provider_mod.MetalNativeProvider;
+    const ProviderImpl = MetalNativeProvider;
+    var host_materialize_trace_count: usize = 0;
+
+    const Buf = struct {
+        data: []f32,
+        allocator: std.mem.Allocator,
+        owned: bool,
+        shared_data_refcount: ?*usize = null,
+        logical_shape: ?[]i64 = null,
+        view_strides: ?[]usize = null,
+        logical_view_strides: ?[]usize = null,
+        view_index_map: ?[]usize = null,
+        shared_view_index_refcount: ?*usize = null,
+        view_base_offset: usize = 0,
+        metal_tensor: ?MetalTensor = null,
+        lazy_entry: ?*gpu_hosted_store_mod.LazyWeightEntry = null,
+        quantized_storage: ?*const QuantizedStorage = null,
+        runtime_quantized_storage: ?*const QuantizedStorage = null,
+        owned_quantized_storage: ?*QuantizedStorage = null,
+        native_dense_bytes: ?[]const u8 = null,
+        native_dense_dtype: ?tensor_mod.DType = null,
+        native_dense_bytes_owned: bool = false,
+    };
+
+    const NativeDenseBytes = struct {
+        bytes: []const u8,
+        dtype: tensor_mod.DType,
+        owned: bool = false,
+    };
+
+    const CachedDenseWeight = struct {
+        data: []f32,
+        logical_shape: []i64,
+        lazy_entry: ?*gpu_hosted_store_mod.LazyWeightEntry = null,
+        runtime_quantized_storage: ?*const QuantizedStorage = null,
+        native_dense_bytes: ?[]const u8 = null,
+        native_dense_dtype: ?tensor_mod.DType = null,
+        native_dense_bytes_owned: bool = false,
+
+        fn deinit(self: *CachedDenseWeight, allocator: std.mem.Allocator) void {
+            if (self.data.len != 0) allocator.free(self.data);
+            allocator.free(self.logical_shape);
+            if (self.native_dense_bytes_owned) {
+                if (self.native_dense_bytes) |bytes| allocator.free(bytes);
+            }
+            self.* = undefined;
+        }
+    };
+
+    const HostFallbackNative = struct {
+        allocator: std.mem.Allocator,
+        weight_store: NativeWeightStore,
+        compute: *native_compute_mod.NativeCompute,
+        cb: ops.ComputeBackend,
+
+        fn init(allocator: std.mem.Allocator) !HostFallbackNative {
+            var weight_store: NativeWeightStore = .{
+                .allocator = allocator,
+                .resident_weights = .empty,
+                .lazy_weights = .empty,
+            };
+            const compute = try allocator.create(native_compute_mod.NativeCompute);
+            errdefer allocator.destroy(compute);
+            compute.* = native_compute_mod.NativeCompute.init(allocator, &weight_store, null);
+            return .{
+                .allocator = allocator,
+                .weight_store = weight_store,
+                .compute = compute,
+                .cb = compute.computeBackend(),
+            };
+        }
+
+        fn deinit(self: *HostFallbackNative) void {
+            self.cb.deinit();
+            self.weight_store.resident_weights.deinit(self.allocator);
+            self.weight_store.lazy_weights.deinit(self.allocator);
+            native_compute_mod.deinitPrefetchQueue(&self.weight_store);
+        }
+    };
+
+    const HostUnaryOp = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh, erf, abs, sigmoid };
+    const HostBinaryOp = enum { add, multiply, subtract, divide, less_than, dot_general, concat_prim };
+    const HostReduceOp = enum { sum, max, mean };
+    const empty_f32: [0]f32 = .{};
+
+    const DynamicLinearSlotKey = struct {
+        weight_buf: usize,
+        bias_buf: usize,
+        quantized_storage: usize,
+        in_dim: usize,
+        out_dim: usize,
+    };
+
+    const DynamicLayerNormSlotKey = struct {
+        gamma_buf: usize,
+        beta_buf: usize,
+        hidden_size: usize,
+    };
+
+    const DynamicRmsNormSlotKey = struct {
+        weight_buf: usize,
+        hidden_size: usize,
+    };
+
+    pub const ReservedHiddenStatePair = struct {
+        front: CT,
+        back: CT,
+    };
+
+    const PendingKvDeviceSeed = struct {
+        attention: ops.AttentionContext,
+        k: MetalTensor,
+        v: MetalTensor,
+        num_kv_heads: u32,
+        head_dim: u32,
+
+        fn deinit(self: *PendingKvDeviceSeed) void {
+            self.k.deinit();
+            self.v.deinit();
+        }
+    };
+
+    const ActivePrefillFrameContractStorage = struct {
+        ops: []u16 = &.{},
+        barriers: []u8 = &.{},
+        quant_dispatches: []u8 = &.{},
+        command_ops: []ops.PlannedCommandOp = &.{},
+
+        fn deinit(self: *ActivePrefillFrameContractStorage, allocator: std.mem.Allocator) void {
+            if (self.ops.len != 0) allocator.free(self.ops);
+            if (self.barriers.len != 0) allocator.free(self.barriers);
+            if (self.quant_dispatches.len != 0) allocator.free(self.quant_dispatches);
+            if (self.command_ops.len != 0) allocator.free(self.command_ops);
+            self.* = .{};
+        }
+
+        fn view(self: *const ActivePrefillFrameContractStorage) metal_runtime.PlannedCommandContractStorage {
+            return .{
+                .ops = self.ops,
+                .barriers = self.barriers,
+                .quant_dispatches = self.quant_dispatches,
+                .command_ops = self.command_ops,
+            };
+        }
+    };
+
+    const PrefillFrameExecuteDeclineReason = enum {
+        no_runtime,
+        no_active_frame,
+        invalid_contract,
+        invalid_shape,
+        missing_plan,
+        plan_mismatch,
+        missing_ple,
+        output_hidden_set,
+    };
+
+    const PrefillFrameLayerDispatch = struct {
+        window: metal_command_planner.GatedFrameLayerWindow,
+        full_contract: ops.PlannedLayerContract,
+    };
+
+    const ActivePrefillFramePlanKey = struct {
+        contract: ops.DecoderRuntimeDecodeContract,
+        layer_count: usize,
+        rows: usize,
+        hidden_size: usize,
+        vocab_size: usize,
+        num_attention_heads: usize,
+        global_head_dim: usize,
+        ple_hidden_size: usize,
+        final_norm_slot: usize,
+        final_lm_head_slot: usize,
+        include_tail: bool,
+        layers_hash: u64,
+    };
+
+    const DeepSeekV4CacheKey = struct {
+        cache_key: usize,
+        layer_index: usize,
+    };
+
+    const DeepSeekV4DeviceComponent = struct {
+        projected: ?MetalTensor = null,
+        gate: ?MetalTensor = null,
+        compressed: ?MetalTensor = null,
+        positions: ?MetalTensor = null,
+        token_capacity: usize = 0,
+        row_capacity: usize = 0,
+        row_dim: usize = 0,
+        gate_width: usize = 0,
+        rows: usize = 0,
+
+        fn deinit(self: *DeepSeekV4DeviceComponent) void {
+            if (self.projected) |*tensor| tensor.deinit();
+            if (self.gate) |*tensor| tensor.deinit();
+            if (self.compressed) |*tensor| tensor.deinit();
+            if (self.positions) |*tensor| tensor.deinit();
+            self.* = .{};
+        }
+    };
+
+    const DeepSeekV4DeviceLayerCache = struct {
+        local: ?MetalTensor = null,
+        local_capacity: usize = 0,
+        local_dim: usize = 0,
+        token_count: usize = 0,
+        compressor: DeepSeekV4DeviceComponent = .{},
+        indexer: DeepSeekV4DeviceComponent = .{},
+
+        fn deinit(self: *DeepSeekV4DeviceLayerCache) void {
+            if (self.local) |*tensor| tensor.deinit();
+            self.compressor.deinit();
+            self.indexer.deinit();
+            self.* = .{};
+        }
+    };
+
+    allocator: std.mem.Allocator,
+    data: *WeightStore,
+    provider: if (build_options.enable_mlx) ?mlx_quant.Provider else void =
+        if (build_options.enable_mlx) null else {},
+    provider_impl: *ProviderImpl,
+    owned_native_provider: bool = false,
+    backend_kv_cache: std.AutoHashMapUnmanaged(BackendKvCacheKey, BackendKvCacheEntry) = .empty,
+    deepseek_v4_device_cache: std.AutoHashMapUnmanaged(DeepSeekV4CacheKey, DeepSeekV4DeviceLayerCache) = .empty,
+    backend_kv_write_serial: u64 = 0,
+    dense_weight_cache: std.StringHashMapUnmanaged(CachedDenseWeight) = .empty,
+    layer_output_scale_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
+    unit_rms_weight_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
+    zero_bias_cache: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
+    dynamic_linear_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
+    dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
+    dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
+    next_dynamic_linear_slot: usize = metal_runtime.decoder_runtime_linear_slot_capacity,
+    next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
+    next_dynamic_rms_norm_slot: usize = metal_runtime.decoder_runtime_rms_norm_slot_capacity,
+    active_prefill_frame_plan: ?metal_command_planner.GatedFrameCommandLowerer = null,
+    active_prefill_frame_plan_key: ?ActivePrefillFramePlanKey = null,
+    active_prefill_frame_contract_storage: ActivePrefillFrameContractStorage = .{},
+    active_prefill_frame_tail_contract: ?ops.PlannedLayerContract = null,
+    pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
+    timing_stats: ops.NativeQuantTimingStats = .{},
+    logged_quantized_gated_ffn_unsupported_type: bool = false,
+    logged_quantized_gated_ffn_backend_mixed_kind: bool = false,
+    logged_quantized_gated_ffn_backend_unsupported_kind: bool = false,
+    /// Optional Io for the CPU-fallback linalg path; see NativeCompute.io.
+    io: ?std.Io = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, null);
+    }
+
+    fn initWithOptionalIo(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        io: ?std.Io,
+    ) !MetalCompute {
+        _ = run_budget;
+        if (io == null and !builtin.is_test) {
+            const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
+            errdefer std.heap.c_allocator.destroy(provider_impl);
+            provider_impl.* = try MetalNativeProvider.create();
+            return .{
+                .allocator = allocator,
+                .data = data,
+                .provider = if (build_options.enable_mlx) null else {},
+                .provider_impl = provider_impl,
+                .owned_native_provider = true,
+                .io = io,
+            };
+        }
+        const lock_io = metalComputeLockIo(io);
+        data.shared_metal_native_provider_lock.lockUncancelable(lock_io);
+        defer data.shared_metal_native_provider_lock.unlock(lock_io);
+        const provider_impl = data.shared_metal_native_provider orelse blk: {
+            const created = try std.heap.c_allocator.create(MetalNativeProvider);
+            errdefer std.heap.c_allocator.destroy(created);
+            created.* = try MetalNativeProvider.create();
+            data.shared_metal_native_provider = created;
+            break :blk created;
+        };
+        return .{
+            .allocator = allocator,
+            .data = data,
+            .provider = if (build_options.enable_mlx) null else {},
+            .provider_impl = provider_impl,
+            .owned_native_provider = false,
+            .io = io,
+        };
+    }
+
+    pub fn initWithIo(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        io: std.Io,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, io);
+    }
+
+    pub fn dequantizeTensorToFloat32(cb: *const ops.ComputeBackend, tensor: CT, allocator: std.mem.Allocator) ![]f32 {
+        if (cb.kind() != .metal) return error.UnsupportedTensorType;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage) |storage| {
+            if (storage.packed_expert != null or storage.shape.len != 2) return error.UnsupportedTensorType;
+            const rows: usize = @intCast(storage.shape[0]);
+            const cols: usize = @intCast(storage.shape[1]);
+            if (try self.dequantizeQuantTensorWithRuntimeRowCopy(tensor, storage, rows, cols, allocator)) |output| {
+                return output;
+            }
+            const output = try allocator.alloc(f32, rows * cols);
+            errdefer allocator.free(output);
+            try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, output);
+            return output;
+        }
+        return toFloat32Op(cb.ptr, tensor, allocator);
+    }
+
+    pub fn getQuantizedStorage(cb: *const ops.ComputeBackend, tensor: CT) ?*const QuantizedStorage {
+        if (cb.kind() != .metal) return null;
+        const buf = toBuf(tensor);
+        return buf.quantized_storage orelse buf.runtime_quantized_storage;
+    }
+
+    pub fn debugHasRuntimeQuantizedStorage(cb: *const ops.ComputeBackend, tensor: CT) bool {
+        if (cb.kind() != .metal) return false;
+        return toBuf(tensor).runtime_quantized_storage != null;
+    }
+
+    pub fn debugHasDeviceTensor(cb: *const ops.ComputeBackend, tensor: CT) bool {
+        if (cb.kind() != .metal) return false;
+        const buf = toBuf(tensor);
+        return if (buf.metal_tensor) |metal_tensor| metal_tensor.isDevice() else false;
+    }
+
+    pub fn debugSharesStorage(cb: *const ops.ComputeBackend, a: CT, b: CT) bool {
+        if (cb.kind() != .metal) return false;
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        if (a_buf.metal_tensor) |a_tensor| {
+            if (b_buf.metal_tensor) |b_tensor| {
+                if (a_tensor.device) |a_device| {
+                    if (b_tensor.device) |b_device| return a_device.ref == b_device.ref;
+                }
+            }
+        }
+        if (a_buf.quantized_storage != null or b_buf.quantized_storage != null or
+            a_buf.runtime_quantized_storage != null or b_buf.runtime_quantized_storage != null or
+            a_buf.owned_quantized_storage != null or b_buf.owned_quantized_storage != null) return false;
+        if (a_buf.data.ptr != b_buf.data.ptr) return false;
+        if (a_buf.shared_data_refcount) |a_ref| {
+            if (b_buf.shared_data_refcount) |b_ref| return b_ref == a_ref;
+            return false;
+        }
+        return a_buf.data.len == b_buf.data.len;
+    }
+
+    pub const PlannedGraphScopeKind = enum {
+        attention_project,
+        embedding,
+        ffn,
+        ple,
+    };
+
+    pub const PlannedGraphScope = struct {
+        active: bool = false,
+        owns_frame: bool = false,
+    };
+
+    pub fn beginPlannedGraphScope(cb: *const ops.ComputeBackend, kind: PlannedGraphScopeKind) !PlannedGraphScope {
+        if (cb.kind() != .metal) return .{};
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.beginPlannedGraphScopeForSelf(kind);
+    }
+
+    fn beginPlannedGraphScopeForSelf(self: *MetalCompute, kind: PlannedGraphScopeKind) !PlannedGraphScope {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return .{};
+        var scope: PlannedGraphScope = .{};
+        const was_active = metal_runtime.hasActiveFrame(runtime);
+        if (!metal_runtime.hasActiveFrame(runtime)) {
+            scope.owns_frame = try self.beginDecoderRuntimeFrame(runtime);
+        }
+        if (!metal_runtime.hasActiveFrame(runtime)) return .{};
+        const source, const region = switch (kind) {
+            .attention_project => .{ metal_runtime.ComputeSource.quant_linear, metal_runtime.ComputeRegion.attention_project },
+            .embedding => .{ metal_runtime.ComputeSource.embedding, metal_runtime.ComputeRegion.embedding },
+            .ffn => .{ metal_runtime.ComputeSource.ffn, metal_runtime.ComputeRegion.ffn },
+            .ple => .{ metal_runtime.ComputeSource.ple, metal_runtime.ComputeRegion.ple },
+        };
+        metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(source), region) catch |err| switch (err) {
+            error.RuntimeUnavailable, error.FrameNotActive, error.PlannedScopeActive => {
+                if (scope.owns_frame) {
+                    var active = true;
+                    self.cancelDecoderRuntimeFrame(runtime, &active);
+                }
+                return .{};
+            },
+            else => return err,
+        };
+        if (traceMetalPlannedScopeLifecycle()) {
+            std.debug.print(
+                "metal_planned_scope_lifecycle: begin kind={s} was_active={} owns_frame={}\n",
+                .{ @tagName(kind), was_active, scope.owns_frame },
+            );
+        }
+        scope.active = true;
+        return scope;
+    }
+
+    pub fn endPlannedGraphScope(cb: *const ops.ComputeBackend, scope: PlannedGraphScope) !void {
+        if (cb.kind() != .metal) return;
+        if (!scope.active and !scope.owns_frame) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.endPlannedGraphScopeForSelf(scope);
+    }
+
+    fn endPlannedGraphScopeForSelf(self: *MetalCompute, scope: PlannedGraphScope) !void {
+        if (!scope.active and !scope.owns_frame) return;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        if (scope.active) {
+            metal_runtime.endPlannedComputeScope(runtime) catch |err| switch (err) {
+                error.PlannedScopeNotActive, error.RuntimeUnavailable => {},
+                else => return err,
+            };
+        }
+        if (traceMetalPlannedScopeLifecycle()) {
+            std.debug.print(
+                "metal_planned_scope_lifecycle: end active={} owns_frame={}\n",
+                .{ scope.active, scope.owns_frame },
+            );
+        }
+        if (scope.owns_frame) {
+            var active = metal_runtime.hasActiveFrame(runtime);
+            try self.submitAndWaitDecoderRuntimeFrame(runtime, &active);
+        }
+    }
+
+    fn traceMetalPlannedScopeLifecycle() bool {
+        const raw = std.c.getenv("TERMITE_METAL_TRACE_PLANNED_SCOPE_LIFECYCLE") orelse return false;
+        const value = std.mem.span(raw);
+        return value.len > 0 and !std.mem.eql(u8, value, "0");
+    }
+
+    fn bufHasAnyQuantizedStorage(buf: *const Buf) bool {
+        return buf.quantized_storage != null or
+            buf.runtime_quantized_storage != null or
+            buf.owned_quantized_storage != null;
+    }
+
+    pub fn makeDeviceResident(cb: *const ops.ComputeBackend, tensor: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null or
+            buf.runtime_quantized_storage != null or
+            buf.owned_quantized_storage != null)
+        {
+            return null;
+        }
+        if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
+            return null;
+        }
+        var device_tensor = try self.ownedDeviceMetalTensorFromCt(tensor);
+        errdefer device_tensor.deinit();
+        if (!device_tensor.isDevice()) {
+            device_tensor.deinit();
+            return null;
+        }
+        return self.ctFromOwnedMetalTensor(device_tensor);
+    }
+
+    pub fn zeroBiasTensor(cb: *const ops.ComputeBackend, out_dim: usize) !CT {
+        if (cb.kind() != .metal) return error.UnsupportedTensorType;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.cachedZeroBiasBuf(out_dim);
+    }
+
+    pub fn reserveHiddenStatePair(cb: *const ops.ComputeBackend, rows: usize, hidden_size: usize) !?ReservedHiddenStatePair {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        try metal_runtime.reserveHiddenState(runtime, rows, hidden_size);
+        const byte_len = rows * hidden_size * @sizeOf(f32);
+        const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
+
+        var front_tensor = MetalTensor.deviceOwned(
+            runtime,
+            metal_runtime.hiddenStateBuffer(runtime, .front) orelse return error.UnexpectedNull,
+            0,
+            byte_len,
+            &shape,
+        );
+        errdefer front_tensor.deinit();
+        const front = try self.metalTensorBufWithHostMaterialization(front_tensor, false);
+        errdefer freeOp(self, front);
+
+        var back_tensor = MetalTensor.deviceOwned(
+            runtime,
+            metal_runtime.hiddenStateBuffer(runtime, .back) orelse return error.UnexpectedNull,
+            0,
+            byte_len,
+            &shape,
+        );
+        errdefer back_tensor.deinit();
+        const back = try self.metalTensorBufWithHostMaterialization(back_tensor, false);
+        errdefer freeOp(self, back);
+
+        return .{
+            .front = front,
+            .back = back,
+        };
+    }
+
+    pub fn copyTensorInto(cb: *const ops.ComputeBackend, src: CT, dst: CT) !bool {
+        if (cb.kind() != .metal) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const dst_buf = toBuf(dst);
+        if (dst_buf.quantized_storage != null) return false;
+        if (dst_buf.metal_tensor) |*dst_tensor| {
+            var src_tensor = try self.ownedMetalTensorFromCt(src);
+            defer src_tensor.deinit();
+            return metal_runtime.copyTensorInto(self.provider_impl, src_tensor, dst_tensor);
+        }
+        return false;
+    }
+
+    pub fn applyPleResidual(
+        cb: *const ops.ComputeBackend,
+        hidden: CT,
+        ple: CT,
+        gate_linear_slot: usize,
+        proj_linear_slot: usize,
+        post_norm_slot: usize,
+        hidden_size: usize,
+        ple_hidden_size: usize,
+        eps: f32,
+        activation: ops.DecoderRuntimeActivationKind,
+    ) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var hidden_tensor = try self.ownedMetalTensorFromCt(hidden);
+        defer hidden_tensor.deinit();
+        var ple_tensor = try self.ownedMetalTensorFromCt(ple);
+        defer ple_tensor.deinit();
+        const result = (try metal_runtime.decoderRuntimeApplyPleResidualDevice(self.provider_impl, .{
+            .hidden = hidden_tensor,
+            .ple = ple_tensor,
+            .gate_linear_slot = gate_linear_slot,
+            .proj_linear_slot = proj_linear_slot,
+            .post_norm_slot = post_norm_slot,
+            .hidden_size = hidden_size,
+            .ple_hidden_size = ple_hidden_size,
+            .eps = eps,
+            .activation = activation,
+        })) orelse return null;
+        return self.ctFromOwnedMetalTensor(result);
+    }
+
+    pub fn debugGatherPagedKvLayer(
+        cb: *const ops.ComputeBackend,
+        allocator: std.mem.Allocator,
+        kv: ops.KvCacheView,
+        token_count: usize,
+        layer_index: usize,
+    ) !?ops.PagedKvLayerCacheRows {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return (try self.gatherPagedKvLayerFromBackendCache(
+            allocator,
+            kv,
+            token_count,
+            layer_index,
+        )) orelse try self.gatherPagedKvLayerFromGatheredSpan(
+            allocator,
+            kv,
+            token_count,
+            layer_index,
+        );
+    }
+
+    fn toBuf(ct: CT) *Buf {
+        return @ptrCast(@alignCast(ct));
+    }
+
+    fn denseBuf(
+        allocator: std.mem.Allocator,
+        data: []f32,
+        owned: bool,
+        shape: []const i32,
+    ) !CT {
+        const buf = try allocator.create(Buf);
+        errdefer allocator.destroy(buf);
+        const shared_data_refcount = if (owned) blk: {
+            const refcount = try allocator.create(usize);
+            errdefer allocator.destroy(refcount);
+            refcount.* = 1;
+            break :blk refcount;
+        } else null;
+        const logical_shape = try allocator.alloc(i64, shape.len);
+        errdefer {
+            allocator.free(logical_shape);
+            if (shared_data_refcount) |refcount| allocator.destroy(refcount);
+        }
+        for (shape, 0..) |dim, i| logical_shape[i] = dim;
+        buf.* = .{
+            .data = data,
+            .allocator = allocator,
+            .owned = owned,
+            .shared_data_refcount = shared_data_refcount,
+            .logical_shape = logical_shape,
+        };
+        return @ptrCast(buf);
+    }
+
+    fn initOwnedHostRefcount(allocator: std.mem.Allocator, owned: bool) !?*usize {
+        if (!owned) return null;
+        const refcount = try allocator.create(usize);
+        refcount.* = 1;
+        return refcount;
+    }
+
+    fn allocLogicalDenseStrides(allocator: std.mem.Allocator, shape: []const i64) ![]usize {
+        const strides = try allocator.alloc(usize, shape.len);
+        errdefer allocator.free(strides);
+        computeStrides(shape, strides);
+        return strides;
+    }
+
+    fn scalarBufWithLogicalShape(
+        self: *MetalCompute,
+        value: f32,
+        logical_shape: []const i64,
+    ) !CT {
+        const scalar = try self.allocator.alloc(f32, 1);
+        errdefer self.allocator.free(scalar);
+        scalar[0] = value;
+        const shape = [_]i32{1};
+        const buf = try denseBuf(self.allocator, scalar, true, &shape);
+        return self.withLogicalShape(buf, logical_shape);
+    }
+
+    fn repeatedBufWithLogicalShape(
+        self: *MetalCompute,
+        data: []const f32,
+        logical_shape: []const i64,
+    ) !CT {
+        const owned = try self.allocator.dupe(f32, data);
+        errdefer self.allocator.free(owned);
+        const shape = [_]i32{@intCast(data.len)};
+        const buf = try denseBuf(self.allocator, owned, true, &shape);
+        return self.withLogicalShape(buf, logical_shape);
+    }
+
+    fn logicalStridesOrContiguous(input: CT, resolved_shape: []const i64, scratch: []usize) []const usize {
+        const buf = toBuf(input);
+        if (buf.view_strides) |strides| return strides;
+        computeStrides(resolved_shape, scratch[0..resolved_shape.len]);
+        return scratch[0..resolved_shape.len];
+    }
+
+    fn makeViewAlias(
+        self: *MetalCompute,
+        input: CT,
+        shape: []const i64,
+        strides: []const usize,
+        base_offset: usize,
+    ) !CT {
+        const source = toBuf(input);
+        if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
+            return error.UnsupportedTensorType;
+        }
+
+        const alias = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(alias);
+        if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* += 1;
+        }
+        errdefer if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* -= 1;
+        };
+        alias.* = .{
+            .data = source.data,
+            .allocator = self.allocator,
+            .owned = source.owned,
+            .shared_data_refcount = source.shared_data_refcount,
+            .logical_shape = try self.allocator.dupe(i64, shape),
+            .view_strides = try self.allocator.dupe(usize, strides),
+            .logical_view_strides = try allocLogicalDenseStrides(self.allocator, shape),
+            .view_index_map = null,
+            .shared_view_index_refcount = null,
+            .view_base_offset = base_offset,
+            .metal_tensor = null,
+            .lazy_entry = null,
+            .quantized_storage = null,
+            .owned_quantized_storage = null,
+        };
+        return @ptrCast(alias);
+    }
+
+    fn aliasHostBufferWithShape(
+        self: *MetalCompute,
+        input: CT,
+        shape: []const i64,
+    ) !CT {
+        const source = toBuf(input);
+        if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
+            return error.UnsupportedTensorType;
+        }
+
+        const alias = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(alias);
+        if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* += 1;
+        }
+        errdefer if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* -= 1;
+        };
+        alias.* = .{
+            .data = source.data,
+            .allocator = self.allocator,
+            .owned = source.owned,
+            .shared_data_refcount = source.shared_data_refcount,
+            .logical_shape = try self.allocator.dupe(i64, shape),
+            .view_strides = null,
+            .logical_view_strides = null,
+            .view_index_map = null,
+            .shared_view_index_refcount = null,
+            .view_base_offset = 0,
+            .metal_tensor = null,
+            .lazy_entry = null,
+            .quantized_storage = null,
+            .owned_quantized_storage = null,
+        };
+        return @ptrCast(alias);
+    }
+
+    fn makeIndexViewAlias(
+        self: *MetalCompute,
+        input: CT,
+        shape: []const i64,
+        index_map: []const usize,
+    ) !CT {
+        const source = toBuf(input);
+        if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
+            return error.UnsupportedTensorType;
+        }
+
+        const alias = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(alias);
+        if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* += 1;
+        }
+        errdefer if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* -= 1;
+        };
+        alias.* = .{
+            .data = source.data,
+            .allocator = self.allocator,
+            .owned = source.owned,
+            .shared_data_refcount = source.shared_data_refcount,
+            .logical_shape = try self.allocator.dupe(i64, shape),
+            .view_strides = null,
+            .logical_view_strides = null,
+            .view_index_map = try self.allocator.dupe(usize, index_map),
+            .shared_view_index_refcount = null,
+            .view_base_offset = 0,
+            .metal_tensor = null,
+            .lazy_entry = null,
+            .quantized_storage = null,
+            .owned_quantized_storage = null,
+        };
+        return @ptrCast(alias);
+    }
+
+    fn adoptIndexViewAlias(
+        self: *MetalCompute,
+        input: CT,
+        shape: []const i64,
+        owned_index_map: []usize,
+    ) !CT {
+        const source = toBuf(input);
+        if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
+            return error.UnsupportedTensorType;
+        }
+
+        const alias = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(alias);
+        if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* += 1;
+        }
+        errdefer if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* -= 1;
+        };
+
+        alias.* = .{
+            .data = source.data,
+            .allocator = self.allocator,
+            .owned = source.owned,
+            .shared_data_refcount = source.shared_data_refcount,
+            .logical_shape = try self.allocator.dupe(i64, shape),
+            .view_strides = null,
+            .logical_view_strides = null,
+            .view_index_map = owned_index_map,
+            .shared_view_index_refcount = null,
+            .view_base_offset = 0,
+            .metal_tensor = null,
+            .lazy_entry = null,
+            .quantized_storage = null,
+            .owned_quantized_storage = null,
+        };
+        return @ptrCast(alias);
+    }
+
+    fn aliasHostIndexViewWithShape(
+        self: *MetalCompute,
+        input: CT,
+        shape: []const i64,
+    ) !CT {
+        const source = toBuf(input);
+        const source_index_map = source.view_index_map orelse return error.InvalidTensorShape;
+        if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
+            return error.UnsupportedTensorType;
+        }
+
+        const alias = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(alias);
+        if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* += 1;
+        }
+        errdefer if (source.owned and source.shared_data_refcount != null) {
+            source.shared_data_refcount.?.* -= 1;
+        };
+
+        const view_refcount = if (source.shared_view_index_refcount) |refcount| blk: {
+            refcount.* += 1;
+            break :blk refcount;
+        } else blk: {
+            const refcount = try self.allocator.create(usize);
+            errdefer self.allocator.destroy(refcount);
+            refcount.* = 2;
+            source.shared_view_index_refcount = refcount;
+            break :blk refcount;
+        };
+        errdefer {
+            view_refcount.* -= 1;
+            if (view_refcount.* == 0) {
+                self.allocator.free(source_index_map);
+                self.allocator.destroy(view_refcount);
+            }
+        }
+
+        alias.* = .{
+            .data = source.data,
+            .allocator = self.allocator,
+            .owned = source.owned,
+            .shared_data_refcount = source.shared_data_refcount,
+            .logical_shape = try self.allocator.dupe(i64, shape),
+            .view_strides = null,
+            .logical_view_strides = null,
+            .view_index_map = source_index_map,
+            .shared_view_index_refcount = view_refcount,
+            .view_base_offset = 0,
+            .metal_tensor = null,
+            .lazy_entry = null,
+            .quantized_storage = null,
+            .owned_quantized_storage = null,
+        };
+        return @ptrCast(alias);
+    }
+
+    fn hasHostView(buf: *const Buf) bool {
+        return buf.view_strides != null or buf.view_index_map != null;
+    }
+
+    fn isContiguousLogicalView(shape: []const i64, strides: []const usize) bool {
+        if (shape.len != strides.len) return false;
+        var expected_stride: usize = 1;
+        var axis = shape.len;
+        while (axis > 0) {
+            axis -= 1;
+            const dim = shape[axis];
+            if (dim <= 0) return false;
+            if (dim != 1 and strides[axis] != expected_stride) return false;
+            expected_stride = std.math.mul(usize, expected_stride, @intCast(dim)) catch return false;
+        }
+        return true;
+    }
+
+    fn wrapRepeatedBufferIndex(idx: usize, len: usize) usize {
+        if (len == 0) return 0;
+        if (idx < len) return idx;
+        return idx % len;
+    }
+
+    const ContiguousSliceRange = struct {
+        offset_elems: usize,
+        len_elems: usize,
+    };
+
+    fn contiguousSliceRange(
+        in_shape: []const i64,
+        out_shape: []const i64,
+        starts: []const usize,
+        strides: []const usize,
+    ) ?ContiguousSliceRange {
+        if (in_shape.len != out_shape.len or in_shape.len != starts.len or in_shape.len != strides.len) return null;
+        if (in_shape.len > metal_tensor_mod.max_dims) return null;
+        const out_numel = safeShapeNumel(out_shape) orelse return null;
+        if (out_numel == 0) return null;
+
+        var last_changed: ?usize = null;
+        for (0..in_shape.len) |axis| {
+            const dim = in_shape[axis];
+            const out_dim = out_shape[axis];
+            if (dim <= 0 or out_dim < 0) return null;
+            if (strides[axis] != 1) return null;
+            const dim_usize: usize = @intCast(dim);
+            const out_dim_usize: usize = @intCast(out_dim);
+            if (starts[axis] > dim_usize) return null;
+            if (out_dim_usize > dim_usize - starts[axis]) return null;
+            if (starts[axis] != 0 or out_dim != dim) last_changed = axis;
+        }
+
+        var in_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        computeStrides(in_shape, in_strides[0..in_shape.len]);
+
+        var offset_elems: usize = 0;
+        for (0..in_shape.len) |axis| {
+            const axis_offset = std.math.mul(usize, starts[axis], in_strides[axis]) catch return null;
+            offset_elems = std.math.add(usize, offset_elems, axis_offset) catch return null;
+        }
+
+        const cut = last_changed orelse return .{ .offset_elems = offset_elems, .len_elems = out_numel };
+
+        var axis: usize = 0;
+        while (axis < cut) : (axis += 1) {
+            if (out_shape[axis] != 1) return null;
+        }
+        axis = cut + 1;
+        while (axis < in_shape.len) : (axis += 1) {
+            if (starts[axis] != 0 or out_shape[axis] != in_shape[axis]) return null;
+        }
+
+        return .{ .offset_elems = offset_elems, .len_elems = out_numel };
+    }
+
+    fn metalTensorBufWithHostMaterialization(
+        self: *MetalCompute,
+        tensor: MetalTensor,
+        materialize_host: bool,
+    ) !CT {
+        var tensor_mut = tensor;
+        const buf = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(buf);
+        const logical_shape = try self.allocator.alloc(i64, tensor.shape().len);
+        errdefer self.allocator.free(logical_shape);
+        for (tensor.shape(), 0..) |dim, i| logical_shape[i] = dim;
+        buf.* = .{
+            .data = if (materialize_host)
+                try tensor_mut.toHostSlice()
+            else
+                @as([*]f32, @ptrFromInt(@alignOf(f32)))[0..0],
+            .allocator = self.allocator,
+            .owned = false,
+            .logical_shape = logical_shape,
+            .metal_tensor = tensor,
+        };
+        return @ptrCast(buf);
+    }
+
+    fn metalTensorBuf(
+        self: *MetalCompute,
+        tensor: MetalTensor,
+    ) !CT {
+        return self.metalTensorBufWithHostMaterialization(tensor, true);
+    }
+
+    fn hostSliceForBuf(buf: *Buf) ![]f32 {
+        if (buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (buf.metal_tensor) |*metal_tensor| {
+            const limit = traceHostMaterializeLimit();
+            if (host_materialize_trace_count < limit) {
+                host_materialize_trace_count += 1;
+                std.debug.print(
+                    "metal_host_materialize: caller=0x{x} bytes={d} tensor_shape={any} logical_shape={any}\n",
+                    .{ @returnAddress(), metal_tensor.deviceByteLen(), metal_tensor.shape(), buf.logical_shape },
+                );
+            }
+            return metal_tensor.toHostSlice();
+        }
+        if (hasHostView(buf)) try materializeViewData(buf);
+        if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
+            return error.UnsupportedTensorType;
+        }
+        return buf.data;
+    }
+
+    fn compareMetalTensors(
+        label: []const u8,
+        layer_index: usize,
+        row_dim: usize,
+        lhs: *MetalTensor,
+        rhs: *MetalTensor,
+    ) !void {
+        const lhs_host = try lhs.toHostSlice();
+        const rhs_host = try rhs.toHostSlice();
+        if (lhs_host.len != rhs_host.len or lhs_host.len == 0) {
+            std.debug.print(
+                "{s} layer={d} shape_mismatch lhs={d} rhs={d}\n",
+                .{ label, layer_index, lhs_host.len, rhs_host.len },
+            );
+            return;
+        }
+        var max_abs: f32 = 0.0;
+        var max_idx: usize = 0;
+        var sum_abs: f64 = 0.0;
+        for (lhs_host, rhs_host, 0..) |l, r, idx| {
+            const diff = @abs(l - r);
+            sum_abs += diff;
+            if (diff > max_abs) {
+                max_abs = diff;
+                max_idx = idx;
+            }
+        }
+        const rows = if (row_dim == 0) 0 else lhs_host.len / row_dim;
+        std.debug.print(
+            "{s} layer={d} rows={d} row_dim={d} max_abs={d:.6}@{d} mean_abs={d:.6}\n",
+            .{ label, layer_index, rows, row_dim, max_abs, max_idx, sum_abs / @as(f64, @floatFromInt(lhs_host.len)) },
+        );
+    }
+
+    fn debugDecodeFiniteCt(self: *MetalCompute, comptime label: []const u8, layer_index: usize, tensor: CT) void {
+        if (!debugDecoderRuntimeFinite()) return;
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) return;
+        const buf = toBuf(tensor);
+        const data = hostSliceForBuf(buf) catch |err| {
+            std.debug.print("decode-finite label={s} layer={d} error={s}\n", .{ label, layer_index, @errorName(err) });
+            return;
+        };
+        var nonfinite: usize = 0;
+        var nan_count: usize = 0;
+        var inf_count: usize = 0;
+        var first_bad: usize = data.len;
+        var min_value: f32 = std.math.inf(f32);
+        var max_value: f32 = -std.math.inf(f32);
+        var max_abs: f32 = 0;
+        for (data, 0..) |value, i| {
+            if (!std.math.isFinite(value)) {
+                nonfinite += 1;
+                if (first_bad == data.len) first_bad = i;
+                if (std.math.isNan(value)) nan_count += 1 else if (std.math.isInf(value)) inf_count += 1;
+                continue;
+            }
+            min_value = @min(min_value, value);
+            max_value = @max(max_value, value);
+            max_abs = @max(max_abs, @abs(value));
+        }
+        std.debug.print(
+            "decode-finite label={s} layer={d} elems={d} nonfinite={d} nan={d} inf={d} first_bad={d} min={e} max={e} max_abs={e}\n",
+            .{ label, layer_index, data.len, nonfinite, nan_count, inf_count, first_bad, min_value, max_value, max_abs },
+        );
+    }
+
+    fn bufElemCount(buf: *const Buf) usize {
+        if (hasHostView(buf)) {
+            if (buf.logical_shape) |shape| {
+                if (safeShapeNumel(shape)) |numel| return numel;
+            }
+        }
+        if (buf.metal_tensor) |*metal_tensor| return metal_tensor.elemCount();
+        return buf.data.len;
+    }
+
+    fn releaseOwnedHostData(buf: *Buf) void {
+        if (!buf.owned) return;
+        if (buf.shared_data_refcount) |refcount| {
+            std.debug.assert(refcount.* > 0);
+            refcount.* -= 1;
+            if (refcount.* == 0) {
+                buf.allocator.free(buf.data);
+                buf.allocator.destroy(refcount);
+            }
+        } else {
+            buf.allocator.free(buf.data);
+        }
+        buf.owned = false;
+        buf.shared_data_refcount = null;
+    }
+
+    fn releaseViewIndexMap(buf: *Buf) void {
+        const index_map = buf.view_index_map orelse return;
+        if (buf.shared_view_index_refcount) |refcount| {
+            std.debug.assert(refcount.* > 0);
+            refcount.* -= 1;
+            if (refcount.* == 0) {
+                buf.allocator.free(index_map);
+                buf.allocator.destroy(refcount);
+            }
+        } else {
+            buf.allocator.free(index_map);
+        }
+        buf.view_index_map = null;
+        buf.shared_view_index_refcount = null;
+    }
+
+    fn materializeViewData(buf: *Buf) !void {
+        const logical_shape = buf.logical_shape orelse return error.InvalidTensorShape;
+        const numel = try shapeNumel(logical_shape);
+        if (buf.data.len == 0) return error.UnsupportedShape;
+
+        if (buf.view_index_map) |index_map| {
+            if (index_map.len != numel) return error.InvalidTensorShape;
+            const output = try buf.allocator.alloc(f32, numel);
+            errdefer buf.allocator.free(output);
+            for (0..numel) |i| {
+                const base_idx = index_map[i];
+                if (base_idx >= buf.data.len) return error.InvalidTensorShape;
+                output[i] = buf.data[base_idx];
+            }
+
+            const refcount = try initOwnedHostRefcount(buf.allocator, true);
+            releaseOwnedHostData(buf);
+            buf.data = output;
+            buf.owned = true;
+            buf.shared_data_refcount = refcount;
+            releaseViewIndexMap(buf);
+            buf.view_base_offset = 0;
+            return;
+        }
+
+        const view_strides = buf.view_strides orelse return;
+        const can_wrap_repeated = numel > buf.data.len and buf.data.len > 0 and numel % buf.data.len == 0;
+
+        const output = try buf.allocator.alloc(f32, numel);
+        errdefer buf.allocator.free(output);
+        const out_strides = buf.logical_view_strides orelse blk: {
+            var local_out_strides: [metal_tensor_mod.max_dims]usize = undefined;
+            computeStrides(logical_shape, local_out_strides[0..logical_shape.len]);
+            break :blk local_out_strides[0..logical_shape.len];
+        };
+        for (0..numel) |flat_out| {
+            var remaining = flat_out;
+            var flat_in = buf.view_base_offset;
+            for (0..logical_shape.len) |d| {
+                const coord = remaining / out_strides[d];
+                remaining %= out_strides[d];
+                flat_in += coord * view_strides[d];
+            }
+            if (flat_in >= buf.data.len) {
+                if (!can_wrap_repeated) return error.InvalidTensorShape;
+                output[flat_out] = buf.data[flat_in % buf.data.len];
+            } else {
+                output[flat_out] = buf.data[flat_in];
+            }
+        }
+
+        const refcount = try initOwnedHostRefcount(buf.allocator, true);
+        releaseOwnedHostData(buf);
+        buf.data = output;
+        buf.owned = true;
+        buf.shared_data_refcount = refcount;
+        buf.allocator.free(view_strides);
+        buf.view_strides = null;
+        if (buf.logical_view_strides) |strides| {
+            buf.allocator.free(strides);
+            buf.logical_view_strides = null;
+        }
+        buf.view_base_offset = 0;
+    }
+
+    fn logicalValueAtFlat(buf: *const Buf, flat: usize) !f32 {
+        if (buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (buf.metal_tensor) |metal_tensor| {
+            var tensor_mut = metal_tensor;
+            const host = try tensor_mut.toHostSlice();
+            return host[wrapRepeatedBufferIndex(flat, host.len)];
+        }
+        if (buf.view_index_map) |index_map| {
+            if (index_map.len == 0) return error.InvalidTensorShape;
+            return buf.data[index_map[flat % index_map.len]];
+        }
+        if (buf.view_strides) |view_strides| {
+            const logical_shape = buf.logical_shape orelse return error.InvalidTensorShape;
+            const numel = try shapeNumel(logical_shape);
+            if (numel == 0) return error.InvalidTensorShape;
+            const out_strides = buf.logical_view_strides orelse blk: {
+                var local_out_strides: [metal_tensor_mod.max_dims]usize = undefined;
+                computeStrides(logical_shape, local_out_strides[0..logical_shape.len]);
+                break :blk local_out_strides[0..logical_shape.len];
+            };
+            const logical_flat = flat % numel;
+            var remaining = logical_flat;
+            var flat_in = buf.view_base_offset;
+            for (0..logical_shape.len) |d| {
+                const coord = remaining / out_strides[d];
+                remaining %= out_strides[d];
+                flat_in += coord * view_strides[d];
+            }
+            return buf.data[wrapRepeatedBufferIndex(flat_in, buf.data.len)];
+        }
+        return buf.data[wrapRepeatedBufferIndex(flat, buf.data.len)];
+    }
+
+    fn tryDirectDenseHostValue(buf: *const Buf, flat: usize) ?f32 {
+        if (buf.quantized_storage != null) return null;
+        if (buf.metal_tensor != null) return null;
+        if (hasHostView(buf)) return null;
+        if (buf.data.len == 0) return null;
+        return buf.data[wrapRepeatedBufferIndex(flat, buf.data.len)];
+    }
+
+    fn convertTensorToOwnedF32(allocator: std.mem.Allocator, tensor: *const tensor_mod.Tensor) ![]f32 {
+        const count = tensor.elementCount();
+        const out = try allocator.alloc(f32, count);
+        switch (tensor.dtype) {
+            .f32 => {
+                if (tensor.asFloat32IfAligned()) |src| {
+                    @memcpy(out, src);
+                } else {
+                    const src_bytes: [*]const u8 = tensor.data.ptr;
+                    for (0..count) |i| {
+                        const offset = i * 4;
+                        const bits: u32 = @bitCast([4]u8{
+                            src_bytes[offset],
+                            src_bytes[offset + 1],
+                            src_bytes[offset + 2],
+                            src_bytes[offset + 3],
+                        });
+                        out[i] = @bitCast(bits);
+                    }
+                }
+            },
+            .f16 => {
+                const src_bytes: [*]const u8 = tensor.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 2;
+                    const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                    out[i] = @floatCast(half);
+                }
+            },
+            .bf16 => {
+                const src_bytes: [*]const u8 = tensor.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 2;
+                    const bits: u16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                    out[i] = @bitCast(@as(u32, bits) << 16);
+                }
+            },
+            .f64 => {
+                const src = tensor.asFloat64();
+                for (src, 0..) |value, i| out[i] = @floatCast(value);
+            },
+            .i8 => {
+                const src = tensor.asInt8();
+                for (src, 0..) |value, i| out[i] = @floatFromInt(value);
+            },
+            .i16 => {
+                const src = tensor.asInt16();
+                for (src, 0..) |value, i| out[i] = @floatFromInt(value);
+            },
+            .i32 => {
+                const src_bytes: [*]const u8 = tensor.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 4;
+                    const value = std.mem.readInt(i32, src_bytes[offset..][0..4], .little);
+                    out[i] = @floatFromInt(value);
+                }
+            },
+            .i64 => {
+                const src = tensor.asInt64();
+                for (src, 0..) |value, i| out[i] = @floatFromInt(value);
+            },
+            .u8 => {
+                const src = std.mem.bytesAsSlice(u8, tensor.data);
+                for (src, 0..) |value, i| out[i] = @floatFromInt(value);
+            },
+            .bool_ => {
+                const src = std.mem.bytesAsSlice(u8, tensor.data);
+                for (src, 0..) |value, i| out[i] = if (value == 0) 0.0 else 1.0;
+            },
+        }
+        return out;
+    }
+
+    fn convertNativeDenseBytesToOwnedF32(
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        dtype: tensor_mod.DType,
+        expected_count: usize,
+    ) ![]f32 {
+        const elem_size: usize = switch (dtype) {
+            .f32, .i32 => 4,
+            .f16, .bf16, .i16 => 2,
+            .f64, .i64 => 8,
+            .i8, .u8, .bool_ => 1,
+        };
+        if (expected_count != 0 and bytes.len != std.math.mul(usize, expected_count, elem_size) catch return error.InvalidTensorShape) return error.InvalidTensorShape;
+        if (expected_count == 0 and bytes.len % elem_size != 0) return error.InvalidTensorShape;
+        const count = if (expected_count != 0) expected_count else bytes.len / elem_size;
+        const out = try allocator.alloc(f32, count);
+        errdefer allocator.free(out);
+        const src: [*]const u8 = bytes.ptr;
+        switch (dtype) {
+            .f32 => {
+                for (0..count) |i| {
+                    const offset = i * 4;
+                    const bits = std.mem.readInt(u32, src[offset..][0..4], .little);
+                    out[i] = @bitCast(bits);
+                }
+            },
+            .f16 => {
+                for (0..count) |i| {
+                    const offset = i * 2;
+                    const half: f16 = @bitCast(std.mem.readInt(u16, src[offset..][0..2], .little));
+                    out[i] = @floatCast(half);
+                }
+            },
+            .bf16 => {
+                for (0..count) |i| {
+                    const offset = i * 2;
+                    const bits = std.mem.readInt(u16, src[offset..][0..2], .little);
+                    out[i] = @bitCast(@as(u32, bits) << 16);
+                }
+            },
+            .f64 => {
+                for (0..count) |i| {
+                    const offset = i * 8;
+                    const bits = std.mem.readInt(u64, src[offset..][0..8], .little);
+                    out[i] = @floatCast(@as(f64, @bitCast(bits)));
+                }
+            },
+            .i8 => {
+                for (0..count) |i| out[i] = @floatFromInt(@as(i8, @bitCast(src[i])));
+            },
+            .i16 => {
+                for (0..count) |i| {
+                    const offset = i * 2;
+                    out[i] = @floatFromInt(std.mem.readInt(i16, src[offset..][0..2], .little));
+                }
+            },
+            .i32 => {
+                for (0..count) |i| {
+                    const offset = i * 4;
+                    out[i] = @floatFromInt(std.mem.readInt(i32, src[offset..][0..4], .little));
+                }
+            },
+            .i64 => {
+                for (0..count) |i| {
+                    const offset = i * 8;
+                    out[i] = @floatFromInt(std.mem.readInt(i64, src[offset..][0..8], .little));
+                }
+            },
+            .u8 => {
+                for (0..count) |i| out[i] = @floatFromInt(src[i]);
+            },
+            .bool_ => {
+                for (0..count) |i| out[i] = if (src[i] == 0) 0.0 else 1.0;
+            },
+        }
+        return out;
+    }
+
+    fn copyTensorRowToF32(
+        tensor: *const tensor_mod.Tensor,
+        row_index: usize,
+        row_width: usize,
+        output: []f32,
+    ) !void {
+        if (output.len < row_width) return error.InvalidTensorShape;
+        switch (tensor.dtype) {
+            .f32 => {
+                if (tensor.asFloat32IfAligned()) |src| {
+                    @memcpy(output[0..row_width], src[row_index * row_width ..][0..row_width]);
+                } else {
+                    const src_bytes: [*]const u8 = tensor.data.ptr;
+                    const row_offset = row_index * row_width * 4;
+                    for (0..row_width) |j| {
+                        const offset = row_offset + j * 4;
+                        const bits: u32 = @bitCast([4]u8{
+                            src_bytes[offset],
+                            src_bytes[offset + 1],
+                            src_bytes[offset + 2],
+                            src_bytes[offset + 3],
+                        });
+                        output[j] = @bitCast(bits);
+                    }
+                }
+            },
+            .f16 => {
+                const src_bytes: [*]const u8 = tensor.data.ptr;
+                const row_offset = row_index * row_width * 2;
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 2;
+                    const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                    output[j] = @floatCast(half);
+                }
+            },
+            .bf16 => {
+                const src_bytes: [*]const u8 = tensor.data.ptr;
+                const row_offset = row_index * row_width * 2;
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 2;
+                    const bits: u16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                    output[j] = @bitCast(@as(u32, bits) << 16);
+                }
+            },
+            else => return error.UnsupportedTensorType,
+        }
+    }
+
+    fn copyNativeDenseRowToF32(
+        bytes: []const u8,
+        dtype: tensor_mod.DType,
+        row_index: usize,
+        row_count: usize,
+        row_width: usize,
+        output: []f32,
+    ) !void {
+        if (output.len < row_width or row_index >= row_count) return error.InvalidTensorShape;
+        const elem_size: usize = switch (dtype) {
+            .f32, .i32 => 4,
+            .f16, .bf16, .i16 => 2,
+            .f64, .i64 => 8,
+            .i8, .u8, .bool_ => 1,
+        };
+        const expected_bytes = try std.math.mul(usize, try std.math.mul(usize, row_count, row_width), elem_size);
+        if (bytes.len < expected_bytes) return error.InvalidTensorShape;
+        const row_offset = try std.math.mul(usize, try std.math.mul(usize, row_index, row_width), elem_size);
+        const src: [*]const u8 = bytes.ptr;
+        switch (dtype) {
+            .f32 => {
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 4;
+                    const bits = std.mem.readInt(u32, src[offset..][0..4], .little);
+                    output[j] = @bitCast(bits);
+                }
+            },
+            .f16 => {
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 2;
+                    const half: f16 = @bitCast(std.mem.readInt(u16, src[offset..][0..2], .little));
+                    output[j] = @floatCast(half);
+                }
+            },
+            .bf16 => {
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 2;
+                    const bits = std.mem.readInt(u16, src[offset..][0..2], .little);
+                    output[j] = @bitCast(@as(u32, bits) << 16);
+                }
+            },
+            .f64 => {
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 8;
+                    const bits = std.mem.readInt(u64, src[offset..][0..8], .little);
+                    output[j] = @floatCast(@as(f64, @bitCast(bits)));
+                }
+            },
+            .i8 => {
+                for (0..row_width) |j| output[j] = @floatFromInt(@as(i8, @bitCast(src[row_offset + j])));
+            },
+            .i16 => {
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 2;
+                    output[j] = @floatFromInt(std.mem.readInt(i16, src[offset..][0..2], .little));
+                }
+            },
+            .i32 => {
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 4;
+                    output[j] = @floatFromInt(std.mem.readInt(i32, src[offset..][0..4], .little));
+                }
+            },
+            .i64 => {
+                for (0..row_width) |j| {
+                    const offset = row_offset + j * 8;
+                    output[j] = @floatFromInt(std.mem.readInt(i64, src[offset..][0..8], .little));
+                }
+            },
+            .u8 => {
+                for (0..row_width) |j| output[j] = @floatFromInt(src[row_offset + j]);
+            },
+            .bool_ => {
+                for (0..row_width) |j| output[j] = if (src[row_offset + j] == 0) 0.0 else 1.0;
+            },
+        }
+    }
+
+    fn linearTensorTransBToF32(
+        tensor: *const tensor_mod.Tensor,
+        input: []const f32,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        output: []f32,
+    ) !void {
+        if (tensor.shape.len != 2 or
+            @as(usize, @intCast(tensor.shape[0])) != out_dim or
+            @as(usize, @intCast(tensor.shape[1])) != in_dim or
+            input.len != rows * in_dim or
+            output.len != rows * out_dim)
+        {
+            return error.InvalidTensorShape;
+        }
+        switch (tensor.dtype) {
+            .f32 => {
+                if (tensor.asFloat32IfAligned()) |weight| {
+                    native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, input, weight, 0.0, output);
+                } else {
+                    const src_bytes: [*]const u8 = tensor.data.ptr;
+                    for (0..rows) |r| {
+                        for (0..out_dim) |o| {
+                            var acc: f32 = 0.0;
+                            const weight_row = o * in_dim;
+                            for (0..in_dim) |i| {
+                                const offset = (weight_row + i) * 4;
+                                const bits: u32 = @bitCast([4]u8{
+                                    src_bytes[offset],
+                                    src_bytes[offset + 1],
+                                    src_bytes[offset + 2],
+                                    src_bytes[offset + 3],
+                                });
+                                acc += input[r * in_dim + i] * @as(f32, @bitCast(bits));
+                            }
+                            output[r * out_dim + o] = acc;
+                        }
+                    }
+                }
+            },
+            .f16 => {
+                const src_bytes: [*]const u8 = tensor.data.ptr;
+                for (0..rows) |r| {
+                    for (0..out_dim) |o| {
+                        var acc: f32 = 0.0;
+                        const weight_row = o * in_dim;
+                        for (0..in_dim) |i| {
+                            const offset = (weight_row + i) * 2;
+                            const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                            acc += input[r * in_dim + i] * @as(f32, @floatCast(half));
+                        }
+                        output[r * out_dim + o] = acc;
+                    }
+                }
+            },
+            .bf16 => {
+                const src_bytes: [*]const u8 = tensor.data.ptr;
+                for (0..rows) |r| {
+                    for (0..out_dim) |o| {
+                        var acc: f32 = 0.0;
+                        const weight_row = o * in_dim;
+                        for (0..in_dim) |i| {
+                            const offset = (weight_row + i) * 2;
+                            const bits: u16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                            acc += input[r * in_dim + i] * @as(f32, @bitCast(@as(u32, bits) << 16));
+                        }
+                        output[r * out_dim + o] = acc;
+                    }
+                }
+            },
+            else => return error.UnsupportedTensorType,
+        }
+    }
+
+    fn logicalShapeFromMlxArray(self: *MetalCompute, arr: mlx.c.mlx_array) ![]i64 {
+        if (comptime build_options.enable_mlx) {
+            const ndim: usize = @intCast(mlx.c.mlx_array_ndim(arr));
+            const shape = try self.allocator.alloc(i64, ndim);
+            for (0..ndim) |axis| shape[axis] = @intCast(mlx.c.mlx_array_dim(arr, @intCast(axis)));
+            return shape;
+        }
+        unreachable;
+    }
+
+    fn logicalShapeFromTensor(self: *MetalCompute, tensor: *const tensor_mod.Tensor) ![]i64 {
+        return self.allocator.dupe(i64, tensor.shape);
+    }
+
+    fn isGpt2Conv1dWeight(name: []const u8) bool {
+        if (!std.mem.startsWith(u8, name, "h.")) return false;
+        if (!std.mem.endsWith(u8, name, ".weight")) return false;
+        if (std.mem.indexOf(u8, name, ".attn.") != null) return true;
+        if (std.mem.indexOf(u8, name, ".mlp.") != null) return true;
+        return false;
+    }
+
+    fn repackGpt2Conv1dResidentHostOrder(
+        self: *MetalCompute,
+        host: []f32,
+        logical_shape: []const i64,
+    ) ![]f32 {
+        if (logical_shape.len != 2) return host;
+        const rows: usize = @intCast(logical_shape[0]);
+        const cols: usize = @intCast(logical_shape[1]);
+        if (rows == 0 or cols == 0) return host;
+        if (host.len != rows * cols) return error.InvalidTensorShape;
+
+        const repacked = try self.allocator.alloc(f32, host.len);
+        errdefer self.allocator.free(repacked);
+        for (0..rows) |r| {
+            for (0..cols) |c| {
+                repacked[r * cols + c] = host[c * rows + r];
+            }
+        }
+        self.allocator.free(host);
+        return repacked;
+    }
+
+    fn nativeDenseLinearBytesForRuntime(self: *MetalCompute, name: []const u8, tensor: *const tensor_mod.Tensor) !?NativeDenseBytes {
+        _ = self;
+        const eligible = tensor.dtype == .bf16 and tensor.shape.len == 2;
+        if (getenvBool("TERMITE_METAL_TRACE_DENSE_LINEAR_PREPARE") and (eligible or tensor.shape.len == 2)) {
+            std.debug.print(
+                "metal_dense_native_candidate: name={s} dtype={s} rank={d} bytes={d} eligible={}\n",
+                .{ name, @tagName(tensor.dtype), tensor.shape.len, tensor.data.len, eligible },
+            );
+        }
+        if (!eligible) return null;
+        return .{
+            .bytes = tensor.data,
+            .dtype = tensor.dtype,
+            .owned = false,
+        };
+    }
+
+    fn makeWeightBuf(
+        self: *MetalCompute,
+        data: []f32,
+        owned: bool,
+        logical_shape: []i64,
+        lazy_entry: ?*gpu_hosted_store_mod.LazyWeightEntry,
+        quantized_storage: ?*const QuantizedStorage,
+        runtime_quantized_storage: ?*const QuantizedStorage,
+    ) !CT {
+        const buf = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(buf);
+        const shared_data_refcount = try initOwnedHostRefcount(self.allocator, owned);
+        errdefer if (shared_data_refcount) |refcount| self.allocator.destroy(refcount);
+        buf.* = .{
+            .data = data,
+            .allocator = self.allocator,
+            .owned = owned,
+            .shared_data_refcount = shared_data_refcount,
+            .logical_shape = logical_shape,
+            .lazy_entry = lazy_entry,
+            .quantized_storage = quantized_storage,
+            .runtime_quantized_storage = runtime_quantized_storage,
+            .native_dense_bytes = null,
+            .native_dense_dtype = null,
+        };
+        return @ptrCast(buf);
+    }
+
+    fn getOrInsertCachedDenseWeight(
+        self: *MetalCompute,
+        full_name: []const u8,
+        data: []f32,
+        logical_shape: []i64,
+        lazy_entry: ?*gpu_hosted_store_mod.LazyWeightEntry,
+        runtime_quantized_storage: ?*const QuantizedStorage,
+        native_dense: ?NativeDenseBytes,
+        native_dense_dtype: ?tensor_mod.DType,
+    ) !*const CachedDenseWeight {
+        const gop = try self.dense_weight_cache.getOrPut(self.allocator, full_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, full_name);
+            errdefer self.allocator.free(gop.key_ptr.*);
+            gop.value_ptr.* = .{
+                .data = data,
+                .logical_shape = logical_shape,
+                .lazy_entry = lazy_entry,
+                .runtime_quantized_storage = runtime_quantized_storage,
+                .native_dense_bytes = if (native_dense) |native_info| native_info.bytes else null,
+                .native_dense_dtype = native_dense_dtype,
+                .native_dense_bytes_owned = if (native_dense) |native_info| native_info.owned else false,
+            };
+        } else {
+            if (data.len != 0) self.allocator.free(data);
+            self.allocator.free(logical_shape);
+            if (native_dense) |native_info| {
+                if (native_info.owned) self.allocator.free(native_info.bytes);
+            }
+        }
+        return gop.value_ptr;
+    }
+
+    fn cachedDenseWeightBuf(self: *MetalCompute, cached: *const CachedDenseWeight) !CT {
+        const shape = try self.allocator.dupe(i64, cached.logical_shape);
+        errdefer self.allocator.free(shape);
+        const tensor = try self.makeWeightBuf(cached.data, false, shape, cached.lazy_entry, null, cached.runtime_quantized_storage);
+        const buf = toBuf(tensor);
+        buf.native_dense_bytes = cached.native_dense_bytes;
+        buf.native_dense_dtype = cached.native_dense_dtype;
+        buf.native_dense_bytes_owned = cached.native_dense_bytes_owned;
+        return tensor;
+    }
+
+    fn getOrInsertZeroBias(self: *MetalCompute, out_dim: usize) ![]f32 {
+        const gop = try self.zero_bias_cache.getOrPut(self.allocator, out_dim);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = try self.allocator.alloc(f32, out_dim);
+            @memset(gop.value_ptr.*, 0.0);
+        }
+        return gop.value_ptr.*;
+    }
+
+    fn cachedZeroBiasBuf(self: *MetalCompute, out_dim: usize) !CT {
+        const data = try self.getOrInsertZeroBias(out_dim);
+        const buf = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(buf);
+        const logical_shape = try self.allocator.alloc(i64, 1);
+        errdefer self.allocator.free(logical_shape);
+        logical_shape[0] = @intCast(out_dim);
+        buf.* = .{
+            .data = data,
+            .allocator = self.allocator,
+            .owned = false,
+            .logical_shape = logical_shape,
+        };
+        return @ptrCast(buf);
+    }
+
+    fn i32ShapeFromI64(self: *MetalCompute, shape_i64: []const i64) ![]i32 {
+        const shape_i32 = try self.allocator.alloc(i32, shape_i64.len);
+        errdefer self.allocator.free(shape_i32);
+        for (shape_i64, 0..) |dim, i| shape_i32[i] = @intCast(dim);
+        return shape_i32;
+    }
+
+    fn shapeNumel(shape: []const i64) !usize {
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim <= 0) return error.UnsupportedShape;
+            count = std.math.mul(usize, count, @intCast(dim)) catch return error.UnsupportedShape;
+        }
+        return count;
+    }
+
+    fn safeShapeNumel(shape: []const i64) ?usize {
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim <= 0) return null;
+            count = std.math.mul(usize, count, @intCast(dim)) catch return null;
+        }
+        return count;
+    }
+
+    fn exactIntegerCubeRoot(value: usize) ?usize {
+        if (value == 0) return 0;
+        var root: usize = 1;
+        while (true) : (root += 1) {
+            const square = std.math.mul(usize, root, root) catch return null;
+            const cube = std.math.mul(usize, square, root) catch return null;
+            if (cube == value) return root;
+            if (cube > value) return null;
+        }
+    }
+
+    fn exactIntegerSquareRoot(value: usize) ?usize {
+        if (value == 0) return 0;
+        var root: usize = 1;
+        while (true) : (root += 1) {
+            const square = std.math.mul(usize, root, root) catch return null;
+            if (square == value) return root;
+            if (square > value) return null;
+        }
+    }
+
+    fn resolveShapeFromDataLen(shape: []const i64, data_len: usize) ?[metal_tensor_mod.max_dims]i64 {
+        if (shape.len > metal_tensor_mod.max_dims) return null;
+
+        if (shape.len == 2 and shape[0] < 0 and shape[1] < 0) {
+            if (exactIntegerSquareRoot(data_len)) |shared_dim| {
+                return .{ @intCast(shared_dim), @intCast(shared_dim), 0, 0, 0, 0, 0, 0 };
+            }
+        }
+
+        if (shape.len == 3 and shape[0] < 0 and shape[1] < 0 and shape[2] > 0) {
+            const trailing_dim: usize = @intCast(shape[2]);
+            if (trailing_dim > 0 and data_len % trailing_dim == 0) {
+                const matrix_elems = data_len / trailing_dim;
+                if (exactIntegerSquareRoot(matrix_elems)) |shared_dim| {
+                    return .{ @intCast(shared_dim), @intCast(shared_dim), shape[2], 0, 0, 0, 0, 0 };
+                }
+            }
+        }
+
+        if (shape.len == 4 and shape[0] < 0 and shape[1] > 0 and shape[2] < 0 and shape[3] < 0) {
+            const head_count: usize = @intCast(shape[1]);
+            if (head_count > 0 and data_len % head_count == 0) {
+                if (exactIntegerCubeRoot(data_len / head_count)) |shared_dim| {
+                    return .{ @intCast(shared_dim), shape[1], @intCast(shared_dim), @intCast(shared_dim), 0, 0, 0, 0 };
+                }
+            }
+        }
+
+        var resolved: [metal_tensor_mod.max_dims]i64 = undefined;
+        var infer_index: ?usize = null;
+        var known_product: usize = 1;
+
+        for (shape, 0..) |dim, i| {
+            resolved[i] = dim;
+            if (dim > 0) {
+                known_product = std.math.mul(usize, known_product, @intCast(dim)) catch return null;
+                continue;
+            }
+            if (infer_index != null) return null;
+            infer_index = i;
+        }
+
+        if (infer_index) |idx| {
+            if (known_product == 0 or data_len % known_product != 0) return null;
+            resolved[idx] = @intCast(data_len / known_product);
+            return resolved;
+        }
+
+        if (known_product != data_len) return null;
+        return resolved;
+    }
+
+    pub fn inferReshapeShapeWithNumel(input_shape: []const i64, target_shape: []const i64, input_numel: usize) ?[metal_tensor_mod.max_dims]i64 {
+        if (target_shape.len > metal_tensor_mod.max_dims) return null;
+        var resolved: [metal_tensor_mod.max_dims]i64 = undefined;
+        var negative_count: usize = 0;
+        for (target_shape, 0..) |dim, i| {
+            resolved[i] = dim;
+            if (dim < 0) negative_count += 1;
+        }
+
+        if (negative_count > 1 and target_shape.len == input_shape.len) {
+            for (target_shape, 0..) |dim, i| {
+                if (dim >= 0) continue;
+                const input_dim = input_shape[i];
+                if (input_dim > 0) resolved[i] = input_dim;
+            }
+        }
+
+        if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len == 2) {
+            var trailing_aligned = true;
+            for (1..target_shape.len) |i| {
+                const input_dim = input_shape[i + 1];
+                if (resolved[i] < 0 and input_dim > 0) {
+                    resolved[i] = input_dim;
+                } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
+                    trailing_aligned = false;
+                    break;
+                }
+            }
+            if (trailing_aligned and resolved[0] < 0) {
+                var collapsed: usize = 1;
+                var valid = true;
+                for (input_shape[0..2]) |dim| {
+                    if (dim <= 0) {
+                        valid = false;
+                        break;
+                    }
+                    collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
+                        valid = false;
+                        break;
+                    };
+                }
+                if (valid) resolved[0] = @intCast(collapsed);
+            }
+        }
+
+        // Collapse inner singleton input dims (e.g. `{77, 1, 512}` → `{77, 512}`) so
+        // that attention-head splits can still resolve against the effective shape.
+        if (negative_count > 1 and input_shape.len >= 3 and target_shape.len == input_shape.len + 1 and resolved[0] == 1) {
+            var collapsed: [metal_tensor_mod.max_dims]i64 = undefined;
+            var collapsed_len: usize = 0;
+            for (input_shape, 0..) |dim, i| {
+                if (i > 0 and i < input_shape.len - 1 and dim == 1) continue;
+                collapsed[collapsed_len] = dim;
+                collapsed_len += 1;
+            }
+            if (collapsed_len < input_shape.len and target_shape.len == collapsed_len + 2) {
+                const input_last = collapsed[collapsed_len - 1];
+                const target_last = target_shape[target_shape.len - 1];
+                if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
+                    for (0..collapsed_len - 1) |i| {
+                        const target_index = i + 1;
+                        if (resolved[target_index] < 0 and collapsed[i] > 0) {
+                            resolved[target_index] = collapsed[i];
+                        }
+                    }
+                    if (resolved[target_shape.len - 2] < 0) {
+                        resolved[target_shape.len - 2] = @divTrunc(input_last, target_last);
+                    }
+                }
+            }
+        }
+
+        if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0 and resolved[3] > 0) {
+            const hidden = input_shape[2];
+            if (hidden > 0 and @rem(hidden, resolved[3]) == 0) {
+                if (resolved[0] < 0 and input_shape[0] > 0) resolved[0] = input_shape[0];
+                if (resolved[2] < 0) resolved[2] = @divTrunc(hidden, resolved[3]);
+            }
+        }
+
+        // Unflatten multi-head attention outputs:
+        //   [batch * heads, seq, head_dim] -> [batch, heads, seq, head_dim]
+        if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0) {
+            const head_count: usize = @intCast(resolved[1]);
+            var unflatten_known_product: usize = head_count;
+            var can_unflatten = head_count > 0;
+            if (input_shape[1] > 0) {
+                unflatten_known_product = std.math.mul(usize, unflatten_known_product, @intCast(input_shape[1])) catch 0;
+                can_unflatten = can_unflatten and unflatten_known_product > 0;
+            }
+            if (input_shape[2] > 0) {
+                unflatten_known_product = std.math.mul(usize, unflatten_known_product, @intCast(input_shape[2])) catch 0;
+                can_unflatten = can_unflatten and unflatten_known_product > 0;
+            } else {
+                can_unflatten = false;
+            }
+            if (can_unflatten and input_shape[1] > 0 and input_numel % unflatten_known_product == 0) {
+                if (resolved[2] < 0) {
+                    resolved[2] = input_shape[1];
+                }
+                if (resolved[3] < 0) {
+                    resolved[3] = input_shape[2];
+                }
+                if (input_shape[0] > 0 and resolved[0] < 0) {
+                    const batch_heads: usize = @intCast(input_shape[0]);
+                    if (batch_heads % head_count == 0) {
+                        resolved[0] = @intCast(batch_heads / head_count);
+                    }
+                }
+                var unresolved: usize = 0;
+                var unresolved_index: usize = 0;
+                var known_product: usize = head_count;
+                var valid = true;
+                for ([_]usize{ 0, 2, 3 }) |axis| {
+                    const dim = resolved[axis];
+                    if (dim > 0) {
+                        known_product = std.math.mul(usize, known_product, @intCast(dim)) catch {
+                            valid = false;
+                            break;
+                        };
+                    } else {
+                        unresolved += 1;
+                        unresolved_index = axis;
+                    }
+                }
+                if (valid and unresolved == 1 and known_product > 0 and input_numel % known_product == 0) {
+                    resolved[unresolved_index] = @intCast(input_numel / known_product);
+                }
+            }
+        }
+
+        if (negative_count > 1 and target_shape.len == input_shape.len + 1 and target_shape.len >= 2) {
+            const input_last = input_shape[input_shape.len - 1];
+            const target_last = target_shape[target_shape.len - 1];
+            if (input_last > 0) {
+                for (0..input_shape.len - 1) |i| {
+                    if (resolved[i] < 0 and input_shape[i] > 0) resolved[i] = input_shape[i];
+                }
+                if (resolved[target_shape.len - 1] < 0 and resolved[target_shape.len - 2] > 0 and @rem(input_last, resolved[target_shape.len - 2]) == 0) {
+                    resolved[target_shape.len - 1] = @divTrunc(input_last, resolved[target_shape.len - 2]);
+                }
+            }
+            if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
+                if (resolved[0] > 0 and input_numel % @as(usize, @intCast(input_last)) == 0) {
+                    const prefix_numel = input_numel / @as(usize, @intCast(input_last));
+                    const leading_dim: usize = @intCast(resolved[0]);
+                    if (leading_dim > 0 and prefix_numel % leading_dim == 0 and resolved[1] < 0) {
+                        resolved[1] = @intCast(prefix_numel / leading_dim);
+                    }
+                }
+                for (0..input_shape.len - 1) |i| {
+                    if (resolved[i] < 0 and input_shape[i] > 0) resolved[i] = input_shape[i];
+                }
+                if (resolved[input_shape.len - 1] < 0) {
+                    resolved[input_shape.len - 1] = @divTrunc(input_last, target_last);
+                }
+            }
+        }
+
+        if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0) {
+            const input_last = input_shape[2];
+            if (input_last > 0 and @rem(input_last, resolved[1]) == 0) {
+                if (resolved[3] < 0) {
+                    resolved[3] = @divTrunc(input_last, resolved[1]);
+                }
+                if (resolved[2] < 0) {
+                    if (input_shape[1] > 0) {
+                        resolved[2] = input_shape[1];
+                    } else {
+                        const prefix_numel = input_numel / @as(usize, @intCast(input_last));
+                        if (resolved[0] < 0) {
+                            resolved[0] = 1;
+                            resolved[2] = @intCast(prefix_numel);
+                        }
+                    }
+                }
+                if (resolved[0] < 0 and input_shape[0] > 0) {
+                    resolved[0] = input_shape[0];
+                }
+            }
+        }
+
+        if (negative_count > 1 and target_shape.len == input_shape.len + 2 and target_shape.len >= 3 and resolved[0] == 1) {
+            const input_last = input_shape[input_shape.len - 1];
+            const target_last = target_shape[target_shape.len - 1];
+            if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
+                for (0..input_shape.len - 1) |i| {
+                    const target_index = i + 1;
+                    if (resolved[target_index] < 0 and input_shape[i] > 0) {
+                        resolved[target_index] = input_shape[i];
+                    }
+                }
+                if (resolved[target_shape.len - 2] < 0) {
+                    resolved[target_shape.len - 2] = @divTrunc(input_last, target_last);
+                }
+            }
+        }
+
+        if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len >= 3) {
+            var valid = true;
+            for (0..target_shape.len - 1) |i| {
+                const input_dim = input_shape[i];
+                if (resolved[i] < 0 and input_dim > 0) {
+                    resolved[i] = input_dim;
+                } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) {
+                var collapsed: usize = 1;
+                for (input_shape[target_shape.len - 1 .. input_shape.len]) |dim| {
+                    if (dim <= 0) {
+                        valid = false;
+                        break;
+                    }
+                    collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
+                        valid = false;
+                        break;
+                    };
+                }
+                if (valid) {
+                    const last_index = target_shape.len - 1;
+                    if (resolved[last_index] < 0) {
+                        resolved[last_index] = @intCast(collapsed);
+                    } else if (resolved[last_index] != @as(i64, @intCast(collapsed))) {
+                        valid = false;
+                    }
+                }
+            }
+        }
+
+        if (negative_count > 1 and input_shape.len == 4 and target_shape.len == 3) {
+            const input_last = input_shape[3];
+            const target_last = target_shape[2];
+            if (input_last > 0 and target_last > 0 and input_last == target_last) {
+                const leading = if (resolved[0] > 0) resolved[0] else if (input_shape[0] > 0) input_shape[0] else 1;
+                const leading_usize: usize = @intCast(leading);
+                const last_usize: usize = @intCast(target_last);
+                const known_product = std.math.mul(usize, leading_usize, last_usize) catch 0;
+                if (known_product > 0 and input_numel % known_product == 0) {
+                    resolved[0] = leading;
+                    resolved[1] = @intCast(input_numel / known_product);
+                    resolved[2] = target_last;
+                }
+            }
+        }
+
+        if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len >= 2 and resolved[0] > 0 and input_shape[0] > 0 and resolved[0] == input_shape[0]) {
+            var valid = true;
+            for (1..target_shape.len - 1) |i| {
+                const input_dim = input_shape[i];
+                if (resolved[i] < 0 and input_dim > 0) {
+                    resolved[i] = input_dim;
+                } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) {
+                var collapsed: usize = 1;
+                for (input_shape[target_shape.len - 1 .. input_shape.len]) |dim| {
+                    if (dim <= 0) {
+                        valid = false;
+                        break;
+                    }
+                    collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
+                        valid = false;
+                        break;
+                    };
+                }
+                if (valid) {
+                    const last_index = target_shape.len - 1;
+                    if (resolved[last_index] < 0) {
+                        resolved[last_index] = @intCast(collapsed);
+                    } else if (resolved[last_index] != @as(i64, @intCast(collapsed))) {
+                        valid = false;
+                    }
+                }
+            }
+        }
+
+        if (negative_count > 1) {
+            var known_product: usize = 1;
+            var valid = true;
+            for (resolved[0..target_shape.len]) |dim| {
+                if (dim <= 0) continue;
+                known_product = std.math.mul(usize, known_product, @intCast(dim)) catch {
+                    valid = false;
+                    break;
+                };
+            }
+            if (valid and known_product == input_numel) {
+                for (0..target_shape.len) |i| {
+                    if (resolved[i] < 0) resolved[i] = 1;
+                }
+                negative_count = 0;
+            }
+        }
+
+        var infer_index: ?usize = null;
+        var known_product: usize = 1;
+        for (resolved[0..target_shape.len], 0..) |dim, i| {
+            if (dim == -1) {
+                if (infer_index != null) return null;
+                infer_index = i;
+                continue;
+            }
+            if (dim <= 0) return null;
+            known_product = std.math.mul(usize, known_product, @intCast(dim)) catch return null;
+        }
+        if (infer_index) |idx| {
+            if (known_product == 0 or input_numel % known_product != 0) return null;
+            resolved[idx] = @intCast(input_numel / known_product);
+        } else if (known_product != input_numel) {
+            return null;
+        }
+        for (resolved[0..target_shape.len]) |dim| {
+            if (dim <= 0) return null;
+        }
+        return resolved;
+    }
+
+    fn symbolicShapeForBroadcast(buf: *const Buf, scratch: *[metal_tensor_mod.max_dims]i64) []const i64 {
+        const data_len = bufElemCount(buf);
+        if (buf.logical_shape) |shape| {
+            if (resolveShapeFromDataLen(shape, data_len)) |resolved| {
+                for (0..shape.len) |i| scratch[i] = resolved[i];
+                return scratch[0..shape.len];
+            }
+            for (shape, 0..) |dim, i| scratch[i] = dim;
+            return scratch[0..shape.len];
+        }
+        scratch[0] = if (data_len == 0) 0 else @intCast(data_len);
+        return scratch[0..1];
+    }
+
+    fn concretizeBroadcastOperandShape(
+        operand_shape: []const i64,
+        data_len: usize,
+        out_shape: []const i64,
+        scratch: *[metal_tensor_mod.max_dims]i64,
+    ) []const i64 {
+        if (operand_shape.len == 0) return scratch[0..0];
+        if (resolveShapeFromDataLen(operand_shape, data_len)) |resolved| {
+            for (0..operand_shape.len) |i| scratch[i] = resolved[i];
+            return scratch[0..operand_shape.len];
+        }
+
+        if (out_shape.len >= operand_shape.len) {
+            var infer_index: ?usize = null;
+            var known_product: usize = 1;
+            const rank_offset = out_shape.len - operand_shape.len;
+            var valid = true;
+
+            for (operand_shape, 0..) |dim, i| {
+                if (dim > 0) {
+                    scratch[i] = dim;
+                } else {
+                    const candidate = out_shape[rank_offset + i];
+                    if (candidate > 0) {
+                        scratch[i] = candidate;
+                    } else {
+                        if (infer_index != null) {
+                            valid = false;
+                            break;
+                        }
+                        infer_index = i;
+                        scratch[i] = -1;
+                        continue;
+                    }
+                }
+                known_product = std.math.mul(usize, known_product, @intCast(scratch[i])) catch {
+                    valid = false;
+                    break;
+                };
+            }
+
+            if (valid) {
+                if (infer_index) |idx| {
+                    if (known_product > 0 and data_len % known_product == 0) {
+                        scratch[idx] = @intCast(data_len / known_product);
+                    } else {
+                        valid = false;
+                    }
+                }
+                if (valid) {
+                    if (safeShapeNumel(scratch[0..operand_shape.len])) |numel| {
+                        if (numel == data_len) return scratch[0..operand_shape.len];
+                    }
+                }
+            }
+        }
+
+        for (operand_shape, 0..) |dim, i| {
+            scratch[i] = if (dim > 0) dim else 1;
+        }
+        if (safeShapeNumel(scratch[0..operand_shape.len])) |numel| {
+            if (numel == data_len) return scratch[0..operand_shape.len];
+        }
+
+        if (operand_shape.len == 1 and data_len > 0) {
+            scratch[0] = @intCast(data_len);
+        }
+        return scratch[0..operand_shape.len];
+    }
+
+    fn computeBroadcastShape3Loose(a_shape: []const i64, b_shape: []const i64, c_shape: []const i64, out_shape: *[metal_tensor_mod.max_dims]i64) ?usize {
+        const out_rank = @max(a_shape.len, @max(b_shape.len, c_shape.len));
+        if (out_rank > metal_tensor_mod.max_dims) return null;
+
+        var idx: usize = 0;
+        while (idx < out_rank) : (idx += 1) {
+            const rev_idx = out_rank - 1 - idx;
+            const dims = [_]i64{
+                if (idx < a_shape.len) a_shape[a_shape.len - 1 - idx] else 1,
+                if (idx < b_shape.len) b_shape[b_shape.len - 1 - idx] else 1,
+                if (idx < c_shape.len) c_shape[c_shape.len - 1 - idx] else 1,
+            };
+
+            var resolved_dim: i64 = 1;
+            var symbolic = false;
+            for (dims) |dim| {
+                if (dim == 1) continue;
+                if (dim > 1) {
+                    if (resolved_dim == 1 or resolved_dim <= 0) {
+                        resolved_dim = dim;
+                    } else if (resolved_dim != dim) {
+                        return null;
+                    }
+                } else {
+                    symbolic = true;
+                }
+            }
+            out_shape[rev_idx] = if (resolved_dim == 1 and symbolic) -1 else resolved_dim;
+        }
+
+        return out_rank;
+    }
+
+    fn computeBroadcastShape3(a_shape: []const i64, b_shape: []const i64, c_shape: []const i64, out_shape: *[metal_tensor_mod.max_dims]i64) ?usize {
+        const out_rank = @max(a_shape.len, @max(b_shape.len, c_shape.len));
+        if (out_rank > metal_tensor_mod.max_dims) return null;
+
+        var idx: usize = 0;
+        while (idx < out_rank) : (idx += 1) {
+            const rev_idx = out_rank - 1 - idx;
+            const dims = [_]i64{
+                if (idx < a_shape.len) a_shape[a_shape.len - 1 - idx] else 1,
+                if (idx < b_shape.len) b_shape[b_shape.len - 1 - idx] else 1,
+                if (idx < c_shape.len) c_shape[c_shape.len - 1 - idx] else 1,
+            };
+
+            var resolved_dim: i64 = 1;
+            for (dims) |dim| {
+                if (dim == 1) continue;
+                if (resolved_dim == 1) {
+                    resolved_dim = dim;
+                } else if (resolved_dim != dim) {
+                    return null;
+                }
+            }
+            out_shape[rev_idx] = resolved_dim;
+        }
+
+        return out_rank;
+    }
+
+    fn shapeMatchesElementCount(shape: []const i64, element_count: usize) bool {
+        if (resolveShapeFromDataLen(shape, element_count)) |_| return true;
+        if (safeShapeNumel(shape)) |numel| return numel == element_count;
+        for (shape) |dim| {
+            if (dim <= 0) return true;
+        }
+        return false;
+    }
+
+    fn propagatedBinaryShapeI64(self: *MetalCompute, a_buf: *const Buf, b_buf: *const Buf, result_len: usize) ![]i64 {
+        var a_symbolic_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+        var b_symbolic_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+        const a_symbolic = symbolicShapeForBroadcast(a_buf, &a_symbolic_buf);
+        const b_symbolic = symbolicShapeForBroadcast(b_buf, &b_symbolic_buf);
+
+        var loose_out_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+        if (computeBroadcastShape3Loose(a_symbolic, b_symbolic, &.{}, &loose_out_shape_buf)) |loose_out_rank| {
+            const loose_out_shape = loose_out_shape_buf[0..loose_out_rank];
+
+            var a_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+            var b_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+            const a_shape = concretizeBroadcastOperandShape(a_symbolic, bufElemCount(a_buf), loose_out_shape, &a_shape_buf);
+            const b_shape = concretizeBroadcastOperandShape(b_symbolic, bufElemCount(b_buf), loose_out_shape, &b_shape_buf);
+
+            var out_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+            if (computeBroadcastShape3(a_shape, b_shape, &.{}, &out_shape_buf)) |out_rank| {
+                const out_shape = out_shape_buf[0..out_rank];
+                if (resolveShapeFromDataLen(out_shape, result_len)) |resolved| {
+                    return self.allocator.dupe(i64, resolved[0..out_rank]);
+                }
+                if (safeShapeNumel(out_shape)) |numel| {
+                    if (numel == result_len) {
+                        return self.allocator.dupe(i64, out_shape);
+                    }
+                }
+            }
+        }
+
+        const a_len = bufElemCount(a_buf);
+        const b_len = bufElemCount(b_buf);
+        if (a_len >= b_len) {
+            if (a_buf.logical_shape) |shape| {
+                if (shapeMatchesElementCount(shape, result_len)) {
+                    if (resolveShapeFromDataLen(shape, result_len)) |resolved| {
+                        return self.allocator.dupe(i64, resolved[0..shape.len]);
+                    }
+                    return self.allocator.dupe(i64, shape);
+                }
+            }
+        }
+        if (b_len >= a_len) {
+            if (b_buf.logical_shape) |shape| {
+                if (shapeMatchesElementCount(shape, result_len)) {
+                    if (resolveShapeFromDataLen(shape, result_len)) |resolved| {
+                        return self.allocator.dupe(i64, resolved[0..shape.len]);
+                    }
+                    return self.allocator.dupe(i64, shape);
+                }
+            }
+        }
+
+        return self.allocator.dupe(i64, &[_]i64{@intCast(result_len)});
+    }
+
+    fn computeStrides(shape: []const i64, out: []usize) void {
+        var stride: usize = 1;
+        var i = shape.len;
+        while (i > 0) {
+            i -= 1;
+            out[i] = stride;
+            stride *= @intCast(shape[i]);
+        }
+    }
+
+    fn backendKindOp(_: *anyopaque) ops.BackendKind {
+        return .metal;
+    }
+
+    fn monotonicNowNs() u128 {
+        var ts: std.posix.timespec = undefined;
+        switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+            .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+            else => return 0,
+        }
+    }
+
+    fn provisionKvDeviceWriteHookOp(
+        ctx: *anyopaque,
+        storage: *runtime_root.kv.storage_runtime.KvStorageRuntime,
+    ) anyerror!void {
+        if (disableDeviceKvWriteHookDebug()) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.provider_impl.hasDecoderRuntime()) return;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        const config = storage.storage.config;
+        const metal_kv_storage = @import("../backends/metal_kv_storage.zig");
+        const metal_storage = metal_kv_storage.MetalKvStorage.create(
+            self.allocator,
+            runtime,
+            config.dtype,
+            config.num_kv_heads,
+            config.head_dim,
+            config.page_size_tokens,
+        ) catch |err| switch (err) {
+            // Silently skip on unsupported dtype — the host write path stays
+            // authoritative and the device fast-path never fires.
+            error.DeviceWriteFormatUnsupported => return,
+            else => return err,
+        };
+        storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
+    }
+
+    pub fn deinit(self: *MetalCompute) void {
+        self.clearActivePrefillFramePlan();
+        self.clearPendingPrefillKvDeviceSeeds();
+        self.resetBackendKvCache();
+        var v4_it = self.deepseek_v4_device_cache.iterator();
+        while (v4_it.next()) |entry| entry.value_ptr.deinit();
+        self.deepseek_v4_device_cache.deinit(self.allocator);
+        var it = self.dense_weight_cache.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.dense_weight_cache.deinit(self.allocator);
+        var scale_it = self.layer_output_scale_device_cache.iterator();
+        while (scale_it.next()) |entry| entry.value_ptr.deinit();
+        self.layer_output_scale_device_cache.deinit(self.allocator);
+        var unit_it = self.unit_rms_weight_device_cache.iterator();
+        while (unit_it.next()) |entry| entry.value_ptr.deinit();
+        self.unit_rms_weight_device_cache.deinit(self.allocator);
+        var zero_it = self.zero_bias_cache.iterator();
+        while (zero_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.zero_bias_cache.deinit(self.allocator);
+        self.dynamic_linear_slots.deinit(self.allocator);
+        self.dynamic_layer_norm_slots.deinit(self.allocator);
+        self.dynamic_rms_norm_slots.deinit(self.allocator);
+        if (comptime build_options.enable_mlx) {
+            if (self.provider) |provider| provider.deinit();
+        }
+        if (self.owned_native_provider) {
+            self.provider_impl.deinitOwned();
+            std.heap.c_allocator.destroy(self.provider_impl);
+        }
+    }
+
+    fn clearActivePrefillFramePlan(self: *MetalCompute) void {
+        if (self.active_prefill_frame_plan) |*plan| plan.deinit();
+        self.active_prefill_frame_plan = null;
+        self.active_prefill_frame_plan_key = null;
+        self.active_prefill_frame_contract_storage.deinit(self.allocator);
+        self.active_prefill_frame_tail_contract = null;
+    }
+
+    fn clearPendingPrefillKvDeviceSeeds(self: *MetalCompute) void {
+        for (self.pending_prefill_kv_device_seeds.items) |*seed| seed.deinit();
+        self.pending_prefill_kv_device_seeds.clearRetainingCapacity();
+    }
+
+    fn queuePrefillKvDeviceSeed(
+        self: *MetalCompute,
+        attention: ops.AttentionContext,
+        k: MetalTensor,
+        v: MetalTensor,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) !void {
+        if (attention.skip_kv_write or attention.kv_storage == null) return;
+        if (attention.kv_storage.?.device_write_hook == null) return;
+        if (!k.isDevice() or !v.isDevice()) return;
+        if (!metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) return;
+        var k_copy = try k.copiedView(0, k.deviceByteLen(), k.shape());
+        errdefer k_copy.deinit();
+        var v_copy = try v.copiedView(0, v.deviceByteLen(), v.shape());
+        errdefer v_copy.deinit();
+        try self.pending_prefill_kv_device_seeds.append(self.allocator, .{
+            .attention = attention,
+            .k = k_copy,
+            .v = v_copy,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+        });
+    }
+
+    fn flushPendingPrefillKvDeviceSeeds(self: *MetalCompute) !void {
+        defer self.clearPendingPrefillKvDeviceSeeds();
+        if (dumpDecodeKvLayerTarget()) |target_layer| {
+            std.debug.print(
+                "metal-prefill-kv-seed-flush: pending={d} target_layer={d}\n",
+                .{ self.pending_prefill_kv_device_seeds.items.len, target_layer },
+            );
+        }
+        for (self.pending_prefill_kv_device_seeds.items) |*seed| {
+            _ = try writePagedKvSuffixDeviceFromTensors(
+                seed.attention,
+                seed.k,
+                seed.v,
+                seed.num_kv_heads,
+                seed.head_dim,
+            );
+        }
+    }
+
+    fn publishPromptKvDevice(
+        self: *MetalCompute,
+        attention: ops.AttentionContext,
+        k: MetalTensor,
+        v: MetalTensor,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) !bool {
+        if (attention.skip_kv_write or attention.kv_storage == null) return false;
+        if (attention.kv_storage.?.device_write_hook == null) return false;
+        if (!k.isDevice() or !v.isDevice()) return false;
+        if (dumpDecodeKvLayerTarget()) |target_layer| {
+            if (target_layer == attention.layer_index) std.debug.print(
+                "metal-prefill-kv-seed-publish: layer={d} mode={s} q={d} kv={d} active={}\n",
+                .{
+                    attention.layer_index,
+                    @tagName(attention.mode),
+                    attention.query_sequence_len,
+                    attention.kv_sequence_len,
+                    metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime),
+                },
+            );
+        }
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            try self.queuePrefillKvDeviceSeed(attention, k, v, num_kv_heads, head_dim);
+            return true;
+        }
+        return try writePagedKvSuffixDeviceFromTensors(attention, k, v, num_kv_heads, head_dim);
+    }
+
+    fn resetBackendKvCache(self: *MetalCompute) void {
+        var it = self.backend_kv_cache.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit();
+        self.backend_kv_cache.deinit(self.allocator);
+        self.backend_kv_cache = .empty;
+    }
+
+    fn deinitBackendOp(ctx: *anyopaque) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.deinit();
+    }
+
+    fn getIoOp(ctx: *anyopaque) ?std.Io {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.io;
+    }
+
+    inline fn dispatchSgemmTransB(
+        self: *const MetalCompute,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: []const f32,
+        b: []const f32,
+        beta: f32,
+        c_out: []f32,
+    ) error{Canceled}!void {
+        if (self.io) |io| {
+            return native.sgemmTransB(io, m, n, k, alpha, a, b, beta, c_out);
+        }
+        native.sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
+    }
+
+    inline fn dispatchSgemm(
+        self: *const MetalCompute,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: []const f32,
+        b: []const f32,
+        beta: f32,
+        c_out: []f32,
+    ) error{Canceled}!void {
+        if (self.io) |io| {
+            return native.sgemm(io, m, n, k, alpha, a, b, beta, c_out);
+        }
+        native.sgemmSync(m, n, k, alpha, a, b, beta, c_out);
+    }
+
+    pub fn computeBackend(self: *MetalCompute) ops.ComputeBackend {
+        return .{ .ptr = self, .vtable = &vtable_impl };
+    }
+
+    fn ownedMetalTensorFromCt(self: *MetalCompute, tensor: CT) !MetalTensor {
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null or
+            buf.runtime_quantized_storage != null or
+            buf.owned_quantized_storage != null)
+        {
+            return error.UnsupportedTensorType;
+        }
+        if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
+            return error.UnsupportedTensorType;
+        }
+        if (buf.metal_tensor) |*metal_tensor| {
+            return metal_tensor.retainedCopy();
+        }
+        if (hasHostView(buf)) try materializeViewData(buf);
+        const shape_i64 = buf.logical_shape orelse blk: {
+            const shape = try self.allocator.alloc(i64, 1);
+            shape[0] = @intCast(buf.data.len);
+            break :blk shape;
+        };
+        defer if (buf.logical_shape == null) self.allocator.free(shape_i64);
+        var shape_i32_buf: [metal_tensor_mod.max_dims]i32 = undefined;
+        if (shape_i64.len > shape_i32_buf.len) return error.UnsupportedShape;
+        for (shape_i64, 0..) |dim, i| shape_i32_buf[i] = @intCast(dim);
+        return MetalTensor.borrowed(buf.data.ptr, buf.data.len, shape_i32_buf[0..shape_i64.len]);
+    }
+
+    fn borrowedMetalTensorFromCt(self: *MetalCompute, tensor: CT) !MetalTensor {
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null or
+            buf.runtime_quantized_storage != null or
+            buf.owned_quantized_storage != null)
+        {
+            return error.UnsupportedTensorType;
+        }
+        if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
+            return error.UnsupportedTensorType;
+        }
+        if (buf.metal_tensor) |metal_tensor| return metal_tensor;
+        if (hasHostView(buf)) try materializeViewData(buf);
+        const shape_i64 = buf.logical_shape orelse blk: {
+            const shape = try self.allocator.alloc(i64, 1);
+            shape[0] = @intCast(buf.data.len);
+            break :blk shape;
+        };
+        defer if (buf.logical_shape == null) self.allocator.free(shape_i64);
+        var shape_i32_buf: [metal_tensor_mod.max_dims]i32 = undefined;
+        if (shape_i64.len > shape_i32_buf.len) return error.UnsupportedShape;
+        for (shape_i64, 0..) |dim, i| shape_i32_buf[i] = @intCast(dim);
+        return MetalTensor.borrowed(buf.data.ptr, buf.data.len, shape_i32_buf[0..shape_i64.len]);
+    }
+
+    fn ownedDeviceMetalTensorFromCt(self: *MetalCompute, tensor: CT) !MetalTensor {
+        var metal_tensor = try self.ownedMetalTensorFromCt(tensor);
+        errdefer metal_tensor.deinit();
+        if (metal_tensor.isDevice()) return metal_tensor;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return metal_tensor;
+        var device_tensor = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            metal_tensor.deviceByteLen(),
+            uploadStorageMode(metal_tensor.deviceByteLen()),
+            metal_tensor.shape(),
+        );
+        errdefer device_tensor.deinit();
+        try metal_tensor.copyInto(&device_tensor);
+        metal_tensor.deinit();
+        return device_tensor;
+    }
+
+    fn nextPow2AtLeast(value: usize) usize {
+        var cap: usize = 1;
+        while (cap < value) : (cap <<= 1) {}
+        return cap;
+    }
+
+    fn allocateDeviceTensor(self: *MetalCompute, rows: usize, cols: usize) !MetalTensor {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+        return MetalTensor.deviceAllocate(@ptrCast(runtime), rows * cols * @sizeOf(f32), .private, &shape);
+    }
+
+    fn resizeDeviceTensorPreserve(
+        self: *MetalCompute,
+        tensor: *?MetalTensor,
+        rows: usize,
+        cols: usize,
+        preserve_bytes: usize,
+    ) !void {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        var replacement = try self.allocateDeviceTensor(rows, cols);
+        errdefer replacement.deinit();
+        if (tensor.*) |*old| {
+            const bytes = @min(preserve_bytes, @min(old.deviceByteLen(), replacement.deviceByteLen()));
+            if (bytes > 0) {
+                const rc = metal_runtime.termite_metal_buffer_copy(
+                    runtime,
+                    old.deviceHandle(),
+                    old.deviceByteOffset(),
+                    replacement.deviceHandle(),
+                    replacement.deviceByteOffset(),
+                    bytes,
+                );
+                if (rc != 0) return error.MetalBufferCopyFailed;
+            }
+            old.deinit();
+        }
+        tensor.* = replacement;
+    }
+
+    fn ensureDeepSeekV4ComponentCapacity(
+        self: *MetalCompute,
+        component: *DeepSeekV4DeviceComponent,
+        token_count: usize,
+        row_count: usize,
+        row_dim: usize,
+        gate_width: usize,
+    ) !void {
+        if (component.row_dim != 0 and (component.row_dim != row_dim or component.gate_width != gate_width)) {
+            component.deinit();
+        }
+        component.row_dim = row_dim;
+        component.gate_width = gate_width;
+        const token_capacity = nextPow2AtLeast(@max(token_count, 1));
+        const row_capacity = nextPow2AtLeast(@max(row_count, 1));
+        if (component.token_capacity < token_capacity) {
+            try self.resizeDeviceTensorPreserve(&component.projected, token_capacity, row_dim, component.token_capacity * row_dim * @sizeOf(f32));
+            try self.resizeDeviceTensorPreserve(&component.gate, token_capacity, gate_width, component.token_capacity * gate_width * @sizeOf(f32));
+            component.token_capacity = token_capacity;
+        }
+        if (component.row_capacity < row_capacity) {
+            try self.resizeDeviceTensorPreserve(&component.compressed, row_capacity, row_dim, component.row_capacity * row_dim * @sizeOf(f32));
+            try self.resizeDeviceTensorPreserve(&component.positions, row_capacity, 1, component.row_capacity * @sizeOf(u32));
+            component.row_capacity = row_capacity;
+        }
+    }
+
+    fn ensureDeepSeekV4LocalCapacity(
+        self: *MetalCompute,
+        layer_cache: *DeepSeekV4DeviceLayerCache,
+        token_count: usize,
+        head_dim: usize,
+    ) !void {
+        if (layer_cache.local_dim != 0 and layer_cache.local_dim != head_dim) {
+            layer_cache.deinit();
+        }
+        layer_cache.local_dim = head_dim;
+        const token_capacity = nextPow2AtLeast(@max(token_count, 1));
+        if (layer_cache.local_capacity < token_capacity) {
+            try self.resizeDeviceTensorPreserve(&layer_cache.local, token_capacity, head_dim, layer_cache.local_capacity * head_dim * @sizeOf(f32));
+            layer_cache.local_capacity = token_capacity;
+        }
+    }
+
+    fn deviceScalarTensorLike(self: *MetalCompute, reference: *const MetalTensor, value: f32) !?MetalTensor {
+        if (!reference.isDevice()) return null;
+        const elem_count = reference.elemCount();
+        if (elem_count == 0) return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const host = try self.allocator.alloc(f32, elem_count);
+        defer self.allocator.free(host);
+        @memset(host, value);
+        var device_tensor = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            elem_count * @sizeOf(f32),
+            uploadStorageMode(elem_count * @sizeOf(f32)),
+            reference.shape(),
+        );
+        errdefer device_tensor.deinit();
+        const host_tensor = MetalTensor.borrowed(host.ptr, host.len, reference.shape());
+        try host_tensor.copyInto(&device_tensor);
+        return device_tensor;
+    }
+
+    fn scalarValueFromBuf(buf: *Buf) !?f32 {
+        if (bufElemCount(buf) != 1) return null;
+        const host = try hostSliceForBuf(buf);
+        if (host.len == 0) return null;
+        return host[0];
+    }
+
+    fn deviceScalarTensorFromBufLike(self: *MetalCompute, buf: *Buf, reference: *const MetalTensor) !?MetalTensor {
+        const scalar = (try scalarValueFromBuf(buf)) orelse return null;
+        return self.deviceScalarTensorLike(reference, scalar);
+    }
+
+    fn retainedOrBroadcastDeviceTensor(
+        self: *MetalCompute,
+        buf: *Buf,
+        tensor: *const MetalTensor,
+        reference: *const MetalTensor,
+    ) !?MetalTensor {
+        if (!tensor.isDevice() or !reference.isDevice()) return null;
+        if (tensor.elemCount() == reference.elemCount()) return try tensor.retainedCopy();
+        if (tensor.elemCount() == 1) return self.deviceScalarTensorFromBufLike(buf, reference);
+        return null;
+    }
+
+    fn nextFreeDynamicLinearSlot(self: *MetalCompute) ?usize {
+        while (self.next_dynamic_linear_slot > 0) {
+            self.next_dynamic_linear_slot -= 1;
+            const slot = self.next_dynamic_linear_slot;
+            if (!self.provider_impl.raw_linear_slots_prepared[slot]) return slot;
+        }
+        return null;
+    }
+
+    fn dynamicLinearDenseBufferKey(buf: *const Buf) usize {
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.deviceHandle()) |handle| {
+                return @intFromPtr(handle) +% (metal_tensor.deviceByteOffset() *% 1315423911);
+            }
+        }
+        if (buf.native_dense_bytes) |bytes| return @intFromPtr(bytes.ptr);
+        return @intFromPtr(buf.data.ptr);
+    }
+
+    fn dynamicLinearSlotKey(weight: CT, bias: CT, in_dim: usize, out_dim: usize) DynamicLinearSlotKey {
+        const weight_buf = toBuf(weight);
+        const bias_buf = toBuf(bias);
+        const quantized_storage = weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage;
+        return .{
+            .weight_buf = if (quantized_storage) |storage| @intFromPtr(storage) else dynamicLinearDenseBufferKey(weight_buf),
+            .bias_buf = dynamicLinearDenseBufferKey(bias_buf),
+            .quantized_storage = if (quantized_storage) |storage| @intFromPtr(storage) else 0,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+        };
+    }
+
+    fn ensureDynamicLinearSlot(
+        self: *MetalCompute,
+        weight: CT,
+        bias: CT,
+        in_dim: usize,
+        out_dim: usize,
+    ) !?usize {
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const key = dynamicLinearSlotKey(weight, bias, in_dim, out_dim);
+        if (self.dynamic_linear_slots.get(key)) |slot| return slot;
+        const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        if (!(try decoderRuntimePrepareLinearOp(self, &.{
+            .slot = slot,
+            .weight = weight,
+            .bias = bias,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .retain_dense_fallback = true,
+        }))) return null;
+        try self.dynamic_linear_slots.put(self.allocator, key, slot);
+        return slot;
+    }
+
+    fn quantizedStorageLinearSlotKey(tensor: CT, in_dim: usize, out_dim: usize) DynamicLinearSlotKey {
+        const weight_buf = toBuf(tensor);
+        const storage = weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage;
+        return .{
+            .weight_buf = if (storage) |s|
+                @intFromPtr(s)
+            else if (weight_buf.native_dense_bytes) |bytes|
+                @intFromPtr(bytes.ptr)
+            else
+                @intFromPtr(weight_buf.data.ptr),
+            .bias_buf = 0,
+            .quantized_storage = if (storage) |s| @intFromPtr(s) else 0,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+        };
+    }
+
+    fn ensureQuantizedStorageLinearSlot(
+        self: *MetalCompute,
+        tensor: CT,
+        in_dim: usize,
+        out_dim: usize,
+    ) !?usize {
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const key = quantizedStorageLinearSlotKey(tensor, in_dim, out_dim);
+        if (self.dynamic_linear_slots.get(key)) |slot| return slot;
+        const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        const zero_bias = try self.cachedZeroBiasBuf(out_dim);
+        defer freeOp(self, zero_bias);
+        if (!(try decoderRuntimePrepareLinearOp(self, &.{
+            .slot = slot,
+            .weight = tensor,
+            .bias = zero_bias,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .retain_dense_fallback = true,
+        }))) return null;
+        try self.dynamic_linear_slots.put(self.allocator, key, slot);
+        return slot;
+    }
+
+    fn dequantizeQuantTensorWithRuntimeRowCopy(
+        self: *MetalCompute,
+        tensor: CT,
+        storage: *const QuantizedStorage,
+        rows: usize,
+        cols: usize,
+        allocator: std.mem.Allocator,
+    ) !?[]f32 {
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        if (!metal_runtime.isMetalNativeSupported(storage.tensor_type)) return null;
+
+        const slot = (try self.ensureQuantizedStorageLinearSlot(tensor, cols, rows)) orelse return null;
+        var device_copy = (try metal_runtime.decoderRuntimeCopyQuantLinearSlotToF32(
+            self.provider_impl,
+            slot,
+            0,
+            rows,
+            cols,
+            rows,
+            1.0,
+        )) orelse return null;
+        defer device_copy.deinit();
+
+        const host = try device_copy.toHostSlice();
+        if (host.len != rows * cols) return null;
+        const output = try allocator.alloc(f32, host.len);
+        errdefer allocator.free(output);
+        @memcpy(output, host);
+        return output;
+    }
+
+    fn nextFreeDynamicLayerNormSlot(self: *MetalCompute) ?usize {
+        while (self.next_dynamic_layer_norm_slot > 0) {
+            self.next_dynamic_layer_norm_slot -= 1;
+            const slot = self.next_dynamic_layer_norm_slot;
+            if (!self.provider_impl.raw_layer_norm_slots_prepared[slot]) return slot;
+        }
+        return null;
+    }
+
+    fn dynamicLayerNormSlotKey(gamma: CT, beta: CT, hidden_size: usize) DynamicLayerNormSlotKey {
+        return .{
+            .gamma_buf = @intFromPtr(toBuf(gamma).data.ptr),
+            .beta_buf = @intFromPtr(toBuf(beta).data.ptr),
+            .hidden_size = hidden_size,
+        };
+    }
+
+    fn ensureDynamicLayerNormSlot(
+        self: *MetalCompute,
+        gamma: CT,
+        beta: CT,
+        hidden_size: usize,
+    ) !?usize {
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const key = dynamicLayerNormSlotKey(gamma, beta, hidden_size);
+        if (self.dynamic_layer_norm_slots.get(key)) |slot| return slot;
+        const slot = self.nextFreeDynamicLayerNormSlot() orelse return null;
+        if (!(try decoderRuntimePrepareLayerNormOp(self, &.{
+            .slot = slot,
+            .weight = gamma,
+            .bias = beta,
+            .hidden_size = hidden_size,
+        }))) return null;
+        try self.dynamic_layer_norm_slots.put(self.allocator, key, slot);
+        return slot;
+    }
+
+    fn nextFreeDynamicRmsNormSlot(self: *MetalCompute) ?usize {
+        while (self.next_dynamic_rms_norm_slot > 0) {
+            self.next_dynamic_rms_norm_slot -= 1;
+            const slot = self.next_dynamic_rms_norm_slot;
+            if (!self.provider_impl.raw_rms_norm_slots_prepared[slot]) return slot;
+        }
+        return null;
+    }
+
+    fn dynamicRmsNormSlotKey(weight: CT, hidden_size: usize) DynamicRmsNormSlotKey {
+        const weight_buf = toBuf(weight);
+        return .{
+            .weight_buf = dynamicLinearDenseBufferKey(weight_buf),
+            .hidden_size = hidden_size,
+        };
+    }
+
+    fn ensureDynamicRmsNormSlot(
+        self: *MetalCompute,
+        weight: CT,
+        hidden_size: usize,
+    ) !?usize {
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const key = dynamicRmsNormSlotKey(weight, hidden_size);
+        if (self.dynamic_rms_norm_slots.get(key)) |slot| return slot;
+        const slot = self.nextFreeDynamicRmsNormSlot() orelse return null;
+        if (!(try decoderRuntimePrepareRmsNormOp(self, &.{
+            .slot = slot,
+            .weight = weight,
+            .hidden_size = hidden_size,
+        }))) return null;
+        try self.dynamic_rms_norm_slots.put(self.allocator, key, slot);
+        return slot;
+    }
+
+    fn ctFromOwnedMetalTensor(self: *MetalCompute, tensor: MetalTensor) !CT {
+        // Preserve device residency — host materialization happens lazily
+        // via `toHostSlice` at the next host-side access. Required for the
+        // Phase-3 device-resident decoder loop, where the layer hot path
+        // must keep hidden state on-device across ops.
+        return self.metalTensorBufWithHostMaterialization(tensor, false);
+    }
+
+    fn cloneTensorShapeOp(ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null or
+            buf.runtime_quantized_storage != null or
+            buf.owned_quantized_storage != null)
+        {
+            return null;
+        }
+        const metal_tensor = buf.metal_tensor orelse return null;
+        if (shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+        var elem_count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0) return error.UnsupportedShape;
+            elem_count = try std.math.mul(usize, elem_count, @intCast(dim));
+        }
+        const byte_len = try std.math.mul(usize, elem_count, @sizeOf(f32));
+        const device_byte_len = metal_tensor.deviceByteLen();
+        if (byte_len > device_byte_len) {
+            if (traceCloneTensorShape()) {
+                std.debug.print(
+                    "metal_clone_tensor_shape: miss reason=byte_len shape_elems={d} byte_len={d} tensor_bytes={d}\n",
+                    .{ elem_count, byte_len, device_byte_len },
+                );
+            }
+            return null;
+        }
+        if (traceCloneTensorShape()) {
+            std.debug.print(
+                "metal_clone_tensor_shape: hit shape_elems={d} byte_len={d} tensor_bytes={d}\n",
+                .{ elem_count, byte_len, device_byte_len },
+            );
+        }
+        var cloned = try metal_tensor.retainedView(0, byte_len, shape);
+        errdefer cloned.deinit();
+        return self.ctFromOwnedMetalTensor(cloned);
+    }
+
+    fn withLogicalShape(self: *MetalCompute, tensor: CT, shape: []const i64) !CT {
+        if (toBuf(tensor).logical_shape) |old_shape| self.allocator.free(old_shape);
+        toBuf(tensor).logical_shape = try self.allocator.dupe(i64, shape);
+        if (toBuf(tensor).view_strides != null) {
+            if (toBuf(tensor).logical_view_strides) |old_strides| self.allocator.free(old_strides);
+            toBuf(tensor).logical_view_strides = try allocLogicalDenseStrides(self.allocator, shape);
+        }
+        return tensor;
+    }
+
+    fn freeOp(ctx: *anyopaque, tensor: CT) void {
+        _ = ctx;
+        const buf = toBuf(tensor);
+        if (buf.lazy_entry) |entry| {
+            if (entry.pin_count > 0) entry.pin_count -= 1;
+        }
+        releaseOwnedHostData(buf);
+        if (buf.logical_shape) |shape| buf.allocator.free(shape);
+        if (buf.view_strides) |strides| buf.allocator.free(strides);
+        if (buf.logical_view_strides) |strides| buf.allocator.free(strides);
+        releaseViewIndexMap(buf);
+        if (buf.metal_tensor) |*metal_tensor| metal_tensor.deinit();
+        if (buf.native_dense_bytes_owned) {
+            if (buf.native_dense_bytes) |bytes| buf.allocator.free(bytes);
+            buf.native_dense_bytes = null;
+            buf.native_dense_bytes_owned = false;
+        }
+        if (buf.owned_quantized_storage) |storage| {
+            storage.deinit();
+            buf.allocator.destroy(storage);
+        }
+        buf.allocator.destroy(buf);
+    }
+
+    fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const owned = try self.allocator.alloc(f32, data.len);
+        @memcpy(owned, data);
+        const shape = [_]i32{@intCast(data.len)};
+        return denseBuf(self.allocator, owned, true, &shape);
+    }
+
+    fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (uploadFloat32InputsToDevice() and shouldUploadFloat32ShapeToMetal(data.len, shape)) {
+            if (self.provider_impl.raw_decode_runtime) |runtime| {
+                var device_tensor = try MetalTensor.deviceAllocate(
+                    @ptrCast(runtime),
+                    data.len * @sizeOf(f32),
+                    uploadStorageMode(data.len * @sizeOf(f32)),
+                    shape,
+                );
+                errdefer device_tensor.deinit();
+                const host_tensor = MetalTensor.borrowed(@constCast(data.ptr), data.len, shape);
+                try host_tensor.copyInto(&device_tensor);
+                return self.ctFromOwnedMetalTensor(device_tensor);
+            }
+        }
+        const owned = try self.allocator.alloc(f32, data.len);
+        @memcpy(owned, data);
+        return denseBuf(self.allocator, owned, true, shape);
+    }
+
+    fn convertDTypeOp(ctx: *anyopaque, tensor: CT, target: ops.GraphDType) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null) return null;
+        const metal_tensor = buf.metal_tensor orelse return null;
+        if (!metal_tensor.isDevice()) return null;
+
+        const kind: u32 = switch (target) {
+            .f32, .f16, .bf16, .f64 => 0,
+            .bool_ => 2,
+            .i8, .i16, .i32, .i64, .u8 => 1,
+        };
+
+        var input_mt = try metal_tensor.retainedCopy();
+        defer input_mt.deinit();
+        if (kind == 0) return self.ctFromOwnedMetalTensor(try metal_tensor.retainedCopy());
+        if (try metal_runtime.decoderRuntimeConvertDTypeF32Device(self.provider_impl, input_mt, kind)) |converted| {
+            return self.ctFromOwnedMetalTensor(converted);
+        }
+        return null;
+    }
+
+    fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        if (buf.owned_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        if (hasHostView(buf)) try materializeViewData(buf);
+        const data = if (buf.metal_tensor) |*metal_tensor|
+            try metal_tensor.toHostSlice()
+        else
+            buf.data;
+        if (buf.logical_shape) |logical_shape| {
+            if (safeShapeNumel(logical_shape)) |logical_numel| {
+                if (logical_numel > data.len and data.len > 0 and logical_numel % data.len == 0) {
+                    const out = try allocator.alloc(f32, logical_numel);
+                    for (0..logical_numel) |i| out[i] = data[i % data.len];
+                    return out;
+                }
+            }
+        }
+        const out = try allocator.alloc(f32, data.len);
+        @memcpy(out, data);
+        return out;
+    }
+
+    fn dequantizeStorageToFloat32(
+        self: *MetalCompute,
+        tensor: CT,
+        storage: *const QuantizedStorage,
+        allocator: std.mem.Allocator,
+    ) ![]f32 {
+        if (storage.packed_expert != null) return error.UnsupportedTensorType;
+        if (storage.shape.len == 2) {
+            const rows: usize = @intCast(storage.shape[0]);
+            const cols: usize = @intCast(storage.shape[1]);
+            if (try self.dequantizeQuantTensorWithRuntimeRowCopy(tensor, storage, rows, cols, allocator)) |output| {
+                return output;
+            }
+        }
+        var elem_count: usize = 1;
+        for (storage.shape) |dim| {
+            if (dim <= 0) return error.UnsupportedShape;
+            elem_count *= @as(usize, @intCast(dim));
+        }
+        const out = try allocator.alloc(f32, elem_count);
+        errdefer allocator.free(out);
+        try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, out);
+        return out;
+    }
+
+    fn canRepresentBroadcastAsRepeatedBuffer(
+        in_shape: []const i64,
+        out_shape: []const i64,
+        broadcast_axes: []const u8,
+    ) bool {
+        if (broadcast_axes.len != in_shape.len) return false;
+        var preserved_suffix: usize = 0;
+        var input_axis = in_shape.len;
+        while (input_axis > 0) {
+            input_axis -= 1;
+            const dim = in_shape[input_axis];
+            if (dim <= 0) return false;
+            if (dim == 1) continue;
+            if (preserved_suffix >= out_shape.len) return false;
+            const out_axis = out_shape.len - 1 - preserved_suffix;
+            if (broadcast_axes[input_axis] != out_axis) return false;
+            if (out_shape[out_axis] != dim) return false;
+            preserved_suffix += 1;
+        }
+        return preserved_suffix > 0;
+    }
+
+    fn tensorShapeOp(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]i64 {
+        _ = ctx;
+        const buf = toBuf(tensor);
+        if (buf.logical_shape) |shape| return allocator.dupe(i64, shape);
+        return allocator.dupe(i64, &[_]i64{@intCast(bufElemCount(buf))});
+    }
+
+    fn sliceLastDimOp(ctx: *anyopaque, tensor: CT, start: usize, stop: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input = toBuf(tensor);
+        const shape = input.logical_shape orelse return error.UnsupportedShape;
+        if (shape.len != 2) return error.UnsupportedShape;
+
+        const rows: usize = @intCast(shape[0]);
+        const cols: usize = @intCast(shape[1]);
+        if (start > stop or stop > cols) return error.OutOfBounds;
+        const out_cols = stop - start;
+
+        if (input.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) {
+                if (rows == 1) {
+                    const byte_offset = start * @sizeOf(f32);
+                    const byte_len = out_cols * @sizeOf(f32);
+                    const out_shape = [_]i32{ 1, @intCast(out_cols) };
+                    const view = try metal_tensor.retainedView(byte_offset, byte_len, &out_shape);
+                    return self.ctFromOwnedMetalTensor(view);
+                }
+                if (try metal_runtime.sliceLastDim2DDevice(self.provider_impl, metal_tensor.*, start, stop)) |sliced| {
+                    return self.ctFromOwnedMetalTensor(sliced);
+                }
+            } else if (rows == 1) {
+                const byte_offset = start * @sizeOf(f32);
+                const byte_len = out_cols * @sizeOf(f32);
+                const out_shape = [_]i32{ 1, @intCast(out_cols) };
+                const view = try metal_tensor.retainedView(byte_offset, byte_len, &out_shape);
+                return self.ctFromOwnedMetalTensor(view);
+            }
+        }
+
+        const input_data = try hostSliceForBuf(input);
+        const out = try input.allocator.alloc(f32, rows * out_cols);
+        errdefer input.allocator.free(out);
+        for (0..rows) |row| {
+            const src = input_data[row * cols + start .. row * cols + stop];
+            const dst = out[row * out_cols ..][0..out_cols];
+            @memcpy(dst, src);
+        }
+
+        const out_shape = [_]i32{ @intCast(rows), @intCast(out_cols) };
+        return denseBuf(input.allocator, out, true, &out_shape);
+    }
+
+    fn evalTensorOp(ctx: *anyopaque, tensor: CT) anyerror!void {
+        _ = ctx;
+        _ = tensor;
+    }
+
+    fn zeroTensorOp(ctx: *anyopaque, rows: usize, dim: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (rows == 0 or dim == 0) return null;
+        if (self.provider_impl.raw_decode_runtime) |runtime| {
+            if (metal_runtime.termite_metal_decode_runtime_ready(runtime) != 0) {
+                const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+                var tensor = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .shared, &shape);
+                errdefer tensor.deinit();
+                const handle = tensor.deviceHandle() orelse return null;
+                const raw = metal_runtime.termite_metal_buffer_contents(handle) orelse return null;
+                const host: [*]f32 = @ptrCast(@alignCast(raw));
+                @memset(host[0 .. rows * dim], 0);
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+        const out = try self.allocator.alloc(f32, rows * dim);
+        @memset(out, 0);
+        const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+        return denseBuf(self.allocator, out, true, &shape);
+    }
+
+    fn reshape2DOp(
+        ctx: *anyopaque,
+        input: CT,
+        old_rows: usize,
+        old_cols: usize,
+        new_rows: usize,
+        new_cols: usize,
+    ) anyerror!CT {
+        _ = old_rows;
+        _ = old_cols;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (input_buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) {
+                const shape = [_]i32{ @intCast(new_rows), @intCast(new_cols) };
+                const view = try metal_tensor.retainedView(0, metal_tensor.deviceByteLen(), &shape);
+                return self.metalTensorBufWithHostMaterialization(view, false);
+            }
+        }
+        const input_data = try hostSliceForBuf(input_buf);
+        const output = try self.allocator.dupe(f32, input_data);
+        errdefer self.allocator.free(output);
+        const shape = [_]i32{ @intCast(new_rows), @intCast(new_cols) };
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
+        return reshape2DOp(ctx, input, 0, 0, rows, cols);
+    }
+
+    fn resolveReshapeShape(input_shape: ?[]const i64, input_numel: usize, new_shape: []const i64) ![metal_tensor_mod.max_dims]i64 {
+        if (new_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+
+        if (input_shape) |shape| {
+            if (inferReshapeShapeWithNumel(shape, new_shape, input_numel)) |resolved| return resolved;
+        }
+        if (resolveShapeFromDataLen(new_shape, input_numel)) |resolved| return resolved;
+
+        var resolved: [metal_tensor_mod.max_dims]i64 = undefined;
+        var infer_index: ?usize = null;
+        var known_product: usize = 1;
+
+        for (new_shape, 0..) |dim, i| {
+            const resolved_dim = blk: {
+                if (dim > 0) break :blk dim;
+                if (dim == 0) {
+                    if (input_shape) |shape| {
+                        if (i < shape.len and shape[i] > 0) break :blk shape[i];
+                    }
+                    return error.UnsupportedShape;
+                }
+                if (dim == -1) {
+                    if (infer_index != null) return error.UnsupportedShape;
+                    infer_index = i;
+                    break :blk dim;
+                }
+                return error.UnsupportedShape;
+            };
+            resolved[i] = resolved_dim;
+            if (resolved_dim > 0) {
+                known_product = std.math.mul(usize, known_product, @intCast(resolved_dim)) catch return error.UnsupportedShape;
+            }
+        }
+
+        if (infer_index) |idx| {
+            if (known_product == 0 or input_numel % known_product != 0) return error.UnsupportedShape;
+            resolved[idx] = @intCast(input_numel / known_product);
+        } else if (known_product != input_numel) {
+            return error.UnsupportedShape;
+        }
+
+        return resolved;
+    }
+
+    fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+
+        const resolved = resolveReshapeShape(input_buf.logical_shape, bufElemCount(input_buf), new_shape) catch {
+            return self.hostFallbackReshape(input, new_shape);
+        };
+        const resolved_slice = resolved[0..new_shape.len];
+
+        if (input_buf.metal_tensor) |*metal_tensor| {
+            const shape_i32 = try self.i32ShapeFromI64(resolved_slice);
+            defer self.allocator.free(shape_i32);
+            const view = try metal_tensor.retainedView(0, metal_tensor.deviceByteLen(), shape_i32);
+            return self.metalTensorBufWithHostMaterialization(view, false);
+        }
+
+        if (input_buf.view_index_map) |source_index_map| {
+            const source_shape = input_buf.logical_shape orelse return error.InvalidTensorShape;
+            const source_numel = try shapeNumel(source_shape);
+            if (source_index_map.len != source_numel) return error.InvalidTensorShape;
+            return self.aliasHostIndexViewWithShape(input, resolved_slice);
+        }
+
+        if (input_buf.view_strides) |view_strides| {
+            if (input_buf.logical_shape) |logical_shape| {
+                if (input_buf.view_base_offset == 0 and isContiguousLogicalView(logical_shape, view_strides)) {
+                    return self.aliasHostBufferWithShape(input, resolved_slice);
+                }
+
+                const source_numel = try shapeNumel(logical_shape);
+                var source_strides: [metal_tensor_mod.max_dims]usize = undefined;
+                computeStrides(logical_shape, source_strides[0..logical_shape.len]);
+                const can_wrap_repeated = source_numel > input_buf.data.len and input_buf.data.len > 0 and source_numel % input_buf.data.len == 0;
+                const index_map = try self.allocator.alloc(usize, source_numel);
+                errdefer self.allocator.free(index_map);
+                for (0..source_numel) |flat| {
+                    var remaining = flat;
+                    var flat_in = input_buf.view_base_offset;
+                    for (0..logical_shape.len) |d| {
+                        const coord = remaining / source_strides[d];
+                        remaining %= source_strides[d];
+                        flat_in += coord * view_strides[d];
+                    }
+                    if (flat_in >= input_buf.data.len) {
+                        if (!can_wrap_repeated) return error.InvalidTensorShape;
+                        index_map[flat] = flat_in % input_buf.data.len;
+                    } else {
+                        index_map[flat] = flat_in;
+                    }
+                }
+                return self.adoptIndexViewAlias(input, resolved_slice, index_map);
+            }
+        } else {
+            return self.aliasHostBufferWithShape(input, resolved_slice);
+        }
+
+        const host = try hostSliceForBuf(input_buf);
+        const output = try self.allocator.dupe(f32, host);
+        errdefer self.allocator.free(output);
+        const shape_i32 = try self.i32ShapeFromI64(resolved_slice);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn resolveConcreteShape(input_buf: *const Buf, declared_shape: []const i64) ![metal_tensor_mod.max_dims]i64 {
+        if (declared_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+        if (resolveReshapeShape(input_buf.logical_shape, bufElemCount(input_buf), declared_shape)) |resolved| {
+            return resolved;
+        } else |_| {}
+        var resolved: [metal_tensor_mod.max_dims]i64 = undefined;
+        for (declared_shape, 0..) |dim, i| {
+            if (dim > 0) {
+                resolved[i] = dim;
+            } else if (input_buf.logical_shape) |shape| {
+                if (i < shape.len and shape[i] > 0) {
+                    resolved[i] = shape[i];
+                } else {
+                    return error.UnsupportedShape;
+                }
+            } else {
+                return error.UnsupportedShape;
+            }
+        }
+        return resolved;
+    }
+
+    fn resolveShapeRightmostUnknown(declared_shape: []const i64, elem_count: usize) ![metal_tensor_mod.max_dims]i64 {
+        if (declared_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+        var resolved: [metal_tensor_mod.max_dims]i64 = undefined;
+        var known_product: usize = 1;
+        var unknown_count: usize = 0;
+        var rightmost_unknown: usize = 0;
+
+        for (declared_shape, 0..) |dim, i| {
+            if (dim > 0) {
+                const usize_dim: usize = @intCast(dim);
+                known_product = std.math.mul(usize, known_product, usize_dim) catch return error.UnsupportedShape;
+                resolved[i] = dim;
+            } else {
+                resolved[i] = 1;
+                unknown_count += 1;
+                rightmost_unknown = i;
+            }
+        }
+
+        if (unknown_count == 0) {
+            if (known_product != elem_count) return error.UnsupportedShape;
+            return resolved;
+        }
+        if (known_product == 0 or elem_count % known_product != 0) return error.UnsupportedShape;
+
+        const inferred = elem_count / known_product;
+        if (inferred == 0) return error.UnsupportedShape;
+        resolved[rightmost_unknown] = @intCast(inferred);
+
+        var final_product: usize = 1;
+        for (resolved[0..declared_shape.len]) |dim| {
+            const usize_dim: usize = @intCast(dim);
+            final_product = std.math.mul(usize, final_product, usize_dim) catch return error.UnsupportedShape;
+        }
+        if (final_product != elem_count) return error.UnsupportedShape;
+        return resolved;
+    }
+
+    fn resolveDotOperandShape(
+        buf: *const Buf,
+        declared_shape: []const i64,
+        batch_axes: []const u8,
+        peer_batch_axes: []const u8,
+        contracting_axes: []const u8,
+        peer_contracting_axes: []const u8,
+        peer_resolved: ?[]const i64,
+    ) ![metal_tensor_mod.max_dims]i64 {
+        if (declared_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+        var resolved: [metal_tensor_mod.max_dims]i64 = undefined;
+        var known_product: usize = 1;
+        var unknown_count: usize = 0;
+        var last_unknown: usize = 0;
+
+        for (declared_shape, 0..) |dim, i| {
+            if (dim > 0) {
+                resolved[i] = dim;
+                known_product = std.math.mul(usize, known_product, @as(usize, @intCast(dim))) catch return error.UnsupportedShape;
+            } else {
+                resolved[i] = 0;
+                unknown_count += 1;
+                last_unknown = i;
+            }
+        }
+
+        if (peer_resolved) |peer| {
+            if (batch_axes.len == peer_batch_axes.len) {
+                for (batch_axes, peer_batch_axes) |axis, peer_axis| {
+                    if (axis >= resolved.len or peer_axis >= peer.len) return error.UnsupportedShape;
+                    if (declared_shape[axis] <= 0 and peer[peer_axis] > 0) {
+                        if (resolved[axis] <= 0) unknown_count -= 1;
+                        resolved[axis] = peer[peer_axis];
+                        known_product = std.math.mul(usize, known_product, @as(usize, @intCast(peer[peer_axis]))) catch return error.UnsupportedShape;
+                    }
+                }
+            }
+            if (contracting_axes.len == peer_contracting_axes.len) {
+                for (contracting_axes, peer_contracting_axes) |axis, peer_axis| {
+                    if (axis >= resolved.len or peer_axis >= peer.len) return error.UnsupportedShape;
+                    if (declared_shape[axis] <= 0 and peer[peer_axis] > 0) {
+                        if (resolved[axis] <= 0) unknown_count -= 1;
+                        resolved[axis] = peer[peer_axis];
+                        known_product = std.math.mul(usize, known_product, @as(usize, @intCast(peer[peer_axis]))) catch return error.UnsupportedShape;
+                    }
+                }
+            }
+        }
+
+        const elem_count = bufElemCount(buf);
+        if (unknown_count == 1) {
+            if (elem_count % known_product != 0) return error.UnsupportedShape;
+            const inferred = elem_count / known_product;
+            if (inferred == 0) return error.UnsupportedShape;
+            resolved[last_unknown] = @intCast(inferred);
+            known_product = elem_count;
+            unknown_count = 0;
+        }
+
+        if (unknown_count > 0) {
+            if (buf.logical_shape) |logical| {
+                for (resolved[0..declared_shape.len], 0..) |dim, i| {
+                    if (dim <= 0 and i < logical.len and logical[i] > 0) {
+                        resolved[i] = logical[i];
+                        known_product = std.math.mul(usize, known_product, @as(usize, @intCast(logical[i]))) catch return error.UnsupportedShape;
+                        unknown_count -= 1;
+                    }
+                }
+            }
+        }
+        if (unknown_count == 0) {
+            if (known_product != elem_count) return error.UnsupportedShape;
+            return resolved;
+        }
+        if (elem_count % known_product != 0) return error.UnsupportedShape;
+
+        const inferred = elem_count / known_product;
+        if (inferred == 0) return error.UnsupportedShape;
+        for (resolved[0..declared_shape.len], 0..) |dim, i| {
+            if (dim <= 0 and i != last_unknown) resolved[i] = 1;
+        }
+        resolved[last_unknown] = @intCast(inferred);
+
+        var final_product: usize = 1;
+        for (resolved[0..declared_shape.len]) |dim| {
+            if (dim <= 0) return error.UnsupportedShape;
+            final_product = std.math.mul(usize, final_product, @as(usize, @intCast(dim))) catch return error.UnsupportedShape;
+        }
+        if (final_product != elem_count) return error.UnsupportedShape;
+        return resolved;
+    }
+
+    fn allConcreteShapeDims(shape: []const i64) bool {
+        for (shape) |dim| {
+            if (dim <= 0) return false;
+        }
+        return true;
+    }
+
+    fn hasSymbolicShapeDims(shape: []const i64) bool {
+        for (shape) |dim| {
+            if (dim <= 0) return true;
+        }
+        return false;
+    }
+
+    fn dotContractingDimsMatch(lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8) bool {
+        if (lhs_contracting.len != rhs_contracting.len) return false;
+        for (lhs_contracting, rhs_contracting) |lhs_axis, rhs_axis| {
+            if (lhs_axis >= lhs_shape.len or rhs_axis >= rhs_shape.len) return false;
+            if (lhs_shape[lhs_axis] != rhs_shape[rhs_axis]) return false;
+        }
+        return true;
+    }
+
+    fn resolveSimple2DDotShapes(
+        lhs_buf: *const Buf,
+        rhs_buf: *const Buf,
+        lhs_shape: []const i64,
+        rhs_shape: []const i64,
+        lhs_contracting: []const u8,
+        rhs_contracting: []const u8,
+    ) ?struct { lhs: [2]i64, rhs: [2]i64 } {
+        if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
+        if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+
+        const lc = lhs_contracting[0];
+        const rc = rhs_contracting[0];
+        if (lc > 1 or rc > 1) return null;
+
+        const lhs_other = 1 - lc;
+        const rhs_other = 1 - rc;
+
+        var k: i64 = 0;
+        if (lc < lhs_shape.len and lhs_shape[lc] > 0) k = lhs_shape[lc];
+        if (k <= 0) {
+            if (lhs_buf.logical_shape) |logical| {
+                if (lc < logical.len and logical[lc] > 0) k = logical[lc];
+            }
+        }
+        if (k <= 0 and rc < rhs_shape.len and rhs_shape[rc] > 0) k = rhs_shape[rc];
+        if (k <= 0) {
+            if (rhs_buf.logical_shape) |logical| {
+                if (rc < logical.len and logical[rc] > 0) k = logical[rc];
+            }
+        }
+        if (k <= 0) return null;
+
+        const k_usize: usize = @intCast(k);
+        const lhs_len = bufElemCount(lhs_buf);
+        const rhs_len = bufElemCount(rhs_buf);
+        if (lhs_len % k_usize != 0 or rhs_len % k_usize != 0) return null;
+
+        const m: i64 = @intCast(lhs_len / k_usize);
+        const n: i64 = @intCast(rhs_len / k_usize);
+        if (m <= 0 or n <= 0) return null;
+
+        var lhs_resolved = [_]i64{ 0, 0 };
+        lhs_resolved[lc] = k;
+        lhs_resolved[lhs_other] = m;
+
+        var rhs_resolved = [_]i64{ 0, 0 };
+        rhs_resolved[rc] = k;
+        rhs_resolved[rhs_other] = n;
+        return .{ .lhs = lhs_resolved, .rhs = rhs_resolved };
+    }
+
+    fn importCtToHostNative(self: *MetalCompute, native_ctx: *HostFallbackNative, ct: CT, shape_override: ?[]const i64) !CT {
+        const buf = toBuf(ct);
+        const shape_i64 = shape_override orelse buf.logical_shape orelse &[_]i64{@intCast(bufElemCount(buf))};
+        const shape_i32 = try self.i32ShapeFromI64(shape_i64);
+        defer self.allocator.free(shape_i32);
+        if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
+            const expected_count = try shapeNumel(shape_i64);
+            const host = try convertNativeDenseBytesToOwnedF32(
+                self.allocator,
+                buf.native_dense_bytes.?,
+                buf.native_dense_dtype.?,
+                expected_count,
+            );
+            defer self.allocator.free(host);
+            return native_ctx.cb.fromFloat32Shape(host, shape_i32);
+        }
+        const host = try hostSliceForBuf(buf);
+        return native_ctx.cb.fromFloat32Shape(host, shape_i32);
+    }
+
+    fn exportCtFromHostNative(self: *MetalCompute, native_ctx: *HostFallbackNative, ct: CT, shape_override: ?[]const i64) !CT {
+        const out = try native_ctx.cb.toFloat32(ct, self.allocator);
+        errdefer self.allocator.free(out);
+        const out_shape_i64 = blk: {
+            if (shape_override) |shape| break :blk try self.allocator.dupe(i64, shape);
+            break :blk try native_ctx.cb.tensorShape(ct, self.allocator);
+        };
+        defer self.allocator.free(out_shape_i64);
+        const out_shape_i32 = try self.i32ShapeFromI64(out_shape_i64);
+        defer self.allocator.free(out_shape_i32);
+        return denseBuf(self.allocator, out, true, out_shape_i32);
+    }
+
+    fn hostFallbackUnary(self: *MetalCompute, input: CT, shape_override: ?[]const i64, comptime op_kind: HostUnaryOp) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, shape_override);
+        defer native_ctx.cb.free(n_input);
+
+        const n_output = switch (op_kind) {
+            .negate => try native_ctx.cb.primNegate(n_input),
+            .sqrt => try native_ctx.cb.primSqrt(n_input),
+            .rsqrt => try native_ctx.cb.primRsqrt(n_input),
+            .exp => try native_ctx.cb.primExp(n_input),
+            .log => try native_ctx.cb.primLog(n_input),
+            .sin => try native_ctx.cb.primSin(n_input),
+            .cos => try native_ctx.cb.primCos(n_input),
+            .tanh => try native_ctx.cb.primTanh(n_input),
+            .erf => try native_ctx.cb.primErf(n_input),
+            .abs => try native_ctx.cb.primAbs(n_input),
+            .sigmoid => try native_ctx.cb.sigmoid(n_input),
+        };
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, shape_override);
+    }
+
+    fn hostFallbackBinary(self: *MetalCompute, a: CT, b: CT, a_shape: ?[]const i64, b_shape: ?[]const i64, comptime op_kind: HostBinaryOp) !CT {
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        const a_len = bufElemCount(a_buf);
+        const b_len = bufElemCount(b_buf);
+        const a_declared_shape = a_shape orelse a_buf.logical_shape;
+        const b_declared_shape = b_shape orelse b_buf.logical_shape;
+        const symbolic_broadcast = (a_declared_shape != null and hasSymbolicShapeDims(a_declared_shape.?)) or
+            (b_declared_shape != null and hasSymbolicShapeDims(b_declared_shape.?));
+
+        if (symbolic_broadcast) {
+            const big_len = if (a_len >= b_len) a_len else b_len;
+            const small_len = if (a_len >= b_len) b_len else a_len;
+            const a_is_big = a_len >= b_len;
+            if (small_len == 0 and big_len != 0) return error.ShapeMismatch;
+
+            const output = try self.allocator.alloc(f32, big_len);
+            errdefer self.allocator.free(output);
+
+            if (small_len == big_len) {
+                for (0..big_len) |i| {
+                    const va = if (a_is_big) try logicalValueAtFlat(a_buf, i) else try logicalValueAtFlat(b_buf, i);
+                    const vb = if (a_is_big) try logicalValueAtFlat(b_buf, i) else try logicalValueAtFlat(a_buf, i);
+                    const a_val = if (a_is_big) va else vb;
+                    const b_val = if (a_is_big) vb else va;
+                    output[i] = switch (op_kind) {
+                        .add => a_val + b_val,
+                        .multiply => a_val * b_val,
+                        .subtract => a_val - b_val,
+                        .divide => a_val / b_val,
+                        .less_than => if (a_val < b_val) 1.0 else 0.0,
+                        else => return error.UnsupportedPrimitiveOp,
+                    };
+                }
+            } else {
+                for (0..big_len) |i| {
+                    const bi = i % small_len;
+                    const a_val = if (a_is_big) try logicalValueAtFlat(a_buf, i) else try logicalValueAtFlat(a_buf, bi);
+                    const b_val = if (a_is_big) try logicalValueAtFlat(b_buf, bi) else try logicalValueAtFlat(b_buf, i);
+                    output[i] = switch (op_kind) {
+                        .add => a_val + b_val,
+                        .multiply => a_val * b_val,
+                        .subtract => a_val - b_val,
+                        .divide => a_val / b_val,
+                        .less_than => if (a_val < b_val) 1.0 else 0.0,
+                        else => return error.UnsupportedPrimitiveOp,
+                    };
+                }
+            }
+
+            if (a_len == b_len) {
+                if (a_buf.logical_shape) |shape| {
+                    if (resolveShapeFromDataLen(shape, output.len)) |resolved| {
+                        const out_shape_i32 = try self.i32ShapeFromI64(resolved[0..shape.len]);
+                        defer self.allocator.free(out_shape_i32);
+                        return denseBuf(self.allocator, output, true, out_shape_i32);
+                    }
+                    if (allConcreteShapeDims(shape) and safeShapeNumel(shape) == output.len) {
+                        const out_shape_i32 = try self.i32ShapeFromI64(shape);
+                        defer self.allocator.free(out_shape_i32);
+                        return denseBuf(self.allocator, output, true, out_shape_i32);
+                    }
+                }
+                if (b_buf.logical_shape) |shape| {
+                    if (resolveShapeFromDataLen(shape, output.len)) |resolved| {
+                        const out_shape_i32 = try self.i32ShapeFromI64(resolved[0..shape.len]);
+                        defer self.allocator.free(out_shape_i32);
+                        return denseBuf(self.allocator, output, true, out_shape_i32);
+                    }
+                    if (allConcreteShapeDims(shape) and safeShapeNumel(shape) == output.len) {
+                        const out_shape_i32 = try self.i32ShapeFromI64(shape);
+                        defer self.allocator.free(out_shape_i32);
+                        return denseBuf(self.allocator, output, true, out_shape_i32);
+                    }
+                }
+            }
+
+            const out_shape_i64 = try self.propagatedBinaryShapeI64(a_buf, b_buf, output.len);
+            defer self.allocator.free(out_shape_i64);
+            const out_shape_i32 = try self.i32ShapeFromI64(out_shape_i64);
+            defer self.allocator.free(out_shape_i32);
+            return denseBuf(self.allocator, output, true, out_shape_i32);
+        }
+
+        const a_shape_i64 = try self.resolveElementwiseShape(a_declared_shape, a_len);
+        defer self.allocator.free(a_shape_i64);
+        const b_shape_i64 = try self.resolveElementwiseShape(b_declared_shape, b_len);
+        defer self.allocator.free(b_shape_i64);
+        var adjusted_a_shape: ?[]i64 = null;
+        defer if (adjusted_a_shape) |shape| self.allocator.free(shape);
+        var adjusted_b_shape: ?[]i64 = null;
+        defer if (adjusted_b_shape) |shape| self.allocator.free(shape);
+
+        const result_shape = self.binaryResultShapeI64(a_shape_i64, b_shape_i64, a_len, b_len) catch |err| switch (err) {
+            error.UnsupportedShape => blk: {
+                adjusted_a_shape = try self.tryExpandFlattenedElementwiseShape(a_shape_i64, b_shape_i64, a_len);
+                adjusted_b_shape = try self.tryExpandFlattenedElementwiseShape(b_shape_i64, a_shape_i64, b_len);
+                break :blk try self.binaryResultShapeI64(adjusted_a_shape orelse a_shape_i64, adjusted_b_shape orelse b_shape_i64, a_len, b_len);
+            },
+            else => return err,
+        };
+        defer self.allocator.free(result_shape);
+
+        const lhs_shape_i64 = adjusted_a_shape orelse a_shape_i64;
+        const rhs_shape_i64 = adjusted_b_shape orelse b_shape_i64;
+        const out_rank = @max(result_shape.len, @max(lhs_shape_i64.len, rhs_shape_i64.len));
+        if (out_rank > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+
+        var out_shape: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var a_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var b_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        for (0..result_shape.len) |i| out_shape[out_rank - result_shape.len + i] = result_shape[i];
+        for (0..lhs_shape_i64.len) |i| a_aligned[out_rank - lhs_shape_i64.len + i] = lhs_shape_i64[i];
+        for (0..rhs_shape_i64.len) |i| b_aligned[out_rank - rhs_shape_i64.len + i] = rhs_shape_i64[i];
+
+        var out_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        var a_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        var b_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        computeStrides(out_shape[0..out_rank], out_strides[0..out_rank]);
+        computeStrides(a_aligned[0..out_rank], a_strides[0..out_rank]);
+        computeStrides(b_aligned[0..out_rank], b_strides[0..out_rank]);
+
+        const out_numel = if (result_shape.len == 0) @as(usize, 1) else try shapeNumel(result_shape);
+        const output = try self.allocator.alloc(f32, out_numel);
+        errdefer self.allocator.free(output);
+
+        for (0..out_numel) |flat| {
+            var rem = flat;
+            var a_idx: usize = 0;
+            var b_idx: usize = 0;
+            for (0..out_rank) |axis| {
+                const coord = if (out_strides[axis] == 0) 0 else rem / out_strides[axis];
+                rem = if (out_strides[axis] == 0) rem else rem % out_strides[axis];
+                if (a_aligned[axis] != 1) a_idx += coord * a_strides[axis];
+                if (b_aligned[axis] != 1) b_idx += coord * b_strides[axis];
+            }
+            const a_val = if (tryDirectDenseHostValue(a_buf, a_idx)) |value| value else try logicalValueAtFlat(a_buf, a_idx);
+            const b_val = if (tryDirectDenseHostValue(b_buf, b_idx)) |value| value else try logicalValueAtFlat(b_buf, b_idx);
+            output[flat] = switch (op_kind) {
+                .add => a_val + b_val,
+                .multiply => a_val * b_val,
+                .subtract => a_val - b_val,
+                .divide => a_val / b_val,
+                .less_than => if (a_val < b_val) 1.0 else 0.0,
+                else => return error.UnsupportedPrimitiveOp,
+            };
+        }
+
+        const out_shape_i32 = try self.i32ShapeFromI64(result_shape);
+        defer self.allocator.free(out_shape_i32);
+        return denseBuf(self.allocator, output, true, out_shape_i32);
+    }
+
+    fn binaryConsumeIntoPreferred(
+        self: *MetalCompute,
+        primary: CT,
+        secondary: CT,
+        comptime op_kind: HostBinaryOp,
+    ) !?CT {
+        const primary_buf = toBuf(primary);
+        const secondary_buf = toBuf(secondary);
+        if (primary_buf.quantized_storage != null or secondary_buf.quantized_storage != null) {
+            return error.UnsupportedTensorType;
+        }
+
+        const primary_len = bufElemCount(primary_buf);
+        const secondary_len = bufElemCount(secondary_buf);
+        if (primary_len < secondary_len) return null;
+        if (secondary_len == 0 and primary_len != 0) return error.ShapeMismatch;
+        if (try self.tryFlatDeviceBinaryRuntimeOp(primary, secondary, op_kind)) |device_result| return device_result;
+        if (try self.tryDevicePrimaryConsumeRuntimeOp(primary, secondary, primary_len, secondary_len, op_kind)) |device_result| return device_result;
+        if (try self.tryAnyDeviceEqualSizeBinaryRuntimeOp(primary, secondary, primary_len, secondary_len, op_kind)) |device_result| return device_result;
+
+        const output = try self.allocator.alloc(f32, primary_len);
+        errdefer self.allocator.free(output);
+
+        if (primary_len == secondary_len) {
+            for (0..primary_len) |i| {
+                const va = if (tryDirectDenseHostValue(primary_buf, i)) |value| value else try logicalValueAtFlat(primary_buf, i);
+                const vb = if (tryDirectDenseHostValue(secondary_buf, i)) |value| value else try logicalValueAtFlat(secondary_buf, i);
+                output[i] = switch (op_kind) {
+                    .add => va + vb,
+                    .multiply => va * vb,
+                    .subtract => va - vb,
+                    .divide => va / vb,
+                    .less_than => if (va < vb) 1.0 else 0.0,
+                    else => return error.UnsupportedPrimitiveOp,
+                };
+            }
+        } else {
+            for (0..primary_len) |i| {
+                const lhs = if (tryDirectDenseHostValue(primary_buf, i)) |value| value else try logicalValueAtFlat(primary_buf, i);
+                const rhs_idx = i % secondary_len;
+                const rhs = if (tryDirectDenseHostValue(secondary_buf, rhs_idx)) |value| value else try logicalValueAtFlat(secondary_buf, rhs_idx);
+                output[i] = switch (op_kind) {
+                    .add => lhs + rhs,
+                    .multiply => lhs * rhs,
+                    .subtract => lhs - rhs,
+                    .divide => lhs / rhs,
+                    .less_than => if (lhs < rhs) 1.0 else 0.0,
+                    else => return error.UnsupportedPrimitiveOp,
+                };
+            }
+        }
+
+        const out_shape_i64 = primary_buf.logical_shape orelse &[_]i64{@intCast(primary_len)};
+        const out_shape_i32 = try self.i32ShapeFromI64(out_shape_i64);
+        defer self.allocator.free(out_shape_i32);
+        return denseBuf(self.allocator, output, true, out_shape_i32);
+    }
+
+    fn tryAnyDeviceEqualSizeBinaryRuntimeOp(
+        self: *MetalCompute,
+        primary: CT,
+        secondary: CT,
+        primary_len: usize,
+        secondary_len: usize,
+        comptime op_kind: HostBinaryOp,
+    ) !?CT {
+        if (disableRuntimeElementwise()) return null;
+        if (primary_len == 0 or primary_len != secondary_len) return null;
+        const primary_metal = toBuf(primary).metal_tensor;
+        const secondary_metal = toBuf(secondary).metal_tensor;
+        const primary_is_device = if (primary_metal) |metal| metal.isDevice() else false;
+        const secondary_is_device = if (secondary_metal) |metal| metal.isDevice() else false;
+        if (!primary_is_device and !secondary_is_device) return null;
+
+        var lhs = blk: {
+            if (primary_metal) |*metal| {
+                if (metal.isDevice()) break :blk try metal.retainedCopy();
+            }
+            break :blk try self.ownedDeviceMetalTensorFromCt(primary);
+        };
+        defer lhs.deinit();
+        var rhs = blk: {
+            if (secondary_metal) |*metal| {
+                if (metal.isDevice()) break :blk try metal.retainedCopy();
+            }
+            break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
+        };
+        defer rhs.deinit();
+
+        const maybe_tensor = switch (op_kind) {
+            .add => try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                .lhs = lhs,
+                .rhs = rhs,
+                .dim = primary_len,
+            }, &self.timing_stats),
+            .multiply => try metal_runtime.decoderRuntimeApplyMultiply(self.provider_impl, lhs, rhs, primary_len),
+            .subtract => try metal_runtime.decoderRuntimeApplySubtract(self.provider_impl, lhs, rhs),
+            .divide => try metal_runtime.decoderRuntimeApplyDivide(self.provider_impl, lhs, rhs),
+            .less_than => try metal_runtime.decoderRuntimeApplyLessThan(self.provider_impl, lhs, rhs),
+            else => null,
+        };
+        if (maybe_tensor) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
+    fn tryDevicePrimaryConsumeRuntimeOp(
+        self: *MetalCompute,
+        primary: CT,
+        secondary: CT,
+        primary_len: usize,
+        secondary_len: usize,
+        comptime op_kind: HostBinaryOp,
+    ) !?CT {
+        if (disableRuntimeElementwise()) return null;
+        const primary_buf = toBuf(primary);
+        const primary_metal = primary_buf.metal_tensor orelse return null;
+        if (!primary_metal.isDevice() or primary_len == 0 or secondary_len == 0) return null;
+
+        if (primary_len == secondary_len) {
+            var lhs = try primary_metal.retainedCopy();
+            defer lhs.deinit();
+            var rhs = blk: {
+                if (toBuf(secondary).metal_tensor) |*secondary_metal| {
+                    if (secondary_metal.isDevice()) break :blk try secondary_metal.retainedCopy();
+                }
+                break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
+            };
+            defer rhs.deinit();
+            const maybe_tensor = switch (op_kind) {
+                .add => try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                    .lhs = lhs,
+                    .rhs = rhs,
+                    .dim = primary_len,
+                }, &self.timing_stats),
+                .multiply => try metal_runtime.decoderRuntimeApplyMultiply(self.provider_impl, lhs, rhs, primary_len),
+                .subtract => try metal_runtime.decoderRuntimeApplySubtract(self.provider_impl, lhs, rhs),
+                .divide => try metal_runtime.decoderRuntimeApplyDivide(self.provider_impl, lhs, rhs),
+                .less_than => try metal_runtime.decoderRuntimeApplyLessThan(self.provider_impl, lhs, rhs),
+                else => null,
+            };
+            if (maybe_tensor) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        if (secondary_len == 1) scalar_blk: {
+            const scalar = tryDirectDenseHostValue(toBuf(secondary), 0) orelse break :scalar_blk;
+            var input = try primary_metal.retainedCopy();
+            defer input.deinit();
+            switch (op_kind) {
+                .multiply => {
+                    if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input, scalar)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                },
+                .divide => {
+                    if (scalar == 0.0) return null;
+                    if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input, 1.0 / scalar)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                },
+                .add, .subtract => {
+                    var rhs = (try self.deviceScalarTensorLike(&primary_metal, if (op_kind == .subtract) -scalar else scalar)) orelse return null;
+                    defer rhs.deinit();
+                    if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                        .lhs = input,
+                        .rhs = rhs,
+                        .dim = primary_len,
+                    }, &self.timing_stats)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                },
+                else => return null,
+            }
+        }
+
+        if (op_kind == .multiply and primary_len % secondary_len == 0 and secondary_len <= 1_000_000) {
+            var lhs = try primary_metal.retainedCopy();
+            defer lhs.deinit();
+            var rhs = blk: {
+                if (toBuf(secondary).metal_tensor) |*secondary_metal| {
+                    if (secondary_metal.isDevice()) break :blk try secondary_metal.retainedCopy();
+                }
+                break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
+            };
+            defer rhs.deinit();
+            if (try metal_runtime.decoderRuntimeApplyMultiplyRhsRepeat(self.provider_impl, lhs, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        if (op_kind == .divide and primary_len % secondary_len == 0 and secondary_len <= 1_000_000) {
+            var lhs = try primary_metal.retainedCopy();
+            defer lhs.deinit();
+            var rhs = blk: {
+                if (toBuf(secondary).metal_tensor) |*secondary_metal| {
+                    if (secondary_metal.isDevice()) break :blk try secondary_metal.retainedCopy();
+                }
+                break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
+            };
+            defer rhs.deinit();
+            if (try metal_runtime.decoderRuntimeApplyDivideRhsRepeat(self.provider_impl, lhs, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        return null;
+    }
+
+    fn hostFallbackWhereSelect(self: *MetalCompute, cond: CT, on_true: CT, on_false: CT) !CT {
+        const cond_buf = toBuf(cond);
+        const true_buf = toBuf(on_true);
+        const false_buf = toBuf(on_false);
+        const cond_data = try hostSliceForBuf(cond_buf);
+        const true_data = try hostSliceForBuf(true_buf);
+        const false_data = try hostSliceForBuf(false_buf);
+        const cond_shape = cond_buf.logical_shape orelse &[_]i64{@intCast(cond_data.len)};
+        const true_shape = true_buf.logical_shape orelse &[_]i64{@intCast(true_data.len)};
+        const false_shape = false_buf.logical_shape orelse &[_]i64{@intCast(false_data.len)};
+        const out_rank = @max(cond_shape.len, @max(true_shape.len, false_shape.len));
+        if (out_rank > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+
+        var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        var cond_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var true_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var false_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+
+        for (0..cond_shape.len) |i| cond_aligned[out_rank - cond_shape.len + i] = cond_shape[i];
+        for (0..true_shape.len) |i| true_aligned[out_rank - true_shape.len + i] = true_shape[i];
+        for (0..false_shape.len) |i| false_aligned[out_rank - false_shape.len + i] = false_shape[i];
+
+        for (0..out_rank) |i| {
+            const cd = cond_aligned[i];
+            const td = true_aligned[i];
+            const fd = false_aligned[i];
+            var dim = cd;
+            if (dim == 1 or dim <= 0) dim = if (td > 1) td else if (fd > 1) fd else @max(@max(cd, td), fd);
+            const dims = [_]i64{ cd, td, fd };
+            for (dims) |candidate| {
+                if (candidate == dim or candidate == 1) continue;
+                if (candidate <= 0 and dim > 0) continue;
+                return error.UnsupportedShape;
+            }
+            if (dim <= 0) return error.UnsupportedShape;
+            out_shape[i] = dim;
+        }
+
+        const out_numel = try shapeNumel(out_shape[0..out_rank]);
+        const output = try self.allocator.alloc(f32, out_numel);
+        errdefer self.allocator.free(output);
+
+        var out_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        computeStrides(out_shape[0..out_rank], out_strides[0..out_rank]);
+        var cond_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        var true_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        var false_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        computeStrides(cond_aligned[0..out_rank], cond_strides[0..out_rank]);
+        computeStrides(true_aligned[0..out_rank], true_strides[0..out_rank]);
+        computeStrides(false_aligned[0..out_rank], false_strides[0..out_rank]);
+
+        for (0..out_numel) |flat| {
+            var rem = flat;
+            var cond_idx: usize = 0;
+            var true_idx: usize = 0;
+            var false_idx: usize = 0;
+            for (0..out_rank) |axis| {
+                const coord = if (out_strides[axis] == 0) 0 else rem / out_strides[axis];
+                rem = if (out_strides[axis] == 0) rem else rem % out_strides[axis];
+                if (cond_aligned[axis] != 1) cond_idx += coord * cond_strides[axis];
+                if (true_aligned[axis] != 1) true_idx += coord * true_strides[axis];
+                if (false_aligned[axis] != 1) false_idx += coord * false_strides[axis];
+            }
+            const cond_use = if (cond_idx < cond_data.len) cond_idx else if (cond_data.len == 1) 0 else flat % cond_data.len;
+            const true_use = if (true_idx < true_data.len) true_idx else if (true_data.len == 1) 0 else flat % true_data.len;
+            const false_use = if (false_idx < false_data.len) false_idx else if (false_data.len == 1) 0 else flat % false_data.len;
+            output[flat] = if (cond_data[cond_use] != 0.0) true_data[true_use] else false_data[false_use];
+        }
+
+        const out_shape_i32 = try self.i32ShapeFromI64(out_shape[0..out_rank]);
+        defer self.allocator.free(out_shape_i32);
+        return denseBuf(self.allocator, output, true, out_shape_i32);
+    }
+
+    fn addConsumeLeftOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.binaryConsumeIntoPreferred(a, b, .add);
+    }
+
+    fn addConsumeRightOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.binaryConsumeIntoPreferred(b, a, .add);
+    }
+
+    fn multiplyConsumeLeftOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.binaryConsumeIntoPreferred(a, b, .multiply);
+    }
+
+    fn multiplyConsumeRightOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.binaryConsumeIntoPreferred(b, a, .multiply);
+    }
+
+    fn subtractConsumeLeftOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.binaryConsumeIntoPreferred(a, b, .subtract);
+    }
+
+    fn divideConsumeLeftOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.binaryConsumeIntoPreferred(a, b, .divide);
+    }
+
+    fn lessThanConsumeLeftOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.binaryConsumeIntoPreferred(a, b, .less_than);
+    }
+
+    fn tryFlatDeviceBinaryRuntimeOp(self: *MetalCompute, a: CT, b: CT, comptime op_kind: HostBinaryOp) !?CT {
+        if (disableRuntimeElementwise()) return null;
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        if (a_buf.quantized_storage != null or b_buf.quantized_storage != null) return null;
+        const a_metal = a_buf.metal_tensor orelse return null;
+        const b_metal = b_buf.metal_tensor orelse return null;
+        if (!a_metal.isDevice() or !b_metal.isDevice()) return null;
+        const a_count = a_metal.elemCount();
+        const b_count = b_metal.elemCount();
+        if (a_count == 0 or b_count == 0) return null;
+
+        if (a_count != b_count and a_count != 1 and b_count != 1) return null;
+
+        var lhs = try a_metal.retainedCopy();
+        defer lhs.deinit();
+        var rhs = try b_metal.retainedCopy();
+        defer rhs.deinit();
+        const maybe_tensor = switch (op_kind) {
+            .add => try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                .lhs = lhs,
+                .rhs = rhs,
+                .dim = @max(a_count, b_count),
+            }, &self.timing_stats),
+            .multiply => try metal_runtime.decoderRuntimeApplyMultiply(self.provider_impl, lhs, rhs, @max(a_count, b_count)),
+            .subtract => try metal_runtime.decoderRuntimeApplySubtract(self.provider_impl, lhs, rhs),
+            .divide => try metal_runtime.decoderRuntimeApplyDivide(self.provider_impl, lhs, rhs),
+            .less_than => try metal_runtime.decoderRuntimeApplyLessThan(self.provider_impl, lhs, rhs),
+            else => null,
+        };
+        if (maybe_tensor) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
+    fn primitiveUnaryActivationKind(comptime op_kind: HostUnaryOp) u32 {
+        return switch (op_kind) {
+            .negate => 6,
+            .sqrt => 7,
+            .rsqrt => 8,
+            .exp => 9,
+            .log => 10,
+            .sin => 11,
+            .cos => 12,
+            .tanh => 13,
+            .erf => 14,
+            .abs => 15,
+            .sigmoid => 16,
+        };
+    }
+
+    fn tryFlatDeviceUnaryRuntimeOp(self: *MetalCompute, a: CT, comptime op_kind: HostUnaryOp) !?CT {
+        if (disableRuntimeElementwise()) return null;
+        const input_buf = toBuf(a);
+        if (input_buf.quantized_storage != null) return null;
+        const input_metal = input_buf.metal_tensor orelse return null;
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+
+        var input = try input_metal.retainedCopy();
+        defer input.deinit();
+        if (try metal_runtime.decoderRuntimeApplyPrimitiveUnary(
+            self.provider_impl,
+            input,
+            primitiveUnaryActivationKind(op_kind),
+        )) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn hostFallbackReduce(self: *MetalCompute, input: CT, axes: []const u8, input_shape: []const i64, comptime op_kind: HostReduceOp) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, input_shape);
+        defer native_ctx.cb.free(n_input);
+
+        const n_output = switch (op_kind) {
+            .sum => try native_ctx.cb.primReduceSum(n_input, axes, input_shape),
+            .max => try native_ctx.cb.primReduceMax(n_input, axes, input_shape),
+            .mean => try native_ctx.cb.primReduceMean(n_input, axes, input_shape),
+        };
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    fn reduceKindId(comptime op_kind: HostReduceOp) u32 {
+        return switch (op_kind) {
+            .sum => 0,
+            .max => 1,
+            .mean => 2,
+        };
+    }
+
+    fn tryDeviceReduceLastDim(self: *MetalCompute, input: CT, axes: []const u8, input_shape: []const i64, comptime op_kind: HostReduceOp) !?CT {
+        if (axes.len != 1) return null;
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return null;
+        const input_metal = input_buf.metal_tensor orelse return null;
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+
+        const declared_shape = input_buf.logical_shape orelse input_shape;
+        if (declared_shape.len == 0 or axes[0] != declared_shape.len - 1) return null;
+        const resolved = resolveShapeFromDataLen(declared_shape, input_metal.elemCount()) orelse return null;
+        const resolved_shape = resolved[0..declared_shape.len];
+        const dim_i64 = resolved_shape[resolved_shape.len - 1];
+        if (dim_i64 <= 0) return null;
+        const dim: usize = @intCast(dim_i64);
+        if (input_metal.elemCount() % dim != 0) return null;
+        const rows = input_metal.elemCount() / dim;
+
+        var output_shape_i64_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+        @memcpy(output_shape_i64_buf[0..resolved_shape.len], resolved_shape);
+        output_shape_i64_buf[resolved_shape.len - 1] = 1;
+        const output_shape_i32 = try self.i32ShapeFromI64(output_shape_i64_buf[0..resolved_shape.len]);
+        defer self.allocator.free(output_shape_i32);
+
+        var input_mt = try input_metal.retainedCopy();
+        defer input_mt.deinit();
+        if (try metal_runtime.decoderRuntimeReduceLastDimDevice(
+            self.provider_impl,
+            input_mt,
+            rows,
+            dim,
+            reduceKindId(op_kind),
+            output_shape_i32,
+        )) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn tryDeviceBroadcastLastDim(
+        self: *MetalCompute,
+        input: CT,
+        in_shape: []const i64,
+        out_shape: []const i64,
+        broadcast_axes: []const u8,
+    ) !?CT {
+        if (in_shape.len == 0 or in_shape.len != out_shape.len or broadcast_axes.len != in_shape.len) return null;
+        for (broadcast_axes, 0..) |axis, i| {
+            if (axis != i) return null;
+        }
+
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return null;
+        const input_metal = input_buf.metal_tensor orelse return null;
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+
+        var rows: usize = 1;
+        for (0..in_shape.len - 1) |axis| {
+            if (in_shape[axis] <= 0 or out_shape[axis] <= 0 or in_shape[axis] != out_shape[axis]) return null;
+            rows = std.math.mul(usize, rows, @intCast(in_shape[axis])) catch return null;
+        }
+        const in_dim_i64 = in_shape[in_shape.len - 1];
+        const out_dim_i64 = out_shape[out_shape.len - 1];
+        if (in_dim_i64 <= 0 or out_dim_i64 <= 0) return null;
+        const in_dim: usize = @intCast(in_dim_i64);
+        const out_dim: usize = @intCast(out_dim_i64);
+        if (in_dim != 1 and in_dim != out_dim) return null;
+        if (input_metal.elemCount() != rows * in_dim) return null;
+
+        const output_shape_i32 = try self.i32ShapeFromI64(out_shape);
+        defer self.allocator.free(output_shape_i32);
+        var input_mt = try input_metal.retainedCopy();
+        defer input_mt.deinit();
+        if (try metal_runtime.decoderRuntimeBroadcastLastDimDevice(
+            self.provider_impl,
+            input_mt,
+            rows,
+            in_dim,
+            out_dim,
+            output_shape_i32,
+        )) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn hostFallbackArgMax(self: *MetalCompute, input: CT, axis: u8, keepdims: bool, input_shape: []const i64) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, input_shape);
+        defer native_ctx.cb.free(n_input);
+        const n_output = try native_ctx.cb.primArgMax(n_input, axis, keepdims, input_shape);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    fn hostFallbackConv1d(
+        self: *MetalCompute,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        time_steps: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const out_time = (time_steps + 2 * padding - kernel_size) / stride + 1;
+
+        const input_shape = [_]i64{
+            @intCast(batch),
+            @intCast(in_channels),
+            @intCast(time_steps),
+        };
+        const weight_shape = [_]i64{
+            @intCast(out_channels),
+            @intCast(in_channels),
+            @intCast(kernel_size),
+        };
+        const bias_shape = [_]i64{@intCast(out_channels)};
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, &input_shape);
+        defer native_ctx.cb.free(n_input);
+        const n_weight = try self.importCtToHostNative(&native_ctx, weight, &weight_shape);
+        defer native_ctx.cb.free(n_weight);
+        const n_bias = try self.importCtToHostNative(&native_ctx, bias, &bias_shape);
+        defer native_ctx.cb.free(n_bias);
+
+        const n_output = try native_ctx.cb.conv1d(
+            n_input,
+            n_weight,
+            n_bias,
+            batch,
+            in_channels,
+            out_channels,
+            time_steps,
+            kernel_size,
+            stride,
+            padding,
+        );
+        defer native_ctx.cb.free(n_output);
+        const out_shape = [_]i64{
+            @intCast(batch),
+            @intCast(out_channels),
+            @intCast(out_time),
+        };
+        return self.exportCtFromHostNative(&native_ctx, n_output, &out_shape);
+    }
+
+    fn hostFallbackConv2d(
+        self: *MetalCompute,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        height: usize,
+        width: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        padding_h: usize,
+        padding_w: usize,
+        groups: usize,
+    ) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
+        const out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
+
+        const input_shape = [_]i64{
+            @intCast(batch),
+            @intCast(in_channels),
+            @intCast(height),
+            @intCast(width),
+        };
+        const weight_shape = [_]i64{
+            @intCast(out_channels),
+            @intCast(if (groups == 0) 0 else in_channels / groups),
+            @intCast(kernel_h),
+            @intCast(kernel_w),
+        };
+        const bias_shape = [_]i64{@intCast(out_channels)};
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, &input_shape);
+        defer native_ctx.cb.free(n_input);
+        const n_weight = try self.importCtToHostNative(&native_ctx, weight, &weight_shape);
+        defer native_ctx.cb.free(n_weight);
+        const n_bias = try self.importCtToHostNative(&native_ctx, bias, &bias_shape);
+        defer native_ctx.cb.free(n_bias);
+
+        const n_output = try native_ctx.cb.conv2d(
+            n_input,
+            n_weight,
+            n_bias,
+            batch,
+            in_channels,
+            out_channels,
+            height,
+            width,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            groups,
+        );
+        defer native_ctx.cb.free(n_output);
+        const out_shape = [_]i64{
+            @intCast(batch),
+            @intCast(out_channels),
+            @intCast(out_h),
+            @intCast(out_w),
+        };
+        return self.exportCtFromHostNative(&native_ctx, n_output, &out_shape);
+    }
+
+    fn hostFallbackSoftmax(self: *MetalCompute, input: CT, last_dim_size: u32, log_softmax: bool) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, null);
+        defer native_ctx.cb.free(n_input);
+        const n_output = if (log_softmax)
+            try native_ctx.cb.primLogSoftmax(n_input, last_dim_size)
+        else
+            try native_ctx.cb.primSoftmax(n_input, last_dim_size);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    fn hostFallbackConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const n_a = try self.importCtToHostNative(&native_ctx, a, a_shape);
+        defer native_ctx.cb.free(n_a);
+        const n_b = try self.importCtToHostNative(&native_ctx, b, b_shape);
+        defer native_ctx.cb.free(n_b);
+        const n_output = try native_ctx.cb.primConcatPrim(n_a, n_b, axis, a_shape, b_shape);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    fn hostFallbackSdpa(
+        self: *MetalCompute,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        mask: []const i64,
+        attn_bias_ct: ?CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const q_shape = toBuf(q_ct).logical_shape;
+        const k_shape = toBuf(k_ct).logical_shape;
+        const v_shape = toBuf(v_ct).logical_shape;
+        const bias_shape = if (attn_bias_ct) |bias| toBuf(bias).logical_shape else null;
+
+        const n_q = try self.importCtToHostNative(&native_ctx, q_ct, q_shape);
+        defer native_ctx.cb.free(n_q);
+        const n_k = try self.importCtToHostNative(&native_ctx, k_ct, k_shape);
+        defer native_ctx.cb.free(n_k);
+        const n_v = try self.importCtToHostNative(&native_ctx, v_ct, v_shape);
+        defer native_ctx.cb.free(n_v);
+        const n_bias = if (attn_bias_ct) |bias| try self.importCtToHostNative(&native_ctx, bias, bias_shape) else null;
+        defer if (n_bias) |ct| native_ctx.cb.free(ct);
+
+        const n_output = try native_ctx.cb.scaledDotProductAttention(
+            n_q,
+            n_k,
+            n_v,
+            mask,
+            n_bias,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    fn hostFallbackDisentangledRelativeAttention(
+        self: *MetalCompute,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        q_r_ct: CT,
+        k_r_ct: CT,
+        mask: []const i64,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const q_shape = toBuf(q_ct).logical_shape;
+        const k_shape = toBuf(k_ct).logical_shape;
+        const v_shape = toBuf(v_ct).logical_shape;
+        const q_r_shape = toBuf(q_r_ct).logical_shape;
+        const k_r_shape = toBuf(k_r_ct).logical_shape;
+
+        const n_q = try self.importCtToHostNative(&native_ctx, q_ct, q_shape);
+        defer native_ctx.cb.free(n_q);
+        const n_k = try self.importCtToHostNative(&native_ctx, k_ct, k_shape);
+        defer native_ctx.cb.free(n_k);
+        const n_v = try self.importCtToHostNative(&native_ctx, v_ct, v_shape);
+        defer native_ctx.cb.free(n_v);
+        const n_q_r = try self.importCtToHostNative(&native_ctx, q_r_ct, q_r_shape);
+        defer native_ctx.cb.free(n_q_r);
+        const n_k_r = try self.importCtToHostNative(&native_ctx, k_r_ct, k_r_shape);
+        defer native_ctx.cb.free(n_k_r);
+
+        const n_output = try native_ctx.cb.disentangledRelativeAttention(
+            n_q,
+            n_k,
+            n_v,
+            n_q_r,
+            n_k_r,
+            mask,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+        defer native_ctx.cb.free(n_output);
+        const out_shape = [_]i64{ @intCast(batch * seq_len), @intCast(num_heads * head_dim) };
+        return self.exportCtFromHostNative(&native_ctx, n_output, &out_shape);
+    }
+
+    fn hostFallbackDotGeneral(
+        self: *MetalCompute,
+        lhs: CT,
+        rhs: CT,
+        lhs_shape: []const i64,
+        rhs_shape: []const i64,
+        lhs_contracting: []const u8,
+        rhs_contracting: []const u8,
+        lhs_batch: []const u8,
+        rhs_batch: []const u8,
+    ) !CT {
+        const lhs_buf = toBuf(lhs);
+        const rhs_buf = toBuf(rhs);
+        if (!hasSymbolicShapeDims(lhs_shape) and !hasSymbolicShapeDims(rhs_shape)) {
+            if (try self.tryDirectHostLinearDotGeneral(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |direct| {
+                return direct;
+            }
+
+            var native_ctx = try HostFallbackNative.init(self.allocator);
+            defer native_ctx.deinit();
+            if (lhs_buf.logical_shape) |lhs_logical| {
+                if (rhs_buf.logical_shape) |rhs_logical| {
+                    if (allConcreteShapeDims(lhs_logical) and allConcreteShapeDims(rhs_logical) and dotContractingDimsMatch(lhs_logical, rhs_logical, lhs_contracting, rhs_contracting)) {
+                        const n_lhs_logical = try self.importCtToHostNative(&native_ctx, lhs, lhs_logical);
+                        defer native_ctx.cb.free(n_lhs_logical);
+                        const n_rhs_logical = try self.importCtToHostNative(&native_ctx, rhs, rhs_logical);
+                        defer native_ctx.cb.free(n_rhs_logical);
+                        const n_output_logical = native_ctx.cb.primDotGeneral(n_lhs_logical, n_rhs_logical, lhs_logical, rhs_logical, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) catch |err| switch (err) {
+                            error.UnsupportedShape => null,
+                            else => return err,
+                        };
+                        if (n_output_logical) |n_output| {
+                            defer native_ctx.cb.free(n_output);
+                            return self.exportCtFromHostNative(&native_ctx, n_output, null);
+                        }
+                    }
+                }
+            }
+        }
+
+        var rhs_seed_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+        const resolved_lhs_buf = resolveDotOperandShape(lhs_buf, lhs_shape, lhs_batch, rhs_batch, lhs_contracting, rhs_contracting, null) catch blk: {
+            rhs_seed_buf = try resolveDotOperandShape(rhs_buf, rhs_shape, rhs_batch, lhs_batch, rhs_contracting, lhs_contracting, null);
+            break :blk try resolveDotOperandShape(lhs_buf, lhs_shape, lhs_batch, rhs_batch, lhs_contracting, rhs_contracting, rhs_seed_buf[0..rhs_shape.len]);
+        };
+        const resolved_lhs = resolved_lhs_buf[0..lhs_shape.len];
+        const resolved_rhs_buf = try resolveDotOperandShape(rhs_buf, rhs_shape, rhs_batch, lhs_batch, rhs_contracting, lhs_contracting, resolved_lhs);
+        const resolved_rhs = resolved_rhs_buf[0..rhs_shape.len];
+
+        if (try self.tryDirectHostLinearDotGeneral(lhs, rhs, resolved_lhs, resolved_rhs, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |direct| {
+            return direct;
+        }
+
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        if (lhs_batch.len == 0 and rhs_batch.len == 0) {
+            if (resolveSimple2DDotShapes(lhs_buf, rhs_buf, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting)) |simple| {
+                const n_lhs_simple = try self.importCtToHostNative(&native_ctx, lhs, &simple.lhs);
+                defer native_ctx.cb.free(n_lhs_simple);
+                const n_rhs_simple = try self.importCtToHostNative(&native_ctx, rhs, &simple.rhs);
+                defer native_ctx.cb.free(n_rhs_simple);
+                const n_output_simple = try native_ctx.cb.primDotGeneral(n_lhs_simple, n_rhs_simple, &simple.lhs, &simple.rhs, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
+                defer native_ctx.cb.free(n_output_simple);
+                return self.exportCtFromHostNative(&native_ctx, n_output_simple, null);
+            }
+        }
+        const n_lhs = try self.importCtToHostNative(&native_ctx, lhs, resolved_lhs);
+        defer native_ctx.cb.free(n_lhs);
+        const n_rhs = try self.importCtToHostNative(&native_ctx, rhs, resolved_rhs);
+        defer native_ctx.cb.free(n_rhs);
+        const n_output = try native_ctx.cb.primDotGeneral(n_lhs, n_rhs, resolved_lhs, resolved_rhs, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    fn conv1dOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        time_steps: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceConv1d(
+            input,
+            weight,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            time_steps,
+            kernel_size,
+            stride,
+            padding,
+        )) |device| return device;
+        return self.hostFallbackConv1d(
+            input,
+            weight,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            time_steps,
+            kernel_size,
+            stride,
+            padding,
+        );
+    }
+
+    fn conv2dOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        height: usize,
+        width: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        padding_h: usize,
+        padding_w: usize,
+        groups: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceConv2d(
+            input,
+            weight,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            height,
+            width,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            groups,
+        )) |device| return device;
+        return self.hostFallbackConv2d(
+            input,
+            weight,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            height,
+            width,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            groups,
+        );
+    }
+
+    fn tryDeviceConv1d(
+        self: *MetalCompute,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        time_steps: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) !?CT {
+        if (bufHasAnyQuantizedStorage(toBuf(input)) or
+            bufHasAnyQuantizedStorage(toBuf(weight)) or
+            bufHasAnyQuantizedStorage(toBuf(bias))) return null;
+        var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
+        defer weight_mt.deinit();
+        var bias_mt = try self.ownedDeviceMetalTensorFromCt(bias);
+        defer bias_mt.deinit();
+        if (!input_mt.isDevice() or !weight_mt.isDevice() or !bias_mt.isDevice()) return null;
+        if (try metal_runtime.decoderRuntimeConv1dF32Device(self.provider_impl, .{
+            .input = input_mt,
+            .weight = weight_mt,
+            .bias = bias_mt,
+            .batch = batch,
+            .in_channels = in_channels,
+            .out_channels = out_channels,
+            .time_steps = time_steps,
+            .kernel_size = kernel_size,
+            .stride = stride,
+            .padding = padding,
+        })) |tensor| return try self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
+    fn tryDeviceConv2d(
+        self: *MetalCompute,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        height: usize,
+        width: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        padding_h: usize,
+        padding_w: usize,
+        groups: usize,
+    ) !?CT {
+        if (bufHasAnyQuantizedStorage(toBuf(input)) or
+            bufHasAnyQuantizedStorage(toBuf(weight)) or
+            bufHasAnyQuantizedStorage(toBuf(bias))) return null;
+        var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
+        defer weight_mt.deinit();
+        var bias_mt = try self.ownedDeviceMetalTensorFromCt(bias);
+        defer bias_mt.deinit();
+        if (!input_mt.isDevice() or !weight_mt.isDevice() or !bias_mt.isDevice()) return null;
+        if (try metal_runtime.decoderRuntimeConv2dF32Device(self.provider_impl, .{
+            .input = input_mt,
+            .weight = weight_mt,
+            .bias = bias_mt,
+            .batch = batch,
+            .in_channels = in_channels,
+            .out_channels = out_channels,
+            .height = height,
+            .width = width,
+            .kernel_h = kernel_h,
+            .kernel_w = kernel_w,
+            .stride_h = stride_h,
+            .stride_w = stride_w,
+            .padding_h = padding_h,
+            .padding_w = padding_w,
+            .groups = groups,
+        })) |tensor| return try self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
+    fn tryDirectHostLinearDotGeneral(
+        self: *MetalCompute,
+        lhs: CT,
+        rhs: CT,
+        lhs_shape: []const i64,
+        rhs_shape: []const i64,
+        lhs_contracting: []const u8,
+        rhs_contracting: []const u8,
+        lhs_batch: []const u8,
+        rhs_batch: []const u8,
+    ) !?CT {
+        if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+        if (lhs_shape.len < 2 or rhs_shape.len != 2) return null;
+        if (rhs_batch.len != 0) return null;
+
+        const lc = lhs_contracting[0];
+        const rc = rhs_contracting[0];
+        if (lc != lhs_shape.len - 1 or rc != 0) return null;
+
+        const k = lhs_shape[lc];
+        const rhs_k = rhs_shape[0];
+        const n = rhs_shape[1];
+        if (k <= 0 or rhs_k <= 0 or n <= 0) return null;
+
+        const lhs_buf = toBuf(lhs);
+        const rhs_buf = toBuf(rhs);
+        const lhs_len = bufElemCount(lhs_buf);
+        const k_usize: usize = @intCast(k);
+        const rhs_k_usize: usize = @intCast(rhs_k);
+        const n_usize: usize = @intCast(n);
+        if (lhs_len % k_usize != 0) return null;
+
+        var effective_rows = lhs_len / k_usize;
+        var effective_k = k_usize;
+        var output_rank = lhs_shape.len;
+        var symbolic_output_shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        var concrete_output_shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        @memcpy(symbolic_output_shape[0..lhs_shape.len], lhs_shape);
+        @memcpy(concrete_output_shape[0..lhs_shape.len], lhs_shape);
+        symbolic_output_shape[output_rank - 1] = n;
+        concrete_output_shape[output_rank - 1] = n;
+
+        if (rhs_k_usize != k_usize and lhs_shape.len >= 2 and lhs_len % rhs_k_usize == 0) {
+            var suffix_product: usize = 1;
+            var suffix_start: ?usize = null;
+            var idx = lhs_shape.len;
+            while (idx > 0) {
+                idx -= 1;
+                const dim = lhs_shape[idx];
+                if (dim <= 0) break;
+                suffix_product = std.math.mul(usize, suffix_product, @intCast(dim)) catch break;
+                if (suffix_product == rhs_k_usize) {
+                    suffix_start = idx;
+                    break;
+                }
+                if (suffix_product > rhs_k_usize) break;
+            }
+            if (suffix_start) |start| {
+                effective_k = rhs_k_usize;
+                effective_rows = lhs_len / effective_k;
+                output_rank = start + 1;
+                for (0..start) |i| {
+                    symbolic_output_shape[i] = lhs_shape[i];
+                    concrete_output_shape[i] = lhs_shape[i];
+                }
+                symbolic_output_shape[start] = n;
+                concrete_output_shape[start] = n;
+            } else {
+                return null;
+            }
+        }
+
+        for (concrete_output_shape[0..output_rank], 0..) |dim, i| {
+            if (dim <= 0) {
+                if (i == output_rank - 1) {
+                    concrete_output_shape[i] = n;
+                } else {
+                    return null;
+                }
+            }
+        }
+
+        const lhs_data = try hostSliceForBuf(lhs_buf);
+        const rhs_data = try hostSliceForBuf(rhs_buf);
+        if (rhs_data.len != effective_k * n_usize) return null;
+
+        const output = try self.allocator.alloc(f32, effective_rows * n_usize);
+        errdefer self.allocator.free(output);
+        try self.dispatchSgemm(effective_rows, n_usize, effective_k, 1.0, lhs_data, rhs_data, 0.0, output);
+
+        var concrete_shape_i32_buf: [metal_tensor_mod.max_dims]i32 = undefined;
+        for (concrete_output_shape[0..output_rank], 0..) |dim, i| {
+            concrete_shape_i32_buf[i] = @intCast(dim);
+        }
+        const result = try denseBuf(self.allocator, output, true, concrete_shape_i32_buf[0..output_rank]);
+
+        var symbolic_differs = false;
+        for (0..output_rank) |i| {
+            if (symbolic_output_shape[i] != concrete_output_shape[i]) {
+                symbolic_differs = true;
+                break;
+            }
+        }
+        if (symbolic_differs or lhs_batch.len > 0) {
+            return self.withLogicalShape(result, symbolic_output_shape[0..output_rank]);
+        }
+        return result;
+    }
+
+    fn hostFallbackReshape(self: *MetalCompute, input: CT, new_shape: []const i64) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const input_buf = toBuf(input);
+        const resolved_shape = resolveReshapeShape(input_buf.logical_shape, bufElemCount(input_buf), new_shape) catch null;
+        const n_input = try self.importCtToHostNative(&native_ctx, input, null);
+        defer native_ctx.cb.free(n_input);
+        const n_output = try native_ctx.cb.primReshape(n_input, new_shape);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, if (resolved_shape) |resolved| resolved[0..new_shape.len] else new_shape);
+    }
+
+    fn hostFallbackGather(self: *MetalCompute, input: CT, indices: CT, axis: u8, input_shape: []const i64) !CT {
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const input_buf = toBuf(input);
+        const indices_buf = toBuf(indices);
+        const resolved_input_buf = resolveConcreteShape(input_buf, input_shape) catch
+            try resolveShapeRightmostUnknown(input_shape, bufElemCount(input_buf));
+        const resolved_input = resolved_input_buf[0..input_shape.len];
+
+        const indices_declared_shape = indices_buf.logical_shape orelse &[_]i64{@intCast(bufElemCount(indices_buf))};
+        const resolved_indices_buf = resolveConcreteShape(indices_buf, indices_declared_shape) catch
+            try resolveShapeRightmostUnknown(indices_declared_shape, bufElemCount(indices_buf));
+        const resolved_indices = resolved_indices_buf[0..indices_declared_shape.len];
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, resolved_input);
+        defer native_ctx.cb.free(n_input);
+        const n_indices = try self.importCtToHostNative(&native_ctx, indices, resolved_indices);
+        defer native_ctx.cb.free(n_indices);
+        const n_output = try native_ctx.cb.primGather(n_input, n_indices, axis, resolved_input);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    fn unsupportedUnaryConsumeOp(_: *anyopaque, _: ops.UnaryConsumeOp, _: CT) anyerror!?CT {
+        return null;
+    }
+
+    fn unsupportedBinaryConsumeOp(_: *anyopaque, _: CT, _: CT) anyerror!?CT {
+        return null;
+    }
+
+    fn unsupportedWhereConsumeOp(_: *anyopaque, _: CT, _: CT, _: CT) anyerror!?CT {
+        return null;
+    }
+
+    fn unsupportedSoftmaxConsumeOp(_: *anyopaque, _: CT, _: u32) anyerror!?CT {
+        return null;
+    }
+
+    fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (perm.len != input_shape.len or perm.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+
+        const resolved_in = try resolveConcreteShape(input_buf, input_shape);
+        const in_shape = resolved_in[0..input_shape.len];
+
+        var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        for (perm, 0..) |axis, i| {
+            if (axis >= input_shape.len) return error.UnsupportedShape;
+            out_shape[i] = in_shape[axis];
+        }
+
+        if (input_buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) {
+                const out_shape_i32 = try self.i32ShapeFromI64(out_shape[0..perm.len]);
+                defer self.allocator.free(out_shape_i32);
+                var input_mt = try metal_tensor.retainedCopy();
+                defer input_mt.deinit();
+                if (try metal_runtime.decoderRuntimeTransposeF32Device(
+                    self.provider_impl,
+                    input_mt,
+                    in_shape,
+                    perm,
+                    out_shape_i32,
+                )) |tensor| {
+                    return self.ctFromOwnedMetalTensor(tensor);
+                }
+            }
+        }
+
+        if (input_buf.metal_tensor == null) {
+            var in_stride_scratch: [metal_tensor_mod.max_dims]usize = undefined;
+            const logical_in_strides = logicalStridesOrContiguous(input, in_shape, in_stride_scratch[0..in_shape.len]);
+            var view_strides: [metal_tensor_mod.max_dims]usize = undefined;
+            for (0..perm.len) |d| view_strides[d] = logical_in_strides[perm[d]];
+            if (self.makeViewAlias(input, out_shape[0..perm.len], view_strides[0..perm.len], input_buf.view_base_offset)) |view| {
+                return view;
+            } else |_| {}
+        }
+
+        const input_host = try hostSliceForBuf(input_buf);
+        const out_numel = try shapeNumel(out_shape[0..perm.len]);
+        const output = try self.allocator.alloc(f32, out_numel);
+        errdefer self.allocator.free(output);
+
+        var in_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        var out_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        computeStrides(in_shape, in_strides[0..in_shape.len]);
+        computeStrides(out_shape[0..perm.len], out_strides[0..perm.len]);
+
+        for (0..out_numel) |flat_out| {
+            var remaining = flat_out;
+            var flat_in: usize = 0;
+            for (0..perm.len) |i| {
+                const coord = remaining / out_strides[i];
+                remaining %= out_strides[i];
+                flat_in += coord * in_strides[perm[i]];
+            }
+            output[flat_out] = input_host[wrapRepeatedBufferIndex(flat_in, input_host.len)];
+        }
+
+        const out_shape_i32 = try self.i32ShapeFromI64(out_shape[0..perm.len]);
+        defer self.allocator.free(out_shape_i32);
+        return denseBuf(self.allocator, output, true, out_shape_i32);
+    }
+
+    fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (target_shape.len > metal_tensor_mod.max_dims or input_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+
+        const resolved_in = try resolveConcreteShape(input_buf, input_shape);
+        const in_shape = resolved_in[0..input_shape.len];
+
+        var resolved_target: [metal_tensor_mod.max_dims]i64 = undefined;
+        for (target_shape, 0..) |dim, i| {
+            var resolved_dim = dim;
+            if (resolved_dim <= 0) {
+                for (broadcast_axes, 0..) |ax, in_axis| {
+                    if (ax == i and in_axis < in_shape.len) {
+                        resolved_dim = in_shape[in_axis];
+                        break;
+                    }
+                }
+            }
+            if (resolved_dim <= 0) resolved_dim = 1;
+            resolved_target[i] = resolved_dim;
+        }
+
+        const out_shape = resolved_target[0..target_shape.len];
+        const out_numel = try shapeNumel(out_shape);
+        if (try self.tryDeviceBroadcastLastDim(input, in_shape, out_shape, broadcast_axes)) |result| return result;
+        if (input_buf.metal_tensor == null) {
+            var in_strides: [metal_tensor_mod.max_dims]usize = undefined;
+            const logical_in_strides = logicalStridesOrContiguous(input, in_shape, in_strides[0..in_shape.len]);
+            var view_strides: [metal_tensor_mod.max_dims]usize = undefined;
+            var can_view = broadcast_axes.len == in_shape.len;
+            for (0..out_shape.len) |d| {
+                view_strides[d] = 0;
+                var mapped_input_dim: ?usize = null;
+                for (broadcast_axes, 0..) |ax, in_d| {
+                    if (ax == d) {
+                        mapped_input_dim = in_d;
+                        break;
+                    }
+                }
+                if (mapped_input_dim) |in_d| {
+                    if (in_shape[in_d] > 1 and in_shape[in_d] != out_shape[d]) {
+                        can_view = false;
+                        break;
+                    }
+                    view_strides[d] = if (in_shape[in_d] > 1) logical_in_strides[in_d] else 0;
+                } else if (out_shape[d] != 1) {
+                    can_view = false;
+                    break;
+                }
+            }
+            if (can_view) {
+                if (self.makeViewAlias(input, out_shape, view_strides[0..out_shape.len], input_buf.view_base_offset)) |view| {
+                    return view;
+                } else |_| {}
+            }
+        }
+        const input_host = try hostSliceForBuf(input_buf);
+        if (input_host.len == 1) {
+            return self.scalarBufWithLogicalShape(input_host[0], out_shape);
+        }
+        if (canRepresentBroadcastAsRepeatedBuffer(in_shape, out_shape, broadcast_axes)) {
+            return self.repeatedBufWithLogicalShape(input_host, out_shape);
+        }
+        const broadcast_temp_limit_elems: usize = 64 * 1024 * 1024;
+        if (out_numel > broadcast_temp_limit_elems) {
+            return error.UnsupportedShape;
+        }
+
+        if (broadcast_axes.len == 0) {
+            if (input_host.len == 0) return error.UnsupportedShape;
+            const output = try self.allocator.alloc(f32, out_numel);
+            errdefer self.allocator.free(output);
+            @memset(output, input_host[0]);
+            const out_shape_i32 = try self.i32ShapeFromI64(out_shape);
+            defer self.allocator.free(out_shape_i32);
+            return denseBuf(self.allocator, output, true, out_shape_i32);
+        }
+
+        var out_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        var in_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        computeStrides(out_shape, out_strides[0..out_shape.len]);
+        computeStrides(in_shape, in_strides[0..in_shape.len]);
+
+        const output = try self.allocator.alloc(f32, out_numel);
+        errdefer self.allocator.free(output);
+
+        for (0..out_numel) |flat_out| {
+            var remaining = flat_out;
+            var flat_in: usize = 0;
+            for (0..out_shape.len) |out_axis| {
+                const coord = remaining / out_strides[out_axis];
+                remaining %= out_strides[out_axis];
+                for (broadcast_axes, 0..) |ax, in_axis| {
+                    if (ax != out_axis) continue;
+                    const input_extent: usize = @intCast(in_shape[in_axis]);
+                    const target_extent: usize = @intCast(out_shape[out_axis]);
+                    const input_coord = if (input_extent == 1)
+                        @as(usize, 0)
+                    else if (input_extent == target_extent)
+                        coord
+                    else if (target_extent > input_extent and target_extent % input_extent == 0)
+                        coord % input_extent
+                    else
+                        return error.ShapeMismatch;
+                    flat_in += input_coord * in_strides[in_axis];
+                    break;
+                }
+            }
+            output[flat_out] = input_host[flat_in];
+        }
+
+        const out_shape_i32 = try self.i32ShapeFromI64(out_shape);
+        defer self.allocator.free(out_shape_i32);
+        return denseBuf(self.allocator, output, true, out_shape_i32);
+    }
+
+    fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        const indices_buf = toBuf(indices);
+        if (input_buf.quantized_storage != null or indices_buf.quantized_storage != null) return error.UnsupportedTensorType;
+
+        const resolved_in = resolveConcreteShape(input_buf, input_shape) catch {
+            return self.hostFallbackGather(input, indices, axis, input_shape);
+        };
+        const in_shape = resolved_in[0..input_shape.len];
+
+        if (axis == 0 and in_shape.len == 2) {
+            const rows: usize = @intCast(in_shape[0]);
+            const cols: usize = @intCast(in_shape[1]);
+            if (input_buf.metal_tensor) |*input_metal| {
+                if (indices_buf.metal_tensor) |*indices_metal| {
+                    if (input_metal.isDevice() and indices_metal.isDevice()) {
+                        const index_count = indices_metal.elemCount();
+                        if (index_count > 0) {
+                            var out_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+                            var out_rank: usize = 0;
+                            if (indices_buf.logical_shape) |idx_shape| {
+                                if (idx_shape.len + 1 > out_shape_buf.len) return error.UnsupportedShape;
+                                for (idx_shape) |dim| {
+                                    if (dim <= 0) return error.UnsupportedShape;
+                                    out_shape_buf[out_rank] = dim;
+                                    out_rank += 1;
+                                }
+                            } else {
+                                out_shape_buf[0] = @intCast(index_count);
+                                out_rank = 1;
+                            }
+                            out_shape_buf[out_rank] = @intCast(cols);
+                            out_rank += 1;
+
+                            const out_shape_i32 = try self.i32ShapeFromI64(out_shape_buf[0..out_rank]);
+                            defer self.allocator.free(out_shape_i32);
+                            var input_mt = try input_metal.retainedCopy();
+                            defer input_mt.deinit();
+                            var indices_mt = try indices_metal.retainedCopy();
+                            defer indices_mt.deinit();
+                            if (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDevice(
+                                self.provider_impl,
+                                input_mt,
+                                indices_mt,
+                                rows,
+                                cols,
+                                index_count,
+                                out_shape_i32,
+                            )) |tensor| {
+                                return self.ctFromOwnedMetalTensor(tensor);
+                            }
+                        }
+                    }
+                }
+            }
+            const input_host = try hostSliceForBuf(input_buf);
+            const idx_data = try hostSliceForBuf(indices_buf);
+
+            var out_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+            var out_rank: usize = 0;
+            if (indices_buf.logical_shape) |idx_shape| {
+                for (idx_shape) |dim| {
+                    out_shape_buf[out_rank] = dim;
+                    out_rank += 1;
+                }
+            } else {
+                out_shape_buf[0] = @intCast(idx_data.len);
+                out_rank = 1;
+            }
+            out_shape_buf[out_rank] = @intCast(cols);
+            out_rank += 1;
+
+            const output = try self.allocator.alloc(f32, idx_data.len * cols);
+            errdefer self.allocator.free(output);
+
+            for (idx_data, 0..) |raw_index, i| {
+                var row_i64 = @as(i64, @intFromFloat(raw_index));
+                if (row_i64 < 0) row_i64 += @as(i64, @intCast(rows));
+                if (row_i64 < 0 or row_i64 >= rows) return error.IndexOutOfBounds;
+                const row: usize = @intCast(row_i64);
+                const src_offset = row * cols;
+                const dst_offset = i * cols;
+                @memcpy(output[dst_offset..][0..cols], input_host[src_offset..][0..cols]);
+            }
+
+            const out_shape_i32 = try self.i32ShapeFromI64(out_shape_buf[0..out_rank]);
+            defer self.allocator.free(out_shape_i32);
+            return denseBuf(self.allocator, output, true, out_shape_i32);
+        }
+
+        return self.hostFallbackGather(input, indices, axis, input_shape);
+    }
+
+    fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (starts.len != limits.len or starts.len != strides.len or starts.len != input_shape.len) return error.UnsupportedShape;
+        if (input_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
+
+        var symbolic_full_range = true;
+        for (0..input_shape.len) |i| {
+            if (!(input_shape[i] < 0 and starts[i] == 0 and limits[i] == -1 and strides[i] == 1)) {
+                symbolic_full_range = false;
+                break;
+            }
+        }
+        if (symbolic_full_range) {
+            if (input_buf.metal_tensor) |*metal_tensor| {
+                const shape_i32 = try self.i32ShapeFromI64(input_shape);
+                defer self.allocator.free(shape_i32);
+                const view = try metal_tensor.retainedView(0, metal_tensor.deviceByteLen(), shape_i32);
+                return self.metalTensorBufWithHostMaterialization(view, false);
+            }
+
+            const input_host = try hostSliceForBuf(input_buf);
+            const output = try self.allocator.dupe(f32, input_host);
+            errdefer self.allocator.free(output);
+            const out_shape_i32 = try self.i32ShapeFromI64(input_shape);
+            defer self.allocator.free(out_shape_i32);
+            return denseBuf(self.allocator, output, true, out_shape_i32);
+        }
+
+        const resolved_in = try resolveConcreteShape(input_buf, input_shape);
+        const in_shape = resolved_in[0..input_shape.len];
+
+        var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        var normalized_starts: [metal_tensor_mod.max_dims]usize = undefined;
+        var normalized_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        for (0..input_shape.len) |i| {
+            const stride = strides[i];
+            if (stride <= 0) return error.UnsupportedShape;
+
+            var start = starts[i];
+            var limit = limits[i];
+            const dim = in_shape[i];
+            if (dim <= 0) return error.UnsupportedShape;
+
+            if (start < 0) start += dim;
+            if (limit < 0) {
+                limit = if (input_shape[i] < 0 and start == 0 and stride == 1)
+                    dim
+                else
+                    limit + dim;
+            }
+            if (start < 0) start = 0;
+            if (limit > dim) limit = dim;
+            if (start > limit) limit = start;
+
+            const span = limit - start;
+            out_shape[i] = if (span <= 0) 0 else @intCast(@divFloor(span + stride - 1, stride));
+            normalized_starts[i] = @intCast(start);
+            normalized_strides[i] = @intCast(stride);
+        }
+
+        const out_numel = try shapeNumel(out_shape[0..input_shape.len]);
+        if (enableContiguousSliceDeviceView()) {
+            if (input_buf.metal_tensor) |*metal_tensor| {
+                if (contiguousSliceRange(
+                    in_shape,
+                    out_shape[0..input_shape.len],
+                    normalized_starts[0..input_shape.len],
+                    normalized_strides[0..input_shape.len],
+                )) |range| {
+                    const shape_i32 = try self.i32ShapeFromI64(out_shape[0..input_shape.len]);
+                    defer self.allocator.free(shape_i32);
+                    const byte_offset = std.math.mul(usize, range.offset_elems, @sizeOf(f32)) catch return error.UnsupportedShape;
+                    const byte_len = std.math.mul(usize, range.len_elems, @sizeOf(f32)) catch return error.UnsupportedShape;
+                    const view = try metal_tensor.retainedView(byte_offset, byte_len, shape_i32);
+                    return self.metalTensorBufWithHostMaterialization(view, false);
+                }
+            }
+        }
+
+        const input_host = try hostSliceForBuf(input_buf);
+        const output = try self.allocator.alloc(f32, out_numel);
+        errdefer self.allocator.free(output);
+
+        var in_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        var out_strides: [metal_tensor_mod.max_dims]usize = undefined;
+        computeStrides(in_shape, in_strides[0..in_shape.len]);
+        computeStrides(out_shape[0..input_shape.len], out_strides[0..input_shape.len]);
+
+        for (0..out_numel) |flat_out| {
+            var remaining = flat_out;
+            var flat_in: usize = 0;
+            for (0..input_shape.len) |axis| {
+                const coord = remaining / out_strides[axis];
+                remaining %= out_strides[axis];
+                const in_coord = normalized_starts[axis] + coord * normalized_strides[axis];
+                flat_in += in_coord * in_strides[axis];
+            }
+            output[flat_out] = input_host[flat_in];
+        }
+
+        const out_shape_i32 = try self.i32ShapeFromI64(out_shape[0..input_shape.len]);
+        defer self.allocator.free(out_shape_i32);
+        return denseBuf(self.allocator, output, true, out_shape_i32);
+    }
+
+    fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceBinaryRuntimeOp(a, b, .subtract)) |device_result| return device_result;
+        return self.hostFallbackBinary(a, b, null, null, .subtract);
+    }
+
+    fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceBinaryRuntimeOp(a, b, .divide)) |device_result| return device_result;
+        return self.hostFallbackBinary(a, b, null, null, .divide);
+    }
+
+    fn negateOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .negate)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .negate);
+    }
+
+    fn primSqrtOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .sqrt)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .sqrt);
+    }
+
+    fn primRsqrtOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .rsqrt)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .rsqrt);
+    }
+
+    fn primExpOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .exp)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .exp);
+    }
+
+    fn primLogOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .log)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .log);
+    }
+
+    fn primSinOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .sin)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .sin);
+    }
+
+    fn primCosOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .cos)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .cos);
+    }
+
+    fn primTanhOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .tanh)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .tanh);
+    }
+
+    fn primErfOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .erf)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .erf);
+    }
+
+    fn primAbsOp(ctx: *anyopaque, a: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(a, .abs)) |device_result| return device_result;
+        return self.hostFallbackUnary(a, null, .abs);
+    }
+
+    fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceBinaryRuntimeOp(a, b, .less_than)) |device_result| return device_result;
+        return self.hostFallbackBinary(a, b, null, null, .less_than);
+    }
+
+    fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!disableRuntimeElementwise()) {
+            const cond_buf = toBuf(cond);
+            const true_buf = toBuf(on_true);
+            const false_buf = toBuf(on_false);
+            if (cond_buf.quantized_storage == null and true_buf.quantized_storage == null and false_buf.quantized_storage == null) {
+                if (cond_buf.metal_tensor) |*cond_metal| {
+                    if (true_buf.metal_tensor) |*true_metal| {
+                        if (false_buf.metal_tensor) |*false_metal| {
+                            device_path: {
+                                if (!cond_metal.isDevice() or !true_metal.isDevice() or !false_metal.isDevice()) break :device_path;
+                                const target_count = if (cond_metal.elemCount() > 1)
+                                    cond_metal.elemCount()
+                                else if (true_metal.elemCount() > 1)
+                                    true_metal.elemCount()
+                                else
+                                    false_metal.elemCount();
+                                if (target_count == 0) break :device_path;
+                                if ((cond_metal.elemCount() != target_count and cond_metal.elemCount() != 1) or
+                                    (true_metal.elemCount() != target_count and true_metal.elemCount() != 1) or
+                                    (false_metal.elemCount() != target_count and false_metal.elemCount() != 1)) break :device_path;
+                                var cond_mt = try cond_metal.retainedCopy();
+                                defer cond_mt.deinit();
+                                var true_mt = try true_metal.retainedCopy();
+                                defer true_mt.deinit();
+                                var false_mt = try false_metal.retainedCopy();
+                                defer false_mt.deinit();
+                                if (try metal_runtime.decoderRuntimeApplyWhereSelect(
+                                    self.provider_impl,
+                                    cond_mt,
+                                    true_mt,
+                                    false_mt,
+                                )) |tensor| {
+                                    return self.ctFromOwnedMetalTensor(tensor);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return self.hostFallbackWhereSelect(cond, on_true, on_false);
+    }
+
+    fn reduceSumOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceReduceLastDim(input, axes, input_shape, .sum)) |result| return result;
+        return self.hostFallbackReduce(input, axes, input_shape, .sum);
+    }
+
+    fn reduceMaxOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceReduceLastDim(input, axes, input_shape, .max)) |result| return result;
+        return self.hostFallbackReduce(input, axes, input_shape, .max);
+    }
+
+    fn reduceMeanOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceReduceLastDim(input, axes, input_shape, .mean)) |result| return result;
+        return self.hostFallbackReduce(input, axes, input_shape, .mean);
+    }
+
+    fn argmaxOp(ctx: *anyopaque, input: CT, axis: u8, keepdims: bool, input_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage == null) {
+            if (input_buf.metal_tensor) |*input_metal| {
+                if (input_metal.isDevice() and input_shape.len <= metal_tensor_mod.max_dims and axis < input_shape.len) {
+                    const resolved_in = resolveConcreteShape(input_buf, input_shape) catch null;
+                    if (resolved_in) |resolved_buf| {
+                        const resolved = resolved_buf[0..input_shape.len];
+                        const axis_dim_i64 = resolved[axis];
+                        if (axis_dim_i64 > 0) {
+                            var outer: usize = 1;
+                            for (resolved[0..axis]) |dim| {
+                                if (dim <= 0) return error.UnsupportedShape;
+                                outer = std.math.mul(usize, outer, @intCast(dim)) catch return error.UnsupportedShape;
+                            }
+                            var inner: usize = 1;
+                            for (resolved[axis + 1 ..]) |dim| {
+                                if (dim <= 0) return error.UnsupportedShape;
+                                inner = std.math.mul(usize, inner, @intCast(dim)) catch return error.UnsupportedShape;
+                            }
+
+                            var out_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+                            var out_rank: usize = 0;
+                            if (keepdims) {
+                                out_rank = resolved.len;
+                                for (resolved, 0..) |dim, i| out_shape_buf[i] = if (i == axis) 1 else dim;
+                            } else {
+                                for (resolved, 0..) |dim, i| {
+                                    if (i == axis) continue;
+                                    out_shape_buf[out_rank] = dim;
+                                    out_rank += 1;
+                                }
+                            }
+                            const out_shape_i32 = try self.i32ShapeFromI64(out_shape_buf[0..out_rank]);
+                            defer self.allocator.free(out_shape_i32);
+                            var input_mt = try input_metal.retainedCopy();
+                            defer input_mt.deinit();
+                            if (try metal_runtime.decoderRuntimeArgmaxAxisF32Device(
+                                self.provider_impl,
+                                input_mt,
+                                outer,
+                                @intCast(axis_dim_i64),
+                                inner,
+                                out_shape_i32,
+                            )) |tensor| {
+                                return self.ctFromOwnedMetalTensor(tensor);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return self.hostFallbackArgMax(input, axis, keepdims, input_shape);
+    }
+
+    fn softmaxOp(ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(input);
+        if (buf.quantized_storage == null and last_dim_size != 0) {
+            if (buf.metal_tensor) |*metal_tensor| {
+                if (metal_tensor.isDevice()) {
+                    const dim: usize = @intCast(last_dim_size);
+                    const elem_count = metal_tensor.elemCount();
+                    if (elem_count != 0 and elem_count % dim == 0) {
+                        var input_mt = try metal_tensor.retainedCopy();
+                        defer input_mt.deinit();
+                        if (try metal_runtime.decoderRuntimeApplySoftmaxDevice(self.provider_impl, input_mt, elem_count / dim, dim, false)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+        }
+        return self.hostFallbackSoftmax(input, last_dim_size, false);
+    }
+
+    fn scaledDotProductAttentionOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        mask: []const i64,
+        attn_bias_ct: ?CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0) resident_path: {
+            const q_buf = toBuf(q_ct);
+            const k_buf = toBuf(k_ct);
+            const v_buf = toBuf(v_ct);
+            if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) break :resident_path;
+            const total = batch * num_heads * seq_len * head_dim;
+            if (total == 0) break :resident_path;
+
+            var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
+            defer v_mt.deinit();
+            if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice()) break :resident_path;
+            if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) break :resident_path;
+
+            var bias_mt: ?MetalTensor = null;
+            defer if (bias_mt) |*tensor| tensor.deinit();
+            var bias_mode: u32 = 0;
+            if (attn_bias_ct) |bias_ct| {
+                const bias_buf = toBuf(bias_ct);
+                if (bias_buf.quantized_storage != null) break :resident_path;
+                const shared_bias_len = num_heads * seq_len * seq_len;
+                const batched_bias_len = batch * shared_bias_len;
+                const broadcast_head_bias_len = batch * seq_len * seq_len;
+                const bias_elem_count = bufElemCount(bias_buf);
+                if (bias_elem_count == shared_bias_len) {
+                    bias_mode = 1;
+                } else if (bias_elem_count == batched_bias_len) {
+                    bias_mode = 2;
+                } else if (bias_elem_count == broadcast_head_bias_len) {
+                    bias_mode = 3;
+                } else {
+                    break :resident_path;
+                }
+                bias_mt = try self.ownedDeviceMetalTensorFromCt(bias_ct);
+                if (!bias_mt.?.isDevice()) break :resident_path;
+            }
+
+            var mask_mt: ?MetalTensor = null;
+            defer if (mask_mt) |*tensor| tensor.deinit();
+            if (mask.len > 0) {
+                if (mask.len < batch * seq_len) break :resident_path;
+                const mask_values = try self.allocator.alloc(f32, batch * seq_len);
+                defer self.allocator.free(mask_values);
+                for (mask_values, 0..) |*value, i| value.* = if (mask[i] != 0) 1.0 else 0.0;
+                const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
+                const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
+                var device_mask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mask_values.len * @sizeOf(f32), uploadStorageMode(mask_values.len * @sizeOf(f32)), &mask_shape);
+                errdefer device_mask.deinit();
+                const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
+                try host_mask.copyInto(&device_mask);
+                mask_mt = device_mask;
+            }
+
+            if (try metal_runtime.decoderRuntimeSdpaF32Device(self.provider_impl, .{
+                .q = q_mt,
+                .k = k_mt,
+                .v = v_mt,
+                .bias = bias_mt,
+                .mask = mask_mt,
+                .batch = batch,
+                .seq_len = seq_len,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+                .bias_mode = bias_mode,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+        return self.hostFallbackSdpa(q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
+    }
+
+    fn disentangledRelativeAttentionOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        q_r_ct: CT,
+        k_r_ct: CT,
+        mask: []const i64,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0) resident_path: {
+            const q_buf = toBuf(q_ct);
+            const k_buf = toBuf(k_ct);
+            const v_buf = toBuf(v_ct);
+            const q_r_buf = toBuf(q_r_ct);
+            const k_r_buf = toBuf(k_r_ct);
+            if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null or
+                q_r_buf.quantized_storage != null or k_r_buf.quantized_storage != null) break :resident_path;
+
+            if (seq_len > std.math.maxInt(usize) / 2) break :resident_path;
+            const hidden = num_heads * head_dim;
+            const total = batch * seq_len * hidden;
+            const rel_total = (seq_len * 2 - 1) * hidden;
+            if (total == 0 or rel_total == 0) break :resident_path;
+
+            var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
+            defer v_mt.deinit();
+            var q_r_mt = try self.ownedDeviceMetalTensorFromCt(q_r_ct);
+            defer q_r_mt.deinit();
+            var k_r_mt = try self.ownedDeviceMetalTensorFromCt(k_r_ct);
+            defer k_r_mt.deinit();
+            if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice() or !q_r_mt.isDevice() or !k_r_mt.isDevice()) break :resident_path;
+            if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) break :resident_path;
+            if (q_r_mt.elemCount() < rel_total or k_r_mt.elemCount() < rel_total) break :resident_path;
+
+            var mask_mt: ?MetalTensor = null;
+            defer if (mask_mt) |*tensor| tensor.deinit();
+            if (mask.len > 0) {
+                if (mask.len < batch * seq_len) break :resident_path;
+                const mask_values = try self.allocator.alloc(f32, batch * seq_len);
+                defer self.allocator.free(mask_values);
+                for (mask_values, 0..) |*value, i| value.* = if (mask[i] != 0) 1.0 else 0.0;
+                const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
+                const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
+                var device_mask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mask_values.len * @sizeOf(f32), uploadStorageMode(mask_values.len * @sizeOf(f32)), &mask_shape);
+                errdefer device_mask.deinit();
+                const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
+                try host_mask.copyInto(&device_mask);
+                mask_mt = device_mask;
+            }
+
+            if (try metal_runtime.decoderRuntimeDisentangledRelativeAttentionF32Device(self.provider_impl, .{
+                .q = q_mt,
+                .k = k_mt,
+                .v = v_mt,
+                .q_r = q_r_mt,
+                .k_r = k_r_mt,
+                .mask = mask_mt,
+                .batch = batch,
+                .seq_len = seq_len,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+        return self.hostFallbackDisentangledRelativeAttention(
+            q_ct,
+            k_ct,
+            v_ct,
+            q_r_ct,
+            k_r_ct,
+            mask,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+    }
+
+    fn causalSelfAttentionOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        attn_bias_ct: ?CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const q_buf = toBuf(q_ct);
+        const k_buf = toBuf(k_ct);
+        const v_buf = toBuf(v_ct);
+        if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (batch == 1) {
+            var q_mt = try self.ownedMetalTensorFromCt(q_ct);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedMetalTensorFromCt(k_ct);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedMetalTensorFromCt(v_ct);
+            defer v_mt.deinit();
+            var bias_mt: ?MetalTensor = null;
+            if (attn_bias_ct) |bias_ct| bias_mt = try self.ownedMetalTensorFromCt(bias_ct);
+            defer if (bias_mt) |*tensor| tensor.deinit();
+
+            if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                .q = q_mt,
+                .k = k_mt,
+                .v = v_mt,
+                .bias = bias_mt,
+                .attn_or_mask = @as(?[]const u8, null),
+                .q_len = seq_len,
+                .kv_len = seq_len,
+                .num_heads = num_heads,
+                .num_kv_heads = num_heads,
+                .head_dim = head_dim,
+                .query_position_offset = @as(usize, 0),
+                .kv_position_offset = @as(usize, 0),
+                .sliding_window = @as(usize, 0),
+                .total_sequence_len = seq_len,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+
+        const q_host = try hostSliceForBuf(q_buf);
+        const k_host = try hostSliceForBuf(k_buf);
+        const v_host = try hostSliceForBuf(v_buf);
+        const bias_host: ?[]f32 = if (attn_bias_ct) |bias_ct| try hostSliceForBuf(toBuf(bias_ct)) else null;
+        const output = try native_compute_mod.flashCausalAttentionHost(
+            self.allocator,
+            q_host,
+            k_host,
+            v_host,
+            bias_host,
+            null,
+            0,
+            batch,
+            seq_len,
+            seq_len,
+            0,
+            0,
+            num_heads,
+            num_heads,
+            head_dim,
+        );
+        errdefer self.allocator.free(output);
+        const shape = [_]i32{ @intCast(batch * seq_len), @intCast(num_heads * head_dim) };
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn logSoftmaxOp(ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(input);
+        if (buf.quantized_storage == null and last_dim_size != 0) {
+            if (buf.metal_tensor) |*metal_tensor| {
+                if (metal_tensor.isDevice()) {
+                    const dim: usize = @intCast(last_dim_size);
+                    const elem_count = metal_tensor.elemCount();
+                    if (elem_count != 0 and elem_count % dim == 0) {
+                        var input_mt = try metal_tensor.retainedCopy();
+                        defer input_mt.deinit();
+                        if (try metal_runtime.decoderRuntimeApplySoftmaxDevice(self.provider_impl, input_mt, elem_count / dim, dim, true)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+        }
+        return self.hostFallbackSoftmax(input, last_dim_size, true);
+    }
+
+    fn concatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) {
+            const a_buf = toBuf(a);
+            const b_buf = toBuf(b);
+            std.debug.print(
+                "metal_concat_prim: begin axis={d} a_shape={any} b_shape={any} a_quant={} a_runtime_quant={} a_device={} b_quant={} b_runtime_quant={} b_device={}\n",
+                .{
+                    axis,
+                    a_shape,
+                    b_shape,
+                    a_buf.quantized_storage != null,
+                    a_buf.runtime_quantized_storage != null,
+                    if (a_buf.metal_tensor) |tensor| tensor.isDevice() else false,
+                    b_buf.quantized_storage != null,
+                    b_buf.runtime_quantized_storage != null,
+                    if (b_buf.metal_tensor) |tensor| tensor.isDevice() else false,
+                },
+            );
+        }
+        if (try self.quantizedConcatPrim(a, b, axis, a_shape, b_shape)) |packed_concat| {
+            if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) std.debug.print("metal_concat_prim: path=quantized\n", .{});
+            return packed_concat;
+        }
+        if (try self.nativeDenseConcatPrim(a, b, axis, a_shape, b_shape)) |native_dense_concat| {
+            if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) std.debug.print("metal_concat_prim: path=native_dense\n", .{});
+            return native_dense_concat;
+        }
+        if (try self.deviceConcatPrim(a, b, axis, a_shape, b_shape)) |device_concat| {
+            if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) std.debug.print("metal_concat_prim: path=device\n", .{});
+            return device_concat;
+        }
+        if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) std.debug.print("metal_concat_prim: path=host_fallback\n", .{});
+        return self.hostFallbackConcatPrim(a, b, axis, a_shape, b_shape);
+    }
+
+    fn quantizedConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
+        if (axis != 0 or a_shape.len == 0 or a_shape.len != b_shape.len or a_shape.len > metal_tensor_mod.max_dims) return null;
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        const a_storage = a_buf.quantized_storage orelse a_buf.runtime_quantized_storage orelse return null;
+        const b_storage = b_buf.quantized_storage orelse b_buf.runtime_quantized_storage orelse return null;
+        if (!std.meta.eql(a_storage.tensor_type, b_storage.tensor_type)) return null;
+        if (a_storage.packed_expert != null or b_storage.packed_expert != null) return null;
+
+        const resolved_a = a_storage.shape;
+        const resolved_b = b_storage.shape;
+        if (resolved_a.len != a_shape.len or resolved_b.len != b_shape.len) return null;
+        for (1..resolved_a.len) |dim| {
+            if (resolved_a[dim] != resolved_b[dim]) return null;
+        }
+        if (resolved_a[0] <= 0 or resolved_b[0] <= 0) return null;
+        const rows_a: usize = @intCast(resolved_a[0]);
+        const rows_b: usize = @intCast(resolved_b[0]);
+        if (rows_a == 0 or rows_b == 0) return null;
+        if (a_storage.raw_bytes.len % rows_a != 0 or b_storage.raw_bytes.len % rows_b != 0) return null;
+        const row_bytes = a_storage.raw_bytes.len / rows_a;
+        if (b_storage.raw_bytes.len / rows_b != row_bytes) return null;
+
+        const raw = try self.allocator.alloc(u8, a_storage.raw_bytes.len + b_storage.raw_bytes.len);
+        errdefer self.allocator.free(raw);
+        @memcpy(raw[0..a_storage.raw_bytes.len], a_storage.raw_bytes);
+        @memcpy(raw[a_storage.raw_bytes.len..][0..b_storage.raw_bytes.len], b_storage.raw_bytes);
+
+        const shape = try self.allocator.dupe(i64, resolved_a);
+        errdefer self.allocator.free(shape);
+        shape[0] = @intCast(rows_a + rows_b);
+
+        const storage = try self.allocator.create(QuantizedStorage);
+        errdefer self.allocator.destroy(storage);
+        storage.* = .{
+            .tensor_type = a_storage.tensor_type,
+            .raw_bytes = raw,
+            .shape = shape,
+            .raw_owned = true,
+            .allocator = self.allocator,
+        };
+        errdefer storage.deinit();
+
+        const buf = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(buf);
+        buf.* = .{
+            .data = empty_f32[0..],
+            .allocator = self.allocator,
+            .owned = false,
+            .logical_shape = try self.allocator.dupe(i64, shape),
+            .quantized_storage = storage,
+            .runtime_quantized_storage = storage,
+            .owned_quantized_storage = storage,
+        };
+        errdefer {
+            if (buf.logical_shape) |logical_shape| self.allocator.free(logical_shape);
+        }
+        return @ptrCast(buf);
+    }
+
+    fn denseDtypeByteSize(dtype: tensor_mod.DType) usize {
+        return switch (dtype) {
+            .f32, .i32 => 4,
+            .f16, .bf16, .i16 => 2,
+            .f64, .i64 => 8,
+            .i8, .u8, .bool_ => 1,
+        };
+    }
+
+    fn nativeDenseConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
+        if (a_shape.len == 0 or a_shape.len != b_shape.len or axis >= a_shape.len) return null;
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        const a_bytes = a_buf.native_dense_bytes orelse return null;
+        const b_bytes = b_buf.native_dense_bytes orelse return null;
+        const dtype = a_buf.native_dense_dtype orelse return null;
+        if (b_buf.native_dense_dtype == null or b_buf.native_dense_dtype.? != dtype) return null;
+
+        const axis_index: usize = @intCast(axis);
+        var out_shape = try self.allocator.dupe(i64, a_shape);
+        errdefer self.allocator.free(out_shape);
+        for (0..a_shape.len) |dim| {
+            if (a_shape[dim] <= 0 or b_shape[dim] <= 0) return null;
+            if (dim == axis_index) {
+                out_shape[dim] = a_shape[dim] + b_shape[dim];
+            } else if (a_shape[dim] != b_shape[dim]) {
+                return null;
+            }
+        }
+
+        const elem_size = denseDtypeByteSize(dtype);
+        const outer = safeShapeNumel(a_shape[0..axis_index]) orelse return null;
+        const inner = safeShapeNumel(a_shape[axis_index + 1 ..]) orelse return null;
+        const a_axis: usize = @intCast(a_shape[axis_index]);
+        const b_axis: usize = @intCast(b_shape[axis_index]);
+        const a_chunk_elems = std.math.mul(usize, a_axis, inner) catch return null;
+        const b_chunk_elems = std.math.mul(usize, b_axis, inner) catch return null;
+        const a_chunk_bytes = std.math.mul(usize, a_chunk_elems, elem_size) catch return null;
+        const b_chunk_bytes = std.math.mul(usize, b_chunk_elems, elem_size) catch return null;
+        const out_chunk_bytes = std.math.add(usize, a_chunk_bytes, b_chunk_bytes) catch return null;
+        const a_expected_bytes = std.math.mul(usize, outer, a_chunk_bytes) catch return null;
+        const b_expected_bytes = std.math.mul(usize, outer, b_chunk_bytes) catch return null;
+        if (a_bytes.len != a_expected_bytes or b_bytes.len != b_expected_bytes) return null;
+
+        const out_bytes = std.math.mul(usize, outer, out_chunk_bytes) catch return null;
+        const raw = try self.allocator.alloc(u8, out_bytes);
+        errdefer self.allocator.free(raw);
+        for (0..outer) |outer_index| {
+            const a_src = a_bytes[outer_index * a_chunk_bytes ..][0..a_chunk_bytes];
+            const b_src = b_bytes[outer_index * b_chunk_bytes ..][0..b_chunk_bytes];
+            const dst = raw[outer_index * out_chunk_bytes ..][0..out_chunk_bytes];
+            @memcpy(dst[0..a_chunk_bytes], a_src);
+            @memcpy(dst[a_chunk_bytes..][0..b_chunk_bytes], b_src);
+        }
+
+        const buf = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(buf);
+        buf.* = .{
+            .data = empty_f32[0..],
+            .allocator = self.allocator,
+            .owned = false,
+            .logical_shape = out_shape,
+            .native_dense_bytes = raw,
+            .native_dense_dtype = dtype,
+            .native_dense_bytes_owned = true,
+        };
+        return @ptrCast(buf);
+    }
+
+    fn deviceConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (a_shape.len == 0 or a_shape.len != b_shape.len or a_shape.len > metal_tensor_mod.max_dims) return null;
+        if (axis >= a_shape.len) return null;
+        const axis_index: usize = @intCast(axis);
+
+        var a_tensor = self.ownedDeviceMetalTensorFromCt(a) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer a_tensor.deinit();
+        var b_tensor = self.ownedDeviceMetalTensorFromCt(b) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer b_tensor.deinit();
+        if (!a_tensor.isDevice() or !b_tensor.isDevice()) return null;
+
+        var resolved_a_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+        var resolved_b_buf: [metal_tensor_mod.max_dims]i64 = undefined;
+        const resolved_a = resolveConcatDeviceShape(a_shape, &a_tensor, &resolved_a_buf) orelse return null;
+        const resolved_b = resolveConcatDeviceShape(b_shape, &b_tensor, &resolved_b_buf) orelse return null;
+        const rank = resolved_a.len;
+
+        var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        for (0..rank) |dim| {
+            if (dim == axis_index) {
+                out_shape[dim] = resolved_a[dim] + resolved_b[dim];
+            } else if (resolved_a[dim] == resolved_b[dim]) {
+                out_shape[dim] = resolved_a[dim];
+            } else {
+                return null;
+            }
+        }
+
+        const inner = safeShapeNumel(resolved_a[axis_index + 1 ..]) orelse return null;
+        const a_axis: usize = @intCast(resolved_a[axis_index]);
+        const b_axis: usize = @intCast(resolved_b[axis_index]);
+        const outer = safeShapeNumel(resolved_a[0..axis_index]) orelse return null;
+        if (inner == 0 or a_axis == 0 or b_axis == 0) return null;
+        const a_chunk = a_axis * inner;
+        const b_chunk = b_axis * inner;
+        const out_chunk = (a_axis + b_axis) * inner;
+        const out_numel = outer * out_chunk;
+        if (a_tensor.elemCount() != outer * a_chunk or b_tensor.elemCount() != outer * b_chunk) return null;
+
+        var out_shape_i32: [metal_tensor_mod.max_dims]i32 = undefined;
+        for (out_shape[0..rank], 0..) |dim, idx| out_shape_i32[idx] = @intCast(dim);
+        var output = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            out_numel * @sizeOf(f32),
+            .private,
+            out_shape_i32[0..rank],
+        );
+        errdefer output.deinit();
+
+        for (0..outer) |outer_idx| {
+            const a_offset = outer_idx * a_chunk * @sizeOf(f32);
+            const b_offset = outer_idx * b_chunk * @sizeOf(f32);
+            const out_offset = outer_idx * out_chunk * @sizeOf(f32);
+            const a_bytes = a_chunk * @sizeOf(f32);
+            const b_bytes = b_chunk * @sizeOf(f32);
+            const a_view_shape = [_]i32{@intCast(a_chunk)};
+            const b_view_shape = [_]i32{@intCast(b_chunk)};
+
+            var a_src = try a_tensor.retainedView(a_offset, a_bytes, &a_view_shape);
+            defer a_src.deinit();
+            var a_dst = try output.retainedView(out_offset, a_bytes, &a_view_shape);
+            defer a_dst.deinit();
+            try a_src.copyInto(&a_dst);
+
+            var b_src = try b_tensor.retainedView(b_offset, b_bytes, &b_view_shape);
+            defer b_src.deinit();
+            var b_dst = try output.retainedView(out_offset + a_bytes, b_bytes, &b_view_shape);
+            defer b_dst.deinit();
+            try b_src.copyInto(&b_dst);
+        }
+
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
+    fn resolveConcatDeviceShape(
+        declared_shape: []const i64,
+        tensor: *const MetalTensor,
+        scratch: *[metal_tensor_mod.max_dims]i64,
+    ) ?[]const i64 {
+        if (declared_shape.len > scratch.len) return null;
+        const elem_count = tensor.elemCount();
+        if (resolveShapeFromDataLen(declared_shape, elem_count)) |resolved| {
+            scratch.* = resolved;
+            return scratch[0..declared_shape.len];
+        }
+        const metal_shape = tensor.shape();
+        if (metal_shape.len == declared_shape.len) {
+            for (metal_shape, 0..) |dim, idx| scratch[idx] = dim;
+            if (safeShapeNumel(scratch[0..declared_shape.len])) |numel| {
+                if (numel == elem_count) return scratch[0..declared_shape.len];
+            }
+        }
+        return null;
+    }
+
+    fn dotGeneralOp(
+        ctx: *anyopaque,
+        lhs: CT,
+        rhs: CT,
+        lhs_shape: []const i64,
+        rhs_shape: []const i64,
+        lhs_contracting: []const u8,
+        rhs_contracting: []const u8,
+        lhs_batch: []const u8,
+        rhs_batch: []const u8,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceDotGeneral2D(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |device| return device;
+        if (try self.tryDeviceDotGeneralBatched(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |device| return device;
+        return self.hostFallbackDotGeneral(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
+    }
+
+    fn tryDeviceDotGeneral2D(
+        self: *MetalCompute,
+        lhs: CT,
+        rhs: CT,
+        lhs_shape: []const i64,
+        rhs_shape: []const i64,
+        lhs_contracting: []const u8,
+        rhs_contracting: []const u8,
+        lhs_batch: []const u8,
+        rhs_batch: []const u8,
+    ) !?CT {
+        if (lhs_batch.len != 0 or rhs_batch.len != 0) return null;
+        if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+        if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
+        if (lhs_contracting[0] != 1 or (rhs_contracting[0] != 0 and rhs_contracting[0] != 1)) return null;
+        if (bufHasAnyQuantizedStorage(toBuf(lhs)) or bufHasAnyQuantizedStorage(toBuf(rhs))) return null;
+
+        const m_i64 = lhs_shape[0];
+        const k_i64 = lhs_shape[1];
+        const rhs_k_i64 = rhs_shape[rhs_contracting[0]];
+        const n_i64 = rhs_shape[1 - @as(usize, rhs_contracting[0])];
+        if (m_i64 <= 0 or k_i64 <= 0 or rhs_k_i64 <= 0 or n_i64 <= 0 or k_i64 != rhs_k_i64) return null;
+        const m: usize = @intCast(m_i64);
+        const n: usize = @intCast(n_i64);
+        const k: usize = @intCast(k_i64);
+
+        var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
+        defer lhs_mt.deinit();
+        var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
+        defer rhs_mt.deinit();
+        if (!lhs_mt.isDevice() or !rhs_mt.isDevice()) return null;
+        if (try metal_runtime.decoderRuntimeDotGeneral2DF32Device(
+            self.provider_impl,
+            lhs_mt,
+            rhs_mt,
+            m,
+            n,
+            k,
+            rhs_contracting[0],
+        )) |tensor| return try self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
+    fn tryDeviceDotGeneralBatched(
+        self: *MetalCompute,
+        lhs: CT,
+        rhs: CT,
+        lhs_shape: []const i64,
+        rhs_shape: []const i64,
+        lhs_contracting: []const u8,
+        rhs_contracting: []const u8,
+        lhs_batch: []const u8,
+        rhs_batch: []const u8,
+    ) !?CT {
+        if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+        if (lhs_batch.len == 0 or lhs_batch.len != rhs_batch.len) return null;
+        if (lhs_shape.len != rhs_shape.len or lhs_shape.len != lhs_batch.len + 2) return null;
+        if (lhs_shape.len == 0 or lhs_shape.len > ml.graph.shape.max_rank) return null;
+        if (bufHasAnyQuantizedStorage(toBuf(lhs)) or bufHasAnyQuantizedStorage(toBuf(rhs))) return null;
+
+        const rank = lhs_shape.len;
+        const m_axis = rank - 2;
+        const k_axis = rank - 1;
+        if (lhs_contracting[0] != k_axis) return null;
+        const rhs_contract_axis: usize = rhs_contracting[0];
+        if (rhs_contract_axis != k_axis and rhs_contract_axis != m_axis) return null;
+
+        var batch_count: usize = 1;
+        var output_shape_buf: [ml.graph.shape.max_rank]i32 = undefined;
+        for (lhs_batch, 0..) |lhs_axis_u8, idx| {
+            const lhs_axis: usize = lhs_axis_u8;
+            const rhs_axis: usize = rhs_batch[idx];
+            if (lhs_axis != idx or rhs_axis != idx) return null;
+            const dim = lhs_shape[idx];
+            if (dim <= 0 or rhs_shape[idx] != dim) return null;
+            batch_count = std.math.mul(usize, batch_count, @intCast(dim)) catch return null;
+            output_shape_buf[idx] = @intCast(dim);
+        }
+
+        const m_i64 = lhs_shape[m_axis];
+        const k_i64 = lhs_shape[k_axis];
+        const rhs_k_i64 = rhs_shape[rhs_contract_axis];
+        const n_i64 = rhs_shape[if (rhs_contract_axis == k_axis) m_axis else k_axis];
+        if (m_i64 <= 0 or k_i64 <= 0 or rhs_k_i64 <= 0 or n_i64 <= 0 or k_i64 != rhs_k_i64) return null;
+        const m: usize = @intCast(m_i64);
+        const n: usize = @intCast(n_i64);
+        const k: usize = @intCast(k_i64);
+        output_shape_buf[m_axis] = @intCast(m);
+        output_shape_buf[k_axis] = @intCast(n);
+
+        var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
+        defer lhs_mt.deinit();
+        var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
+        defer rhs_mt.deinit();
+        if (!lhs_mt.isDevice() or !rhs_mt.isDevice()) return null;
+        if (try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(
+            self.provider_impl,
+            lhs_mt,
+            rhs_mt,
+            batch_count,
+            m,
+            n,
+            k,
+            @intCast(rhs_contract_axis - m_axis),
+            output_shape_buf[0..rank],
+        )) |tensor| return try self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
+    fn concatRows2DOp(
+        ctx: *anyopaque,
+        a: CT,
+        b: CT,
+        rows_a: usize,
+        rows_b: usize,
+        cols: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        if (a_buf.quantized_storage != null or b_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        const a_data = try hostSliceForBuf(a_buf);
+        const b_data = try hostSliceForBuf(b_buf);
+        if (a_data.len != rows_a * cols or b_data.len != rows_b * cols) return error.InvalidTensorShape;
+        const output = try self.allocator.alloc(f32, (rows_a + rows_b) * cols);
+        errdefer self.allocator.free(output);
+        @memcpy(output[0..a_data.len], a_data);
+        @memcpy(output[a_data.len..][0..b_data.len], b_data);
+        const shape = [_]i32{ @intCast(rows_a + rows_b), @intCast(cols) };
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn sliceRows2DOp(
+        ctx: *anyopaque,
+        input: CT,
+        start_row: usize,
+        row_count: usize,
+        cols: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        const input_len = bufElemCount(input_buf);
+        const total_rows = @divExact(input_len, cols);
+        if (total_rows * cols != input_len) return error.InvalidTensorShape;
+        if (start_row + row_count > total_rows) return error.InvalidTensorShape;
+        if (input_buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) {
+                const byte_offset = start_row * cols * @sizeOf(f32);
+                const byte_len = row_count * cols * @sizeOf(f32);
+                const shape = [_]i32{ @intCast(row_count), @intCast(cols) };
+                const view = try metal_tensor.retainedView(byte_offset, byte_len, &shape);
+                return self.metalTensorBufWithHostMaterialization(view, false);
+            }
+        }
+        const input_data = try hostSliceForBuf(input_buf);
+        const output = try self.allocator.alloc(f32, row_count * cols);
+        errdefer self.allocator.free(output);
+        @memcpy(output, input_data[start_row * cols ..][0 .. row_count * cols]);
+        const shape = [_]i32{ @intCast(row_count), @intCast(cols) };
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn embeddingLookupOp(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const weight_buf = toBuf(weight);
+        const quantized_storage = weight_buf.quantized_storage;
+        const shape = if (quantized_storage) |storage|
+            storage.shape
+        else
+            weight_buf.logical_shape orelse return error.InvalidTensorShape;
+        if (shape.len != 2) return error.InvalidTensorShape;
+        const rows: usize = @intCast(shape[0]);
+        const cols: usize = @intCast(shape[1]);
+        if (cols != dim) return error.InvalidTensorShape;
+
+        if (quantized_storage == null and weight_buf.native_dense_bytes == null and !disableRuntimeEmbeddingLookup()) {
+            var weight_mt = try self.ownedMetalTensorFromCt(weight);
+            defer weight_mt.deinit();
+            if (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
+                .weight = weight_mt,
+                .ids = ids,
+                .total = total,
+                .dim = dim,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+        if (quantized_storage) |storage| {
+            if (!disableRuntimeEmbeddingLookup()) {
+                if (try metal_runtime.decoderRuntimeQuantEmbeddingLookup(self.provider_impl, storage, ids, total, dim, 1.0)) |tensor| {
+                    return self.ctFromOwnedMetalTensor(tensor);
+                }
+            }
+        }
+        if (quantized_storage == null and !disableRuntimeEmbeddingLookup()) {
+            if (weight_buf.native_dense_bytes) |bytes| {
+                if (weight_buf.native_dense_dtype != null and weight_buf.native_dense_dtype.? == .bf16) {
+                    if (try metal_runtime.decoderRuntimeNativeBf16EmbeddingLookup(
+                        self.provider_impl,
+                        bytes,
+                        ids,
+                        total,
+                        dim,
+                        rows,
+                    )) |tensor| {
+                        return self.ctFromOwnedMetalTensor(tensor);
+                    }
+                }
+            }
+        }
+
+        const out = try self.allocator.alloc(f32, total * dim);
+        errdefer self.allocator.free(out);
+        if (quantized_storage) |storage| {
+            for (0..total) |i| {
+                const idx: usize = @intCast(ids[i]);
+                if (idx >= rows) return error.InvalidTensorShape;
+                if (weight_buf.lazy_entry) |entry| {
+                    if (entry.host_loaded) |*loaded| {
+                        if (loaded.tensor.shape.len == 2 and
+                            @as(usize, @intCast(loaded.tensor.shape[0])) == rows and
+                            @as(usize, @intCast(loaded.tensor.shape[1])) == dim)
+                        {
+                            try copyTensorRowToF32(&loaded.tensor, idx, dim, out[i * dim .. (i + 1) * dim]);
+                            continue;
+                        }
+                    }
+                }
+                try quant_codec.dequantizeRow(storage.tensor_type, storage.raw_bytes, dim, idx, out[i * dim .. (i + 1) * dim]);
+            }
+        } else {
+            for (0..total) |i| {
+                const idx: usize = @intCast(ids[i]);
+                if (idx >= rows) return error.InvalidTensorShape;
+                if (weight_buf.native_dense_bytes) |bytes| {
+                    if (weight_buf.native_dense_dtype) |dtype| {
+                        try copyNativeDenseRowToF32(bytes, dtype, idx, rows, dim, out[i * dim .. (i + 1) * dim]);
+                        continue;
+                    }
+                }
+                if (weight_buf.lazy_entry) |entry| {
+                    if (entry.host_loaded) |*loaded| {
+                        if (loaded.tensor.shape.len == 2 and
+                            @as(usize, @intCast(loaded.tensor.shape[0])) == rows and
+                            @as(usize, @intCast(loaded.tensor.shape[1])) == dim)
+                        {
+                            try copyTensorRowToF32(&loaded.tensor, idx, dim, out[i * dim .. (i + 1) * dim]);
+                            continue;
+                        }
+                    }
+                }
+                const weight_data = try hostSliceForBuf(weight_buf);
+                @memcpy(out[i * dim .. (i + 1) * dim], weight_data[idx * dim .. (idx + 1) * dim]);
+            }
+        }
+        const out_shape = [_]i32{ @intCast(total), @intCast(dim) };
+        return denseBuf(self.allocator, out, true, &out_shape);
+    }
+
+    fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.row_ids.len != request.rows or request.rows == 0 or request.dim == 0) return null;
+        const input_buf = toBuf(request.input);
+        const storage = input_buf.quantized_storage orelse return null;
+        if (storage.packed_expert != null or storage.shape.len != 2) return null;
+        const source_rows: usize = @intCast(storage.shape[0]);
+        const dim: usize = @intCast(storage.shape[1]);
+        if (dim != request.dim) return null;
+        if (!metal_runtime.isMetalNativeSupported(storage.tensor_type)) return null;
+
+        const slot = (try self.ensureQuantizedStorageLinearSlot(request.input, dim, source_rows)) orelse return null;
+        const tensor = (try metal_runtime.decoderRuntimeGetRowsQuantLinearSlot(
+            self.provider_impl,
+            slot,
+            request.row_ids,
+            dim,
+            source_rows,
+            1.0,
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        const weight_buf = toBuf(weight);
+        if (input_buf.quantized_storage != null or weight_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (!disableRuntimeElementwise()) {
+            if (input_buf.metal_tensor) |*input_metal| {
+                if (traceGatedDeviceRequested()) {
+                    std.debug.print(
+                        "metal-rms-device-attempt input_device={} input_rank={d} input_dim={d} requested_dim={d} weight_elems={d}\n",
+                        .{
+                            input_metal.isDevice(),
+                            input_metal.ndim(),
+                            if (input_metal.ndim() > 1) @as(usize, @intCast(input_metal.dim(1))) else 0,
+                            dim,
+                            bufElemCount(weight_buf),
+                        },
+                    );
+                }
+                if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and bufElemCount(weight_buf) == dim) {
+                    var input_mt = try input_metal.retainedCopy();
+                    defer input_mt.deinit();
+                    var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
+                    defer weight_mt.deinit();
+                    if (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
+                        self.provider_impl,
+                        input_mt,
+                        weight_mt,
+                        dim,
+                        eps,
+                    )) |tensor| {
+                        if (traceGatedDeviceRequested()) std.debug.print("metal-rms-device-success rows={d} dim={d}\n", .{ input_mt.dim(0), dim });
+                        return self.ctFromOwnedMetalTensor(tensor);
+                    }
+                    if (traceGatedDeviceRequested()) std.debug.print("metal-rms-device-null rows={d} dim={d}\n", .{ input_mt.dim(0), dim });
+                }
+            }
+        }
+        const input_data = try hostSliceForBuf(input_buf);
+        const weight_data = try hostSliceForBuf(weight_buf);
+        const output = try self.allocator.dupe(f32, input_data);
+        errdefer self.allocator.free(output);
+        activations_mod.rmsNorm(output, weight_data, dim, eps);
+        const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
+        const shape_i32 = try self.i32ShapeFromI64(shape_i64);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        const gamma_buf = toBuf(gamma);
+        const beta_buf = toBuf(beta);
+        if (input_buf.quantized_storage != null or gamma_buf.quantized_storage != null or beta_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (!disableRuntimeElementwise()) {
+            if (input_buf.metal_tensor) |*input_metal| {
+                if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and
+                    bufElemCount(gamma_buf) == dim and bufElemCount(beta_buf) == dim)
+                {
+                    if (try self.ensureDynamicLayerNormSlot(gamma, beta, dim)) |slot| {
+                        if (try decoderRuntimeApplyLayerNormOp(ctx, &.{
+                            .slot = slot,
+                            .input = input,
+                            .hidden_size = dim,
+                            .eps = eps,
+                        })) |tensor| {
+                            return tensor;
+                        }
+                    }
+                }
+            }
+        }
+        const input_data = try hostSliceForBuf(input_buf);
+        const gamma_data = try hostSliceForBuf(gamma_buf);
+        const beta_data = try hostSliceForBuf(beta_buf);
+        const output = try self.allocator.dupe(f32, input_data);
+        errdefer self.allocator.free(output);
+        activations_mod.layerNorm(output, gamma_data, beta_data, dim, eps);
+        const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
+        const shape_i32 = try self.i32ShapeFromI64(shape_i64);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn linearNoBiasOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!CT {
+        return linearNoBiasOpWithPlannedDispatch(ctx, input, weight, rows, in_dim, out_dim, null);
+    }
+
+    fn deviceTensorMatchesLinearRows(input: *const MetalTensor, rows: usize, in_dim: usize) bool {
+        if (!input.isDevice() or rows == 0 or in_dim == 0) return false;
+        if (input.elemCount() != rows * in_dim) return false;
+        if (input.ndim() == 2) {
+            if (@as(usize, @intCast(input.dim(0))) != rows) return false;
+            if (@as(usize, @intCast(input.dim(1))) != in_dim) return false;
+        }
+        return true;
+    }
+
+    fn retainedLinearInputView(input: *const MetalTensor, in_dim: usize) !MetalTensor {
+        if (in_dim == 0 or input.elemCount() == 0 or input.elemCount() % in_dim != 0) return error.InvalidTensorShape;
+        const rows = input.elemCount() / in_dim;
+        const shape = [_]i32{ @intCast(rows), @intCast(in_dim) };
+        if (input.ndim() == 2 and
+            @as(usize, @intCast(input.dim(0))) == rows and
+            @as(usize, @intCast(input.dim(1))) == in_dim)
+        {
+            return input.retainedCopy();
+        }
+        return input.retainedView(0, input.deviceByteLen(), &shape);
+    }
+
+    fn linearNoBiasOpWithPlannedDispatch(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        planned_dispatch: ?u8,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        const weight_buf = toBuf(weight);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (weight_buf.native_dense_bytes != null and weight_buf.native_dense_dtype != null and self.provider_impl.hasDecoderRuntime()) {
+            const zero_bias = try self.cachedZeroBiasBuf(out_dim);
+            defer freeOp(ctx, zero_bias);
+            if (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) |slot| {
+                if (try decoderRuntimeApplyLinearOp(ctx, &.{
+                    .slot = slot,
+                    .input = input,
+                    .in_dim = in_dim,
+                    .out_dim = out_dim,
+                })) |tensor| {
+                    return tensor;
+                }
+            }
+        }
+        if (input_buf.metal_tensor) |*input_metal| {
+            if (deviceTensorMatchesLinearRows(input_metal, rows, in_dim)) {
+                const zero_bias = try self.cachedZeroBiasBuf(out_dim);
+                defer freeOp(ctx, zero_bias);
+                if (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) |slot| {
+                    if (try decoderRuntimeApplyLinearOp(ctx, &.{
+                        .slot = slot,
+                        .input = input,
+                        .in_dim = in_dim,
+                        .out_dim = out_dim,
+                    })) |tensor| {
+                        return tensor;
+                    }
+                }
+            }
+        }
+        const input_data = try hostSliceForBuf(input_buf);
+        if (input_data.len != rows * in_dim) return error.InvalidTensorShape;
+
+        const output = try self.allocator.alloc(f32, rows * out_dim);
+        errdefer self.allocator.free(output);
+
+        if (weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage) |storage| {
+            if (referenceQuantLinearDebug()) {
+                const weight_host = try self.allocator.alloc(f32, out_dim * in_dim);
+                defer self.allocator.free(weight_host);
+                try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, weight_host);
+                try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input_data, weight_host, 0.0, output);
+            } else {
+                if (!(try metal_runtime.tryRawProviderQuantizedLinearHostWithDispatch(
+                    self.provider_impl,
+                    storage,
+                    input_data.ptr,
+                    rows,
+                    in_dim,
+                    out_dim,
+                    output.ptr,
+                    planned_dispatch,
+                ))) return error.UnsupportedTensorType;
+            }
+        } else if (weight_buf.native_dense_bytes != null and weight_buf.native_dense_dtype != null) {
+            const entry = weight_buf.lazy_entry orelse return error.UnsupportedTensorType;
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            gpu_hosted_store_mod.touchLazyWeight(self.data, entry);
+            try gpu_hosted_store_mod.ensureHostLazyWeightLoadedSimple(self.data, entry);
+            const loaded = entry.host_loaded orelse return error.UnsupportedTensorType;
+            try linearTensorTransBToF32(&loaded.tensor, input_data, rows, in_dim, out_dim, output);
+        } else {
+            const weight_data = try hostSliceForBuf(weight_buf);
+            if (weight_data.len != out_dim * in_dim) return error.InvalidTensorShape;
+            try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input_data, weight_data, 0.0, output);
+        }
+
+        const out_shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+        return denseBuf(self.allocator, output, true, &out_shape);
+    }
+
+    fn validatePlannedLinear(
+        weight: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        plan: ops.OperatorPlan,
+    ) !void {
+        switch (plan) {
+            .quant_matmul => |quant| {
+                if (quant.operator == .fallback or
+                    quant.rows != rows or
+                    quant.in_dim != in_dim or
+                    quant.out_dim != out_dim)
+                {
+                    return error.InvalidPartitionPlan;
+                }
+                const weight_buf = toBuf(weight);
+                const storage = (weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage) orelse
+                    return error.InvalidPartitionPlan;
+                const format = backend_contracts.quantFormatFromGgufTensorType(storage.tensor_type) orelse return error.InvalidPartitionPlan;
+                if (format != quant.format) return error.InvalidPartitionPlan;
+            },
+            else => return error.InvalidPartitionPlan,
+        }
+    }
+
+    fn linearNoBiasPlannedOp(
+        ctx: *anyopaque,
+        request: *const ops.LinearNoBiasPlannedRequest,
+    ) anyerror!CT {
+        try validatePlannedLinear(
+            request.weight,
+            request.rows,
+            request.in_dim,
+            request.out_dim,
+            request.operator_plan,
+        );
+        const planned_dispatch = switch (request.operator_plan) {
+            .quant_matmul => |quant| @as(u8, @intFromEnum(quant.dispatch)),
+            else => return error.InvalidPartitionPlan,
+        };
+        return linearNoBiasOpWithPlannedDispatch(
+            ctx,
+            request.input,
+            request.weight,
+            request.rows,
+            request.in_dim,
+            request.out_dim,
+            planned_dispatch,
+        );
+    }
+
+    fn linearNoBiasGroupedOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        projection_out_dims: []const u32,
+        num_projections: usize,
+    ) anyerror!CT {
+        if (num_projections == 0 or num_projections > projection_out_dims.len) return error.InvalidTensorShape;
+        var total: usize = 0;
+        for (projection_out_dims[0..num_projections]) |dim| {
+            if (dim == 0) return error.InvalidTensorShape;
+            total += @intCast(dim);
+        }
+        if (total != out_dim) return error.InvalidTensorShape;
+
+        // The graph pass has already concatenated the projection weights. The
+        // Metal backend can therefore use the existing single combined linear
+        // path here; downstream row-1 last-dim slices remain cheap device views
+        // when the result is device-resident.
+        return linearNoBiasOp(ctx, input, weight, rows, in_dim, out_dim);
+    }
+
+    fn linearOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!CT {
+        return linearOpWithPlannedDispatch(ctx, input, weight, bias, rows, in_dim, out_dim, null);
+    }
+
+    fn linearOpWithPlannedDispatch(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        planned_dispatch: ?u8,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        const bias_buf = toBuf(bias);
+        if (input_buf.quantized_storage != null or bias_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (input_buf.metal_tensor) |*input_metal| {
+            if (deviceTensorMatchesLinearRows(input_metal, rows, in_dim) and
+                bufElemCount(bias_buf) == out_dim)
+            {
+                if (try self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim)) |slot| {
+                    if (try decoderRuntimeApplyLinearOp(ctx, &.{
+                        .slot = slot,
+                        .input = input,
+                        .in_dim = in_dim,
+                        .out_dim = out_dim,
+                    })) |tensor| {
+                        return tensor;
+                    }
+                }
+            }
+        }
+        const result = try linearNoBiasOpWithPlannedDispatch(ctx, input, weight, rows, in_dim, out_dim, planned_dispatch);
+        errdefer freeOp(ctx, result);
+        const bias_data = try hostSliceForBuf(bias_buf);
+        if (bias_data.len != out_dim) return error.InvalidTensorShape;
+        const result_buf = toBuf(result);
+        for (0..rows) |row| {
+            for (0..out_dim) |col| {
+                result_buf.data[row * out_dim + col] += bias_data[col];
+            }
+        }
+        return result;
+    }
+
+    fn linearPlannedOp(
+        ctx: *anyopaque,
+        request: *const ops.LinearPlannedRequest,
+    ) anyerror!CT {
+        try validatePlannedLinear(
+            request.weight,
+            request.rows,
+            request.in_dim,
+            request.out_dim,
+            request.operator_plan,
+        );
+        const planned_dispatch = switch (request.operator_plan) {
+            .quant_matmul => |quant| @as(u8, @intFromEnum(quant.dispatch)),
+            else => return error.InvalidPartitionPlan,
+        };
+        return linearOpWithPlannedDispatch(
+            ctx,
+            request.input,
+            request.weight,
+            request.bias,
+            request.rows,
+            request.in_dim,
+            request.out_dim,
+            planned_dispatch,
+        );
+    }
+
+    fn linearNoBiasPairOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight_a: CT,
+        weight_b: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!ops.LinearNoBiasPairResult {
+        const first = try linearNoBiasOp(ctx, input, weight_a, rows, in_dim, out_dim);
+        errdefer freeOp(ctx, first);
+        const second = try linearNoBiasOp(ctx, input, weight_b, rows, in_dim, out_dim);
+        return .{
+            .first = first,
+            .second = second,
+        };
+    }
+
+    fn concatOp(
+        ctx: *anyopaque,
+        a: CT,
+        b: CT,
+        total: usize,
+        dim_a: usize,
+        dim_b: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const a_data = try hostSliceForBuf(toBuf(a));
+        const b_data = try hostSliceForBuf(toBuf(b));
+        if (a_data.len != total * dim_a or b_data.len != total * dim_b) return error.InvalidTensorShape;
+
+        const out_dim = dim_a + dim_b;
+        const output = try self.allocator.alloc(f32, total * out_dim);
+        errdefer self.allocator.free(output);
+        for (0..total) |i| {
+            @memcpy(output[i * out_dim ..][0..dim_a], a_data[i * dim_a ..][0..dim_a]);
+            @memcpy(output[i * out_dim + dim_a ..][0..dim_b], b_data[i * dim_b ..][0..dim_b]);
+        }
+        const shape = [_]i32{ @intCast(total), @intCast(out_dim) };
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn splitLastDim3Op(
+        ctx: *anyopaque,
+        input: CT,
+        rows: usize,
+        dim: usize,
+    ) anyerror!ops.SplitLastDim3Result {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const data = try hostSliceForBuf(toBuf(input));
+        if (data.len != rows * dim * 3) return error.UnexpectedOutputShape;
+
+        const total = rows * dim;
+        const first = try self.allocator.alloc(f32, total);
+        errdefer self.allocator.free(first);
+        const second = try self.allocator.alloc(f32, total);
+        errdefer self.allocator.free(second);
+        const third = try self.allocator.alloc(f32, total);
+        errdefer self.allocator.free(third);
+
+        for (0..rows) |row| {
+            const src = row * dim * 3;
+            const dst = row * dim;
+            @memcpy(first[dst..][0..dim], data[src..][0..dim]);
+            @memcpy(second[dst..][0..dim], data[src + dim ..][0..dim]);
+            @memcpy(third[dst..][0..dim], data[src + dim * 2 ..][0..dim]);
+        }
+
+        const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+        return .{
+            .first = try denseBuf(self.allocator, first, true, &shape),
+            .second = try denseBuf(self.allocator, second, true, &shape),
+            .third = try denseBuf(self.allocator, third, true, &shape),
+        };
+    }
+
+    fn linearPairOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight_a: CT,
+        bias_a: CT,
+        weight_b: CT,
+        bias_b: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!ops.LinearPairResult {
+        const first = try linearOp(ctx, input, weight_a, bias_a, rows, in_dim, out_dim);
+        errdefer freeOp(ctx, first);
+        const second = try linearOp(ctx, input, weight_b, bias_b, rows, in_dim, out_dim);
+        return .{
+            .first = first,
+            .second = second,
+        };
+    }
+
+    fn linearTripleOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight_a: CT,
+        bias_a: CT,
+        weight_b: CT,
+        bias_b: CT,
+        weight_c: CT,
+        bias_c: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!ops.LinearTripleResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage == null) {
+            if (input_buf.metal_tensor) |*input_metal| {
+                if (deviceTensorMatchesLinearRows(input_metal, rows, in_dim)) {
+                    const slot_a = try self.ensureDynamicLinearSlot(weight_a, bias_a, in_dim, out_dim);
+                    const slot_b = try self.ensureDynamicLinearSlot(weight_b, bias_b, in_dim, out_dim);
+                    const slot_c = try self.ensureDynamicLinearSlot(weight_c, bias_c, in_dim, out_dim);
+                    if (slot_a != null and slot_b != null and slot_c != null) {
+                        if (try decoderRuntimeApplyLinearQkvOp(ctx, &.{
+                            .q_slot = slot_a.?,
+                            .k_slot = slot_b.?,
+                            .v_slot = slot_c.?,
+                            .input = input,
+                            .in_dim = in_dim,
+                            .q_out_dim = out_dim,
+                            .kv_out_dim = out_dim,
+                        })) |triple| {
+                            return .{
+                                .first = triple.first,
+                                .second = triple.second,
+                                .third = triple.third,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        const first = try linearOp(ctx, input, weight_a, bias_a, rows, in_dim, out_dim);
+        errdefer freeOp(ctx, first);
+        const second = try linearOp(ctx, input, weight_b, bias_b, rows, in_dim, out_dim);
+        errdefer freeOp(ctx, second);
+        const third = try linearOp(ctx, input, weight_c, bias_c, rows, in_dim, out_dim);
+        return .{ .first = first, .second = second, .third = third };
+    }
+
+    fn ropeOp(
+        ctx: *anyopaque,
+        input: CT,
+        seq_len: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        position_offset: usize,
+        consecutive_pairs: bool,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        const input_len = bufElemCount(input_buf);
+        const total_chunks = input_len / head_dim;
+        if (seq_len == 0) return error.InvalidRoPEInput;
+        if (total_chunks % seq_len != 0) return error.InvalidRoPEInput;
+        const chunks_per_position = total_chunks / seq_len;
+        if (chunks_per_position == 0) return error.InvalidRoPEInput;
+        const positions = try self.allocator.alloc(usize, total_chunks);
+        defer self.allocator.free(positions);
+        for (0..total_chunks) |tok| {
+            positions[tok] = position_offset + ((tok / chunks_per_position) % seq_len);
+        }
+
+        var input_mt = try self.ownedMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        if (try metal_runtime.decoderRuntimeApplyRope(self.provider_impl, .{
+            .input = input_mt,
+            .positions = positions,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .consecutive_pairs = consecutive_pairs,
+        })) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        const data = try hostSliceForBuf(input_buf);
+        const output = try self.allocator.dupe(f32, data);
+        errdefer self.allocator.free(output);
+        native_compute_mod.ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
+        const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
+        const shape_i32 = try self.i32ShapeFromI64(shape_i64);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn ropePerItemOp(
+        ctx: *anyopaque,
+        input: CT,
+        batch: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        query_lengths: []const usize,
+        position_offsets: []const usize,
+        consecutive_pairs: bool,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (query_lengths.len != batch or position_offsets.len != batch) return error.InvalidRoPEInput;
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        const data = try hostSliceForBuf(input_buf);
+        const row_count = batch * max_seq_len;
+        if (row_count == 0) {
+            const duped = try self.allocator.dupe(f32, data);
+            errdefer self.allocator.free(duped);
+            const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
+            const shape_i32 = try self.i32ShapeFromI64(shape_i64);
+            defer self.allocator.free(shape_i32);
+            return denseBuf(self.allocator, duped, true, shape_i32);
+        }
+        if (data.len % row_count != 0) return error.InvalidRoPEInput;
+        const row_dim = data.len / row_count;
+        if (row_dim % head_dim != 0) return error.InvalidRoPEInput;
+        const num_heads = row_dim / head_dim;
+        const total_tokens = row_count * num_heads;
+        const positions = try self.allocator.alloc(usize, total_tokens);
+        defer self.allocator.free(positions);
+        @memset(positions, 0);
+
+        for (0..batch) |b| {
+            if (query_lengths[b] > max_seq_len) return error.InvalidRoPEInput;
+            for (0..query_lengths[b]) |pos| {
+                const absolute_pos = position_offsets[b] + pos;
+                const row_base = (b * max_seq_len + pos) * num_heads;
+                for (0..num_heads) |h| positions[row_base + h] = absolute_pos;
+            }
+        }
+
+        var input_mt = try self.ownedMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        if (try metal_runtime.decoderRuntimeApplyRope(self.provider_impl, .{
+            .input = input_mt,
+            .positions = positions,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .consecutive_pairs = consecutive_pairs,
+        })) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        const output = try self.allocator.dupe(f32, data);
+        errdefer self.allocator.free(output);
+        native_compute_mod.ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
+        const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
+        const shape_i32 = try self.i32ShapeFromI64(shape_i64);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn compactKvRows(
+        allocator: std.mem.Allocator,
+        rows: []const f32,
+        token_count: usize,
+        src_width: usize,
+        dst_width: usize,
+    ) ![]f32 {
+        if (src_width == dst_width) return allocator.dupe(f32, rows);
+        const out = try allocator.alloc(f32, token_count * dst_width);
+        errdefer allocator.free(out);
+        for (0..token_count) |tok| {
+            @memcpy(
+                out[tok * dst_width ..][0..dst_width],
+                rows[tok * src_width ..][0..dst_width],
+            );
+        }
+        return out;
+    }
+
+    const AttentionKvSource = struct {
+        ptr_id: usize,
+        kv_storage: runtime_root.kv.storage.KvStorage,
+        manager: ?*runtime_root.kv.manager.KvManager = null,
+        storage: ?*runtime_root.kv.storage_runtime.KvStorageRuntime = null,
+    };
+
+    const GatheredFullKv = struct {
+        k: MetalTensor,
+        v: MetalTensor,
+
+        fn deinit(self: *GatheredFullKv) void {
+            self.k.deinit();
+            self.v.deinit();
+            self.* = undefined;
+        }
+    };
+
+    const PagedKvBootstrap = struct {
+        k_blocks: []MetalTensor,
+        v_blocks: []MetalTensor,
+        token_counts: []usize,
+
+        fn deinit(self: *PagedKvBootstrap, allocator: std.mem.Allocator) void {
+            for (self.k_blocks) |*tensor| tensor.deinit();
+            for (self.v_blocks) |*tensor| tensor.deinit();
+            allocator.free(self.k_blocks);
+            allocator.free(self.v_blocks);
+            allocator.free(self.token_counts);
+            self.* = undefined;
+        }
+    };
+
+    const GatheredKvRows = struct {
+        k: []f32,
+        v: []f32,
+    };
+
+    const BackendKvCacheKey = metal_runtime.GatheredSpanKey;
+
+    const BackendKvCacheEntry = struct {
+        k: MetalTensor,
+        v: MetalTensor,
+        row_width: usize,
+        token_count: usize,
+        position_offset: usize,
+        block_signature: u64 = 0,
+        write_serial: u64 = 0,
+
+        fn deinit(self: *BackendKvCacheEntry) void {
+            self.k.deinit();
+            self.v.deinit();
+            self.* = undefined;
+        }
+    };
+
+    fn kvViewBlockSignature(kv: ops.KvCacheView) u64 {
+        const blocks = kv.logical_blocks orelse return 0;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&kv.pool_id));
+        hasher.update(std.mem.asBytes(&kv.logical_block_count));
+        hasher.update(std.mem.sliceAsBytes(blocks));
+        return hasher.final();
+    }
+
+    fn attentionBlockSignature(attention: ops.AttentionContext) u64 {
+        const kv = attention.kv_cache orelse return 0;
+        return kvViewBlockSignature(kv);
+    }
+
+    fn backendEntryMatches(
+        entry: *const BackendKvCacheEntry,
+        token_count: usize,
+        position_offset: usize,
+        row_width: usize,
+        block_signature: u64,
+    ) bool {
+        return entry.position_offset == position_offset and
+            entry.token_count >= token_count and
+            entry.row_width == row_width and
+            (block_signature == 0 or entry.block_signature == 0 or entry.block_signature == block_signature);
+    }
+
+    fn attentionKvSource(attention: ops.AttentionContext) !AttentionKvSource {
+        const kv = attention.kv_cache orelse return error.InvalidPagedKvState;
+        if (attention.kv_storage) |storage| {
+            const handle = storage.getPoolMut(kv.pool_id) orelse return error.InvalidPoolId;
+            return .{
+                .ptr_id = @intFromPtr(storage),
+                .kv_storage = handle.*,
+                .storage = storage,
+            };
+        }
+        const manager = attention.kv_manager orelse return error.InvalidPagedKvState;
+        const handle = manager.getPoolMut(kv.pool_id) orelse return error.InvalidPoolId;
+        return .{
+            .ptr_id = @intFromPtr(manager),
+            .kv_storage = handle.*,
+            .manager = manager,
+        };
+    }
+
+    fn compressedKeyFormatForStorage(storage: *const runtime_root.kv.storage.KvStorage) ?metal_runtime.CompressedKeyFormat {
+        return switch (storage.config.dtype) {
+            .polar4 => .polar4,
+            .turbo3 => .turbo3,
+            else => null,
+        };
+    }
+
+    fn graphAttentionKvFormatForStorage(storage: *const runtime_root.kv.storage.KvStorage) graph_quant_matmul.AttentionKvFormat {
+        return switch (storage.config.dtype) {
+            .polar4 => .polar4,
+            .turbo3 => .turbo3,
+            .f32 => .f32,
+            else => .quantized,
+        };
+    }
+
+    fn directAttentionSpanFormat(
+        storage: *const runtime_root.kv.storage.KvStorage,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) ?metal_runtime.CompressedKeyFormat {
+        const format = compressedKeyFormatForStorage(storage) orelse return null;
+        const num_kv_heads_u32: u32 = @intCast(num_kv_heads);
+        const head_dim_u32: u32 = @intCast(head_dim);
+        const key_row_bytes = switch (format) {
+            .polar4 => runtime_root.kv.turboquant.polar4KeyBytes(num_kv_heads_u32, head_dim_u32),
+            .turbo3 => runtime_root.kv.turboquant.turbo3KeyBytes(num_kv_heads_u32, head_dim_u32) +
+                runtime_root.kv.turboquant.turbo3ResidualBytes(num_kv_heads_u32, head_dim_u32),
+        };
+        if (key_row_bytes == 0) return null;
+        return format;
+    }
+
+    fn compressedKeyRowBytesForStorage(storage: *const runtime_root.kv.storage.KvStorage, format: metal_runtime.CompressedKeyFormat) usize {
+        return switch (format) {
+            .polar4 => runtime_root.kv.turboquant.polar4KeyBytes(storage.config.num_kv_heads, storage.config.head_dim),
+            .turbo3 => runtime_root.kv.turboquant.turbo3KeyBytes(storage.config.num_kv_heads, storage.config.head_dim) +
+                runtime_root.kv.turboquant.turbo3ResidualBytes(storage.config.num_kv_heads, storage.config.head_dim),
+        };
+    }
+
+    fn directAttentionSpanKeyRowBytes(
+        num_kv_heads: usize,
+        head_dim: usize,
+        format: metal_runtime.CompressedKeyFormat,
+    ) usize {
+        const num_kv_heads_u32: u32 = @intCast(num_kv_heads);
+        const head_dim_u32: u32 = @intCast(head_dim);
+        return switch (format) {
+            .polar4 => runtime_root.kv.turboquant.polar4KeyBytes(num_kv_heads_u32, head_dim_u32),
+            .turbo3 => runtime_root.kv.turboquant.turbo3KeyBytes(num_kv_heads_u32, head_dim_u32) +
+                runtime_root.kv.turboquant.turbo3ResidualBytes(num_kv_heads_u32, head_dim_u32),
+        };
+    }
+
+    fn cloneMetalTensorRows(_: *MetalCompute, rows: []const f32, token_count: usize, row_width: usize) !MetalTensor {
+        const shape = [_]i32{ @intCast(token_count), @intCast(row_width) };
+        return MetalTensor.ownedCloneFrom(rows, &shape);
+    }
+
+    fn maybeDumpDecodeKvTensor(
+        _: *MetalCompute,
+        comptime label: []const u8,
+        layer_index: usize,
+        tensor: *MetalTensor,
+        token_count: usize,
+        row_width: usize,
+    ) !void {
+        const target = dumpDecodeKvLayerTarget() orelse return;
+        if (target != layer_index) return;
+        const host = try tensor.toHostSlice();
+        if (host.len < token_count * row_width or token_count == 0 or row_width == 0) return;
+        const all = host[0 .. token_count * row_width];
+        const first_row = host[0..row_width];
+        const row = host[(token_count - 1) * row_width ..][0..row_width];
+        var first_min: f32 = first_row[0];
+        var first_max: f32 = first_row[0];
+        var first_sum_abs: f64 = 0;
+        var min_value: f32 = row[0];
+        var max_value: f32 = row[0];
+        var sum: f64 = 0;
+        var sum_abs: f64 = 0;
+        var zeroish_count: usize = 0;
+        for (all) |value| {
+            if (@abs(value) < 0.000001) zeroish_count += 1;
+        }
+        for (first_row) |value| {
+            first_min = @min(first_min, value);
+            first_max = @max(first_max, value);
+            first_sum_abs += @abs(value);
+        }
+        for (row) |value| {
+            min_value = @min(min_value, value);
+            max_value = @max(max_value, value);
+            sum += value;
+            sum_abs += @abs(value);
+        }
+        const first_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(first_row));
+        const row_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(row));
+        const full_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(all));
+        std.debug.print(
+            "metal-decode-kv layer-{d}-{s}: row_dim={d} tokens={d} full_hash=0x{x} first_hash=0x{x} row_hash=0x{x} zeroish={d}/{d} first_min={d:.6} first_max={d:.6} first_mean_abs={d:.6} min={d:.6} max={d:.6} mean={d:.6} mean_abs={d:.6}\n",
+            .{
+                layer_index,
+                label,
+                row_width,
+                token_count,
+                full_hash,
+                first_hash,
+                row_hash,
+                zeroish_count,
+                all.len,
+                first_min,
+                first_max,
+                first_sum_abs / @as(f64, @floatFromInt(row_width)),
+                min_value,
+                max_value,
+                sum / @as(f64, @floatFromInt(row_width)),
+                sum_abs / @as(f64, @floatFromInt(row_width)),
+            },
+        );
+    }
+
+    fn maybeDumpDecodeStageCt(
+        _: *MetalCompute,
+        comptime label: []const u8,
+        layer_index: usize,
+        tensor: CT,
+        row_width: usize,
+    ) !void {
+        const target = dumpDecodeKvLayerTarget() orelse return;
+        if (target != layer_index) return;
+        const buf = toBuf(tensor);
+        const values = try hostSliceForBuf(buf);
+        if (values.len < row_width or row_width == 0) return;
+        const row_count = values.len / row_width;
+        if (row_count == 0) return;
+        const row = values[(row_count - 1) * row_width ..][0..row_width];
+        var min_value: f32 = row[0];
+        var max_value: f32 = row[0];
+        var sum: f64 = 0;
+        var sum_abs: f64 = 0;
+        for (row) |value| {
+            min_value = @min(min_value, value);
+            max_value = @max(max_value, value);
+            sum += value;
+            sum_abs += @abs(value);
+        }
+        const row_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(row));
+        std.debug.print(
+            "metal-decode-stage layer-{d}-{s}: row_dim={d} rows={d} row_hash=0x{x} min={d:.6} max={d:.6} mean={d:.6} mean_abs={d:.6}\n",
+            .{
+                layer_index,
+                label,
+                row_width,
+                row_count,
+                row_hash,
+                min_value,
+                max_value,
+                sum / @as(f64, @floatFromInt(row_width)),
+                sum_abs / @as(f64, @floatFromInt(row_width)),
+            },
+        );
+    }
+
+    fn maybeDumpDecodeStageTensor(
+        _: *MetalCompute,
+        comptime label: []const u8,
+        layer_index: usize,
+        tensor: MetalTensor,
+        row_width: usize,
+    ) !void {
+        const target = dumpDecodeKvLayerTarget() orelse return;
+        if (target != layer_index) return;
+        var tensor_copy = tensor;
+        const values = try tensor_copy.toHostSlice();
+        if (values.len < row_width or row_width == 0) return;
+        const row_count = values.len / row_width;
+        if (row_count == 0) return;
+        const row = values[(row_count - 1) * row_width ..][0..row_width];
+        var min_value: f32 = row[0];
+        var max_value: f32 = row[0];
+        var sum: f64 = 0;
+        var sum_abs: f64 = 0;
+        for (row) |value| {
+            min_value = @min(min_value, value);
+            max_value = @max(max_value, value);
+            sum += value;
+            sum_abs += @abs(value);
+        }
+        const row_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(row));
+        std.debug.print(
+            "metal-decode-stage layer-{d}-{s}: row_dim={d} rows={d} row_hash=0x{x} min={d:.6} max={d:.6} mean={d:.6} mean_abs={d:.6}\n",
+            .{
+                layer_index,
+                label,
+                row_width,
+                row_count,
+                row_hash,
+                min_value,
+                max_value,
+                sum / @as(f64, @floatFromInt(row_width)),
+                sum_abs / @as(f64, @floatFromInt(row_width)),
+            },
+        );
+    }
+
+    fn updateBackendKvLayerCache(
+        self: *MetalCompute,
+        key: BackendKvCacheKey,
+        k_rows: []const f32,
+        v_rows: []const f32,
+        query_sequence_len: usize,
+        kv_tokens: usize,
+        kv_position_offset: usize,
+        row_width: usize,
+        block_signature: u64,
+    ) !bool {
+        if (query_sequence_len == 0 or kv_tokens == 0) return false;
+        if (k_rows.len != query_sequence_len * row_width or v_rows.len != query_sequence_len * row_width) {
+            return error.InvalidPagedKvShape;
+        }
+
+        const gop = try self.backend_kv_cache.getOrPut(self.allocator, key);
+        self.backend_kv_write_serial +%= 1;
+        const write_serial = self.backend_kv_write_serial;
+        if (!gop.found_existing) {
+            if (query_sequence_len != kv_tokens) {
+                _ = self.backend_kv_cache.remove(key);
+                return false;
+            }
+            errdefer _ = self.backend_kv_cache.remove(key);
+            gop.value_ptr.* = .{
+                .k = try self.cloneMetalTensorRows(k_rows, kv_tokens, row_width),
+                .v = try self.cloneMetalTensorRows(v_rows, kv_tokens, row_width),
+                .row_width = row_width,
+                .token_count = kv_tokens,
+                .position_offset = kv_position_offset,
+                .block_signature = block_signature,
+                .write_serial = write_serial,
+            };
+            return true;
+        }
+
+        const entry = gop.value_ptr;
+        if (entry.row_width != row_width) {
+            entry.deinit();
+            entry.* = .{
+                .k = try self.cloneMetalTensorRows(k_rows, kv_tokens, row_width),
+                .v = try self.cloneMetalTensorRows(v_rows, kv_tokens, row_width),
+                .row_width = row_width,
+                .token_count = kv_tokens,
+                .position_offset = kv_position_offset,
+                .block_signature = block_signature,
+                .write_serial = write_serial,
+            };
+            return true;
+        }
+
+        if (query_sequence_len == kv_tokens) {
+            var next_k = try self.cloneMetalTensorRows(k_rows, kv_tokens, row_width);
+            errdefer next_k.deinit();
+            var next_v = try self.cloneMetalTensorRows(v_rows, kv_tokens, row_width);
+            errdefer next_v.deinit();
+            entry.deinit();
+            entry.* = .{
+                .k = next_k,
+                .v = next_v,
+                .row_width = row_width,
+                .token_count = kv_tokens,
+                .position_offset = kv_position_offset,
+                .block_signature = block_signature,
+                .write_serial = write_serial,
+            };
+            return true;
+        }
+
+        if (backendEntryMatches(entry, kv_tokens, kv_position_offset, row_width, block_signature)) {
+            return true;
+        }
+
+        const expected_prior_tokens = kv_tokens -| query_sequence_len;
+        if (entry.position_offset == kv_position_offset and
+            entry.token_count == expected_prior_tokens and
+            (block_signature == 0 or entry.block_signature == 0 or entry.block_signature == block_signature))
+        {
+            var k_suffix = try self.cloneMetalTensorRows(k_rows, query_sequence_len, row_width);
+            errdefer k_suffix.deinit();
+            var v_suffix = try self.cloneMetalTensorRows(v_rows, query_sequence_len, row_width);
+            errdefer v_suffix.deinit();
+            var next_k = try metal_runtime.concatenateRows(self.provider_impl, entry.k, k_suffix);
+            errdefer next_k.deinit();
+            var next_v = try metal_runtime.concatenateRows(self.provider_impl, entry.v, v_suffix);
+            errdefer next_v.deinit();
+            entry.deinit();
+            entry.* = .{
+                .k = next_k,
+                .v = next_v,
+                .row_width = row_width,
+                .token_count = kv_tokens,
+                .position_offset = kv_position_offset,
+                .block_signature = block_signature,
+                .write_serial = write_serial,
+            };
+            return true;
+        }
+
+        return false;
+    }
+
+    fn gatherPagedKvLayerFromBackendCache(
+        self: *MetalCompute,
+        allocator: std.mem.Allocator,
+        kv: ops.KvCacheView,
+        token_count: usize,
+        layer_index: usize,
+    ) !?ops.PagedKvLayerCacheRows {
+        const storage = kv.kv_storage orelse return null;
+        const key: BackendKvCacheKey = .{
+            .source_ptr_id = @intFromPtr(storage),
+            .sequence_id = kv.sequence_id,
+            .layer_index = layer_index,
+        };
+        const entry = self.backend_kv_cache.getPtr(key) orelse {
+            if (try gatherPagedKvLayerFromStorageHost(allocator, storage, kv, token_count, layer_index)) |rows| {
+                return rows;
+            }
+            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+                std.log.info(
+                    "metal backend kv cache miss: no entry seq={d} layer={d} tokens={d} offset={d} source=0x{x}",
+                    .{ kv.sequence_id, layer_index, token_count, kv.position_offset, key.source_ptr_id },
+                );
+            }
+            return null;
+        };
+        if (!backendEntryMatches(entry, token_count, kv.position_offset, entry.row_width, kvViewBlockSignature(kv))) {
+            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+                std.log.info(
+                    "metal backend kv cache miss: shape/signature mismatch seq={d} layer={d} want_tokens={d} have_tokens={d} want_offset={d} have_offset={d} want_sig=0x{x} have_sig=0x{x} source=0x{x}",
+                    .{ kv.sequence_id, layer_index, token_count, entry.token_count, kv.position_offset, entry.position_offset, kvViewBlockSignature(kv), entry.block_signature, key.source_ptr_id },
+                );
+            }
+            return null;
+        }
+        const prefix_shape = [_]i32{
+            @intCast(token_count),
+            @intCast(entry.row_width),
+        };
+        var k_tensor = if (entry.token_count == token_count)
+            try entry.k.retainedCopy()
+        else
+            try entry.k.retainedView(0, token_count * entry.row_width * @sizeOf(f32), &prefix_shape);
+        defer k_tensor.deinit();
+        const k = try allocator.dupe(f32, try k_tensor.toHostSlice());
+        errdefer allocator.free(k);
+        var v_tensor = if (entry.token_count == token_count)
+            try entry.v.retainedCopy()
+        else
+            try entry.v.retainedView(0, token_count * entry.row_width * @sizeOf(f32), &prefix_shape);
+        defer v_tensor.deinit();
+        const v = try allocator.dupe(f32, try v_tensor.toHostSlice());
+        return .{ .k = k, .v = v };
+    }
+
+    fn gatherPagedKvLayerFromStorageHost(
+        allocator: std.mem.Allocator,
+        storage: *runtime_root.kv.storage_runtime.KvStorageRuntime,
+        kv: ops.KvCacheView,
+        token_count: usize,
+        layer_index: usize,
+    ) !?ops.PagedKvLayerCacheRows {
+        const pool = storage.getPoolMut(kv.pool_id) orelse return null;
+        const table = storage.blockTable(kv.sequence_id) orelse return null;
+        if (token_count > table.tokenCount(pool.config.page_size_tokens)) return null;
+        if (!pool.config.hasSymmetricValueWidth()) return error.UnsupportedAsymmetricKvWidths;
+        const token_width = pool.valuesPerToken();
+        const k = try allocator.alloc(f32, token_count * token_width);
+        const v = try allocator.alloc(f32, token_count * token_width);
+        var keep_rows = false;
+        defer if (!keep_rows) {
+            allocator.free(k);
+            allocator.free(v);
+        };
+        for (0..token_count) |token_idx| {
+            const block_idx = token_idx / pool.config.page_size_tokens;
+            const token_offset = token_idx % pool.config.page_size_tokens;
+            if (block_idx >= table.blocks.items.len) return null;
+            const block_id = table.blocks.items[block_idx];
+            const row = pool.readToken(block_id, layer_index, token_offset) catch |err| switch (err) {
+                error.KvBytesUnavailable => return null,
+                else => return err,
+            };
+            const start = token_idx * token_width;
+            @memcpy(k[start .. start + token_width], row.k);
+            @memcpy(v[start .. start + token_width], row.v);
+        }
+        keep_rows = true;
+        return .{ .k = k, .v = v };
+    }
+
+    fn gatherPagedKvLayerFromGatheredSpan(
+        self: *MetalCompute,
+        allocator: std.mem.Allocator,
+        kv: ops.KvCacheView,
+        token_count: usize,
+        layer_index: usize,
+    ) !?ops.PagedKvLayerCacheRows {
+        const storage = kv.kv_storage orelse return null;
+        const rows = try metal_runtime.cloneGatheredSpanRows(
+            self.provider_impl,
+            allocator,
+            .{
+                .source_ptr_id = @intFromPtr(storage),
+                .sequence_id = kv.sequence_id,
+                .layer_index = layer_index,
+            },
+            token_count,
+            kv.position_offset,
+        );
+        if (rows) |r| return .{ .k = r.k, .v = r.v };
+        return null;
+    }
+
+    fn gatherFullKvFromBackendCache(
+        self: *MetalCompute,
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+        allow_host_fallback: bool,
+    ) !?GatheredFullKv {
+        const kv = attention.kv_cache orelse return null;
+        const source = try attentionKvSource(attention);
+        const key: BackendKvCacheKey = .{
+            .source_ptr_id = source.ptr_id,
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+        };
+        if (self.backend_kv_cache.getPtr(key)) |entry| {
+            const row_width = num_kv_heads * head_dim;
+            if (backendEntryMatches(entry, attention.kv_sequence_len, attention.kv_position_offset, row_width, attentionBlockSignature(attention))) {
+                const prefix_shape = [_]i32{
+                    @intCast(attention.kv_sequence_len),
+                    @intCast(entry.row_width),
+                };
+                return .{
+                    .k = if (entry.token_count == attention.kv_sequence_len)
+                        try entry.k.retainedCopy()
+                    else
+                        try entry.k.retainedView(0, attention.kv_sequence_len * entry.row_width * @sizeOf(f32), &prefix_shape),
+                    .v = if (entry.token_count == attention.kv_sequence_len)
+                        try entry.v.retainedCopy()
+                    else
+                        try entry.v.retainedView(0, attention.kv_sequence_len * entry.row_width * @sizeOf(f32), &prefix_shape),
+                };
+            }
+        }
+        if (try metal_runtime.retainGatheredSpanDevice(
+            self.provider_impl,
+            key,
+            attention.kv_sequence_len,
+            attention.kv_position_offset,
+        )) |span| {
+            const row_width = num_kv_heads * head_dim;
+            if (span.k.ndim() == 2 and span.v.ndim() == 2 and
+                @as(usize, @intCast(span.k.dim(0))) == attention.kv_sequence_len and
+                @as(usize, @intCast(span.v.dim(0))) == attention.kv_sequence_len and
+                @as(usize, @intCast(span.k.dim(1))) == row_width and
+                @as(usize, @intCast(span.v.dim(1))) == row_width)
+            {
+                return .{ .k = span.k, .v = span.v };
+            }
+            var k_mut = span.k;
+            var v_mut = span.v;
+            k_mut.deinit();
+            v_mut.deinit();
+            return null;
+        }
+        if (!allow_host_fallback) return null;
+        const rows = (try self.gatherPagedKvLayerFromBackendCache(
+            self.allocator,
+            kv,
+            attention.kv_sequence_len,
+            attention.layer_index,
+        )) orelse (try self.gatherPagedKvLayerFromGatheredSpan(
+            self.allocator,
+            kv,
+            attention.kv_sequence_len,
+            attention.layer_index,
+        )) orelse return null;
+        defer {
+            self.allocator.free(rows.k);
+            self.allocator.free(rows.v);
+        }
+        const row_width = num_kv_heads * head_dim;
+        if (rows.k.len != attention.kv_sequence_len * row_width or rows.v.len != attention.kv_sequence_len * row_width) {
+            return null;
+        }
+        const shape = [_]i32{ @intCast(attention.kv_sequence_len), @intCast(row_width) };
+        return .{
+            .k = try MetalTensor.ownedCloneFrom(rows.k, &shape),
+            .v = try MetalTensor.ownedCloneFrom(rows.v, &shape),
+        };
+    }
+
+    fn gatherFullKvFromDeviceHook(
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) !?GatheredFullKv {
+        const kv = attention.kv_cache orelse return null;
+        const storage = attention.kv_storage orelse return null;
+        const hook = storage.device_write_hook orelse return null;
+        const layer = hook.gatherLayerKvDevice(.{
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+            .token_count = attention.kv_sequence_len,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+        }) catch |err| switch (err) {
+            error.DeviceReadUnsupported, error.DeviceReadFallback => return null,
+            else => return err,
+        };
+        const row_width = num_kv_heads * head_dim;
+        if (layer.token_count < attention.kv_sequence_len or layer.row_width != row_width or layer.value_element_bytes != @sizeOf(f32)) return null;
+        const runtime = layer.runtime orelse return null;
+        const shape = [_]i32{ @intCast(attention.kv_sequence_len), @intCast(row_width) };
+        const byte_len = attention.kv_sequence_len * row_width * @sizeOf(f32);
+        if (layer.k.byte_len < byte_len or layer.v.byte_len < byte_len) return null;
+        return .{
+            .k = MetalTensor.deviceBorrowed(runtime, layer.k.handle, layer.k.byte_offset, byte_len, &shape),
+            .v = MetalTensor.deviceBorrowed(runtime, layer.v.handle, layer.v.byte_offset, byte_len, &shape),
+        };
+    }
+
+    fn pagedKvLayerFromDeviceHook(
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) !?runtime_root.kv.storage_runtime.DevicePagedKvLayer {
+        const kv = attention.kv_cache orelse return null;
+        const storage = attention.kv_storage orelse return null;
+        const hook = storage.device_write_hook orelse return null;
+        const layer = hook.pagedLayerKvDevice(.{
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+            .token_count = attention.kv_sequence_len,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+        }) catch |err| switch (err) {
+            error.DeviceReadUnsupported, error.DeviceReadFallback => {
+                if (traceQuantBlockRequested()) std.debug.print(
+                    "metal-paged-kv-layer-null layer={d} tokens={d} reason={s}\n",
+                    .{ attention.layer_index, attention.kv_sequence_len, @errorName(err) },
+                );
+                return null;
+            },
+            else => return err,
+        };
+        if (layer.token_count < attention.kv_sequence_len) {
+            if (traceQuantBlockRequested()) std.debug.print(
+                "metal-paged-kv-layer-null layer={d} tokens={d} reason=short-layer-token-count actual={d}\n",
+                .{ attention.layer_index, attention.kv_sequence_len, layer.token_count },
+            );
+            return null;
+        }
+        if (layer.runtime == null) {
+            if (traceQuantBlockRequested()) std.debug.print(
+                "metal-paged-kv-layer-null layer={d} tokens={d} reason=no-runtime\n",
+                .{ attention.layer_index, attention.kv_sequence_len },
+            );
+            return null;
+        }
+        return layer;
+    }
+
+    fn pagedSlotAttentionSupported(paged_layer: runtime_root.kv.storage_runtime.DevicePagedKvLayer) bool {
+        return metalPagedAttentionKvFormatSupported(paged_layer.format);
+    }
+
+    fn pagedKvBlockTokenOffsets(
+        self: *MetalCompute,
+        attention: ops.AttentionContext,
+        page_size: usize,
+    ) !?[]u32 {
+        if (page_size == 0) return null;
+        const kv = attention.kv_cache orelse return null;
+        const block_ids = if (kv.logical_blocks) |blocks|
+            blocks
+        else if (attention.kv_storage) |storage| blk: {
+            const table = storage.blockTable(kv.sequence_id) orelse return error.InvalidSequenceId;
+            break :blk table.blocks.items;
+        } else if (attention.kv_manager) |manager| blk: {
+            const table = manager.blockTable(kv.sequence_id) orelse return error.InvalidSequenceId;
+            break :blk table.blocks.items;
+        } else return null;
+        const needed_blocks = std.math.divCeil(usize, attention.kv_sequence_len, page_size) catch return null;
+        if (needed_blocks == 0 or block_ids.len < needed_blocks) return null;
+        const offsets = try self.allocator.alloc(u32, needed_blocks);
+        errdefer self.allocator.free(offsets);
+        for (offsets, block_ids[0..needed_blocks]) |*offset, block_id| {
+            const token_offset = std.math.mul(usize, @as(usize, block_id), page_size) catch return error.KvCapacityTooSmall;
+            if (token_offset > std.math.maxInt(u32)) return error.KvCapacityTooSmall;
+            offset.* = @intCast(token_offset);
+        }
+        return offsets;
+    }
+
+    fn gatherPagedKvBootstrapFromBackendCache(
+        self: *MetalCompute,
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) !?PagedKvBootstrap {
+        const kv = attention.kv_cache orelse return null;
+        if (attention.query_sequence_len >= attention.kv_sequence_len) return null;
+        const prior_tokens = attention.kv_sequence_len - attention.query_sequence_len;
+        if (prior_tokens == 0) return null;
+
+        const rows = (try self.gatherPagedKvLayerFromBackendCache(
+            self.allocator,
+            .{
+                .sequence_id = kv.sequence_id,
+                .pool_id = kv.pool_id,
+                .logical_block_count = kv.logical_block_count,
+                .tail_tokens = kv.tail_tokens,
+                .position_offset = attention.kv_position_offset,
+                .logical_blocks = kv.logical_blocks,
+                .kv_storage = kv.kv_storage,
+            },
+            prior_tokens,
+            attention.layer_index,
+        )) orelse (try self.gatherPagedKvLayerFromGatheredSpan(
+            self.allocator,
+            .{
+                .sequence_id = kv.sequence_id,
+                .pool_id = kv.pool_id,
+                .logical_block_count = kv.logical_block_count,
+                .tail_tokens = kv.tail_tokens,
+                .position_offset = attention.kv_position_offset,
+                .logical_blocks = kv.logical_blocks,
+                .kv_storage = kv.kv_storage,
+            },
+            prior_tokens,
+            attention.layer_index,
+        )) orelse return null;
+        defer {
+            self.allocator.free(rows.k);
+            self.allocator.free(rows.v);
+        }
+
+        const row_width = num_kv_heads * head_dim;
+        if (rows.k.len != prior_tokens * row_width or rows.v.len != prior_tokens * row_width) return null;
+
+        const k_blocks = try self.allocator.alloc(MetalTensor, 1);
+        errdefer self.allocator.free(k_blocks);
+        const v_blocks = try self.allocator.alloc(MetalTensor, 1);
+        errdefer self.allocator.free(v_blocks);
+        const token_counts = try self.allocator.alloc(usize, 1);
+        errdefer self.allocator.free(token_counts);
+
+        k_blocks[0] = try self.cloneMetalTensorRows(rows.k, prior_tokens, row_width);
+        errdefer k_blocks[0].deinit();
+        v_blocks[0] = try self.cloneMetalTensorRows(rows.v, prior_tokens, row_width);
+        errdefer v_blocks[0].deinit();
+        token_counts[0] = prior_tokens;
+
+        return .{
+            .k_blocks = k_blocks,
+            .v_blocks = v_blocks,
+            .token_counts = token_counts,
+        };
+    }
+
+    fn ensurePagedKvSuffixWritten(
+        attention: ops.AttentionContext,
+        k_rows: []const f32,
+        v_rows: []const f32,
+    ) !void {
+        if (attention.skip_kv_write) return;
+        const kv = attention.kv_cache orelse return error.InvalidPagedKvState;
+        if (attention.kv_storage) |storage| {
+            try storage.writeLayerKvSuffix(
+                kv.sequence_id,
+                attention.layer_index,
+                attention.kv_sequence_len,
+                attention.query_sequence_len,
+                k_rows,
+                v_rows,
+            );
+            return;
+        }
+        const manager = attention.kv_manager orelse return error.InvalidPagedKvState;
+        try manager.writeLayerKvSuffix(
+            kv.sequence_id,
+            attention.layer_index,
+            attention.kv_sequence_len,
+            attention.query_sequence_len,
+            k_rows,
+            v_rows,
+        );
+    }
+
+    /// Phase 6 device-first suffix write. When both k and v are device-resident
+    /// and the active storage has a device-write hook installed, encode the
+    /// suffix into device span buffers directly without downloading to host.
+    /// Returns `true` if the device path handled the write, `false` if the
+    /// caller should fall back to the host materialization path.
+    fn tryEnsurePagedKvSuffixDevice(
+        attention: ops.AttentionContext,
+        k_buf: *const Buf,
+        v_buf: *const Buf,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) !bool {
+        if (comptime !build_options.enable_metal) return false;
+        if (attention.skip_kv_write) return true;
+        const k_tensor = k_buf.metal_tensor orelse return false;
+        const v_tensor = v_buf.metal_tensor orelse return false;
+        return tryEnsurePagedKvSuffixDeviceFromTensors(attention, &k_tensor, &v_tensor, num_kv_heads, head_dim);
+    }
+
+    fn tryEnsurePagedKvSuffixDeviceFromTensors(
+        attention: ops.AttentionContext,
+        k_tensor: *const MetalTensor,
+        v_tensor: *const MetalTensor,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) !bool {
+        if (comptime !build_options.enable_metal) return false;
+        if (attention.skip_kv_write) return true;
+        const kv = attention.kv_cache orelse return error.InvalidPagedKvState;
+        const storage = attention.kv_storage orelse return false;
+        if (!k_tensor.isDevice() or !v_tensor.isDevice()) return false;
+        const k_handle = k_tensor.deviceHandle() orelse return false;
+        const v_handle = v_tensor.deviceHandle() orelse return false;
+        const write = runtime_root.kv.storage_runtime.KvSuffixWrite{
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+            .total_token_count = attention.kv_sequence_len,
+            .suffix_token_count = attention.query_sequence_len,
+            .position_offset = attention.kv_position_offset,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+        };
+        const k_ref = runtime_root.kv.storage_runtime.DeviceKvRef{
+            .handle = k_handle,
+            .byte_offset = k_tensor.deviceByteOffset(),
+            .byte_len = k_tensor.deviceByteLen(),
+        };
+        const v_ref = runtime_root.kv.storage_runtime.DeviceKvRef{
+            .handle = v_handle,
+            .byte_offset = v_tensor.deviceByteOffset(),
+            .byte_len = v_tensor.deviceByteLen(),
+        };
+
+        storage.writeLayerKvSuffixDevice(write, k_ref, v_ref) catch |err| switch (err) {
+            error.DeviceWriteUnsupported,
+            error.DeviceWriteFormatUnsupported,
+            error.DeviceWriteFallback,
+            => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn gatherFullKv(
+        self: *MetalCompute,
+        source: AttentionKvSource,
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) !GatheredFullKv {
+        const kv = attention.kv_cache orelse return error.InvalidPagedKvState;
+        const gathered: GatheredKvRows = if (source.storage) |storage| blk: {
+            const rows = try storage.gatherLayerKv(self.allocator, kv.sequence_id, attention.layer_index, attention.kv_sequence_len);
+            break :blk .{ .k = rows.k, .v = rows.v };
+        } else blk: {
+            const rows = try source.manager.?.gatherLayerKv(self.allocator, kv.sequence_id, attention.layer_index, attention.kv_sequence_len);
+            break :blk .{ .k = rows.k, .v = rows.v };
+        };
+        defer {
+            self.allocator.free(gathered.k);
+            self.allocator.free(gathered.v);
+        }
+
+        if (!source.kv_storage.config.hasSymmetricValueWidth()) return error.UnsupportedAsymmetricKvWidths;
+        const src_width = source.kv_storage.valuesPerToken();
+        const dst_width = num_kv_heads * head_dim;
+        const compact_k = try compactKvRows(self.allocator, gathered.k, attention.kv_sequence_len, src_width, dst_width);
+        defer self.allocator.free(compact_k);
+        const compact_v = try compactKvRows(self.allocator, gathered.v, attention.kv_sequence_len, src_width, dst_width);
+        defer self.allocator.free(compact_v);
+
+        const shape = [_]i32{ @intCast(attention.kv_sequence_len), @intCast(dst_width) };
+        return .{
+            .k = try MetalTensor.ownedCloneFrom(compact_k, &shape),
+            .v = try MetalTensor.ownedCloneFrom(compact_v, &shape),
+        };
+    }
+
+    fn allowsFutureAttention(attn_or_mask: ?[]const u8, total_sequence_len: usize, query_pos: usize, key_pos: usize) bool {
+        const mask = attn_or_mask orelse return false;
+        if (query_pos >= total_sequence_len or key_pos >= total_sequence_len) return false;
+        const idx = query_pos * total_sequence_len + key_pos;
+        if (idx >= mask.len) return false;
+        return mask[idx] != 0;
+    }
+
+    fn allowsPastAttention(sliding_window: usize, query_pos: usize, key_pos: usize) bool {
+        if (key_pos > query_pos) return false;
+        if (sliding_window == 0) return true;
+        return query_pos - key_pos < sliding_window;
+    }
+
+    fn binaryResultShapeI64(self: *MetalCompute, a_shape: ?[]const i64, b_shape: ?[]const i64, a_count: usize, b_count: usize) ![]i64 {
+        const result_count = @max(a_count, b_count);
+        if (a_shape == null and b_shape == null) {
+            return self.allocator.dupe(i64, &[_]i64{@intCast(result_count)});
+        }
+        const lhs = a_shape orelse &[_]i64{@intCast(a_count)};
+        const rhs = b_shape orelse &[_]i64{@intCast(b_count)};
+        const out_rank = @max(lhs.len, rhs.len);
+        var out = try self.allocator.alloc(i64, out_rank);
+        errdefer self.allocator.free(out);
+
+        for (0..out_rank) |i| {
+            const lhs_i = if (i < out_rank - lhs.len) 1 else lhs[i - (out_rank - lhs.len)];
+            const rhs_i = if (i < out_rank - rhs.len) 1 else rhs[i - (out_rank - rhs.len)];
+            if (lhs_i == rhs_i) {
+                out[i] = lhs_i;
+            } else if (lhs_i == 1) {
+                out[i] = rhs_i;
+            } else if (rhs_i == 1) {
+                out[i] = lhs_i;
+            } else {
+                return error.UnsupportedShape;
+            }
+        }
+        return out;
+    }
+
+    fn tryExpandFlattenedElementwiseShape(
+        self: *MetalCompute,
+        shape: []const i64,
+        peer: []const i64,
+        elem_count: usize,
+    ) !?[]i64 {
+        if (shape.len != peer.len or shape.len < 3) return null;
+        const last = shape.len - 1;
+        if (shape[last] <= 0 or peer[last] <= 0 or shape[last] != peer[last]) return null;
+
+        var prefix_product: usize = 1;
+        for (peer[0..last], 0..) |dim, i| {
+            if (dim <= 0) return null;
+            if (i > 0 and shape[i] != 1) return null;
+            prefix_product = std.math.mul(usize, prefix_product, @intCast(dim)) catch return null;
+        }
+
+        if (shape[0] <= 0 or @as(usize, @intCast(shape[0])) != prefix_product) return null;
+        if (elem_count != prefix_product * @as(usize, @intCast(shape[last]))) return null;
+        return try self.allocator.dupe(i64, peer);
+    }
+
+    fn resolveElementwiseShape(self: *MetalCompute, shape_hint: ?[]const i64, elem_count: usize) ![]i64 {
+        if (shape_hint) |shape| {
+            if (allConcreteShapeDims(shape)) return self.allocator.dupe(i64, shape);
+            var unknown_count: usize = 0;
+            for (shape) |dim| {
+                if (dim <= 0) unknown_count += 1;
+            }
+            if (unknown_count <= 1) {
+                const resolved = try resolveShapeRightmostUnknown(shape, elem_count);
+                return self.allocator.dupe(i64, resolved[0..shape.len]);
+            }
+        }
+        return self.allocator.dupe(i64, &[_]i64{@intCast(elem_count)});
+    }
+
+    fn canFlatElementwise(a_shape: ?[]const i64, b_shape: ?[]const i64, a_count: usize, b_count: usize) bool {
+        if (a_count == 1 or b_count == 1) return true;
+        if (a_count != b_count) return false;
+        if (a_shape == null and b_shape == null) return true;
+        const lhs = a_shape orelse return false;
+        const rhs = b_shape orelse return false;
+        return std.mem.eql(i64, lhs, rhs);
+    }
+
+    fn binaryResultShape(self: *MetalCompute, a_buf: *const Buf, b_buf: *const Buf) ![]i32 {
+        const shape_i64 = try self.binaryResultShapeI64(a_buf.logical_shape, b_buf.logical_shape, bufElemCount(a_buf), bufElemCount(b_buf));
+        defer self.allocator.free(shape_i64);
+        return self.i32ShapeFromI64(shape_i64);
+    }
+
+    fn unaryLikeInput(self: *MetalCompute, input_buf: *const Buf, output: []f32) !CT {
+        const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
+        const shape_i32 = try self.i32ShapeFromI64(shape_i64);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn applyUnaryActivationOp(
+        ctx: *anyopaque,
+        input: CT,
+        runtime_kind: ?ops.DecoderRuntimeActivationKind,
+        comptime func: *const fn ([]f32) void,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (!disableRuntimeElementwise()) {
+            if (runtime_kind) |kind| {
+                if (input_buf.logical_shape) |shape_i64| {
+                    if (shape_i64.len == 2 and shape_i64[1] > 0) {
+                        const maybe_runtime = try decoderRuntimeApplyActivationOp(ctx, &.{
+                            .input = input,
+                            .kind = kind,
+                            .dim = @intCast(shape_i64[1]),
+                        });
+                        if (maybe_runtime) |runtime_tensor| return runtime_tensor;
+                    }
+                }
+            }
+        }
+        const input_data = try hostSliceForBuf(input_buf);
+        const output = try self.allocator.dupe(f32, input_data);
+        errdefer self.allocator.free(output);
+        func(output);
+        return self.unaryLikeInput(input_buf, output);
+    }
+
+    fn gqaCausalAttentionOp(
+        ctx: *anyopaque,
+        Q: CT,
+        K: CT,
+        V: CT,
+        attn_bias: ?CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const q_buf = toBuf(Q);
+        const k_buf = toBuf(K);
+        const v_buf = toBuf(V);
+        if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) {
+            return error.UnsupportedTensorType;
+        }
+        const bias_buf = if (attn_bias) |tensor| toBuf(tensor) else null;
+
+        const h_q = num_heads * head_dim;
+        const total = batch * seq_len;
+        if (batch == 1) {
+            var q_mt = try self.ownedMetalTensorFromCt(Q);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedMetalTensorFromCt(K);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedMetalTensorFromCt(V);
+            defer v_mt.deinit();
+            var bias_mt: ?MetalTensor = null;
+            defer if (bias_mt) |*tensor| tensor.deinit();
+            if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
+            if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                .q = q_mt,
+                .k = k_mt,
+                .v = v_mt,
+                .bias = bias_mt,
+                .attn_or_mask = @as(?[]const u8, null),
+                .q_len = seq_len,
+                .kv_len = seq_len,
+                .num_heads = num_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .query_position_offset = @as(usize, 0),
+                .kv_position_offset = @as(usize, 0),
+                .sliding_window = @as(usize, 0),
+                .total_sequence_len = seq_len,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+
+        const q_data = try hostSliceForBuf(q_buf);
+        const k_data = try hostSliceForBuf(k_buf);
+        const v_data = try hostSliceForBuf(v_buf);
+        const bias_data = if (bias_buf) |buf| try hostSliceForBuf(buf) else null;
+        const output = try native_compute_mod.flashCausalAttentionHost(
+            self.allocator,
+            q_data,
+            k_data,
+            v_data,
+            bias_data,
+            null,
+            0,
+            batch,
+            seq_len,
+            seq_len,
+            0,
+            0,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+        errdefer self.allocator.free(output);
+        const out_shape = [_]i32{ @intCast(total), @intCast(h_q) };
+        return denseBuf(self.allocator, output, true, &out_shape);
+    }
+
+    fn runAttentionOp(ctx: *anyopaque, request: *const ops.RunAttentionRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var attention = request.attention;
+        if (request.attention_sink.hasMetadata()) attention.attention_sink = request.attention_sink;
+        if (attention.attention_sink.hasMetadata()) return null;
+        if (attention.mode != .dense_causal) return null;
+        if (attention.kv_batch != null) return null;
+        if (attention.query_sequence_len != attention.kv_sequence_len) return null;
+        if (attention.kv_position_offset != 0) return null;
+        if (attention.total_sequence_len != attention.query_sequence_len) return null;
+
+        const q_buf = toBuf(request.q);
+        const k_buf = toBuf(request.k);
+        const v_buf = toBuf(request.v);
+        if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) {
+            return error.UnsupportedTensorType;
+        }
+
+        var q_mt = try self.ownedMetalTensorFromCt(request.q);
+        defer q_mt.deinit();
+        var k_mt = try self.ownedMetalTensorFromCt(request.k);
+        defer k_mt.deinit();
+        var v_mt = try self.ownedMetalTensorFromCt(request.v);
+        defer v_mt.deinit();
+
+        if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+            .q = q_mt,
+            .k = k_mt,
+            .v = v_mt,
+            .bias = @as(?MetalTensor, null),
+            .attn_or_mask = attention.attn_or_mask,
+            .q_len = attention.query_sequence_len,
+            .kv_len = attention.kv_sequence_len,
+            .num_heads = request.num_heads,
+            .num_kv_heads = request.num_kv_heads,
+            .head_dim = request.head_dim,
+            .query_position_offset = @as(usize, 0),
+            .kv_position_offset = @as(usize, 0),
+            .sliding_window = attention.sliding_window,
+            .total_sequence_len = attention.total_sequence_len,
+        })) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn deepSeekV4BiasRows(bias: *const MetalTensor, row_dim: usize, compress_rate: usize) ?usize {
+        const elems = bias.elemCount();
+        if (elems == row_dim) return 1;
+        if (elems == compress_rate * row_dim) return compress_rate;
+        return null;
+    }
+
+    fn deepSeekV4ShapeIs(tensor: *const MetalTensor, dims: []const usize) bool {
+        if (tensor.ndim() != dims.len) return false;
+        for (dims, 0..) |expected, dim_index| {
+            if (@as(usize, @intCast(tensor.dim(dim_index))) != expected) return false;
+        }
+        return true;
+    }
+
+    fn deepSeekV4BiasShapeIs(tensor: *const MetalTensor, row_dim: usize, compress_rate: usize) bool {
+        return deepSeekV4ShapeIs(tensor, &.{row_dim}) or
+            deepSeekV4ShapeIs(tensor, &.{ compress_rate, row_dim });
+    }
+
+    fn updateDeepSeekV4DeviceComponent(
+        self: *MetalCompute,
+        component_state: *DeepSeekV4DeviceComponent,
+        request: *const ops.DeepSeekV4CompressedAttentionRequest,
+        component: *const ops.DeepSeekV4CompressedComponentRequest,
+        projected: *const MetalTensor,
+        gate: *const MetalTensor,
+        bias: *const MetalTensor,
+        norm: *const MetalTensor,
+        row_count: usize,
+    ) !bool {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        const bias_rows = deepSeekV4BiasRows(bias, component.row_dim, request.compress_rate) orelse return false;
+        try self.ensureDeepSeekV4ComponentCapacity(
+            component_state,
+            request.total_tokens,
+            row_count,
+            component.row_dim,
+            component.gate_width,
+        );
+        const projected_cache = component_state.projected orelse return false;
+        const gate_cache = component_state.gate orelse return false;
+        const compressed = component_state.compressed orelse return false;
+        const positions = component_state.positions orelse return false;
+        const rc = metal_runtime.termite_metal_decode_runtime_compressed_attention_update_component_device(
+            runtime,
+            projected.deviceHandle(),
+            projected.deviceByteOffset(),
+            gate.deviceHandle(),
+            gate.deviceByteOffset(),
+            bias.deviceHandle(),
+            bias.deviceByteOffset(),
+            bias_rows,
+            norm.deviceHandle(),
+            norm.deviceByteOffset(),
+            projected_cache.deviceHandle(),
+            projected_cache.deviceByteOffset(),
+            gate_cache.deviceHandle(),
+            gate_cache.deviceByteOffset(),
+            compressed.deviceHandle(),
+            compressed.deviceByteOffset(),
+            positions.deviceHandle(),
+            positions.deviceByteOffset(),
+            request.query_rows,
+            request.query_abs_start,
+            request.total_tokens,
+            request.compress_rate,
+            component.row_dim,
+            component.gate_width,
+            row_count,
+            request.rope_dim,
+            request.rope_theta,
+            request.rope_freq_scale,
+            request.eps,
+            if (request.rope_consecutive_pairs) 1 else 0,
+        );
+        return rc == 0;
+    }
+
+    fn runDeepSeekV4CompressedAttentionOp(ctx: *anyopaque, request: *const ops.DeepSeekV4CompressedAttentionRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return null;
+        if (metal_runtime.hasActiveFrame(runtime)) return null;
+        if (request.query_rows == 0 or request.total_tokens == 0 or request.compress_rate <= 1) return null;
+        if (request.head_dim == 0 or request.num_heads == 0 or request.query_abs_start + request.query_rows != request.total_tokens) return null;
+        if (request.compressor.row_dim != request.head_dim) return null;
+        if (request.compressor.gate_width != 1 and request.compressor.gate_width != request.compress_rate) return null;
+        if (request.path == .compressed_sparse and request.top_k > 512) return null;
+        if (request.path == .compressed_sparse) {
+            const index_component = request.indexer orelse return null;
+            if (request.index_query == null or request.index_head_weights == null) return null;
+            if (request.index_heads == 0 or request.index_head_dim == 0 or request.top_k == 0) return null;
+            if (index_component.row_dim != request.index_head_dim) return null;
+            if (index_component.gate_width != 1 and index_component.gate_width != request.compress_rate) return null;
+        }
+
+        var q = try self.ownedDeviceMetalTensorFromCt(request.q);
+        defer q.deinit();
+        var local_kv = try self.ownedDeviceMetalTensorFromCt(request.local_kv);
+        defer local_kv.deinit();
+        var sinks = try self.ownedDeviceMetalTensorFromCt(request.sinks);
+        defer sinks.deinit();
+        if (!q.isDevice() or !local_kv.isDevice() or !sinks.isDevice()) return null;
+        if (q.elemCount() != request.query_rows * request.num_heads * request.head_dim) return null;
+        if (local_kv.elemCount() != request.query_rows * request.head_dim) return null;
+        if (sinks.elemCount() != request.num_heads) return null;
+        if (!deepSeekV4ShapeIs(&q, &.{ request.query_rows, request.num_heads * request.head_dim })) return null;
+        if (!deepSeekV4ShapeIs(&local_kv, &.{ request.query_rows, request.head_dim })) return null;
+
+        var comp_projected = try self.ownedDeviceMetalTensorFromCt(request.compressor.projected);
+        defer comp_projected.deinit();
+        var comp_gate = try self.ownedDeviceMetalTensorFromCt(request.compressor.gate);
+        defer comp_gate.deinit();
+        var comp_bias = try self.ownedDeviceMetalTensorFromCt(request.compressor.bias);
+        defer comp_bias.deinit();
+        var comp_norm = try self.ownedDeviceMetalTensorFromCt(request.compressor.norm);
+        defer comp_norm.deinit();
+        if (comp_projected.elemCount() != request.query_rows * request.compressor.row_dim) return null;
+        if (comp_gate.elemCount() != request.query_rows * request.compressor.gate_width) return null;
+        if (comp_norm.elemCount() != request.compressor.row_dim) return null;
+        if (!deepSeekV4ShapeIs(&comp_projected, &.{ request.query_rows, request.compressor.row_dim })) return null;
+        if (!deepSeekV4ShapeIs(&comp_gate, &.{ request.query_rows, request.compressor.gate_width })) return null;
+        if (!deepSeekV4ShapeIs(&comp_norm, &.{request.compressor.row_dim})) return null;
+        if (!deepSeekV4BiasShapeIs(&comp_bias, request.compressor.row_dim, request.compress_rate)) return null;
+
+        const gop = try self.deepseek_v4_device_cache.getOrPut(self.allocator, .{
+            .cache_key = request.cache_key,
+            .layer_index = request.layer_index,
+        });
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const layer_cache = gop.value_ptr;
+        if (layer_cache.token_count > request.total_tokens) layer_cache.deinit();
+        if (layer_cache.token_count != request.query_abs_start) {
+            if (layer_cache.token_count != 0) layer_cache.deinit();
+            return null;
+        }
+        try self.ensureDeepSeekV4LocalCapacity(layer_cache, request.total_tokens, request.head_dim);
+
+        const local_tensor = layer_cache.local orelse return null;
+        const store_rc = metal_runtime.termite_metal_decode_runtime_compressed_attention_store_local_device(
+            runtime,
+            local_kv.deviceHandle(),
+            local_kv.deviceByteOffset(),
+            local_tensor.deviceHandle(),
+            local_tensor.deviceByteOffset(),
+            request.query_rows,
+            request.query_abs_start,
+            request.head_dim,
+        );
+        if (store_rc != 0) {
+            layer_cache.deinit();
+            return null;
+        }
+
+        const row_count = (request.total_tokens + request.compress_rate - 1) / request.compress_rate;
+        if (!try self.updateDeepSeekV4DeviceComponent(&layer_cache.compressor, request, &request.compressor, &comp_projected, &comp_gate, &comp_bias, &comp_norm, row_count)) {
+            layer_cache.deinit();
+            return null;
+        }
+
+        var idx_projected: ?MetalTensor = null;
+        var idx_gate: ?MetalTensor = null;
+        var idx_bias: ?MetalTensor = null;
+        var idx_norm: ?MetalTensor = null;
+        var idx_query: ?MetalTensor = null;
+        var idx_weights: ?MetalTensor = null;
+        var selected_indices: ?MetalTensor = null;
+        var selected_scores: ?MetalTensor = null;
+        defer if (idx_projected) |*tensor| tensor.deinit();
+        defer if (idx_gate) |*tensor| tensor.deinit();
+        defer if (idx_bias) |*tensor| tensor.deinit();
+        defer if (idx_norm) |*tensor| tensor.deinit();
+        defer if (idx_query) |*tensor| tensor.deinit();
+        defer if (idx_weights) |*tensor| tensor.deinit();
+        defer if (selected_indices) |*tensor| tensor.deinit();
+        defer if (selected_scores) |*tensor| tensor.deinit();
+
+        var has_indexer = false;
+        if (request.path == .compressed_sparse) {
+            const index_component = request.indexer.?;
+            const index_query_ct = request.index_query.?;
+            const index_weights_ct = request.index_head_weights.?;
+            idx_projected = try self.ownedDeviceMetalTensorFromCt(index_component.projected);
+            idx_gate = try self.ownedDeviceMetalTensorFromCt(index_component.gate);
+            idx_bias = try self.ownedDeviceMetalTensorFromCt(index_component.bias);
+            idx_norm = try self.ownedDeviceMetalTensorFromCt(index_component.norm);
+            idx_query = try self.ownedDeviceMetalTensorFromCt(index_query_ct);
+            idx_weights = try self.ownedDeviceMetalTensorFromCt(index_weights_ct);
+            if (idx_projected.?.elemCount() != request.query_rows * index_component.row_dim or
+                idx_gate.?.elemCount() != request.query_rows * index_component.gate_width or
+                idx_norm.?.elemCount() != index_component.row_dim or
+                idx_query.?.elemCount() != request.query_rows * request.index_heads * request.index_head_dim or
+                idx_weights.?.elemCount() != request.query_rows * request.index_heads)
+            {
+                layer_cache.deinit();
+                return null;
+            }
+            if (!deepSeekV4ShapeIs(&idx_projected.?, &.{ request.query_rows, index_component.row_dim }) or
+                !deepSeekV4ShapeIs(&idx_gate.?, &.{ request.query_rows, index_component.gate_width }) or
+                !deepSeekV4ShapeIs(&idx_norm.?, &.{index_component.row_dim}) or
+                !deepSeekV4BiasShapeIs(&idx_bias.?, index_component.row_dim, request.compress_rate) or
+                !deepSeekV4ShapeIs(&idx_query.?, &.{ request.query_rows, request.index_heads * request.index_head_dim }) or
+                !deepSeekV4ShapeIs(&idx_weights.?, &.{ request.query_rows, request.index_heads }))
+            {
+                layer_cache.deinit();
+                return null;
+            }
+            if (!try self.updateDeepSeekV4DeviceComponent(&layer_cache.indexer, request, &index_component, &idx_projected.?, &idx_gate.?, &idx_bias.?, &idx_norm.?, row_count)) {
+                layer_cache.deinit();
+                return null;
+            }
+            const selected_shape = [_]i32{ @intCast(request.query_rows), @intCast(request.top_k) };
+            selected_indices = try MetalTensor.deviceAllocate(@ptrCast(runtime), request.query_rows * request.top_k * @sizeOf(u32), .private, &selected_shape);
+            selected_scores = try MetalTensor.deviceAllocate(@ptrCast(runtime), request.query_rows * request.top_k * @sizeOf(f32), .private, &selected_shape);
+            has_indexer = true;
+        }
+
+        const compressed_tensor = layer_cache.compressor.compressed orelse {
+            layer_cache.deinit();
+            return null;
+        };
+        const compressed_positions = layer_cache.compressor.positions orelse {
+            layer_cache.deinit();
+            return null;
+        };
+        const index_tensor: ?MetalTensor = if (has_indexer) blk: {
+            break :blk layer_cache.indexer.compressed orelse {
+                layer_cache.deinit();
+                return null;
+            };
+        } else null;
+        const index_positions: ?MetalTensor = if (has_indexer) blk: {
+            break :blk layer_cache.indexer.positions orelse {
+                layer_cache.deinit();
+                return null;
+            };
+        } else null;
+
+        const output_shape = [_]i32{ @intCast(request.query_rows), @intCast(request.num_heads * request.head_dim) };
+        var output = try MetalTensor.deviceAllocate(@ptrCast(runtime), request.query_rows * request.num_heads * request.head_dim * @sizeOf(f32), .private, &output_shape);
+        errdefer output.deinit();
+        const rc = metal_runtime.termite_metal_decode_runtime_compressed_attention_hybrid_attention_device(
+            runtime,
+            q.deviceHandle(),
+            q.deviceByteOffset(),
+            local_tensor.deviceHandle(),
+            local_tensor.deviceByteOffset(),
+            compressed_tensor.deviceHandle(),
+            compressed_tensor.deviceByteOffset(),
+            compressed_positions.deviceHandle(),
+            compressed_positions.deviceByteOffset(),
+            if (index_tensor) |tensor| tensor.deviceHandle() else null,
+            if (index_tensor) |tensor| tensor.deviceByteOffset() else 0,
+            if (index_positions) |tensor| tensor.deviceHandle() else null,
+            if (index_positions) |tensor| tensor.deviceByteOffset() else 0,
+            if (idx_query) |tensor| tensor.deviceHandle() else null,
+            if (idx_query) |tensor| tensor.deviceByteOffset() else 0,
+            if (idx_weights) |tensor| tensor.deviceHandle() else null,
+            if (idx_weights) |tensor| tensor.deviceByteOffset() else 0,
+            if (selected_indices) |tensor| tensor.deviceHandle() else null,
+            if (selected_indices) |tensor| tensor.deviceByteOffset() else 0,
+            if (selected_scores) |tensor| tensor.deviceHandle() else null,
+            if (selected_scores) |tensor| tensor.deviceByteOffset() else 0,
+            sinks.deviceHandle(),
+            sinks.deviceByteOffset(),
+            output.deviceHandle(),
+            output.deviceByteOffset(),
+            request.query_abs_start,
+            request.query_rows,
+            request.total_tokens,
+            row_count,
+            request.num_heads,
+            request.head_dim,
+            request.sliding_window,
+            request.top_k,
+            if (has_indexer) row_count else 0,
+            request.index_heads,
+            request.index_head_dim,
+        );
+        if (rc != 0) {
+            output.deinit();
+            layer_cache.deinit();
+            return null;
+        }
+        const result = try self.ctFromOwnedMetalTensor(output);
+        layer_cache.token_count = request.total_tokens;
+        layer_cache.compressor.rows = row_count;
+        if (has_indexer) layer_cache.indexer.rows = row_count;
+        return result;
+    }
+
+    fn attentionSinkScoresHost(sink: ops.AttentionSinkMetadata, num_heads: usize) !?[]const f32 {
+        if (sink.per_head_tensor) |tensor| {
+            const sink_buf = toBuf(tensor);
+            const scores = try hostSliceForBuf(sink_buf);
+            if (scores.len < num_heads) return error.InvalidAttentionSinkShape;
+            return scores[0..num_heads];
+        }
+        if (sink.slot != null) return error.UnsupportedAttentionSink;
+        return null;
+    }
+
+    fn gqaAttentionHostFallback(
+        self: *MetalCompute,
+        q_host: []const f32,
+        k_host: []const f32,
+        v_host: []const f32,
+        bias_data: ?[]const f32,
+        attention: ops.AttentionContext,
+        batch: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) ![]f32 {
+        const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
+        if (try attentionSinkScoresHost(attention.attention_sink, num_heads)) |sink_scores| {
+            return native_compute_mod.gqaAttentionSlicesSinkHost(
+                self.allocator,
+                q_host,
+                k_host,
+                v_host,
+                bias_data,
+                attention.attn_or_mask,
+                attention.sliding_window,
+                sink_scores,
+                attention.total_sequence_len,
+                batch,
+                attention.query_sequence_len,
+                attention.kv_sequence_len,
+                query_position_offset,
+                attention.kv_position_offset,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+        }
+        return native_compute_mod.flashCausalAttentionHost(
+            self.allocator,
+            q_host,
+            k_host,
+            v_host,
+            bias_data,
+            attention.attn_or_mask,
+            attention.sliding_window,
+            batch,
+            attention.query_sequence_len,
+            attention.kv_sequence_len,
+            query_position_offset,
+            attention.kv_position_offset,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+    }
+
+    fn gqaPagedAttentionOp(
+        ctx: *anyopaque,
+        Q: CT,
+        K: CT,
+        V: CT,
+        attn_bias: ?CT,
+        attention: ops.AttentionContext,
+        batch: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const has_attention_sink = attention.attention_sink.hasMetadata();
+        if (dumpDecodeKvLayerTarget()) |target_layer| {
+            if (target_layer == attention.layer_index) {
+                std.debug.print(
+                    "metal-gqa-paged-attn layer={d} mode={s} q={d} kv={d} pos={d} skip={} has_cache={} has_storage={} has_manager={}\n",
+                    .{
+                        attention.layer_index,
+                        @tagName(attention.mode),
+                        attention.query_sequence_len,
+                        attention.kv_sequence_len,
+                        attention.kv_position_offset,
+                        attention.skip_kv_write,
+                        attention.kv_cache != null,
+                        attention.kv_storage != null,
+                        attention.kv_manager != null,
+                    },
+                );
+            }
+        }
+
+        const q_buf = toBuf(Q);
+        const k_buf = toBuf(K);
+        const v_buf = toBuf(V);
+        if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) return error.UnsupportedTensorType;
+
+        const h_q = num_heads * head_dim;
+        const h_kv = num_kv_heads * head_dim;
+        if (attention.kv_batch) |kv_batch| {
+            if (attention.attn_or_mask != null or attn_bias != null) return error.AttentionOrMaskBatchUnsupported;
+            if (kv_batch.len != batch) return error.InvalidPagedKvBatch;
+            const max_q_rows = attention.query_sequence_len;
+            if (bufElemCount(q_buf) != batch * max_q_rows * h_q) return error.InvalidAttentionShape;
+            if (bufElemCount(k_buf) != batch * max_q_rows * h_kv) return error.InvalidAttentionShape;
+            if (bufElemCount(v_buf) != batch * max_q_rows * h_kv) return error.InvalidAttentionShape;
+
+            const is_mixed = kv_batch[0].per_item_query_len != null;
+            const q_span = max_q_rows * h_q;
+            const output = try self.allocator.alloc(f32, batch * q_span);
+            errdefer self.allocator.free(output);
+            @memset(output, 0.0);
+
+            for (0..batch) |b| {
+                const view = kv_batch[b];
+                const item_q_len = if (is_mixed) (view.per_item_query_len orelse max_q_rows) else max_q_rows;
+                const q_slice = try sliceRows2DOp(ctx, Q, b * max_q_rows, item_q_len, h_q);
+                defer freeOp(ctx, q_slice);
+                const k_slice = try sliceRows2DOp(ctx, K, b * max_q_rows, item_q_len, h_kv);
+                defer freeOp(ctx, k_slice);
+                const v_slice = try sliceRows2DOp(ctx, V, b * max_q_rows, item_q_len, h_kv);
+                defer freeOp(ctx, v_slice);
+
+                const item_attention: ops.AttentionContext = if (is_mixed) .{
+                    .mode = view.per_item_mode orelse attention.mode,
+                    .total_sequence_len = view.per_item_total_len orelse attention.total_sequence_len,
+                    .query_sequence_len = item_q_len,
+                    .kv_sequence_len = view.per_item_kv_len orelse attention.kv_sequence_len,
+                    .kv_position_offset = view.per_item_kv_position_offset orelse attention.kv_position_offset,
+                    .decoder_runtime_resident_kv_sequence_len = attention.decoder_runtime_resident_kv_sequence_len,
+                    .decoder_runtime_resident_kv_position_offset = attention.decoder_runtime_resident_kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                    .kv_cache = view.kv_cache,
+                    .kv_manager = view.kv_manager,
+                    .kv_storage = view.kv_storage,
+                    .kv_batch = null,
+                    .layer_index = attention.layer_index,
+                    .attention_sink = attention.attention_sink,
+                    .skip_kv_write = attention.skip_kv_write,
+                } else blk: {
+                    var item = attention;
+                    item.kv_batch = null;
+                    item.kv_cache = view.kv_cache;
+                    item.kv_manager = view.kv_manager;
+                    item.kv_storage = view.kv_storage;
+                    break :blk item;
+                };
+
+                const item_ct = try gqaPagedAttentionOp(ctx, q_slice, k_slice, v_slice, null, item_attention, 1, num_heads, num_kv_heads, head_dim);
+                defer freeOp(ctx, item_ct);
+                const item_output = try hostSliceForBuf(toBuf(item_ct));
+                const item_q_span = item_q_len * h_q;
+                if (item_output.len != item_q_span) return error.InvalidAttentionShape;
+                @memcpy(output[b * q_span ..][0..item_q_span], item_output);
+            }
+
+            const out_shape = [_]i32{ @intCast(batch * max_q_rows), @intCast(h_q) };
+            return denseBuf(self.allocator, output, true, &out_shape);
+        }
+        if (batch != 1) return error.UnsupportedTensorType;
+        if (bufElemCount(q_buf) != attention.query_sequence_len * h_q) return error.InvalidAttentionShape;
+        if (bufElemCount(k_buf) != attention.query_sequence_len * h_kv) return error.InvalidAttentionShape;
+        if (bufElemCount(v_buf) != attention.query_sequence_len * h_kv) return error.InvalidAttentionShape;
+
+        const bias_buf = if (attn_bias) |tensor| toBuf(tensor) else null;
+        const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and !has_attention_sink) {
+            if (attn_bias != null or disableRuntimeAttentionF32()) return error.UnsupportedTensorType;
+            var q_mt = try self.ownedMetalTensorFromCt(Q);
+            defer q_mt.deinit();
+            if (attention.kv_cache == null or (attention.kv_manager == null and attention.kv_storage == null)) {
+                var k_mt = try self.ownedMetalTensorFromCt(K);
+                defer k_mt.deinit();
+                var v_mt = try self.ownedMetalTensorFromCt(V);
+                defer v_mt.deinit();
+                if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                    .q = q_mt,
+                    .k = k_mt,
+                    .v = v_mt,
+                    .bias = @as(?MetalTensor, null),
+                    .attn_or_mask = attention.attn_or_mask,
+                    .q_len = attention.query_sequence_len,
+                    .kv_len = attention.kv_sequence_len,
+                    .num_heads = num_heads,
+                    .num_kv_heads = num_kv_heads,
+                    .head_dim = head_dim,
+                    .query_position_offset = query_position_offset,
+                    .kv_position_offset = attention.kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                    .total_sequence_len = attention.total_sequence_len,
+                })) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                return error.UnsupportedTensorType;
+            }
+
+            const device_written = try tryEnsurePagedKvSuffixDevice(
+                attention,
+                k_buf,
+                v_buf,
+                @intCast(num_kv_heads),
+                @intCast(head_dim),
+            );
+            if (device_written and attention.attn_or_mask == null) {
+                if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
+                    if (pagedSlotAttentionSupported(paged_layer)) {
+                        const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
+                        defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
+                        if (block_offsets_opt) |block_offsets| {
+                            if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlot(self.provider_impl, .{
+                                .q = q_mt,
+                                .slot = paged_layer.slot,
+                                .format = paged_layer.format,
+                                .block_token_offsets = block_offsets,
+                                .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
+                                .kv_tokens = attention.kv_sequence_len,
+                                .num_heads = num_heads,
+                                .num_kv_heads = num_kv_heads,
+                                .head_dim = head_dim,
+                                .key_row_bytes = paged_layer.key_row_bytes,
+                                .base_key_row_bytes = paged_layer.base_key_row_bytes,
+                                .query_position = attention.total_sequence_len - 1,
+                                .query_position_offset = query_position_offset,
+                                .kv_position_offset = attention.kv_position_offset,
+                                .sliding_window = attention.sliding_window,
+                            })) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+            var k_mt = try self.ownedMetalTensorFromCt(K);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedMetalTensorFromCt(V);
+            defer v_mt.deinit();
+            var gathered_full: ?GatheredFullKv = null;
+            defer if (gathered_full) |*full| full.deinit();
+            const source = try attentionKvSource(attention);
+            const gathered_k: MetalTensor, const gathered_v: MetalTensor = if (attention.skip_kv_write) blk: {
+                gathered_full = (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) orelse
+                    (try self.gatherFullKvFromBackendCache(attention, num_kv_heads, head_dim, false)) orelse
+                    return error.KvBytesUnavailable;
+                break :blk .{ gathered_full.?.k, gathered_full.?.v };
+            } else blk: {
+                if (device_written) {
+                    if (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) |gathered| {
+                        gathered_full = gathered;
+                        break :blk .{ gathered_full.?.k, gathered_full.?.v };
+                    }
+                }
+                const kv = attention.kv_cache.?;
+                const entry = (try metal_runtime.updateGatheredSpan(
+                    self.provider_impl,
+                    .{
+                        .source_ptr_id = source.ptr_id,
+                        .sequence_id = kv.sequence_id,
+                        .layer_index = attention.layer_index,
+                    },
+                    k_mt,
+                    v_mt,
+                    &.{},
+                    &.{},
+                    &.{},
+                    null,
+                    null,
+                    attention.query_sequence_len,
+                    attention.kv_sequence_len,
+                    attention.kv_position_offset,
+                    &self.timing_stats,
+                )) orelse return error.KvBytesUnavailable;
+                break :blk .{ entry.k, entry.v };
+            };
+            if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                .q = q_mt,
+                .k = gathered_k,
+                .v = gathered_v,
+                .bias = @as(?MetalTensor, null),
+                .attn_or_mask = attention.attn_or_mask,
+                .q_len = attention.query_sequence_len,
+                .kv_len = attention.kv_sequence_len,
+                .num_heads = num_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .query_position_offset = query_position_offset,
+                .kv_position_offset = attention.kv_position_offset,
+                .sliding_window = attention.sliding_window,
+                .total_sequence_len = attention.total_sequence_len,
+            })) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+            return error.UnsupportedTensorType;
+        }
+
+        if (!disableRuntimeAttentionF32() and attn_bias == null and !has_attention_sink) device_attention: {
+            var q_mt = try self.ownedMetalTensorFromCt(Q);
+            defer q_mt.deinit();
+            const prefer_device_kv_suffix = attention.kv_storage != null;
+            var k_mt = if (prefer_device_kv_suffix) try self.ownedDeviceMetalTensorFromCt(K) else try self.ownedMetalTensorFromCt(K);
+            defer k_mt.deinit();
+            var v_mt = if (prefer_device_kv_suffix) try self.ownedDeviceMetalTensorFromCt(V) else try self.ownedMetalTensorFromCt(V);
+            defer v_mt.deinit();
+
+            var gathered_full: ?GatheredFullKv = null;
+            defer if (gathered_full) |*full| full.deinit();
+            const attention_k: MetalTensor, const attention_v: MetalTensor = if (attention.skip_kv_write and
+                attention.kv_cache != null and
+                (attention.kv_manager != null or attention.kv_storage != null))
+            blk: {
+                gathered_full = (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) orelse
+                    (try self.gatherFullKvFromBackendCache(attention, num_kv_heads, head_dim, false)) orelse
+                    break :device_attention;
+                break :blk .{ gathered_full.?.k, gathered_full.?.v };
+            } else if (!attention.skip_kv_write and
+                attention.kv_cache != null and
+                (attention.kv_manager != null or attention.kv_storage != null))
+            blk: {
+                const device_written = try tryEnsurePagedKvSuffixDeviceFromTensors(
+                    attention,
+                    &k_mt,
+                    &v_mt,
+                    @intCast(num_kv_heads),
+                    @intCast(head_dim),
+                );
+                if (dumpDecodeKvLayerTarget()) |target_layer| {
+                    if (target_layer == attention.layer_index) {
+                        var k_debug = try self.ownedMetalTensorFromCt(K);
+                        defer k_debug.deinit();
+                        var v_debug = try self.ownedMetalTensorFromCt(V);
+                        defer v_debug.deinit();
+                        try self.maybeDumpDecodeKvTensor("prefill-source-k", attention.layer_index, &k_debug, attention.query_sequence_len, h_kv);
+                        try self.maybeDumpDecodeKvTensor("prefill-source-v", attention.layer_index, &v_debug, attention.query_sequence_len, h_kv);
+                        if (device_written) {
+                            if (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) |gathered| {
+                                var gathered_mut = gathered;
+                                defer gathered_mut.deinit();
+                                try self.maybeDumpDecodeKvTensor("prefill-device-k", attention.layer_index, &gathered_mut.k, attention.kv_sequence_len, h_kv);
+                                try self.maybeDumpDecodeKvTensor("prefill-device-v", attention.layer_index, &gathered_mut.v, attention.kv_sequence_len, h_kv);
+                            }
+                        }
+                    }
+                }
+                const shadow_device_prefill_for_rebuild = device_written and
+                    attention.mode == .paged_prefill and
+                    attention.kv_sequence_len == attention.query_sequence_len and
+                    attention.kv_cache != null and
+                    attention.kv_storage != null;
+                if (!device_written or attention.kv_manager != null or shadow_device_prefill_for_rebuild) {
+                    const k_host_for_cache = try hostSliceForBuf(k_buf);
+                    const v_host_for_cache = try hostSliceForBuf(v_buf);
+                    if (!device_written or attention.kv_manager != null) {
+                        try ensurePagedKvSuffixWritten(attention, k_host_for_cache, v_host_for_cache);
+                    }
+                    const source = try attentionKvSource(attention);
+                    const kv = attention.kv_cache.?;
+                    _ = try self.updateBackendKvLayerCache(
+                        .{
+                            .source_ptr_id = source.ptr_id,
+                            .sequence_id = kv.sequence_id,
+                            .layer_index = attention.layer_index,
+                        },
+                        k_host_for_cache,
+                        v_host_for_cache,
+                        attention.query_sequence_len,
+                        attention.kv_sequence_len,
+                        attention.kv_position_offset,
+                        h_kv,
+                        attentionBlockSignature(attention),
+                    );
+                }
+                if (device_written and attention.attn_or_mask == null) {
+                    if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
+                        if (traceQuantBlockRequested()) std.debug.print(
+                            "metal-gqa-paged-slot layer={d} format={d} supported={} tokens={d}\n",
+                            .{ attention.layer_index, paged_layer.format, pagedSlotAttentionSupported(paged_layer), attention.kv_sequence_len },
+                        );
+                        if (pagedSlotAttentionSupported(paged_layer)) {
+                            const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
+                            defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
+                            if (block_offsets_opt) |block_offsets| {
+                                if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlot(self.provider_impl, .{
+                                    .q = q_mt,
+                                    .slot = paged_layer.slot,
+                                    .format = paged_layer.format,
+                                    .block_token_offsets = block_offsets,
+                                    .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
+                                    .kv_tokens = attention.kv_sequence_len,
+                                    .num_heads = num_heads,
+                                    .num_kv_heads = num_kv_heads,
+                                    .head_dim = head_dim,
+                                    .key_row_bytes = paged_layer.key_row_bytes,
+                                    .base_key_row_bytes = paged_layer.base_key_row_bytes,
+                                    .query_position = attention.total_sequence_len - 1,
+                                    .query_position_offset = query_position_offset,
+                                    .kv_position_offset = attention.kv_position_offset,
+                                    .sliding_window = attention.sliding_window,
+                                })) |tensor| {
+                                    return self.ctFromOwnedMetalTensor(tensor);
+                                }
+                            }
+                        }
+                    }
+                }
+                const source = try attentionKvSource(attention);
+                const kv = attention.kv_cache.?;
+                if (device_written) {
+                    if (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) |gathered| {
+                        if (traceQuantBlockRequested()) std.debug.print(
+                            "metal-gqa-device-full layer={d} tokens={d}\n",
+                            .{ attention.layer_index, attention.kv_sequence_len },
+                        );
+                        gathered_full = gathered;
+                        break :blk .{ gathered_full.?.k, gathered_full.?.v };
+                    }
+                }
+                const entry = (try metal_runtime.updateGatheredSpan(
+                    self.provider_impl,
+                    .{
+                        .source_ptr_id = source.ptr_id,
+                        .sequence_id = kv.sequence_id,
+                        .layer_index = attention.layer_index,
+                    },
+                    k_mt,
+                    v_mt,
+                    &.{},
+                    &.{},
+                    &.{},
+                    null,
+                    null,
+                    attention.query_sequence_len,
+                    attention.kv_sequence_len,
+                    attention.kv_position_offset,
+                    &self.timing_stats,
+                )) orelse break :device_attention;
+                break :blk .{ entry.k, entry.v };
+            } else .{ k_mt, v_mt };
+
+            if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                .q = q_mt,
+                .k = attention_k,
+                .v = attention_v,
+                .bias = @as(?MetalTensor, null),
+                .attn_or_mask = attention.attn_or_mask,
+                .q_len = attention.query_sequence_len,
+                .kv_len = attention.kv_sequence_len,
+                .num_heads = num_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .query_position_offset = query_position_offset,
+                .kv_position_offset = attention.kv_position_offset,
+                .sliding_window = attention.sliding_window,
+                .total_sequence_len = attention.total_sequence_len,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+
+        // KV-storage host shadows, backend-cache host rebuilds, paged-quant
+        // attention, and the CPU `flashCausalAttentionHost` fallback require
+        // host-pointer data. Keep this behind the device runtime attempt so
+        // normal Metal prefill does not download Q/K/V on the hot path.
+        const q_host = try hostSliceForBuf(q_buf);
+        const k_host = try hostSliceForBuf(k_buf);
+        const v_host = try hostSliceForBuf(v_buf);
+        const bias_data = if (bias_buf) |buf| try hostSliceForBuf(buf) else null;
+
+        if (!attention.skip_kv_write and attention.kv_sequence_len == attention.query_sequence_len and attention.kv_position_offset == 0) {
+            if (attention.kv_cache) |kv| {
+                if (attention.kv_manager != null or attention.kv_storage != null) {
+                    if (attention.kv_storage) |storage| {
+                        try storage.writeLayerKvSuffix(
+                            kv.sequence_id,
+                            attention.layer_index,
+                            attention.kv_sequence_len,
+                            attention.query_sequence_len,
+                            k_host,
+                            v_host,
+                        );
+                    } else {
+                        const manager = attention.kv_manager.?;
+                        try manager.writeLayerKvSuffix(
+                            kv.sequence_id,
+                            attention.layer_index,
+                            attention.kv_sequence_len,
+                            attention.query_sequence_len,
+                            k_host,
+                            v_host,
+                        );
+                    }
+                    const source = try attentionKvSource(attention);
+                    _ = try self.updateBackendKvLayerCache(
+                        .{
+                            .source_ptr_id = source.ptr_id,
+                            .sequence_id = kv.sequence_id,
+                            .layer_index = attention.layer_index,
+                        },
+                        k_host,
+                        v_host,
+                        attention.query_sequence_len,
+                        attention.kv_sequence_len,
+                        attention.kv_position_offset,
+                        h_kv,
+                        attentionBlockSignature(attention),
+                    );
+                }
+            }
+            var q_mt = try self.ownedMetalTensorFromCt(Q);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedMetalTensorFromCt(K);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedMetalTensorFromCt(V);
+            defer v_mt.deinit();
+            var bias_mt: ?MetalTensor = null;
+            defer if (bias_mt) |*tensor| tensor.deinit();
+            if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
+            if (!disableRuntimeAttentionF32()) {
+                if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                    .q = q_mt,
+                    .k = k_mt,
+                    .v = v_mt,
+                    .bias = bias_mt,
+                    .attn_or_mask = attention.attn_or_mask,
+                    .q_len = attention.query_sequence_len,
+                    .kv_len = attention.kv_sequence_len,
+                    .num_heads = num_heads,
+                    .num_kv_heads = num_kv_heads,
+                    .head_dim = head_dim,
+                    .query_position_offset = query_position_offset,
+                    .kv_position_offset = attention.kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                    .total_sequence_len = attention.total_sequence_len,
+                })) |tensor| {
+                    return self.ctFromOwnedMetalTensor(tensor);
+                }
+            }
+            const output = try self.gqaAttentionHostFallback(
+                q_host,
+                k_host,
+                v_host,
+                bias_data,
+                attention,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            errdefer self.allocator.free(output);
+            const out_shape = [_]i32{ @intCast(batch * attention.query_sequence_len), @intCast(h_q) };
+            return denseBuf(self.allocator, output, true, &out_shape);
+        }
+
+        if (attention.kv_cache == null or (attention.kv_manager == null and attention.kv_storage == null)) {
+            var q_mt = try self.ownedMetalTensorFromCt(Q);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedMetalTensorFromCt(K);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedMetalTensorFromCt(V);
+            defer v_mt.deinit();
+            var bias_mt: ?MetalTensor = null;
+            defer if (bias_mt) |*tensor| tensor.deinit();
+            if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
+            if (!disableRuntimeAttentionF32()) {
+                if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                    .q = q_mt,
+                    .k = k_mt,
+                    .v = v_mt,
+                    .bias = bias_mt,
+                    .attn_or_mask = attention.attn_or_mask,
+                    .q_len = attention.query_sequence_len,
+                    .kv_len = attention.kv_sequence_len,
+                    .num_heads = num_heads,
+                    .num_kv_heads = num_kv_heads,
+                    .head_dim = head_dim,
+                    .query_position_offset = query_position_offset,
+                    .kv_position_offset = attention.kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                    .total_sequence_len = attention.total_sequence_len,
+                })) |tensor| {
+                    return self.ctFromOwnedMetalTensor(tensor);
+                }
+            }
+            const output = try self.gqaAttentionHostFallback(
+                q_host,
+                k_host,
+                v_host,
+                bias_data,
+                attention,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            errdefer self.allocator.free(output);
+            const out_shape = [_]i32{ @intCast(batch * attention.query_sequence_len), @intCast(h_q) };
+            return denseBuf(self.allocator, output, true, &out_shape);
+        }
+
+        const kv = attention.kv_cache.?;
+        const block_ids = if (attention.kv_storage) |storage|
+            if (kv.logical_blocks) |blocks|
+                blocks
+            else blk: {
+                const table = storage.blockTable(kv.sequence_id) orelse return error.InvalidSequenceId;
+                break :blk table.blocks.items;
+            }
+        else blk: {
+            const manager = attention.kv_manager.?;
+            if (kv.logical_blocks) |blocks|
+                break :blk blocks;
+            const table = manager.blockTable(kv.sequence_id) orelse return error.InvalidSequenceId;
+            break :blk table.blocks.items;
+        };
+        var pool_storage: runtime_root.kv.storage.KvStorage = if (attention.kv_storage) |storage|
+            (storage.getPoolMut(kv.pool_id) orelse return error.InvalidPoolId).*
+        else blk: {
+            const manager = attention.kv_manager.?;
+            break :blk (manager.getPoolMut(kv.pool_id) orelse return error.InvalidPoolId).*;
+        };
+        const pool = &pool_storage;
+        var fallback_device_written = false;
+        if (!attention.skip_kv_write and attention.kv_storage != null) {
+            var k_device_mt = try self.ownedDeviceMetalTensorFromCt(K);
+            defer k_device_mt.deinit();
+            var v_device_mt = try self.ownedDeviceMetalTensorFromCt(V);
+            defer v_device_mt.deinit();
+            fallback_device_written = try tryEnsurePagedKvSuffixDeviceFromTensors(
+                attention,
+                &k_device_mt,
+                &v_device_mt,
+                @intCast(num_kv_heads),
+                @intCast(head_dim),
+            );
+        }
+        if (!attention.skip_kv_write and !fallback_device_written) {
+            if (attention.kv_storage) |storage| {
+                try storage.writeLayerKvSuffix(
+                    kv.sequence_id,
+                    attention.layer_index,
+                    attention.kv_sequence_len,
+                    attention.query_sequence_len,
+                    k_host,
+                    v_host,
+                );
+            } else {
+                const manager = attention.kv_manager.?;
+                try manager.writeLayerKvSuffix(
+                    kv.sequence_id,
+                    attention.layer_index,
+                    attention.kv_sequence_len,
+                    attention.query_sequence_len,
+                    k_host,
+                    v_host,
+                );
+            }
+        }
+        const source = try attentionKvSource(attention);
+        if (!attention.skip_kv_write and !fallback_device_written) {
+            _ = try self.updateBackendKvLayerCache(
+                .{
+                    .source_ptr_id = source.ptr_id,
+                    .sequence_id = kv.sequence_id,
+                    .layer_index = attention.layer_index,
+                },
+                k_host,
+                v_host,
+                attention.query_sequence_len,
+                attention.kv_sequence_len,
+                attention.kv_position_offset,
+                h_kv,
+                attentionBlockSignature(attention),
+            );
+        }
+        const compressed_kv = pool.config.dtype == .polar4 or pool.config.dtype == .turbo3;
+        const compressed_host_direct_exact = compressed_kv and
+            pool.config.store_cpu_bytes and
+            pool.config.num_kv_heads == num_kv_heads and
+            pool.config.head_dim == head_dim;
+        if (compressed_host_direct_exact) {
+            return try gqaPagedAttentionDirectTurboQuant(self, pool, block_ids, attention.layer_index, q_host, bias_data, attention, num_heads, num_kv_heads, head_dim);
+        }
+        if (!pool.config.store_cpu_bytes or compressed_kv) {
+            var gathered_full = if (attention.kv_storage != null)
+                (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) orelse
+                    (try self.gatherFullKvFromBackendCache(attention, num_kv_heads, head_dim, true)) orelse
+                    return error.KvBytesUnavailable
+            else
+                (try self.gatherFullKvFromBackendCache(attention, num_kv_heads, head_dim, true)) orelse
+                    return error.KvBytesUnavailable;
+            defer gathered_full.deinit();
+            try self.maybeDumpDecodeKvTensor("k", attention.layer_index, &gathered_full.k, attention.kv_sequence_len, h_kv);
+            try self.maybeDumpDecodeKvTensor("v", attention.layer_index, &gathered_full.v, attention.kv_sequence_len, h_kv);
+
+            var q_mt = try self.ownedMetalTensorFromCt(Q);
+            defer q_mt.deinit();
+            var bias_mt: ?MetalTensor = null;
+            defer if (bias_mt) |*tensor| tensor.deinit();
+            if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
+            if (!disableRuntimeAttentionF32() and !has_attention_sink) {
+                if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                    .q = q_mt,
+                    .k = gathered_full.k,
+                    .v = gathered_full.v,
+                    .bias = bias_mt,
+                    .attn_or_mask = attention.attn_or_mask,
+                    .q_len = attention.query_sequence_len,
+                    .kv_len = attention.kv_sequence_len,
+                    .num_heads = num_heads,
+                    .num_kv_heads = num_kv_heads,
+                    .head_dim = head_dim,
+                    .query_position_offset = query_position_offset,
+                    .kv_position_offset = attention.kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                    .total_sequence_len = attention.total_sequence_len,
+                })) |tensor| {
+                    return self.ctFromOwnedMetalTensor(tensor);
+                }
+            }
+
+            const full_k_host = try gathered_full.k.toHostSlice();
+            const full_v_host = try gathered_full.v.toHostSlice();
+            const output = try self.gqaAttentionHostFallback(
+                q_host,
+                full_k_host,
+                full_v_host,
+                bias_data,
+                attention,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            errdefer self.allocator.free(output);
+            const out_shape = [_]i32{ @intCast(batch * attention.query_sequence_len), @intCast(h_q) };
+            return denseBuf(self.allocator, output, true, &out_shape);
+        }
+        const q_seq_len = attention.query_sequence_len;
+        const kv_seq_len = attention.kv_sequence_len;
+        const H_q = num_heads * head_dim;
+        const heads_per_group = num_heads / num_kv_heads;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const sink_scores = try attentionSinkScoresHost(attention.attention_sink, num_heads);
+        const output = try self.allocator.alloc(f32, q_seq_len * H_q);
+        errdefer self.allocator.free(output);
+        @memset(output, 0.0);
+
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            for (0..q_seq_len) |qi| {
+                const q_ptr = q_host[qi * H_q + h * head_dim ..].ptr;
+                const out_ptr = output[qi * H_q + h * head_dim ..].ptr;
+                var running_max = if (sink_scores) |scores| scores[h] else -std.math.inf(f32);
+                var running_sum: f32 = if (sink_scores != null) 1.0 else 0.0;
+
+                for (0..kv_seq_len) |token_idx| {
+                    const block_idx = token_idx / pool.config.page_size_tokens;
+                    const token_offset = token_idx % pool.config.page_size_tokens;
+                    if (block_idx >= block_ids.len) return error.InvalidPagedKvState;
+                    const block_id = block_ids[block_idx];
+                    const row = try pool.readToken(block_id, attention.layer_index, token_offset);
+                    const k_ptr = row.k[kv_h * head_dim ..].ptr;
+                    const v_ptr = row.v[kv_h * head_dim ..].ptr;
+
+                    const query_pos = query_position_offset + qi;
+                    const key_pos = attention.kv_position_offset + token_idx;
+                    if ((key_pos > query_pos and
+                        !allowsFutureAttention(attention.attn_or_mask, attention.total_sequence_len, query_pos, key_pos)) or
+                        !allowsPastAttention(attention.sliding_window, query_pos, key_pos))
+                    {
+                        continue;
+                    }
+
+                    var score = linalg.dot(q_ptr[0..head_dim], k_ptr[0..head_dim]) * scale;
+                    if (bias_data) |bias_values| {
+                        score += bias_values[h * q_seq_len * kv_seq_len + qi * kv_seq_len + key_pos];
+                    }
+
+                    const new_max = @max(running_max, score);
+                    const prev_scale: f32 = if (running_sum == 0.0) 0.0 else @exp(running_max - new_max);
+                    const score_scale = @exp(score - new_max);
+                    if (prev_scale != 1.0) {
+                        for (0..head_dim) |d| out_ptr[d] *= prev_scale;
+                    }
+                    linalg.axpy(score_scale, v_ptr[0..head_dim], out_ptr[0..head_dim]);
+                    running_sum = running_sum * prev_scale + score_scale;
+                    running_max = new_max;
+                }
+
+                if (running_sum != 0.0) {
+                    const inv_sum = 1.0 / running_sum;
+                    for (0..head_dim) |d| out_ptr[d] *= inv_sum;
+                }
+            }
+        }
+
+        const out_shape = [_]i32{ @intCast(batch * attention.query_sequence_len), @intCast(h_q) };
+        return denseBuf(self.allocator, output, true, &out_shape);
+    }
+
+    fn gqaPagedAttentionDirectTurboQuant(
+        self: *MetalCompute,
+        pool: *runtime_root.kv.storage.KvStorage,
+        block_ids: []const runtime_root.kv.block.KvBlockId,
+        layer_index: usize,
+        Q: []const f32,
+        bias: ?[]const f32,
+        attention: ops.AttentionContext,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) !CT {
+        if (pool.config.num_kv_heads != num_kv_heads or pool.config.head_dim != head_dim) return error.InvalidPagedKvState;
+
+        const q_seq_len = attention.query_sequence_len;
+        const kv_seq_len = attention.kv_sequence_len;
+        const query_position_offset = attention.total_sequence_len - q_seq_len;
+        const kv_position_offset = attention.kv_position_offset;
+        const H_q = num_heads * head_dim;
+        const heads_per_group = num_heads / num_kv_heads;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const sink_scores = try attentionSinkScoresHost(attention.attention_sink, num_heads);
+        const output = try self.allocator.alloc(f32, q_seq_len * H_q);
+        errdefer self.allocator.free(output);
+        @memset(output, 0.0);
+
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            for (0..q_seq_len) |qi| {
+                const q_slice = Q[qi * H_q + h * head_dim ..][0..head_dim];
+                var turbo3_projected_query: [runtime_root.kv.turboquant.turbo3_residual_bits_per_head]f32 = undefined;
+                if (pool.config.dtype == .turbo3) {
+                    try runtime_root.kv.turboquant.projectTurbo3ResidualQuery(q_slice, &turbo3_projected_query, @intCast(head_dim), kv_h);
+                }
+                const out_ptr = output[qi * H_q + h * head_dim ..].ptr;
+                var running_max = if (sink_scores) |scores| scores[h] else -std.math.inf(f32);
+                var running_sum: f32 = if (sink_scores != null) 1.0 else 0.0;
+
+                for (0..kv_seq_len) |token_idx| {
+                    const block_idx = token_idx / pool.config.page_size_tokens;
+                    const token_offset = token_idx % pool.config.page_size_tokens;
+                    if (block_idx >= block_ids.len) return error.InvalidPagedKvState;
+                    const block_id = block_ids[block_idx];
+
+                    const query_pos = query_position_offset + qi;
+                    const key_pos = kv_position_offset + token_idx;
+                    if ((key_pos > query_pos and
+                        !allowsFutureAttention(attention.attn_or_mask, attention.total_sequence_len, query_pos, key_pos)) or
+                        !allowsPastAttention(attention.sliding_window, query_pos, key_pos))
+                    {
+                        continue;
+                    }
+
+                    const encoded = try pool.readEncodedToken(block_id, layer_index, token_offset);
+                    const v_row = try pool.readValueToken(block_id, layer_index, token_offset);
+                    const v_ptr = v_row[kv_h * head_dim ..].ptr;
+
+                    var score = switch (pool.config.dtype) {
+                        .polar4 => try runtime_root.kv.turboquant.dotPolar4KeyFast(q_slice, encoded.k_bytes, @intCast(num_kv_heads), @intCast(head_dim), kv_h),
+                        .turbo3 => blk: {
+                            const base_bytes = runtime_root.kv.turboquant.turbo3KeyBytes(@intCast(num_kv_heads), @intCast(head_dim));
+                            const residual_bytes = runtime_root.kv.turboquant.turbo3ResidualBytes(@intCast(num_kv_heads), @intCast(head_dim));
+                            const base_score = try runtime_root.kv.turboquant.dotTurbo3KeyFast(q_slice, encoded.k_bytes[0..base_bytes], @intCast(num_kv_heads), @intCast(head_dim), kv_h);
+                            const residual_score = try runtime_root.kv.turboquant.dotTurbo3ProjectedResidualSketch(&turbo3_projected_query, encoded.k_bytes[base_bytes..][0..residual_bytes], @intCast(num_kv_heads), @intCast(head_dim), kv_h);
+                            break :blk base_score + runtime_root.kv.turboquant.turbo3_residual_default_scale * residual_score;
+                        },
+                        else => unreachable,
+                    };
+                    score *= scale;
+                    if (bias) |bias_data| {
+                        score += bias_data[h * q_seq_len * kv_seq_len + qi * kv_seq_len + key_pos];
+                    }
+
+                    const new_max = @max(running_max, score);
+                    const prev_scale: f32 = if (running_sum == 0.0) 0.0 else @exp(running_max - new_max);
+                    const score_scale = @exp(score - new_max);
+                    if (prev_scale != 1.0) {
+                        for (0..head_dim) |d| out_ptr[d] *= prev_scale;
+                    }
+                    linalg.axpy(score_scale, v_ptr[0..head_dim], out_ptr[0..head_dim]);
+                    running_sum = running_sum * prev_scale + score_scale;
+                    running_max = new_max;
+                }
+
+                if (running_sum != 0.0) {
+                    const inv_sum = 1.0 / running_sum;
+                    for (0..head_dim) |d| out_ptr[d] *= inv_sum;
+                }
+            }
+        }
+
+        const out_shape = [_]i32{ @intCast(q_seq_len), @intCast(H_q) };
+        return denseBuf(self.allocator, output, true, &out_shape);
+    }
+
+    fn runAttentionResidualOp(ctx: *anyopaque, request: *const ops.RunAttentionResidualRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var attention = request.attention;
+        if (request.attention_sink.hasMetadata()) attention.attention_sink = request.attention_sink;
+        if (attention.attention_sink.hasMetadata()) return null;
+        const trace_attn_null = traceAttentionResidualNullRequested() and
+            (traceAttentionResidualNullLayerTarget() == null or traceAttentionResidualNullLayerTarget().? == attention.layer_index);
+        if (attention.mode != .paged_decode) {
+            if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=mode mode={s}\n", .{ attention.layer_index, @tagName(attention.mode) });
+            return null;
+        }
+        if (attention.query_sequence_len != 1 or attention.attn_or_mask != null) {
+            if (trace_attn_null) std.debug.print(
+                "metal-attn-residual-null layer={d} reason=query-shape q_len={d} mask={any}\n",
+                .{ attention.layer_index, attention.query_sequence_len, attention.attn_or_mask != null },
+            );
+            return null;
+        }
+        _ = attention.kv_cache orelse {
+            if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=no-kv-cache\n", .{attention.layer_index});
+            return null;
+        };
+        if (attention.kv_manager == null and attention.kv_storage == null) {
+            if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=no-kv-source\n", .{attention.layer_index});
+            return null;
+        }
+
+        const source = try attentionKvSource(attention);
+        const format = directAttentionSpanFormat(&source.kv_storage, request.num_kv_heads, request.head_dim);
+
+        if (attention.decoder_runtime_resident_kv_sequence_len != null and
+            attention.decoder_runtime_resident_kv_position_offset != null)
+        {
+            const prior_kv_tokens = attention.decoder_runtime_resident_kv_sequence_len.?;
+            const prior_kv_position_offset = attention.decoder_runtime_resident_kv_position_offset.?;
+            const prior_end = prior_kv_position_offset + prior_kv_tokens;
+            const current_end = attention.kv_position_offset + attention.kv_sequence_len;
+            if (attention.kv_position_offset < prior_kv_position_offset or current_end < prior_end) {
+                metal_runtime.decoderRuntimeResetState(self.provider_impl);
+            }
+        }
+
+        const q_buf = toBuf(request.q);
+        const k_buf = toBuf(request.k);
+        const v_buf = toBuf(request.v);
+        const residual_buf = toBuf(request.residual);
+        if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null or residual_buf.quantized_storage != null) {
+            if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=quantized-input\n", .{attention.layer_index});
+            return error.UnsupportedTensorType;
+        }
+
+        const device_written = try tryEnsurePagedKvSuffixDevice(
+            attention,
+            k_buf,
+            v_buf,
+            @intCast(request.num_kv_heads),
+            @intCast(request.head_dim),
+        );
+        const backend_cache_needs_rebuild = source.kv_storage.config.store_cpu_bytes or
+            !metal_runtime.hasGatheredSpanCache(self.provider_impl, source.ptr_id, attention.kv_cache.?.sequence_id, attention.layer_index);
+        const frame_active = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+        const frame_has_device_suffix = blk: {
+            if (attention.skip_kv_write) break :blk true;
+            const k_tensor = k_buf.metal_tensor orelse break :blk false;
+            const v_tensor = v_buf.metal_tensor orelse break :blk false;
+            break :blk k_tensor.isDevice() and v_tensor.isDevice();
+        };
+        const frame_can_use_runtime_span = frame_active and format == null and
+            !source.kv_storage.config.store_cpu_bytes and frame_has_device_suffix;
+        // Host path still needed when (a) the device write didn't fire (host
+        // storage, dtype outside the compressed fast path, or CPU-bytes-shadow
+        // requested by config) or (b) the backend gather cache needs host rows
+        // to rebuild. tryEnsurePagedKvSuffixDevice returns false on fallback
+        // cases; config.store_cpu_bytes=true means the host shadow is authoritative
+        // for this storage and must stay in sync.
+        if (!device_written or backend_cache_needs_rebuild or source.kv_storage.config.store_cpu_bytes) {
+            if (frame_active and !frame_can_use_runtime_span) {
+                if (trace_attn_null) std.debug.print(
+                    "metal-attn-residual-null layer={d} reason=frame-host-kv-update device_written={} rebuild={} cpu_shadow={}\n",
+                    .{ attention.layer_index, device_written, backend_cache_needs_rebuild, source.kv_storage.config.store_cpu_bytes },
+                );
+                return null;
+            }
+            if (!frame_active) {
+                const k_host = try hostSliceForBuf(k_buf);
+                const v_host = try hostSliceForBuf(v_buf);
+                if (!device_written) {
+                    try ensurePagedKvSuffixWritten(attention, k_host, v_host);
+                } else if (source.kv_storage.config.store_cpu_bytes) {
+                    // Device write succeeded but config demands a host shadow.
+                    try ensurePagedKvSuffixWritten(attention, k_host, v_host);
+                }
+                if (backend_cache_needs_rebuild and !attention.skip_kv_write) {
+                    _ = try self.updateBackendKvLayerCache(
+                        .{
+                            .source_ptr_id = source.ptr_id,
+                            .sequence_id = attention.kv_cache.?.sequence_id,
+                            .layer_index = attention.layer_index,
+                        },
+                        k_host,
+                        v_host,
+                        attention.query_sequence_len,
+                        attention.kv_sequence_len,
+                        attention.kv_position_offset,
+                        request.num_kv_heads * request.head_dim,
+                        attentionBlockSignature(attention),
+                    );
+                }
+            }
+        }
+        if (format == null and !attention.skip_kv_write) {
+            if (frame_active) {
+                if (!frame_can_use_runtime_span) {
+                    if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=frame-host-format-null-cache\n", .{attention.layer_index});
+                    return null;
+                }
+            } else {
+                const k_host = try hostSliceForBuf(k_buf);
+                const v_host = try hostSliceForBuf(v_buf);
+                _ = try self.updateBackendKvLayerCache(
+                    .{
+                        .source_ptr_id = source.ptr_id,
+                        .sequence_id = attention.kv_cache.?.sequence_id,
+                        .layer_index = attention.layer_index,
+                    },
+                    k_host,
+                    v_host,
+                    attention.query_sequence_len,
+                    attention.kv_sequence_len,
+                    attention.kv_position_offset,
+                    request.num_kv_heads * request.head_dim,
+                    attentionBlockSignature(attention),
+                );
+            }
+        }
+
+        if (format == null) {
+            var q_mt = try self.ownedMetalTensorFromCt(request.q);
+            defer q_mt.deinit();
+            var residual_mt = try self.ownedMetalTensorFromCt(request.residual);
+            defer residual_mt.deinit();
+
+            var gathered_full = gathered_blk: {
+                if (frame_active and !attention.skip_kv_write) {
+                    var k_mt = try self.ownedMetalTensorFromCt(request.k);
+                    defer k_mt.deinit();
+                    var v_mt = try self.ownedMetalTensorFromCt(request.v);
+                    defer v_mt.deinit();
+                    const kv = attention.kv_cache.?;
+                    const entry = (try metal_runtime.updateGatheredSpan(
+                        self.provider_impl,
+                        .{
+                            .source_ptr_id = source.ptr_id,
+                            .sequence_id = kv.sequence_id,
+                            .layer_index = attention.layer_index,
+                        },
+                        k_mt,
+                        v_mt,
+                        &.{},
+                        &.{},
+                        &.{},
+                        null,
+                        null,
+                        attention.query_sequence_len,
+                        attention.kv_sequence_len,
+                        attention.kv_position_offset,
+                        &self.timing_stats,
+                    )) orelse {
+                        if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=frame-gathered-span-update-null\n", .{attention.layer_index});
+                        return null;
+                    };
+                    break :gathered_blk GatheredFullKv{
+                        .k = try entry.k.retainedCopy(),
+                        .v = try entry.v.retainedCopy(),
+                    };
+                }
+                break :gathered_blk (try gatherFullKvFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse (try self.gatherFullKvFromBackendCache(attention, request.num_kv_heads, request.head_dim, !frame_active)) orelse blk: {
+                    if (frame_active) return null;
+                    break :blk gatherFullKv(self, source, attention, request.num_kv_heads, request.head_dim) catch {
+                        if (trace_attn_null) std.debug.print(
+                            "metal-attn-residual-null layer={d} reason=no-span-format-no-full-kv kv_dtype={s} num_kv_heads={d} head_dim={d}\n",
+                            .{ attention.layer_index, @tagName(source.kv_storage.config.dtype), request.num_kv_heads, request.head_dim },
+                        );
+                        return null;
+                    };
+                };
+            };
+            defer gathered_full.deinit();
+            try self.maybeDumpDecodeKvTensor("decode-k", attention.layer_index, &gathered_full.k, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
+            try self.maybeDumpDecodeKvTensor("decode-v", attention.layer_index, &gathered_full.v, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
+
+            const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
+            const attention_input_size = request.num_heads * request.head_dim;
+            const attention_output = attention_output_blk: {
+                if (!disableRuntimeAttentionF32()) {
+                    if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                        .q = q_mt,
+                        .k = gathered_full.k,
+                        .v = gathered_full.v,
+                        .bias = @as(?metal_runtime.MetalTensor, null),
+                        .attn_or_mask = attention.attn_or_mask,
+                        .q_len = attention.query_sequence_len,
+                        .kv_len = attention.kv_sequence_len,
+                        .num_heads = request.num_heads,
+                        .num_kv_heads = request.num_kv_heads,
+                        .head_dim = request.head_dim,
+                        .query_position_offset = query_position_offset,
+                        .kv_position_offset = attention.kv_position_offset,
+                        .sliding_window = attention.sliding_window,
+                        .total_sequence_len = attention.total_sequence_len,
+                    })) |tensor| break :attention_output_blk tensor;
+                }
+
+                const q_host = try q_mt.toHostSlice();
+                const k_host = try gathered_full.k.toHostSlice();
+                const v_host = try gathered_full.v.toHostSlice();
+                const host_output = try native_compute_mod.flashCausalAttentionHost(
+                    self.allocator,
+                    q_host,
+                    k_host,
+                    v_host,
+                    null,
+                    attention.attn_or_mask,
+                    attention.sliding_window,
+                    1,
+                    attention.query_sequence_len,
+                    attention.kv_sequence_len,
+                    query_position_offset,
+                    attention.kv_position_offset,
+                    request.num_heads,
+                    request.num_kv_heads,
+                    request.head_dim,
+                );
+                errdefer self.allocator.free(host_output);
+                const out_shape = [_]i32{ @intCast(attention.query_sequence_len), @intCast(attention_input_size) };
+                break :attention_output_blk MetalTensor.owned(host_output, &out_shape);
+            };
+            try self.maybeDumpDecodeStageTensor("attn-out", attention.layer_index, attention_output, attention_input_size);
+
+            var current = attention_output;
+            var current_live = true;
+            defer if (current_live) current.deinit();
+            if (request.pre_linear_rms_norm_slot) |slot| {
+                const normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                    .slot = slot,
+                    .input = current,
+                    .hidden_size = attention_input_size,
+                    .eps = request.eps,
+                }, &self.timing_stats)) orelse {
+                    if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=no-span-format-pre-norm-null\n", .{attention.layer_index});
+                    return null;
+                };
+                current.deinit();
+                current = normed;
+            }
+
+            const projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = request.linear_slot,
+                .input = current,
+                .in_dim = attention_input_size,
+                .out_dim = request.hidden_size,
+            })) orelse {
+                if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=no-span-format-linear-null\n", .{attention.layer_index});
+                return null;
+            };
+            current.deinit();
+            current = projected;
+            try self.maybeDumpDecodeStageTensor("attn-proj", attention.layer_index, current, request.hidden_size);
+
+            if (request.post_linear_rms_norm_slot) |slot| {
+                const normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                    .slot = slot,
+                    .input = current,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.eps,
+                }, &self.timing_stats)) orelse {
+                    if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=no-span-format-post-norm-null\n", .{attention.layer_index});
+                    return null;
+                };
+                current.deinit();
+                current = normed;
+                try self.maybeDumpDecodeStageTensor("attn-post", attention.layer_index, current, request.hidden_size);
+            }
+
+            const result_tensor = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                .lhs = current,
+                .rhs = residual_mt,
+                .dim = request.hidden_size,
+            }, &self.timing_stats)) orelse {
+                if (trace_attn_null) std.debug.print("metal-attn-residual-null layer={d} reason=no-span-format-add-null\n", .{attention.layer_index});
+                return null;
+            };
+            try self.maybeDumpDecodeStageTensor("attn-residual", attention.layer_index, result_tensor, request.hidden_size);
+            current.deinit();
+            current_live = false;
+            return self.ctFromOwnedMetalTensor(result_tensor);
+        }
+
+        var q_mt = try self.ownedMetalTensorFromCt(request.q);
+        defer q_mt.deinit();
+        var k_mt = try self.ownedMetalTensorFromCt(request.k);
+        defer k_mt.deinit();
+        var v_mt = try self.ownedMetalTensorFromCt(request.v);
+        defer v_mt.deinit();
+        var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
+        defer residual_mt.deinit();
+
+        var gathered_full: ?GatheredFullKv = null;
+        defer if (gathered_full) |*full| full.deinit();
+        const kv = attention.kv_cache.?;
+        if (attention.query_sequence_len < attention.kv_sequence_len and
+            !metal_runtime.hasGatheredSpanCache(self.provider_impl, source.ptr_id, kv.sequence_id, attention.layer_index))
+        {
+            gathered_full = (try self.gatherFullKvFromBackendCache(attention, request.num_kv_heads, request.head_dim, !frame_active)) orelse blk: {
+                if (frame_active) return null;
+                break :blk try gatherFullKv(self, source, attention, request.num_kv_heads, request.head_dim);
+            };
+        }
+
+        const attention_input_size = request.num_heads * request.head_dim;
+        const tensor = (metal_runtime.runCompressedAttentionResidual(self.provider_impl, .{
+            .q = q_mt,
+            .k_suffix = k_mt,
+            .v_suffix = v_mt,
+            .bootstrap_k_blocks = &.{},
+            .bootstrap_v_blocks = &.{},
+            .bootstrap_block_token_counts = &.{},
+            .full_k = if (gathered_full) |full| full.k else null,
+            .full_v = if (gathered_full) |full| full.v else null,
+            .source_ptr_id = source.ptr_id,
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+            .query_sequence_len = attention.query_sequence_len,
+            .kv_tokens = attention.kv_sequence_len,
+            .num_heads = request.num_heads,
+            .num_kv_heads = request.num_kv_heads,
+            .head_dim = request.head_dim,
+            .key_row_bytes = directAttentionSpanKeyRowBytes(request.num_kv_heads, request.head_dim, format.?),
+            .query_position = attention.total_sequence_len - 1,
+            .kv_position_offset = attention.kv_position_offset,
+            .sliding_window = attention.sliding_window,
+            .attention_linear_slot = request.linear_slot,
+            .attention_pre_linear_rms_norm_slot = request.pre_linear_rms_norm_slot,
+            .attention_post_linear_rms_norm_slot = request.post_linear_rms_norm_slot,
+            .residual = residual_mt,
+            .hidden_size = request.hidden_size,
+            .attention_input_size = attention_input_size,
+            .eps = request.eps,
+            .format = format.?,
+        }, &self.timing_stats) catch |err| switch (err) {
+            error.MetalBufferDownloadFailed => return null,
+            else => return err,
+        }) orelse {
+            if (trace_attn_null) std.debug.print(
+                "metal-attn-residual-null layer={d} reason=runtime-null skip_kv_write={any} kv_tokens={d} kv_pos={d} sliding={d}\n",
+                .{
+                    attention.layer_index,
+                    attention.skip_kv_write,
+                    attention.kv_sequence_len,
+                    attention.kv_position_offset,
+                    attention.sliding_window,
+                },
+            );
+            return null;
+        };
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn runAttentionOutputResidualOp(ctx: *anyopaque, request: *const ops.RunAttentionOutputResidualRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var attention_output = try self.ownedMetalTensorFromCt(request.attention_output);
+        defer attention_output.deinit();
+        var residual = try self.ownedMetalTensorFromCt(request.residual);
+        defer residual.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyAttentionOutputResidualDevice(self.provider_impl, .{
+            .attention_output = attention_output,
+            .residual = residual,
+            .rows = request.rows,
+            .attention_input_size = request.attention_input_size,
+            .hidden_size = request.hidden_size,
+            .linear_slot = request.linear_slot,
+            .pre_linear_rms_norm_slot = request.pre_linear_rms_norm_slot,
+            .post_linear_rms_norm_slot = request.post_linear_rms_norm_slot,
+            .eps = request.eps,
+        })) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn seedPagedAttentionSpanOp(ctx: *anyopaque, request: *const ops.SeedPagedAttentionSpanRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const attention = request.attention;
+        if (attention.mode != .paged_prefill and attention.mode != .paged_decode) return false;
+        if (attention.skip_kv_write) return false;
+        const kv = attention.kv_cache orelse return false;
+        if (attention.kv_manager == null and attention.kv_storage == null) return false;
+
+        const source = try attentionKvSource(attention);
+        const row_width = request.num_kv_heads * request.head_dim;
+        const k_buf = toBuf(request.k);
+        const v_buf = toBuf(request.v);
+        const cache_key: BackendKvCacheKey = .{
+            .source_ptr_id = source.ptr_id,
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+        };
+        if (source.kv_storage.config.store_cpu_bytes) {
+            const k_host = try hostSliceForBuf(k_buf);
+            const v_host = try hostSliceForBuf(v_buf);
+            _ = try self.updateBackendKvLayerCache(
+                cache_key,
+                k_host,
+                v_host,
+                attention.query_sequence_len,
+                attention.kv_sequence_len,
+                attention.kv_position_offset,
+                row_width,
+                attentionBlockSignature(attention),
+            );
+        }
+        var k_mt = try self.ownedMetalTensorFromCt(request.k);
+        defer k_mt.deinit();
+        var v_mt = try self.ownedMetalTensorFromCt(request.v);
+        defer v_mt.deinit();
+        try self.maybeDumpDecodeKvTensor("prefill-k", attention.layer_index, &k_mt, attention.kv_sequence_len, row_width);
+        try self.maybeDumpDecodeKvTensor("prefill-v", attention.layer_index, &v_mt, attention.kv_sequence_len, row_width);
+        const seeded = (try metal_runtime.updateGatheredSpan(
+            self.provider_impl,
+            .{
+                .source_ptr_id = source.ptr_id,
+                .sequence_id = kv.sequence_id,
+                .layer_index = attention.layer_index,
+            },
+            k_mt,
+            v_mt,
+            &.{},
+            &.{},
+            &.{},
+            null,
+            null,
+            attention.query_sequence_len,
+            attention.kv_sequence_len,
+            attention.kv_position_offset,
+            &self.timing_stats,
+        )) != null;
+        if (!seeded) return false;
+        _ = try self.publishPromptKvDevice(
+            attention,
+            k_mt,
+            v_mt,
+            @intCast(request.num_kv_heads),
+            @intCast(request.head_dim),
+        );
+        return true;
+    }
+
+    fn applyPrefillHeadNormCt(
+        ctx: *anyopaque,
+        input: CT,
+        slot: usize,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) !?CT {
+        if (rows == 0 or heads == 0 or head_dim == 0) return null;
+        const flat = try reshape2dOp(ctx, input, rows * heads, head_dim);
+        defer freeOp(ctx, flat);
+        const normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = slot,
+            .input = flat,
+            .hidden_size = head_dim,
+            .eps = eps,
+        })) orelse return null;
+        defer freeOp(ctx, normed);
+        return try reshape2dOp(ctx, normed, rows, heads * head_dim);
+    }
+
+    fn preparePrefillValueForAttentionCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        input: CT,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        eps: f32,
+        global_head_dim: usize,
+    ) !CT {
+        if (global_head_dim == 0) return input;
+        if (rows == 0 or heads == 0 or head_dim == 0 or kv_dim != heads * head_dim) return error.InvalidTensorShape;
+        const ones_ct = try self.ctFromOwnedMetalTensor(
+            (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return error.UnsupportedTensorType,
+        );
+        defer freeOp(ctx, ones_ct);
+        const flat = try reshape2dOp(ctx, input, rows * heads, head_dim);
+        defer freeOp(ctx, flat);
+        const normed = try rmsNormOp(ctx, flat, ones_ct, head_dim, eps);
+        defer freeOp(ctx, normed);
+        return try reshape2dOp(ctx, normed, rows, kv_dim);
+    }
+
+    fn applyPrefillHeadNormRopeScratchDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        slot: usize,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+        freq_scale: f32,
+        consecutive_pairs: bool,
+        value_scale: f32,
+        output_index: usize,
+    ) !?MetalTensor {
+        if (rows == 0 or heads == 0 or head_dim == 0 or rope_dim == 0) return null;
+        if (!input.isDevice() or input.elemCount() != rows * heads * head_dim) return null;
+        return metal_runtime.decoderRuntimeApplyHeadRmsNormRopeRowsScratch(self.provider_impl, .{
+            .slot = slot,
+            .input = input,
+            .total_heads = rows * heads,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .position = position_offset,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .eps = 0.0,
+            .value_scale = value_scale,
+            .consecutive_pairs = consecutive_pairs,
+        }, output_index, heads);
+    }
+
+    fn applyPrefillValueNormScratchDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        eps: f32,
+        output_index: usize,
+    ) !?MetalTensor {
+        if (rows == 0 or heads == 0 or head_dim == 0 or kv_dim != heads * head_dim) return null;
+        if (!input.isDevice() or input.elemCount() != rows * kv_dim) return null;
+        const flat_shape = [_]i32{ @intCast(rows * heads), @intCast(head_dim) };
+        var flat = try input.retainedView(0, rows * kv_dim * @sizeOf(f32), &flat_shape);
+        defer flat.deinit();
+        var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
+        defer ones.deinit();
+        var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceScratch(
+            self.provider_impl,
+            flat,
+            ones,
+            head_dim,
+            eps,
+            output_index,
+        )) orelse return null;
+        defer normed.deinit();
+        const out_shape = [_]i32{ @intCast(rows), @intCast(kv_dim) };
+        return try normed.retainedView(0, rows * kv_dim * @sizeOf(f32), &out_shape);
+    }
+
+    fn seedPagedAttentionSpanMt(
+        self: *MetalCompute,
+        source: AttentionKvSource,
+        attention: ops.AttentionContext,
+        k_mt: MetalTensor,
+        v_mt: MetalTensor,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) !bool {
+        if (attention.mode != .paged_prefill and attention.mode != .paged_decode) return false;
+        if (attention.skip_kv_write) return false;
+        const kv = attention.kv_cache orelse return false;
+        if (attention.kv_manager == null and attention.kv_storage == null) return false;
+
+        const row_width = num_kv_heads * head_dim;
+        const cache_key: BackendKvCacheKey = .{
+            .source_ptr_id = source.ptr_id,
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+        };
+        if (source.kv_storage.config.store_cpu_bytes) {
+            const k_ct = try retainedCtFromMetalTensor(self, &k_mt);
+            defer freeOp(self, k_ct);
+            const v_ct = try retainedCtFromMetalTensor(self, &v_mt);
+            defer freeOp(self, v_ct);
+            const k_host = try hostSliceForBuf(toBuf(k_ct));
+            const v_host = try hostSliceForBuf(toBuf(v_ct));
+            _ = try self.updateBackendKvLayerCache(
+                cache_key,
+                k_host,
+                v_host,
+                attention.query_sequence_len,
+                attention.kv_sequence_len,
+                attention.kv_position_offset,
+                row_width,
+                attentionBlockSignature(attention),
+            );
+        }
+        var dump_k = k_mt;
+        var dump_v = v_mt;
+        try self.maybeDumpDecodeKvTensor("prefill-k", attention.layer_index, &dump_k, attention.kv_sequence_len, row_width);
+        try self.maybeDumpDecodeKvTensor("prefill-v", attention.layer_index, &dump_v, attention.kv_sequence_len, row_width);
+        var cache_k = try k_mt.copiedView(0, k_mt.deviceByteLen(), k_mt.shape());
+        defer cache_k.deinit();
+        var cache_v = try v_mt.copiedView(0, v_mt.deviceByteLen(), v_mt.shape());
+        defer cache_v.deinit();
+        const seeded = (try metal_runtime.updateGatheredSpan(
+            self.provider_impl,
+            .{
+                .source_ptr_id = source.ptr_id,
+                .sequence_id = kv.sequence_id,
+                .layer_index = attention.layer_index,
+            },
+            cache_k,
+            cache_v,
+            &.{},
+            &.{},
+            &.{},
+            null,
+            null,
+            attention.query_sequence_len,
+            attention.kv_sequence_len,
+            attention.kv_position_offset,
+            &self.timing_stats,
+        )) != null;
+        if (!seeded) return false;
+        _ = try self.publishPromptKvDevice(
+            attention,
+            k_mt,
+            v_mt,
+            @intCast(num_kv_heads),
+            @intCast(head_dim),
+        );
+        return true;
+    }
+
+    fn runGatedPrefillLayerStagedQuantized(
+        self: *MetalCompute,
+        request: *const ops.RunGatedDecoderBlockRequest,
+        source: AttentionKvSource,
+        attention_input_mt: MetalTensor,
+        rows: usize,
+        q_slot: usize,
+        k_slot: usize,
+        v_slot: usize,
+        q_norm_slot: usize,
+        k_norm_slot: usize,
+        attention_input_size: usize,
+        kv_dim: usize,
+        planned_block_contract: ops.PlannedLayerContract,
+        use_planned_block_contract: bool,
+    ) !?MetalTensor {
+        const attention = request.attention;
+        const trace_quant = traceQuantBlockRequested();
+        var q_projected: MetalTensor = undefined;
+        var have_q_projected = false;
+        defer if (have_q_projected) q_projected.deinit();
+        var k_projected: ?MetalTensor = null;
+        defer if (k_projected) |*tensor| tensor.deinit();
+        var v_projected: ?MetalTensor = null;
+        defer if (v_projected) |*tensor| tensor.deinit();
+
+        var setup_scope = self.beginActivePlannedComputeScopeIfPossible(.layer, .attention_project);
+        defer self.endActivePlannedComputeScope(setup_scope);
+        {
+            if (attention.skip_kv_write) {
+                q_projected = (try metal_runtime.tryApplyQuantizedRuntimeLinearScratch(
+                    self.provider_impl,
+                    q_slot,
+                    attention_input_mt,
+                    rows,
+                    request.hidden_size,
+                    attention_input_size,
+                )) orelse (try metal_runtime.tryApplyQuantizedRuntimeLinear(
+                    self.provider_impl,
+                    q_slot,
+                    attention_input_mt,
+                    rows,
+                    request.hidden_size,
+                    attention_input_size,
+                )) orelse (try metal_runtime.tryApplyDenseRuntimeLinear(
+                    self.provider_impl,
+                    q_slot,
+                    attention_input_mt,
+                    rows,
+                    request.hidden_size,
+                    attention_input_size,
+                )) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} rows={d} reason=q-projection slot={d} kind={s} input_device={} input_ndim={d} hidden={d} out={d}\n",
+                        .{
+                            attention.layer_index,
+                            rows,
+                            q_slot,
+                            @tagName(self.provider_impl.raw_linear_slot_kinds[q_slot]),
+                            attention_input_mt.isDevice(),
+                            attention_input_mt.ndim(),
+                            request.hidden_size,
+                            attention_input_size,
+                        },
+                    );
+                    return null;
+                };
+                have_q_projected = true;
+            } else {
+                const qkv = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvScratch(
+                    self.provider_impl,
+                    q_slot,
+                    k_slot,
+                    v_slot,
+                    attention_input_mt,
+                    rows,
+                    request.hidden_size,
+                    attention_input_size,
+                    kv_dim,
+                )) orelse (try metal_runtime.tryApplyQuantizedRuntimeLinearQkv(
+                    self.provider_impl,
+                    q_slot,
+                    k_slot,
+                    v_slot,
+                    attention_input_mt,
+                    rows,
+                    request.hidden_size,
+                    attention_input_size,
+                    kv_dim,
+                )) orelse (try metal_runtime.tryApplyDenseRuntimeLinearQkv(
+                    self.provider_impl,
+                    q_slot,
+                    k_slot,
+                    v_slot,
+                    attention_input_mt,
+                    rows,
+                    request.hidden_size,
+                    attention_input_size,
+                    kv_dim,
+                )) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} rows={d} reason=qkv-projection q_slot={d} k_slot={d} v_slot={d} q_kind={s} k_kind={s} v_kind={s} input_device={} input_ndim={d} hidden={d} q_out={d} kv_out={d}\n",
+                        .{
+                            attention.layer_index,
+                            rows,
+                            q_slot,
+                            k_slot,
+                            v_slot,
+                            @tagName(self.provider_impl.raw_linear_slot_kinds[q_slot]),
+                            @tagName(self.provider_impl.raw_linear_slot_kinds[k_slot]),
+                            @tagName(self.provider_impl.raw_linear_slot_kinds[v_slot]),
+                            attention_input_mt.isDevice(),
+                            attention_input_mt.ndim(),
+                            request.hidden_size,
+                            attention_input_size,
+                            kv_dim,
+                        },
+                    );
+                    return null;
+                };
+                q_projected = qkv.first;
+                have_q_projected = true;
+                k_projected = qkv.second;
+                v_projected = qkv.third;
+            }
+        }
+        self.activePlannedComputeBarrier(setup_scope);
+
+        const query_value_scale: f32 = if (request.global_head_dim == 0) 1.0 else @sqrt(@as(f32, @floatFromInt(request.head_dim)));
+        var q_rope_mt = (try self.applyPrefillHeadNormRopeScratchDeviceMt(
+            q_projected,
+            q_norm_slot,
+            rows,
+            request.num_heads,
+            request.head_dim,
+            request.rope_active_dim,
+            attention.total_sequence_len - attention.query_sequence_len,
+            request.rope_theta,
+            request.rope_freq_scale,
+            request.rope_consecutive_pairs,
+            query_value_scale,
+            3,
+        )) orelse {
+            if (trace_quant) std.debug.print(
+                "metal-prefill-staged-null layer={d} rows={d} reason=q-headnorm-rope slot={d} q_device={} q_ndim={d} heads={d} head_dim={d} rope_dim={d}\n",
+                .{ attention.layer_index, rows, q_norm_slot, q_projected.isDevice(), q_projected.ndim(), request.num_heads, request.head_dim, request.rope_active_dim },
+            );
+            return null;
+        };
+        defer q_rope_mt.deinit();
+
+        var k_rope_mt: ?MetalTensor = null;
+        defer if (k_rope_mt) |*tensor| tensor.deinit();
+        var v_for_attn_mt: ?MetalTensor = null;
+        defer if (v_for_attn_mt) |*tensor| tensor.deinit();
+        if (!attention.skip_kv_write) {
+            k_rope_mt = (try self.applyPrefillHeadNormRopeScratchDeviceMt(
+                k_projected.?,
+                k_norm_slot,
+                rows,
+                request.num_kv_heads,
+                request.head_dim,
+                request.rope_active_dim,
+                attention.total_sequence_len - attention.query_sequence_len,
+                request.rope_theta,
+                request.rope_freq_scale,
+                request.rope_consecutive_pairs,
+                1.0,
+                4,
+            )) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} rows={d} reason=k-headnorm-rope slot={d} k_device={} k_ndim={d} heads={d} head_dim={d} rope_dim={d}\n",
+                    .{ attention.layer_index, rows, k_norm_slot, k_projected.?.isDevice(), k_projected.?.ndim(), request.num_kv_heads, request.head_dim, request.rope_active_dim },
+                );
+                return null;
+            };
+
+            if (request.global_head_dim != 0) {
+                v_for_attn_mt = (try self.applyPrefillValueNormScratchDeviceMt(
+                    v_projected.?,
+                    rows,
+                    request.num_kv_heads,
+                    request.head_dim,
+                    kv_dim,
+                    request.eps,
+                    5,
+                )) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} rows={d} reason=v-value-norm v_device={} v_ndim={d} heads={d} head_dim={d} kv_dim={d}\n",
+                        .{ attention.layer_index, rows, v_projected.?.isDevice(), v_projected.?.ndim(), request.num_kv_heads, request.head_dim, kv_dim },
+                    );
+                    return null;
+                };
+            } else {
+                v_for_attn_mt = try v_projected.?.retainedCopy();
+            }
+        }
+        self.endActivePlannedComputeScope(setup_scope);
+        setup_scope = false;
+
+        var block_request = request.*;
+        block_request.q = null;
+        block_request.k = null;
+        block_request.v = null;
+        block_request.attention_input = null;
+        block_request.attention = attention;
+        block_request.planned_layer_contract = if (use_planned_block_contract) planned_block_contract else .{};
+
+        var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
+        defer residual_mt.deinit();
+        var kv_suffix_written = false;
+        const tensor = (try self.runGatedDecoderBlockF32KvDeviceMt(
+            &block_request,
+            source,
+            q_rope_mt,
+            if (attention.skip_kv_write) null else k_rope_mt.?,
+            if (attention.skip_kv_write) null else v_for_attn_mt.?,
+            residual_mt,
+            null,
+            null,
+            &kv_suffix_written,
+        )) orelse {
+            if (trace_quant) std.debug.print(
+                "metal-prefill-staged-null layer={d} rows={d} reason=f32-kv-block q_device={} k_device={} v_device={} residual_device={} skip_kv={}\n",
+                .{
+                    attention.layer_index,
+                    rows,
+                    q_rope_mt.isDevice(),
+                    if (k_rope_mt) |k| k.isDevice() else false,
+                    if (v_for_attn_mt) |v| v.isDevice() else false,
+                    residual_mt.isDevice(),
+                    attention.skip_kv_write,
+                },
+            );
+            return null;
+        };
+        if (!attention.skip_kv_write and !kv_suffix_written) {
+            _ = try self.publishPromptKvDevice(
+                attention,
+                k_rope_mt.?,
+                v_for_attn_mt.?,
+                @intCast(request.num_kv_heads),
+                @intCast(request.head_dim),
+            );
+        }
+        return tensor;
+    }
+
+    fn runGatedPrefillFrameLayerQuantized(
+        self: *MetalCompute,
+        request: *const ops.RunGatedDecoderBlockRequest,
+        source: AttentionKvSource,
+        attention_input_mt: MetalTensor,
+        rows: usize,
+        q_slot: usize,
+        k_slot: usize,
+        v_slot: usize,
+        q_norm_slot: usize,
+        k_norm_slot: usize,
+        attention_input_size: usize,
+        kv_dim: usize,
+        planned_setup_contract: ops.PlannedLayerContract,
+        planned_block_contract: ops.PlannedLayerContract,
+        planned_frame_contract: ops.PlannedLayerContract,
+        layer_window: ?ops.PlannedFrameLayerWindow,
+    ) !?MetalTensor {
+        self.timing_stats.prefill_frame_executor_layer_runtime_calls += 1;
+        const layer_started_at = monotonicNowNs();
+        var layer_runtime_success = false;
+        defer {
+            const layer_finished_at = monotonicNowNs();
+            if (layer_finished_at > layer_started_at) {
+                self.timing_stats.prefill_frame_executor_layer_runtime_nanos += layer_finished_at - layer_started_at;
+            }
+            if (!layer_runtime_success) {
+                self.timing_stats.prefill_frame_executor_layer_runtime_failures += 1;
+            }
+        }
+
+        const trace_quant = traceQuantBlockRequested();
+        const attention = request.attention;
+        var value_norm_weight: ?MetalTensor = null;
+        defer if (value_norm_weight) |*tensor| tensor.deinit();
+        if (request.global_head_dim != 0 and !attention.skip_kv_write) {
+            value_norm_weight = (try self.unitRmsWeightDeviceTensor(request.head_dim)) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-planned-layer-null layer={d} rows={d} reason=value-norm-weight\n",
+                    .{ attention.layer_index, rows },
+                );
+                return null;
+            };
+        }
+
+        const query_value_scale: f32 = if (request.global_head_dim == 0) 1.0 else @sqrt(@as(f32, @floatFromInt(request.head_dim)));
+        const ple_mt_for_block: ?MetalTensor = if (request.ple) |ple_ct| blk: {
+            const ple_mt = try self.borrowedMetalTensorFromCt(ple_ct);
+            if (!ple_mt.isDevice() or ple_mt.ndim() != 2) {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-planned-layer-null layer={d} rows={d} reason=ple-not-device-or-2d device={} ndim={d}\n",
+                    .{ attention.layer_index, rows, ple_mt.isDevice(), ple_mt.ndim() },
+                );
+                return null;
+            }
+            if (@as(usize, @intCast(ple_mt.dim(0))) != rows or
+                @as(usize, @intCast(ple_mt.dim(1))) != request.ple_hidden_size)
+            {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-planned-layer-null layer={d} rows={d} reason=ple-shape dim0={d} dim1={d} ple_hidden={d}\n",
+                    .{ attention.layer_index, rows, @as(usize, @intCast(ple_mt.dim(0))), @as(usize, @intCast(ple_mt.dim(1))), request.ple_hidden_size },
+                );
+                return null;
+            }
+            break :blk ple_mt;
+        } else null;
+
+        if (attention.attn_or_mask == null and attention.kv_cache != null and attention.kv_storage != null) direct_frame_layer: {
+            const paged_layer = (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-frame-layer-direct-null layer={d} rows={d} reason=no-paged-layer shares_kv={}\n",
+                    .{ attention.layer_index, rows, attention.skip_kv_write },
+                );
+                break :direct_frame_layer;
+            };
+            const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
+            defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
+            const block_offsets = block_offsets_opt orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-frame-layer-direct-null layer={d} rows={d} reason=no-block-offsets shares_kv={}\n",
+                    .{ attention.layer_index, rows, attention.skip_kv_write },
+                );
+                break :direct_frame_layer;
+            };
+            const output_scale_value_active: ?f32 = request.output_scale_value orelse if (request.output_scale) |scale_ct| blk: {
+                const scale_buf = toBuf(scale_ct);
+                if (bufElemCount(scale_buf) != 1) {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-frame-layer-direct-null layer={d} rows={d} reason=scale-shape\n",
+                        .{ attention.layer_index, rows },
+                    );
+                    break :direct_frame_layer;
+                }
+                break :blk tryDirectDenseHostValue(scale_buf, 0) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-frame-layer-direct-null layer={d} rows={d} reason=scale-host-value\n",
+                        .{ attention.layer_index, rows },
+                    );
+                    break :direct_frame_layer;
+                };
+            } else null;
+
+            var residual_direct_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
+            defer residual_direct_mt.deinit();
+            const frame_setup_start = if (layer_window) |window| window.setup_start else 0;
+            const frame_block_start = if (layer_window) |window| window.block_start else 0;
+            const frame_layer_end = if (layer_window) |window| window.layer_end else 0;
+
+            const direct_started_at = monotonicNowNs();
+            const direct_tensor = try metal_runtime.runPrefillPagedGatedFrameLayerDevice(
+                self.provider_impl,
+                .{
+                    .shares_kv = attention.skip_kv_write,
+                    .q_slot = q_slot,
+                    .k_slot = k_slot,
+                    .v_slot = v_slot,
+                    .rows = rows,
+                    .hidden_size = request.hidden_size,
+                    .attention_input_size = attention_input_size,
+                    .kv_dim = kv_dim,
+                    .q_norm_slot = q_norm_slot,
+                    .k_norm_slot = k_norm_slot,
+                    .num_heads = request.num_heads,
+                    .num_kv_heads = request.num_kv_heads,
+                    .head_dim = request.head_dim,
+                    .rope_dim = request.rope_active_dim,
+                    .position = attention.total_sequence_len - attention.query_sequence_len,
+                    .theta = request.rope_theta,
+                    .freq_scale = request.rope_freq_scale,
+                    .eps = request.eps,
+                    .query_value_scale = query_value_scale,
+                    .consecutive_pairs = request.rope_consecutive_pairs,
+                    .planned_setup_contract = planned_setup_contract,
+                    .planned_block_contract = planned_block_contract,
+                    .planned_frame_contract = planned_frame_contract,
+                    .planned_setup_start = frame_setup_start,
+                    .planned_block_start = frame_block_start,
+                    .planned_layer_end = frame_layer_end,
+                    .kv_tokens = attention.kv_sequence_len,
+                    .query_position_offset = attention.total_sequence_len - attention.query_sequence_len,
+                    .kv_position_offset = attention.kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                    .total_sequence_len = attention.total_sequence_len,
+                    .attention_linear_slot = request.attention_linear_slot,
+                    .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                    .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                    .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                    .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                    .ffn_post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+                    .ffn_post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+                    .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                    .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                    .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                    .intermediate_size = request.intermediate_size,
+                    .activation = request.activation,
+                    .layer_index = attention.layer_index,
+                    .ple_gate_linear_slot = request.ple_gate_linear_slot,
+                    .ple_proj_linear_slot = request.ple_proj_linear_slot,
+                    .ple_post_norm_slot = request.ple_post_norm_slot,
+                    .ple_hidden_size = request.ple_hidden_size,
+                    .output_scale_value = output_scale_value_active,
+                },
+                attention_input_mt,
+                residual_direct_mt,
+                value_norm_weight,
+                ple_mt_for_block,
+                paged_layer,
+                block_offsets,
+                &self.timing_stats,
+            );
+            const direct_finished_at = monotonicNowNs();
+            if (direct_finished_at > direct_started_at) {
+                self.timing_stats.prefill_frame_executor_layer_block_nanos += direct_finished_at - direct_started_at;
+            }
+            if (direct_tensor) |tensor| {
+                layer_runtime_success = true;
+                self.timing_stats.prefill_frame_executor_layer_runtime_successes += 1;
+                return tensor;
+            }
+            if (trace_quant) std.debug.print(
+                "metal-prefill-frame-layer-direct-null layer={d} rows={d} reason=runtime-null shares_kv={} ple={}\n",
+                .{ attention.layer_index, rows, attention.skip_kv_write, ple_mt_for_block != null },
+            );
+        }
+
+        var fallback_setup_contract = planned_setup_contract;
+        var fallback_block_contract = planned_block_contract;
+        if ((!plannedContractIsActive(fallback_setup_contract) or !plannedContractIsActive(fallback_block_contract))) {
+            if (layer_window) |window| {
+                fallback_setup_contract = self.activePrefillFrameContractWindow(window.setup_start, window.block_start);
+                fallback_block_contract = self.activePrefillFrameContractWindow(window.block_start, window.layer_end);
+                if (plannedContractIsActive(fallback_setup_contract) and plannedContractIsActive(fallback_block_contract)) {
+                    self.timing_stats.prefill_frame_executor_layer_contracts += 1;
+                }
+            }
+        }
+        if (!plannedContractIsActive(fallback_setup_contract) or !plannedContractIsActive(fallback_block_contract)) return null;
+
+        const setup_started_at = monotonicNowNs();
+        var setup = try metal_runtime.decoderRuntimeApplyPrefillSetupDevice(self.provider_impl, .{
+            .shares_kv = attention.skip_kv_write,
+            .q_slot = q_slot,
+            .k_slot = k_slot,
+            .v_slot = v_slot,
+            .input = attention_input_mt,
+            .rows = rows,
+            .hidden_size = request.hidden_size,
+            .attention_input_size = attention_input_size,
+            .kv_dim = kv_dim,
+            .q_norm_slot = q_norm_slot,
+            .k_norm_slot = k_norm_slot,
+            .value_norm_weight = value_norm_weight,
+            .num_heads = request.num_heads,
+            .num_kv_heads = request.num_kv_heads,
+            .head_dim = request.head_dim,
+            .rope_dim = request.rope_active_dim,
+            .position = attention.total_sequence_len - attention.query_sequence_len,
+            .theta = request.rope_theta,
+            .freq_scale = request.rope_freq_scale,
+            .eps = request.eps,
+            .query_value_scale = query_value_scale,
+            .consecutive_pairs = request.rope_consecutive_pairs,
+            .planned_layer_contract = fallback_setup_contract,
+            .keep_scope_open_after = true,
+        });
+        const setup_finished_at = monotonicNowNs();
+        if (setup_finished_at > setup_started_at) {
+            self.timing_stats.prefill_frame_executor_layer_setup_nanos += setup_finished_at - setup_started_at;
+        }
+        if (setup) |*prefill_setup| {
+            defer prefill_setup.deinit();
+            errdefer self.endActivePlannedComputeScopeIfAny();
+
+            var block_request = request.*;
+            block_request.q = null;
+            block_request.k = null;
+            block_request.v = null;
+            block_request.attention_input = null;
+            block_request.attention = attention;
+            block_request.planned_layer_contract = fallback_block_contract;
+
+            var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
+            defer residual_mt.deinit();
+            const block_started_at = monotonicNowNs();
+            const tensor = (try self.runGatedDecoderBlockF32KvDeviceMt(
+                &block_request,
+                source,
+                prefill_setup.q,
+                if (attention.skip_kv_write) null else prefill_setup.k.?,
+                if (attention.skip_kv_write) null else prefill_setup.v.?,
+                residual_mt,
+                ple_mt_for_block,
+                null,
+                null,
+            ));
+            const block_finished_at = monotonicNowNs();
+            if (block_finished_at > block_started_at) {
+                self.timing_stats.prefill_frame_executor_layer_block_nanos += block_finished_at - block_started_at;
+            }
+            if (tensor) |result| {
+                layer_runtime_success = true;
+                self.timing_stats.prefill_frame_executor_layer_runtime_successes += 1;
+                return result;
+            } else {
+                self.endActivePlannedComputeScopeIfAny();
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-planned-layer-null layer={d} rows={d} reason=block-null shares_kv={} ple={}\n",
+                    .{ attention.layer_index, rows, attention.skip_kv_write, ple_mt_for_block != null },
+                );
+                return null;
+            }
+        }
+        if (trace_quant) std.debug.print(
+            "metal-prefill-planned-layer-staged-path layer={d} rows={d} reason=fused-setup-null shares_kv={}\n",
+            .{ attention.layer_index, rows, attention.skip_kv_write },
+        );
+        self.timing_stats.prefill_frame_executor_layer_staged_paths += 1;
+        const staged_started_at = monotonicNowNs();
+        const staged = (try self.runGatedPrefillLayerStagedQuantized(
+            request,
+            source,
+            attention_input_mt,
+            rows,
+            q_slot,
+            k_slot,
+            v_slot,
+            q_norm_slot,
+            k_norm_slot,
+            attention_input_size,
+            kv_dim,
+            fallback_block_contract,
+            true,
+        )) orelse return null;
+        const staged_finished_at = monotonicNowNs();
+        if (staged_finished_at > staged_started_at) {
+            self.timing_stats.prefill_frame_executor_layer_staged_nanos += staged_finished_at - staged_started_at;
+        }
+        layer_runtime_success = true;
+        self.timing_stats.prefill_frame_executor_layer_runtime_successes += 1;
+        return staged;
+    }
+
+    fn runGatedPrefillLayerFromAttentionInput(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        request: *const ops.RunGatedDecoderBlockRequest,
+        source: AttentionKvSource,
+    ) !?CT {
+        const trace_quant = traceQuantBlockRequested();
+        if (!metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null reason=no-active-frame\n", .{});
+            return null;
+        }
+        const attention = request.attention;
+        if (attention.mode != .paged_prefill or attention.attn_or_mask != null) {
+            if (trace_quant) std.debug.print(
+                "metal-prefill-planned-layer-null layer={d} reason=mode-or-mask mode={s} mask={}\n",
+                .{ attention.layer_index, @tagName(attention.mode), attention.attn_or_mask != null },
+            );
+            return null;
+        }
+        if (attention.query_sequence_len == 0 or attention.kv_sequence_len == 0) {
+            if (trace_quant) std.debug.print(
+                "metal-prefill-planned-layer-null layer={d} reason=empty-len q={d} kv={d}\n",
+                .{ attention.layer_index, attention.query_sequence_len, attention.kv_sequence_len },
+            );
+            return null;
+        }
+        const attention_input_ct = request.attention_input orelse {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null layer={d} reason=no-attention-input\n", .{attention.layer_index});
+            return null;
+        };
+        const q_slot = request.q_linear_slot orelse {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null layer={d} reason=no-q-slot\n", .{attention.layer_index});
+            return null;
+        };
+        const q_norm_slot = request.q_head_norm_slot orelse {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null layer={d} reason=no-q-norm-slot\n", .{attention.layer_index});
+            return null;
+        };
+        const k_slot = if (!attention.skip_kv_write) request.k_linear_slot orelse {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null layer={d} reason=no-k-slot\n", .{attention.layer_index});
+            return null;
+        } else 0;
+        const v_slot = if (!attention.skip_kv_write) request.v_linear_slot orelse {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null layer={d} reason=no-v-slot\n", .{attention.layer_index});
+            return null;
+        } else 0;
+        const k_norm_slot = if (!attention.skip_kv_write) request.k_head_norm_slot orelse {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null layer={d} reason=no-k-norm-slot\n", .{attention.layer_index});
+            return null;
+        } else 0;
+        if (request.rope_active_dim == 0) {
+            if (trace_quant) std.debug.print("metal-prefill-planned-layer-null layer={d} reason=no-rope-dim\n", .{attention.layer_index});
+            return null;
+        }
+
+        const attention_input_mt = try self.borrowedMetalTensorFromCt(attention_input_ct);
+        if (!attention_input_mt.isDevice() or attention_input_mt.ndim() != 2) {
+            if (trace_quant) std.debug.print(
+                "metal-prefill-planned-layer-null layer={d} reason=input-not-device-or-2d device={} ndim={d}\n",
+                .{ attention.layer_index, attention_input_mt.isDevice(), attention_input_mt.ndim() },
+            );
+            return null;
+        }
+        const rows: usize = @intCast(attention_input_mt.dim(0));
+        if (rows != attention.query_sequence_len or @as(usize, @intCast(attention_input_mt.dim(1))) != request.hidden_size) {
+            if (trace_quant) std.debug.print(
+                "metal-prefill-planned-layer-null layer={d} rows={d} reason=input-shape q={d} hidden={d} dim1={d}\n",
+                .{ attention.layer_index, rows, attention.query_sequence_len, request.hidden_size, @as(usize, @intCast(attention_input_mt.dim(1))) },
+            );
+            return null;
+        }
+        const attention_input_size = request.num_heads * request.head_dim;
+        const kv_dim = request.num_kv_heads * request.head_dim;
+        if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(
+            self.provider_impl,
+            rows,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            request.hidden_size,
+            @max(request.intermediate_size, request.ple_hidden_size),
+            request.graph_plan_tail_vocab_size,
+        )) {
+            if (trace_quant) std.debug.print(
+                "metal-prefill-planned-layer-null layer={d} rows={d} reason=reserve-scratch\n",
+                .{ attention.layer_index, rows },
+            );
+            return null;
+        }
+
+        const using_full_frame_contract = plannedContractIsActive(request.planned_frame_contract) and
+            request.planned_frame_layer_window != null;
+        const using_frame_layer_contract = plannedContractIsActive(request.planned_setup_contract) and
+            plannedContractIsActive(request.planned_layer_contract);
+        var planned_setup_ops = [_]u16{0} ** 16;
+        var planned_setup_barriers = [_]u8{0} ** 16;
+        var planned_setup_quant_dispatches = [_]u8{255} ** 16;
+        var planned_setup_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
+        var planned_block_ops = [_]u16{0} ** 16;
+        var planned_block_barriers = [_]u8{0} ** 16;
+        var planned_block_quant_dispatches = [_]u8{255} ** 16;
+        var planned_block_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
+        var planned_setup_contract: ops.PlannedLayerContract = .{};
+        var planned_block_contract: ops.PlannedLayerContract = .{};
+        var planned_frame_contract: ops.PlannedLayerContract = .{};
+        var planned_frame_layer_window: ?ops.PlannedFrameLayerWindow = null;
+        var have_planned_contracts = false;
+        if (using_full_frame_contract) {
+            self.timing_stats.prefill_frame_executor_local_plan_bypasses += 1;
+            planned_frame_contract = request.planned_frame_contract;
+            planned_frame_layer_window = request.planned_frame_layer_window;
+            have_planned_contracts = true;
+        } else if (using_frame_layer_contract) {
+            self.timing_stats.prefill_frame_executor_local_plan_bypasses += 1;
+            planned_setup_contract = request.planned_setup_contract;
+            planned_block_contract = request.planned_layer_contract;
+            have_planned_contracts = true;
+        } else {
+            var setup_plan_storage = metal_command_planner.AttentionSetupCommandLowerer{};
+            var layer_plan_storage = metal_command_planner.PrefillGatedLayerCommandLowerer{};
+            if (setup_plan_storage.build(.{
+                .shares_kv = attention.skip_kv_write,
+                .has_attention_pre_norm = false,
+                .attention_pre_norm_slot = 0,
+                .q_linear_slot = q_slot,
+                .k_linear_slot = k_slot,
+                .v_linear_slot = v_slot,
+                .q_head_norm_slot = q_norm_slot,
+                .k_head_norm_slot = k_norm_slot,
+                .attention_layer_index = attention.layer_index,
+                .value_norm = request.global_head_dim != 0 and !attention.skip_kv_write,
+                .kv_seed = false,
+                .source = @intFromEnum(metal_runtime.ComputeSource.layer),
+                .region = @intFromEnum(metal_runtime.ComputeRegion.layer),
+                .rows = rows,
+                .hidden_size = request.hidden_size,
+                .attention_input_size = attention_input_size,
+                .kv_dim = kv_dim,
+            })) |_| {
+                const setup_command_view = setup_plan_storage.commandView();
+                var block_command_view = setup_command_view;
+                if (request.ple != null and
+                    request.ple_gate_linear_slot != null and
+                    request.ple_proj_linear_slot != null and
+                    request.ple_post_norm_slot != null and
+                    request.attention_linear_slot < metal_runtime.decoder_runtime_linear_slot_capacity and
+                    request.gate_ffn_linear_slot < metal_runtime.decoder_runtime_linear_slot_capacity and
+                    request.up_ffn_linear_slot < metal_runtime.decoder_runtime_linear_slot_capacity and
+                    request.down_ffn_linear_slot < metal_runtime.decoder_runtime_linear_slot_capacity)
+                {
+                    if (request.attention_post_linear_rms_norm_slot) |attention_post_norm_slot| {
+                        if (request.ffn_rms_norm_slot orelse request.ffn_layer_norm_slot) |ffn_pre_norm_slot| {
+                            if (request.ffn_post_down_rms_norm_slot orelse request.ffn_post_gate_rms_norm_slot) |ffn_post_norm_slot| {
+                                layer_plan_storage.build(.{
+                                    .shares_kv = attention.skip_kv_write,
+                                    .has_attention_pre_norm = false,
+                                    .attention_pre_norm_slot = 0,
+                                    .q_linear_slot = q_slot,
+                                    .k_linear_slot = k_slot,
+                                    .v_linear_slot = v_slot,
+                                    .q_head_norm_slot = q_norm_slot,
+                                    .k_head_norm_slot = k_norm_slot,
+                                    .attention_layer_index = attention.layer_index,
+                                    .value_norm = request.global_head_dim != 0 and !attention.skip_kv_write,
+                                    .kv_seed = !attention.skip_kv_write,
+                                    .attention_linear_slot = request.attention_linear_slot,
+                                    .attention_post_norm_slot = attention_post_norm_slot,
+                                    .ffn_pre_norm_slot = ffn_pre_norm_slot,
+                                    .gate_linear_slot = request.gate_ffn_linear_slot,
+                                    .up_linear_slot = request.up_ffn_linear_slot,
+                                    .down_linear_slot = request.down_ffn_linear_slot,
+                                    .ffn_post_norm_slot = ffn_post_norm_slot,
+                                    .ple_gate_linear_slot = request.ple_gate_linear_slot.?,
+                                    .ple_proj_linear_slot = request.ple_proj_linear_slot.?,
+                                    .ple_post_norm_slot = request.ple_post_norm_slot.?,
+                                    .source = @intFromEnum(metal_runtime.ComputeSource.layer),
+                                    .region = @intFromEnum(metal_runtime.ComputeRegion.layer),
+                                    .rows = rows,
+                                    .kv_len = attention.kv_sequence_len,
+                                    .hidden_size = request.hidden_size,
+                                    .attention_input_size = attention_input_size,
+                                    .kv_dim = kv_dim,
+                                    .head_dim = request.head_dim,
+                                    .attention_kv_format = .f32,
+                                    .attention_storage = if (attention.kv_storage != null) .paged else .dense,
+                                    .intermediate_size = request.intermediate_size,
+                                    .ple_hidden_size = request.ple_hidden_size,
+                                }) catch {};
+                                if (layer_plan_storage.commandView().ops.len != 0) {
+                                    block_command_view = layer_plan_storage.commandView();
+                                }
+                            }
+                        }
+                    }
+                }
+                var setup_op_count = setup_command_view.ops.len;
+                if (setup_op_count < block_command_view.ops.len and
+                    block_command_view.ops[setup_op_count].kind == .kv_seed)
+                {
+                    setup_op_count += 1;
+                }
+                planned_setup_contract = metal_runtime.plannedContractFromCommandPlan(
+                    block_command_view,
+                    &planned_setup_ops,
+                    &planned_setup_barriers,
+                    &planned_setup_quant_dispatches,
+                    &planned_setup_command_ops,
+                    0,
+                );
+                planned_block_contract = metal_runtime.plannedContractFromCommandPlan(
+                    block_command_view,
+                    &planned_block_ops,
+                    &planned_block_barriers,
+                    &planned_block_quant_dispatches,
+                    &planned_block_command_ops,
+                    setup_op_count,
+                );
+                have_planned_contracts = true;
+            } else |err| {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-planned-layer-null layer={d} reason=setup-plan-error err={s}\n",
+                    .{ attention.layer_index, @errorName(err) },
+                );
+            }
+        }
+        if (have_planned_contracts) {
+            if (try self.runGatedPrefillFrameLayerQuantized(
+                request,
+                source,
+                attention_input_mt,
+                rows,
+                q_slot,
+                k_slot,
+                v_slot,
+                q_norm_slot,
+                k_norm_slot,
+                attention_input_size,
+                kv_dim,
+                planned_setup_contract,
+                planned_block_contract,
+                planned_frame_contract,
+                planned_frame_layer_window,
+            )) |tensor| {
+                _ = ctx;
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+            return null;
+        }
+
+        const tensor = (try self.runGatedPrefillLayerStagedQuantized(
+            request,
+            source,
+            attention_input_mt,
+            rows,
+            q_slot,
+            k_slot,
+            v_slot,
+            q_norm_slot,
+            k_norm_slot,
+            attention_input_size,
+            kv_dim,
+            .{},
+            false,
+        )) orelse return null;
+        _ = ctx;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn runGatedDecoderBlockF32KvDevice(
+        self: *MetalCompute,
+        request: *const ops.RunGatedDecoderBlockRequest,
+        source: AttentionKvSource,
+    ) !?MetalTensor {
+        if (request.q == null) return null;
+        var q_mt = try self.ownedMetalTensorFromCt(request.q.?);
+        defer q_mt.deinit();
+        var residual_mt = try self.ownedMetalTensorFromCt(request.residual);
+        defer residual_mt.deinit();
+        var k_mt: ?MetalTensor = null;
+        defer if (k_mt) |*tensor| tensor.deinit();
+        var v_mt: ?MetalTensor = null;
+        defer if (v_mt) |*tensor| tensor.deinit();
+        if (!request.attention.skip_kv_write) {
+            if (request.k == null or request.v == null) return null;
+            k_mt = try self.ownedMetalTensorFromCt(request.k.?);
+            v_mt = try self.ownedMetalTensorFromCt(request.v.?);
+        }
+        return self.runGatedDecoderBlockF32KvDeviceMt(
+            request,
+            source,
+            q_mt,
+            k_mt,
+            v_mt,
+            residual_mt,
+            null,
+            null,
+            null,
+        );
+    }
+
+    fn writePagedKvSuffixDeviceFromTensors(
+        attention: ops.AttentionContext,
+        k_tensor: MetalTensor,
+        v_tensor: MetalTensor,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) !bool {
+        if (attention.skip_kv_write) return true;
+        const kv = attention.kv_cache orelse return error.InvalidPagedKvState;
+        const storage = attention.kv_storage orelse return false;
+        if (dumpDecodeKvLayerTarget()) |target_layer| {
+            if (target_layer == attention.layer_index) std.debug.print(
+                "metal-paged-kv-write-device: layer={d} mode={s} total={d} suffix={d} pos={d}\n",
+                .{
+                    attention.layer_index,
+                    @tagName(attention.mode),
+                    attention.kv_sequence_len,
+                    attention.query_sequence_len,
+                    attention.kv_position_offset,
+                },
+            );
+        }
+        if (!k_tensor.isDevice() or !v_tensor.isDevice()) return false;
+        const k_handle = k_tensor.deviceHandle() orelse return false;
+        const v_handle = v_tensor.deviceHandle() orelse return false;
+        try k_tensor.retainForActiveFrame();
+        try v_tensor.retainForActiveFrame();
+        const write = runtime_root.kv.storage_runtime.KvSuffixWrite{
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+            .total_token_count = attention.kv_sequence_len,
+            .suffix_token_count = attention.query_sequence_len,
+            .position_offset = attention.kv_position_offset,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+        };
+        storage.writeLayerKvSuffixDevice(
+            write,
+            .{
+                .handle = k_handle,
+                .byte_offset = k_tensor.deviceByteOffset(),
+                .byte_len = k_tensor.deviceByteLen(),
+            },
+            .{
+                .handle = v_handle,
+                .byte_offset = v_tensor.deviceByteOffset(),
+                .byte_len = v_tensor.deviceByteLen(),
+            },
+        ) catch |err| switch (err) {
+            error.DeviceWriteUnsupported,
+            error.DeviceWriteFormatUnsupported,
+            error.DeviceWriteFallback,
+            => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn ensurePagedKvDevicePrefixFromBackendCache(
+        self: *MetalCompute,
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) !bool {
+        if (attention.skip_kv_write) return true;
+        if (attention.query_sequence_len >= attention.kv_sequence_len) return true;
+        const prior_tokens = attention.kv_sequence_len - attention.query_sequence_len;
+        if (prior_tokens == 0) return true;
+
+        const kv = attention.kv_cache orelse return false;
+        var prefix_attention = attention;
+        prefix_attention.kv_sequence_len = prior_tokens;
+        prefix_attention.query_sequence_len = prior_tokens;
+        if (try gatherFullKvFromDeviceHook(prefix_attention, num_kv_heads, head_dim)) |prefix| {
+            var owned_prefix = prefix;
+            owned_prefix.deinit();
+            return true;
+        }
+
+        const rows = (try self.gatherPagedKvLayerFromBackendCache(
+            self.allocator,
+            .{
+                .sequence_id = kv.sequence_id,
+                .pool_id = kv.pool_id,
+                .logical_block_count = kv.logical_block_count,
+                .tail_tokens = kv.tail_tokens,
+                .position_offset = attention.kv_position_offset,
+                .logical_blocks = kv.logical_blocks,
+                .kv_storage = kv.kv_storage,
+            },
+            prior_tokens,
+            attention.layer_index,
+        )) orelse (try self.gatherPagedKvLayerFromGatheredSpan(
+            self.allocator,
+            .{
+                .sequence_id = kv.sequence_id,
+                .pool_id = kv.pool_id,
+                .logical_block_count = kv.logical_block_count,
+                .tail_tokens = kv.tail_tokens,
+                .position_offset = attention.kv_position_offset,
+                .logical_blocks = kv.logical_blocks,
+                .kv_storage = kv.kv_storage,
+            },
+            prior_tokens,
+            attention.layer_index,
+        ));
+        if (rows) |cache_rows| {
+            defer {
+                self.allocator.free(cache_rows.k);
+                self.allocator.free(cache_rows.v);
+            }
+
+            const row_width = num_kv_heads * head_dim;
+            if (cache_rows.k.len != prior_tokens * row_width or cache_rows.v.len != prior_tokens * row_width) return false;
+            const shape = [_]i32{ @intCast(prior_tokens), @intCast(row_width) };
+            var k_prefix = try MetalTensor.ownedCloneFrom(cache_rows.k, &shape);
+            defer k_prefix.deinit();
+            var v_prefix = try MetalTensor.ownedCloneFrom(cache_rows.v, &shape);
+            defer v_prefix.deinit();
+
+            if (try writePagedKvSuffixDeviceFromTensors(
+                prefix_attention,
+                k_prefix,
+                v_prefix,
+                @intCast(num_kv_heads),
+                @intCast(head_dim),
+            )) return true;
+        }
+
+        return false;
+    }
+
+    fn finishGatedDecoderBlockFromAttentionOutputMt(
+        self: *MetalCompute,
+        request: *const ops.RunGatedDecoderBlockRequest,
+        attention_layer_index: usize,
+        attn_out: MetalTensor,
+        residual_mt: MetalTensor,
+        compare_tensor: ?*MetalTensor,
+    ) !?MetalTensor {
+        const trace_quant = traceQuantBlockRequested();
+        const attention_input_size = request.num_heads * request.head_dim;
+        const block_scope = self.beginActivePlannedComputeScopeIfPossible(.layer, .layer);
+        defer self.endActivePlannedComputeScope(block_scope);
+        var projected: MetalTensor = undefined;
+        {
+            const projection_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .attention_project);
+            defer self.endActivePlannedComputeScope(projection_scope);
+            projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = request.attention_linear_slot,
+                .input = attn_out,
+                .in_dim = attention_input_size,
+                .out_dim = request.hidden_size,
+            })) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} reason=attention-output-linear slot={d} in={d} out={d} rows={d} input_device={}\n",
+                    .{ attention_layer_index, request.attention_linear_slot, attention_input_size, request.hidden_size, @as(usize, @intCast(attn_out.dim(0))), attn_out.isDevice() },
+                );
+                return null;
+            };
+        }
+        defer projected.deinit();
+
+        var attn_post: MetalTensor = undefined;
+        var attn_res: MetalTensor = undefined;
+        var ffn_normed: MetalTensor = undefined;
+        {
+            const residual_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.rms_norm, .ffn_norm);
+            defer self.endActivePlannedComputeScope(residual_scope);
+            attn_post = if (request.attention_post_linear_rms_norm_slot) |slot|
+                (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                    .slot = slot,
+                    .input = projected,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.eps,
+                }, &self.timing_stats)) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} reason=attention-post-rms slot={d} hidden={d}\n",
+                        .{ attention_layer_index, slot, request.hidden_size },
+                    );
+                    return null;
+                }
+            else
+                try projected.retainedCopy();
+            errdefer attn_post.deinit();
+            self.activePlannedComputeBarrier(residual_scope or block_scope);
+            attn_res = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                .lhs = attn_post,
+                .rhs = residual_mt,
+                .dim = request.hidden_size,
+            }, &self.timing_stats)) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} reason=attention-residual-add hidden={d} lhs_device={} rhs_device={}\n",
+                    .{ attention_layer_index, request.hidden_size, attn_post.isDevice(), residual_mt.isDevice() },
+                );
+                return null;
+            };
+            errdefer attn_res.deinit();
+            self.activePlannedComputeBarrier(residual_scope or block_scope);
+            ffn_normed = (try metal_runtime.decoderRuntimeApplyFfnNormInternal(
+                self.provider_impl,
+                attn_res,
+                request.ffn_layer_norm_slot,
+                request.ffn_rms_norm_slot,
+                request.hidden_size,
+                request.eps,
+            )) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} reason=ffn-norm layer_norm={?d} rms_norm={?d} hidden={d}\n",
+                    .{ attention_layer_index, request.ffn_layer_norm_slot, request.ffn_rms_norm_slot, request.hidden_size },
+                );
+                return null;
+            };
+        }
+        defer attn_post.deinit();
+        defer attn_res.deinit();
+        defer ffn_normed.deinit();
+
+        if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
+            .gate_linear_slot = request.gate_ffn_linear_slot,
+            .up_linear_slot = request.up_ffn_linear_slot,
+            .down_linear_slot = request.down_ffn_linear_slot,
+            .rows = @as(usize, @intCast(ffn_normed.dim(0))),
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .activation = request.activation,
+            .eps = request.eps,
+            .post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+            .post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+        }, ffn_normed, attn_res, &self.timing_stats)) |tensor| {
+            if (compare_tensor) |mono| {
+                var staged = tensor;
+                try compareMetalTensors("metal-quant-monolithic-vs-direct-ffn", attention_layer_index, request.hidden_size, mono, &staged);
+            }
+            return tensor;
+        }
+
+        const ffn_rows = @as(usize, @intCast(ffn_normed.dim(0)));
+        var gate_proj: MetalTensor = undefined;
+        var up_proj: MetalTensor = undefined;
+        {
+            const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
+            defer self.endActivePlannedComputeScope(ffn_scope);
+            if (ffn_rows == 1) {
+                const gate_up = (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
+                    .slot_a = request.gate_ffn_linear_slot,
+                    .slot_b = request.up_ffn_linear_slot,
+                    .input = ffn_normed,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} reason=ffn-pair slot_a={d} slot_b={d} hidden={d} intermediate={d}\n",
+                        .{ attention_layer_index, request.gate_ffn_linear_slot, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size },
+                    );
+                    return null;
+                };
+                gate_proj = gate_up.first;
+                up_proj = gate_up.second;
+            } else {
+                gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = request.gate_ffn_linear_slot,
+                    .input = ffn_normed,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} reason=ffn-gate-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
+                        .{ attention_layer_index, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
+                    );
+                    return null;
+                };
+                errdefer gate_proj.deinit();
+                up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = request.up_ffn_linear_slot,
+                    .input = ffn_normed,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} reason=ffn-up-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
+                        .{ attention_layer_index, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
+                    );
+                    return null;
+                };
+            }
+        }
+        defer gate_proj.deinit();
+        defer up_proj.deinit();
+
+        var activated: MetalTensor = undefined;
+        var gated: MetalTensor = undefined;
+        {
+            const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
+            defer self.endActivePlannedComputeScope(ffn_scope);
+            activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+                .input = gate_proj,
+                .kind = request.activation,
+                .dim = request.intermediate_size,
+            }, &self.timing_stats)) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} reason=ffn-activation intermediate={d}\n",
+                    .{ attention_layer_index, request.intermediate_size },
+                );
+                return null;
+            };
+            errdefer activated.deinit();
+            self.activePlannedComputeBarrier(ffn_scope or block_scope);
+            gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+                self.provider_impl,
+                activated,
+                up_proj,
+                request.intermediate_size,
+            )) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} reason=ffn-multiply intermediate={d}\n",
+                    .{ attention_layer_index, request.intermediate_size },
+                );
+                return null;
+            };
+        }
+        defer activated.deinit();
+        defer gated.deinit();
+
+        var down: MetalTensor = undefined;
+        {
+            const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
+            defer self.endActivePlannedComputeScope(ffn_scope);
+            down = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = request.down_ffn_linear_slot,
+                .input = gated,
+                .in_dim = request.intermediate_size,
+                .out_dim = request.hidden_size,
+            })) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} reason=ffn-down-linear slot={d} intermediate={d} hidden={d}\n",
+                    .{ attention_layer_index, request.down_ffn_linear_slot, request.intermediate_size, request.hidden_size },
+                );
+                return null;
+            };
+        }
+        defer down.deinit();
+
+        var down_post: MetalTensor = undefined;
+        var staged_result: MetalTensor = undefined;
+        {
+            const residual_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.rms_norm, .ffn);
+            defer self.endActivePlannedComputeScope(residual_scope);
+            down_post = if (request.ffn_post_down_rms_norm_slot) |slot|
+                (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                    .slot = slot,
+                    .input = down,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.eps,
+                }, &self.timing_stats)) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} reason=ffn-post-rms slot={d} hidden={d}\n",
+                        .{ attention_layer_index, slot, request.hidden_size },
+                    );
+                    return null;
+                }
+            else
+                try down.retainedCopy();
+            errdefer down_post.deinit();
+            self.activePlannedComputeBarrier(residual_scope or block_scope);
+            staged_result = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                .lhs = down_post,
+                .rhs = attn_res,
+                .dim = request.hidden_size,
+            }, &self.timing_stats)) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-staged-null layer={d} reason=ffn-residual-add hidden={d}\n",
+                    .{ attention_layer_index, request.hidden_size },
+                );
+                return null;
+            };
+        }
+        defer down_post.deinit();
+        errdefer staged_result.deinit();
+        if (compare_tensor) |mono| {
+            try compareMetalTensors("metal-quant-monolithic-vs-staged", attention_layer_index, request.hidden_size, mono, &staged_result);
+        }
+        return staged_result;
+    }
+
+    fn runGatedDecoderBlockF32KvDeviceMt(
+        self: *MetalCompute,
+        request: *const ops.RunGatedDecoderBlockRequest,
+        source: AttentionKvSource,
+        q_mt: MetalTensor,
+        maybe_k_mt: ?MetalTensor,
+        maybe_v_mt: ?MetalTensor,
+        residual_mt: MetalTensor,
+        ple_mt_override: ?MetalTensor,
+        output_mt: ?MetalTensor,
+        kv_suffix_device_written: ?*bool,
+    ) !?MetalTensor {
+        const attention = request.attention;
+        if (disableRuntimeAttentionF32()) return null;
+        if (!q_mt.isDevice() or !residual_mt.isDevice()) return null;
+
+        const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
+        if (attention.attn_or_mask == null and attention.kv_cache != null and attention.kv_storage != null) paged_attention: {
+            const trace_quant = traceQuantBlockRequested();
+            const use_active_paged_block = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
+                (attention.mode == .paged_prefill or enableActiveCompressedQuantBlock());
+            const direct_paged_request = .{
+                .num_heads = request.num_heads,
+                .num_kv_heads = request.num_kv_heads,
+                .head_dim = request.head_dim,
+                .attention_linear_slot = request.attention_linear_slot,
+                .hidden_size = request.hidden_size,
+                .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                .intermediate_size = request.intermediate_size,
+                .ple = ple_mt_override,
+                .ple_gate_linear_slot = request.ple_gate_linear_slot,
+                .ple_proj_linear_slot = request.ple_proj_linear_slot,
+                .ple_post_norm_slot = request.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+            };
+            if (use_active_paged_block and metal_runtime.supportsDirectPagedGatedDecoderBlockDevice(self.provider_impl, direct_paged_request)) {
+                const paged_layer = (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse {
+                    if (traceQuantBlockRequested()) std.debug.print(
+                        "metal-prefill-planned-quant-null layer={d} rows={d} reason=no-paged-layer shares_kv={}\n",
+                        .{ attention.layer_index, attention.query_sequence_len, attention.skip_kv_write },
+                    );
+                    return null;
+                };
+                const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
+                defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
+                const block_offsets = block_offsets_opt orelse {
+                    if (traceQuantBlockRequested()) std.debug.print(
+                        "metal-prefill-planned-quant-null layer={d} rows={d} reason=no-block-offsets shares_kv={}\n",
+                        .{ attention.layer_index, attention.query_sequence_len, attention.skip_kv_write },
+                    );
+                    return null;
+                };
+                const k_suffix = if (attention.skip_kv_write) null else (maybe_k_mt orelse {
+                    if (traceQuantBlockRequested()) std.debug.print(
+                        "metal-prefill-planned-quant-null layer={d} rows={d} reason=no-k-suffix\n",
+                        .{ attention.layer_index, attention.query_sequence_len },
+                    );
+                    return null;
+                });
+                const v_suffix = if (attention.skip_kv_write) null else (maybe_v_mt orelse {
+                    if (traceQuantBlockRequested()) std.debug.print(
+                        "metal-prefill-planned-quant-null layer={d} rows={d} reason=no-v-suffix\n",
+                        .{ attention.layer_index, attention.query_sequence_len },
+                    );
+                    return null;
+                });
+                const output_scale_value_active: ?f32 = request.output_scale_value orelse if (request.output_scale) |scale_ct| blk: {
+                    const scale_buf = toBuf(scale_ct);
+                    if (bufElemCount(scale_buf) != 1) {
+                        if (traceQuantBlockRequested()) std.debug.print(
+                            "metal-prefill-planned-quant-null layer={d} rows={d} reason=scale-shape\n",
+                            .{ attention.layer_index, attention.query_sequence_len },
+                        );
+                        return null;
+                    }
+                    break :blk tryDirectDenseHostValue(scale_buf, 0) orelse {
+                        if (traceQuantBlockRequested()) std.debug.print(
+                            "metal-prefill-planned-quant-null layer={d} rows={d} reason=scale-host-value\n",
+                            .{ attention.layer_index, attention.query_sequence_len },
+                        );
+                        return null;
+                    };
+                } else null;
+                try q_mt.retainForActiveFrame();
+                if (k_suffix) |k_mt| try k_mt.retainForActiveFrame();
+                if (v_suffix) |v_mt| try v_mt.retainForActiveFrame();
+                try residual_mt.retainForActiveFrame();
+                if (ple_mt_override) |ple_mt| try ple_mt.retainForActiveFrame();
+                if (output_mt) |out| {
+                    if (try metal_runtime.runAttentionPagedGatedDecoderBlockDeviceInto(
+                        self.provider_impl,
+                        .{
+                            .query_sequence_len = attention.query_sequence_len,
+                            .kv_tokens = attention.kv_sequence_len,
+                            .num_heads = request.num_heads,
+                            .num_kv_heads = request.num_kv_heads,
+                            .head_dim = request.head_dim,
+                            .query_position_offset = query_position_offset,
+                            .kv_position_offset = attention.kv_position_offset,
+                            .sliding_window = attention.sliding_window,
+                            .total_sequence_len = attention.total_sequence_len,
+                            .attention_linear_slot = request.attention_linear_slot,
+                            .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                            .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                            .hidden_size = request.hidden_size,
+                            .eps = request.eps,
+                            .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                            .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                            .ffn_post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+                            .ffn_post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+                            .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                            .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                            .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                            .intermediate_size = request.intermediate_size,
+                            .activation = request.activation,
+                            .layer_index = attention.layer_index,
+                            .ple = ple_mt_override,
+                            .ple_gate_linear_slot = request.ple_gate_linear_slot,
+                            .ple_proj_linear_slot = request.ple_proj_linear_slot,
+                            .ple_post_norm_slot = request.ple_post_norm_slot,
+                            .ple_hidden_size = request.ple_hidden_size,
+                            .output_scale_value = output_scale_value_active,
+                            .planned_layer_contract = request.planned_layer_contract,
+                        },
+                        q_mt,
+                        k_suffix,
+                        v_suffix,
+                        residual_mt,
+                        paged_layer,
+                        block_offsets,
+                        out,
+                        &self.timing_stats,
+                    )) {
+                        if (!attention.skip_kv_write) {
+                            if (kv_suffix_device_written) |written| written.* = true;
+                        }
+                        return try out.retainedCopy();
+                    }
+                }
+                if (try metal_runtime.runAttentionPagedGatedDecoderBlockDevice(
+                    self.provider_impl,
+                    .{
+                        .query_sequence_len = attention.query_sequence_len,
+                        .kv_tokens = attention.kv_sequence_len,
+                        .num_heads = request.num_heads,
+                        .num_kv_heads = request.num_kv_heads,
+                        .head_dim = request.head_dim,
+                        .query_position_offset = query_position_offset,
+                        .kv_position_offset = attention.kv_position_offset,
+                        .sliding_window = attention.sliding_window,
+                        .total_sequence_len = attention.total_sequence_len,
+                        .attention_linear_slot = request.attention_linear_slot,
+                        .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                        .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                        .hidden_size = request.hidden_size,
+                        .eps = request.eps,
+                        .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                        .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                        .ffn_post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+                        .ffn_post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+                        .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                        .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                        .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                        .intermediate_size = request.intermediate_size,
+                        .activation = request.activation,
+                        .layer_index = attention.layer_index,
+                        .ple = ple_mt_override,
+                        .ple_gate_linear_slot = request.ple_gate_linear_slot,
+                        .ple_proj_linear_slot = request.ple_proj_linear_slot,
+                        .ple_post_norm_slot = request.ple_post_norm_slot,
+                        .ple_hidden_size = request.ple_hidden_size,
+                        .output_scale_value = output_scale_value_active,
+                        .planned_layer_contract = request.planned_layer_contract,
+                    },
+                    q_mt,
+                    k_suffix,
+                    v_suffix,
+                    residual_mt,
+                    paged_layer,
+                    block_offsets,
+                    &self.timing_stats,
+                )) |tensor| {
+                    if (!attention.skip_kv_write) {
+                        if (kv_suffix_device_written) |written| written.* = true;
+                    }
+                    return tensor;
+                }
+                if (traceQuantBlockRequested()) std.debug.print(
+                    "metal-prefill-planned-quant-null layer={d} rows={d} reason=runtime-null shares_kv={} ple={}\n",
+                    .{ attention.layer_index, attention.query_sequence_len, attention.skip_kv_write, ple_mt_override != null },
+                );
+                break :paged_attention;
+            } else if (use_active_paged_block and traceQuantBlockRequested()) {
+                std.debug.print(
+                    "metal-prefill-planned-quant-skip layer={d} rows={d} reason=non-quant-block-slots\n",
+                    .{ attention.layer_index, attention.query_sequence_len },
+                );
+            }
+            const storage_ready = if (attention.skip_kv_write)
+                true
+            else blk: {
+                if (!(try self.ensurePagedKvDevicePrefixFromBackendCache(
+                    attention,
+                    request.num_kv_heads,
+                    request.head_dim,
+                ))) {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-paged-fallback-null layer={d} rows={d} reason=kv-prefix-device-cache\n",
+                        .{ attention.layer_index, attention.query_sequence_len },
+                    );
+                    break :paged_attention;
+                }
+                const k_mt = maybe_k_mt orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-paged-fallback-null layer={d} rows={d} reason=no-k-suffix\n",
+                        .{ attention.layer_index, attention.query_sequence_len },
+                    );
+                    break :paged_attention;
+                };
+                const v_mt = maybe_v_mt orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-paged-fallback-null layer={d} rows={d} reason=no-v-suffix\n",
+                        .{ attention.layer_index, attention.query_sequence_len },
+                    );
+                    break :paged_attention;
+                };
+                const wrote = try writePagedKvSuffixDeviceFromTensors(
+                    attention,
+                    k_mt,
+                    v_mt,
+                    @intCast(request.num_kv_heads),
+                    @intCast(request.head_dim),
+                );
+                if (wrote) {
+                    if (kv_suffix_device_written) |written| written.* = true;
+                }
+                break :blk wrote;
+            };
+            if (!storage_ready) {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-paged-fallback-null layer={d} rows={d} reason=kv-suffix-write\n",
+                    .{ attention.layer_index, attention.query_sequence_len },
+                );
+                break :paged_attention;
+            }
+            const paged_layer = (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-paged-fallback-null layer={d} rows={d} reason=no-paged-layer-after-write\n",
+                    .{ attention.layer_index, attention.query_sequence_len },
+                );
+                break :paged_attention;
+            };
+            const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
+            defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
+            const block_offsets = block_offsets_opt orelse {
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-paged-fallback-null layer={d} rows={d} reason=no-block-offsets-after-write\n",
+                    .{ attention.layer_index, attention.query_sequence_len },
+                );
+                break :paged_attention;
+            };
+            if (dumpDecodeKvLayerTarget()) |target_layer| {
+                if (target_layer == attention.layer_index) {
+                    if (try gatherFullKvFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |gathered| {
+                        var gathered_full = gathered;
+                        defer gathered_full.deinit();
+                        try self.maybeDumpDecodeKvTensor("paged-k", attention.layer_index, &gathered_full.k, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
+                        try self.maybeDumpDecodeKvTensor("paged-v", attention.layer_index, &gathered_full.v, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
+                    }
+                }
+            }
+            if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+                try q_mt.retainForActiveFrame();
+                try residual_mt.retainForActiveFrame();
+            }
+            if (pagedSlotAttentionSupported(paged_layer)) {
+                var attn_out = (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlot(self.provider_impl, .{
+                    .q = q_mt,
+                    .slot = paged_layer.slot,
+                    .format = paged_layer.format,
+                    .block_token_offsets = block_offsets,
+                    .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
+                    .kv_tokens = attention.kv_sequence_len,
+                    .num_heads = request.num_heads,
+                    .num_kv_heads = request.num_kv_heads,
+                    .head_dim = request.head_dim,
+                    .key_row_bytes = paged_layer.key_row_bytes,
+                    .base_key_row_bytes = paged_layer.base_key_row_bytes,
+                    .query_position = attention.total_sequence_len - 1,
+                    .query_position_offset = query_position_offset,
+                    .kv_position_offset = attention.kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                    .planned_layer_contract = request.planned_layer_contract,
+                })) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-paged-fallback-null layer={d} rows={d} reason=paged-slot-attention-runtime\n",
+                        .{ attention.layer_index, attention.query_sequence_len },
+                    );
+                    break :paged_attention;
+                };
+                defer attn_out.deinit();
+                if (try self.finishGatedDecoderBlockFromAttentionOutputMt(
+                    request,
+                    attention.layer_index,
+                    attn_out,
+                    residual_mt,
+                    null,
+                )) |tensor| return tensor;
+                if (trace_quant) std.debug.print(
+                    "metal-prefill-paged-fallback-null layer={d} rows={d} reason=finish-block\n",
+                    .{ attention.layer_index, attention.query_sequence_len },
+                );
+            } else if (trace_quant) {
+                std.debug.print(
+                    "metal-prefill-paged-fallback-null layer={d} rows={d} reason=paged-slot-unsupported format={d}\n",
+                    .{ attention.layer_index, attention.query_sequence_len, paged_layer.format },
+                );
+            }
+        }
+
+        var owned_gathered: ?GatheredFullKv = null;
+        defer if (owned_gathered) |*full| full.deinit();
+        const gathered_k: MetalTensor, const gathered_v: MetalTensor = if (attention.skip_kv_write) blk: {
+            owned_gathered = (try gatherFullKvFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse
+                (try self.gatherFullKvFromBackendCache(attention, request.num_kv_heads, request.head_dim, false)) orelse
+                return null;
+            break :blk .{ owned_gathered.?.k, owned_gathered.?.v };
+        } else blk: {
+            const k_mt = maybe_k_mt orelse return null;
+            const v_mt = maybe_v_mt orelse return null;
+            if (!k_mt.isDevice() or !v_mt.isDevice()) return null;
+            if (try gatherFullKvFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |gathered| {
+                owned_gathered = gathered;
+                break :blk .{ owned_gathered.?.k, owned_gathered.?.v };
+            }
+            const kv = attention.kv_cache.?;
+            const key: metal_runtime.GatheredSpanKey = .{
+                .source_ptr_id = source.ptr_id,
+                .sequence_id = kv.sequence_id,
+                .layer_index = attention.layer_index,
+            };
+            var full_k: ?MetalTensor = null;
+            defer if (full_k) |*tensor| tensor.deinit();
+            var full_v: ?MetalTensor = null;
+            defer if (full_v) |*tensor| tensor.deinit();
+            if (attention.query_sequence_len < attention.kv_sequence_len and
+                !metal_runtime.hasGatheredSpanCache(self.provider_impl, source.ptr_id, kv.sequence_id, attention.layer_index))
+            {
+                const prior_tokens = attention.kv_sequence_len - attention.query_sequence_len;
+                const row_width = request.num_kv_heads * request.head_dim;
+                const backend_key: BackendKvCacheKey = .{
+                    .source_ptr_id = source.ptr_id,
+                    .sequence_id = kv.sequence_id,
+                    .layer_index = attention.layer_index,
+                };
+                if (self.backend_kv_cache.getPtr(backend_key)) |cache_entry| {
+                    if (cache_entry.position_offset == attention.kv_position_offset and
+                        cache_entry.token_count >= prior_tokens and
+                        cache_entry.row_width == row_width)
+                    {
+                        const prefix_shape = [_]i32{ @intCast(prior_tokens), @intCast(row_width) };
+                        var prefix_k = if (cache_entry.token_count == prior_tokens)
+                            try cache_entry.k.retainedCopy()
+                        else
+                            try cache_entry.k.retainedView(0, prior_tokens * row_width * @sizeOf(f32), &prefix_shape);
+                        defer prefix_k.deinit();
+                        var prefix_v = if (cache_entry.token_count == prior_tokens)
+                            try cache_entry.v.retainedCopy()
+                        else
+                            try cache_entry.v.retainedView(0, prior_tokens * row_width * @sizeOf(f32), &prefix_shape);
+                        defer prefix_v.deinit();
+                        full_k = try metal_runtime.concatenateRows(self.provider_impl, prefix_k, k_mt);
+                        full_v = try metal_runtime.concatenateRows(self.provider_impl, prefix_v, v_mt);
+                    }
+                }
+            }
+            const entry = (try metal_runtime.updateGatheredSpan(
+                self.provider_impl,
+                key,
+                k_mt,
+                v_mt,
+                &.{},
+                &.{},
+                &.{},
+                full_k,
+                full_v,
+                attention.query_sequence_len,
+                attention.kv_sequence_len,
+                attention.kv_position_offset,
+                &self.timing_stats,
+            )) orelse return null;
+            owned_gathered = .{
+                .k = try entry.k.retainedCopy(),
+                .v = try entry.v.retainedCopy(),
+            };
+            break :blk .{ owned_gathered.?.k, owned_gathered.?.v };
+        };
+
+        const ple_mt: ?MetalTensor = if (ple_mt_override) |mt|
+            mt
+        else if (request.ple) |ple_ct|
+            try self.borrowedMetalTensorFromCt(ple_ct)
+        else
+            null;
+        const output_scale_value: ?f32 = request.output_scale_value orelse if (request.output_scale) |scale_ct| blk: {
+            const scale_buf = toBuf(scale_ct);
+            if (bufElemCount(scale_buf) != 1) return null;
+            break :blk tryDirectDenseHostValue(scale_buf, 0) orelse return null;
+        } else null;
+        const block_request = .{
+            .query_sequence_len = attention.query_sequence_len,
+            .kv_tokens = attention.kv_sequence_len,
+            .num_heads = request.num_heads,
+            .num_kv_heads = request.num_kv_heads,
+            .head_dim = request.head_dim,
+            .query_position_offset = query_position_offset,
+            .kv_position_offset = attention.kv_position_offset,
+            .sliding_window = attention.sliding_window,
+            .total_sequence_len = attention.total_sequence_len,
+            .attention_linear_slot = request.attention_linear_slot,
+            .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+            .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+            .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+            .ffn_post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+            .ffn_post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+            .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+            .up_ffn_linear_slot = request.up_ffn_linear_slot,
+            .down_ffn_linear_slot = request.down_ffn_linear_slot,
+            .intermediate_size = request.intermediate_size,
+            .activation = request.activation,
+            .layer_index = attention.layer_index,
+            .ple = ple_mt,
+            .ple_gate_linear_slot = request.ple_gate_linear_slot,
+            .ple_proj_linear_slot = request.ple_proj_linear_slot,
+            .ple_post_norm_slot = request.ple_post_norm_slot,
+            .ple_hidden_size = request.ple_hidden_size,
+            .output_scale_value = output_scale_value,
+            .planned_layer_contract = request.planned_layer_contract,
+        };
+        const active_frame = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+        const planned_contract_active = request.planned_layer_contract.ops.len != 0 or
+            request.planned_layer_contract.command_ops.len != 0;
+        const allow_gathered_direct_block = attention.query_sequence_len == 1 and !active_frame and !planned_contract_active;
+        const compare_monolithic = allow_gathered_direct_block and compareMonolithicQuantBlock();
+        var monolithic_compare: ?MetalTensor = null;
+        defer if (monolithic_compare) |*tensor| tensor.deinit();
+        if (allow_gathered_direct_block and !compare_monolithic) if (output_mt) |out| {
+            if (try metal_runtime.runAttentionF32GatedDecoderBlockDeviceInto(
+                self.provider_impl,
+                block_request,
+                q_mt,
+                gathered_k,
+                gathered_v,
+                residual_mt,
+                out,
+                &self.timing_stats,
+            )) {
+                return try out.retainedCopy();
+            }
+        };
+        if (allow_gathered_direct_block) {
+            if (try metal_runtime.runAttentionF32GatedDecoderBlockDevice(self.provider_impl, block_request, q_mt, gathered_k, gathered_v, residual_mt, &self.timing_stats)) |tensor| {
+                if (compare_monolithic) {
+                    monolithic_compare = tensor;
+                } else {
+                    return tensor;
+                }
+            } else if (!compare_monolithic) {
+                return null;
+            }
+        }
+        if (compare_monolithic and monolithic_compare == null) {
+            std.debug.print(
+                "metal-quant-monolithic-vs-staged layer={d} monolithic_unavailable mode={s} q_len={d}\n",
+                .{ attention.layer_index, @tagName(attention.mode), attention.query_sequence_len },
+            );
+        }
+
+        if (compare_monolithic) {
+            try metal_runtime.flushActiveFrame(self.provider_impl.raw_decode_runtime);
+        }
+
+        if (!active_frame or planned_contract_active) return null;
+
+        try q_mt.retainForActiveFrame();
+        try gathered_k.retainForActiveFrame();
+        try gathered_v.retainForActiveFrame();
+        try residual_mt.retainForActiveFrame();
+
+        var attn_out = (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+            .q = q_mt,
+            .k = gathered_k,
+            .v = gathered_v,
+            .bias = @as(?metal_runtime.MetalTensor, null),
+            .attn_or_mask = attention.attn_or_mask,
+            .q_len = attention.query_sequence_len,
+            .kv_len = attention.kv_sequence_len,
+            .num_heads = request.num_heads,
+            .num_kv_heads = request.num_kv_heads,
+            .head_dim = request.head_dim,
+            .query_position_offset = query_position_offset,
+            .kv_position_offset = attention.kv_position_offset,
+            .sliding_window = attention.sliding_window,
+            .total_sequence_len = attention.total_sequence_len,
+        })) orelse return null;
+        defer attn_out.deinit();
+
+        const attention_input_size = request.num_heads * request.head_dim;
+        var projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .slot = request.attention_linear_slot,
+            .input = attn_out,
+            .in_dim = attention_input_size,
+            .out_dim = request.hidden_size,
+        })) orelse return null;
+        defer projected.deinit();
+
+        var attn_post = if (request.attention_post_linear_rms_norm_slot) |slot|
+            (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                .slot = slot,
+                .input = projected,
+                .hidden_size = request.hidden_size,
+                .eps = request.eps,
+            }, &self.timing_stats)) orelse return null
+        else
+            try projected.retainedCopy();
+        defer attn_post.deinit();
+
+        var attn_res = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+            .lhs = attn_post,
+            .rhs = residual_mt,
+            .dim = request.hidden_size,
+        }, &self.timing_stats)) orelse return null;
+        defer attn_res.deinit();
+
+        var ffn_normed = (try metal_runtime.decoderRuntimeApplyFfnNormInternal(
+            self.provider_impl,
+            attn_res,
+            request.ffn_layer_norm_slot,
+            request.ffn_rms_norm_slot,
+            request.hidden_size,
+            request.eps,
+        )) orelse return null;
+        defer ffn_normed.deinit();
+
+        if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
+            .gate_linear_slot = request.gate_ffn_linear_slot,
+            .up_linear_slot = request.up_ffn_linear_slot,
+            .down_linear_slot = request.down_ffn_linear_slot,
+            .rows = @as(usize, @intCast(ffn_normed.dim(0))),
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .activation = request.activation,
+            .eps = request.eps,
+            .post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+            .post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+        }, ffn_normed, attn_res, &self.timing_stats)) |tensor| {
+            if (monolithic_compare) |*mono| {
+                var staged = tensor;
+                try compareMetalTensors("metal-quant-monolithic-vs-direct-ffn", attention.layer_index, request.hidden_size, mono, &staged);
+            }
+            return tensor;
+        }
+
+        const ffn_rows = @as(usize, @intCast(ffn_normed.dim(0)));
+        var gate_proj: MetalTensor = undefined;
+        var up_proj: MetalTensor = undefined;
+        if (ffn_rows == 1) {
+            const gate_up = (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
+                .slot_a = request.gate_ffn_linear_slot,
+                .slot_b = request.up_ffn_linear_slot,
+                .input = ffn_normed,
+                .in_dim = request.hidden_size,
+                .out_dim = request.intermediate_size,
+            })) orelse return null;
+            gate_proj = gate_up.first;
+            up_proj = gate_up.second;
+        } else {
+            gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = request.gate_ffn_linear_slot,
+                .input = ffn_normed,
+                .in_dim = request.hidden_size,
+                .out_dim = request.intermediate_size,
+            })) orelse return null;
+            errdefer gate_proj.deinit();
+            up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = request.up_ffn_linear_slot,
+                .input = ffn_normed,
+                .in_dim = request.hidden_size,
+                .out_dim = request.intermediate_size,
+            })) orelse return null;
+        }
+        defer gate_proj.deinit();
+        defer up_proj.deinit();
+
+        var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+            .input = gate_proj,
+            .kind = request.activation,
+            .dim = request.intermediate_size,
+        }, &self.timing_stats)) orelse return null;
+        defer activated.deinit();
+
+        var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+            self.provider_impl,
+            activated,
+            up_proj,
+            request.intermediate_size,
+        )) orelse return null;
+        defer gated.deinit();
+
+        var down = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .slot = request.down_ffn_linear_slot,
+            .input = gated,
+            .in_dim = request.intermediate_size,
+            .out_dim = request.hidden_size,
+        })) orelse return null;
+        defer down.deinit();
+
+        var down_post = if (request.ffn_post_down_rms_norm_slot) |slot|
+            (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                .slot = slot,
+                .input = down,
+                .hidden_size = request.hidden_size,
+                .eps = request.eps,
+            }, &self.timing_stats)) orelse return null
+        else
+            try down.retainedCopy();
+        defer down_post.deinit();
+
+        var staged_result = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+            .lhs = down_post,
+            .rhs = attn_res,
+            .dim = request.hidden_size,
+        }, &self.timing_stats)) orelse return null;
+        errdefer staged_result.deinit();
+        if (monolithic_compare) |*mono| {
+            try compareMetalTensors("metal-quant-monolithic-vs-staged", attention.layer_index, request.hidden_size, mono, &staged_result);
+        }
+        return staged_result;
+    }
+
+    fn runGatedDecoderBlockOp(ctx: *anyopaque, request: *const ops.RunGatedDecoderBlockRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const attention = request.attention;
+        if (attention.mode != .paged_decode and attention.mode != .paged_prefill) return null;
+        if (attention.mode == .paged_decode and attention.query_sequence_len != 1) return null;
+        if (attention.query_sequence_len == 0 or attention.attn_or_mask != null) return null;
+        _ = attention.kv_cache orelse return null;
+        if (attention.kv_manager == null and attention.kv_storage == null) return null;
+        if (request.q == null and request.attention_input == null) return null;
+        if (!attention.skip_kv_write and
+            (request.k == null or request.v == null) and
+            (request.attention_input == null or request.q_linear_slot == null or request.k_linear_slot == null or request.v_linear_slot == null))
+        {
+            return null;
+        }
+
+        const source = try attentionKvSource(attention);
+        const frame_active = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+        if (attention.mode == .paged_prefill) {
+            self.timing_stats.f32_kv_gated_block_calls += 1;
+            if (try runGatedPrefillLayerFromAttentionInput(ctx, self, request, source)) |layer_ct| {
+                self.timing_stats.f32_kv_gated_block_successes += 1;
+                return layer_ct;
+            }
+            const tensor = (try self.runGatedDecoderBlockF32KvDevice(request, source)) orelse {
+                self.timing_stats.f32_kv_gated_block_nulls += 1;
+                return null;
+            };
+            self.timing_stats.f32_kv_gated_block_successes += 1;
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        const format_opt = directAttentionSpanFormat(&source.kv_storage, request.num_kv_heads, request.head_dim);
+        if (frame_active and format_opt != null and !enableActiveCompressedQuantBlock()) {
+            self.timing_stats.f32_kv_gated_block_calls += 1;
+            self.timing_stats.compressed_block_active_frame_f32_reroutes += 1;
+            const tensor = (try self.runGatedDecoderBlockF32KvDevice(request, source)) orelse {
+                self.timing_stats.f32_kv_gated_block_nulls += 1;
+                return null;
+            };
+            self.timing_stats.f32_kv_gated_block_successes += 1;
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        const format = format_opt orelse {
+            self.timing_stats.f32_kv_gated_block_calls += 1;
+            const tensor = (try self.runGatedDecoderBlockF32KvDevice(request, source)) orelse {
+                self.timing_stats.f32_kv_gated_block_nulls += 1;
+                return null;
+            };
+            self.timing_stats.f32_kv_gated_block_successes += 1;
+            return self.ctFromOwnedMetalTensor(tensor);
+        };
+        if (request.ple != null) return null;
+        if (metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.attention_linear_slot, request.num_heads * request.head_dim, request.hidden_size) == false) return null;
+        if (metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size) == false) return null;
+        if (metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size) == false) return null;
+        if (metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.down_ffn_linear_slot, request.intermediate_size, request.hidden_size) == false) return null;
+
+        if (attention.decoder_runtime_resident_kv_sequence_len != null and
+            attention.decoder_runtime_resident_kv_position_offset != null)
+        {
+            const prior_kv_tokens = attention.decoder_runtime_resident_kv_sequence_len.?;
+            const prior_kv_position_offset = attention.decoder_runtime_resident_kv_position_offset.?;
+            const prior_end = prior_kv_position_offset + prior_kv_tokens;
+            const current_end = attention.kv_position_offset + attention.kv_sequence_len;
+            if (attention.kv_position_offset < prior_kv_position_offset or current_end < prior_end) {
+                metal_runtime.decoderRuntimeResetState(self.provider_impl);
+            }
+        }
+
+        const residual_mt = try self.borrowedMetalTensorFromCt(request.residual);
+        var attention_input_mt: ?MetalTensor = null;
+        if (request.attention_input) |attention_input_ct| {
+            attention_input_mt = try self.borrowedMetalTensorFromCt(attention_input_ct);
+        }
+        var q_mt: ?MetalTensor = null;
+        if (request.q) |q_ct| {
+            q_mt = try self.borrowedMetalTensorFromCt(q_ct);
+        }
+        var k_mt: ?MetalTensor = null;
+        if (request.k) |k_ct| {
+            const k_buf = toBuf(k_ct);
+            if (k_buf.quantized_storage != null) return error.UnsupportedTensorType;
+            k_mt = try self.borrowedMetalTensorFromCt(k_ct);
+        }
+        var v_mt: ?MetalTensor = null;
+        if (request.v) |v_ct| {
+            const v_buf = toBuf(v_ct);
+            if (v_buf.quantized_storage != null) return error.UnsupportedTensorType;
+            v_mt = try self.borrowedMetalTensorFromCt(v_ct);
+        }
+
+        const kv = attention.kv_cache.?;
+        var bootstrap: ?PagedKvBootstrap = null;
+        defer if (bootstrap) |*owned| owned.deinit(self.allocator);
+        if (attention.query_sequence_len < attention.kv_sequence_len and
+            !metal_runtime.hasGatheredSpanCache(self.provider_impl, source.ptr_id, kv.sequence_id, attention.layer_index))
+        {
+            if (frame_active) {
+                self.timing_stats.compressed_block_active_frame_bootstrap_misses += 1;
+                return null;
+            }
+            bootstrap = try self.gatherPagedKvBootstrapFromBackendCache(attention, request.num_kv_heads, request.head_dim);
+        }
+
+        const tensor = (try metal_runtime.runCompressedAttentionGatedDecoderBlockBackend(
+            self.provider_impl,
+            ctx,
+            .{
+                .q = q_mt,
+                .k_suffix = k_mt,
+                .v_suffix = v_mt,
+                .attention_input = attention_input_mt,
+                .q_linear_slot = request.q_linear_slot,
+                .k_linear_slot = request.k_linear_slot,
+                .v_linear_slot = request.v_linear_slot,
+                .bootstrap_k_blocks = if (bootstrap) |owned| owned.k_blocks else &.{},
+                .bootstrap_v_blocks = if (bootstrap) |owned| owned.v_blocks else &.{},
+                .bootstrap_block_token_counts = if (bootstrap) |owned| owned.token_counts else &.{},
+                .full_k = null,
+                .full_v = null,
+                .kv_manager = attention.kv_manager,
+                .kv_storage = attention.kv_storage,
+                .kv_pool_id = kv.pool_id,
+                .skip_kv_write = attention.skip_kv_write,
+                .source_ptr_id = source.ptr_id,
+                .sequence_id = kv.sequence_id,
+                .layer_index = attention.layer_index,
+                .query_sequence_len = attention.query_sequence_len,
+                .kv_tokens = attention.kv_sequence_len,
+                .num_heads = request.num_heads,
+                .num_kv_heads = request.num_kv_heads,
+                .head_dim = request.head_dim,
+                .key_row_bytes = directAttentionSpanKeyRowBytes(request.num_kv_heads, request.head_dim, format),
+                .query_position = attention.total_sequence_len - 1,
+                .kv_position_offset = attention.kv_position_offset,
+                .sliding_window = attention.sliding_window,
+                .format = format,
+                .attention_linear_slot = request.attention_linear_slot,
+                .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                .residual = residual_mt,
+                .hidden_size = request.hidden_size,
+                .eps = request.eps,
+                .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                .ffn_post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+                .ffn_post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+                .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                .intermediate_size = request.intermediate_size,
+                .activation = request.activation,
+            },
+            &self.timing_stats,
+            &self.logged_quantized_gated_ffn_unsupported_type,
+            &self.logged_quantized_gated_ffn_backend_mixed_kind,
+            &self.logged_quantized_gated_ffn_backend_unsupported_kind,
+            runGatedFfnResidualOp,
+            decoderRuntimeApplyLinearOp,
+            decoderRuntimeApplyLinearPairOp,
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyBlockFfnNorm(
+        ctx: *anyopaque,
+        input: CT,
+        layer_norm_slot: ?usize,
+        rms_norm_slot: ?usize,
+        hidden_size: usize,
+        eps: f32,
+    ) anyerror!?CT {
+        if (layer_norm_slot) |slot| {
+            return decoderRuntimeApplyLayerNormOp(ctx, &.{
+                .slot = slot,
+                .input = input,
+                .hidden_size = hidden_size,
+                .eps = eps,
+            });
+        }
+        if (rms_norm_slot) |slot| {
+            return decoderRuntimeApplyRmsNormOp(ctx, &.{
+                .slot = slot,
+                .input = input,
+                .hidden_size = hidden_size,
+                .eps = eps,
+            });
+        }
+        return input;
+    }
+
+    fn runDenseFfnResidualOp(ctx: *anyopaque, request: *const ops.RunDenseFfnResidualRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var residual = try self.ownedMetalTensorFromCt(request.residual);
+        defer residual.deinit();
+        if (try metal_runtime.decoderRuntimeApplyLinearActivationLinearResidual(self.provider_impl, .{
+            .first_linear_slot = request.first_linear_slot,
+            .second_linear_slot = request.second_linear_slot,
+            .input = input,
+            .residual = residual,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .activation = request.activation,
+        })) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        const first = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.first_linear_slot,
+            .input = request.input,
+            .in_dim = request.hidden_size,
+            .out_dim = request.intermediate_size,
+        })) orelse return null;
+        defer freeOp(ctx, first);
+
+        const activated = (try decoderRuntimeApplyActivationOp(ctx, &.{
+            .input = first,
+            .kind = request.activation,
+            .dim = request.intermediate_size,
+        })) orelse return null;
+        defer freeOp(ctx, activated);
+
+        const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.second_linear_slot,
+            .input = activated,
+            .in_dim = request.intermediate_size,
+            .out_dim = request.hidden_size,
+        })) orelse return null;
+        defer freeOp(ctx, projected);
+
+        return addOp(ctx, projected, request.residual);
+    }
+
+    fn runGatedFfnResidualOp(ctx: *anyopaque, request: *const ops.RunGatedFfnResidualRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const frame_active = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+        const input_buf = toBuf(request.input);
+        const residual_buf = toBuf(request.residual);
+        if (input_buf.quantized_storage != null or residual_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        const input_shape = input_buf.logical_shape orelse return null;
+        const residual_shape = residual_buf.logical_shape orelse return null;
+        if (input_shape.len != 2 or residual_shape.len != 2) return null;
+        const rows: usize = @intCast(input_shape[0]);
+        if (rows == 0) return null;
+        if (@as(usize, @intCast(input_shape[1])) != request.hidden_size or
+            @as(usize, @intCast(residual_shape[0])) != rows or
+            @as(usize, @intCast(residual_shape[1])) != request.hidden_size)
+        {
+            return null;
+        }
+
+        if (input_buf.metal_tensor) |input_mt| {
+            if (residual_buf.metal_tensor) |residual_mt| {
+                if (input_mt.isDevice() and residual_mt.isDevice()) {
+                    if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(
+                        self.provider_impl,
+                        .{
+                            .rows = rows,
+                            .hidden_size = request.hidden_size,
+                            .intermediate_size = request.intermediate_size,
+                            .activation = request.activation,
+                            .eps = request.eps,
+                            .gate_linear_slot = request.gate_linear_slot,
+                            .up_linear_slot = request.up_linear_slot,
+                            .down_linear_slot = request.down_linear_slot,
+                            .post_gate_rms_norm_slot = request.post_gate_rms_norm_slot,
+                            .post_down_rms_norm_slot = request.post_down_rms_norm_slot,
+                            .planned_layer_contract = request.planned_layer_contract,
+                        },
+                        input_mt,
+                        residual_mt,
+                        &self.timing_stats,
+                    )) |tensor| {
+                        self.timing_stats.quantized_gated_ffn_direct_successes += 1;
+                        return self.ctFromOwnedMetalTensor(tensor);
+                    }
+                }
+            }
+        }
+
+        if (try self.runStagedGatedFfnResidualDevice(request)) |tensor| return tensor;
+
+        if (frame_active) return null;
+
+        const input_data = try hostSliceForBuf(input_buf);
+        const residual_data = try hostSliceForBuf(residual_buf);
+        if (input_data.len != rows * request.hidden_size or residual_data.len != rows * request.hidden_size) return null;
+
+        if (!metal_runtime.shouldAttemptDirectQuantizedGatedFfn(
+            self.provider_impl,
+            request.gate_linear_slot,
+            request.up_linear_slot,
+            request.down_linear_slot,
+            &self.timing_stats,
+            &self.logged_quantized_gated_ffn_backend_mixed_kind,
+            &self.logged_quantized_gated_ffn_backend_unsupported_kind,
+        )) return null;
+
+        const output = try std.heap.c_allocator.alloc(f32, rows * request.hidden_size);
+        errdefer std.heap.c_allocator.free(output);
+        const compare_batched = rows > 1 and std.c.getenv("TERMITE_METAL_COMPARE_BATCHED_GATED_FFN") != null;
+        if (!(try metal_runtime.tryRawQuantizedGatedFfnResidualHost(self.provider_impl, .{
+            .input = input_data.ptr,
+            .residual = residual_data.ptr,
+            .rows = rows,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .activation = request.activation,
+            .gate_linear_slot = request.gate_linear_slot,
+            .up_linear_slot = request.up_linear_slot,
+            .down_linear_slot = request.down_linear_slot,
+            .post_gate_rms_norm_slot = request.post_gate_rms_norm_slot,
+            .post_down_rms_norm_slot = request.post_down_rms_norm_slot,
+            .output = output.ptr,
+        }, &self.timing_stats, &self.logged_quantized_gated_ffn_unsupported_type))) {
+            return null;
+        }
+        if (compare_batched) {
+            const rowwise_output = try std.heap.c_allocator.alloc(f32, rows * request.hidden_size);
+            defer std.heap.c_allocator.free(rowwise_output);
+            for (0..rows) |row| {
+                const row_offset = row * request.hidden_size;
+                if (!(try metal_runtime.tryRawQuantizedGatedFfnResidualHost(self.provider_impl, .{
+                    .input = input_data[row_offset..].ptr,
+                    .residual = residual_data[row_offset..].ptr,
+                    .rows = 1,
+                    .hidden_size = request.hidden_size,
+                    .intermediate_size = request.intermediate_size,
+                    .activation = request.activation,
+                    .gate_linear_slot = request.gate_linear_slot,
+                    .up_linear_slot = request.up_linear_slot,
+                    .down_linear_slot = request.down_linear_slot,
+                    .post_gate_rms_norm_slot = request.post_gate_rms_norm_slot,
+                    .post_down_rms_norm_slot = request.post_down_rms_norm_slot,
+                    .output = rowwise_output[row_offset..].ptr,
+                }, &self.timing_stats, &self.logged_quantized_gated_ffn_unsupported_type))) {
+                    return null;
+                }
+            }
+            var max_abs: f32 = 0.0;
+            var max_idx: usize = 0;
+            for (output, rowwise_output, 0..) |actual, expected, idx| {
+                const diff = @abs(actual - expected);
+                if (diff > max_abs) {
+                    max_abs = diff;
+                    max_idx = idx;
+                }
+            }
+            std.debug.print(
+                "metal-batched-gated-ffn-compare rows={d} hidden={d} intermediate={d} max_abs={d:.6} idx={d}\n",
+                .{ rows, request.hidden_size, request.intermediate_size, max_abs, max_idx },
+            );
+        }
+        self.timing_stats.quantized_gated_ffn_direct_successes += 1;
+        const shape = [_]i32{ @intCast(rows), @intCast(request.hidden_size) };
+        return denseBuf(std.heap.c_allocator, output, true, &shape);
+    }
+
+    fn runStagedGatedFfnResidualDevice(
+        self: *MetalCompute,
+        request: *const ops.RunGatedFfnResidualRequest,
+    ) !?CT {
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var residual = try self.ownedMetalTensorFromCt(request.residual);
+        defer residual.deinit();
+        if (!input.isDevice() or !residual.isDevice()) return null;
+        if (input.ndim() != 2 or residual.ndim() != 2) return null;
+        const rows: usize = @intCast(input.dim(0));
+        if (rows == 0 or @as(usize, @intCast(input.dim(1))) != request.hidden_size) return null;
+        if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != request.hidden_size) return null;
+
+        var gate_proj: MetalTensor = undefined;
+        var up_proj: MetalTensor = undefined;
+        if (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
+            .slot_a = request.gate_linear_slot,
+            .slot_b = request.up_linear_slot,
+            .input = input,
+            .in_dim = request.hidden_size,
+            .out_dim = request.intermediate_size,
+        })) |pair| {
+            gate_proj = pair.first;
+            up_proj = pair.second;
+        } else {
+            gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = request.gate_linear_slot,
+                .input = input,
+                .in_dim = request.hidden_size,
+                .out_dim = request.intermediate_size,
+            })) orelse return null;
+            errdefer gate_proj.deinit();
+            up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = request.up_linear_slot,
+                .input = input,
+                .in_dim = request.hidden_size,
+                .out_dim = request.intermediate_size,
+            })) orelse return null;
+        }
+        defer gate_proj.deinit();
+        defer up_proj.deinit();
+
+        var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+            .input = gate_proj,
+            .kind = request.activation,
+            .dim = request.intermediate_size,
+        }, &self.timing_stats)) orelse return null;
+        defer activated.deinit();
+
+        var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+            self.provider_impl,
+            activated,
+            up_proj,
+            request.intermediate_size,
+        )) orelse return null;
+        defer gated.deinit();
+
+        var projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .slot = request.down_linear_slot,
+            .input = gated,
+            .in_dim = request.intermediate_size,
+            .out_dim = request.hidden_size,
+        })) orelse return null;
+        defer projected.deinit();
+
+        var normalized = if (request.post_down_rms_norm_weight) |weight_ct| blk: {
+            var weight = if (request.post_down_rms_norm_slot) |slot| slot_weight: {
+                if (slot < self.provider_impl.raw_rms_norm_slot_weights.len) {
+                    if (self.provider_impl.raw_rms_norm_slot_weights[slot]) |*slot_weight| {
+                        break :slot_weight try slot_weight.retainedCopy();
+                    }
+                }
+                break :slot_weight try self.ownedDeviceMetalTensorFromCt(weight_ct);
+            } else try self.ownedDeviceMetalTensorFromCt(weight_ct);
+            defer weight.deinit();
+            break :blk (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
+                self.provider_impl,
+                projected,
+                weight,
+                request.hidden_size,
+                request.eps,
+            )) orelse if (request.post_down_rms_norm_slot) |slot|
+                (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                    .slot = slot,
+                    .input = projected,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.eps,
+                }, &self.timing_stats)) orelse return null
+            else
+                return null;
+        } else if (request.post_down_rms_norm_slot) |slot|
+            (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                .slot = slot,
+                .input = projected,
+                .hidden_size = request.hidden_size,
+                .eps = request.eps,
+            }, &self.timing_stats)) orelse return null
+        else
+            try projected.retainedCopy();
+        defer normalized.deinit();
+
+        const output = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+            .lhs = normalized,
+            .rhs = residual,
+            .dim = request.hidden_size,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
+    fn runDenseDecoderBlockOp(ctx: *anyopaque, request: *const ops.RunDenseDecoderBlockRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const cb = ops.ComputeBackend{ .ptr = ctx, .vtable = &vtable_impl };
+        const attention = request.attention;
+        const trace = denseBlockTraceRequested();
+        var q_tensor = request.q;
+        var k_tensor = request.k;
+        var v_tensor = request.v;
+        var owns_q = false;
+        var owns_k = false;
+        var owns_v = false;
+        defer if (owns_q and q_tensor != null) freeOp(ctx, q_tensor.?);
+        defer if (owns_k and k_tensor != null) freeOp(ctx, k_tensor.?);
+        defer if (owns_v and v_tensor != null) freeOp(ctx, v_tensor.?);
+
+        const can_project_from_attention_input = request.attention_input != null and request.fused_qkv_linear_slot != null;
+
+        if ((attention.mode == .paged_prefill or attention.mode == .paged_decode) and
+            attention.attn_or_mask == null and
+            attention.kv_cache != null and
+            (attention.kv_manager != null or attention.kv_storage != null))
+        {
+            const source = try attentionKvSource(attention);
+            const format = directAttentionSpanFormat(&source.kv_storage, request.num_kv_heads, request.head_dim) orelse null;
+            if (format != null and
+                self.provider_impl.raw_linear_slot_kinds[request.attention_linear_slot] == .dense and
+                self.provider_impl.raw_linear_slot_kinds[request.first_ffn_linear_slot] == .dense and
+                self.provider_impl.raw_linear_slot_kinds[request.second_ffn_linear_slot] == .dense)
+            {
+                if (attention.decoder_runtime_resident_kv_sequence_len != null and
+                    attention.decoder_runtime_resident_kv_position_offset != null)
+                {
+                    const prior_kv_tokens = attention.decoder_runtime_resident_kv_sequence_len.?;
+                    const prior_kv_position_offset = attention.decoder_runtime_resident_kv_position_offset.?;
+                    const prior_end = prior_kv_position_offset + prior_kv_tokens;
+                    const current_end = attention.kv_position_offset + attention.kv_sequence_len;
+                    if (attention.kv_position_offset < prior_kv_position_offset or current_end < prior_end) {
+                        metal_runtime.decoderRuntimeResetState(self.provider_impl);
+                    }
+                }
+
+                const residual_buf = toBuf(request.residual);
+                if (residual_buf.quantized_storage == null) {
+                    var residual_mt = try self.ownedMetalTensorFromCt(request.residual);
+                    defer residual_mt.deinit();
+                    const kv = attention.kv_cache.?;
+                    var bootstrap: ?PagedKvBootstrap = null;
+                    defer if (bootstrap) |*owned| owned.deinit(self.allocator);
+                    const frame_active = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+                    if (attention.query_sequence_len < attention.kv_sequence_len and
+                        !metal_runtime.hasGatheredSpanCache(self.provider_impl, source.ptr_id, kv.sequence_id, attention.layer_index))
+                    {
+                        if (frame_active) {
+                            self.timing_stats.compressed_block_active_frame_bootstrap_misses += 1;
+                            return null;
+                        }
+                        bootstrap = try self.gatherPagedKvBootstrapFromBackendCache(attention, request.num_kv_heads, request.head_dim);
+                    }
+
+                    if (q_tensor != null and k_tensor != null and v_tensor != null) {
+                        const k_ct_fast = k_tensor.?;
+                        const v_ct_fast = v_tensor.?;
+                        const k_buf = toBuf(k_ct_fast);
+                        const v_buf = toBuf(v_ct_fast);
+                        if (k_buf.quantized_storage == null and v_buf.quantized_storage == null) {
+                            var q_mt = try self.ownedMetalTensorFromCt(q_tensor.?);
+                            defer q_mt.deinit();
+                            var k_mt = try self.ownedMetalTensorFromCt(k_ct_fast);
+                            defer k_mt.deinit();
+                            var v_mt = try self.ownedMetalTensorFromCt(v_ct_fast);
+                            defer v_mt.deinit();
+
+                            if (try metal_runtime.runCompressedAttentionDenseDecoderBlockDirect(self.provider_impl, .{
+                                .q = q_mt,
+                                .k_suffix = k_mt,
+                                .v_suffix = v_mt,
+                                .attention_input = null,
+                                .fused_qkv_linear_slot = null,
+                                .kv_manager = attention.kv_manager,
+                                .kv_storage = attention.kv_storage,
+                                .kv_pool_id = kv.pool_id,
+                                .skip_kv_write = attention.skip_kv_write,
+                                .bootstrap_k_blocks = if (bootstrap) |owned| owned.k_blocks else &.{},
+                                .bootstrap_v_blocks = if (bootstrap) |owned| owned.v_blocks else &.{},
+                                .bootstrap_block_token_counts = if (bootstrap) |owned| owned.token_counts else &.{},
+                                .full_k = null,
+                                .full_v = null,
+                                .source_ptr_id = source.ptr_id,
+                                .sequence_id = kv.sequence_id,
+                                .layer_index = attention.layer_index,
+                                .query_sequence_len = attention.query_sequence_len,
+                                .kv_tokens = attention.kv_sequence_len,
+                                .num_heads = request.num_heads,
+                                .num_kv_heads = request.num_kv_heads,
+                                .head_dim = request.head_dim,
+                                .key_row_bytes = directAttentionSpanKeyRowBytes(request.num_kv_heads, request.head_dim, format.?),
+                                .query_position = attention.total_sequence_len - 1,
+                                .kv_position_offset = attention.kv_position_offset,
+                                .sliding_window = attention.sliding_window,
+                                .format = format.?,
+                                .attention_linear_slot = request.attention_linear_slot,
+                                .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                                .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                                .residual = residual_mt,
+                                .hidden_size = request.hidden_size,
+                                .eps = request.eps,
+                                .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                                .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                                .first_ffn_linear_slot = request.first_ffn_linear_slot,
+                                .second_ffn_linear_slot = request.second_ffn_linear_slot,
+                                .intermediate_size = request.intermediate_size,
+                                .activation = request.activation,
+                            }, &self.timing_stats)) |tensor| {
+                                return self.ctFromOwnedMetalTensor(tensor);
+                            }
+                        }
+                    } else if (can_project_from_attention_input) {
+                        var attention_input_mt = try self.ownedMetalTensorFromCt(request.attention_input.?);
+                        defer attention_input_mt.deinit();
+                        if (try metal_runtime.runCompressedAttentionDenseDecoderBlockDirect(self.provider_impl, .{
+                            .q = null,
+                            .k_suffix = null,
+                            .v_suffix = null,
+                            .attention_input = attention_input_mt,
+                            .fused_qkv_linear_slot = request.fused_qkv_linear_slot.?,
+                            .kv_manager = attention.kv_manager,
+                            .kv_storage = attention.kv_storage,
+                            .kv_pool_id = kv.pool_id,
+                            .skip_kv_write = attention.skip_kv_write,
+                            .bootstrap_k_blocks = if (bootstrap) |owned| owned.k_blocks else &.{},
+                            .bootstrap_v_blocks = if (bootstrap) |owned| owned.v_blocks else &.{},
+                            .bootstrap_block_token_counts = if (bootstrap) |owned| owned.token_counts else &.{},
+                            .full_k = null,
+                            .full_v = null,
+                            .source_ptr_id = source.ptr_id,
+                            .sequence_id = kv.sequence_id,
+                            .layer_index = attention.layer_index,
+                            .query_sequence_len = attention.query_sequence_len,
+                            .kv_tokens = attention.kv_sequence_len,
+                            .num_heads = request.num_heads,
+                            .num_kv_heads = request.num_kv_heads,
+                            .head_dim = request.head_dim,
+                            .key_row_bytes = directAttentionSpanKeyRowBytes(request.num_kv_heads, request.head_dim, format.?),
+                            .query_position = attention.total_sequence_len - 1,
+                            .kv_position_offset = attention.kv_position_offset,
+                            .sliding_window = attention.sliding_window,
+                            .format = format.?,
+                            .attention_linear_slot = request.attention_linear_slot,
+                            .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                            .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                            .residual = residual_mt,
+                            .hidden_size = request.hidden_size,
+                            .eps = request.eps,
+                            .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                            .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                            .first_ffn_linear_slot = request.first_ffn_linear_slot,
+                            .second_ffn_linear_slot = request.second_ffn_linear_slot,
+                            .intermediate_size = request.intermediate_size,
+                            .activation = request.activation,
+                        }, &self.timing_stats)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (q_tensor == null or k_tensor == null or v_tensor == null) {
+            if (!can_project_from_attention_input) return null;
+            const q_dim = request.num_heads * request.head_dim;
+            const kv_dim = request.num_kv_heads * request.head_dim;
+            const fused_qkv = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                .slot = request.fused_qkv_linear_slot.?,
+                .input = request.attention_input.?,
+                .in_dim = request.hidden_size,
+                .out_dim = q_dim + kv_dim * 2,
+            })) orelse {
+                if (trace) std.debug.print("dense-block-trace: fused_qkv linear returned null rows={d} mode={s}\n", .{ attention.query_sequence_len, @tagName(attention.mode) });
+                return null;
+            };
+            errdefer freeOp(ctx, fused_qkv);
+            const q = try cb.sliceLastDim(fused_qkv, 0, q_dim);
+            errdefer freeOp(ctx, q);
+            const k = try cb.sliceLastDim(fused_qkv, q_dim, q_dim + kv_dim);
+            errdefer freeOp(ctx, k);
+            const v = try cb.sliceLastDim(fused_qkv, q_dim + kv_dim, q_dim + kv_dim * 2);
+            freeOp(ctx, fused_qkv);
+            q_tensor = q;
+            k_tensor = k;
+            v_tensor = v;
+            owns_q = true;
+            owns_k = true;
+            owns_v = true;
+        }
+
+        const q_ct = q_tensor orelse return null;
+        const k_ct = k_tensor orelse return null;
+        const v_ct = v_tensor orelse return null;
+
+        const maybe_fast_attn_res = try runAttentionResidualOp(ctx, &.{
+            .q = q_ct,
+            .k = k_ct,
+            .v = v_ct,
+            .residual = request.residual,
+            .attention = request.attention,
+            .attention_sink = request.attention.attention_sink,
+            .num_heads = request.num_heads,
+            .num_kv_heads = request.num_kv_heads,
+            .head_dim = request.head_dim,
+            .linear_slot = request.attention_linear_slot,
+            .pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+            .post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+        });
+        const maybe_attn_res: ?CT = if (maybe_fast_attn_res) |fast_attn_res| fast_attn_res else blk: {
+            const attn_out = try gqaPagedAttentionOp(
+                ctx,
+                q_ct,
+                k_ct,
+                v_ct,
+                null,
+                request.attention,
+                1,
+                request.num_heads,
+                request.num_kv_heads,
+                request.head_dim,
+            );
+            errdefer freeOp(ctx, attn_out);
+
+            var current = attn_out;
+            if (request.attention_pre_linear_rms_norm_slot) |slot| {
+                const normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+                    .slot = slot,
+                    .input = current,
+                    .hidden_size = request.num_heads * request.head_dim,
+                    .eps = request.eps,
+                })) orelse {
+                    freeOp(ctx, current);
+                    break :blk null;
+                };
+                freeOp(ctx, current);
+                current = normed;
+            }
+
+            const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                .slot = request.attention_linear_slot,
+                .input = current,
+                .in_dim = request.num_heads * request.head_dim,
+                .out_dim = request.hidden_size,
+            })) orelse {
+                if (trace) std.debug.print("dense-block-trace: attention output linear returned null rows={d} mode={s}\n", .{ attention.query_sequence_len, @tagName(attention.mode) });
+                freeOp(ctx, current);
+                break :blk null;
+            };
+            freeOp(ctx, current);
+            current = projected;
+
+            if (request.attention_post_linear_rms_norm_slot) |slot| {
+                const normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+                    .slot = slot,
+                    .input = current,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.eps,
+                })) orelse {
+                    freeOp(ctx, current);
+                    break :blk null;
+                };
+                freeOp(ctx, current);
+                current = normed;
+            }
+
+            const result = try addOp(ctx, current, request.residual);
+            freeOp(ctx, current);
+            break :blk result;
+        };
+        const attn_res = maybe_attn_res orelse return null;
+        defer freeOp(ctx, attn_res);
+
+        const ffn_normed = (try decoderRuntimeApplyBlockFfnNorm(
+            ctx,
+            attn_res,
+            request.ffn_layer_norm_slot,
+            request.ffn_rms_norm_slot,
+            request.hidden_size,
+            request.eps,
+        )) orelse {
+            if (trace) std.debug.print("dense-block-trace: ffn norm returned null rows={d} mode={s}\n", .{ attention.query_sequence_len, @tagName(attention.mode) });
+            return null;
+        };
+        defer if (ffn_normed != attn_res) freeOp(ctx, ffn_normed);
+
+        const result = try runDenseFfnResidualOp(ctx, &.{
+            .first_linear_slot = request.first_ffn_linear_slot,
+            .second_linear_slot = request.second_ffn_linear_slot,
+            .input = ffn_normed,
+            .residual = attn_res,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .activation = request.activation,
+        });
+        if (trace and result == null) std.debug.print("dense-block-trace: dense ffn residual returned null rows={d} mode={s}\n", .{ attention.query_sequence_len, @tagName(attention.mode) });
+        return result;
+    }
+
+    fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        if (bufHasAnyQuantizedStorage(a_buf) or bufHasAnyQuantizedStorage(b_buf)) return error.UnsupportedTensorType;
+        if (!disableRuntimeElementwise()) {
+            const a_len = bufElemCount(a_buf);
+            const b_len = bufElemCount(b_buf);
+            if (try self.tryAnyDeviceEqualSizeBinaryRuntimeOp(a, b, a_len, b_len, .add)) |device_result| return device_result;
+            if (a_buf.metal_tensor) |*a_metal| {
+                if (b_buf.metal_tensor) |*b_metal| {
+                    if (a_metal.isDevice() and b_metal.isDevice() and a_metal.elemCount() == b_metal.elemCount()) {
+                        var lhs = try a_metal.retainedCopy();
+                        defer lhs.deinit();
+                        var rhs = try b_metal.retainedCopy();
+                        defer rhs.deinit();
+                        if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                            .lhs = lhs,
+                            .rhs = rhs,
+                            .dim = lhs.elemCount(),
+                        }, &self.timing_stats)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+                if (a_metal.isDevice() and bufElemCount(b_buf) == 1) {
+                    if (tryDirectDenseHostValue(b_buf, 0)) |scalar| {
+                        var lhs = try a_metal.retainedCopy();
+                        defer lhs.deinit();
+                        var rhs = (try self.deviceScalarTensorLike(a_metal, scalar)) orelse return error.UnsupportedTensorType;
+                        defer rhs.deinit();
+                        if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                            .lhs = lhs,
+                            .rhs = rhs,
+                            .dim = lhs.elemCount(),
+                        }, &self.timing_stats)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+            if (b_buf.metal_tensor) |*b_metal| {
+                if (b_metal.isDevice() and bufElemCount(a_buf) == 1) {
+                    if (tryDirectDenseHostValue(a_buf, 0)) |scalar| {
+                        var lhs = (try self.deviceScalarTensorLike(b_metal, scalar)) orelse return error.UnsupportedTensorType;
+                        defer lhs.deinit();
+                        var rhs = try b_metal.retainedCopy();
+                        defer rhs.deinit();
+                        if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                            .lhs = lhs,
+                            .rhs = rhs,
+                            .dim = rhs.elemCount(),
+                        }, &self.timing_stats)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+            if (a_buf.logical_shape) |shape_i64| {
+                if (shape_i64.len == 2) {
+                    if (b_buf.logical_shape) |b_shape_i64| {
+                        if (b_shape_i64.len == 2 and
+                            shape_i64[0] == b_shape_i64[0] and
+                            shape_i64[1] == b_shape_i64[1] and
+                            shape_i64[1] > 0)
+                        {
+                            const maybe_runtime = try decoderRuntimeApplyAddOp(ctx, &.{
+                                .lhs = a,
+                                .rhs = b,
+                                .dim = @intCast(shape_i64[1]),
+                            });
+                            if (maybe_runtime) |runtime_tensor| return runtime_tensor;
+                        }
+                    }
+                }
+            }
+        }
+        const a_data = try hostSliceForBuf(a_buf);
+        const b_data = try hostSliceForBuf(b_buf);
+        if (!canFlatElementwise(a_buf.logical_shape, b_buf.logical_shape, a_data.len, b_data.len)) {
+            return self.hostFallbackBinary(a, b, null, null, .add);
+        }
+        const output_len = @max(a_data.len, b_data.len);
+        const output = try self.allocator.alloc(f32, output_len);
+        errdefer self.allocator.free(output);
+        for (0..output_len) |i| {
+            const a_val = if (a_data.len == 1) a_data[0] else a_data[i];
+            const b_val = if (b_data.len == 1) b_data[0] else b_data[i];
+            output[i] = a_val + b_val;
+        }
+        const shape_i32 = try self.binaryResultShape(a_buf, b_buf);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        if (bufHasAnyQuantizedStorage(a_buf) or bufHasAnyQuantizedStorage(b_buf)) return error.UnsupportedTensorType;
+        if (!disableRuntimeElementwise()) {
+            const a_len = bufElemCount(a_buf);
+            const b_len = bufElemCount(b_buf);
+            if (try self.tryDevicePrimaryConsumeRuntimeOp(a, b, a_len, b_len, .multiply)) |device_result| return device_result;
+            if (try self.tryDevicePrimaryConsumeRuntimeOp(b, a, b_len, a_len, .multiply)) |device_result| return device_result;
+            if (try self.tryAnyDeviceEqualSizeBinaryRuntimeOp(a, b, a_len, b_len, .multiply)) |device_result| return device_result;
+            if (a_buf.metal_tensor) |*a_metal| {
+                if (b_buf.metal_tensor) |*b_metal| {
+                    if (a_metal.isDevice() and b_metal.isDevice() and a_metal.elemCount() == b_metal.elemCount()) {
+                        var lhs = try a_metal.retainedCopy();
+                        defer lhs.deinit();
+                        var rhs = try b_metal.retainedCopy();
+                        defer rhs.deinit();
+                        if (try metal_runtime.decoderRuntimeApplyMultiply(
+                            self.provider_impl,
+                            lhs,
+                            rhs,
+                            lhs.elemCount(),
+                        )) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+            if (a_buf.metal_tensor) |*a_metal| {
+                if (a_metal.isDevice() and bufElemCount(b_buf) == 1) {
+                    if (tryDirectDenseHostValue(b_buf, 0)) |scale| {
+                        var input_mt = try a_metal.retainedCopy();
+                        defer input_mt.deinit();
+                        if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input_mt, scale)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+            if (b_buf.metal_tensor) |*b_metal| {
+                if (b_metal.isDevice() and bufElemCount(a_buf) == 1) {
+                    if (tryDirectDenseHostValue(a_buf, 0)) |scale| {
+                        var input_mt = try b_metal.retainedCopy();
+                        defer input_mt.deinit();
+                        if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input_mt, scale)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+            if (a_buf.logical_shape) |shape_i64| {
+                if (shape_i64.len == 2) {
+                    if (b_buf.logical_shape) |b_shape_i64| {
+                        if (b_shape_i64.len == 2 and
+                            shape_i64[0] == b_shape_i64[0] and
+                            shape_i64[1] == b_shape_i64[1] and
+                            shape_i64[1] > 0)
+                        {
+                            var lhs = try self.ownedMetalTensorFromCt(a);
+                            defer lhs.deinit();
+                            var rhs = try self.ownedMetalTensorFromCt(b);
+                            defer rhs.deinit();
+                            if (try metal_runtime.decoderRuntimeApplyMultiply(
+                                self.provider_impl,
+                                lhs,
+                                rhs,
+                                @intCast(shape_i64[1]),
+                            )) |tensor| {
+                                return self.ctFromOwnedMetalTensor(tensor);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        const a_data = try hostSliceForBuf(a_buf);
+        const b_data = try hostSliceForBuf(b_buf);
+        if (!canFlatElementwise(a_buf.logical_shape, b_buf.logical_shape, a_data.len, b_data.len)) {
+            return self.hostFallbackBinary(a, b, null, null, .multiply);
+        }
+        const output_len = @max(a_data.len, b_data.len);
+        const output = try self.allocator.alloc(f32, output_len);
+        errdefer self.allocator.free(output);
+        for (0..output_len) |i| {
+            const a_val = if (a_data.len == 1) a_data[0] else a_data[i];
+            const b_val = if (b_data.len == 1) b_data[0] else b_data[i];
+            output[i] = a_val * b_val;
+        }
+        const shape_i32 = try self.binaryResultShape(a_buf, b_buf);
+        defer self.allocator.free(shape_i32);
+        return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        return applyUnaryActivationOp(ctx, input, .gelu, activations_mod.gelu);
+    }
+
+    fn geluNewOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        return applyUnaryActivationOp(ctx, input, .gelu_new, activations_mod.gelu);
+    }
+
+    fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        return applyUnaryActivationOp(ctx, input, .relu, activations_mod.relu);
+    }
+
+    fn siluOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        return applyUnaryActivationOp(ctx, input, .silu, activations_mod.silu);
+    }
+
+    fn quickGeluOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        return applyUnaryActivationOp(ctx, input, .quick_gelu, activations_mod.quickGelu);
+    }
+
+    fn sigmoidOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(input, .sigmoid)) |device_result| return device_result;
+        return applyUnaryActivationOp(ctx, input, null, activations_mod.sigmoid);
+    }
+
+    fn tanhOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryFlatDeviceUnaryRuntimeOp(input, .tanh)) |device_result| return device_result;
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        const input_data = try hostSliceForBuf(input_buf);
+        const output = try self.allocator.alloc(f32, input_data.len);
+        errdefer self.allocator.free(output);
+        for (input_data, 0..) |v, i| output[i] = std.math.tanh(v);
+        return self.unaryLikeInput(input_buf, output);
+    }
+
+    fn getWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+
+        var name_buf: [1024]u8 = undefined;
+        const name_z: [:0]const u8 = blk: {
+            const written = if (self.data.prefix.len > 0)
+                std.fmt.bufPrint(&name_buf, "{s}.{s}", .{ self.data.prefix, name }) catch
+                    return error.WeightNameTooLong
+            else src: {
+                if (name.len >= name_buf.len) return error.WeightNameTooLong;
+                @memcpy(name_buf[0..name.len], name);
+                break :src name_buf[0..name.len];
+            };
+            name_buf[written.len] = 0;
+            break :blk name_buf[0..written.len :0];
+        };
+        const full_name = name_z[0..name_z.len];
+
+        if (self.dense_weight_cache.get(full_name)) |*cached| {
+            return self.cachedDenseWeightBuf(cached);
+        }
+
+        self.data.prefetch.lock();
+        defer self.data.prefetch.unlock();
+        if (self.data.lazy_weights.getPtr(name)) |entry| {
+            gpu_hosted_store_mod.touchLazyWeight(self.data, entry);
+            try gpu_hosted_store_mod.ensureHostLazyWeightLoadedSimple(self.data, entry);
+
+            if (!build_options.enable_mlx and preferHostLoadedWeightsDebug()) {
+                if (entry.host_loaded) |*loaded| {
+                    const host = try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
+                    errdefer self.allocator.free(host);
+                    const shape = try self.logicalShapeFromTensor(&loaded.tensor);
+                    errdefer self.allocator.free(shape);
+                    const runtime_storage = if (entry.quantized_storage) |*storage| storage else null;
+                    const native_dense = try self.nativeDenseLinearBytesForRuntime(full_name, &loaded.tensor);
+                    errdefer if (native_dense) |native_info| {
+                        if (native_info.owned) self.allocator.free(native_info.bytes);
+                    };
+                    const native_dense_dtype = if (native_dense) |native_info| native_info.dtype else null;
+                    const cached = try self.getOrInsertCachedDenseWeight(full_name, host, shape, entry, runtime_storage, native_dense, native_dense_dtype);
+                    return self.cachedDenseWeightBuf(cached);
+                }
+            }
+
+            if (entry.quantized_storage) |*storage| {
+                if (entry.prefer_dense) {
+                    // Keep the token-embedding data path dense while retaining
+                    // a packed view for final-head runtime preparation.
+                } else {
+                    if (comptime !build_options.enable_mlx) {
+                        if (!metal_runtime.isMetalNativeSupported(storage.tensor_type)) {
+                            std.log.err(
+                                "metal-native build cannot execute weight '{s}' with quant format {s}; rebuild with -Dmlx=true or requantize to a supported Metal quant format",
+                                .{ full_name, storage.tensor_type.name() },
+                            );
+                            return error.UnsupportedQuantFormatForMetalOnly;
+                        }
+                    }
+                    entry.pin_count += 1;
+                    const shape = try self.allocator.dupe(i64, storage.shape);
+                    errdefer self.allocator.free(shape);
+                    return self.makeWeightBuf(&.{}, false, shape, entry, storage, null);
+                }
+            }
+
+            if (entry.host_loaded) |*loaded| {
+                const shape = try self.logicalShapeFromTensor(&loaded.tensor);
+                errdefer self.allocator.free(shape);
+                const runtime_storage = if (entry.quantized_storage) |*storage| storage else null;
+                const native_dense = try self.nativeDenseLinearBytesForRuntime(full_name, &loaded.tensor);
+                errdefer if (native_dense) |native_info| {
+                    if (native_info.owned) self.allocator.free(native_info.bytes);
+                };
+                const native_dense_dtype = if (native_dense) |native_info| native_info.dtype else null;
+                const host = if (native_dense != null)
+                    @as([]f32, &.{})
+                else
+                    try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
+                errdefer if (native_dense == null) self.allocator.free(host);
+                const cached = try self.getOrInsertCachedDenseWeight(full_name, host, shape, entry, runtime_storage, native_dense, native_dense_dtype);
+                return self.cachedDenseWeightBuf(cached);
+            }
+        }
+
+        if (comptime build_options.enable_mlx) {
+            if (mlx.getWeight(self.data.resident_weights, name_z)) |arr| {
+                defer _ = mlx.c.mlx_array_free(arr);
+                var host = try mlx.readFloat32(arr, self.allocator);
+                errdefer self.allocator.free(host);
+                const shape = try self.logicalShapeFromMlxArray(arr);
+                errdefer self.allocator.free(shape);
+                if (isGpt2Conv1dWeight(full_name)) {
+                    host = try self.repackGpt2Conv1dResidentHostOrder(host, shape);
+                }
+                const cached = try self.getOrInsertCachedDenseWeight(full_name, host, shape, null, null, null, null);
+                return self.cachedDenseWeightBuf(cached);
+            }
+        }
+
+        if (traceMissingWeightDebug()) {
+            std.debug.print("metal_missing_weight: requested={s} full={s} prefix={s}\n", .{ name, full_name, self.data.prefix });
+        }
+        return error.MissingWeight;
+    }
+
+    fn prefetchWeightHintOp(ctx: *anyopaque, name: []const u8, hint: u32) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.data.prefetch_initialized) return;
+        if (build_options.enable_mlx) {
+            const name_z = self.allocator.dupeZ(u8, name) catch return;
+            defer self.allocator.free(name_z);
+            if (mlx.getWeight(self.data.resident_weights, name_z)) |arr| {
+                defer _ = mlx.c.mlx_array_free(arr);
+                return;
+            }
+        }
+        self.data.prefetch.lock();
+        defer self.data.prefetch.unlock();
+        if (self.data.lazy_weights.getPtr(name)) |entry| {
+            if (self.data.shared_prefetch) |shared_prefetch| {
+                entry.prefetch_score = shared_prefetch.noteRequest(name, hint) catch entry.prefetch_score;
+            } else {
+                entry.prefetch_score +|= hint;
+            }
+            if (!entry.pending_prefetch) {
+                entry.pending_prefetch = true;
+                self.data.prefetch.appendLocked(entry) catch {};
+            }
+            self.data.prefetch.signal();
+        }
+    }
+
+    fn drainPrefetchBudgetOp(ctx: *anyopaque, max_items: usize) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.data.prefetch_initialized) return;
+        self.data.prefetch.drainBudget(max_items);
+    }
+
+    fn decoderRuntimePrepareGreedyOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeGreedyRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.decoderRuntimePrepareGreedy(self.provider_impl, request.*, &self.timing_stats);
+    }
+
+    fn decoderRuntimeResetStateOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.resetBackendKvCache();
+        self.clearActivePrefillFramePlan();
+        self.clearPendingPrefillKvDeviceSeeds();
+        return metal_runtime.decoderRuntimeResetState(self.provider_impl);
+    }
+
+    fn validateDecodeEmbeddingWeight(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        weight: CT,
+        min_rows: usize,
+        dim: usize,
+    ) anyerror!bool {
+        if (dim == 0) return false;
+        const shape = try tensorShapeOp(ctx, weight, self.allocator);
+        defer self.allocator.free(shape);
+        if (shape.len != 2) return false;
+        if (shape[0] < @as(i64, @intCast(min_rows))) return false;
+        if (shape[1] != @as(i64, @intCast(dim))) return false;
+        return true;
+    }
+
+    const DecodeBatchHostInputs = struct {
+        token_ids: []i64,
+        positions: []usize,
+
+        fn deinit(self: *DecodeBatchHostInputs, allocator: std.mem.Allocator) void {
+            allocator.free(self.token_ids);
+            allocator.free(self.positions);
+            self.* = undefined;
+        }
+    };
+
+    const DecodeBatchInitialTensors = struct {
+        hidden: MetalTensor,
+        ple_token_embedding: ?MetalTensor = null,
+        ple_vectors: ?MetalTensor = null,
+
+        fn deinit(self: *DecodeBatchInitialTensors) void {
+            self.hidden.deinit();
+            if (self.ple_token_embedding) |*tensor| tensor.deinit();
+            if (self.ple_vectors) |*tensor| tensor.deinit();
+            self.* = undefined;
+        }
+    };
+
+    fn prepareDecodeBatchHostInputs(self: *MetalCompute, request: *const ops.DecoderRuntimeDecodeRequest) !?DecodeBatchHostInputs {
+        if (request.items.len == 0) return null;
+        var token_ids = try self.allocator.alloc(i64, request.items.len);
+        var success = false;
+        defer if (!success) self.allocator.free(token_ids);
+        var positions = try self.allocator.alloc(usize, request.items.len);
+        defer if (!success) self.allocator.free(positions);
+
+        for (request.items, 0..) |item, idx| {
+            if (item.token_id < 0 or @as(usize, @intCast(item.token_id)) >= request.vocab_size) return null;
+            if (item.seq_len == 0 or item.position + 1 != item.seq_len) return null;
+            if (item.attention.total_sequence_len != item.seq_len) return null;
+            if (item.attention.mode != .paged_decode) return null;
+            if (item.attention.query_sequence_len != 1) return null;
+            if (item.attention.attn_or_mask != null) return null;
+            token_ids[idx] = item.token_id;
+            positions[idx] = item.position;
+        }
+
+        success = true;
+        return .{
+            .token_ids = token_ids,
+            .positions = positions,
+        };
+    }
+
+    fn lookupDecodeEmbeddingTensor(
+        self: *MetalCompute,
+        weight: CT,
+        token_ids: []const i64,
+        dim: usize,
+        scale: f32,
+    ) !?MetalTensor {
+        if (token_ids.len == 0 or dim == 0) return null;
+        const weight_buf = toBuf(weight);
+        if (weight_buf.quantized_storage) |storage| {
+            return metal_runtime.decoderRuntimeQuantEmbeddingLookup(
+                self.provider_impl,
+                storage,
+                token_ids,
+                token_ids.len,
+                dim,
+                scale,
+            );
+        }
+
+        if (weight_buf.native_dense_bytes != null and weight_buf.native_dense_dtype != null) {
+            const shape = weight_buf.logical_shape orelse return error.InvalidTensorShape;
+            if (shape.len != 2 or @as(usize, @intCast(shape[1])) != dim) return error.InvalidTensorShape;
+            const rows: usize = @intCast(shape[0]);
+            if (!disableRuntimeEmbeddingLookup() and weight_buf.native_dense_dtype.? == .bf16) {
+                if (try metal_runtime.decoderRuntimeNativeBf16EmbeddingLookup(
+                    self.provider_impl,
+                    weight_buf.native_dense_bytes.?,
+                    token_ids,
+                    token_ids.len,
+                    dim,
+                    rows,
+                )) |tensor| {
+                    return scaleDecodeTensor(self, tensor, scale);
+                }
+            }
+            const out = try self.allocator.alloc(f32, token_ids.len * dim);
+            errdefer self.allocator.free(out);
+            for (token_ids, 0..) |id, i| {
+                if (id < 0) return error.InvalidTensorShape;
+                const idx: usize = @intCast(id);
+                if (idx >= rows) return error.InvalidTensorShape;
+                try copyNativeDenseRowToF32(
+                    weight_buf.native_dense_bytes.?,
+                    weight_buf.native_dense_dtype.?,
+                    idx,
+                    rows,
+                    dim,
+                    out[i * dim .. (i + 1) * dim],
+                );
+            }
+            const out_shape = [_]i32{ @intCast(token_ids.len), @intCast(dim) };
+            const host_ct = try denseBuf(self.allocator, out, true, &out_shape);
+            defer freeOp(self, host_ct);
+            var device_tensor = try self.ownedDeviceMetalTensorFromCt(host_ct);
+            errdefer device_tensor.deinit();
+            return scaleDecodeTensor(self, device_tensor, scale);
+        }
+
+        var weight_mt = try self.ownedMetalTensorFromCt(weight);
+        defer weight_mt.deinit();
+        var embedding = (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
+            .weight = weight_mt,
+            .ids = token_ids,
+            .total = token_ids.len,
+            .dim = dim,
+        })) orelse return null;
+        errdefer embedding.deinit();
+        return scaleDecodeTensor(self, embedding, scale);
+    }
+
+    fn scaleDecodeTensor(self: *MetalCompute, tensor: MetalTensor, scale: f32) !?MetalTensor {
+        if (std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) return tensor;
+        var input = tensor;
+        defer input.deinit();
+        return metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input, scale);
+    }
+
+    fn reshapeDecodeTensorView(tensor: *const MetalTensor, rows: usize, cols: usize) !?MetalTensor {
+        if (rows == 0 or cols == 0) return null;
+        const elem_count = std.math.mul(usize, rows, cols) catch return null;
+        if (tensor.elemCount() != elem_count) return null;
+        const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+        return try tensor.retainedView(0, tensor.deviceByteLen(), &shape);
+    }
+
+    fn computeDecodePleVectors(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        initial: *const DecodeBatchInitialTensors,
+    ) !?MetalTensor {
+        const ple_model_proj_slot = request.ple_model_proj_slot orelse return null;
+        const ple_proj_norm_slot = request.ple_proj_norm_slot orelse return null;
+        const ple_token_embedding = initial.ple_token_embedding orelse return null;
+        const ple_total_dim = std.math.mul(usize, request.ple_hidden_size, request.layer_count) catch return null;
+
+        const planned_scope = try self.beginPlannedGraphScopeForSelf(.ple);
+        defer self.endPlannedGraphScopeForSelf(planned_scope) catch {};
+
+        var ple_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
+        defer ple_region_scope.deinit();
+
+        var model_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .slot = ple_model_proj_slot,
+            .input = initial.hidden,
+            .in_dim = request.hidden_size,
+            .out_dim = ple_total_dim,
+        })) orelse return null;
+        defer model_proj.deinit();
+
+        const flat_rows = std.math.mul(usize, request.items.len, request.layer_count) catch return null;
+        var projected_flat = (try reshapeDecodeTensorView(&model_proj, flat_rows, request.ple_hidden_size)) orelse return null;
+        defer projected_flat.deinit();
+
+        var normed_flat = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+            .slot = ple_proj_norm_slot,
+            .input = projected_flat,
+            .hidden_size = request.ple_hidden_size,
+            .eps = request.norm_eps,
+        }, &self.timing_stats)) orelse return null;
+        defer normed_flat.deinit();
+
+        var normed_proj = (try reshapeDecodeTensorView(&normed_flat, request.items.len, ple_total_dim)) orelse return null;
+        defer normed_proj.deinit();
+
+        return metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
+            .lhs = ple_token_embedding,
+            .rhs = normed_proj,
+            .dim = ple_total_dim,
+            .scale = 1.0 / @sqrt(@as(f32, 2.0)),
+        }, &self.timing_stats);
+    }
+
+    fn sliceDecodePleLayerView(
+        ple_vectors: *const MetalTensor,
+        batch_size: usize,
+        layer: usize,
+        ple_hidden_size: usize,
+        layer_count: usize,
+    ) !?MetalTensor {
+        if (batch_size != 1) return null;
+        if (layer >= layer_count or ple_hidden_size == 0) return null;
+        const total_dim = std.math.mul(usize, ple_hidden_size, layer_count) catch return null;
+        if (ple_vectors.ndim() != 2) return null;
+        if (@as(usize, @intCast(ple_vectors.dim(0))) != batch_size) return null;
+        if (@as(usize, @intCast(ple_vectors.dim(1))) != total_dim) return null;
+        const byte_offset = std.math.mul(usize, layer * ple_hidden_size, @sizeOf(f32)) catch return null;
+        const byte_len = std.math.mul(usize, ple_hidden_size, @sizeOf(f32)) catch return null;
+        const shape = [_]i32{ @intCast(batch_size), @intCast(ple_hidden_size) };
+        return try ple_vectors.retainedView(byte_offset, byte_len, &shape);
+    }
+
+    fn applyDecodePleLayer(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+        layer_index: usize,
+        hidden: MetalTensor,
+        ple_vectors: MetalTensor,
+    ) !?MetalTensor {
+        const ple_gate_linear_slot = layer.ple_gate_linear_slot orelse return null;
+        const ple_proj_linear_slot = layer.ple_proj_linear_slot orelse return null;
+        const ple_post_norm_slot = layer.ple_post_norm_slot orelse return null;
+        var ple_input = (try sliceDecodePleLayerView(
+            &ple_vectors,
+            request.items.len,
+            layer_index,
+            request.ple_hidden_size,
+            request.layer_count,
+        )) orelse return null;
+        defer ple_input.deinit();
+        try self.maybeDumpDecodeStageTensor("ple-input", layer_index, ple_input, request.ple_hidden_size);
+
+        if (try metal_runtime.decoderRuntimeApplyPleResidualDevice(self.provider_impl, .{
+            .hidden = hidden,
+            .ple = ple_input,
+            .gate_linear_slot = ple_gate_linear_slot,
+            .proj_linear_slot = ple_proj_linear_slot,
+            .post_norm_slot = ple_post_norm_slot,
+            .hidden_size = request.hidden_size,
+            .ple_hidden_size = request.ple_hidden_size,
+            .eps = request.norm_eps,
+            .activation = request.activation,
+        })) |tensor| {
+            return tensor;
+        }
+
+        var gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .slot = ple_gate_linear_slot,
+            .input = hidden,
+            .in_dim = request.hidden_size,
+            .out_dim = request.ple_hidden_size,
+        })) orelse return null;
+        defer gate_proj.deinit();
+        try self.maybeDumpDecodeStageTensor("ple-gate-proj", layer_index, gate_proj, request.ple_hidden_size);
+
+        var gate = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+            .input = gate_proj,
+            .kind = request.activation,
+            .dim = request.ple_hidden_size,
+        }, &self.timing_stats)) orelse return null;
+        defer gate.deinit();
+        try self.maybeDumpDecodeStageTensor("ple-gate", layer_index, gate, request.ple_hidden_size);
+
+        var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+            self.provider_impl,
+            gate,
+            ple_input,
+            request.ple_hidden_size,
+        )) orelse return null;
+        defer gated.deinit();
+        try self.maybeDumpDecodeStageTensor("ple-gated", layer_index, gated, request.ple_hidden_size);
+
+        var projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .slot = ple_proj_linear_slot,
+            .input = gated,
+            .in_dim = request.ple_hidden_size,
+            .out_dim = request.hidden_size,
+        })) orelse return null;
+        defer projected.deinit();
+        try self.maybeDumpDecodeStageTensor("ple-proj", layer_index, projected, request.hidden_size);
+
+        var normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+            .slot = ple_post_norm_slot,
+            .input = projected,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+        }, &self.timing_stats)) orelse return null;
+        defer normed.deinit();
+        try self.maybeDumpDecodeStageTensor("ple-post", layer_index, normed, request.hidden_size);
+
+        return metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+            .lhs = hidden,
+            .rhs = normed,
+            .dim = request.hidden_size,
+        }, &self.timing_stats);
+    }
+
+    fn retainedCtFromMetalTensor(self: *MetalCompute, tensor: *const MetalTensor) !CT {
+        const retained = try tensor.retainedCopy();
+        return self.ctFromOwnedMetalTensor(retained);
+    }
+
+    fn zeroDecodeCt(self: *MetalCompute, len: usize, rows: usize, cols: usize) !CT {
+        if (len != rows * cols) return error.InvalidTensorShape;
+        const data = try self.allocator.alloc(f32, len);
+        errdefer self.allocator.free(data);
+        @memset(data, 0.0);
+        const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+        return denseBuf(self.allocator, data, true, &shape);
+    }
+
+    fn scalarDecodeCt(self: *MetalCompute, value: f32) !CT {
+        const data = try self.allocator.alloc(f32, 1);
+        errdefer self.allocator.free(data);
+        data[0] = value;
+        const shape = [_]i32{1};
+        return denseBuf(self.allocator, data, true, &shape);
+    }
+
+    fn maybeApplyDecodeHeadNormCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        input: CT,
+        slot: ?usize,
+        heads: usize,
+        head_dim: usize,
+    ) !CT {
+        const norm_slot = slot orelse return input;
+        if (try self.applyDecodeHeadNormDevice(input, norm_slot, heads, head_dim)) |device_result| return device_result;
+        const flat = try reshape2dOp(ctx, input, heads, head_dim);
+        defer freeOp(ctx, flat);
+        const normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = norm_slot,
+            .input = flat,
+            .hidden_size = head_dim,
+            .eps = 0.0,
+        })) orelse return input;
+        defer freeOp(ctx, normed);
+        return try reshape2dOp(ctx, normed, 1, heads * head_dim);
+    }
+
+    fn applyDecodeHeadNormDevice(
+        self: *MetalCompute,
+        input: CT,
+        slot: usize,
+        heads: usize,
+        head_dim: usize,
+    ) !?CT {
+        if (heads == 0 or head_dim == 0) return null;
+        const input_buf = toBuf(input);
+        const input_mt_ptr = if (input_buf.metal_tensor) |*mt| mt else return null;
+        if (!input_mt_ptr.isDevice() or input_mt_ptr.elemCount() != heads * head_dim) return null;
+        const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
+        var flat = try input_mt_ptr.retainedView(0, heads * head_dim * @sizeOf(f32), &flat_shape);
+        defer flat.deinit();
+        var normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+            .slot = slot,
+            .input = flat,
+            .hidden_size = head_dim,
+            .eps = 0.0,
+        }, &self.timing_stats)) orelse return null;
+        errdefer normed.deinit();
+        const out_shape = [_]i32{ 1, @intCast(heads * head_dim) };
+        const reshaped = try normed.retainedView(0, heads * head_dim * @sizeOf(f32), &out_shape);
+        normed.deinit();
+        return self.ctFromOwnedMetalTensor(reshaped);
+    }
+
+    fn maybeApplyDecodeHeadNormRopeCt(
+        self: *MetalCompute,
+        input: CT,
+        slot: ?usize,
+        heads: usize,
+        head_dim: usize,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+        attention: ops.AttentionContext,
+        value_scale: f32,
+    ) !?CT {
+        const norm_slot = slot orelse return null;
+        if (layer.rope_active_dim == 0) return null;
+        return self.applyDecodeHeadNormRopeDevice(
+            input,
+            norm_slot,
+            heads,
+            head_dim,
+            layer.rope_active_dim,
+            attention.total_sequence_len - attention.query_sequence_len,
+            decodeLayerRopeTheta(layer),
+            request.rope_freq_scale,
+            request.rope_consecutive_pairs,
+            value_scale,
+        );
+    }
+
+    fn applyDecodeHeadNormRopeDevice(
+        self: *MetalCompute,
+        input: CT,
+        slot: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position: usize,
+        theta: f32,
+        freq_scale: f32,
+        consecutive_pairs: bool,
+        value_scale: f32,
+    ) !?CT {
+        if (heads == 0 or head_dim == 0 or rope_dim == 0) return null;
+        const input_buf = toBuf(input);
+        const input_mt_ptr = if (input_buf.metal_tensor) |*mt| mt else return null;
+        if (!input_mt_ptr.isDevice() or input_mt_ptr.elemCount() != heads * head_dim) return null;
+        const fused = (try self.applyDecodeHeadNormRopeDeviceMt(
+            input_mt_ptr.*,
+            slot,
+            heads,
+            head_dim,
+            rope_dim,
+            position,
+            theta,
+            freq_scale,
+            consecutive_pairs,
+            value_scale,
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(fused);
+    }
+
+    fn applyDecodeHeadNormRopeDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        slot: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position: usize,
+        theta: f32,
+        freq_scale: f32,
+        consecutive_pairs: bool,
+        value_scale: f32,
+    ) !?MetalTensor {
+        if (heads == 0 or head_dim == 0 or rope_dim == 0) return null;
+        if (!input.isDevice() or input.elemCount() != heads * head_dim) return null;
+        return metal_runtime.decoderRuntimeApplyHeadRmsNormRope(self.provider_impl, .{
+            .slot = slot,
+            .input = input,
+            .total_heads = heads,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .position = position,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .eps = 0.0,
+            .value_scale = value_scale,
+            .consecutive_pairs = consecutive_pairs,
+        });
+    }
+
+    fn applyDecodeHeadNormRopeScratchDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        slot: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position: usize,
+        theta: f32,
+        freq_scale: f32,
+        consecutive_pairs: bool,
+        value_scale: f32,
+        output_index: usize,
+    ) !?MetalTensor {
+        if (heads == 0 or head_dim == 0 or rope_dim == 0) return null;
+        if (!input.isDevice() or input.elemCount() != heads * head_dim) return null;
+        return metal_runtime.decoderRuntimeApplyHeadRmsNormRopeScratch(self.provider_impl, .{
+            .slot = slot,
+            .input = input,
+            .total_heads = heads,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .position = position,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .eps = 0.0,
+            .value_scale = value_scale,
+            .consecutive_pairs = consecutive_pairs,
+        }, output_index);
+    }
+
+    fn applyDecodeHeadNormRopeIntoDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        slot: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position: usize,
+        theta: f32,
+        freq_scale: f32,
+        consecutive_pairs: bool,
+        value_scale: f32,
+        output: MetalTensor,
+    ) !bool {
+        if (heads == 0 or head_dim == 0 or rope_dim == 0) return false;
+        if (!input.isDevice() or input.elemCount() != heads * head_dim) return false;
+        if (!output.isDevice() or output.elemCount() != heads * head_dim) return false;
+        return metal_runtime.decoderRuntimeApplyHeadRmsNormRopeInto(self.provider_impl, .{
+            .slot = slot,
+            .input = input,
+            .total_heads = heads,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .position = position,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .eps = 0.0,
+            .value_scale = value_scale,
+            .consecutive_pairs = consecutive_pairs,
+        }, output);
+    }
+
+    fn applyDecodeRmsNormScratchDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        slot: usize,
+        hidden_size: usize,
+        eps: f32,
+        output_index: usize,
+    ) !?MetalTensor {
+        if (hidden_size == 0) return null;
+        if (!input.isDevice() or input.ndim() != 2) return null;
+        if (@as(usize, @intCast(input.dim(0))) != 1 or @as(usize, @intCast(input.dim(1))) != hidden_size) return null;
+        return metal_runtime.decoderRuntimeApplyRmsNormScratch(self.provider_impl, .{
+            .slot = slot,
+            .input = input,
+            .hidden_size = hidden_size,
+            .eps = eps,
+        }, output_index, &self.timing_stats);
+    }
+
+    fn prepareDecodeQueryForAttentionCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        input: CT,
+        global_head_dim: usize,
+        head_dim: usize,
+    ) !CT {
+        if (global_head_dim == 0) return input;
+        if (try self.applyDecodeQueryScaleDevice(input, @sqrt(@as(f32, @floatFromInt(head_dim))))) |device_result| {
+            return device_result;
+        }
+        const scale = try self.scalarDecodeCt(@sqrt(@as(f32, @floatFromInt(head_dim))));
+        defer freeOp(ctx, scale);
+        return multiplyOp(ctx, input, scale);
+    }
+
+    fn applyDecodeQueryScaleDevice(self: *MetalCompute, input: CT, scale: f32) !?CT {
+        const input_buf = toBuf(input);
+        const input_mt_ptr = if (input_buf.metal_tensor) |*mt| mt else return null;
+        if (!input_mt_ptr.isDevice()) return null;
+        var input_mt = try input_mt_ptr.retainedCopy();
+        defer input_mt.deinit();
+        const scaled = (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input_mt, scale)) orelse return null;
+        return self.ctFromOwnedMetalTensor(scaled);
+    }
+
+    fn prepareDecodeValueForAttentionCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        input: CT,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+    ) !CT {
+        if (request.global_head_dim == 0 or layer.shares_kv) return input;
+        const heads = layer.kv_heads;
+        const head_dim = layer.head_dim;
+        const kv_dim = heads * head_dim;
+        if (try self.applyDecodeValueNormDevice(input, heads, head_dim, kv_dim, request.norm_eps)) |device_result| {
+            return device_result;
+        }
+        const ones = try self.allocator.alloc(f32, head_dim);
+        defer self.allocator.free(ones);
+        @memset(ones, 1.0);
+        const ones_shape = [_]i32{@intCast(head_dim)};
+        const ones_ct = try denseBuf(self.allocator, try self.allocator.dupe(f32, ones), true, &ones_shape);
+        defer freeOp(ctx, ones_ct);
+        const reshaped = try reshape2dOp(ctx, input, heads, head_dim);
+        defer freeOp(ctx, reshaped);
+        const normed = try rmsNormOp(ctx, reshaped, ones_ct, head_dim, request.norm_eps);
+        defer freeOp(ctx, normed);
+        return try reshape2dOp(ctx, normed, 1, kv_dim);
+    }
+
+    fn unitRmsWeightDeviceTensor(self: *MetalCompute, dim: usize) !?MetalTensor {
+        if (self.unit_rms_weight_device_cache.getPtr(dim)) |cached| {
+            return try cached.retainedCopy();
+        }
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const host = try self.allocator.alloc(f32, dim);
+        defer self.allocator.free(host);
+        @memset(host, 1.0);
+        const shape = [_]i32{@intCast(dim)};
+        const host_tensor = MetalTensor.borrowed(host.ptr, host.len, &shape);
+        var device_tensor = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            dim * @sizeOf(f32),
+            uploadStorageMode(dim * @sizeOf(f32)),
+            &shape,
+        );
+        errdefer device_tensor.deinit();
+        try host_tensor.copyInto(&device_tensor);
+        const gop = try self.unit_rms_weight_device_cache.getOrPut(self.allocator, dim);
+        if (gop.found_existing) {
+            device_tensor.deinit();
+        } else {
+            gop.value_ptr.* = device_tensor;
+        }
+        return try gop.value_ptr.retainedCopy();
+    }
+
+    fn applyDecodeValueNormDevice(
+        self: *MetalCompute,
+        input: CT,
+        heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        eps: f32,
+    ) !?CT {
+        if (heads == 0 or head_dim == 0 or kv_dim != heads * head_dim) return null;
+        const input_buf = toBuf(input);
+        const input_mt_ptr = if (input_buf.metal_tensor) |*mt| mt else return null;
+        if (!input_mt_ptr.isDevice() or input_mt_ptr.elemCount() != kv_dim) return null;
+        const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
+        var flat = try input_mt_ptr.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
+        defer flat.deinit();
+        var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
+        defer ones.deinit();
+        var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
+            self.provider_impl,
+            flat,
+            ones,
+            head_dim,
+            eps,
+        )) orelse return null;
+        errdefer normed.deinit();
+        const out_shape = [_]i32{ 1, @intCast(kv_dim) };
+        const reshaped = try normed.retainedView(0, kv_dim * @sizeOf(f32), &out_shape);
+        normed.deinit();
+        return self.ctFromOwnedMetalTensor(reshaped);
+    }
+
+    fn applyDecodeValueNormDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        eps: f32,
+    ) !?MetalTensor {
+        if (heads == 0 or head_dim == 0 or kv_dim != heads * head_dim) return null;
+        if (!input.isDevice() or input.elemCount() != kv_dim) return null;
+        const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
+        var flat = try input.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
+        defer flat.deinit();
+        var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
+        defer ones.deinit();
+        var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
+            self.provider_impl,
+            flat,
+            ones,
+            head_dim,
+            eps,
+        )) orelse return null;
+        errdefer normed.deinit();
+        const out_shape = [_]i32{ 1, @intCast(kv_dim) };
+        const reshaped = try normed.retainedView(0, kv_dim * @sizeOf(f32), &out_shape);
+        normed.deinit();
+        return reshaped;
+    }
+
+    fn applyDecodeValueNormScratchDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        eps: f32,
+        output_index: usize,
+    ) !?MetalTensor {
+        if (heads == 0 or head_dim == 0 or kv_dim != heads * head_dim) return null;
+        if (!input.isDevice() or input.elemCount() != kv_dim) return null;
+        const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
+        var flat = try input.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
+        defer flat.deinit();
+        var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
+        defer ones.deinit();
+        var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceScratch(
+            self.provider_impl,
+            flat,
+            ones,
+            head_dim,
+            eps,
+            output_index,
+        )) orelse return null;
+        defer normed.deinit();
+        const out_shape = [_]i32{ 1, @intCast(kv_dim) };
+        return try normed.retainedView(0, kv_dim * @sizeOf(f32), &out_shape);
+    }
+
+    fn applyDecodeValueNormIntoDeviceMt(
+        self: *MetalCompute,
+        input: MetalTensor,
+        heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        eps: f32,
+        output: MetalTensor,
+    ) !bool {
+        if (heads == 0 or head_dim == 0 or kv_dim != heads * head_dim) return false;
+        if (!input.isDevice() or input.elemCount() != kv_dim) return false;
+        if (!output.isDevice() or output.elemCount() != kv_dim) return false;
+        const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
+        var flat_input = try input.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
+        defer flat_input.deinit();
+        var flat_output = try output.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
+        defer flat_output.deinit();
+        var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return false;
+        defer ones.deinit();
+        return metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceInto(
+            self.provider_impl,
+            flat_input,
+            ones,
+            head_dim,
+            eps,
+            flat_output,
+        );
+    }
+
+    fn decodeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
+        if (layer.rope_dim > 0 and layer.rope_active_dim > 0 and layer.rope_active_dim < layer.rope_dim) {
+            const freq_dim: f32 = @floatFromInt(layer.rope_dim);
+            const active_dim: f32 = @floatFromInt(layer.rope_active_dim);
+            return std.math.pow(f32, layer.rope_theta, active_dim / freq_dim);
+        }
+        return layer.rope_theta;
+    }
+
+    fn maybeApplyDecodeRopeCt(
+        ctx: *anyopaque,
+        input: CT,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+        attention: ops.AttentionContext,
+    ) !CT {
+        if (layer.rope_active_dim == 0) return input;
+        const position_offset = attention.total_sequence_len - attention.query_sequence_len;
+        return try ropeOp(
+            ctx,
+            input,
+            attention.query_sequence_len,
+            layer.head_dim,
+            layer.rope_active_dim,
+            decodeLayerRopeTheta(layer),
+            request.rope_freq_scale,
+            position_offset,
+            request.rope_consecutive_pairs,
+        );
+    }
+
+    fn applyDecodePleLayerCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+        layer_index: usize,
+        hidden: CT,
+        ple_vectors: CT,
+    ) !?CT {
+        const ple_gate_linear_slot = layer.ple_gate_linear_slot orelse return null;
+        const ple_proj_linear_slot = layer.ple_proj_linear_slot orelse return null;
+        const ple_post_norm_slot = layer.ple_post_norm_slot orelse return null;
+        const ple_offset = layer_index * request.ple_hidden_size;
+        const ple_input = blk: {
+            const ple_buf = toBuf(ple_vectors);
+            if (ple_buf.metal_tensor) |*ple_mt| {
+                if (ple_mt.isDevice() and ple_mt.ndim() == 2 and
+                    @as(usize, @intCast(ple_mt.dim(0))) == request.items.len and
+                    @as(usize, @intCast(ple_mt.dim(1))) == request.ple_hidden_size * request.layer_count)
+                {
+                    const byte_offset = std.math.mul(usize, ple_offset, @sizeOf(f32)) catch return error.UnsupportedShape;
+                    const byte_len = std.math.mul(usize, request.ple_hidden_size, @sizeOf(f32)) catch return error.UnsupportedShape;
+                    const shape = [_]i32{ @intCast(request.items.len), @intCast(request.ple_hidden_size) };
+                    break :blk try self.ctFromOwnedMetalTensor(try ple_mt.retainedView(byte_offset, byte_len, &shape));
+                }
+            }
+            break :blk try sliceLastDimOp(ctx, ple_vectors, ple_offset, ple_offset + request.ple_hidden_size);
+        };
+        defer freeOp(ctx, ple_input);
+        try self.maybeDumpDecodeStageCt("ple-input", layer_index, ple_input, request.ple_hidden_size);
+        const gate_proj = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = ple_gate_linear_slot,
+            .input = hidden,
+            .in_dim = request.hidden_size,
+            .out_dim = request.ple_hidden_size,
+        })) orelse return null;
+        defer freeOp(ctx, gate_proj);
+        try self.maybeDumpDecodeStageCt("ple-gate-proj", layer_index, gate_proj, request.ple_hidden_size);
+        const gate = (try decoderRuntimeApplyActivationOp(ctx, &.{
+            .input = gate_proj,
+            .kind = request.activation,
+            .dim = request.ple_hidden_size,
+        })) orelse return null;
+        defer freeOp(ctx, gate);
+        try self.maybeDumpDecodeStageCt("ple-gate", layer_index, gate, request.ple_hidden_size);
+        const gated = try multiplyOp(ctx, gate, ple_input);
+        defer freeOp(ctx, gated);
+        try self.maybeDumpDecodeStageCt("ple-gated", layer_index, gated, request.ple_hidden_size);
+        const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = ple_proj_linear_slot,
+            .input = gated,
+            .in_dim = request.ple_hidden_size,
+            .out_dim = request.hidden_size,
+        })) orelse return null;
+        defer freeOp(ctx, projected);
+        try self.maybeDumpDecodeStageCt("ple-proj", layer_index, projected, request.hidden_size);
+        const normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = ple_post_norm_slot,
+            .input = projected,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+        })) orelse return null;
+        defer freeOp(ctx, normed);
+        try self.maybeDumpDecodeStageCt("ple-post", layer_index, normed, request.hidden_size);
+        return addOp(ctx, hidden, normed);
+    }
+
+    fn applyDecodeLayerOutputScaleCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        hidden: CT,
+        layer_index: usize,
+    ) !CT {
+        var name_buf: [128]u8 = undefined;
+        const scale_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer_index}) catch return hidden;
+        if (try self.applyDecodeLayerOutputScaleDevice(ctx, hidden, scale_name, layer_index)) |device_result| {
+            freeOp(ctx, hidden);
+            return device_result;
+        }
+        var fallback_buf: [128]u8 = undefined;
+        const fallback_name = std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.layer_scalar", .{layer_index}) catch return hidden;
+        if (try self.applyDecodeLayerOutputScaleDevice(ctx, hidden, fallback_name, layer_index)) |device_result| {
+            freeOp(ctx, hidden);
+            return device_result;
+        }
+        const scale = getWeightOp(ctx, scale_name) catch
+            getWeightOp(ctx, fallback_name) catch return hidden;
+        defer freeOp(ctx, scale);
+        var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
+        defer tail_region_scope.deinit();
+        const result = try multiplyOp(ctx, hidden, scale);
+        freeOp(ctx, hidden);
+        return result;
+    }
+
+    fn applyDecodeLayerOutputScaleValueCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        hidden: CT,
+        output_scale_value: ?f32,
+    ) !CT {
+        const scale = output_scale_value orelse return hidden;
+        if (@abs(scale - 1.0) <= 0.000001) return hidden;
+        var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
+        defer tail_region_scope.deinit();
+        const scale_shape = [_]i32{1};
+        const scale_ct = try fromFloat32ShapeOp(ctx, &[_]f32{scale}, &scale_shape);
+        defer freeOp(ctx, scale_ct);
+        const result = try multiplyOp(ctx, hidden, scale_ct);
+        freeOp(ctx, hidden);
+        return result;
+    }
+
+    fn getDecodeLayerOutputScaleCt(ctx: *anyopaque, layer_index: usize) ?CT {
+        var name_buf: [128]u8 = undefined;
+        const scale_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer_index}) catch return null;
+        return getWeightOp(ctx, scale_name) catch blk: {
+            var fallback_buf: [128]u8 = undefined;
+            const fallback_name = std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.layer_scalar", .{layer_index}) catch return null;
+            break :blk getWeightOp(ctx, fallback_name) catch null;
+        };
+    }
+
+    fn reservedHiddenContains(pair: ?ReservedHiddenStatePair, tensor: CT) bool {
+        if (pair) |slots| return tensor == slots.front or tensor == slots.back;
+        return false;
+    }
+
+    fn reservedHiddenInactive(pair: ReservedHiddenStatePair, front_active: bool) CT {
+        return if (front_active) pair.back else pair.front;
+    }
+
+    fn layerOutputScaleDeviceTensor(
+        self: *MetalCompute,
+        ctx: *anyopaque,
+        scale_name: []const u8,
+        layer_index: usize,
+    ) !?MetalTensor {
+        if (self.layer_output_scale_device_cache.getPtr(layer_index)) |cached| {
+            return try cached.retainedCopy();
+        }
+
+        const scale_ct = getWeightOp(ctx, scale_name) catch return null;
+        defer freeOp(ctx, scale_ct);
+        var scale_device = try self.ownedDeviceMetalTensorFromCt(scale_ct);
+        errdefer scale_device.deinit();
+        if (!scale_device.isDevice()) return null;
+
+        const gop = try self.layer_output_scale_device_cache.getOrPut(self.allocator, layer_index);
+        if (gop.found_existing) {
+            scale_device.deinit();
+        } else {
+            gop.value_ptr.* = scale_device;
+        }
+        return try gop.value_ptr.retainedCopy();
+    }
+
+    fn applyDecodeLayerOutputScaleDevice(
+        self: *MetalCompute,
+        ctx: *anyopaque,
+        hidden: CT,
+        scale_name: []const u8,
+        layer_index: usize,
+    ) !?CT {
+        const hidden_buf = toBuf(hidden);
+        const hidden_mt_ptr = if (hidden_buf.metal_tensor) |*mt| mt else return null;
+        if (!hidden_mt_ptr.isDevice()) return null;
+        var hidden_mt = try hidden_mt_ptr.retainedCopy();
+        defer hidden_mt.deinit();
+        var scale_mt = (try self.layerOutputScaleDeviceTensor(ctx, scale_name, layer_index)) orelse return null;
+        defer scale_mt.deinit();
+        if (scale_mt.elemCount() != hidden_mt.elemCount()) return null;
+        var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
+        defer tail_region_scope.deinit();
+        const scaled = (try metal_runtime.decoderRuntimeApplyMultiply(
+            self.provider_impl,
+            hidden_mt,
+            scale_mt,
+            hidden_mt.elemCount(),
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(scaled);
+    }
+
+    fn runDecodeGatedBlockSplitCt(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+        layer_index: usize,
+        q: CT,
+        k: CT,
+        v: CT,
+        residual: CT,
+        attention: ops.AttentionContext,
+    ) !?CT {
+        const attn_res = (try runAttentionResidualOp(ctx, &.{
+            .q = q,
+            .k = k,
+            .v = v,
+            .residual = residual,
+            .attention = attention,
+            .num_heads = request.num_attention_heads,
+            .num_kv_heads = layer.kv_heads,
+            .head_dim = layer.head_dim,
+            .linear_slot = layer.attention_linear_slot,
+            .post_linear_rms_norm_slot = layer.attn_post_norm_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+        })) orelse return null;
+        self.debugDecodeFiniteCt("split-attn", layer_index, attn_res);
+        try self.maybeDumpDecodeStageCt("attn-residual", layer_index, attn_res, request.hidden_size);
+        errdefer freeOp(ctx, attn_res);
+
+        const ffn_normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = layer.ffn_pre_norm_slot,
+            .input = attn_res,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+        })) orelse {
+            freeOp(ctx, attn_res);
+            return null;
+        };
+        self.debugDecodeFiniteCt("split-ffn-norm", layer_index, ffn_normed);
+        try self.maybeDumpDecodeStageCt("ffn-norm", layer_index, ffn_normed, request.hidden_size);
+        defer freeOp(ctx, ffn_normed);
+
+        var ffn_normed_mt = try self.ownedDeviceMetalTensorFromCt(ffn_normed);
+        defer ffn_normed_mt.deinit();
+        var attn_res_mt = try self.ownedDeviceMetalTensorFromCt(attn_res);
+        defer attn_res_mt.deinit();
+        if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
+            .gate_linear_slot = layer.gate_ffn_linear_slot,
+            .up_linear_slot = layer.up_ffn_linear_slot,
+            .down_linear_slot = layer.down_ffn_linear_slot,
+            .rows = request.items.len,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = layer.intermediate_size,
+            .activation = request.activation,
+            .eps = request.norm_eps,
+            .post_gate_rms_norm_slot = @as(?usize, null),
+            .post_down_rms_norm_slot = @as(?usize, layer.ffn_post_norm_slot),
+        }, ffn_normed_mt, attn_res_mt, &self.timing_stats)) |tensor| {
+            const result = try self.ctFromOwnedMetalTensor(tensor);
+            self.debugDecodeFiniteCt("split-gated-ffn-device", layer_index, result);
+            try self.maybeDumpDecodeStageCt("ffn-residual", layer_index, result, request.hidden_size);
+            freeOp(ctx, attn_res);
+            return result;
+        }
+
+        const gate_up = (try decoderRuntimeApplyLinearPairOp(ctx, &.{
+            .slot_a = layer.gate_ffn_linear_slot,
+            .slot_b = layer.up_ffn_linear_slot,
+            .input = ffn_normed,
+            .in_dim = request.hidden_size,
+            .out_dim = layer.intermediate_size,
+        })) orelse {
+            freeOp(ctx, attn_res);
+            return null;
+        };
+        self.debugDecodeFiniteCt("split-gate", layer_index, gate_up.first);
+        self.debugDecodeFiniteCt("split-up", layer_index, gate_up.second);
+        defer freeOp(ctx, gate_up.first);
+        defer freeOp(ctx, gate_up.second);
+        const activated = (try decoderRuntimeApplyActivationOp(ctx, &.{
+            .input = gate_up.first,
+            .kind = request.activation,
+            .dim = layer.intermediate_size,
+        })) orelse {
+            freeOp(ctx, attn_res);
+            return null;
+        };
+        self.debugDecodeFiniteCt("split-activated", layer_index, activated);
+        defer freeOp(ctx, activated);
+        const gated = try multiplyOp(ctx, activated, gate_up.second);
+        self.debugDecodeFiniteCt("split-gated", layer_index, gated);
+        defer freeOp(ctx, gated);
+        const down = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = layer.down_ffn_linear_slot,
+            .input = gated,
+            .in_dim = layer.intermediate_size,
+            .out_dim = request.hidden_size,
+        })) orelse {
+            freeOp(ctx, attn_res);
+            return null;
+        };
+        self.debugDecodeFiniteCt("split-down", layer_index, down);
+        defer freeOp(ctx, down);
+        const down_post = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = layer.ffn_post_norm_slot,
+            .input = down,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+        })) orelse {
+            freeOp(ctx, attn_res);
+            return null;
+        };
+        self.debugDecodeFiniteCt("split-down-post", layer_index, down_post);
+        defer freeOp(ctx, down_post);
+        const result = try addOp(ctx, down_post, attn_res);
+        self.debugDecodeFiniteCt("split-result", layer_index, result);
+        freeOp(ctx, attn_res);
+        return result;
+    }
+
+    fn runActiveGatedLayerFromAttentionInputMt(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+        layer_index: usize,
+        attention_input: CT,
+        residual: CT,
+        attention: ops.AttentionContext,
+        ple_input_for_block: ?CT,
+        output_scale_value: ?f32,
+        output_mt: ?MetalTensor,
+    ) !?CT {
+        var attention_input_mt = try self.ownedDeviceMetalTensorFromCt(attention_input);
+        defer attention_input_mt.deinit();
+        var residual_mt = try self.ownedDeviceMetalTensorFromCt(residual);
+        defer residual_mt.deinit();
+        const ple_mt: ?MetalTensor = if (ple_input_for_block) |ct|
+            try self.borrowedMetalTensorFromCt(ct)
+        else
+            null;
+        var block = (try self.runActiveGatedLayerFromAttentionInputDeviceMt(
+            request,
+            layer,
+            layer_index,
+            attention_input_mt,
+            null,
+            residual_mt,
+            residual,
+            attention,
+            ple_mt,
+            output_scale_value,
+            output_mt,
+        )) orelse return null;
+        var block_owned = true;
+        errdefer if (block_owned) block.deinit();
+        const result = try self.ctFromOwnedMetalTensor(block);
+        block_owned = false;
+        return result;
+    }
+
+    fn runActiveGatedLayerFromAttentionInputDeviceMt(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        layer: *const ops.DecoderRuntimeLayerSpec,
+        layer_index: usize,
+        attention_input_mt: MetalTensor,
+        attention_pre_norm_slot: ?usize,
+        residual_mt: MetalTensor,
+        residual_ct_for_request: CT,
+        attention: ops.AttentionContext,
+        ple_input_for_block: ?MetalTensor,
+        output_scale_value: ?f32,
+        output_mt: ?MetalTensor,
+    ) !?MetalTensor {
+        const trace = traceDecoderRuntimeDecode();
+        if (!metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            if (trace) std.debug.print("decoder-runtime-decode-direct: miss layer={d} reason=no-active-frame\n", .{layer_index});
+            return null;
+        }
+        if (attention.mode != .paged_decode or attention.query_sequence_len != 1 or attention.attn_or_mask != null) {
+            if (trace) std.debug.print(
+                "decoder-runtime-decode-direct: miss layer={d} reason=attention-shape mode={s} q={d} mask={}\n",
+                .{ layer_index, @tagName(attention.mode), attention.query_sequence_len, attention.attn_or_mask != null },
+            );
+            return null;
+        }
+        const source = try attentionKvSource(attention);
+        const head_dim = layer.head_dim;
+        const attention_input_size = request.num_attention_heads * head_dim;
+        const kv_dim = layer.kv_heads * head_dim;
+
+        if (attention_input_mt.ndim() != 2 or residual_mt.ndim() != 2) {
+            if (trace) std.debug.print(
+                "decoder-runtime-decode-direct: miss layer={d} reason=rank input_ndim={d} residual_ndim={d}\n",
+                .{ layer_index, attention_input_mt.ndim(), residual_mt.ndim() },
+            );
+            return null;
+        }
+        if (@as(usize, @intCast(attention_input_mt.dim(0))) != 1 or
+            @as(usize, @intCast(attention_input_mt.dim(1))) != request.hidden_size or
+            @as(usize, @intCast(residual_mt.dim(0))) != 1 or
+            @as(usize, @intCast(residual_mt.dim(1))) != request.hidden_size)
+        {
+            if (trace) std.debug.print(
+                "decoder-runtime-decode-direct: miss layer={d} reason=input-shape input={d}x{d} residual={d}x{d} hidden={d}\n",
+                .{
+                    layer_index,
+                    @as(usize, @intCast(attention_input_mt.dim(0))),
+                    @as(usize, @intCast(attention_input_mt.dim(1))),
+                    @as(usize, @intCast(residual_mt.dim(0))),
+                    @as(usize, @intCast(residual_mt.dim(1))),
+                    request.hidden_size,
+                },
+            );
+            return null;
+        }
+
+        var kv_suffix_dest: ?metal_runtime.GatheredSpanSuffixViews = null;
+        defer if (kv_suffix_dest) |*views| views.deinit();
+        if (!layer.shares_kv) reserve_kv_dest: {
+            const kv = attention.kv_cache orelse break :reserve_kv_dest;
+            if (attention.query_sequence_len == 0 or attention.kv_sequence_len < attention.query_sequence_len) break :reserve_kv_dest;
+            const expected_prefix_tokens = attention.kv_sequence_len - attention.query_sequence_len;
+            kv_suffix_dest = try metal_runtime.reserveGatheredSpanSuffixViews(
+                self.provider_impl,
+                .{
+                    .source_ptr_id = source.ptr_id,
+                    .sequence_id = kv.sequence_id,
+                    .layer_index = attention.layer_index,
+                },
+                expected_prefix_tokens,
+                attention.kv_sequence_len,
+                attention.kv_position_offset,
+                kv_dim,
+                kv_dim,
+                attention.query_sequence_len,
+            );
+        }
+
+        var q_projected: MetalTensor = undefined;
+        var have_q_projected = false;
+        defer if (have_q_projected) q_projected.deinit();
+        var k_projected: ?MetalTensor = null;
+        defer if (k_projected) |*tensor| tensor.deinit();
+        var v_projected: ?MetalTensor = null;
+        defer if (v_projected) |*tensor| tensor.deinit();
+
+        var attention_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
+        defer attention_region_scope.deinit();
+
+        const use_layer_planned_block_scope =
+            ple_input_for_block != null and
+            layer.ple_gate_linear_slot != null and
+            layer.ple_proj_linear_slot != null and
+            layer.ple_post_norm_slot != null and
+            layer.ffn_pre_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity and
+            layer.ffn_post_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity and
+            layer.attn_post_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity;
+        const attention_setup_source: metal_runtime.ComputeSource = if (use_layer_planned_block_scope)
+            .layer
+        else if (layer.shares_kv)
+            .quant_linear
+        else
+            .quant_qkv;
+        const attention_setup_region: metal_runtime.ComputeRegion = if (use_layer_planned_block_scope) .layer else .attention;
+        var setup_plan_storage = metal_command_planner.AttentionSetupCommandLowerer{};
+        var layer_plan_storage = metal_command_planner.GatedLayerCommandLowerer{};
+        var planned_view: metal_command_planner.PlanView = .{
+            .planned_ops = &.{},
+            .scopes = &.{},
+            .barrier_count = 0,
+        };
+        var planned_command_view: metal_command_planner.GraphCommandPlanView = .{
+            .ops = &.{},
+            .resources = &.{},
+            .planned_ops = &.{},
+            .scopes = &.{},
+            .scratch_slots = &.{},
+            .barrier_count = 0,
+        };
+        const layer_attention_kv_format: graph_quant_matmul.AttentionKvFormat = blk: {
+            if (attention.attn_or_mask != null) break :blk .f32;
+            const source_for_plan = attentionKvSource(attention) catch break :blk .f32;
+            break :blk graphAttentionKvFormatForStorage(&source_for_plan.kv_storage);
+        };
+        if (trace) std.debug.print(
+            "decoder-runtime-decode-direct: plan layer={d} use_layer_scope={} shares_kv={} kv_format={s} storage={} ple={}\n",
+            .{ layer_index, use_layer_planned_block_scope, layer.shares_kv, @tagName(layer_attention_kv_format), attention.kv_storage != null, ple_input_for_block != null },
+        );
+        if (use_layer_planned_block_scope) {
+            layer_plan_storage.build(.{
+                .shares_kv = layer.shares_kv,
+                .has_attention_pre_norm = attention_pre_norm_slot != null,
+                .attention_pre_norm_slot = attention_pre_norm_slot orelse 0,
+                .q_linear_slot = layer.q_linear_slot,
+                .k_linear_slot = layer.k_linear_slot,
+                .v_linear_slot = layer.v_linear_slot,
+                .q_head_norm_slot = layer.q_head_norm_slot orelse 0,
+                .k_head_norm_slot = layer.k_head_norm_slot orelse 0,
+                .attention_layer_index = attention.layer_index,
+                .value_norm = request.global_head_dim != 0,
+                .kv_seed = !layer.shares_kv,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .attention_post_norm_slot = layer.attn_post_norm_slot,
+                .ffn_pre_norm_slot = layer.ffn_pre_norm_slot,
+                .gate_linear_slot = layer.gate_ffn_linear_slot,
+                .up_linear_slot = layer.up_ffn_linear_slot,
+                .down_linear_slot = layer.down_ffn_linear_slot,
+                .ffn_post_norm_slot = layer.ffn_post_norm_slot,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot orelse unreachable,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot orelse unreachable,
+                .ple_post_norm_slot = layer.ple_post_norm_slot orelse unreachable,
+                .source = @intFromEnum(attention_setup_source),
+                .region = @intFromEnum(attention_setup_region),
+                .hidden_size = request.hidden_size,
+                .kv_len = attention.kv_sequence_len,
+                .attention_input_size = attention_input_size,
+                .kv_dim = kv_dim,
+                .head_dim = head_dim,
+                .attention_kv_format = layer_attention_kv_format,
+                .attention_storage = if (attention.kv_storage != null) .paged else .dense,
+                .intermediate_size = layer.intermediate_size,
+                .ple_hidden_size = request.ple_hidden_size,
+            }) catch {};
+            planned_command_view = layer_plan_storage.commandView();
+            planned_view = planned_command_view.planView();
+        } else {
+            setup_plan_storage.build(.{
+                .shares_kv = layer.shares_kv,
+                .has_attention_pre_norm = attention_pre_norm_slot != null,
+                .attention_pre_norm_slot = attention_pre_norm_slot orelse 0,
+                .q_linear_slot = layer.q_linear_slot,
+                .k_linear_slot = layer.k_linear_slot,
+                .v_linear_slot = layer.v_linear_slot,
+                .q_head_norm_slot = layer.q_head_norm_slot orelse 0,
+                .k_head_norm_slot = layer.k_head_norm_slot orelse 0,
+                .attention_layer_index = attention.layer_index,
+                .value_norm = request.global_head_dim != 0,
+                .kv_seed = false,
+                .source = @intFromEnum(attention_setup_source),
+                .region = @intFromEnum(attention_setup_region),
+            }) catch {};
+            planned_command_view = setup_plan_storage.commandView();
+            planned_view = planned_command_view.planView();
+        }
+        var attention_setup_plan = metal_runtime.PlannedComputeSequence{
+            .runtime = self.provider_impl.raw_decode_runtime,
+            .plan = planned_view,
+            .command_plan = planned_command_view,
+        };
+        defer attention_setup_plan.deinit();
+
+        var projection_input_mt = attention_input_mt;
+        var projection_input_owned: ?MetalTensor = null;
+        defer if (projection_input_owned) |*tensor| tensor.deinit();
+        if (attention_pre_norm_slot) |slot| {
+            _ = attention_setup_plan.beforeNext();
+            projection_input_owned = (try self.applyDecodeRmsNormScratchDeviceMt(
+                attention_input_mt,
+                slot,
+                request.hidden_size,
+                request.norm_eps,
+                5,
+            )) orelse return null;
+            self.timing_stats.active_decode_attn_norm_ops += 1;
+            projection_input_mt = projection_input_owned.?;
+        }
+
+        if (layer.shares_kv) {
+            const q_planned = attention_setup_plan.beforeNext();
+            var q = if (q_planned)
+                try metal_runtime.tryApplyQuantizedRuntimeLinearScratch(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                )
+            else
+                null;
+            if (q == null and q_planned) attention_setup_plan.disable();
+            if (q == null) {
+                q = (try metal_runtime.tryApplyQuantizedRuntimeLinearScratch(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                )) orelse (try metal_runtime.tryApplyQuantizedRuntimeLinear(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                )) orelse (try metal_runtime.tryApplyDenseRuntimeLinear(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                ));
+            }
+            q_projected = q orelse return null;
+            have_q_projected = true;
+            self.timing_stats.active_decode_q_linear_ops += 1;
+        } else {
+            const qkv_planned = attention_setup_plan.beforeNext();
+            var qkv = if (qkv_planned)
+                try metal_runtime.tryApplyQuantizedRuntimeLinearQkvScratch(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    layer.k_linear_slot,
+                    layer.v_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                    kv_dim,
+                )
+            else
+                null;
+            if (qkv == null and qkv_planned) attention_setup_plan.disable();
+            if (qkv == null) {
+                qkv = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvScratch(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    layer.k_linear_slot,
+                    layer.v_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                    kv_dim,
+                )) orelse (try metal_runtime.tryApplyQuantizedRuntimeLinearQkv(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    layer.k_linear_slot,
+                    layer.v_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                    kv_dim,
+                )) orelse (try metal_runtime.tryApplyDenseRuntimeLinearQkv(
+                    self.provider_impl,
+                    layer.q_linear_slot,
+                    layer.k_linear_slot,
+                    layer.v_linear_slot,
+                    projection_input_mt,
+                    1,
+                    request.hidden_size,
+                    attention_input_size,
+                    kv_dim,
+                ));
+            }
+            const qkv_result = qkv orelse return null;
+            q_projected = qkv_result.first;
+            have_q_projected = true;
+            k_projected = qkv_result.second;
+            v_projected = qkv_result.third;
+            self.timing_stats.active_decode_qkv_ops += 1;
+        }
+
+        const q_norm_slot = layer.q_head_norm_slot orelse return null;
+        const query_value_scale: f32 = if (request.global_head_dim == 0) 1.0 else @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const q_head_planned = attention_setup_plan.beforeNext();
+        var q_for_block = (try self.applyDecodeHeadNormRopeScratchDeviceMt(
+            q_projected,
+            q_norm_slot,
+            request.num_attention_heads,
+            head_dim,
+            layer.rope_active_dim,
+            attention.total_sequence_len - attention.query_sequence_len,
+            decodeLayerRopeTheta(layer),
+            request.rope_freq_scale,
+            request.rope_consecutive_pairs,
+            query_value_scale,
+            3,
+        )) orelse q_fallback: {
+            if (q_head_planned) attention_setup_plan.disable();
+            break :q_fallback (try self.applyDecodeHeadNormRopeDeviceMt(
+                q_projected,
+                q_norm_slot,
+                request.num_attention_heads,
+                head_dim,
+                layer.rope_active_dim,
+                attention.total_sequence_len - attention.query_sequence_len,
+                decodeLayerRopeTheta(layer),
+                request.rope_freq_scale,
+                request.rope_consecutive_pairs,
+                query_value_scale,
+            ));
+        } orelse return null;
+        defer q_for_block.deinit();
+        self.timing_stats.active_decode_head_norm_ops += 1;
+        self.timing_stats.active_decode_rope_ops += 1;
+        self.timing_stats.active_decode_head_norm_rope_fused_ops += 1;
+        self.timing_stats.active_decode_head_norm_rope_fused_kernels += 1;
+        if (layer.shares_kv) {
+            if (!use_layer_planned_block_scope or attention_setup_plan.disabled or attention_setup_plan.active_scope_index == null) {
+                try attention_setup_plan.endActiveScope();
+            }
+        }
+
+        var k_for_block: ?MetalTensor = null;
+        defer if (k_for_block) |*tensor| tensor.deinit();
+        var v_for_block: ?MetalTensor = null;
+        defer if (v_for_block) |*tensor| tensor.deinit();
+        if (!layer.shares_kv) {
+            const k_norm_slot = layer.k_head_norm_slot orelse return null;
+            _ = attention_setup_plan.beforeNext();
+            if (kv_suffix_dest) |*dest| {
+                if (try self.applyDecodeHeadNormRopeIntoDeviceMt(
+                    k_projected.?,
+                    k_norm_slot,
+                    layer.kv_heads,
+                    head_dim,
+                    layer.rope_active_dim,
+                    attention.total_sequence_len - attention.query_sequence_len,
+                    decodeLayerRopeTheta(layer),
+                    request.rope_freq_scale,
+                    request.rope_consecutive_pairs,
+                    1.0,
+                    dest.k,
+                )) {
+                    k_for_block = try dest.k.retainedCopy();
+                }
+            }
+            if (k_for_block == null) {
+                k_for_block = (try self.applyDecodeHeadNormRopeScratchDeviceMt(
+                    k_projected.?,
+                    k_norm_slot,
+                    layer.kv_heads,
+                    head_dim,
+                    layer.rope_active_dim,
+                    attention.total_sequence_len - attention.query_sequence_len,
+                    decodeLayerRopeTheta(layer),
+                    request.rope_freq_scale,
+                    request.rope_consecutive_pairs,
+                    1.0,
+                    4,
+                )) orelse (try self.applyDecodeHeadNormRopeDeviceMt(
+                    k_projected.?,
+                    k_norm_slot,
+                    layer.kv_heads,
+                    head_dim,
+                    layer.rope_active_dim,
+                    attention.total_sequence_len - attention.query_sequence_len,
+                    decodeLayerRopeTheta(layer),
+                    request.rope_freq_scale,
+                    request.rope_consecutive_pairs,
+                    1.0,
+                )) orelse return null;
+            }
+            self.timing_stats.active_decode_head_norm_ops += 1;
+            self.timing_stats.active_decode_rope_ops += 1;
+            self.timing_stats.active_decode_head_norm_rope_fused_ops += 1;
+            self.timing_stats.active_decode_head_norm_rope_fused_kernels += 1;
+
+            if (request.global_head_dim != 0) {
+                _ = attention_setup_plan.beforeNext();
+                if (kv_suffix_dest) |*dest| {
+                    if (try self.applyDecodeValueNormIntoDeviceMt(
+                        v_projected.?,
+                        layer.kv_heads,
+                        head_dim,
+                        kv_dim,
+                        request.norm_eps,
+                        dest.v,
+                    )) {
+                        v_for_block = try dest.v.retainedCopy();
+                    }
+                }
+                if (v_for_block == null) {
+                    v_for_block = (try self.applyDecodeValueNormScratchDeviceMt(
+                        v_projected.?,
+                        layer.kv_heads,
+                        head_dim,
+                        kv_dim,
+                        request.norm_eps,
+                        0,
+                    )) orelse (try self.applyDecodeValueNormDeviceMt(
+                        v_projected.?,
+                        layer.kv_heads,
+                        head_dim,
+                        kv_dim,
+                        request.norm_eps,
+                    )) orelse return null;
+                }
+                if (!use_layer_planned_block_scope or attention_setup_plan.disabled or attention_setup_plan.active_scope_index == null) {
+                    try attention_setup_plan.endActiveScope();
+                }
+            } else {
+                if (!use_layer_planned_block_scope or attention_setup_plan.disabled or attention_setup_plan.active_scope_index == null) {
+                    try attention_setup_plan.endActiveScope();
+                }
+                if (kv_suffix_dest) |*dest| {
+                    try v_projected.?.copyInto(&dest.v);
+                    v_for_block = try dest.v.retainedCopy();
+                } else {
+                    v_for_block = try v_projected.?.retainedCopy();
+                }
+            }
+        }
+
+        var planned_layer_op_storage = [_]u16{0} ** 16;
+        var planned_layer_barrier_storage = [_]u8{0} ** 16;
+        var planned_layer_quant_dispatch_storage = [_]u8{255} ** 16;
+        var planned_layer_command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 16;
+        const planned_layer_contract = attention_setup_plan.exportActiveCommandContract(
+            &planned_layer_op_storage,
+            &planned_layer_barrier_storage,
+            &planned_layer_quant_dispatch_storage,
+            &planned_layer_command_op_storage,
+        );
+        var kv_suffix_written = false;
+        var block = (try self.runGatedDecoderBlockF32KvDeviceMt(
+            &ops.RunGatedDecoderBlockRequest{
+                .q = null,
+                .k = null,
+                .v = null,
+                .residual = residual_ct_for_request,
+                .attention = attention,
+                .num_heads = request.num_attention_heads,
+                .num_kv_heads = layer.kv_heads,
+                .head_dim = head_dim,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .attention_post_linear_rms_norm_slot = layer.attn_post_norm_slot,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+                .ffn_rms_norm_slot = layer.ffn_pre_norm_slot,
+                .ffn_post_down_rms_norm_slot = layer.ffn_post_norm_slot,
+                .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = layer.up_ffn_linear_slot,
+                .down_ffn_linear_slot = layer.down_ffn_linear_slot,
+                .intermediate_size = layer.intermediate_size,
+                .activation = request.activation,
+                .ple = null,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot,
+                .ple_post_norm_slot = layer.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+                .output_scale_value = output_scale_value,
+                .planned_layer_contract = planned_layer_contract,
+                .graph_plan_tail_vocab_size = request.vocab_size,
+            },
+            source,
+            q_for_block,
+            k_for_block,
+            v_for_block,
+            residual_mt,
+            ple_input_for_block,
+            output_mt,
+            &kv_suffix_written,
+        )) orelse {
+            if (trace) std.debug.print(
+                "decoder-runtime-decode-direct: miss layer={d} reason=block-null active_scope={} disabled={}\n",
+                .{ layer_index, attention_setup_plan.active_scope_index != null, attention_setup_plan.disabled },
+            );
+            return null;
+        };
+        errdefer block.deinit();
+        if (attention.mode == .paged_prefill and !attention.skip_kv_write and !kv_suffix_written) {
+            _ = try self.publishPromptKvDevice(
+                attention,
+                k_for_block.?,
+                v_for_block.?,
+                @intCast(layer.kv_heads),
+                @intCast(head_dim),
+            );
+        }
+        return block;
+    }
+
+    fn runActiveDecoderRuntimeDecode(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        batch_inputs: *const DecodeBatchHostInputs,
+        queued_token_id: *bool,
+        immediate_token_id: *u32,
+        queued_final_input: *?MetalTensor,
+    ) !bool {
+        const trace = traceDecoderRuntimeDecode();
+        queued_token_id.* = false;
+        queued_final_input.* = null;
+        if (request.items.len != 1) {
+            self.timing_stats.active_decode_frame_batch_fallbacks += 1;
+            if (trace) std.debug.print("decoder-runtime-decode: fallback reason=batch-size batch={d}\n", .{request.items.len});
+            return false;
+        }
+        var initial_tensors = (try prepareDecodeBatchInitialTensors(self, request, batch_inputs)) orelse {
+            self.timing_stats.active_decode_frame_initial_tensor_fallbacks += 1;
+            if (trace) std.debug.print("decoder-runtime-decode: fallback reason=initial-tensors\n", .{});
+            return false;
+        };
+        defer initial_tensors.deinit();
+
+        var hidden = try retainedCtFromMetalTensor(self, &initial_tensors.hidden);
+        var owns_hidden = true;
+        defer if (owns_hidden) freeOp(ctx, hidden);
+        var reserved_hidden: ?ReservedHiddenStatePair = null;
+        var reserved_hidden_front_active = true;
+        defer if (reserved_hidden) |slots| {
+            freeOp(ctx, slots.front);
+            freeOp(ctx, slots.back);
+        };
+        if (request.hidden_size != 0) reserve_hidden_blk: {
+            var cb = self.computeBackend();
+            const slots = (try MetalCompute.reserveHiddenStatePair(&cb, 1, request.hidden_size)) orelse break :reserve_hidden_blk;
+            reserved_hidden = slots;
+            reserved_hidden_front_active = false;
+        }
+
+        var ple_vectors_mt: ?MetalTensor = null;
+        if (initial_tensors.ple_vectors) |*ple_vectors| {
+            ple_vectors_mt = try ple_vectors.retainedCopy();
+        }
+        defer if (ple_vectors_mt) |*tensor| tensor.deinit();
+
+        const item = request.items[0];
+        for (request.layers, 0..) |layer, layer_index| {
+            const head_dim = layer.head_dim;
+            const kv_dim = layer.kv_heads * head_dim;
+            const attention_input_size = request.num_attention_heads * head_dim;
+
+            var attention = item.attention;
+            attention.layer_index = layer.kv_layer_index;
+            attention.skip_kv_write = layer.shares_kv;
+            attention.sliding_window = layer.sliding_window;
+
+            var ple_input_for_block_mt: ?MetalTensor = null;
+            defer if (ple_input_for_block_mt) |*tensor| tensor.deinit();
+            var ple_input_for_block: ?CT = null;
+            defer if (ple_input_for_block) |ct| freeOp(ctx, ct);
+            if (ple_vectors_mt) |*ple_vectors| {
+                if (layer.ple_gate_linear_slot != null and layer.ple_proj_linear_slot != null and layer.ple_post_norm_slot != null) {
+                    if (try sliceDecodePleLayerView(
+                        ple_vectors,
+                        request.items.len,
+                        layer_index,
+                        request.ple_hidden_size,
+                        request.layer_count,
+                    )) |ple_view| {
+                        ple_input_for_block_mt = ple_view;
+                    }
+                }
+            }
+            const block_output_scale_value = layer.output_scale_value;
+
+            var attempted_active_direct = false;
+            const hidden_mt = self.borrowedMetalTensorFromCt(hidden) catch null;
+            if (hidden_mt) |hidden_device| {
+                if (hidden_device.isDevice()) {
+                    attempted_active_direct = true;
+                    self.timing_stats.active_decode_layer_input_direct_attempts += 1;
+                    const reserved_output_ct: ?CT = if (reserved_hidden) |slots|
+                        reservedHiddenInactive(slots, reserved_hidden_front_active)
+                    else
+                        null;
+                    var reserved_output_mt: ?MetalTensor = null;
+                    if (reserved_output_ct) |ct| {
+                        reserved_output_mt = self.borrowedMetalTensorFromCt(ct) catch null;
+                        if (reserved_output_mt != null and !reserved_output_mt.?.isDevice()) reserved_output_mt = null;
+                    }
+                    if (try self.runActiveGatedLayerFromAttentionInputDeviceMt(
+                        request,
+                        &layer,
+                        layer_index,
+                        hidden_device,
+                        layer.attn_pre_norm_slot,
+                        hidden_device,
+                        hidden,
+                        attention,
+                        ple_input_for_block_mt,
+                        block_output_scale_value,
+                        reserved_output_mt,
+                    )) |block_mt_raw| {
+                        var block_mt = block_mt_raw;
+                        var block_mt_owned = true;
+                        errdefer if (block_mt_owned) block_mt.deinit();
+                        self.timing_stats.active_decode_layer_input_direct_hits += 1;
+                        self.timing_stats.active_decode_layers += 1;
+                        if (reserved_output_ct != null and reserved_output_mt != null) {
+                            block_mt.deinit();
+                            block_mt_owned = false;
+                            const next_hidden = reserved_output_ct.?;
+                            self.debugDecodeFiniteCt("layer-out", layer_index, next_hidden);
+                            try self.maybeDumpDecodeStageCt("output-scale", layer_index, next_hidden, request.hidden_size);
+                            if (owns_hidden and !reservedHiddenContains(reserved_hidden, hidden)) freeOp(ctx, hidden);
+                            hidden = next_hidden;
+                            owns_hidden = false;
+                            reserved_hidden_front_active = !reserved_hidden_front_active;
+                            continue;
+                        }
+                        const block_hidden = try self.ctFromOwnedMetalTensor(block_mt);
+                        block_mt_owned = false;
+                        self.debugDecodeFiniteCt("block", layer_index, block_hidden);
+                        const next_hidden = block_hidden;
+                        self.debugDecodeFiniteCt("layer-out", layer_index, next_hidden);
+                        try self.maybeDumpDecodeStageCt("output-scale", layer_index, next_hidden, request.hidden_size);
+                        if (owns_hidden and !reservedHiddenContains(reserved_hidden, hidden)) freeOp(ctx, hidden);
+                        hidden = next_hidden;
+                        owns_hidden = true;
+                        continue;
+                    }
+                }
+            }
+            if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+                self.timing_stats.active_decode_frame_layer_fallbacks += 1;
+                if (trace) std.debug.print(
+                    "decoder-runtime-decode: fallback reason=active-direct-layer-miss layer={d} attempted={}\n",
+                    .{ layer_index, attempted_active_direct },
+                );
+                return false;
+            }
+
+            const attn_normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+                .slot = layer.attn_pre_norm_slot,
+                .input = hidden,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+            })) orelse {
+                if (trace) std.debug.print("decoder-runtime-decode: fallback reason=attn-norm layer={d}\n", .{layer_index});
+                return false;
+            };
+            self.timing_stats.active_decode_attn_norm_ops += 1;
+            defer freeOp(ctx, attn_normed);
+
+            if (!attempted_active_direct) {
+                self.timing_stats.active_decode_layer_input_direct_attempts += 1;
+                if (ple_input_for_block == null) {
+                    if (ple_input_for_block_mt) |*mt| {
+                        ple_input_for_block = try self.ctFromOwnedMetalTensor(try mt.retainedCopy());
+                    }
+                }
+                if (try self.runActiveGatedLayerFromAttentionInputMt(
+                    request,
+                    &layer,
+                    layer_index,
+                    attn_normed,
+                    hidden,
+                    attention,
+                    ple_input_for_block,
+                    block_output_scale_value,
+                    null,
+                )) |block_hidden| {
+                    self.timing_stats.active_decode_layer_input_direct_hits += 1;
+                    self.timing_stats.active_decode_layers += 1;
+                    self.debugDecodeFiniteCt("block", layer_index, block_hidden);
+                    const next_hidden = block_hidden;
+                    self.debugDecodeFiniteCt("layer-out", layer_index, next_hidden);
+                    try self.maybeDumpDecodeStageCt("output-scale", layer_index, next_hidden, request.hidden_size);
+                    if (owns_hidden and !reservedHiddenContains(reserved_hidden, hidden)) freeOp(ctx, hidden);
+                    hidden = next_hidden;
+                    owns_hidden = true;
+                    continue;
+                }
+            }
+
+            if (ple_input_for_block == null) {
+                if (ple_input_for_block_mt) |*mt| {
+                    ple_input_for_block = try self.ctFromOwnedMetalTensor(try mt.retainedCopy());
+                }
+            }
+
+            var q: CT = undefined;
+            var k_value: ?CT = null;
+            var v_value: ?CT = null;
+            if (layer.shares_kv) {
+                q = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                    .slot = layer.q_linear_slot,
+                    .input = attn_normed,
+                    .in_dim = request.hidden_size,
+                    .out_dim = attention_input_size,
+                })) orelse {
+                    if (trace) std.debug.print("decoder-runtime-decode: fallback reason=shared-q layer={d}\n", .{layer_index});
+                    return false;
+                };
+                self.timing_stats.active_decode_q_linear_ops += 1;
+                errdefer freeOp(ctx, q);
+            } else {
+                if (request.global_head_dim != 0) {
+                    q = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                        .slot = layer.q_linear_slot,
+                        .input = attn_normed,
+                        .in_dim = request.hidden_size,
+                        .out_dim = attention_input_size,
+                    })) orelse {
+                        if (trace) std.debug.print("decoder-runtime-decode: fallback reason=q layer={d}\n", .{layer_index});
+                        return false;
+                    };
+                    errdefer freeOp(ctx, q);
+                    k_value = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                        .slot = layer.k_linear_slot,
+                        .input = attn_normed,
+                        .in_dim = request.hidden_size,
+                        .out_dim = kv_dim,
+                    })) orelse {
+                        if (trace) std.debug.print("decoder-runtime-decode: fallback reason=k layer={d}\n", .{layer_index});
+                        return false;
+                    };
+                    errdefer if (k_value) |ct| freeOp(ctx, ct);
+                    v_value = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                        .slot = layer.v_linear_slot,
+                        .input = attn_normed,
+                        .in_dim = request.hidden_size,
+                        .out_dim = kv_dim,
+                    })) orelse {
+                        if (trace) std.debug.print("decoder-runtime-decode: fallback reason=v layer={d}\n", .{layer_index});
+                        return false;
+                    };
+                    self.timing_stats.active_decode_q_linear_ops += 3;
+                } else {
+                    const qkv = (try decoderRuntimeApplyLinearQkvOp(ctx, &.{
+                        .q_slot = layer.q_linear_slot,
+                        .k_slot = layer.k_linear_slot,
+                        .v_slot = layer.v_linear_slot,
+                        .input = attn_normed,
+                        .in_dim = request.hidden_size,
+                        .q_out_dim = attention_input_size,
+                        .kv_out_dim = kv_dim,
+                    })) orelse {
+                        if (trace) std.debug.print("decoder-runtime-decode: fallback reason=qkv layer={d}\n", .{layer_index});
+                        return false;
+                    };
+                    self.timing_stats.active_decode_qkv_ops += 1;
+                    q = qkv.first;
+                    k_value = qkv.second;
+                    v_value = qkv.third;
+                }
+            }
+            defer freeOp(ctx, q);
+            defer if (k_value) |ct| freeOp(ctx, ct);
+            defer if (v_value) |ct| freeOp(ctx, ct);
+
+            const query_value_scale: f32 = if (request.global_head_dim == 0) 1.0 else @sqrt(@as(f32, @floatFromInt(head_dim)));
+            const q_head_norm_rope = try self.maybeApplyDecodeHeadNormRopeCt(
+                q,
+                layer.q_head_norm_slot,
+                request.num_attention_heads,
+                head_dim,
+                request,
+                &layer,
+                attention,
+                query_value_scale,
+            );
+            if (q_head_norm_rope != null) {
+                self.timing_stats.active_decode_head_norm_ops += 1;
+                self.timing_stats.active_decode_rope_ops += 1;
+                self.timing_stats.active_decode_head_norm_rope_fused_ops += 1;
+                self.timing_stats.active_decode_head_norm_rope_fused_kernels += 1;
+            }
+            const q_attn = if (q_head_norm_rope) |ct|
+                ct
+            else
+                try maybeApplyDecodeHeadNormCt(ctx, self, q, layer.q_head_norm_slot, request.num_attention_heads, head_dim);
+            if (q_head_norm_rope == null and q_attn != q) self.timing_stats.active_decode_head_norm_ops += 1;
+            defer if (q_attn != q) freeOp(ctx, q_attn);
+            const k_head_norm_rope = if (!layer.shares_kv)
+                try self.maybeApplyDecodeHeadNormRopeCt(
+                    k_value.?,
+                    layer.k_head_norm_slot,
+                    layer.kv_heads,
+                    head_dim,
+                    request,
+                    &layer,
+                    attention,
+                    1.0,
+                )
+            else
+                null;
+            if (k_head_norm_rope != null) {
+                self.timing_stats.active_decode_head_norm_ops += 1;
+                self.timing_stats.active_decode_rope_ops += 1;
+                self.timing_stats.active_decode_head_norm_rope_fused_ops += 1;
+                self.timing_stats.active_decode_head_norm_rope_fused_kernels += 1;
+            }
+            const k_attn = if (!layer.shares_kv)
+                if (k_head_norm_rope) |ct|
+                    ct
+                else
+                    try maybeApplyDecodeHeadNormCt(ctx, self, k_value.?, layer.k_head_norm_slot, layer.kv_heads, head_dim)
+            else
+                null;
+            if (k_attn) |ct| {
+                if (k_head_norm_rope == null and ct != k_value.?) self.timing_stats.active_decode_head_norm_ops += 1;
+            }
+            defer if (k_attn) |ct| if (ct != k_value.?) freeOp(ctx, ct);
+            const q_for_attn = if (q_head_norm_rope != null)
+                q_attn
+            else
+                try prepareDecodeQueryForAttentionCt(ctx, self, q_attn, request.global_head_dim, head_dim);
+            defer if (q_for_attn != q_attn) freeOp(ctx, q_for_attn);
+            const q_rope = if (q_head_norm_rope != null)
+                q_for_attn
+            else
+                try maybeApplyDecodeRopeCt(ctx, q_for_attn, request, &layer, attention);
+            if (q_head_norm_rope == null and q_rope != q_for_attn) self.timing_stats.active_decode_rope_ops += 1;
+            defer if (q_rope != q_for_attn) freeOp(ctx, q_rope);
+            const k_rope = if (!layer.shares_kv)
+                if (k_head_norm_rope != null)
+                    k_attn.?
+                else
+                    try maybeApplyDecodeRopeCt(ctx, k_attn.?, request, &layer, attention)
+            else
+                null;
+            if (k_rope) |ct| {
+                if (k_head_norm_rope == null and ct != k_attn.?) self.timing_stats.active_decode_rope_ops += 1;
+            }
+            defer if (k_rope) |ct| if (ct != k_attn.?) freeOp(ctx, ct);
+            const v_for_attn = if (!layer.shares_kv)
+                try prepareDecodeValueForAttentionCt(ctx, self, v_value.?, request, &layer)
+            else
+                null;
+            defer if (v_for_attn) |ct| if (ct != v_value.?) freeOp(ctx, ct);
+            self.debugDecodeFiniteCt("block-input", layer_index, hidden);
+            self.debugDecodeFiniteCt("q", layer_index, q_rope);
+            if (k_rope) |ct| self.debugDecodeFiniteCt("k", layer_index, ct);
+            if (v_for_attn) |ct| self.debugDecodeFiniteCt("v", layer_index, ct);
+            try self.maybeDumpDecodeStageCt("hidden", layer_index, hidden, request.hidden_size);
+            try self.maybeDumpDecodeStageCt("q", layer_index, q_for_attn, attention_input_size);
+            try self.maybeDumpDecodeStageCt("q-rope", layer_index, q_rope, attention_input_size);
+            if (k_attn) |ct| try self.maybeDumpDecodeStageCt("k", layer_index, ct, kv_dim);
+            if (k_rope) |ct| try self.maybeDumpDecodeStageCt("k-rope", layer_index, ct, kv_dim);
+            if (v_for_attn) |ct| try self.maybeDumpDecodeStageCt("v", layer_index, ct, kv_dim);
+
+            const direct_block_hidden = try runGatedDecoderBlockOp(ctx, &.{
+                .q = q_rope,
+                .k = k_rope,
+                .v = v_for_attn,
+                .residual = hidden,
+                .attention = attention,
+                .num_heads = request.num_attention_heads,
+                .num_kv_heads = layer.kv_heads,
+                .head_dim = head_dim,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .attention_post_linear_rms_norm_slot = layer.attn_post_norm_slot,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+                .ffn_rms_norm_slot = layer.ffn_pre_norm_slot,
+                .ffn_post_down_rms_norm_slot = layer.ffn_post_norm_slot,
+                .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = layer.up_ffn_linear_slot,
+                .down_ffn_linear_slot = layer.down_ffn_linear_slot,
+                .intermediate_size = layer.intermediate_size,
+                .activation = request.activation,
+                .ple = ple_input_for_block,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot,
+                .ple_post_norm_slot = layer.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+            });
+            const block_includes_ple = direct_block_hidden != null and ple_input_for_block != null;
+            const block_hidden = direct_block_hidden orelse blk: {
+                if (layer.shares_kv) {
+                    if (trace) std.debug.print(
+                        "decoder-runtime-decode: fallback reason=shared-block layer={d} kv_layer={d} kv_tokens={d} kv_pos={d} sliding={d}\n",
+                        .{ layer_index, layer.kv_layer_index, attention.kv_sequence_len, attention.kv_position_offset, attention.sliding_window },
+                    );
+                    return false;
+                }
+                break :blk (try runDecodeGatedBlockSplitCt(
+                    ctx,
+                    self,
+                    request,
+                    &layer,
+                    layer_index,
+                    q_rope,
+                    k_rope.?,
+                    v_for_attn.?,
+                    hidden,
+                    attention,
+                )) orelse {
+                    if (trace) std.debug.print(
+                        "decoder-runtime-decode: fallback reason=block layer={d} kv_layer={d} shared={} kv_tokens={d} kv_pos={d} sliding={d}\n",
+                        .{ layer_index, layer.kv_layer_index, layer.shares_kv, attention.kv_sequence_len, attention.kv_position_offset, attention.sliding_window },
+                    );
+                    return false;
+                };
+            };
+            self.timing_stats.active_decode_layers += 1;
+            self.debugDecodeFiniteCt("block", layer_index, block_hidden);
+            var layer_result = block_hidden;
+            if (!block_includes_ple) {
+                if (ple_vectors_mt) |ple| {
+                    const ple_result = blk: {
+                        var block_mt = try self.ownedMetalTensorFromCt(block_hidden);
+                        defer block_mt.deinit();
+                        if (try applyDecodePleLayer(self, request, &layer, layer_index, block_mt, ple)) |tensor| {
+                            break :blk try self.ctFromOwnedMetalTensor(tensor);
+                        }
+
+                        const ple_ct = try retainedCtFromMetalTensor(self, &ple);
+                        defer freeOp(ctx, ple_ct);
+                        break :blk (try applyDecodePleLayerCt(ctx, self, request, &layer, layer_index, block_hidden, ple_ct)) orelse {
+                            if (trace) std.debug.print("decoder-runtime-decode: fallback reason=ple layer={d}\n", .{layer_index});
+                            freeOp(ctx, block_hidden);
+                            return false;
+                        };
+                    };
+                    self.timing_stats.active_decode_ple_ops += 1;
+                    self.debugDecodeFiniteCt("ple", layer_index, ple_result);
+                    try self.maybeDumpDecodeStageCt("ple", layer_index, ple_result, request.hidden_size);
+                    freeOp(ctx, block_hidden);
+                    layer_result = ple_result;
+                }
+            }
+
+            const next_hidden = try applyDecodeLayerOutputScaleValueCt(ctx, self, layer_result, layer.output_scale_value);
+            self.debugDecodeFiniteCt("layer-out", layer_index, next_hidden);
+            try self.maybeDumpDecodeStageCt("output-scale", layer_index, next_hidden, request.hidden_size);
+            if (owns_hidden and !reservedHiddenContains(reserved_hidden, hidden)) freeOp(ctx, hidden);
+            hidden = next_hidden;
+            owns_hidden = true;
+        }
+
+        var final_input = try self.ownedDeviceMetalTensorFromCt(hidden);
+        errdefer final_input.deinit();
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) final_tail_blk: {
+            var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
+            defer tail_region_scope.deinit();
+            var tail_plan_storage = metal_command_planner.TailCommandLowerer{};
+            tail_plan_storage.build(.{
+                .final_norm_slot = request.final_norm_slot,
+                .lm_head_slot = request.final_lm_head_slot,
+                .source = @intFromEnum(metal_runtime.ComputeSource.tail),
+                .region = @intFromEnum(metal_runtime.ComputeRegion.tail),
+                .hidden_size = request.hidden_size,
+                .vocab_size = request.vocab_size,
+            }) catch {};
+            var planned_tail_op_storage = [_]u16{0} ** 3;
+            var planned_tail_barrier_storage = [_]u8{0} ** 3;
+            var planned_tail_quant_dispatch_storage = [_]u8{255} ** 3;
+            var planned_tail_command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 3;
+            const planned_tail_contract = metal_runtime.plannedContractFromCommandPlan(
+                tail_plan_storage.commandView(),
+                &planned_tail_op_storage,
+                &planned_tail_barrier_storage,
+                &planned_tail_quant_dispatch_storage,
+                &planned_tail_command_op_storage,
+                0,
+            );
+            if (!try metal_runtime.decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self.provider_impl, .{
+                .input = final_input,
+                .norm_slot = request.final_norm_slot,
+                .linear_slot = request.final_lm_head_slot,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+                .out_dim = request.vocab_size,
+                .planned_layer_contract = planned_tail_contract,
+            })) break :final_tail_blk;
+            queued_token_id.* = true;
+            queued_final_input.* = final_input;
+            self.timing_stats.active_decode_final_fused_argmax_ops += 1;
+            if (trace) std.debug.print("decoder-runtime-decode: active queued-token\n", .{});
+            return true;
+        }
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            final_input.deinit();
+            self.timing_stats.active_decode_frame_tail_fallbacks += 1;
+            if (trace) std.debug.print("decoder-runtime-decode: fallback reason=planned-final-device-tail\n", .{});
+            return false;
+        }
+        final_input.deinit();
+
+        const token_id = (try decoderRuntimeApplyRmsNormLinearArgmaxOp(ctx, &.{
+            .input = hidden,
+            .norm_slot = request.final_norm_slot,
+            .linear_slot = request.final_lm_head_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+            .out_dim = request.vocab_size,
+        })) orelse {
+            if (trace) std.debug.print("decoder-runtime-decode: fallback reason=final-argmax\n", .{});
+            return false;
+        };
+        immediate_token_id.* = @intCast(token_id);
+        if (trace) std.debug.print("decoder-runtime-decode: active token_id={d}\n", .{token_id});
+        return true;
+    }
+
+    fn prepareDecodeBatchInitialTensors(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        inputs: *const DecodeBatchHostInputs,
+    ) !?DecodeBatchInitialTensors {
+        const token_embedding_weight = request.token_embedding_weight orelse return null;
+        const embedding_scope = try self.beginPlannedGraphScopeForSelf(.embedding);
+        defer self.endPlannedGraphScopeForSelf(embedding_scope) catch {};
+        const hidden_raw = (try lookupDecodeEmbeddingTensor(
+            self,
+            token_embedding_weight,
+            inputs.token_ids,
+            request.hidden_size,
+            request.token_embedding_scale,
+        )) orelse return null;
+        var hidden = hidden_raw;
+        errdefer hidden.deinit();
+
+        var ple_token_embedding: ?MetalTensor = null;
+        if (request.ple_hidden_size != 0 and request.layer_count != 0) {
+            const ple_scope = try self.beginPlannedGraphScopeForSelf(.ple);
+            defer self.endPlannedGraphScopeForSelf(ple_scope) catch {};
+            var ple_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
+            defer ple_region_scope.deinit();
+            const ple_token_embedding_weight = request.ple_token_embedding_weight orelse return null;
+            const ple_total_dim = request.ple_hidden_size * request.layer_count;
+            const ple_raw = (try lookupDecodeEmbeddingTensor(
+                self,
+                ple_token_embedding_weight,
+                inputs.token_ids,
+                ple_total_dim,
+                @sqrt(@as(f32, @floatFromInt(request.ple_hidden_size))),
+            )) orelse return null;
+            var ple = ple_raw;
+            errdefer ple.deinit();
+            ple_token_embedding = ple;
+        }
+
+        var result = DecodeBatchInitialTensors{
+            .hidden = hidden,
+            .ple_token_embedding = ple_token_embedding,
+        };
+        errdefer result.deinit();
+        if (result.ple_token_embedding != null) {
+            result.ple_vectors = (try computeDecodePleVectors(self, request, &result)) orelse return null;
+        }
+        return result;
+    }
+
+    fn decoderRuntimeDecodeOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.timing_stats.active_decode_frame_attempts += 1;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return false;
+        if (request.mode != .greedy_argmax) return false;
+        if (request.items.len == 0 or request.items.len != request.output_token_ids.len) return false;
+        if (request.input_token_ids) |token_ids| {
+            const shape = try tensorShapeOp(ctx, token_ids, self.allocator);
+            defer self.allocator.free(shape);
+            if (shape.len != 1 or shape[0] != @as(i64, @intCast(request.items.len))) return false;
+        }
+        if (request.input_positions) |positions| {
+            const shape = try tensorShapeOp(ctx, positions, self.allocator);
+            defer self.allocator.free(shape);
+            if (shape.len != 1 or shape[0] != @as(i64, @intCast(request.items.len))) return false;
+        }
+        if (request.layer_count == 0 or request.layers.len != request.layer_count) return false;
+        if (request.hidden_size == 0 or request.vocab_size == 0 or request.num_attention_heads == 0) return false;
+        if (request.final_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity) return false;
+        if (request.final_lm_head_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+        const token_embedding_weight = request.token_embedding_weight orelse return false;
+        if (!(try validateDecodeEmbeddingWeight(ctx, self, token_embedding_weight, request.vocab_size, request.hidden_size))) return false;
+        var batch_inputs = (try prepareDecodeBatchHostInputs(self, request)) orelse return false;
+        defer batch_inputs.deinit(self.allocator);
+        for (request.layers) |layer| {
+            if (layer.attn_pre_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity) return false;
+            if (layer.attn_post_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity) return false;
+            if (layer.ffn_pre_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity) return false;
+            if (layer.ffn_post_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity) return false;
+            if (layer.q_head_norm_slot) |slot| if (slot >= metal_runtime.decoder_runtime_rms_norm_slot_capacity) return false;
+            if (layer.k_head_norm_slot) |slot| if (slot >= metal_runtime.decoder_runtime_rms_norm_slot_capacity) return false;
+            if (layer.q_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.k_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.v_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.attention_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.gate_ffn_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.up_ffn_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.down_ffn_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.ple_gate_linear_slot) |slot| if (slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.ple_proj_linear_slot) |slot| if (slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+            if (layer.ple_post_norm_slot) |slot| if (slot >= metal_runtime.decoder_runtime_rms_norm_slot_capacity) return false;
+        }
+
+        switch (request.contract) {
+            .gemma4_gated_ple_shared_kv => {
+                if (request.ple_hidden_size == 0) return false;
+                if (request.global_head_dim == 0) return false;
+                if (request.ple_model_proj_slot == null or request.ple_proj_norm_slot == null) return false;
+                if (request.ple_model_proj_slot.? >= metal_runtime.decoder_runtime_linear_slot_capacity) return false;
+                if (request.ple_proj_norm_slot.? >= metal_runtime.decoder_runtime_rms_norm_slot_capacity) return false;
+                const ple_token_embedding_weight = request.ple_token_embedding_weight orelse return false;
+                if (!(try validateDecodeEmbeddingWeight(ctx, self, ple_token_embedding_weight, request.vocab_size, request.ple_hidden_size * request.layer_count))) return false;
+            },
+        }
+        if (!metal_runtime.decoderRuntimeReserveGreedyTailScratch(self.provider_impl, request.vocab_size)) {
+            self.timing_stats.active_decode_frame_scratch_failures += 1;
+            return false;
+        }
+        const active_decode_frame_enabled = enableActiveDecodeFrame();
+        if (active_decode_frame_enabled) {
+            for (request.layers) |layer| {
+                if (layer.head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return false;
+                if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(
+                    self.provider_impl,
+                    1,
+                    request.num_attention_heads,
+                    layer.kv_heads,
+                    layer.head_dim,
+                    request.hidden_size,
+                    @max(layer.intermediate_size, request.ple_hidden_size),
+                    0,
+                )) {
+                    self.timing_stats.active_decode_frame_scratch_failures += 1;
+                    return false;
+                }
+            }
+        } else {
+            self.timing_stats.active_decode_frame_disabled += 1;
+        }
+        var active_frame = false;
+        if (active_decode_frame_enabled and !metal_runtime.hasActiveFrame(runtime)) {
+            active_frame = try self.beginDecoderRuntimeFrame(runtime);
+        }
+        errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
+        var queued_token_id = false;
+        var immediate_token_id: u32 = 0;
+        var queued_final_input: ?MetalTensor = null;
+        defer if (queued_final_input) |*tensor| tensor.deinit();
+        if (try runActiveDecoderRuntimeDecode(ctx, self, request, &batch_inputs, &queued_token_id, &immediate_token_id, &queued_final_input)) {
+            try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
+            const token_id = if (queued_token_id)
+                (try metal_runtime.decoderRuntimeReadTokenId(self.provider_impl)) orelse return false
+            else
+                @as(usize, immediate_token_id);
+            request.output_token_ids[0] = @intCast(token_id);
+            self.timing_stats.active_decode_frame_successes += 1;
+            return true;
+        }
+        self.timing_stats.active_decode_frame_fallbacks += 1;
+        self.cancelDecoderRuntimeFrame(runtime, &active_frame);
+        if (prepareDecodeInputsDebug()) {
+            var initial_tensors = (try prepareDecodeBatchInitialTensors(self, request, &batch_inputs)) orelse return false;
+            defer initial_tensors.deinit();
+            if (request.layers.len > 0) {
+                if (initial_tensors.ple_vectors) |ple_vectors| {
+                    var ple_hidden = (try applyDecodePleLayer(
+                        self,
+                        request,
+                        &request.layers[0],
+                        0,
+                        initial_tensors.hidden,
+                        ple_vectors,
+                    )) orelse return false;
+                    defer ple_hidden.deinit();
+                }
+            }
+        }
+        return false;
+    }
+
+    fn reserveGraphPlanSlotsFromCommandPlan(
+        self: *MetalCompute,
+        plan: metal_command_planner.GraphCommandPlanView,
+    ) !bool {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (plan.scratch_slots.len == 0) return true;
+        metal_runtime.beginGraphPlan(runtime) catch return false;
+        for (plan.scratch_slots) |scratch| {
+            if (scratch.bytes == 0) continue;
+            metal_runtime.reserveGraphPlanSlot(runtime, scratch.slot, scratch.bytes) catch return false;
+        }
+        metal_runtime.commitGraphPlan(runtime) catch return false;
+        return true;
+    }
+
+    fn prepareActivePrefillFrameContractStorage(
+        self: *MetalCompute,
+        plan: metal_command_planner.GraphCommandPlanView,
+    ) !bool {
+        self.active_prefill_frame_contract_storage.deinit(self.allocator);
+        if (plan.ops.len == 0 or plan.planned_ops.len == 0) return false;
+        var storage: ActivePrefillFrameContractStorage = .{};
+        errdefer storage.deinit(self.allocator);
+        storage.ops = try self.allocator.alloc(u16, plan.planned_ops.len);
+        storage.barriers = try self.allocator.alloc(u8, plan.planned_ops.len);
+        storage.quant_dispatches = try self.allocator.alloc(u8, plan.ops.len);
+        storage.command_ops = try self.allocator.alloc(ops.PlannedCommandOp, plan.ops.len);
+        if (!metal_runtime.populatePlannedCommandContractStorage(plan, storage.view())) return false;
+        self.active_prefill_frame_contract_storage = storage;
+        self.timing_stats.prefill_frame_contract_ops = @intCast(plan.ops.len);
+        self.timing_stats.prefill_frame_contract_scopes = @intCast(plan.scopes.len);
+        self.timing_stats.prefill_frame_contract_barriers = @intCast(plan.barrier_count);
+        return true;
+    }
+
+    fn activePrefillFrameContractWindow(
+        self: *MetalCompute,
+        start_index: usize,
+        end_index: usize,
+    ) ops.PlannedLayerContract {
+        self.timing_stats.prefill_frame_contract_windows += 1;
+        return metal_runtime.plannedContractWindowFromStorage(
+            self.active_prefill_frame_contract_storage.view(),
+            start_index,
+            end_index,
+        );
+    }
+
+    fn activePrefillFrameFullContract(self: *MetalCompute) ?ops.PlannedLayerContract {
+        const len = self.active_prefill_frame_contract_storage.command_ops.len;
+        if (len == 0) return null;
+        const contract = metal_runtime.plannedContractWindowFromStorage(
+            self.active_prefill_frame_contract_storage.view(),
+            0,
+            len,
+        );
+        if (!plannedContractIsActive(contract)) return null;
+        self.timing_stats.prefill_frame_contract_full_frames += 1;
+        return contract;
+    }
+
+    fn plannedContractIsActive(contract: ops.PlannedLayerContract) bool {
+        return contract.command_ops.len != 0 or contract.ops.len != 0;
+    }
+
+    fn beginActivePlannedComputeScopeIfPossible(
+        self: *MetalCompute,
+        source: metal_runtime.ComputeSource,
+        region: metal_runtime.ComputeRegion,
+    ) bool {
+        const runtime = self.provider_impl.raw_decode_runtime;
+        if (!metal_runtime.hasActiveFrame(runtime)) return false;
+        metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(source), region) catch return false;
+        return true;
+    }
+
+    fn endActivePlannedComputeScope(self: *MetalCompute, active: bool) void {
+        if (!active) return;
+        self.endActivePlannedComputeScopeIfAny();
+    }
+
+    fn activePlannedComputeBarrier(self: *MetalCompute, active: bool) void {
+        if (!active) return;
+        metal_runtime.plannedComputeBarrier(self.provider_impl.raw_decode_runtime) catch {};
+    }
+
+    fn endActivePlannedComputeScopeIfAny(self: *MetalCompute) void {
+        metal_runtime.endPlannedComputeScope(self.provider_impl.raw_decode_runtime) catch |err| switch (err) {
+            metal_runtime.FrameError.PlannedScopeNotActive,
+            metal_runtime.FrameError.FrameNotActive,
+            metal_runtime.FrameError.RuntimeUnavailable,
+            => {},
+            else => {},
+        };
+    }
+
+    fn activePrefillFrameLayerDispatch(
+        self: *MetalCompute,
+        window: metal_command_planner.GatedFrameLayerWindow,
+        full_contract: ops.PlannedLayerContract,
+    ) ?PrefillFrameLayerDispatch {
+        if (window.layer_end > self.active_prefill_frame_contract_storage.command_ops.len) return null;
+        if (window.layer_start >= window.setup_start) return null;
+        if (window.setup_start >= window.block_start or window.block_start >= window.layer_end) return null;
+        if (!plannedContractIsActive(full_contract)) return null;
+        if (window.layer_end > full_contract.command_ops.len or
+            window.layer_end > full_contract.ops.len or
+            window.layer_end > full_contract.barriers.len or
+            window.layer_end > full_contract.quant_dispatches.len)
+        {
+            return null;
+        }
+        self.timing_stats.prefill_frame_executor_scope_links += 1;
+        return .{ .window = window, .full_contract = full_contract };
+    }
+
+    fn activePrefillFrameTailContract(
+        self: *MetalCompute,
+        window: metal_command_planner.GatedFrameTailWindow,
+    ) ?ops.PlannedLayerContract {
+        if (window.logits_end > self.active_prefill_frame_contract_storage.command_ops.len) return null;
+        const contract = self.activePrefillFrameContractWindow(window.start, window.logits_end);
+        if (!plannedContractIsActive(contract)) return null;
+        self.timing_stats.prefill_frame_executor_tail_contracts += 1;
+        return contract;
+    }
+
+    fn declinePrefillFrameExecute(self: *MetalCompute, reason: PrefillFrameExecuteDeclineReason) bool {
+        switch (reason) {
+            .no_runtime => self.timing_stats.prefill_frame_execute_no_runtime += 1,
+            .no_active_frame => self.timing_stats.prefill_frame_execute_no_active_frame += 1,
+            .invalid_contract => self.timing_stats.prefill_frame_execute_invalid_contract += 1,
+            .invalid_shape => self.timing_stats.prefill_frame_execute_invalid_shape += 1,
+            .missing_plan => self.timing_stats.prefill_frame_execute_missing_plan += 1,
+            .plan_mismatch => self.timing_stats.prefill_frame_execute_plan_mismatch += 1,
+            .missing_ple => self.timing_stats.prefill_frame_execute_missing_ple += 1,
+            .output_hidden_set => self.timing_stats.prefill_frame_execute_output_hidden_set += 1,
+        }
+        return false;
+    }
+
+    fn reserveGraphPlanSlotsOp(ctx: *anyopaque, slots: []const ops.GraphPlanSlot) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (slots.len == 0) return true;
+        metal_runtime.beginGraphPlan(runtime) catch return false;
+        for (slots) |slot| {
+            if (slot.bytes == 0) continue;
+            metal_runtime.reserveGraphPlanSlot(runtime, slot.slot, slot.bytes) catch return false;
+        }
+        metal_runtime.commitGraphPlan(runtime) catch return false;
+        return true;
+    }
+
+    fn hashOptionalUsize(hasher: *std.hash.Wyhash, value: ?usize) void {
+        std.hash.autoHash(hasher, value != null);
+        std.hash.autoHash(hasher, value orelse 0);
+    }
+
+    fn hashOptionalF32(hasher: *std.hash.Wyhash, value: ?f32) void {
+        std.hash.autoHash(hasher, value != null);
+        std.hash.autoHash(hasher, @as(u32, @bitCast(value orelse 0.0)));
+    }
+
+    fn prefillFramePlanLayerHash(layers: []const ops.DecoderRuntimeLayerSpec) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        for (layers) |layer| {
+            std.hash.autoHash(&hasher, layer.shares_kv);
+            std.hash.autoHash(&hasher, layer.kv_layer_index);
+            std.hash.autoHash(&hasher, layer.kv_heads);
+            std.hash.autoHash(&hasher, layer.head_dim);
+            std.hash.autoHash(&hasher, layer.intermediate_size);
+            std.hash.autoHash(&hasher, layer.sliding_window);
+            std.hash.autoHash(&hasher, layer.rope_dim);
+            std.hash.autoHash(&hasher, layer.rope_active_dim);
+            std.hash.autoHash(&hasher, @as(u32, @bitCast(layer.rope_theta)));
+            std.hash.autoHash(&hasher, layer.attn_pre_norm_slot);
+            std.hash.autoHash(&hasher, layer.attn_post_norm_slot);
+            std.hash.autoHash(&hasher, layer.ffn_pre_norm_slot);
+            std.hash.autoHash(&hasher, layer.ffn_post_norm_slot);
+            hashOptionalUsize(&hasher, layer.q_head_norm_slot);
+            hashOptionalUsize(&hasher, layer.k_head_norm_slot);
+            std.hash.autoHash(&hasher, layer.q_linear_slot);
+            std.hash.autoHash(&hasher, layer.k_linear_slot);
+            std.hash.autoHash(&hasher, layer.v_linear_slot);
+            std.hash.autoHash(&hasher, layer.attention_linear_slot);
+            std.hash.autoHash(&hasher, layer.gate_ffn_linear_slot);
+            std.hash.autoHash(&hasher, layer.up_ffn_linear_slot);
+            std.hash.autoHash(&hasher, layer.down_ffn_linear_slot);
+            hashOptionalUsize(&hasher, layer.ple_gate_linear_slot);
+            hashOptionalUsize(&hasher, layer.ple_proj_linear_slot);
+            hashOptionalUsize(&hasher, layer.ple_post_norm_slot);
+            hashOptionalF32(&hasher, layer.output_scale_value);
+        }
+        return hasher.final();
+    }
+
+    fn prefillFramePlanKey(request: *const ops.DecoderRuntimePrefillFramePlanRequest) ActivePrefillFramePlanKey {
+        return .{
+            .contract = request.contract,
+            .layer_count = request.layer_count,
+            .rows = request.rows,
+            .hidden_size = request.hidden_size,
+            .vocab_size = request.vocab_size,
+            .num_attention_heads = request.num_attention_heads,
+            .global_head_dim = request.global_head_dim,
+            .ple_hidden_size = request.ple_hidden_size,
+            .final_norm_slot = request.final_norm_slot,
+            .final_lm_head_slot = request.final_lm_head_slot,
+            .include_tail = request.include_tail,
+            .layers_hash = prefillFramePlanLayerHash(request.layers),
+        };
+    }
+
+    fn hasReusablePrefillFramePlan(self: *const MetalCompute, key: ActivePrefillFramePlanKey) bool {
+        if (self.active_prefill_frame_plan == null) return false;
+        if (self.active_prefill_frame_plan_key) |active_key| {
+            if (!std.meta.eql(active_key, key)) return false;
+        } else return false;
+        if (self.active_prefill_frame_contract_storage.command_ops.len == 0) return false;
+        return true;
+    }
+
+    fn decoderRuntimePlanPrefillFrameOp(
+        ctx: *anyopaque,
+        request: *const ops.DecoderRuntimePrefillFramePlanRequest,
+    ) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.timing_stats.prefill_frame_plan_attempts += 1;
+        var plan_success = false;
+        defer {
+            if (!plan_success) self.timing_stats.prefill_frame_plan_failures += 1;
+        }
+        if (request.contract != .gemma4_gated_ple_shared_kv) {
+            traceMetalPrefillFramePlan("decline=contract", .{});
+            return false;
+        }
+        if (request.rows <= 1 or request.layer_count == 0 or request.layers.len != request.layer_count) {
+            traceMetalPrefillFramePlan(
+                "decline=shape rows={d} layer_count={d} layers_len={d}",
+                .{ request.rows, request.layer_count, request.layers.len },
+            );
+            return false;
+        }
+        if (request.hidden_size == 0 or request.num_attention_heads == 0) {
+            traceMetalPrefillFramePlan(
+                "decline=model-shape hidden={d} heads={d}",
+                .{ request.hidden_size, request.num_attention_heads },
+            );
+            return false;
+        }
+        if (request.include_tail and request.vocab_size == 0) {
+            traceMetalPrefillFramePlan("decline=tail-vocab", .{});
+            return false;
+        }
+        if (request.ple_hidden_size == 0) {
+            traceMetalPrefillFramePlan("decline=ple-hidden", .{});
+            return false;
+        }
+        const plan_key = prefillFramePlanKey(request);
+        if (self.hasReusablePrefillFramePlan(plan_key)) {
+            plan_success = true;
+            self.timing_stats.prefill_frame_plan_successes += 1;
+            return true;
+        }
+
+        var layers = try self.allocator.alloc(metal_command_planner.GatedFrameCommandLowerer.Layer, request.layer_count);
+        defer self.allocator.free(layers);
+        for (request.layers, 0..) |layer, index| {
+            const attention_input_size = request.num_attention_heads * layer.head_dim;
+            const kv_dim = layer.kv_heads * layer.head_dim;
+            if (layer.attn_pre_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity or
+                layer.attn_post_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity or
+                layer.ffn_pre_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity or
+                layer.ffn_post_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity)
+            {
+                traceMetalPrefillFramePlan("decline=norm-slot layer={d}", .{index});
+                return false;
+            }
+            if (layer.q_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
+                layer.attention_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
+                layer.gate_ffn_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
+                layer.up_ffn_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
+                layer.down_ffn_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity)
+            {
+                traceMetalPrefillFramePlan("decline=linear-slot layer={d}", .{index});
+                return false;
+            }
+            if (!layer.shares_kv) {
+                if (layer.k_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
+                    layer.v_linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity)
+                {
+                    traceMetalPrefillFramePlan("decline=kv-linear-slot layer={d}", .{index});
+                    return false;
+                }
+            }
+            if (layer.ple_gate_linear_slot == null or layer.ple_proj_linear_slot == null or layer.ple_post_norm_slot == null) {
+                traceMetalPrefillFramePlan("decline=ple-slot layer={d}", .{index});
+                return false;
+            }
+            const q_format = self.preparedLinearMatmulFormatForLinearSlot(layer.q_linear_slot, request.hidden_size, attention_input_size) orelse {
+                traceMetalPrefillFramePlan("decline=q-format layer={d} slot={d} in={d} out={d}", .{ index, layer.q_linear_slot, request.hidden_size, attention_input_size });
+                return false;
+            };
+            const k_format = if (layer.shares_kv)
+                q_format
+            else
+                self.preparedLinearMatmulFormatForLinearSlot(layer.k_linear_slot, request.hidden_size, kv_dim) orelse {
+                    traceMetalPrefillFramePlan("decline=k-format layer={d} slot={d} in={d} out={d}", .{ index, layer.k_linear_slot, request.hidden_size, kv_dim });
+                    return false;
+                };
+            const v_format = if (layer.shares_kv)
+                q_format
+            else
+                self.preparedLinearMatmulFormatForLinearSlot(layer.v_linear_slot, request.hidden_size, kv_dim) orelse {
+                    traceMetalPrefillFramePlan("decline=v-format layer={d} slot={d} in={d} out={d}", .{ index, layer.v_linear_slot, request.hidden_size, kv_dim });
+                    return false;
+                };
+            const attention_format = self.preparedLinearMatmulFormatForLinearSlot(layer.attention_linear_slot, attention_input_size, request.hidden_size) orelse {
+                traceMetalPrefillFramePlan("decline=attention-format layer={d} slot={d} in={d} out={d}", .{ index, layer.attention_linear_slot, attention_input_size, request.hidden_size });
+                return false;
+            };
+            const gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.gate_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse {
+                traceMetalPrefillFramePlan("decline=gate-format layer={d} slot={d} in={d} out={d}", .{ index, layer.gate_ffn_linear_slot, request.hidden_size, layer.intermediate_size });
+                return false;
+            };
+            const up_format = self.preparedLinearMatmulFormatForLinearSlot(layer.up_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse {
+                traceMetalPrefillFramePlan("decline=up-format layer={d} slot={d} in={d} out={d}", .{ index, layer.up_ffn_linear_slot, request.hidden_size, layer.intermediate_size });
+                return false;
+            };
+            const down_format = self.preparedLinearMatmulFormatForLinearSlot(layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size) orelse {
+                traceMetalPrefillFramePlan("decline=down-format layer={d} slot={d} in={d} out={d}", .{ index, layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size });
+                return false;
+            };
+            const ple_gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse {
+                traceMetalPrefillFramePlan("decline=ple-gate-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size });
+                return false;
+            };
+            const ple_projection_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse {
+                traceMetalPrefillFramePlan("decline=ple-proj-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size });
+                return false;
+            };
+            layers[index] = .{
+                .shares_kv = layer.shares_kv,
+                .kv_layer_index = layer.kv_layer_index,
+                .kv_heads = layer.kv_heads,
+                .head_dim = layer.head_dim,
+                .intermediate_size = layer.intermediate_size,
+                .attn_pre_norm_slot = layer.attn_pre_norm_slot,
+                .attn_post_norm_slot = layer.attn_post_norm_slot,
+                .ffn_pre_norm_slot = layer.ffn_pre_norm_slot,
+                .ffn_post_norm_slot = layer.ffn_post_norm_slot,
+                .q_head_norm_slot = layer.q_head_norm_slot,
+                .k_head_norm_slot = layer.k_head_norm_slot,
+                .q_linear_slot = layer.q_linear_slot,
+                .k_linear_slot = layer.k_linear_slot,
+                .v_linear_slot = layer.v_linear_slot,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .gate_linear_slot = layer.gate_ffn_linear_slot,
+                .up_linear_slot = layer.up_ffn_linear_slot,
+                .down_linear_slot = layer.down_ffn_linear_slot,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot,
+                .ple_post_norm_slot = layer.ple_post_norm_slot,
+                .quant_formats = .{
+                    .q = q_format,
+                    .k = k_format,
+                    .v = v_format,
+                    .attention_output = attention_format,
+                    .gate = gate_format,
+                    .up = up_format,
+                    .down = down_format,
+                    .ple_gate = ple_gate_format,
+                    .ple_projection = ple_projection_format,
+                },
+            };
+        }
+        const tail_quant_format = if (request.include_tail)
+            self.preparedLinearMatmulFormatForLinearSlot(
+                request.final_lm_head_slot,
+                request.hidden_size,
+                request.vocab_size,
+            ) orelse {
+                traceMetalPrefillFramePlan("decline=tail-format slot={d} in={d} out={d}", .{ request.final_lm_head_slot, request.hidden_size, request.vocab_size });
+                return false;
+            }
+        else
+            metal_command_planner.QuantMatmulFormat.unknown;
+
+        self.clearActivePrefillFramePlan();
+        self.active_prefill_frame_plan = metal_command_planner.GatedFrameCommandLowerer.init(self.allocator);
+        self.active_prefill_frame_plan_key = plan_key;
+        errdefer self.clearActivePrefillFramePlan();
+        if (self.active_prefill_frame_plan) |*frame_plan| {
+            frame_plan.build(.{
+                .rows = request.rows,
+                .hidden_size = request.hidden_size,
+                .vocab_size = request.vocab_size,
+                .num_attention_heads = request.num_attention_heads,
+                .global_head_dim = request.global_head_dim,
+                .ple_hidden_size = request.ple_hidden_size,
+                .final_norm_slot = request.final_norm_slot,
+                .lm_head_slot = request.final_lm_head_slot,
+                .tail_quant_format = tail_quant_format,
+                .include_tail = request.include_tail,
+                .activation_dtype = .f16,
+                .layers = layers,
+                .source = @intFromEnum(metal_runtime.ComputeSource.layer),
+                .layer_region = @intFromEnum(metal_runtime.ComputeRegion.layer),
+                .tail_source = @intFromEnum(metal_runtime.ComputeSource.tail),
+                .tail_region = @intFromEnum(metal_runtime.ComputeRegion.tail),
+            }) catch {
+                self.clearActivePrefillFramePlan();
+                return false;
+            };
+            const reserved = try self.reserveGraphPlanSlotsFromCommandPlan(frame_plan.view());
+            const prepared_contract = reserved and try self.prepareActivePrefillFrameContractStorage(frame_plan.view());
+            if (!prepared_contract) self.clearActivePrefillFramePlan();
+            if (prepared_contract) {
+                plan_success = true;
+                self.timing_stats.prefill_frame_plan_successes += 1;
+            }
+            return prepared_contract;
+        }
+        return false;
+    }
+
+    fn decoderRuntimeExecuteGraphCommandPlanFrameOp(
+        ctx: *anyopaque,
+        request: *const ops.DecoderRuntimeGraphCommandPlanFrameRequest,
+    ) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.timing_stats.prefill_frame_execute_attempts += 1;
+        var execute_success = false;
+        defer {
+            if (!execute_success) self.timing_stats.prefill_frame_execute_failures += 1;
+        }
+        const runtime = self.provider_impl.raw_decode_runtime orelse return self.declinePrefillFrameExecute(.no_runtime);
+        if (!metal_runtime.hasActiveFrame(runtime)) return self.declinePrefillFrameExecute(.no_active_frame);
+        if (request.contract != .gemma4_gated_ple_shared_kv) return self.declinePrefillFrameExecute(.invalid_contract);
+        if (request.rows <= 1 or request.layer_count == 0 or request.layers.len != request.layer_count) return self.declinePrefillFrameExecute(.invalid_shape);
+        if (request.hidden_size == 0 or request.vocab_size == 0 or request.num_attention_heads == 0) return self.declinePrefillFrameExecute(.invalid_shape);
+        if (request.ple_hidden_size == 0) return self.declinePrefillFrameExecute(.invalid_shape);
+        const frame_plan = &(self.active_prefill_frame_plan orelse return self.declinePrefillFrameExecute(.missing_plan));
+        if (request.ple_vectors == null) {
+            return self.declinePrefillFrameExecute(.missing_ple);
+        }
+        if (request.output_hidden.* != null) return self.declinePrefillFrameExecute(.output_hidden_set);
+
+        var hidden = request.hidden;
+        var owns_hidden = false;
+        errdefer if (owns_hidden) freeOp(ctx, hidden);
+
+        const full_frame_contract = self.activePrefillFrameFullContract() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
+        for (request.layers, 0..) |layer, layer_index| {
+            const head_dim = layer.head_dim;
+            if (head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return error.UnsupportedShape;
+            const attention_input_size = request.num_attention_heads * head_dim;
+            const layer_window = frame_cursor.nextLayer(.{
+                .shares_kv = layer.shares_kv,
+                .value_norm = request.global_head_dim != 0 and !layer.shares_kv,
+            }) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+            const layer_dispatch = self.activePrefillFrameLayerDispatch(layer_window, full_frame_contract) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+
+            const attn_normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+                .slot = layer.attn_pre_norm_slot,
+                .input = hidden,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+            })) orelse return error.UnsupportedOperation;
+            defer freeOp(ctx, attn_normed);
+
+            const ple_offset = layer_index * request.ple_hidden_size;
+            const block_ple_input = try sliceLastDimOp(
+                ctx,
+                request.ple_vectors.?,
+                ple_offset,
+                ple_offset + request.ple_hidden_size,
+            );
+            defer freeOp(ctx, block_ple_input);
+
+            var attention = request.attention;
+            attention.layer_index = if (layer.shares_kv) layer.kv_layer_index else layer_index;
+            attention.skip_kv_write = layer.shares_kv;
+            attention.sliding_window = layer.sliding_window;
+
+            const prev_hidden = hidden;
+            const block_hidden = (try runGatedDecoderBlockOp(ctx, &.{
+                .attention_input = attn_normed,
+                .residual = hidden,
+                .attention = attention,
+                .num_heads = request.num_attention_heads,
+                .num_kv_heads = layer.kv_heads,
+                .head_dim = head_dim,
+                .q_linear_slot = layer.q_linear_slot,
+                .k_linear_slot = if (!layer.shares_kv) layer.k_linear_slot else null,
+                .v_linear_slot = if (!layer.shares_kv) layer.v_linear_slot else null,
+                .q_head_norm_slot = layer.q_head_norm_slot,
+                .k_head_norm_slot = if (!layer.shares_kv) layer.k_head_norm_slot else null,
+                .rope_active_dim = layer.rope_active_dim,
+                .rope_theta = layer.rope_theta,
+                .rope_freq_scale = request.rope_freq_scale,
+                .rope_consecutive_pairs = request.rope_consecutive_pairs,
+                .global_head_dim = request.global_head_dim,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .attention_post_linear_rms_norm_slot = layer.attn_post_norm_slot,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+                .ffn_rms_norm_slot = layer.ffn_pre_norm_slot,
+                .ffn_post_gate_rms_norm_slot = null,
+                .ffn_post_down_rms_norm_slot = layer.ffn_post_norm_slot,
+                .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = layer.up_ffn_linear_slot,
+                .down_ffn_linear_slot = layer.down_ffn_linear_slot,
+                .intermediate_size = layer.intermediate_size,
+                .activation = request.activation,
+                .ple = block_ple_input,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot,
+                .ple_post_norm_slot = layer.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+                .output_scale_value = layer.output_scale_value,
+                .planned_setup_contract = .{},
+                .planned_layer_contract = .{},
+                .planned_frame_contract = layer_dispatch.full_contract,
+                .planned_frame_layer_window = .{
+                    .layer_start = layer_dispatch.window.layer_start,
+                    .setup_start = layer_dispatch.window.setup_start,
+                    .block_start = layer_dispatch.window.block_start,
+                    .layer_end = layer_dispatch.window.layer_end,
+                },
+                .graph_plan_tail_vocab_size = request.vocab_size,
+            })) orelse return error.UnsupportedOperation;
+            if (owns_hidden) freeOp(ctx, prev_hidden);
+            hidden = block_hidden;
+            owns_hidden = true;
+            _ = attention_input_size;
+        }
+
+        const tail_window = frame_cursor.nextTailLogits() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        if (!frame_cursor.complete()) return self.declinePrefillFrameExecute(.plan_mismatch);
+        self.active_prefill_frame_tail_contract = self.activePrefillFrameTailContract(tail_window) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        request.output_hidden.* = hidden;
+        owns_hidden = false;
+        execute_success = true;
+        self.timing_stats.prefill_frame_execute_successes += 1;
+        return true;
+    }
+
+    fn beginDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime) !bool {
+        const rt = runtime orelse return false;
+        if (metal_runtime.hasActiveFrame(rt)) return false;
+        self.clearPendingPrefillKvDeviceSeeds();
+        try metal_runtime.beginFrame(rt);
+        self.timing_stats.decoder_runtime_frame_begins += 1;
+        return true;
+    }
+
+    fn submitAndWaitDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime, active: *bool) !void {
+        if (!active.*) return;
+        const rt = runtime orelse {
+            active.* = false;
+            return;
+        };
+        if (!metal_runtime.activeFrameHasWork(rt)) {
+            metal_runtime.cancelFrame(rt) catch {};
+            active.* = false;
+            try self.flushPendingPrefillKvDeviceSeeds();
+            return;
+        }
+        try metal_runtime.submitFrame(rt);
+        const started_at = monotonicNowNs();
+        try metal_runtime.waitFrame(rt);
+        const finished_at = monotonicNowNs();
+        self.timing_stats.decoder_runtime_frame_submits += 1;
+        if (finished_at > started_at) {
+            self.timing_stats.decoder_runtime_frame_wait_nanos += @intCast(finished_at - started_at);
+        }
+        self.timing_stats.decoder_runtime_frame_gpu_nanos += metal_runtime.lastFrameGpuNanos(rt);
+        try self.flushPendingPrefillKvDeviceSeeds();
+        active.* = false;
+    }
+
+    fn cancelDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime, active: *bool) void {
+        if (!active.*) return;
+        const rt = runtime orelse {
+            active.* = false;
+            self.clearPendingPrefillKvDeviceSeeds();
+            return;
+        };
+        metal_runtime.cancelFrame(rt) catch {};
+        active.* = false;
+        self.clearPendingPrefillKvDeviceSeeds();
+    }
+
+    fn decoderRuntimeBeginFrameOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        return try self.beginDecoderRuntimeFrame(runtime);
+    }
+
+    fn decoderRuntimeHasActiveFrameOp(ctx: *anyopaque) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+    }
+
+    fn decoderRuntimeSubmitAndWaitFrameOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        var active = metal_runtime.hasActiveFrame(runtime);
+        try self.submitAndWaitDecoderRuntimeFrame(runtime, &active);
+    }
+
+    fn decoderRuntimeFlushActiveFrameOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        try metal_runtime.flushActiveFrame(runtime);
+    }
+
+    fn decoderRuntimeCancelFrameOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        var active = metal_runtime.hasActiveFrame(runtime);
+        self.cancelDecoderRuntimeFrame(runtime, &active);
+    }
+
+    fn gatherPagedKvLayerCacheOp(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        kv: ops.KvCacheView,
+        token_count: usize,
+        layer_index: usize,
+    ) anyerror!?ops.PagedKvLayerCacheRows {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return (try self.gatherPagedKvLayerFromBackendCache(allocator, kv, token_count, layer_index)) orelse
+            try self.gatherPagedKvLayerFromGatheredSpan(allocator, kv, token_count, layer_index);
+    }
+
+    fn seedPagedKvLayerCacheOp(
+        ctx: *anyopaque,
+        kv: ops.KvCacheView,
+        token_count: usize,
+        layer_index: usize,
+        k_rows_host: []const f32,
+        v_rows_host: []const f32,
+    ) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const storage = kv.kv_storage orelse return false;
+        const pool = storage.getPool(kv.pool_id) orelse return error.InvalidPoolId;
+        if (!pool.config.hasSymmetricValueWidth()) return error.UnsupportedAsymmetricKvWidths;
+        _ = try self.updateBackendKvLayerCache(
+            .{
+                .source_ptr_id = @intFromPtr(storage),
+                .sequence_id = kv.sequence_id,
+                .layer_index = layer_index,
+            },
+            k_rows_host,
+            v_rows_host,
+            token_count,
+            token_count,
+            kv.position_offset,
+            pool.valuesPerToken(),
+            kvViewBlockSignature(kv),
+        );
+        return true;
+    }
+
+    fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
+        const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
+        var provider_stats = self.timing_stats;
+        self.populateMemoryDebugStats(&provider_stats);
+        return .{
+            .native_quant_null = false,
+            .provider = provider_stats,
+            .quant = .{},
+        };
+    }
+
+    fn directFamilyTimingSnapshotOp(ctx: *anyopaque) ops.DirectFamilyTimingSnapshot {
+        const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
+        const provider_stats = self.timing_stats;
+        return .{
+            .project_nanos = provider_stats.compressed_block_project_nanos +
+                provider_stats.prefill_frame_executor_layer_setup_nanos,
+            .span_prep_nanos = provider_stats.compressed_block_span_prep_nanos,
+            .quant_attn_nanos = provider_stats.compressed_block_quantized_attention_nanos +
+                provider_stats.compressed_block_attention_span_nanos +
+                provider_stats.compressed_block_attention_prefix_nanos,
+            .block_apply_nanos = provider_stats.compressed_block_apply_nanos +
+                provider_stats.prefill_frame_executor_layer_runtime_nanos,
+            .frame_wait_nanos = provider_stats.decoder_runtime_frame_wait_nanos,
+            .frame_gpu_nanos = provider_stats.decoder_runtime_frame_gpu_nanos,
+        };
+    }
+
+    fn resetDebugTimingStatsOp(ctx: *anyopaque) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.timing_stats = .{};
+        metal_tensor_mod.resetMemoryStats();
+    }
+
+    fn rawLinearSlotRuntimePrepared(self: *const MetalCompute, slot: usize) bool {
+        const provider = self.provider_impl;
+        return provider.raw_linear_slot_runtime_prepared_kind[slot] != .none;
+    }
+
+    fn quantMatmulFormatForRuntimeKind(kind: metal_runtime.RawQuantizedRuntimeLinearKind) ?metal_command_planner.QuantMatmulFormat {
+        return switch (kind) {
+            .q1_0 => .q1_0,
+            .i2_s => .i2_s,
+            .i8_s => .i8_s,
+            .q2_k => .q2_k,
+            .q3_k => .q3_k,
+            .q4_0 => .q4_0,
+            .q4_1 => .q4_1,
+            .q4_k => .q4_k,
+            .q5_0 => .q5_0,
+            .q5_1 => .q5_1,
+            .q5_k => .q5_k,
+            .q6_k => .q6_k,
+            .q8_0 => .q8_0,
+            .q8_1 => .q8_1,
+            .q8_k => .q8_k,
+            .iq1_s => .iq1_s,
+            .iq1_m => .iq1_m,
+            .iq2_xxs => .iq2_xxs,
+            .iq2_xs => .iq2_xs,
+            .iq2_s => .iq2_s,
+            .iq3_xxs => .iq3_xxs,
+            .iq3_s => .iq3_s,
+            .iq4_nl => .iq4_nl,
+            .iq4_xs => .iq4_xs,
+            .tq1_0 => .tq1_0,
+            .tq2_0 => .tq2_0,
+            .mxfp4 => .mxfp4,
+            .nvfp4 => .nvfp4,
+            .tl1 => .tl1,
+            .tl2 => .tl2,
+            .none => null,
+        };
+    }
+
+    fn preparedLinearMatmulFormatForLinearSlot(
+        self: *MetalCompute,
+        slot: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) ?metal_command_planner.QuantMatmulFormat {
+        const provider = self.provider_impl;
+        if (slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return null;
+        if (!provider.raw_linear_slots_prepared[slot]) return null;
+        if (provider.raw_linear_slot_in_dims[slot] != in_dim or
+            provider.raw_linear_slot_out_dims[slot] != out_dim)
+        {
+            return null;
+        }
+        return switch (provider.raw_linear_slot_kinds[slot]) {
+            .dense => .f32,
+            .quantized => quantMatmulFormatForRuntimeKind(metal_runtime.ensureQuantizedRuntimeLinearSlotPrepared(
+                provider,
+                slot,
+                in_dim,
+                out_dim,
+            )),
+            .none => null,
+        };
+    }
+
+    fn populateMemoryDebugStats(self: *const MetalCompute, stats: *ops.NativeQuantTimingStats) void {
+        const tensor_stats = metal_tensor_mod.memoryStatsSnapshot();
+        stats.metal_tensor_device_owned_buffers_created = tensor_stats.device_owned_buffers_created;
+        stats.metal_tensor_device_owned_buffers_released = tensor_stats.device_owned_buffers_released;
+        stats.metal_tensor_device_owned_live_bytes = tensor_stats.device_owned_live_bytes;
+        stats.metal_tensor_device_owned_peak_live_bytes = tensor_stats.device_owned_peak_live_bytes;
+        stats.metal_tensor_host_mirror_allocations = tensor_stats.host_mirror_allocations;
+        stats.metal_tensor_host_mirror_frees = tensor_stats.host_mirror_frees;
+        stats.metal_tensor_host_mirror_live_bytes = tensor_stats.host_mirror_live_bytes;
+        stats.metal_tensor_host_mirror_peak_live_bytes = tensor_stats.host_mirror_peak_live_bytes;
+        stats.metal_tensor_host_mirror_download_bytes = tensor_stats.host_mirror_download_bytes;
+        stats.metal_tensor_to_host_calls = tensor_stats.to_host_calls;
+        stats.metal_tensor_to_host_device_calls = tensor_stats.to_host_device_calls;
+        const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
+        stats.metal_runtime_buffer_count = runtime_stats.buffer_count;
+        stats.metal_runtime_total_bytes = runtime_stats.total_bytes;
+        stats.metal_runtime_embedding_bytes = runtime_stats.embedding_bytes;
+        stats.metal_runtime_norm_bytes = runtime_stats.norm_bytes;
+        stats.metal_runtime_dense_linear_bytes = runtime_stats.dense_linear_bytes;
+        stats.metal_runtime_dense_linear_buffer_count = runtime_stats.dense_linear_buffer_count;
+        stats.metal_runtime_dense_linear_largest_slot = runtime_stats.dense_linear_largest_slot;
+        stats.metal_runtime_dense_linear_largest_bytes = runtime_stats.dense_linear_largest_bytes;
+        stats.metal_runtime_dense_linear_largest_in_dim = runtime_stats.dense_linear_largest_in_dim;
+        stats.metal_runtime_dense_linear_largest_out_dim = runtime_stats.dense_linear_largest_out_dim;
+        stats.metal_runtime_dense_linear_weight_bytes = runtime_stats.dense_linear_weight_bytes;
+        stats.metal_runtime_dense_linear_f32_weight_bytes = runtime_stats.dense_linear_f32_weight_bytes;
+        stats.metal_runtime_dense_linear_bf16_weight_bytes = runtime_stats.dense_linear_bf16_weight_bytes;
+        stats.metal_runtime_dense_linear_f32_slots = runtime_stats.dense_linear_f32_slots;
+        stats.metal_runtime_dense_linear_bf16_slots = runtime_stats.dense_linear_bf16_slots;
+        stats.metal_runtime_quant_linear_bytes = runtime_stats.quant_linear_bytes;
+        stats.metal_runtime_scratch_bytes = runtime_stats.scratch_bytes;
+        stats.metal_runtime_scratch_pool_bytes = runtime_stats.scratch_pool_bytes;
+        stats.metal_runtime_scratch_pool_slots = runtime_stats.scratch_pool_slots;
+        stats.metal_runtime_scratch_pool_in_use_slots = runtime_stats.scratch_pool_in_use_slots;
+        stats.metal_runtime_scratch_pool_pending_slots = runtime_stats.scratch_pool_pending_slots;
+        stats.metal_runtime_attention_span_bytes = runtime_stats.attention_span_bytes;
+        stats.metal_runtime_hidden_state_bytes = runtime_stats.hidden_state_bytes;
+        stats.metal_runtime_frame_retained_bytes = runtime_stats.frame_retained_bytes;
+        stats.metal_runtime_graph_plan_bytes = runtime_stats.graph_plan_bytes;
+        stats.metal_runtime_graph_plan_slots = runtime_stats.graph_plan_slots;
+        stats.metal_runtime_graph_plan_active = runtime_stats.graph_plan_active;
+        stats.metal_runtime_graph_plan_count = runtime_stats.graph_plan_count;
+        stats.metal_runtime_graph_plan_allocations = runtime_stats.graph_plan_allocations;
+        stats.metal_runtime_graph_plan_reuses = runtime_stats.graph_plan_reuses;
+        stats.metal_runtime_compute_encoder_count = runtime_stats.compute_encoder_count;
+        stats.metal_runtime_blit_encoder_count = runtime_stats.blit_encoder_count;
+        stats.metal_runtime_last_frame_compute_encoder_count = runtime_stats.last_frame_compute_encoder_count;
+        stats.metal_runtime_last_frame_blit_encoder_count = runtime_stats.last_frame_blit_encoder_count;
+        stats.metal_runtime_last_frame_planned_compute_scope_count = runtime_stats.last_frame_planned_compute_scope_count;
+        stats.metal_runtime_last_frame_planned_barrier_count = runtime_stats.last_frame_planned_barrier_count;
+        stats.metal_runtime_last_frame_compute_quant_linear_count = runtime_stats.last_frame_compute_quant_linear_count;
+        stats.metal_runtime_last_frame_compute_quant_qkv_count = runtime_stats.last_frame_compute_quant_qkv_count;
+        stats.metal_runtime_last_frame_compute_quant_pair_act_count = runtime_stats.last_frame_compute_quant_pair_act_count;
+        stats.metal_runtime_last_frame_compute_attention_count = runtime_stats.last_frame_compute_attention_count;
+        stats.metal_runtime_last_frame_compute_rms_norm_count = runtime_stats.last_frame_compute_rms_norm_count;
+        stats.metal_runtime_last_frame_compute_head_rope_count = runtime_stats.last_frame_compute_head_rope_count;
+        stats.metal_runtime_last_frame_compute_ffn_count = runtime_stats.last_frame_compute_ffn_count;
+        stats.metal_runtime_last_frame_compute_ple_count = runtime_stats.last_frame_compute_ple_count;
+        stats.metal_runtime_last_frame_compute_tail_count = runtime_stats.last_frame_compute_tail_count;
+        stats.metal_runtime_last_frame_compute_embedding_count = runtime_stats.last_frame_compute_embedding_count;
+        stats.metal_runtime_last_frame_compute_dense_linear_count = runtime_stats.last_frame_compute_dense_linear_count;
+        stats.metal_runtime_last_frame_compute_layer_count = runtime_stats.last_frame_compute_layer_count;
+        stats.metal_runtime_last_frame_compute_other_count = runtime_stats.last_frame_compute_other_count;
+        stats.metal_runtime_last_frame_compute_region_attention_count = runtime_stats.last_frame_compute_region_attention_count;
+        stats.metal_runtime_last_frame_compute_region_attention_project_count = runtime_stats.last_frame_compute_region_attention_project_count;
+        stats.metal_runtime_last_frame_compute_region_ffn_norm_count = runtime_stats.last_frame_compute_region_ffn_norm_count;
+        stats.metal_runtime_last_frame_compute_region_ffn_count = runtime_stats.last_frame_compute_region_ffn_count;
+        stats.metal_runtime_last_frame_compute_region_ple_count = runtime_stats.last_frame_compute_region_ple_count;
+        stats.metal_runtime_last_frame_compute_region_tail_count = runtime_stats.last_frame_compute_region_tail_count;
+        stats.metal_runtime_last_frame_compute_region_embedding_count = runtime_stats.last_frame_compute_region_embedding_count;
+        stats.metal_runtime_last_frame_compute_region_layer_count = runtime_stats.last_frame_compute_region_layer_count;
+        stats.metal_runtime_last_frame_compute_region_other_count = runtime_stats.last_frame_compute_region_other_count;
+        stats.metal_runtime_last_frame_planned_command_op_count = runtime_stats.last_frame_planned_command_op_count;
+        stats.metal_runtime_last_frame_planned_command_op_kind_counts = runtime_stats.last_frame_planned_command_op_kind_counts;
+        stats.metal_runtime_last_frame_planned_command_operator_counts = runtime_stats.last_frame_planned_command_operator_counts;
+        stats.metal_runtime_last_frame_planned_command_quant_dispatch_counts = runtime_stats.last_frame_planned_command_quant_dispatch_counts;
+        stats.metal_runtime_last_frame_blit_buffer_upload_count = runtime_stats.last_frame_blit_buffer_upload_count;
+        stats.metal_runtime_last_frame_blit_buffer_copy_count = runtime_stats.last_frame_blit_buffer_copy_count;
+        stats.metal_runtime_last_frame_blit_buffer_slice_count = runtime_stats.last_frame_blit_buffer_slice_count;
+        stats.metal_runtime_last_frame_blit_attention_span_count = runtime_stats.last_frame_blit_attention_span_count;
+        stats.metal_runtime_last_frame_blit_ffn_copy_count = runtime_stats.last_frame_blit_ffn_copy_count;
+        stats.metal_runtime_last_frame_blit_embedding_count = runtime_stats.last_frame_blit_embedding_count;
+        stats.metal_runtime_last_frame_blit_other_count = runtime_stats.last_frame_blit_other_count;
+        stats.metal_runtime_q8_0_linear_dispatch_scalar = runtime_stats.q8_0_linear_dispatch_scalar;
+        stats.metal_runtime_q8_0_linear_dispatch_mmv = runtime_stats.q8_0_linear_dispatch_mmv;
+        stats.metal_runtime_q8_0_linear_dispatch_small_batch = runtime_stats.q8_0_linear_dispatch_small_batch;
+        stats.metal_runtime_q8_0_linear_dispatch_mm = runtime_stats.q8_0_linear_dispatch_mm;
+        stats.metal_runtime_q8_0_linear_rows_1 = runtime_stats.q8_0_linear_rows_1;
+        stats.metal_runtime_q8_0_linear_rows_2_8 = runtime_stats.q8_0_linear_rows_2_8;
+        stats.metal_runtime_q8_0_linear_rows_9_64 = runtime_stats.q8_0_linear_rows_9_64;
+        stats.metal_runtime_q8_0_linear_rows_65_plus = runtime_stats.q8_0_linear_rows_65_plus;
+        stats.metal_runtime_q8_0_pair_activation_mm_f16_output = runtime_stats.q8_0_pair_activation_mm_f16_output;
+        stats.metal_runtime_q8_0_linear_mm_f16_input = runtime_stats.q8_0_linear_mm_f16_input;
+        stats.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output = runtime_stats.q8_0_pair_activation_rms_scale_mmv_f16_output;
+        stats.metal_runtime_q8_0_linear_mmv_f16_input = runtime_stats.q8_0_linear_mmv_f16_input;
+        stats.metal_runtime_q8_0_linear_family_dispatch_counts = runtime_stats.q8_0_linear_family_dispatch_counts;
+
+        const provider = self.provider_impl;
+        stats.metal_provider_quantized_runtime_private_nanos = provider.raw_quant_runtime_private_prepare_nanos;
+        stats.metal_provider_quantized_runtime_mapped_nanos = provider.raw_quant_runtime_mapped_prepare_nanos;
+        stats.metal_provider_quantized_runtime_mapped_attempts = provider.raw_quant_runtime_mapped_attempts;
+        stats.metal_provider_quantized_runtime_mapped_fallbacks = provider.raw_quant_runtime_mapped_fallbacks;
+        stats.metal_provider_quantized_runtime_mapped_failures = provider.raw_quant_runtime_mapped_failures;
+        for (0..metal_runtime.decoder_runtime_linear_slot_capacity) |slot| {
+            if (!provider.raw_linear_slots_prepared[slot]) continue;
+            switch (provider.raw_linear_slot_kinds[slot]) {
+                .quantized => {
+                    const storage = provider.raw_linear_slot_quantized_storage[slot] orelse continue;
+                    const prepared_bytes = storage.preparedBytes(.row_major_blocks) orelse storage.raw_bytes;
+                    stats.metal_provider_quantized_slots += 1;
+                    stats.metal_provider_quantized_raw_bytes += @intCast(storage.raw_bytes.len);
+                    if (storage.raw_owned) {
+                        stats.metal_provider_quantized_raw_owned_bytes += @intCast(storage.raw_bytes.len);
+                    }
+                    if (storage.preparedBytes(.row_major_blocks)) |bytes| {
+                        stats.metal_provider_quantized_prepared_bytes += @intCast(bytes.len);
+                    }
+                    if (self.rawLinearSlotRuntimePrepared(slot)) {
+                        stats.metal_provider_quantized_runtime_prepared_slots += 1;
+                        stats.metal_provider_quantized_runtime_prepared_bytes += @intCast(prepared_bytes.len);
+                        switch (provider.raw_linear_slot_runtime_prepared_modes[slot]) {
+                            .private_upload => {
+                                stats.metal_provider_quantized_runtime_private_slots += 1;
+                                stats.metal_provider_quantized_runtime_private_bytes += @intCast(prepared_bytes.len);
+                            },
+                            .mapped_shared => {
+                                stats.metal_provider_quantized_runtime_mapped_slots += 1;
+                                stats.metal_provider_quantized_runtime_mapped_bytes += @intCast(prepared_bytes.len);
+                            },
+                            .none => {},
+                        }
+                    }
+                },
+                .dense => {
+                    if (provider.raw_linear_slot_dense_weights[slot]) |weight| {
+                        stats.metal_provider_dense_slot_host_bytes += @intCast(weight.deviceByteLen());
+                    }
+                    if (provider.raw_linear_slot_dense_biases[slot]) |bias| {
+                        stats.metal_provider_dense_slot_host_bytes += @intCast(bias.deviceByteLen());
+                    }
+                },
+                .none => {},
+            }
+        }
+
+        for (0..metal_runtime.decoder_runtime_layer_norm_slot_capacity) |slot| {
+            if (provider.raw_layer_norm_slots_prepared[slot]) {
+                if (provider.raw_layer_norm_slot_weights[slot]) |weight| {
+                    stats.metal_provider_norm_slot_host_bytes += @intCast(weight.deviceByteLen());
+                }
+                if (provider.raw_layer_norm_slot_biases[slot]) |bias| {
+                    stats.metal_provider_norm_slot_host_bytes += @intCast(bias.deviceByteLen());
+                }
+            }
+            if (provider.raw_rms_norm_slots_prepared[slot]) {
+                if (provider.raw_rms_norm_slot_weights[slot]) |weight| {
+                    stats.metal_provider_norm_slot_host_bytes += @intCast(weight.deviceByteLen());
+                }
+            }
+        }
+
+        var gathered_it = provider.gathered_spans.iterator();
+        while (gathered_it.next()) |entry| {
+            stats.metal_provider_gathered_span_entries += 1;
+            stats.metal_provider_gathered_span_device_bytes += @intCast(entry.value_ptr.k.deviceByteLen());
+            stats.metal_provider_gathered_span_device_bytes += @intCast(entry.value_ptr.v.deviceByteLen());
+            if (entry.value_ptr.encoded_key) |encoded| {
+                stats.metal_provider_gathered_span_encoded_host_bytes += @intCast(encoded.len);
+            }
+        }
+    }
+
+    fn decoderRuntimeReadyOp(ctx: *anyopaque) bool {
+        const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.provider_impl.hasDecoderRuntime();
+    }
+
+    fn decoderRuntimeAbsoluteEmbeddingsPreparedOp(ctx: *anyopaque) bool {
+        const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.decoderRuntimeAbsoluteEmbeddingsPrepared(self.provider_impl);
+    }
+
+    fn decoderRuntimeReserveKvTokens(gpt_config: anytype, current_kv_tokens: usize) usize {
+        if (gpt_config.sliding_window > 0) return gpt_config.sliding_window;
+        if (gpt_config.max_position_embeddings > 0) return gpt_config.max_position_embeddings;
+        return if (current_kv_tokens > 0) current_kv_tokens else 1;
+    }
+
+    fn decoderRuntimePrepareOrReuseFamilyOp(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        gpt_config: @import("../models/gpt.zig").Config,
+        current_kv_tokens: usize,
+        configured_layer_count: usize,
+    ) anyerror!ops.DecoderRuntimePrepareReuseResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const reserve_kv_tokens = decoderRuntimeReserveKvTokens(gpt_config, current_kv_tokens);
+        if (metal_runtime.decoderRuntimeFamilyPrepared(self.provider_impl) and
+            metal_runtime.decoderRuntimePreparedSlotsMatchFamily(self.provider_impl, gpt_config))
+        {
+            if (reserve_kv_tokens <= metal_runtime.decoderRuntimePreparedKvTokens(self.provider_impl)) {
+                return .{
+                    .prepared = true,
+                    .reserve_kv_tokens = reserve_kv_tokens,
+                    .fast_hit = true,
+                };
+            }
+            const prepared = try decoderRuntimePrepareGreedyOp(ctx, &.{
+                .hidden_size = gpt_config.hidden_size,
+                .intermediate_size = gpt_config.intermediate_size,
+                .num_layers = gpt_config.num_hidden_layers,
+                .num_heads = gpt_config.num_attention_heads,
+                .num_kv_heads = gpt_config.effectiveKVHeads(),
+                .head_dim = gpt_config.headDim(),
+                .vocab_size = gpt_config.vocab_size,
+                .kv_tokens = reserve_kv_tokens,
+            });
+            if (prepared) metal_runtime.noteDecoderRuntimeGreedyPrepared(self.provider_impl, reserve_kv_tokens);
+            return .{
+                .prepared = prepared,
+                .reserve_kv_tokens = reserve_kv_tokens,
+                .used_greedy = prepared,
+            };
+        }
+
+        const cb = self.computeBackend();
+        const prepared = try metal_runtime.prepareDecodeRuntimeFamily(
+            &cb,
+            allocator,
+            gpt_config,
+            reserve_kv_tokens,
+            configured_layer_count,
+        );
+        if (prepared) metal_runtime.noteDecoderRuntimeFamilyPrepared(self.provider_impl, reserve_kv_tokens);
+        return .{
+            .prepared = prepared,
+            .reserve_kv_tokens = reserve_kv_tokens,
+        };
+    }
+
+    fn decoderRuntimePrepareAbsoluteEmbeddingsOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareAbsoluteEmbeddingsRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var token = try self.ownedMetalTensorFromCt(request.token_embedding);
+        defer token.deinit();
+        var position = try self.ownedMetalTensorFromCt(request.position_embedding);
+        defer position.deinit();
+        return metal_runtime.decoderRuntimePrepareAbsoluteEmbeddings(self.provider_impl, .{
+            .token_embedding = token,
+            .position_embedding = position,
+            .vocab_size = request.vocab_size,
+            .max_position_embeddings = request.max_position_embeddings,
+            .hidden_size = request.hidden_size,
+        });
+    }
+
+    fn decoderRuntimeEmbedAbsolutePositionOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEmbedAbsolutePositionRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const tensor = (try metal_runtime.decoderRuntimeEmbedAbsolutePosition(self.provider_impl, request.*, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimePrepareLayerNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareLayerNormRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var weight = try self.ownedMetalTensorFromCt(request.weight);
+        defer weight.deinit();
+        var bias = try self.ownedMetalTensorFromCt(request.bias);
+        defer bias.deinit();
+        return metal_runtime.decoderRuntimePrepareLayerNorm(self.provider_impl, .{
+            .slot = request.slot,
+            .weight = weight,
+            .bias = bias,
+            .hidden_size = request.hidden_size,
+        });
+    }
+
+    fn decoderRuntimeEnsureLayerNormSlotOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEnsureLayerNormSlotRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.ensureDynamicLayerNormSlot(request.weight, request.bias, request.hidden_size);
+    }
+
+    fn decoderRuntimeApplyLayerNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyLayerNorm(self.provider_impl, .{
+            .slot = request.slot,
+            .input = input,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimePrepareRmsNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareRmsNormRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var weight = try self.ownedMetalTensorFromCt(request.weight);
+        defer weight.deinit();
+        return metal_runtime.decoderRuntimePrepareRmsNorm(self.provider_impl, .{
+            .slot = request.slot,
+            .weight = weight,
+            .hidden_size = request.hidden_size,
+        });
+    }
+
+    fn decoderRuntimeEnsureRmsNormSlotOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEnsureRmsNormSlotRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.ensureDynamicRmsNormSlot(request.weight, request.hidden_size);
+    }
+
+    fn decoderRuntimeApplyRmsNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+            .slot = request.slot,
+            .input = input,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeEnsureLinearSlotOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEnsureLinearSlotRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.bias) |bias| {
+            return self.ensureDynamicLinearSlot(request.weight, bias, request.in_dim, request.out_dim);
+        }
+        const zero_bias = try self.cachedZeroBiasBuf(request.out_dim);
+        defer freeOp(ctx, zero_bias);
+        return self.ensureDynamicLinearSlot(request.weight, zero_bias, request.in_dim, request.out_dim);
+    }
+
+    fn decoderRuntimePrepareLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareLinearRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const weight_buf = toBuf(request.weight);
+        const runtime_quantized_storage = weight_buf.quantized_storage orelse blk: {
+            const storage = weight_buf.runtime_quantized_storage orelse break :blk null;
+            if (!metal_runtime.isMetalNativeSupported(storage.tensor_type)) break :blk null;
+            break :blk storage;
+        };
+        const has_native_bf16 = if (weight_buf.native_dense_dtype) |dtype| dtype == .bf16 else false;
+        const dense_bf16_bytes = if (runtime_quantized_storage == null and has_native_bf16)
+            weight_buf.native_dense_bytes
+        else
+            null;
+        const dense_bf16_no_copy_safe = dense_bf16_bytes != null and !weight_buf.native_dense_bytes_owned;
+        if (getenvBool("TERMITE_METAL_TRACE_DENSE_LINEAR_PREPARE") and runtime_quantized_storage == null) {
+            std.debug.print(
+                "metal_dense_prepare_request: slot={d} in={d} out={d} has_native_bf16={} native_bytes={d} no_copy_safe={}\n",
+                .{
+                    request.slot,
+                    request.in_dim,
+                    request.out_dim,
+                    has_native_bf16,
+                    if (dense_bf16_bytes) |bytes| bytes.len else 0,
+                    dense_bf16_no_copy_safe,
+                },
+            );
+        }
+        var dense_weight: ?MetalTensor = if (runtime_quantized_storage == null and dense_bf16_bytes == null)
+            try self.ownedMetalTensorFromCt(request.weight)
+        else
+            null;
+        defer if (dense_weight) |*weight| weight.deinit();
+        var dummy_weight_value: f32 = 0;
+        const dummy_weight_shape = [_]i32{0};
+        const weight = dense_weight orelse MetalTensor.borrowed((&dummy_weight_value)[0..1].ptr, 0, &dummy_weight_shape);
+        var bias = try self.ownedMetalTensorFromCt(request.bias);
+        defer bias.deinit();
+        return metal_runtime.decoderRuntimePrepareLinear(self.provider_impl, .{
+            .weight = weight,
+            .bias = bias,
+            .quantized_storage = runtime_quantized_storage,
+            .slot = request.slot,
+            .in_dim = request.in_dim,
+            .out_dim = request.out_dim,
+            .retain_dense_fallback = request.retain_dense_fallback,
+            .dense_bf16_bytes = dense_bf16_bytes,
+            .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
+        }, &self.timing_stats);
+    }
+
+    fn decoderRuntimeApplyLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var linear_input = try retainedLinearInputView(&input, request.in_dim);
+        defer linear_input.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .slot = request.slot,
+            .input = linear_input,
+            .in_dim = request.in_dim,
+            .out_dim = request.out_dim,
+        })) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearArgmaxRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        if (try metal_runtime.decoderRuntimeApplyLinearArgmax(self.provider_impl, .{
+            .slot = request.slot,
+            .input = input,
+            .in_dim = request.in_dim,
+            .out_dim = request.out_dim,
+        })) |token_id| return token_id;
+        const logits = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.slot,
+            .input = request.input,
+            .in_dim = request.in_dim,
+            .out_dim = request.out_dim,
+        })) orelse return null;
+        defer freeOp(ctx, logits);
+        return if (try argmaxLastRowOp(ctx, logits, 1, request.out_dim)) |token_id|
+            @as(usize, token_id)
+        else
+            null;
+    }
+
+    fn argmaxLastRowOp(ctx: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!?u32 {
+        if (rows == 0 or dim == 0) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) {
+                var last_row = if (rows == 1)
+                    try metal_tensor.retainedCopy()
+                else blk: {
+                    const byte_offset = (rows - 1) * dim * @sizeOf(f32);
+                    const byte_len = dim * @sizeOf(f32);
+                    const shape = [_]i32{ 1, @intCast(dim) };
+                    break :blk try metal_tensor.retainedView(byte_offset, byte_len, &shape);
+                };
+                defer last_row.deinit();
+                if (try metal_runtime.argmaxLogitsDevice(self.provider_impl, last_row, dim)) |token_id| return @intCast(token_id);
+            }
+        }
+        const data = if (buf.metal_tensor) |*metal_tensor|
+            try metal_tensor.toHostSlice()
+        else
+            buf.data;
+        if (data.len != rows * dim) return error.InvalidTensorShape;
+        const last_row = data[(rows - 1) * dim ..][0..dim];
+        var best_idx: u32 = 0;
+        var best_val = last_row[0];
+        for (last_row[1..], 1..) |value, idx| {
+            if (value > best_val) {
+                best_val = value;
+                best_idx = @intCast(idx);
+            }
+        }
+        return best_idx;
+    }
+
+    fn sampleLastRowOp(ctx: *anyopaque, request: *const ops.SampleLastRowRequest) anyerror!?u32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.rows == 0 or request.dim == 0) return null;
+        const buf = toBuf(request.tensor);
+        if (buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) {
+                var last_row = if (request.rows == 1)
+                    try metal_tensor.retainedCopy()
+                else blk: {
+                    const byte_offset = (request.rows - 1) * request.dim * @sizeOf(f32);
+                    const byte_len = request.dim * @sizeOf(f32);
+                    const shape = [_]i32{ 1, @intCast(request.dim) };
+                    break :blk try metal_tensor.retainedView(byte_offset, byte_len, &shape);
+                };
+                defer last_row.deinit();
+                if (try metal_runtime.sampleLogitsDevice(self.provider_impl, .{
+                    .input = last_row,
+                    .out_dim = request.dim,
+                    .temperature = request.temperature,
+                    .top_k = @as(usize, @intCast(@min(request.top_k, @as(usize, @intCast(std.math.maxInt(i32)))))),
+                    .top_p = request.top_p,
+                    .min_p = request.min_p,
+                    .repetition_penalty = request.repetition_penalty,
+                    .frequency_penalty = request.frequency_penalty,
+                    .presence_penalty = request.presence_penalty,
+                    .token_history = request.token_history,
+                })) |token_id| return @intCast(token_id);
+            }
+        }
+        const data = if (buf.metal_tensor) |*metal_tensor|
+            try metal_tensor.toHostSlice()
+        else
+            buf.data;
+        if (data.len != request.rows * request.dim) return error.InvalidTensorShape;
+        const last_row = data[(request.rows - 1) * request.dim ..][0..request.dim];
+        return @intCast(model_runtime.sampleTokenFromLogits(
+            self.allocator,
+            last_row,
+            .{
+                .temperature = request.temperature,
+                .top_p = request.top_p,
+                .top_k = @intCast(@min(request.top_k, @as(usize, @intCast(std.math.maxInt(i32))))),
+                .min_p = request.min_p,
+                .repetition_penalty = request.repetition_penalty,
+                .frequency_penalty = request.frequency_penalty,
+                .presence_penalty = request.presence_penalty,
+            },
+            request.token_history,
+        ));
+    }
+
+    fn decoderRuntimeApplyLayerNormLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormLinearArgmaxRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        return metal_runtime.decoderRuntimeApplyLayerNormLinearArgmax(self.provider_impl, .{
+            .input = input,
+            .norm_slot = request.norm_slot,
+            .linear_slot = request.linear_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .out_dim = request.out_dim,
+        });
+    }
+
+    fn decoderRuntimeApplyLayerNormLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormLinearRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyLayerNormLinear(self.provider_impl, .{
+            .input = input,
+            .norm_slot = request.norm_slot,
+            .linear_slot = request.linear_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .out_dim = request.out_dim,
+        })) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyLayerNormLinearSampleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormLinearSampleRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        return metal_runtime.decoderRuntimeApplyLayerNormLinearSample(self.provider_impl, .{
+            .input = input,
+            .norm_slot = request.norm_slot,
+            .linear_slot = request.linear_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .out_dim = request.out_dim,
+            .temperature = request.temperature,
+            .top_k = request.top_k,
+            .top_p = request.top_p,
+            .min_p = request.min_p,
+            .repetition_penalty = request.repetition_penalty,
+            .frequency_penalty = request.frequency_penalty,
+            .presence_penalty = request.presence_penalty,
+            .token_history = request.token_history,
+        });
+    }
+
+    fn decoderRuntimeApplyRmsNormLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormLinearArgmaxRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        return metal_runtime.decoderRuntimeApplyRmsNormLinearArgmax(self.provider_impl, .{
+            .input = input,
+            .norm_slot = request.norm_slot,
+            .linear_slot = request.linear_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .out_dim = request.out_dim,
+        });
+    }
+
+    fn decoderRuntimeApplyRmsNormLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormLinearRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        if (self.active_prefill_frame_plan) |*frame_plan| {
+            if (input.isDevice() and
+                frame_plan.tail_quant_format == .q8_0 and
+                frame_plan.matchesTail(request.norm_slot, request.linear_slot, request.hidden_size, request.out_dim))
+            {
+                if (self.active_prefill_frame_tail_contract) |planned_tail_contract| {
+                    self.timing_stats.prefill_frame_tail_contract_hits += 1;
+                    if (try metal_runtime.decoderRuntimeEncodeRmsNormLinearLogitsDevice(self.provider_impl, .{
+                        .input = input,
+                        .norm_slot = request.norm_slot,
+                        .linear_slot = request.linear_slot,
+                        .hidden_size = request.hidden_size,
+                        .eps = request.eps,
+                        .out_dim = request.out_dim,
+                        .planned_layer_contract = planned_tail_contract,
+                    })) |tensor| {
+                        return self.ctFromOwnedMetalTensor(tensor);
+                    }
+                } else {
+                    self.timing_stats.prefill_frame_tail_contract_misses += 1;
+                }
+            }
+        }
+        const tensor = (try metal_runtime.decoderRuntimeApplyRmsNormLinear(self.provider_impl, .{
+            .input = input,
+            .norm_slot = request.norm_slot,
+            .linear_slot = request.linear_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .out_dim = request.out_dim,
+        })) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyRmsNormLinearSampleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        return metal_runtime.decoderRuntimeApplyRmsNormLinearSample(self.provider_impl, .{
+            .input = input,
+            .norm_slot = request.norm_slot,
+            .linear_slot = request.linear_slot,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .out_dim = request.out_dim,
+            .temperature = request.temperature,
+            .top_k = request.top_k,
+            .top_p = request.top_p,
+            .min_p = request.min_p,
+            .repetition_penalty = request.repetition_penalty,
+            .frequency_penalty = request.frequency_penalty,
+            .presence_penalty = request.presence_penalty,
+            .token_history = request.token_history,
+        });
+    }
+
+    fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearPairRequest) anyerror!?ops.LinearNoBiasPairResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        const rows: usize = @intCast(input.dim(0));
+        if (try metal_runtime.tryApplyQuantizedRuntimeLinearPair(
+            self.provider_impl,
+            request.slot_a,
+            request.slot_b,
+            input,
+            rows,
+            request.in_dim,
+            request.out_dim,
+        )) |pair| {
+            return .{
+                .first = try self.ctFromOwnedMetalTensor(pair.first),
+                .second = try self.ctFromOwnedMetalTensor(pair.second),
+            };
+        }
+        if (try metal_runtime.tryApplyDenseRuntimeLinearPair(
+            self.provider_impl,
+            request.slot_a,
+            request.slot_b,
+            input,
+            rows,
+            request.in_dim,
+            request.out_dim,
+        )) |pair| {
+            return .{
+                .first = try self.ctFromOwnedMetalTensor(pair.first),
+                .second = try self.ctFromOwnedMetalTensor(pair.second),
+            };
+        }
+
+        const first = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.slot_a,
+            .input = request.input,
+            .in_dim = request.in_dim,
+            .out_dim = request.out_dim,
+        })) orelse return null;
+        errdefer freeOp(ctx, first);
+        const second = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.slot_b,
+            .input = request.input,
+            .in_dim = request.in_dim,
+            .out_dim = request.out_dim,
+        })) orelse {
+            freeOp(ctx, first);
+            return null;
+        };
+        return .{
+            .first = first,
+            .second = second,
+        };
+    }
+
+    fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var linear_input = try retainedLinearInputView(&input, request.in_dim);
+        defer linear_input.deinit();
+        const rows: usize = @intCast(linear_input.dim(0));
+        if (rows > 1 and metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            if (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvScratch(
+                self.provider_impl,
+                request.q_slot,
+                request.k_slot,
+                request.v_slot,
+                linear_input,
+                rows,
+                request.in_dim,
+                request.q_out_dim,
+                request.kv_out_dim,
+            )) |triple| {
+                return .{
+                    .first = try self.ctFromOwnedMetalTensor(triple.first),
+                    .second = try self.ctFromOwnedMetalTensor(triple.second),
+                    .third = try self.ctFromOwnedMetalTensor(triple.third),
+                };
+            }
+        }
+        if (try metal_runtime.tryApplyQuantizedRuntimeLinearQkv(
+            self.provider_impl,
+            request.q_slot,
+            request.k_slot,
+            request.v_slot,
+            linear_input,
+            rows,
+            request.in_dim,
+            request.q_out_dim,
+            request.kv_out_dim,
+        )) |triple| {
+            return .{
+                .first = try self.ctFromOwnedMetalTensor(triple.first),
+                .second = try self.ctFromOwnedMetalTensor(triple.second),
+                .third = try self.ctFromOwnedMetalTensor(triple.third),
+            };
+        }
+        if (try metal_runtime.tryApplyDenseRuntimeLinearQkv(
+            self.provider_impl,
+            request.q_slot,
+            request.k_slot,
+            request.v_slot,
+            linear_input,
+            rows,
+            request.in_dim,
+            request.q_out_dim,
+            request.kv_out_dim,
+        )) |triple| {
+            return .{
+                .first = try self.ctFromOwnedMetalTensor(triple.first),
+                .second = try self.ctFromOwnedMetalTensor(triple.second),
+                .third = try self.ctFromOwnedMetalTensor(triple.third),
+            };
+        }
+        if (try metal_runtime.tryApplyDenseRuntimeLinear(
+            self.provider_impl,
+            request.q_slot,
+            linear_input,
+            rows,
+            request.in_dim,
+            request.q_out_dim,
+        )) |q_out| {
+            errdefer {
+                var q_out_mut = q_out;
+                q_out_mut.deinit();
+            }
+            if (try metal_runtime.tryApplyDenseRuntimeLinearPair(
+                self.provider_impl,
+                request.k_slot,
+                request.v_slot,
+                linear_input,
+                rows,
+                request.in_dim,
+                request.kv_out_dim,
+            )) |kv_out| {
+                return .{
+                    .first = try self.ctFromOwnedMetalTensor(q_out),
+                    .second = try self.ctFromOwnedMetalTensor(kv_out.first),
+                    .third = try self.ctFromOwnedMetalTensor(kv_out.second),
+                };
+            }
+        }
+
+        const first = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.q_slot,
+            .input = request.input,
+            .in_dim = request.in_dim,
+            .out_dim = request.q_out_dim,
+        })) orelse return null;
+        errdefer freeOp(ctx, first);
+        const second = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.k_slot,
+            .input = request.input,
+            .in_dim = request.in_dim,
+            .out_dim = request.kv_out_dim,
+        })) orelse {
+            freeOp(ctx, first);
+            return null;
+        };
+        errdefer {
+            freeOp(ctx, first);
+            freeOp(ctx, second);
+        }
+        const third = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.v_slot,
+            .input = request.input,
+            .in_dim = request.in_dim,
+            .out_dim = request.kv_out_dim,
+        })) orelse {
+            freeOp(ctx, first);
+            freeOp(ctx, second);
+            return null;
+        };
+        return .{
+            .first = first,
+            .second = second,
+            .third = third,
+        };
+    }
+
+    fn decoderRuntimeApplyActivationOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyActivationRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+            .input = input,
+            .kind = request.kind,
+            .dim = request.dim,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyAddOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyAddRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var lhs = try self.ownedMetalTensorFromCt(request.lhs);
+        defer lhs.deinit();
+        var rhs = try self.ownedMetalTensorFromCt(request.rhs);
+        defer rhs.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+            .lhs = lhs,
+            .rhs = rhs,
+            .dim = request.dim,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyAddScaleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyAddScaleRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var lhs = try self.ownedMetalTensorFromCt(request.lhs);
+        defer lhs.deinit();
+        var rhs = try self.ownedMetalTensorFromCt(request.rhs);
+        defer rhs.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
+            .lhs = lhs,
+            .rhs = rhs,
+            .dim = request.dim,
+            .scale = request.scale,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyScaledAddScaleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var lhs = try self.ownedMetalTensorFromCt(request.lhs);
+        defer lhs.deinit();
+        var rhs = try self.ownedMetalTensorFromCt(request.rhs);
+        defer rhs.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyScaledAddScale(self.provider_impl, .{
+            .lhs = lhs,
+            .rhs = rhs,
+            .dim = request.dim,
+            .lhs_scale = request.lhs_scale,
+            .output_scale = request.output_scale,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    const vtable_impl = blk: {
+        var vt = native_compute_mod.vtable_impl;
+        vt.backendKind = backendKindOp;
+        vt.deinitBackend = deinitBackendOp;
+        vt.getIo = getIoOp;
+        vt.reserveGraphPlanSlots = reserveGraphPlanSlotsOp;
+        vt.freeTensor = freeOp;
+        vt.getWeight = getWeightOp;
+        vt.prefetchWeightHint = prefetchWeightHintOp;
+        vt.drainPrefetchBudget = drainPrefetchBudgetOp;
+        vt.fromFloat32 = fromFloat32Op;
+        vt.fromFloat32Shape = fromFloat32ShapeOp;
+        vt.convertDType = convertDTypeOp;
+        vt.toFloat32 = toFloat32Op;
+        vt.exportTensorData = null;
+        vt.cloneTensorShape = cloneTensorShapeOp;
+        vt.tensorShape = tensorShapeOp;
+        vt.sliceLastDim = sliceLastDimOp;
+        vt.evalTensor = evalTensorOp;
+        vt.argmaxLastRow = argmaxLastRowOp;
+        vt.sampleLastRow = sampleLastRowOp;
+        vt.zeroTensor = zeroTensorOp;
+        vt.subtract = subtractOp;
+        vt.divide = divideOp;
+        vt.negate = negateOp;
+        vt.sqrtOp = primSqrtOp;
+        vt.rsqrtOp = primRsqrtOp;
+        vt.expOp = primExpOp;
+        vt.logOp = primLogOp;
+        vt.sinOp = primSinOp;
+        vt.cosOp = primCosOp;
+        vt.tanhOp = primTanhOp;
+        vt.erfOp = primErfOp;
+        vt.absOp = primAbsOp;
+        vt.lessThan = lessThanOp;
+        vt.whereSelect = whereSelectOp;
+        vt.reduceSumOp = reduceSumOp;
+        vt.reduceMaxOp = reduceMaxOp;
+        vt.reduceMeanOp = reduceMeanOp;
+        vt.argmaxOp = argmaxOp;
+        vt.reshapeOp = primReshapeOp;
+        vt.transposeOp = primTransposeOp;
+        vt.broadcastInDimOp = primBroadcastInDimOp;
+        vt.dotGeneralOp = dotGeneralOp;
+        vt.gatherOp = primGatherOp;
+        vt.sliceOp = primSliceOp;
+        vt.concatPrimOp = concatPrimOp;
+        vt.softmaxOp = softmaxOp;
+        vt.scaledDotProductAttention = scaledDotProductAttentionOp;
+        vt.disentangledRelativeAttention = disentangledRelativeAttentionOp;
+        vt.causalSelfAttention = causalSelfAttentionOp;
+        vt.logSoftmaxOp = logSoftmaxOp;
+        vt.conv1d = conv1dOp;
+        vt.conv2d = conv2dOp;
+        vt.unaryConsume = unsupportedUnaryConsumeOp;
+        vt.addConsumeLeft = addConsumeLeftOp;
+        vt.addConsumeRight = addConsumeRightOp;
+        vt.multiplyConsumeLeft = multiplyConsumeLeftOp;
+        vt.multiplyConsumeRight = multiplyConsumeRightOp;
+        vt.subtractConsumeLeft = subtractConsumeLeftOp;
+        vt.divideConsumeLeft = divideConsumeLeftOp;
+        vt.lessThanConsumeLeft = lessThanConsumeLeftOp;
+        vt.whereSelectConsumeTrue = unsupportedWhereConsumeOp;
+        vt.whereSelectConsumeFalse = unsupportedWhereConsumeOp;
+        vt.softmaxConsume = unsupportedSoftmaxConsumeOp;
+        vt.logSoftmaxConsume = unsupportedSoftmaxConsumeOp;
+        vt.reshape2D = reshape2DOp;
+        vt.reshape2d = reshape2dOp;
+        vt.concatRows2D = concatRows2DOp;
+        vt.sliceRows2D = sliceRows2DOp;
+        vt.embeddingLookup = embeddingLookupOp;
+        vt.takeRows = takeRowsOp;
+        vt.gelu = geluOp;
+        vt.geluNew = geluNewOp;
+        vt.relu = reluOp;
+        vt.silu = siluOp;
+        vt.quickGelu = quickGeluOp;
+        vt.sigmoid = sigmoidOp;
+        vt.tanh_act = tanhOp;
+        vt.concat = concatOp;
+        vt.rmsNorm = rmsNormOp;
+        vt.layerNorm = layerNormOp;
+        vt.linear = linearOp;
+        vt.linearPlanned = linearPlannedOp;
+        vt.linearNoBias = linearNoBiasOp;
+        vt.linearNoBiasPlanned = linearNoBiasPlannedOp;
+        vt.linearNoBiasGrouped = linearNoBiasGroupedOp;
+        vt.linearNoBiasPair = linearNoBiasPairOp;
+        vt.splitLastDim3 = splitLastDim3Op;
+        vt.linearPair = linearPairOp;
+        vt.linearTriple = linearTripleOp;
+        vt.rope = ropeOp;
+        vt.ropePerItem = ropePerItemOp;
+        vt.gqaCausalAttention = gqaCausalAttentionOp;
+        vt.runAttention = runAttentionOp;
+        vt.runDeepSeekV4CompressedAttention = runDeepSeekV4CompressedAttentionOp;
+        vt.gqaPagedAttention = gqaPagedAttentionOp;
+        vt.gatherPagedKvLayerCache = gatherPagedKvLayerCacheOp;
+        vt.seedPagedKvLayerCache = seedPagedKvLayerCacheOp;
+        vt.seedPagedAttentionSpan = seedPagedAttentionSpanOp;
+        vt.runAttentionResidual = runAttentionResidualOp;
+        vt.runAttentionOutputResidual = runAttentionOutputResidualOp;
+        vt.provisionKvDeviceWriteHook = provisionKvDeviceWriteHookOp;
+        vt.runDenseFfnResidual = runDenseFfnResidualOp;
+        vt.runDenseDecoderBlock = runDenseDecoderBlockOp;
+        vt.runGatedFfnResidual = runGatedFfnResidualOp;
+        vt.runGatedDecoderBlock = runGatedDecoderBlockOp;
+        vt.add = addOp;
+        vt.multiply = multiplyOp;
+        vt.debugTimingSnapshot = debugTimingSnapshotOp;
+        vt.directFamilyTimingSnapshot = directFamilyTimingSnapshotOp;
+        vt.resetDebugTimingStats = resetDebugTimingStatsOp;
+        vt.decoderRuntimePrepareOrReuseFamily = decoderRuntimePrepareOrReuseFamilyOp;
+        vt.decoderRuntimeReady = decoderRuntimeReadyOp;
+        vt.decoderRuntimeAbsoluteEmbeddingsPrepared = decoderRuntimeAbsoluteEmbeddingsPreparedOp;
+        vt.decoderRuntimePrepareGreedy = decoderRuntimePrepareGreedyOp;
+        vt.decoderRuntimeResetState = decoderRuntimeResetStateOp;
+        vt.decoderRuntimeDecode = decoderRuntimeDecodeOp;
+        vt.decoderRuntimePlanPrefillFrame = decoderRuntimePlanPrefillFrameOp;
+        vt.decoderRuntimeExecuteGraphCommandPlanFrame = decoderRuntimeExecuteGraphCommandPlanFrameOp;
+        vt.decoderRuntimeBeginFrame = decoderRuntimeBeginFrameOp;
+        vt.decoderRuntimeHasActiveFrame = decoderRuntimeHasActiveFrameOp;
+        vt.decoderRuntimeSubmitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
+        vt.decoderRuntimeFlushActiveFrame = decoderRuntimeFlushActiveFrameOp;
+        vt.decoderRuntimeCancelFrame = decoderRuntimeCancelFrameOp;
+        vt.decoderRuntimePrepareAbsoluteEmbeddings = decoderRuntimePrepareAbsoluteEmbeddingsOp;
+        vt.decoderRuntimeEmbedAbsolutePosition = decoderRuntimeEmbedAbsolutePositionOp;
+        vt.decoderRuntimePrepareLayerNorm = decoderRuntimePrepareLayerNormOp;
+        vt.decoderRuntimeEnsureLayerNormSlot = decoderRuntimeEnsureLayerNormSlotOp;
+        vt.decoderRuntimeApplyLayerNorm = decoderRuntimeApplyLayerNormOp;
+        vt.decoderRuntimePrepareRmsNorm = decoderRuntimePrepareRmsNormOp;
+        vt.decoderRuntimeEnsureRmsNormSlot = decoderRuntimeEnsureRmsNormSlotOp;
+        vt.decoderRuntimeApplyRmsNorm = decoderRuntimeApplyRmsNormOp;
+        vt.decoderRuntimePrepareLinear = decoderRuntimePrepareLinearOp;
+        vt.decoderRuntimeEnsureLinearSlot = decoderRuntimeEnsureLinearSlotOp;
+        vt.decoderRuntimeApplyLinear = decoderRuntimeApplyLinearOp;
+        vt.decoderRuntimeApplyLayerNormLinearArgmax = decoderRuntimeApplyLayerNormLinearArgmaxOp;
+        vt.decoderRuntimeApplyLayerNormLinear = decoderRuntimeApplyLayerNormLinearOp;
+        vt.decoderRuntimeApplyLayerNormLinearSample = decoderRuntimeApplyLayerNormLinearSampleOp;
+        vt.decoderRuntimeApplyRmsNormLinearArgmax = decoderRuntimeApplyRmsNormLinearArgmaxOp;
+        vt.decoderRuntimeApplyRmsNormLinear = decoderRuntimeApplyRmsNormLinearOp;
+        vt.decoderRuntimeApplyRmsNormLinearSample = decoderRuntimeApplyRmsNormLinearSampleOp;
+        vt.decoderRuntimeApplyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp;
+        vt.decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp;
+        vt.decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp;
+        vt.decoderRuntimeApplyActivation = decoderRuntimeApplyActivationOp;
+        vt.decoderRuntimeApplyAdd = decoderRuntimeApplyAddOp;
+        vt.decoderRuntimeApplyAddScale = decoderRuntimeApplyAddScaleOp;
+        vt.decoderRuntimeApplyScaledAddScale = decoderRuntimeApplyScaledAddScaleOp;
+        break :blk vt;
+    };
+} else struct {
+    pub const ReservedHiddenStatePair = struct {
+        front: CT,
+        back: CT,
+    };
+
+    pub const PlannedGraphScopeKind = enum {
+        attention_project,
+        ffn,
+        ple,
+    };
+
+    pub const PlannedGraphScope = struct {
+        active: bool = false,
+        owns_frame: bool = false,
+    };
+
+    pub fn init(_: std.mem.Allocator, _: *WeightStore, _: ?*runtime_root.tier.memory.RunBudget) !void {
+        return error.MetalNotEnabled;
+    }
+
+    pub fn reserveHiddenStatePair(_: *const ops.ComputeBackend, _: usize, _: usize) !?ReservedHiddenStatePair {
+        return null;
+    }
+
+    pub fn copyTensorInto(_: *const ops.ComputeBackend, _: CT, _: CT) !bool {
+        return false;
+    }
+
+    pub fn beginPlannedGraphScope(_: *const ops.ComputeBackend, _: PlannedGraphScopeKind) !PlannedGraphScope {
+        return .{};
+    }
+
+    pub fn endPlannedGraphScope(_: *const ops.ComputeBackend, _: PlannedGraphScope) !void {}
+};
+
+/// Metal-native prefetch queue installation. Uses the simple synchronous
+/// loader in gpu_hosted_store — Metal doesn't stage packed experts to a
+/// background queue the way the MLX provider does, so the generic callback
+/// is sufficient.
+pub fn initPrefetchQueue(data: *WeightStore, allocator: std.mem.Allocator) void {
+    gpu_hosted_store_mod.installPrefetchQueue(
+        data,
+        allocator,
+        &gpu_hosted_store_mod.simplePrefetchProcess,
+        &gpu_hosted_store_mod.simplePrefetchPriority,
+    );
+}
+
+pub fn startPrefetchWorker(data: *WeightStore) !void {
+    try gpu_hosted_store_mod.startPrefetchWorker(data);
+}
+
+pub fn stopPrefetchWorker(data: *WeightStore) void {
+    gpu_hosted_store_mod.stopPrefetchWorker(data);
+}
+
+pub fn deinitPrefetchQueue(data: *WeightStore) void {
+    gpu_hosted_store_mod.deinitPrefetchQueue(data);
+}
+
+pub fn deinitPackedExpertViews(data: *WeightStore, allocator: std.mem.Allocator) void {
+    gpu_hosted_store_mod.deinitPackedExpertViews(data, allocator);
+}
+
+fn metalComputeLockIo(io: ?std.Io) std.Io {
+    return io orelse if (builtin.is_test) std.testing.io else unreachable;
+}
+
+pub fn deinitSharedNativeProvider(data: *WeightStore) void {
+    if (comptime !build_options.enable_metal) return;
+    if (comptime build_options.enable_mlx) return;
+    if (!data.shared_metal_native_provider_lock.tryLock()) {
+        std.debug.assert(false);
+        return;
+    }
+    defer data.shared_metal_native_provider_lock.unlock(std.Io.failing);
+    const provider = data.shared_metal_native_provider orelse return;
+    provider.deinitOwned();
+    std.heap.c_allocator.destroy(provider);
+    data.shared_metal_native_provider = null;
+}
+
+fn testMetalWeightStoreInit(allocator: std.mem.Allocator) WeightStore {
+    if (comptime build_options.enable_mlx) {
+        return .{
+            .allocator = allocator,
+            .resident_weights = .{},
+            .stream = .{},
+            .prefix = "",
+            .lazy_weights = .empty,
+        };
+    }
+    return .{
+        .allocator = allocator,
+        .resident_weights = {},
+        .stream = {},
+        .prefix = "",
+        .lazy_weights = .empty,
+    };
+}
+
+test "metal_compute: native provider is shared across backend lifetimes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (comptime build_options.enable_mlx) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+
+    var first = try MetalCompute.init(allocator, &metal_ws, null);
+    const first_provider = first.provider_impl;
+    try std.testing.expect(metal_ws.shared_metal_native_provider != null);
+    first.deinit();
+
+    var second = try MetalCompute.init(allocator, &metal_ws, null);
+    defer second.deinit();
+    try std.testing.expectEqual(first_provider, second.provider_impl);
+}
+
+test "metal_compute: paged decode attention matches native on f32 cache" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+    const prior_tokens: usize = 3;
+    const total_tokens: usize = 4;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    var prior_k: [prior_tokens * hidden_kv]f32 = undefined;
+    var prior_v: [prior_tokens * hidden_kv]f32 = undefined;
+    var suffix_k: [hidden_kv]f32 = undefined;
+    var suffix_v: [hidden_kv]f32 = undefined;
+    var q_data: [hidden_q]f32 = undefined;
+
+    for (&prior_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 29)) - 14)) / 13.0;
+    for (&prior_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 31)) - 15)) / 11.0;
+    for (&suffix_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 23)) - 11)) / 9.0;
+    for (&suffix_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 19)) - 9)) / 7.0;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 37)) - 18)) / 17.0;
+
+    var metal_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer metal_manager.deinit();
+    const metal_pool = try metal_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const metal_seq = try metal_manager.attachSequence(metal_pool);
+    try metal_manager.appendTokens(metal_seq, total_tokens);
+    try metal_manager.writeLayerKvSuffix(metal_seq, 0, prior_tokens, prior_tokens, &prior_k, &prior_v);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_seq, total_tokens);
+    try native_manager.writeLayerKvSuffix(native_seq, 0, prior_tokens, prior_tokens, &prior_k, &prior_v);
+
+    const q_shape = [_]i32{ 1, @intCast(hidden_q) };
+    const kv_shape = [_]i32{ 1, @intCast(hidden_kv) };
+    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(&suffix_k, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(&suffix_v, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(&suffix_k, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(&suffix_v, &kv_shape);
+    defer native_cb.free(native_v);
+
+    const metal_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = metal_seq,
+            .pool_id = metal_pool,
+            .logical_block_count = metal_manager.blockTable(metal_seq).?.len(),
+            .tail_tokens = metal_manager.blockTable(metal_seq).?.tail_tokens,
+            .logical_blocks = metal_manager.blockTable(metal_seq).?.blocks.items,
+        },
+        .kv_manager = &metal_manager,
+        .layer_index = 0,
+    };
+    const native_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = native_seq,
+            .pool_id = native_pool,
+            .logical_block_count = native_manager.blockTable(native_seq).?.len(),
+            .tail_tokens = native_manager.blockTable(native_seq).?.tail_tokens,
+            .logical_blocks = native_manager.blockTable(native_seq).?.blocks.items,
+        },
+        .kv_manager = &native_manager,
+        .layer_index = 0,
+    };
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, metal_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+
+    const metal_gathered = try metal_manager.gatherLayerKv(allocator, metal_seq, 0, total_tokens);
+    defer allocator.free(metal_gathered.k);
+    defer allocator.free(metal_gathered.v);
+    const native_gathered = try native_manager.gatherLayerKv(allocator, native_seq, 0, total_tokens);
+    defer allocator.free(native_gathered.k);
+    defer allocator.free(native_gathered.v);
+    try std.testing.expectEqualSlices(f32, native_gathered.k, metal_gathered.k);
+    try std.testing.expectEqualSlices(f32, native_gathered.v, metal_gathered.v);
+}
+
+test "metal_compute: mixed paged attention batch matches native" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+    const max_q_len: usize = 2;
+    const decode_prior_tokens: usize = 3;
+    const decode_total_tokens: usize = 4;
+    const prefill_tokens: usize = 2;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    var decode_prior_k: [decode_prior_tokens * hidden_kv]f32 = undefined;
+    var decode_prior_v: [decode_prior_tokens * hidden_kv]f32 = undefined;
+    var q_data: [2 * max_q_len * hidden_q]f32 = undefined;
+    var k_data: [2 * max_q_len * hidden_kv]f32 = undefined;
+    var v_data: [2 * max_q_len * hidden_kv]f32 = undefined;
+
+    for (&decode_prior_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 29)) - 14)) / 13.0;
+    for (&decode_prior_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 31)) - 15)) / 11.0;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 37)) - 18)) / 17.0;
+    for (&k_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 23)) - 11)) / 9.0;
+    for (&v_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 19)) - 9)) / 7.0;
+    @memset(k_data[hidden_kv .. 2 * hidden_kv], 0.0);
+    @memset(v_data[hidden_kv .. 2 * hidden_kv], 0.0);
+
+    var metal_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer metal_manager.deinit();
+    const metal_pool = try metal_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const metal_decode_seq = try metal_manager.attachSequence(metal_pool);
+    try metal_manager.appendTokens(metal_decode_seq, decode_total_tokens);
+    try metal_manager.writeLayerKvSuffix(metal_decode_seq, 0, decode_prior_tokens, decode_prior_tokens, &decode_prior_k, &decode_prior_v);
+    const metal_prefill_seq = try metal_manager.attachSequence(metal_pool);
+    try metal_manager.appendTokens(metal_prefill_seq, prefill_tokens);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_decode_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_decode_seq, decode_total_tokens);
+    try native_manager.writeLayerKvSuffix(native_decode_seq, 0, decode_prior_tokens, decode_prior_tokens, &decode_prior_k, &decode_prior_v);
+    const native_prefill_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_prefill_seq, prefill_tokens);
+
+    const q_shape = [_]i32{ @intCast(2 * max_q_len), @intCast(hidden_q) };
+    const kv_shape = [_]i32{ @intCast(2 * max_q_len), @intCast(hidden_kv) };
+    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(&k_data, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(&v_data, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(&k_data, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(&v_data, &kv_shape);
+    defer native_cb.free(native_v);
+
+    var metal_batch = [_]ops.KvBatchView{
+        .{
+            .kv_cache = .{
+                .sequence_id = metal_decode_seq,
+                .pool_id = metal_pool,
+                .logical_block_count = metal_manager.blockTable(metal_decode_seq).?.len(),
+                .tail_tokens = metal_manager.blockTable(metal_decode_seq).?.tail_tokens,
+                .logical_blocks = metal_manager.blockTable(metal_decode_seq).?.blocks.items,
+            },
+            .kv_manager = &metal_manager,
+            .per_item_query_len = 1,
+            .per_item_total_len = decode_total_tokens,
+            .per_item_kv_len = decode_total_tokens,
+            .per_item_kv_position_offset = 0,
+            .per_item_mode = .paged_decode,
+        },
+        .{
+            .kv_cache = .{
+                .sequence_id = metal_prefill_seq,
+                .pool_id = metal_pool,
+                .logical_block_count = metal_manager.blockTable(metal_prefill_seq).?.len(),
+                .tail_tokens = metal_manager.blockTable(metal_prefill_seq).?.tail_tokens,
+                .logical_blocks = metal_manager.blockTable(metal_prefill_seq).?.blocks.items,
+            },
+            .kv_manager = &metal_manager,
+            .per_item_query_len = prefill_tokens,
+            .per_item_total_len = prefill_tokens,
+            .per_item_kv_len = prefill_tokens,
+            .per_item_kv_position_offset = 0,
+            .per_item_mode = .paged_prefill,
+        },
+    };
+    var native_batch = [_]ops.KvBatchView{
+        .{
+            .kv_cache = .{
+                .sequence_id = native_decode_seq,
+                .pool_id = native_pool,
+                .logical_block_count = native_manager.blockTable(native_decode_seq).?.len(),
+                .tail_tokens = native_manager.blockTable(native_decode_seq).?.tail_tokens,
+                .logical_blocks = native_manager.blockTable(native_decode_seq).?.blocks.items,
+            },
+            .kv_manager = &native_manager,
+            .per_item_query_len = 1,
+            .per_item_total_len = decode_total_tokens,
+            .per_item_kv_len = decode_total_tokens,
+            .per_item_kv_position_offset = 0,
+            .per_item_mode = .paged_decode,
+        },
+        .{
+            .kv_cache = .{
+                .sequence_id = native_prefill_seq,
+                .pool_id = native_pool,
+                .logical_block_count = native_manager.blockTable(native_prefill_seq).?.len(),
+                .tail_tokens = native_manager.blockTable(native_prefill_seq).?.tail_tokens,
+                .logical_blocks = native_manager.blockTable(native_prefill_seq).?.blocks.items,
+            },
+            .kv_manager = &native_manager,
+            .per_item_query_len = prefill_tokens,
+            .per_item_total_len = prefill_tokens,
+            .per_item_kv_len = prefill_tokens,
+            .per_item_kv_position_offset = 0,
+            .per_item_mode = .paged_prefill,
+        },
+    };
+
+    const metal_attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = decode_total_tokens,
+        .query_sequence_len = max_q_len,
+        .kv_sequence_len = decode_total_tokens,
+        .kv_batch = &metal_batch,
+        .layer_index = 0,
+    };
+    const native_attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = decode_total_tokens,
+        .query_sequence_len = max_q_len,
+        .kv_sequence_len = decode_total_tokens,
+        .kv_batch = &native_batch,
+        .layer_index = 0,
+    };
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, metal_attention, 2, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 2, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+}
+
+test "metal_compute: paged decode attention matches native on storage runtime f32 cache" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+    const prior_tokens: usize = 3;
+    const total_tokens: usize = 4;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    var prior_k: [prior_tokens * hidden_kv]f32 = undefined;
+    var prior_v: [prior_tokens * hidden_kv]f32 = undefined;
+    var suffix_k: [hidden_kv]f32 = undefined;
+    var suffix_v: [hidden_kv]f32 = undefined;
+    var q_data: [hidden_q]f32 = undefined;
+
+    for (&prior_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 29)) - 14)) / 13.0;
+    for (&prior_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 31)) - 15)) / 11.0;
+    for (&suffix_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 23)) - 11)) / 9.0;
+    for (&suffix_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 19)) - 9)) / 7.0;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 37)) - 18)) / 17.0;
+
+    var metal_storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    defer metal_storage.deinit();
+    const metal_pool = metal_storage.poolId();
+    const metal_seq = try metal_storage.attachSequence(metal_pool);
+    try metal_storage.appendTokens(metal_seq, total_tokens);
+    try metal_storage.writeLayerKvSuffix(metal_seq, 0, prior_tokens, prior_tokens, &prior_k, &prior_v);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_seq, total_tokens);
+    try native_manager.writeLayerKvSuffix(native_seq, 0, prior_tokens, prior_tokens, &prior_k, &prior_v);
+
+    const q_shape = [_]i32{ 1, @intCast(hidden_q) };
+    const kv_shape = [_]i32{ 1, @intCast(hidden_kv) };
+    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(&suffix_k, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(&suffix_v, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(&suffix_k, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(&suffix_v, &kv_shape);
+    defer native_cb.free(native_v);
+
+    const metal_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = metal_seq,
+            .pool_id = metal_pool,
+            .logical_block_count = metal_storage.blockTable(metal_seq).?.len(),
+            .tail_tokens = metal_storage.blockTable(metal_seq).?.tail_tokens,
+            .logical_blocks = metal_storage.blockTable(metal_seq).?.blocks.items,
+            .kv_storage = &metal_storage,
+        },
+        .kv_storage = &metal_storage,
+        .layer_index = 0,
+    };
+    const native_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = native_seq,
+            .pool_id = native_pool,
+            .logical_block_count = native_manager.blockTable(native_seq).?.len(),
+            .tail_tokens = native_manager.blockTable(native_seq).?.tail_tokens,
+            .logical_blocks = native_manager.blockTable(native_seq).?.blocks.items,
+        },
+        .kv_manager = &native_manager,
+        .layer_index = 0,
+    };
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, metal_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+
+    const metal_gathered = try metal_storage.gatherLayerKv(allocator, metal_seq, 0, total_tokens);
+    defer allocator.free(metal_gathered.k);
+    defer allocator.free(metal_gathered.v);
+    const native_gathered = try native_manager.gatherLayerKv(allocator, native_seq, 0, total_tokens);
+    defer allocator.free(native_gathered.k);
+    defer allocator.free(native_gathered.v);
+    try std.testing.expectEqualSlices(f32, native_gathered.k, metal_gathered.k);
+    try std.testing.expectEqualSlices(f32, native_gathered.v, metal_gathered.v);
+}
+
+test "metal_compute: metal kv device hook gathers f32 physical pages" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    _ = num_heads;
+    const hidden_kv = num_kv_heads * head_dim;
+    const prior_tokens: usize = 3;
+    const total_tokens: usize = 4;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var prior_k: [prior_tokens * hidden_kv]f32 = undefined;
+    var prior_v: [prior_tokens * hidden_kv]f32 = undefined;
+    var suffix_k: [hidden_kv]f32 = undefined;
+    var suffix_v: [hidden_kv]f32 = undefined;
+
+    for (&prior_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 29)) - 14)) / 13.0;
+    for (&prior_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 31)) - 15)) / 11.0;
+    for (&suffix_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 23)) - 11)) / 9.0;
+    for (&suffix_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 19)) - 9)) / 7.0;
+
+    var metal_storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .store_cpu_bytes = false,
+    });
+    defer metal_storage.deinit();
+    try metal_cb.provisionKvDeviceWriteHook(&metal_storage);
+    const metal_pool = metal_storage.poolId();
+    const metal_seq = try metal_storage.attachSequence(metal_pool);
+    try metal_storage.appendTokens(metal_seq, total_tokens);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_seq, total_tokens);
+    try native_manager.writeLayerKvSuffix(native_seq, 0, prior_tokens, prior_tokens, &prior_k, &prior_v);
+
+    const prior_shape = [_]i32{ @intCast(prior_tokens), @intCast(hidden_kv) };
+    const suffix_shape = [_]i32{ 1, @intCast(hidden_kv) };
+    const metal_prior_k_host = try metal_cb.fromFloat32Shape(&prior_k, &prior_shape);
+    defer metal_cb.free(metal_prior_k_host);
+    const metal_prior_v_host = try metal_cb.fromFloat32Shape(&prior_v, &prior_shape);
+    defer metal_cb.free(metal_prior_v_host);
+    const metal_k_host = try metal_cb.fromFloat32Shape(&suffix_k, &suffix_shape);
+    defer metal_cb.free(metal_k_host);
+    const metal_v_host = try metal_cb.fromFloat32Shape(&suffix_v, &suffix_shape);
+    defer metal_cb.free(metal_v_host);
+
+    const seed_attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = prior_tokens,
+        .query_sequence_len = prior_tokens,
+        .kv_sequence_len = prior_tokens,
+        .kv_cache = .{
+            .sequence_id = metal_seq,
+            .pool_id = metal_pool,
+            .logical_block_count = metal_storage.blockTable(metal_seq).?.len(),
+            .tail_tokens = metal_storage.blockTable(metal_seq).?.tail_tokens,
+            .logical_blocks = metal_storage.blockTable(metal_seq).?.blocks.items,
+            .kv_storage = &metal_storage,
+        },
+        .kv_storage = &metal_storage,
+        .layer_index = 0,
+    };
+    var metal_prior_k_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_prior_k_host);
+    defer metal_prior_k_mt.deinit();
+    var metal_prior_v_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_prior_v_host);
+    defer metal_prior_v_mt.deinit();
+    try metal_storage.writeLayerKvSuffixDevice(
+        .{
+            .sequence_id = metal_seq,
+            .layer_index = seed_attention.layer_index,
+            .total_token_count = seed_attention.kv_sequence_len,
+            .suffix_token_count = seed_attention.query_sequence_len,
+            .position_offset = seed_attention.kv_position_offset,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+        },
+        .{
+            .handle = metal_prior_k_mt.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_prior_k_mt.deviceByteOffset(),
+            .byte_len = metal_prior_k_mt.deviceByteLen(),
+        },
+        .{
+            .handle = metal_prior_v_mt.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_prior_v_mt.deviceByteOffset(),
+            .byte_len = metal_prior_v_mt.deviceByteLen(),
+        },
+    );
+
+    var metal_suffix_k_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_k_host);
+    defer metal_suffix_k_mt.deinit();
+    var metal_suffix_v_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_v_host);
+    defer metal_suffix_v_mt.deinit();
+    try metal_storage.writeLayerKvSuffixDevice(
+        .{
+            .sequence_id = metal_seq,
+            .layer_index = 0,
+            .total_token_count = total_tokens,
+            .suffix_token_count = 1,
+            .position_offset = 0,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+        },
+        .{
+            .handle = metal_suffix_k_mt.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_suffix_k_mt.deviceByteOffset(),
+            .byte_len = metal_suffix_k_mt.deviceByteLen(),
+        },
+        .{
+            .handle = metal_suffix_v_mt.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_suffix_v_mt.deviceByteOffset(),
+            .byte_len = metal_suffix_v_mt.deviceByteLen(),
+        },
+    );
+    try native_manager.writeLayerKvSuffix(native_seq, 0, total_tokens, 1, &suffix_k, &suffix_v);
+
+    const metal_rows = try metal_storage.gatherLayerKv(allocator, metal_seq, 0, total_tokens);
+    defer allocator.free(metal_rows.k);
+    defer allocator.free(metal_rows.v);
+    const native_rows = try native_manager.gatherLayerKv(allocator, native_seq, 0, total_tokens);
+    defer allocator.free(native_rows.k);
+    defer allocator.free(native_rows.v);
+    try std.testing.expectEqualSlices(f32, native_rows.k, metal_rows.k);
+    try std.testing.expectEqualSlices(f32, native_rows.v, metal_rows.v);
+}
+
+test "metal_compute: paged decode attention matches native on metal device f32 cache across pages" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 1;
+    const head_dim: usize = 16;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+    const prior_tokens: usize = 10;
+    const total_tokens: usize = 11;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    var prior_k: [prior_tokens * hidden_kv]f32 = undefined;
+    var prior_v: [prior_tokens * hidden_kv]f32 = undefined;
+    var suffix_k: [hidden_kv]f32 = undefined;
+    var suffix_v: [hidden_kv]f32 = undefined;
+    var q_data: [hidden_q]f32 = undefined;
+
+    for (&prior_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 41)) - 20)) / 17.0;
+    for (&prior_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 43)) - 21)) / 19.0;
+    for (&suffix_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 29)) - 14)) / 13.0;
+    for (&suffix_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 31)) - 15)) / 11.0;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 47)) - 23)) / 23.0;
+
+    var metal_storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .store_cpu_bytes = false,
+    });
+    defer metal_storage.deinit();
+    try metal_cb.provisionKvDeviceWriteHook(&metal_storage);
+    const metal_pool = metal_storage.poolId();
+    const metal_seq = try metal_storage.attachSequence(metal_pool);
+    try metal_storage.appendTokens(metal_seq, total_tokens);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_seq, total_tokens);
+    try native_manager.writeLayerKvSuffix(native_seq, 0, prior_tokens, prior_tokens, &prior_k, &prior_v);
+
+    const prior_shape = [_]i32{ @intCast(prior_tokens), @intCast(hidden_kv) };
+    const q_shape = [_]i32{ 1, @intCast(hidden_q) };
+    const kv_shape = [_]i32{ 1, @intCast(hidden_kv) };
+    const metal_prior_k_host = try metal_cb.fromFloat32Shape(&prior_k, &prior_shape);
+    defer metal_cb.free(metal_prior_k_host);
+    const metal_prior_v_host = try metal_cb.fromFloat32Shape(&prior_v, &prior_shape);
+    defer metal_cb.free(metal_prior_v_host);
+    var metal_prior_k = try metal_compute.ownedDeviceMetalTensorFromCt(metal_prior_k_host);
+    defer metal_prior_k.deinit();
+    var metal_prior_v = try metal_compute.ownedDeviceMetalTensorFromCt(metal_prior_v_host);
+    defer metal_prior_v.deinit();
+    try metal_storage.writeLayerKvSuffixDevice(
+        .{
+            .sequence_id = metal_seq,
+            .layer_index = 0,
+            .total_token_count = prior_tokens,
+            .suffix_token_count = prior_tokens,
+            .position_offset = 0,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+        },
+        .{
+            .handle = metal_prior_k.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_prior_k.deviceByteOffset(),
+            .byte_len = metal_prior_k.deviceByteLen(),
+        },
+        .{
+            .handle = metal_prior_v.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_prior_v.deviceByteOffset(),
+            .byte_len = metal_prior_v.deviceByteLen(),
+        },
+    );
+
+    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(&suffix_k, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(&suffix_v, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(&suffix_k, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(&suffix_v, &kv_shape);
+    defer native_cb.free(native_v);
+
+    const metal_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = metal_seq,
+            .pool_id = metal_pool,
+            .logical_block_count = metal_storage.blockTable(metal_seq).?.len(),
+            .tail_tokens = metal_storage.blockTable(metal_seq).?.tail_tokens,
+            .logical_blocks = metal_storage.blockTable(metal_seq).?.blocks.items,
+            .kv_storage = &metal_storage,
+        },
+        .kv_storage = &metal_storage,
+        .layer_index = 0,
+    };
+    const native_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = native_seq,
+            .pool_id = native_pool,
+            .logical_block_count = native_manager.blockTable(native_seq).?.len(),
+            .tail_tokens = native_manager.blockTable(native_seq).?.tail_tokens,
+            .logical_blocks = native_manager.blockTable(native_seq).?.blocks.items,
+        },
+        .kv_manager = &native_manager,
+        .layer_index = 0,
+    };
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, metal_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+
+    try native_manager.writeLayerKvSuffix(native_seq, 0, total_tokens, 1, &suffix_k, &suffix_v);
+    const metal_rows = try metal_storage.gatherLayerKv(allocator, metal_seq, 0, total_tokens);
+    defer allocator.free(metal_rows.k);
+    defer allocator.free(metal_rows.v);
+    const native_rows = try native_manager.gatherLayerKv(allocator, native_seq, 0, total_tokens);
+    defer allocator.free(native_rows.k);
+    defer allocator.free(native_rows.v);
+    try std.testing.expectEqualSlices(f32, native_rows.k, metal_rows.k);
+    try std.testing.expectEqualSlices(f32, native_rows.v, metal_rows.v);
+}
+
+test "metal_compute: paged decode attention matches native on Gemma qLen1 f32 cache shape" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 8;
+    const num_kv_heads: usize = 1;
+    const head_dim: usize = 256;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+    const prior_tokens: usize = 10;
+    const total_tokens: usize = 11;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    const prior_k = try allocator.alloc(f32, prior_tokens * hidden_kv);
+    defer allocator.free(prior_k);
+    const prior_v = try allocator.alloc(f32, prior_tokens * hidden_kv);
+    defer allocator.free(prior_v);
+    const suffix_k = try allocator.alloc(f32, hidden_kv);
+    defer allocator.free(suffix_k);
+    const suffix_v = try allocator.alloc(f32, hidden_kv);
+    defer allocator.free(suffix_v);
+    const q_data = try allocator.alloc(f32, hidden_q);
+    defer allocator.free(q_data);
+
+    for (prior_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 41)) - 20)) / 17.0;
+    for (prior_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 43)) - 21)) / 19.0;
+    for (suffix_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 29)) - 14)) / 13.0;
+    for (suffix_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 31)) - 15)) / 11.0;
+    for (q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 47)) - 23)) / 23.0;
+
+    var metal_storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 16,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .store_cpu_bytes = false,
+    });
+    defer metal_storage.deinit();
+    try metal_cb.provisionKvDeviceWriteHook(&metal_storage);
+    const metal_pool = metal_storage.poolId();
+    const metal_seq = try metal_storage.attachSequence(metal_pool);
+    try metal_storage.appendTokens(metal_seq, total_tokens);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 16,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_seq, total_tokens);
+    try native_manager.writeLayerKvSuffix(native_seq, 0, prior_tokens, prior_tokens, prior_k, prior_v);
+
+    const prior_shape = [_]i32{ @intCast(prior_tokens), @intCast(hidden_kv) };
+    const q_shape = [_]i32{ 1, @intCast(hidden_q) };
+    const kv_shape = [_]i32{ 1, @intCast(hidden_kv) };
+    const metal_prior_k_host = try metal_cb.fromFloat32Shape(prior_k, &prior_shape);
+    defer metal_cb.free(metal_prior_k_host);
+    const metal_prior_v_host = try metal_cb.fromFloat32Shape(prior_v, &prior_shape);
+    defer metal_cb.free(metal_prior_v_host);
+    var metal_prior_k = try metal_compute.ownedDeviceMetalTensorFromCt(metal_prior_k_host);
+    defer metal_prior_k.deinit();
+    var metal_prior_v = try metal_compute.ownedDeviceMetalTensorFromCt(metal_prior_v_host);
+    defer metal_prior_v.deinit();
+    try metal_storage.writeLayerKvSuffixDevice(
+        .{
+            .sequence_id = metal_seq,
+            .layer_index = 0,
+            .total_token_count = prior_tokens,
+            .suffix_token_count = prior_tokens,
+            .position_offset = 0,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+        },
+        .{
+            .handle = metal_prior_k.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_prior_k.deviceByteOffset(),
+            .byte_len = metal_prior_k.deviceByteLen(),
+        },
+        .{
+            .handle = metal_prior_v.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = metal_prior_v.deviceByteOffset(),
+            .byte_len = metal_prior_v.deviceByteLen(),
+        },
+    );
+
+    const metal_q = try metal_cb.fromFloat32Shape(q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(suffix_k, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(suffix_v, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const native_q = try native_cb.fromFloat32Shape(q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(suffix_k, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(suffix_v, &kv_shape);
+    defer native_cb.free(native_v);
+
+    const metal_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = metal_seq,
+            .pool_id = metal_pool,
+            .logical_block_count = metal_storage.blockTable(metal_seq).?.len(),
+            .tail_tokens = metal_storage.blockTable(metal_seq).?.tail_tokens,
+            .logical_blocks = metal_storage.blockTable(metal_seq).?.blocks.items,
+            .kv_storage = &metal_storage,
+        },
+        .kv_storage = &metal_storage,
+        .layer_index = 0,
+    };
+    const native_attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .kv_cache = .{
+            .sequence_id = native_seq,
+            .pool_id = native_pool,
+            .logical_block_count = native_manager.blockTable(native_seq).?.len(),
+            .tail_tokens = native_manager.blockTable(native_seq).?.tail_tokens,
+            .logical_blocks = native_manager.blockTable(native_seq).?.blocks.items,
+        },
+        .kv_manager = &native_manager,
+        .layer_index = 0,
+    };
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, metal_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+}
+
+test "metal_compute: dense causal attention without kv cache matches native" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const q_len: usize = 3;
+    const kv_len: usize = 3;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    var q_data: [q_len * hidden_q]f32 = undefined;
+    var k_data: [kv_len * hidden_kv]f32 = undefined;
+    var v_data: [kv_len * hidden_kv]f32 = undefined;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 41)) - 20)) / 19.0;
+    for (&k_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 31)) - 15)) / 13.0;
+    for (&v_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 37)) - 18)) / 17.0;
+
+    const q_shape = [_]i32{ @intCast(q_len), @intCast(hidden_q) };
+    const kv_shape = [_]i32{ @intCast(kv_len), @intCast(hidden_kv) };
+    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(&k_data, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(&v_data, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(&k_data, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(&v_data, &kv_shape);
+    defer native_cb.free(native_v);
+
+    const attention: ops.AttentionContext = .{
+        .mode = .dense_causal,
+        .total_sequence_len = q_len,
+        .query_sequence_len = q_len,
+        .kv_sequence_len = kv_len,
+    };
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, attention, 1, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+}
+
+test "metal_compute: paged prefill seed publishes prompt kv to device hook" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const seq_len: usize = 3;
+    const hidden_kv = num_kv_heads * head_dim;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var k_data: [seq_len * hidden_kv]f32 = undefined;
+    var v_data: [seq_len * hidden_kv]f32 = undefined;
+    for (&k_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 31)) - 15)) / 13.0;
+    for (&v_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 37)) - 18)) / 17.0;
+
+    var metal_storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .store_cpu_bytes = false,
+    });
+    defer metal_storage.deinit();
+    try metal_cb.provisionKvDeviceWriteHook(&metal_storage);
+    const pool_id = metal_storage.poolId();
+    const sequence_id = try metal_storage.attachSequence(pool_id);
+    try metal_storage.appendTokens(sequence_id, seq_len);
+
+    const kv_shape = [_]i32{ @intCast(seq_len), @intCast(hidden_kv) };
+    const k_host = try metal_cb.fromFloat32Shape(&k_data, &kv_shape);
+    defer metal_cb.free(k_host);
+    const v_host = try metal_cb.fromFloat32Shape(&v_data, &kv_shape);
+    defer metal_cb.free(v_host);
+    var k_device = try metal_compute.ownedDeviceMetalTensorFromCt(k_host);
+    defer k_device.deinit();
+    var v_device = try metal_compute.ownedDeviceMetalTensorFromCt(v_host);
+    defer v_device.deinit();
+
+    const attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        .kv_cache = .{
+            .sequence_id = sequence_id,
+            .pool_id = pool_id,
+            .logical_block_count = metal_storage.blockTable(sequence_id).?.len(),
+            .tail_tokens = metal_storage.blockTable(sequence_id).?.tail_tokens,
+            .logical_blocks = metal_storage.blockTable(sequence_id).?.blocks.items,
+            .kv_storage = &metal_storage,
+        },
+        .kv_storage = &metal_storage,
+        .layer_index = 0,
+    };
+
+    try std.testing.expect(try metal_compute.seedPagedAttentionSpanMt(
+        try MetalCompute.attentionKvSource(attention),
+        attention,
+        k_device,
+        v_device,
+        num_kv_heads,
+        head_dim,
+    ));
+
+    const gathered = try metal_storage.gatherLayerKv(allocator, sequence_id, 0, seq_len);
+    defer allocator.free(gathered.k);
+    defer allocator.free(gathered.v);
+    try std.testing.expectEqualSlices(f32, &k_data, gathered.k);
+    try std.testing.expectEqualSlices(f32, &v_data, gathered.v);
+}
+
+test "metal_compute: shared-kv prefill ignores placeholder kv when skip_kv_write is set" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const seq_len: usize = 3;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    var donor_k: [seq_len * hidden_kv]f32 = undefined;
+    var donor_v: [seq_len * hidden_kv]f32 = undefined;
+    var q_data: [seq_len * hidden_q]f32 = undefined;
+    var placeholder_k = std.mem.zeroes([seq_len * hidden_kv]f32);
+    var placeholder_v = std.mem.zeroes([seq_len * hidden_kv]f32);
+
+    for (&donor_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 31)) - 15)) / 13.0;
+    for (&donor_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 37)) - 18)) / 17.0;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 41)) - 20)) / 19.0;
+
+    var metal_storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .store_cpu_bytes = false,
+    });
+    defer metal_storage.deinit();
+    const metal_pool = metal_storage.poolId();
+    const metal_seq = try metal_storage.attachSequence(metal_pool);
+    try metal_storage.appendTokens(metal_seq, seq_len);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_seq, seq_len);
+    try native_manager.writeLayerKvSuffix(native_seq, 0, seq_len, seq_len, &donor_k, &donor_v);
+
+    const metal_table = metal_storage.blockTable(metal_seq).?;
+    const metal_kv_view: ops.KvCacheView = .{
+        .sequence_id = metal_seq,
+        .pool_id = metal_pool,
+        .logical_block_count = metal_table.len(),
+        .tail_tokens = metal_table.tail_tokens,
+        .logical_blocks = metal_table.blocks.items,
+        .kv_storage = &metal_storage,
+    };
+    try std.testing.expect(try metal_compute.updateBackendKvLayerCache(
+        .{
+            .source_ptr_id = @intFromPtr(&metal_storage),
+            .sequence_id = metal_seq,
+            .layer_index = 0,
+        },
+        &donor_k,
+        &donor_v,
+        seq_len,
+        seq_len,
+        0,
+        hidden_kv,
+        MetalCompute.kvViewBlockSignature(metal_kv_view),
+    ));
+
+    const q_shape = [_]i32{ @intCast(seq_len), @intCast(hidden_q) };
+    const kv_shape = [_]i32{ @intCast(seq_len), @intCast(hidden_kv) };
+    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(&placeholder_k, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(&placeholder_v, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(&placeholder_k, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(&placeholder_v, &kv_shape);
+    defer native_cb.free(native_v);
+
+    const metal_attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        .kv_cache = .{
+            .sequence_id = metal_seq,
+            .pool_id = metal_pool,
+            .logical_block_count = metal_storage.blockTable(metal_seq).?.len(),
+            .tail_tokens = metal_storage.blockTable(metal_seq).?.tail_tokens,
+            .logical_blocks = metal_storage.blockTable(metal_seq).?.blocks.items,
+            .kv_storage = &metal_storage,
+        },
+        .kv_storage = &metal_storage,
+        .layer_index = 0,
+        .skip_kv_write = true,
+    };
+    const native_attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        .kv_cache = .{
+            .sequence_id = native_seq,
+            .pool_id = native_pool,
+            .logical_block_count = native_manager.blockTable(native_seq).?.len(),
+            .tail_tokens = native_manager.blockTable(native_seq).?.tail_tokens,
+            .logical_blocks = native_manager.blockTable(native_seq).?.blocks.items,
+        },
+        .kv_manager = &native_manager,
+        .layer_index = 0,
+        .skip_kv_write = true,
+    };
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, metal_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+
+    var gathered = (try metal_compute.gatherFullKvFromBackendCache(metal_attention, num_kv_heads, head_dim, true)) orelse return error.TestUnexpectedResult;
+    defer gathered.deinit();
+    const gathered_k = try gathered.k.toHostSlice();
+    const gathered_v = try gathered.v.toHostSlice();
+    try std.testing.expectEqualSlices(f32, &donor_k, gathered_k);
+    try std.testing.expectEqualSlices(f32, &donor_v, gathered_v);
+}
+
+test "metal_compute: shared-kv prefill reuses manager gathered span when skip_kv_write is set" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const seq_len: usize = 3;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    var donor_k: [seq_len * hidden_kv]f32 = undefined;
+    var donor_v: [seq_len * hidden_kv]f32 = undefined;
+    var q_data: [seq_len * hidden_q]f32 = undefined;
+    var placeholder_k = std.mem.zeroes([seq_len * hidden_kv]f32);
+    var placeholder_v = std.mem.zeroes([seq_len * hidden_kv]f32);
+
+    for (&donor_k, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 29)) - 14)) / 11.0;
+    for (&donor_v, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 9) % 31)) - 15)) / 13.0;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 17) % 43)) - 21)) / 23.0;
+
+    var metal_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer metal_manager.deinit();
+    const metal_pool = try metal_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const metal_seq = try metal_manager.attachSequence(metal_pool);
+    try metal_manager.appendTokens(metal_seq, seq_len);
+
+    var native_manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer native_manager.deinit();
+    const native_pool = try native_manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const native_seq = try native_manager.attachSequence(native_pool);
+    try native_manager.appendTokens(native_seq, seq_len);
+    try native_manager.writeLayerKvSuffix(native_seq, 0, seq_len, seq_len, &donor_k, &donor_v);
+
+    const q_shape = [_]i32{ @intCast(seq_len), @intCast(hidden_q) };
+    const kv_shape = [_]i32{ @intCast(seq_len), @intCast(hidden_kv) };
+    const metal_q_host = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q_host);
+    const metal_k_host = try metal_cb.fromFloat32Shape(&donor_k, &kv_shape);
+    defer metal_cb.free(metal_k_host);
+    const metal_v_host = try metal_cb.fromFloat32Shape(&donor_v, &kv_shape);
+    defer metal_cb.free(metal_v_host);
+    const metal_placeholder_k_host = try metal_cb.fromFloat32Shape(&placeholder_k, &kv_shape);
+    defer metal_cb.free(metal_placeholder_k_host);
+    const metal_placeholder_v_host = try metal_cb.fromFloat32Shape(&placeholder_v, &kv_shape);
+    defer metal_cb.free(metal_placeholder_v_host);
+
+    const metal_q_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_q_host);
+    const metal_q = try metal_compute.ctFromOwnedMetalTensor(metal_q_mt);
+    defer metal_cb.free(metal_q);
+    const metal_k_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_k_host);
+    const metal_k = try metal_compute.ctFromOwnedMetalTensor(metal_k_mt);
+    defer metal_cb.free(metal_k);
+    const metal_v_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_v_host);
+    const metal_v = try metal_compute.ctFromOwnedMetalTensor(metal_v_mt);
+    defer metal_cb.free(metal_v);
+    const metal_placeholder_k_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_placeholder_k_host);
+    const metal_placeholder_k = try metal_compute.ctFromOwnedMetalTensor(metal_placeholder_k_mt);
+    defer metal_cb.free(metal_placeholder_k);
+    const metal_placeholder_v_mt = try metal_compute.ownedDeviceMetalTensorFromCt(metal_placeholder_v_host);
+    const metal_placeholder_v = try metal_compute.ctFromOwnedMetalTensor(metal_placeholder_v_mt);
+    defer metal_cb.free(metal_placeholder_v);
+
+    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(&placeholder_k, &kv_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(&placeholder_v, &kv_shape);
+    defer native_cb.free(native_v);
+
+    const skip_attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        .kv_cache = .{
+            .sequence_id = metal_seq,
+            .pool_id = metal_pool,
+            .logical_block_count = metal_manager.blockTable(metal_seq).?.len(),
+            .tail_tokens = metal_manager.blockTable(metal_seq).?.tail_tokens,
+            .logical_blocks = metal_manager.blockTable(metal_seq).?.blocks.items,
+        },
+        .kv_manager = &metal_manager,
+        .layer_index = 0,
+        .skip_kv_write = true,
+    };
+    const native_attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        .kv_cache = .{
+            .sequence_id = native_seq,
+            .pool_id = native_pool,
+            .logical_block_count = native_manager.blockTable(native_seq).?.len(),
+            .tail_tokens = native_manager.blockTable(native_seq).?.tail_tokens,
+            .logical_blocks = native_manager.blockTable(native_seq).?.blocks.items,
+        },
+        .kv_manager = &native_manager,
+        .layer_index = 0,
+        .skip_kv_write = true,
+    };
+
+    var seed_k = try metal_compute.ownedMetalTensorFromCt(metal_k);
+    defer seed_k.deinit();
+    var seed_v = try metal_compute.ownedMetalTensorFromCt(metal_v);
+    defer seed_v.deinit();
+    _ = try @import("../backends/metal_runtime.zig").updateGatheredSpan(
+        metal_compute.provider_impl,
+        .{
+            .source_ptr_id = @intFromPtr(&metal_manager),
+            .sequence_id = metal_seq,
+            .layer_index = 0,
+        },
+        seed_k,
+        seed_v,
+        &.{},
+        &.{},
+        &.{},
+        null,
+        null,
+        seq_len,
+        seq_len,
+        0,
+        &metal_compute.timing_stats,
+    ) orelse return error.TestUnexpectedResult;
+
+    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_placeholder_k, metal_placeholder_v, null, skip_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(metal_out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, metal_out));
+    const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 1, num_heads, num_kv_heads, head_dim);
+    defer native_cb.free(native_out);
+
+    const metal_data = try metal_cb.toFloat32(metal_out, allocator);
+    defer allocator.free(metal_data);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    try std.testing.expectEqual(native_data.len, metal_data.len);
+    for (native_data, metal_data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+
+    var gathered = (try metal_compute.gatherFullKvFromBackendCache(skip_attention, num_kv_heads, head_dim, false)) orelse return error.TestUnexpectedResult;
+    defer gathered.deinit();
+    const gathered_k = try gathered.k.toHostSlice();
+    const gathered_v = try gathered.v.toHostSlice();
+    try std.testing.expectEqualSlices(f32, &donor_k, gathered_k);
+    try std.testing.expectEqualSlices(f32, &donor_v, gathered_v);
+}
+
+test "metal_compute: paged prefill populates kv manager cache" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const seq_len: usize = 3;
+    const hidden_q = num_heads * head_dim;
+    const hidden_kv = num_kv_heads * head_dim;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var q_data: [seq_len * hidden_q]f32 = undefined;
+    var k_data: [seq_len * hidden_kv]f32 = undefined;
+    var v_data: [seq_len * hidden_kv]f32 = undefined;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 41)) - 20)) / 19.0;
+    for (&k_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 31)) - 15)) / 13.0;
+    for (&v_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 37)) - 18)) / 17.0;
+
+    var manager = runtime_root.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    const sequence_id = try manager.attachSequence(pool_id);
+    try manager.appendTokens(sequence_id, seq_len);
+
+    const q_shape = [_]i32{ @intCast(seq_len), @intCast(hidden_q) };
+    const kv_shape = [_]i32{ @intCast(seq_len), @intCast(hidden_kv) };
+    const q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(q);
+    const k = try metal_cb.fromFloat32Shape(&k_data, &kv_shape);
+    defer metal_cb.free(k);
+    const v = try metal_cb.fromFloat32Shape(&v_data, &kv_shape);
+    defer metal_cb.free(v);
+
+    const attention: ops.AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        .kv_cache = .{
+            .sequence_id = sequence_id,
+            .pool_id = pool_id,
+            .logical_block_count = manager.blockTable(sequence_id).?.len(),
+            .tail_tokens = manager.blockTable(sequence_id).?.tail_tokens,
+            .logical_blocks = manager.blockTable(sequence_id).?.blocks.items,
+        },
+        .kv_manager = &manager,
+        .layer_index = 0,
+    };
+
+    const out = try metal_cb.gqaPagedAttention(q, k, v, null, attention, 1, num_heads, num_kv_heads, head_dim);
+    defer metal_cb.free(out);
+
+    const gathered = try manager.gatherLayerKv(allocator, sequence_id, 0, seq_len);
+    defer allocator.free(gathered.k);
+    defer allocator.free(gathered.v);
+    try std.testing.expectEqualSlices(f32, &k_data, gathered.k);
+    try std.testing.expectEqualSlices(f32, &v_data, gathered.v);
+}
+
+test "metal_compute: primReshape uses metal backend context safely" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_shape = [_]i32{ 2, 3 };
+    const input_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const input = try metal_cb.fromFloat32Shape(&input_data, &input_shape);
+    defer metal_cb.free(input);
+
+    const reshaped = try metal_cb.primReshape(input, &[_]i64{ 3, 2 });
+    defer metal_cb.free(reshaped);
+
+    const out_shape = try metal_cb.tensorShape(reshaped, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 2 }, out_shape);
+
+    const out = try metal_cb.toFloat32(reshaped, allocator);
+    defer allocator.free(out);
+    try std.testing.expectEqualSlices(f32, &input_data, out);
+}
+
+test "metal_compute: multiply uses shape-aware broadcast fallback" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_shape = [_]i32{ 1, 2, 1, 3 };
+    const rhs_shape = [_]i32{ 1, 1, 4, 3 };
+    const lhs_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const rhs_data = [_]f32{
+        1, 10, 100,
+        2, 20, 200,
+        3, 30, 300,
+        4, 40, 400,
+    };
+
+    const lhs = try metal_cb.fromFloat32Shape(&lhs_data, &lhs_shape);
+    defer metal_cb.free(lhs);
+    const rhs = try metal_cb.fromFloat32Shape(&rhs_data, &rhs_shape);
+    defer metal_cb.free(rhs);
+
+    const out = try metal_cb.multiply(lhs, rhs);
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 4, 3 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    const expected = [_]f32{
+        1,  20,  300,
+        2,  40,  600,
+        3,  60,  900,
+        4,  80,  1200,
+        4,  50,  600,
+        8,  100, 1200,
+        12, 150, 1800,
+        16, 200, 2400,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, out_data);
+}
+
+test "metal_compute: multiply rejects incompatible non-broadcast shapes" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_shape = [_]i32{ 1, 2, 3, 4 };
+    const rhs_shape = [_]i32{ 1, 6, 4, 3 };
+    const lhs_data = [_]f32{1} ** (1 * 2 * 3 * 4);
+    const rhs_data = [_]f32{1} ** (1 * 6 * 4 * 3);
+
+    const lhs = try metal_cb.fromFloat32Shape(&lhs_data, &lhs_shape);
+    defer metal_cb.free(lhs);
+    const rhs = try metal_cb.fromFloat32Shape(&rhs_data, &rhs_shape);
+    defer metal_cb.free(rhs);
+
+    try std.testing.expectError(error.UnsupportedShape, metal_cb.multiply(lhs, rhs));
+}
+
+test "metal_compute: reshape inference preserves seq-hidden attention layout" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const input_shape = [_]i64{ 1, 77, 8, 64 };
+    if (comptime build_options.enable_metal) {
+        const resolved = try MetalCompute.resolveReshapeShape(&input_shape, 1 * 77 * 8 * 64, &.{ 1, -1, -1 });
+        try std.testing.expectEqualSlices(i64, &.{ 1, 77, 512 }, resolved[0..3]);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "metal_compute: reshape inference preserves singleton axis when collapsing attention heads" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const input_shape = [_]i64{ 77, 1, 8, 64 };
+    if (comptime build_options.enable_metal) {
+        const resolved = try MetalCompute.resolveReshapeShape(&input_shape, 77 * 1 * 8 * 64, &.{ -1, -1, -1 });
+        try std.testing.expectEqualSlices(i64, &.{ 77, 1, 512 }, resolved[0..3]);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "metal_compute: transpose resolves symbolic reshape target from buffer length" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const base = try metal_cb.fromFloat32Shape(&([_]f32{1} ** (1 * 77 * 512)), &.{ 1, 77, 512 });
+    defer metal_cb.free(base);
+    const symbolic = try metal_compute.withLogicalShape(base, &.{ -1, -1, 512 });
+
+    const reshaped = try metal_cb.primReshape(symbolic, &.{ 1, -1, -1, 64 });
+    defer metal_cb.free(reshaped);
+
+    const transposed = try metal_cb.primTranspose(reshaped, &.{ 0, 2, 1, 3 }, &.{ 1, -1, -1, 64 });
+    defer metal_cb.free(transposed);
+
+    const out_shape = try metal_cb.tensorShape(transposed, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 8, 77, 64 }, out_shape);
+}
+
+test "metal_compute: transpose dot and conv use device resident Metal kernels" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const transpose_host = try metal_cb.fromFloat32Shape(&[_]f32{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer metal_cb.free(transpose_host);
+    const transpose_mt = try metal_compute.ownedDeviceMetalTensorFromCt(transpose_host);
+    const transpose_input = try metal_compute.ctFromOwnedMetalTensor(transpose_mt);
+    defer metal_cb.free(transpose_input);
+    const transposed = try metal_cb.primTranspose(transpose_input, &.{ 1, 0 }, &.{ 2, 3 });
+    defer metal_cb.free(transposed);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, transposed));
+    const transposed_data = try metal_cb.toFloat32(transposed, allocator);
+    defer allocator.free(transposed_data);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 4, 2, 5, 3, 6 }, transposed_data);
+
+    const lhs_host = try metal_cb.fromFloat32Shape(&[_]f32{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer metal_cb.free(lhs_host);
+    const rhs_host = try metal_cb.fromFloat32Shape(&[_]f32{ 5, 6, 7, 8, 9, 10 }, &.{ 3, 2 });
+    defer metal_cb.free(rhs_host);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+    const rhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(rhs_host);
+    const rhs = try metal_compute.ctFromOwnedMetalTensor(rhs_mt);
+    defer metal_cb.free(rhs);
+    const dot = try metal_cb.primDotGeneral(lhs, rhs, &.{ 2, 2 }, &.{ 3, 2 }, &.{1}, &.{1}, &.{}, &.{});
+    defer metal_cb.free(dot);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, dot));
+    const dot_data = try metal_cb.toFloat32(dot, allocator);
+    defer allocator.free(dot_data);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 17, 23, 29, 39, 53, 67 }, dot_data);
+
+    const conv_input_host = try metal_cb.fromFloat32Shape(&[_]f32{ 1, 2, 3, 4 }, &.{ 1, 1, 4 });
+    defer metal_cb.free(conv_input_host);
+    const conv_weight_host = try metal_cb.fromFloat32Shape(&[_]f32{ 1, 10 }, &.{ 1, 1, 2 });
+    defer metal_cb.free(conv_weight_host);
+    const conv_bias_host = try metal_cb.fromFloat32Shape(&[_]f32{1}, &.{1});
+    defer metal_cb.free(conv_bias_host);
+    const conv_input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(conv_input_host);
+    const conv_input = try metal_compute.ctFromOwnedMetalTensor(conv_input_mt);
+    defer metal_cb.free(conv_input);
+    const conv_weight_mt = try metal_compute.ownedDeviceMetalTensorFromCt(conv_weight_host);
+    const conv_weight = try metal_compute.ctFromOwnedMetalTensor(conv_weight_mt);
+    defer metal_cb.free(conv_weight);
+    const conv_bias_mt = try metal_compute.ownedDeviceMetalTensorFromCt(conv_bias_host);
+    const conv_bias = try metal_compute.ctFromOwnedMetalTensor(conv_bias_mt);
+    defer metal_cb.free(conv_bias);
+    const conv = try metal_cb.conv1d(conv_input, conv_weight, conv_bias, 1, 1, 1, 4, 2, 1, 0);
+    defer metal_cb.free(conv);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, conv));
+    const conv_data = try metal_cb.toFloat32(conv, allocator);
+    defer allocator.free(conv_data);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 22, 33, 44 }, conv_data);
+
+    const conv2_input_host = try metal_cb.fromFloat32Shape(&[_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }, &.{ 1, 1, 3, 3 });
+    defer metal_cb.free(conv2_input_host);
+    const conv2_weight_host = try metal_cb.fromFloat32Shape(&[_]f32{ 1, 10, 100, 1000 }, &.{ 1, 1, 2, 2 });
+    defer metal_cb.free(conv2_weight_host);
+    const conv2_bias_host = try metal_cb.fromFloat32Shape(&[_]f32{1}, &.{1});
+    defer metal_cb.free(conv2_bias_host);
+    const conv2_input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(conv2_input_host);
+    const conv2_input = try metal_compute.ctFromOwnedMetalTensor(conv2_input_mt);
+    defer metal_cb.free(conv2_input);
+    const conv2_weight_mt = try metal_compute.ownedDeviceMetalTensorFromCt(conv2_weight_host);
+    const conv2_weight = try metal_compute.ctFromOwnedMetalTensor(conv2_weight_mt);
+    defer metal_cb.free(conv2_weight);
+    const conv2_bias_mt = try metal_compute.ownedDeviceMetalTensorFromCt(conv2_bias_host);
+    const conv2_bias = try metal_compute.ctFromOwnedMetalTensor(conv2_bias_mt);
+    defer metal_cb.free(conv2_bias);
+    const conv2 = try metal_cb.conv2d(conv2_input, conv2_weight, conv2_bias, 1, 1, 1, 3, 3, 2, 2, 1, 1, 0, 0, 1);
+    defer metal_cb.free(conv2);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, conv2));
+    const conv2_data = try metal_cb.toFloat32(conv2, allocator);
+    defer allocator.free(conv2_data);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 5422, 6533, 8755, 9866 }, conv2_data);
+}
+
+test "metal_compute: inferReshapeShape ignores collapsed singleton when restoring attention heads" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const resolved = MetalCompute.inferReshapeShapeWithNumel(&.{ 77, 1, 512 }, &.{ 1, -1, -1, 64 }, 77 * 512) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 77, 8, 64 }, resolved[0..4]);
+}
+
+test "metal_compute: inferReshapeShapeWithNumel unflattens batch-head axis for attention outputs" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const resolved = MetalCompute.inferReshapeShapeWithNumel(&.{ 48, 512, 64 }, &.{ -1, 12, -1, -1 }, 48 * 512 * 64) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(i64, &.{ 4, 12, 512, 64 }, resolved[0..4]);
+}
+
+test "metal_compute: inferReshapeShapeWithNumel restores batch axis from symbolic prefix" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const resolved = MetalCompute.inferReshapeShapeWithNumel(&.{ -1, 512, 64 }, &.{ -1, 12, -1, -1 }, 4 * 12 * 512 * 64) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(i64, &.{ 4, 12, 512, 64 }, resolved[0..4]);
+}
+
+test "metal_compute: inferReshapeShapeWithNumel collapses symbolic attention heads" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const resolved = MetalCompute.inferReshapeShapeWithNumel(&.{ 1, -1, -1, 64 }, &.{ -1, -1, 64 }, 1 * 8 * 77 * 64) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 616, 64 }, resolved[0..3]);
+}
+
+test "metal_compute: slice preserves full-range symbolic tensors" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_shape = [_]i32{ 2, 3 };
+    const input_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const input = try metal_cb.fromFloat32Shape(&input_data, &input_shape);
+    const shaped = try metal_compute.withLogicalShape(input, &.{ -1, -1 });
+    defer metal_cb.free(shaped);
+
+    const sliced = try metal_cb.primSlice(shaped, &.{ 0, 0 }, &.{ -1, -1 }, &.{ 1, 1 }, &.{ -1, -1 });
+    defer metal_cb.free(sliced);
+
+    const out_shape = try metal_cb.tensorShape(sliced, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ -1, -1 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(sliced, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &input_data, out_data);
+}
+
+test "metal_compute: contiguousSliceRange recognizes only contiguous row-major slices" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const batch_rows = MetalCompute.contiguousSliceRange(
+        &.{ 10, 20 },
+        &.{ 3, 20 },
+        &.{ 2, 0 },
+        &.{ 1, 1 },
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 40), batch_rows.offset_elems);
+    try std.testing.expectEqual(@as(usize, 60), batch_rows.len_elems);
+
+    const fixed_batch_inner_rows = MetalCompute.contiguousSliceRange(
+        &.{ 2, 10, 20 },
+        &.{ 1, 5, 20 },
+        &.{ 1, 3, 0 },
+        &.{ 1, 1, 1 },
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 260), fixed_batch_inner_rows.offset_elems);
+    try std.testing.expectEqual(@as(usize, 100), fixed_batch_inner_rows.len_elems);
+
+    try std.testing.expect(MetalCompute.contiguousSliceRange(
+        &.{ 2, 10, 20 },
+        &.{ 2, 5, 20 },
+        &.{ 0, 3, 0 },
+        &.{ 1, 1, 1 },
+    ) == null);
+    try std.testing.expect(MetalCompute.contiguousSliceRange(
+        &.{ 10, 20 },
+        &.{ 10, 5 },
+        &.{ 0, 3 },
+        &.{ 1, 1 },
+    ) == null);
+    try std.testing.expect(MetalCompute.contiguousSliceRange(
+        &.{ 10, 20 },
+        &.{ 5, 20 },
+        &.{ 0, 0 },
+        &.{ 2, 1 },
+    ) == null);
+}
+
+test "metal_compute: scalar broadcast stays lazy and materializes on export" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const scalar = try metal_cb.fromFloat32Shape(&.{1.5}, &.{ 1, 1, 1 });
+    defer metal_cb.free(scalar);
+
+    const broadcast = try metal_cb.primBroadcastInDim(scalar, &.{ 2, 3, 4 }, &.{ 0, 1, 2 }, &.{ 1, 1, 1 });
+    defer metal_cb.free(broadcast);
+
+    try std.testing.expectEqual(@as(usize, 1), MetalCompute.toBuf(broadcast).data.len);
+
+    const out_shape = try metal_cb.tensorShape(broadcast, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 4 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(broadcast, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqual(@as(usize, 24), out_data.len);
+    for (out_data) |value| {
+        try std.testing.expectEqual(@as(f32, 1.5), value);
+    }
+}
+
+test "metal_compute: suffix-vector broadcast stays lazy and materializes on export" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 1, 4 });
+    defer metal_cb.free(input);
+
+    const broadcast = try metal_cb.primBroadcastInDim(input, &.{ 2, 3, 4 }, &.{ 0, 1, 2 }, &.{ 1, 1, 4 });
+    defer metal_cb.free(broadcast);
+
+    try std.testing.expectEqual(@as(usize, 4), MetalCompute.toBuf(broadcast).data.len);
+    try std.testing.expect(MetalCompute.toBuf(broadcast).view_strides != null);
+
+    const out_shape = try metal_cb.tensorShape(broadcast, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 4 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(broadcast, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqual(@as(usize, 24), out_data.len);
+    const expected = [_]f32{
+        1, 2, 3, 4,
+        1, 2, 3, 4,
+        1, 2, 3, 4,
+        1, 2, 3, 4,
+        1, 2, 3, 4,
+        1, 2, 3, 4,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, out_data);
+}
+
+test "metal_compute: binary fallback handles lazy repeated broadcast buffers" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_data = [_]f32{
+        10,  20,  30,  40,
+        50,  60,  70,  80,
+        90,  100, 110, 120,
+        130, 140, 150, 160,
+        170, 180, 190, 200,
+        210, 220, 230, 240,
+    };
+    const lhs = try metal_cb.fromFloat32Shape(&lhs_data, &.{ 2, 3, 4 });
+    defer metal_cb.free(lhs);
+
+    const rhs_base = try metal_cb.fromFloat32Shape(&.{ 1, 2, 5, 10 }, &.{ 1, 1, 4 });
+    defer metal_cb.free(rhs_base);
+
+    const rhs = try metal_cb.primBroadcastInDim(rhs_base, &.{ 2, 3, 4 }, &.{ 0, 1, 2 }, &.{ 1, 1, 4 });
+    defer metal_cb.free(rhs);
+
+    try std.testing.expectEqual(@as(usize, 4), MetalCompute.toBuf(rhs).data.len);
+
+    const out = try metal_cb.primDivide(lhs, rhs);
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 4 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    const expected = [_]f32{
+        10,  10,  6,  4,
+        50,  30,  14, 8,
+        90,  50,  22, 12,
+        130, 70,  30, 16,
+        170, 90,  38, 20,
+        210, 110, 46, 24,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, out_data);
+}
+
+test "metal_compute: transpose handles lazy repeated broadcast buffers" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 1, 4 });
+    defer metal_cb.free(input);
+
+    const broadcast = try metal_cb.primBroadcastInDim(input, &.{ 2, 3, 4 }, &.{ 0, 1, 2 }, &.{ 1, 1, 4 });
+    defer metal_cb.free(broadcast);
+
+    const transposed = try metal_cb.primTranspose(broadcast, &.{ 2, 0, 1 }, &.{ 2, 3, 4 });
+    defer metal_cb.free(transposed);
+
+    try std.testing.expect(MetalCompute.toBuf(transposed).view_strides != null);
+
+    const out_shape = try metal_cb.tensorShape(transposed, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 4, 2, 3 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(transposed, allocator);
+    defer allocator.free(out_data);
+    const expected = [_]f32{
+        1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2,
+        3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, out_data);
+}
+
+test "metal_compute: transpose materializes suffix repeated broadcast buffers" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    defer metal_cb.free(input);
+
+    const broadcast = try metal_cb.primBroadcastInDim(input, &.{ 2, 3, 4 }, &.{ 1, 2 }, &.{ 1, 4 });
+    defer metal_cb.free(broadcast);
+
+    try std.testing.expectEqual(@as(usize, 4), MetalCompute.toBuf(broadcast).data.len);
+    try std.testing.expect(MetalCompute.toBuf(broadcast).view_strides == null);
+
+    const transposed = try metal_cb.primTranspose(broadcast, &.{ 1, 0, 2 }, &.{ 2, 3, 4 });
+    defer metal_cb.free(transposed);
+
+    try std.testing.expect(MetalCompute.toBuf(transposed).view_strides != null);
+
+    const out_shape = try metal_cb.tensorShape(transposed, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 2, 4 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(transposed, allocator);
+    defer allocator.free(out_data);
+    const expected = [_]f32{
+        1, 2, 3, 4, 1, 2, 3, 4,
+        1, 2, 3, 4, 1, 2, 3, 4,
+        1, 2, 3, 4, 1, 2, 3, 4,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, out_data);
+}
+
+test "metal_compute: reshape of transposed host view stays lazy and exports correctly" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input = try metal_cb.fromFloat32Shape(&.{
+        1, 2, 3,
+        4, 5, 6,
+    }, &.{ 2, 3 });
+    defer metal_cb.free(input);
+
+    const transposed = try metal_cb.primTranspose(input, &.{ 1, 0 }, &.{ 2, 3 });
+    defer metal_cb.free(transposed);
+    try std.testing.expect(MetalCompute.toBuf(transposed).view_strides != null);
+
+    const reshaped = try metal_cb.primReshape(transposed, &.{ 2, 3 });
+    defer metal_cb.free(reshaped);
+    try std.testing.expect(MetalCompute.toBuf(reshaped).view_index_map != null);
+
+    const out_shape = try metal_cb.tensorShape(reshaped, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(reshaped, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{
+        1, 4, 2,
+        5, 3, 6,
+    }, out_data);
+}
+
+test "metal_compute: reshaping an index-view alias reuses the index map" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input = try metal_cb.fromFloat32Shape(&.{
+        1, 2, 3,
+        4, 5, 6,
+    }, &.{ 2, 3 });
+    defer metal_cb.free(input);
+
+    const transposed = try metal_cb.primTranspose(input, &.{ 1, 0 }, &.{ 2, 3 });
+    defer metal_cb.free(transposed);
+
+    const reshaped = try metal_cb.primReshape(transposed, &.{ 2, 3 });
+    defer metal_cb.free(reshaped);
+    const reshaped_buf = MetalCompute.toBuf(reshaped);
+    try std.testing.expect(reshaped_buf.view_index_map != null);
+
+    const reshaped_again = try metal_cb.primReshape(reshaped, &.{ 3, 2 });
+    defer metal_cb.free(reshaped_again);
+    const reshaped_again_buf = MetalCompute.toBuf(reshaped_again);
+    try std.testing.expect(reshaped_again_buf.view_index_map != null);
+    try std.testing.expect(reshaped_buf.view_index_map.?.ptr == reshaped_again_buf.view_index_map.?.ptr);
+    try std.testing.expect(reshaped_buf.shared_view_index_refcount != null);
+    try std.testing.expect(reshaped_buf.shared_view_index_refcount.? == reshaped_again_buf.shared_view_index_refcount.?);
+    try std.testing.expectEqual(@as(usize, 2), reshaped_buf.shared_view_index_refcount.?.*);
+
+    const out_data = try metal_cb.toFloat32(reshaped_again, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{
+        1, 4,
+        2, 5,
+        3, 6,
+    }, out_data);
+}
+
+test "metal_compute: multiply preserves symbolic larger operand shape" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_shape = [_]i32{12};
+    const lhs_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const rhs_shape = [_]i32{ 1, 1, 3, 1 };
+    const rhs_data = [_]f32{ 10, 100, 1000 };
+
+    const lhs = try metal_cb.fromFloat32Shape(&lhs_data, &lhs_shape);
+    const lhs_symbolic = try metal_compute.withLogicalShape(lhs, &.{ -1, -1, 3, -1 });
+    defer metal_cb.free(lhs_symbolic);
+
+    const rhs = try metal_cb.fromFloat32Shape(&rhs_data, &rhs_shape);
+    defer metal_cb.free(rhs);
+
+    const out = try metal_cb.multiply(lhs_symbolic, rhs);
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ -1, -1, 3, -1 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    const expected = [_]f32{ 10, 200, 3000, 40, 500, 6000, 70, 800, 9000, 100, 1100, 12000 };
+    try std.testing.expectEqualSlices(f32, &expected, out_data);
+}
+
+test "metal_compute: symbolic equal-length add preserves concrete lhs shape" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_shape = [_]i32{ 1, 2, 3 };
+    const rhs_shape = [_]i32{ 2, 1, 3 };
+    const lhs_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const rhs_data = [_]f32{ 10, 20, 30, 40, 50, 60 };
+
+    const lhs_raw = try metal_cb.fromFloat32Shape(&lhs_data, &lhs_shape);
+    const lhs = try metal_compute.withLogicalShape(lhs_raw, &.{ 1, 2, 3 });
+    defer metal_cb.free(lhs);
+
+    const rhs_raw = try metal_cb.fromFloat32Shape(&rhs_data, &rhs_shape);
+    const rhs = try metal_compute.withLogicalShape(rhs_raw, &.{ -1, -1, 3 });
+    defer metal_cb.free(rhs);
+
+    const out = try metal_cb.add(lhs, rhs);
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, out_shape);
+}
+
+test "metal_compute: addConsumeLeft preserves lhs shape for equal-length broadcast layouts" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_shape = [_]i32{ 1, 2, 3 };
+    const rhs_shape = [_]i32{ 2, 1, 3 };
+    const lhs_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const rhs_data = [_]f32{ 10, 20, 30, 40, 50, 60 };
+
+    const lhs_raw = try metal_cb.fromFloat32Shape(&lhs_data, &lhs_shape);
+    const lhs = try metal_compute.withLogicalShape(lhs_raw, &.{ 1, 2, 3 });
+    defer metal_cb.free(lhs);
+
+    const rhs_raw = try metal_cb.fromFloat32Shape(&rhs_data, &rhs_shape);
+    const rhs = try metal_compute.withLogicalShape(rhs_raw, &.{ 2, 1, 3 });
+    defer metal_cb.free(rhs);
+
+    const out = (try metal_cb.addConsumeLeft(lhs, rhs)).?;
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
+}
+
+test "metal_compute: addConsumeLeft keeps equal-size device tensors resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{ 2, 3 };
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &shape);
+    defer metal_cb.free(lhs_host);
+    const rhs_host = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &shape);
+    defer metal_cb.free(rhs_host);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+    const rhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(rhs_host);
+    const rhs = try metal_compute.ctFromOwnedMetalTensor(rhs_mt);
+    defer metal_cb.free(rhs);
+
+    const out = (try metal_cb.addConsumeLeft(lhs, rhs)).?;
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
+}
+
+test "metal_compute: addConsumeLeft uploads equal-size host rhs instead of downloading lhs" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{ 2, 3 };
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &shape);
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &shape);
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    const out = (try metal_cb.addConsumeLeft(lhs, rhs)).?;
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
+}
+
+test "metal_compute: addConsumeLeft uploads equal-size host lhs when rhs is device resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{ 2, 3 };
+    const lhs = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &shape);
+    defer metal_cb.free(lhs);
+    const rhs_host = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &shape);
+    defer metal_cb.free(rhs_host);
+    const rhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(rhs_host);
+    const rhs = try metal_compute.ctFromOwnedMetalTensor(rhs_mt);
+    defer metal_cb.free(rhs);
+
+    const out = (try metal_cb.addConsumeLeft(lhs, rhs)).?;
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
+}
+
+test "metal_compute: add uploads equal-size host peer instead of downloading device operand" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{ 2, 3 };
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &shape);
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &shape);
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    const out = try metal_cb.add(lhs, rhs);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
+}
+
+test "metal_compute: multiply uploads equal-size host peer instead of downloading device operand" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{ 2, 3 };
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &shape);
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &shape);
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    const out = try metal_cb.multiply(lhs, rhs);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 40, 90, 160, 250, 360 }, out_data);
+}
+
+test "metal_compute: multiply keeps row-wise rhs broadcast resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30 }, &.{3});
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    const out = try metal_cb.multiply(lhs, rhs);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 40, 90, 40, 100, 180 }, out_data);
+}
+
+test "metal_compute: multiply keeps device scalar rhs broadcast resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer metal_cb.free(lhs_host);
+    const rhs_host = try metal_cb.fromFloat32Shape(&.{2}, &.{1});
+    defer metal_cb.free(rhs_host);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+    const rhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(rhs_host);
+    const rhs = try metal_compute.ctFromOwnedMetalTensor(rhs_mt);
+    defer metal_cb.free(rhs);
+
+    const out = try metal_cb.multiply(lhs, rhs);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8, 10, 12 }, out_data);
+}
+
+test "metal_compute: batched dot_general keeps attention matmul resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_shape = [_]i32{ 2, 2, 3 };
+    const rhs_shape = [_]i32{ 2, 4, 3 };
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{
+        1,  2,  3,
+        4,  5,  6,
+        7,  8,  9,
+        10, 11, 12,
+    }, &lhs_shape);
+    defer metal_cb.free(lhs_host);
+    const rhs_host = try metal_cb.fromFloat32Shape(&.{
+        1, 0, 0,
+        0, 1, 0,
+        0, 0, 1,
+        1, 1, 1,
+        2, 0, 0,
+        0, 2, 0,
+        0, 0, 2,
+        1, 2, 3,
+    }, &rhs_shape);
+    defer metal_cb.free(rhs_host);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+    const rhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(rhs_host);
+    const rhs = try metal_compute.ctFromOwnedMetalTensor(rhs_mt);
+    defer metal_cb.free(rhs);
+
+    const out = try metal_cb.primDotGeneral(lhs, rhs, &.{ 2, 2, 3 }, &.{ 2, 4, 3 }, &.{2}, &.{2}, &.{0}, &.{0});
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 4 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{
+        1,  2,  3,  6,
+        4,  5,  6,  15,
+        14, 16, 18, 50,
+        20, 22, 24, 68,
+    }, out_data);
+}
+
+test "metal_compute: divideConsumeLeft repeats small rhs on device" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_shape = [_]i32{ 2, 3 };
+    const rhs_shape = [_]i32{3};
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 2, 8, 18, 4, 10, 24 }, &lhs_shape);
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 2, 4, 6 }, &rhs_shape);
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    const out = (try metal_cb.divideConsumeLeft(lhs, rhs)).?;
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 2, 2.5, 4 }, out_data);
+}
+
+test "metal_compute: divideConsumeLeft uploads equal-size host rhs instead of downloading lhs" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{ 2, 3 };
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 2, 8, 18, 4, 10, 24 }, &shape);
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 2, 4, 6, 2, 5, 3 }, &shape);
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    const out = (try metal_cb.divideConsumeLeft(lhs, rhs)).?;
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 2, 2, 8 }, out_data);
+}
+
+test "metal_compute: scaled dot product attention fallback preserves shape and values" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const qkv_shape = [_]i32{ 1, 1, 2, 2 };
+    const q_data = [_]f32{ 1, 0, 0, 1 };
+    const k_data = [_]f32{ 1, 0, 0, 1 };
+    const v_data = [_]f32{ 2, 4, 6, 8 };
+    const mask = [_]i64{ 1, 1 };
+
+    const q = try metal_cb.fromFloat32Shape(&q_data, &qkv_shape);
+    defer metal_cb.free(q);
+    const k = try metal_cb.fromFloat32Shape(&k_data, &qkv_shape);
+    defer metal_cb.free(k);
+    const v = try metal_cb.fromFloat32Shape(&v_data, &qkv_shape);
+    defer metal_cb.free(v);
+
+    const out = try metal_cb.scaledDotProductAttention(q, k, v, &mask, null, 1, 2, 1, 2);
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 1, 2, 2 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    const expected = [_]f32{
+        3.3209534, 5.3209534,
+        4.6790466, 6.6790466,
+    };
+    for (expected, out_data) |expected_value, actual_value| {
+        try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-4);
+    }
+}
+
+test "metal_compute: linearTriple is owned by metal backend" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_shape = [_]i32{ 2, 3 };
+    const weight_shape = [_]i32{ 2, 3 };
+    const bias_shape = [_]i32{2};
+    const input_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const weight_a_data = [_]f32{ 1, 0, 0, 0, 1, 0 };
+    const weight_b_data = [_]f32{ 0, 0, 1, 1, 1, 1 };
+    const weight_c_data = [_]f32{ 1, 1, 0, 0, 1, 1 };
+    const bias_a_data = [_]f32{ 10, 20 };
+    const bias_b_data = [_]f32{ -1, -2 };
+    const bias_c_data = [_]f32{ 0.5, -0.5 };
+
+    const input = try metal_cb.fromFloat32Shape(&input_data, &input_shape);
+    defer metal_cb.free(input);
+    const weight_a = try metal_cb.fromFloat32Shape(&weight_a_data, &weight_shape);
+    defer metal_cb.free(weight_a);
+    const weight_b = try metal_cb.fromFloat32Shape(&weight_b_data, &weight_shape);
+    defer metal_cb.free(weight_b);
+    const weight_c = try metal_cb.fromFloat32Shape(&weight_c_data, &weight_shape);
+    defer metal_cb.free(weight_c);
+    const bias_a = try metal_cb.fromFloat32Shape(&bias_a_data, &bias_shape);
+    defer metal_cb.free(bias_a);
+    const bias_b = try metal_cb.fromFloat32Shape(&bias_b_data, &bias_shape);
+    defer metal_cb.free(bias_b);
+    const bias_c = try metal_cb.fromFloat32Shape(&bias_c_data, &bias_shape);
+    defer metal_cb.free(bias_c);
+
+    const triple = try metal_cb.linearTriple(input, weight_a, bias_a, weight_b, bias_b, weight_c, bias_c, 2, 3, 2);
+    defer metal_cb.free(triple.first);
+    defer metal_cb.free(triple.second);
+    defer metal_cb.free(triple.third);
+
+    const first = try metal_cb.toFloat32(triple.first, allocator);
+    defer allocator.free(first);
+    const second = try metal_cb.toFloat32(triple.second, allocator);
+    defer allocator.free(second);
+    const third = try metal_cb.toFloat32(triple.third, allocator);
+    defer allocator.free(third);
+
+    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 14, 25 }, first);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 5, 13 }, second);
+    try std.testing.expectEqualSlices(f32, &.{ 3.5, 4.5, 9.5, 10.5 }, third);
+}
+
+test "metal_compute: device linear applies bias through metal runtime slot" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_shape = [_]i32{ 2, 3 };
+    const weight_shape = [_]i32{ 2, 3 };
+    const bias_shape = [_]i32{2};
+    const input_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const weight_data = [_]f32{ 1, 0, 0, 0, 1, 1 };
+    const bias_data = [_]f32{ 10, -1 };
+
+    const input_host = try metal_cb.fromFloat32Shape(&input_data, &input_shape);
+    defer metal_cb.free(input_host);
+    const input_device_tensor = try metal_compute.ownedDeviceMetalTensorFromCt(input_host);
+    const input = try metal_compute.ctFromOwnedMetalTensor(input_device_tensor);
+    defer metal_cb.free(input);
+    const weight = try metal_cb.fromFloat32Shape(&weight_data, &weight_shape);
+    defer metal_cb.free(weight);
+    const bias = try metal_cb.fromFloat32Shape(&bias_data, &bias_shape);
+    defer metal_cb.free(bias);
+
+    const out = try metal_cb.linear(input, weight, bias, 2, 3, 2);
+    defer metal_cb.free(out);
+
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 4, 14, 10 }, out_data);
+}
+
+test "metal_compute: dynamic rms norm slot key distinguishes native dense buffers" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    var empty_a: [0]f32 = .{};
+    var empty_b: [0]f32 = .{};
+    var bytes_a = [_]u8{ 1, 2, 3, 4 };
+    var bytes_b = [_]u8{ 5, 6, 7, 8 };
+    var buf_a = MetalCompute.Buf{
+        .data = empty_a[0..],
+        .allocator = std.testing.allocator,
+        .owned = false,
+        .native_dense_bytes = bytes_a[0..],
+        .native_dense_dtype = .bf16,
+    };
+    var buf_b = MetalCompute.Buf{
+        .data = empty_b[0..],
+        .allocator = std.testing.allocator,
+        .owned = false,
+        .native_dense_bytes = bytes_b[0..],
+        .native_dense_dtype = .bf16,
+    };
+
+    const key_a = MetalCompute.dynamicRmsNormSlotKey(@ptrCast(&buf_a), 1536);
+    const key_b = MetalCompute.dynamicRmsNormSlotKey(@ptrCast(&buf_b), 1536);
+    try std.testing.expectEqual(@intFromPtr(bytes_a[0..].ptr), key_a.weight_buf);
+    try std.testing.expectEqual(@intFromPtr(bytes_b[0..].ptr), key_b.weight_buf);
+    try std.testing.expect(key_a.weight_buf != key_b.weight_buf);
+}
+
+test "metal_compute: causal self attention is owned by metal backend" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const qkv_shape = [_]i32{ 2, 2 };
+    const q_data = [_]f32{ 1, 0, 0, 1 };
+    const k_data = [_]f32{ 1, 0, 0, 1 };
+    const v_data = [_]f32{ 2, 4, 6, 8 };
+
+    const q = try metal_cb.fromFloat32Shape(&q_data, &qkv_shape);
+    defer metal_cb.free(q);
+    const k = try metal_cb.fromFloat32Shape(&k_data, &qkv_shape);
+    defer metal_cb.free(k);
+    const v = try metal_cb.fromFloat32Shape(&v_data, &qkv_shape);
+    defer metal_cb.free(v);
+
+    const out = try metal_cb.causalSelfAttention(q, k, v, null, 1, 2, 1, 2);
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, out_shape);
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    const expected = [_]f32{
+        2.0,       4.0,
+        4.6790466, 6.6790466,
+    };
+    for (expected, out_data) |expected_value, actual_value| {
+        try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-4);
+    }
+}

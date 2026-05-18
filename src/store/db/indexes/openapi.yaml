@@ -32,6 +32,7 @@ components:
         - full_text
         - embeddings
         - graph
+        - algebraic
       description: "The type of the index."
     IndexConfig:
       type: object
@@ -40,6 +41,7 @@ components:
         - $ref: "#/components/schemas/FullTextIndexConfig"
         - $ref: "#/components/schemas/EmbeddingsIndexConfig"
         - $ref: "#/components/schemas/GraphIndexConfig"
+        - $ref: "#/components/schemas/AlgebraicIndexConfig"
       required:
         - name
         - type
@@ -72,9 +74,25 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether to use memory-only storage"
+    AlgebraicIndexConfig:
+      type: object
+      description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
+      properties:
+        derive_from_schema:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API."
     FullTextIndexStats:
       type: object
+      required:
+        - index_type
       properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - full_text
+          description: "Discriminator for the index stats variant."
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -173,7 +191,15 @@ components:
     EmbeddingsIndexStats:
       type: object
       description: "Statistics for an embeddings index (dense or sparse)"
+      required:
+        - index_type
       properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - embeddings
+          description: "Discriminator for the index stats variant."
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -220,10 +246,145 @@ components:
     IndexStats:
       type: object
       description: "Statistics for an index"
+      discriminator:
+        propertyName: index_type
+        mapping:
+          full_text: "#/components/schemas/FullTextIndexStats"
+          embeddings: "#/components/schemas/EmbeddingsIndexStats"
+          graph: "#/components/schemas/GraphIndexStats"
+          algebraic: "#/components/schemas/AlgebraicIndexStats"
       oneOf:
         - $ref: "#/components/schemas/FullTextIndexStats"
         - $ref: "#/components/schemas/EmbeddingsIndexStats"
         - $ref: "#/components/schemas/GraphIndexStats"
+        - $ref: "#/components/schemas/AlgebraicIndexStats"
+    AlgebraicIndexStats:
+      type: object
+      description: "Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics."
+      required:
+        - index_type
+      properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - algebraic
+          description: "Discriminator for the index stats variant."
+        error:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Error message if stats could not be retrieved"
+        total_indexed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents reflected in the algebraic sidecar"
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Size of the index in bytes"
+        rebuilding:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the sidecar is currently rebuilding"
+        backfill_progress:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Backfill progress as a ratio from 0.0 to 1.0"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents processed during current backfill"
+        healthy:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        parse_error_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        schema_version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        capability_lifecycle_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Schema-derived algebraic capability lifecycle, for example current, stale, or rebuild_required."
+        planner_selected:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        planner_fallback_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        planner_last_decision:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - selected
+            - fallback
+        planner_last_fallback_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        planner_last_estimated_scan_rows:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Latest algebraic planner scan-row estimate for the last selected or fallback decision."
+        planner_last_estimated_result_buckets:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Latest algebraic planner result-bucket estimate for the last selected or fallback decision."
+        planner_lifecycle_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        planner_lifecycle_blocking_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        adaptive_progress_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        recommendation_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of currently recommended algebraic shapes."
+        adaptive_backfilling_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        adaptive_ready_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        adaptive_stale_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        adaptive_cleanup_recommended_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        last_error_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        active_progress_lifecycle:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        active_progress_rows_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        active_progress_target_rows:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
     MergeStrategy:
       type: string
       enum:
@@ -416,7 +577,15 @@ components:
     GraphIndexStats:
       type: object
       description: "Statistics for graph index"
+      required:
+        - index_type
       properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - graph
+          description: "Discriminator for the index stats variant."
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -446,6 +615,29 @@ components:
           type: integer
           format: uint64
           description: "Number of edges indexed during current rebuild"
+        algebraic_graph:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          description: "Algebraic graph execution health for bounded semiring traversal."
+          properties:
+            traversal:
+              type: object
+              properties:
+                attempted:
+                  type: integer
+                  format: uint64
+                proven:
+                  type: integer
+                  format: uint64
+                rejected:
+                  type: integer
+                  format: uint64
+                fallback:
+                  type: integer
+                  format: uint64
+                result_nodes:
+                  type: integer
+                  format: uint64
     Edge:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -868,6 +1060,12 @@ components:
           items:
             $ref: '#/components/schemas/PathEdge'
           description: "Edges in path from start to this node"
+        provenance:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Algebraic provenance labels folded into this result, when requested by an algebraic graph executor"
         edges:
           x-go-type-skip-optional-pointer: true
           type: array

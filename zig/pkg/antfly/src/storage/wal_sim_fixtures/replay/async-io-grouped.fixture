@@ -1,0 +1,19 @@
+storage-sim-fixture-v1
+mode wal
+label async-io-grouped
+case_label async-io-grouped
+origin_seed 0xA17F2002
+expectation expected WAL state to survive replayed reopen and grouped append schedules
+no_sync false
+commit_backend async_io
+group_commit_window_ns 2000000
+expected_visible_entries 3
+expected_last_lsn 5
+
+action append_batch 2
+action concurrent_pair
+action verify_from 1
+action reopen_and_verify_from 2
+action truncate_and_verify_from 2 1
+action append
+action verify_from 1

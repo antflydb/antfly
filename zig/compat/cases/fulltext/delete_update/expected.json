@@ -1,0 +1,18 @@
+{
+  "alpha_after_delete_and_update": {
+    "total_hits": 0,
+    "hits": []
+  },
+  "replacement_after_update": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:b",
+        "stored_data": {
+          "title": "beta",
+          "body": "replacement body"
+        }
+      }
+    ]
+  }
+}

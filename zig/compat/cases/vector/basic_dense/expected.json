@@ -1,0 +1,14 @@
+{
+  "knn_dense": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:a",
+        "stored_data": {
+          "title": "alpha",
+          "embedding": [1, 0, 0]
+        }
+      }
+    ]
+  }
+}

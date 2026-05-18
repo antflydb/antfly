@@ -1,4 +1,4 @@
-// Copyright 2025 The Antfly Authors
+// Copyright 2026 The Antfly Authors
 // Licensed under the Apache License, Version 2.0
 
 package mcp

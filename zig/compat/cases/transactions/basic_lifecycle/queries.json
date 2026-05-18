@@ -1,0 +1,34 @@
+[
+  {
+    "name": "status_t1",
+    "request": {
+      "get_transaction_status": {
+        "txn": "t1"
+      }
+    }
+  },
+  {
+    "name": "status_t2",
+    "request": {
+      "get_transaction_status": {
+        "txn": "t2"
+      }
+    }
+  },
+  {
+    "name": "lookup_a",
+    "request": {
+      "lookup": {
+        "key": "doc:a"
+      }
+    }
+  },
+  {
+    "name": "lookup_b",
+    "request": {
+      "lookup": {
+        "key": "doc:b"
+      }
+    }
+  }
+]

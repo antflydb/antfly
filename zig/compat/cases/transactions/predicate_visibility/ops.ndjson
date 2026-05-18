@@ -1,0 +1,6 @@
+{"op":"batch","writes":[{"key":"doc:cas","value":{"title":"v1"}}],"deletes":[],"timestamp_ns":10000}
+{"op":"begin_transaction","txn":"t1","timestamp_ns":11000}
+{"op":"write_transaction","txn":"t1","writes":[{"key":"doc:cas","value":{"title":"v2"}}],"deletes":[],"predicates":[{"key":"doc:cas","expected_version":10000}]}
+{"op":"commit_transaction","txn":"t1","timestamp_ns":11001}
+{"op":"begin_transaction","txn":"t2","timestamp_ns":12000}
+{"op":"write_transaction","txn":"t2","writes":[{"key":"doc:cas","value":{"title":"stale"}}],"deletes":[],"predicates":[{"key":"doc:cas","expected_version":10000}],"expect_error":"version_conflict"}

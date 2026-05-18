@@ -1,0 +1,17 @@
+{
+  "knn_sparse": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:a",
+        "stored_data": {
+          "title": "alpha",
+          "sparse": {
+            "indices": [0, 2],
+            "values": [0.9, 0.1]
+          }
+        }
+      }
+    ]
+  }
+}

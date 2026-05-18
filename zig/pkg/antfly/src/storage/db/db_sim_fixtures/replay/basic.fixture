@@ -1,0 +1,24 @@
+storage-sim-fixture-v1
+# DB split replay fixture for full split, reopen, and post-split writes.
+
+mode db_split
+label basic
+case_label basic
+origin_seed 0x1
+expectation expected DB split replay to preserve source/destination text state across full split and reopen
+expected_source_doc_count 3
+expected_dest_doc_count 2
+expected_source_alpha_hits 2
+expected_source_beta_hits 0
+expected_source_gamma_hits 1
+expected_dest_alpha_hits 0
+expected_dest_beta_hits 2
+expected_dest_gamma_hits 0
+
+action add_doc left_alpha
+action add_doc mixed_alpha_beta
+action split_full
+action reopen_source
+action reopen_dest
+action add_doc right_beta
+action add_doc left_gamma

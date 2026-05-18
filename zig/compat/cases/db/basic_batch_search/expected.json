@@ -1,0 +1,19 @@
+{
+  "match_all": {
+    "total_hits": 2,
+    "hits": [
+      {
+        "id": "doc:a",
+        "stored_data": {
+          "title": "alpha"
+        }
+      },
+      {
+        "id": "doc:b",
+        "stored_data": {
+          "title": "beta"
+        }
+      }
+    ]
+  }
+}

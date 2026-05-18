@@ -1,0 +1,15 @@
+storage-sim-fixture-v1
+mode persistent
+label basic
+case_label basic
+origin_seed 0x1
+expectation expected persistent index replay to preserve WAL-backed segments across reopen cycles
+expected_doc_count 3
+expected_segment_count 2
+expected_alpha_hits 1
+expected_beta_hits 0
+expected_gamma_hits 2
+
+action index_segment alpha
+action reopen
+action index_segment gamma_pair

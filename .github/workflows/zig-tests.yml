@@ -1,0 +1,435 @@
+name: Zig Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    - cron: "0 8 * * *"
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: arc-antfly-standard
+    outputs:
+      zig_tests: ${{ steps.detect.outputs.zig_tests }}
+      e2e: ${{ steps.detect.outputs.e2e }}
+      model_check: ${{ steps.detect.outputs.model_check }}
+      trace_validate: ${{ steps.detect.outputs.trace_validate }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant changes
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            {
+              echo "zig_tests=true"
+              echo "e2e=true"
+              echo "model_check=true"
+              echo "trace_validate=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "zig_tests=false" >> "$GITHUB_OUTPUT"
+            if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
+              {
+                echo "e2e=false"
+                echo "model_check=true"
+                echo "trace_validate=true"
+              } >> "$GITHUB_OUTPUT"
+            else
+              {
+                echo "e2e=true"
+                echo "model_check=false"
+                echo "trace_validate=false"
+              } >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            base="${{ github.event.before }}"
+          else
+            {
+              echo "zig_tests=true"
+              echo "e2e=true"
+              echo "model_check=true"
+              echo "trace_validate=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob)zig/**/*.zig' \
+            zig/build.zig \
+            zig/build.zig.zon \
+            zig/deps/snowball \
+            Makefile \
+            zig/Makefile \
+            .github/workflows/zig-tests.yml \
+            .github/workflows/zig-container.yml \
+            zig/Dockerfile
+          then
+            echo "zig_tests=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "zig_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob)zig/**/*.zig' \
+            ':(glob)zig/e2e/**' \
+            Makefile \
+            zig/build.zig \
+            zig/build.zig.zon \
+            zig/Makefile \
+            .github/workflows/zig-tests.yml \
+            .github/workflows/zig-container.yml
+          then
+            echo "e2e=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob)zig/specs/tla/**' \
+            ':(glob)zig/scripts/tla-*.sh' \
+            ':(glob)zig/scripts/tla-*.py' \
+            Makefile \
+            zig/Makefile \
+            .github/workflows/zig-tests.yml
+          then
+            echo "model_check=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "model_check=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob)zig/specs/tla/**' \
+            ':(glob)zig/scripts/tla-*.sh' \
+            ':(glob)zig/scripts/tla-*.py' \
+            ':(glob)zig/pkg/antfly/src/tracing/**' \
+            ':(glob)zig/pkg/antfly/src/raft/**' \
+            ':(glob)zig/pkg/antfly/src/storage/db/**' \
+            ':(glob)zig/lib/raft/**' \
+            Makefile \
+            zig/Makefile \
+            zig/build.zig \
+            .github/workflows/zig-tests.yml
+          then
+            echo "trace_validate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "trace_validate=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  generated:
+    needs: changes
+    if: github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true'
+    runs-on: arc-antfly-standard
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Restore Zig build cache
+        id: zig-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ env.ZIG_LOCAL_CACHE_DIR }}
+            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: zig-${{ runner.os }}-${{ runner.arch }}-0.16.0-main-${{ github.sha }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-0.16.0-main-
+            zig-${{ runner.os }}-${{ runner.arch }}-0.16.0-
+
+      - name: Check Snowball generated sources
+        run: make zig-snowball-check
+
+  unit:
+    needs: changes
+    if: github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true'
+    runs-on: arc-antfly-heavy
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Run hermetic Antfly unit tests
+        run: make zig-unit-test
+
+  full-default:
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    runs-on: arc-antfly-heavy
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Run full Zig unit tests
+        run: make zig-test
+
+  e2e-base:
+    needs: changes
+    if: github.event_name != 'schedule' && needs.changes.outputs.e2e == 'true'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 45
+    env:
+      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
+      HF_HOME: /mnt/cache/antfly/zig/hf
+      TERMITE_HOME: /mnt/cache/antfly/zig/termite
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        run: |
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
+          rm -rf ~/.cache ~/.termite
+          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
+          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Build E2E binaries
+        shell: bash
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=Debug install-antfly
+          # shellcheck disable=SC2016
+          printf '%s\n' '#!/usr/bin/env sh' 'exec "$(dirname "$0")/antfly" termite "$@"' > zig-out/bin/termite
+          chmod +x zig-out/bin/antfly zig-out/bin/termite
+
+      - name: Run Antfly base E2E
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+        run: |
+          chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
+          uv run --project e2e/antfly pytest -q \
+            -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
+            e2e/antfly
+
+      - name: Run Termite base E2E
+        working-directory: zig
+        env:
+          TERMITE_BIN: ./zig-out/bin/termite
+        run: |
+          uv run --project e2e/termite pytest -q \
+            -m "not slow and not multimodal and not model_integration and not browser_integration" \
+            e2e/termite
+
+  e2e-full:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    env:
+      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
+      HF_HOME: /mnt/cache/antfly/zig/hf
+      TERMITE_HOME: /mnt/cache/antfly/zig/termite
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        run: |
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
+          rm -rf ~/.cache ~/.termite
+          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
+          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Build E2E binaries
+        shell: bash
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=Debug install-antfly
+          # shellcheck disable=SC2016
+          printf '%s\n' '#!/usr/bin/env sh' 'exec "$(dirname "$0")/antfly" termite "$@"' > zig-out/bin/termite
+          chmod +x zig-out/bin/antfly zig-out/bin/termite
+
+      - name: Run Antfly full E2E
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+        run: |
+          chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
+          uv run --project e2e/antfly pytest -q e2e/antfly
+
+      - name: Run Termite full E2E
+        working-directory: zig
+        env:
+          TERMITE_BIN: ./zig-out/bin/termite
+        run: uv run --project e2e/termite pytest -q e2e/termite
+
+  tla-verify:
+    needs: changes
+    if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
+    runs-on: ${{ needs.changes.outputs.trace_validate == 'true' && 'arc-antfly-heavy' || 'arc-antfly-standard' }}
+    timeout-minutes: 30
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: ${{ needs.changes.outputs.trace_validate == 'true' }}
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        if: needs.changes.outputs.trace_validate == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        if: needs.changes.outputs.trace_validate == 'true'
+        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Run TLC on all specs
+        if: needs.changes.outputs.model_check == 'true'
+        working-directory: zig
+        run: make tla-check
+
+      - name: Download TLA+ tools
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        run: make tla-tools
+
+      - name: Run raft tests and extract traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        env:
+          ANTFLY_TRACE_FILE: /tmp/raft-trace.ndjson
+        run: |
+          zig build -Dwith_tla=true raft-test
+          test -s /tmp/raft-trace.ndjson
+          echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
+
+      - name: Validate raft traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        run: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
+
+      - name: Run transaction tests and extract traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        env:
+          ANTFLY_TRACE_FILE: /tmp/txn-trace.ndjson
+        run: |
+          zig build -Dwith_tla=true lib-db-txn-test
+          test -s /tmp/txn-trace.ndjson
+          echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
+
+      - name: Validate transaction traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        run: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson

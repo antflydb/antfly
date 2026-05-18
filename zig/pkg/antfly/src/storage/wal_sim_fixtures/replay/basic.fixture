@@ -1,0 +1,18 @@
+storage-sim-fixture-v1
+mode wal
+label basic
+case_label basic
+origin_seed 0xA17F2001
+expectation expected WAL state to survive replayed reopen and truncate schedules
+no_sync false
+commit_backend adaptive
+expected_visible_entries 3
+expected_last_lsn 4
+
+action append
+action append_batch 2
+action verify_from 1
+action reopen_and_verify_from 1
+action truncate_and_verify_from 1 1
+action append
+action verify_from 1
