@@ -41,9 +41,16 @@ Implemented:
 - Remote-content helpers resolve configured HTTP headers and S3 credentials at
   fetch time, including managed embedder query-template paths that receive the
   API server `FileStore`.
+- `DB.OpenOptions` can carry a `FileStore` and remote-content config, so
+  lower-level managed DB opens, generated source-template rendering, and
+  enrichment workers can resolve remote-content credentials outside
+  API-server-only paths.
 - Metadata-service CDC snapshot and streaming coordinators now receive the
   service-owned `FileStore`, so replication DSNs can rotate without restarting
   the metadata service.
+- Metadata-service restore planning uses `openBackupLocationWithSecrets()` when
+  the concrete service owns a `FileStore`, so S3 restore metadata reads can use
+  live secret-backed AWS credentials.
 
 Still needed:
 
@@ -53,8 +60,6 @@ Still needed:
   state.
 - Runtime tests for generator/reranker, foreign DSN, CDC DSN, S3 backup, and
   remote-content credential rotation.
-- Extending remote-content config ownership to any standalone/local DB paths
-  that are opened without an API-server-owned `FileStore`.
 - A future encrypted-at-rest codec, if non-Kubernetes deployments need local
   secret-file encryption.
 
@@ -398,16 +403,16 @@ workers.
 | Reranker providers | Runtime options now carry and resolve `api_key` references before rerank calls. | Add provider-specific tests once non-local reranker clients are implemented. |
 | Foreign DSNs | Implemented for API query paths that have the API server `FileStore`. | Add runtime tests and define pool invalidation behavior for any long-lived foreign clients. |
 | CDC replication DSNs | Metadata-service snapshot and streaming coordinators pass the service-owned `FileStore` into runners, which resolve before snapshot/stream connections. | Add reconnect/retry tests for active workers after DSN rotation. |
-| S3/backup credentials | Implemented for `openBackupLocationWithSecrets()` with AWS override keys, and wired through API/httpx backup handlers. | Add rotation tests and decide whether metadata-service-only restore planning should own a store. |
-| Remote-content S3 credentials | Fetch helpers select configured credentials and resolve secret references immediately before S3 fetches. | Extend config ownership to standalone/local DB paths and add rotation tests. |
-| Remote-content HTTP headers | Fetch helpers select configured HTTP credentials and resolve header secret references immediately before outbound HTTP fetches. | Extend config ownership to standalone/local DB paths and add rotation tests. |
+| S3/backup credentials | Implemented for `openBackupLocationWithSecrets()` with AWS override keys, and wired through API/httpx backup handlers plus metadata-service restore planning when the service owns a `FileStore`. | Add rotation tests and define generation-keyed client caching if S3 client rebuild cost becomes visible. |
+| Remote-content S3 credentials | Fetch helpers select configured credentials and resolve secret references immediately before S3 fetches. `DB.OpenOptions`, managed DB opens, and enrichment runtimes can carry the `FileStore` and remote-content config outside API-server-only paths. | Add rotation tests. |
+| Remote-content HTTP headers | Fetch helpers select configured HTTP credentials and resolve header secret references immediately before outbound HTTP fetches. `DB.OpenOptions`, managed DB opens, and enrichment runtimes can carry the `FileStore` and remote-content config outside API-server-only paths. | Add rotation tests. |
 
 Recommended implementation order:
 
-1. Extend remote-content config ownership to standalone/local DB paths that do
-   not flow through the API server sources.
-2. Add runtime tests for generator/reranker, foreign DSN, CDC DSN, and S3 backup
-   rotation.
+1. Add runtime tests for generator/reranker, foreign DSN, CDC DSN, S3 backup,
+   and remote-content credential rotation.
+2. Define reconnect and pool/client invalidation contracts for foreign DSNs,
+   CDC workers, and any S3/remote-content clients that become generation-cached.
 3. Add generation-keyed client caches where per-request rebuilds become too
    expensive.
 
@@ -529,9 +534,9 @@ Additional runtime tests:
    endpoint.
 8. [done] Migrate generator and reranker provider credential plumbing.
 9. [partial] Preserve and resolve remote-content HTTP header references at
-   fetch time; standalone/local DB ownership and tests remain.
+   fetch time; rotation tests remain.
 10. [partial] Preserve and resolve remote-content S3 references at fetch time;
-   standalone/local DB ownership and tests remain.
+   rotation tests remain.
 11. [partial] Migrate foreign DSNs and CDC DSNs; reconnect tests remain.
 12. [todo] Add logs and metrics for stale reload state.
 13. [done] Document operational behavior for malformed files, file deletion, Kubernetes

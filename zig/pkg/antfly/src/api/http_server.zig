@@ -409,7 +409,7 @@ pub const StatusSource = struct {
             }
 
             fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void {
-                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, backup_id);
+                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, backup_id, serviceSecretStore(cast(ptr)));
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
@@ -603,12 +603,21 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     try svc.runRound();
 }
 
-fn persistRestoreTableIntent(service: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+fn serviceSecretStore(service: anytype) ?*common_secrets.FileStore {
+    const Ptr = @TypeOf(service);
+    const Service = std.meta.Child(Ptr);
+    if (comptime @hasField(Service, "secret_store")) {
+        return service.secret_store;
+    }
+    return null;
+}
+
+fn persistRestoreTableIntent(service: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8, secret_store: ?*common_secrets.FileStore) !void {
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     if (tables_api.findTableByName(&snapshot, table_name) != null) return error.TableAlreadyExists;
 
-    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, null);
+    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, secret_store);
     defer spec.deinit(alloc);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);

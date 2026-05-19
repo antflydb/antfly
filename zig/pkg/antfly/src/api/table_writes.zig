@@ -6358,6 +6358,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
             manager: ?*resource_manager_mod.ResourceManager,
             open_mode: ManagedDbOpenMode,
             runtime: ?*db_mod.background_runtime.BackendRuntime,
+            store: ?*common_secrets.FileStore,
+            remote: ?*const scraping.RemoteContentConfig,
         ) !db_mod.DB {
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,
@@ -6365,6 +6367,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                 .lsm_root_generation = root_generation,
                 .resource_manager = manager,
                 .backend_runtime = runtime,
+                .secret_store = store,
+                .remote_content = remote,
                 .enrichment = .{
                     .dense_embedder = dense,
                     .sparse_embedder = sparse,
@@ -6380,6 +6384,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                     }),
                 .default_async, .writer_no_replay => if (dense != null or sparse != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -6388,6 +6394,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .enrichment = .{
                             .dense_embedder = dense,
                             .sparse_embedder = sparse,
@@ -6406,6 +6414,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),
@@ -6415,6 +6425,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                     .lsm_root_generation = root_generation,
                     .resource_manager = manager,
                     .backend_runtime = runtime,
+                    .secret_store = store,
+                    .remote_content = remote,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
                     .ttl_cleanup = .{ .enabled = false },
@@ -6428,6 +6440,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .enrichment = .{
                             .dense_embedder = dense,
                             .sparse_embedder = sparse,
@@ -6445,6 +6459,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = true,
                         .ttl_cleanup = .{ .enabled = false },
@@ -6458,6 +6474,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .enrichment = .{
                             .dense_embedder = dense,
                             .sparse_embedder = sparse,
@@ -6475,6 +6493,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .open_mode = .status_only,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -6488,7 +6508,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
     var db = blk: {
         const dense = embedders.dense;
         const sparse = embedders.sparse;
-        const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime);
+        const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content);
         embedders.dense = null;
         embedders.sparse = null;
         break :blk opened;
@@ -6508,7 +6528,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
         db = blk: {
             const dense = embedders.dense;
             const sparse = embedders.sparse;
-            const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime);
+            const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content);
             embedders.dense = null;
             embedders.sparse = null;
             break :blk opened;

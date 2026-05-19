@@ -4758,6 +4758,8 @@ fn openProvisionedQueryDbForTableWithCache(
         .lsm_root_generation = lsm_root_generation,
         .resource_manager = resource_manager,
         .backend_runtime = backend_runtime,
+        .secret_store = secret_store,
+        .remote_content = remote_content,
     });
     defer alloc.free(indexes_json);
 
@@ -4799,6 +4801,8 @@ fn openProvisionedQueryDbForTableWithCache(
             .lsm_root_generation = lsm_root_generation,
             .resource_manager = resource_manager,
             .backend_runtime = backend_runtime,
+            .secret_store = secret_store,
+            .remote_content = remote_content,
             .enrichment = .{
                 .dense_embedder = dense,
                 .sparse_embedder = sparse,
@@ -4814,6 +4818,8 @@ fn openProvisionedQueryDbForTableWithCache(
         .lsm_root_generation = lsm_root_generation,
         .resource_manager = resource_manager,
         .backend_runtime = backend_runtime,
+        .secret_store = secret_store,
+        .remote_content = remote_content,
     });
     errdefer db.close();
 
@@ -4823,7 +4829,7 @@ fn openProvisionedQueryDbForTableWithCache(
         // index from metadata. Reopen after reconcile so searches run against
         // the stabilized post-reconcile index-manager state.
         db.close();
-        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store);
+        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
         db = if (embedders.dense != null or embedders.sparse != null) blk: {
             const dense = embedders.dense;
             const sparse = embedders.sparse;
@@ -4834,6 +4840,8 @@ fn openProvisionedQueryDbForTableWithCache(
                 .lsm_root_generation = lsm_root_generation,
                 .resource_manager = resource_manager,
                 .backend_runtime = backend_runtime,
+                .secret_store = secret_store,
+                .remote_content = remote_content,
                 .enrichment = .{
                     .dense_embedder = dense,
                     .sparse_embedder = sparse,
@@ -4849,6 +4857,8 @@ fn openProvisionedQueryDbForTableWithCache(
             .lsm_root_generation = lsm_root_generation,
             .resource_manager = resource_manager,
             .backend_runtime = backend_runtime,
+            .secret_store = secret_store,
+            .remote_content = remote_content,
         });
     }
     if (summary.indexes_added > 0) {
