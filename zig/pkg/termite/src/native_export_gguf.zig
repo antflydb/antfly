@@ -89,6 +89,7 @@ const QuantizationFilter = struct {
 const TensorTransform = enum {
     none,
     transpose_2d_dense,
+    onnx_gru_zrh_to_rzn,
 };
 
 const TensorPlan = struct {
@@ -948,6 +949,7 @@ fn writeGlinerEncoderGguf(
 
     const names = try access.listNames(allocator);
     defer allocator.free(names);
+    const source_is_onnx = tensor_access_mod.isOnnxInitializerAccess(access);
 
     var tensors = std.ArrayListUnmanaged(TensorPlan).empty;
     defer {
@@ -963,9 +965,13 @@ fn writeGlinerEncoderGguf(
         const output_name_result = try mapGlinerEncoderTensorNameToDebertaGguf(allocator, record.descriptor.name);
         defer if (output_name_result.owned) allocator.free(output_name_result.name);
 
-        const dimensions = try reversedDimsFromShape(allocator, record.descriptor.shape);
+        const transform = if (source_is_onnx)
+            glinerOnnxLinearWeightTransform(record.descriptor.name, record.descriptor.shape)
+        else
+            .none;
+        const dimensions = try dimsForTransform(allocator, record.descriptor.shape, transform);
         errdefer allocator.free(dimensions);
-        const tensor_quantization = supportedQuantizationForDescriptor(false, quantization, record.descriptor, .none);
+        const tensor_quantization = supportedQuantizationForDescriptor(false, quantization, record.descriptor, transform);
         const filtered_quantization = if (quantizationFilterMatches(filter, record.descriptor.name, output_name_result.name))
             tensor_quantization
         else
@@ -981,6 +987,7 @@ fn writeGlinerEncoderGguf(
             .dimensions = dimensions,
             .tensor_type = tensor_type,
             .quantization = filtered_quantization,
+            .transform = transform,
         });
     }
 
@@ -1103,6 +1110,7 @@ fn writeGlinerHeadGguf(
 ) !void {
     const names = try access.listNames(allocator);
     defer allocator.free(names);
+    const source_is_onnx = tensor_access_mod.isOnnxInitializerAccess(access);
 
     var head_tensors = std.ArrayListUnmanaged(TensorPlan).empty;
     defer {
@@ -1114,9 +1122,13 @@ fn writeGlinerHeadGguf(
         if (isGlinerEncoderTensorName(name)) continue;
         var record = try access.getRecord(allocator, name);
         defer record.deinit();
-        const dimensions = try reversedDimsFromShape(allocator, record.descriptor.shape);
+
+        if (try appendGlinerSpecialHeadTensorPlans(allocator, &head_tensors, record, source_is_onnx)) continue;
+
+        const transform = glinerHeadTransform(record.descriptor.name, record.descriptor.shape, source_is_onnx);
+        const dimensions = try glinerHeadDimsForRecord(allocator, record.descriptor.name, record.descriptor.shape, transform);
         errdefer allocator.free(dimensions);
-        const tensor_quantization = supportedQuantizationForDescriptor(false, quantization, record.descriptor, .none);
+        const tensor_quantization = supportedQuantizationForDescriptor(false, quantization, record.descriptor, transform);
         const filtered_quantization = if (quantizationFilterMatches(filter, record.descriptor.name, record.descriptor.name))
             tensor_quantization
         else
@@ -1131,6 +1143,7 @@ fn writeGlinerHeadGguf(
             .dimensions = dimensions,
             .tensor_type = tensor_type,
             .quantization = filtered_quantization,
+            .transform = transform,
         });
     }
 
@@ -1171,6 +1184,122 @@ fn buildGlinerHeadMetadataEntries(allocator: std.mem.Allocator) ![]gguf_mod.form
         .value = .{ .u32 = 32 },
     });
     return try entries.toOwnedSlice(allocator);
+}
+
+fn appendGlinerSpecialHeadTensorPlans(
+    allocator: std.mem.Allocator,
+    tensors: *std.ArrayListUnmanaged(TensorPlan),
+    record: tensor_access_mod.Record,
+    source_is_onnx: bool,
+) !bool {
+    if (!std.mem.eql(u8, record.descriptor.name, "count_embed.gru.bias")) return false;
+    const dtype = switch (record.descriptor.encoding) {
+        .dense => |value| value,
+        else => return error.UnsupportedDenseTensorTypeForGgufExport,
+    };
+    const elem_size = denseElementSize(dtype);
+    if (elem_size == 0) return error.UnsupportedDenseTensorTypeForGgufExport;
+    if (record.descriptor.shape.len == 0) return error.InvalidTensorShape;
+    const last_dim = record.descriptor.shape[record.descriptor.shape.len - 1];
+    if (last_dim <= 0 or @mod(last_dim, 2) != 0) return error.InvalidTensorShape;
+
+    const split_elements: usize = @intCast(@divExact(last_dim, 2));
+    const split_bytes = split_elements * elem_size;
+    if (record.descriptor.byte_len < split_bytes * 2) return error.InvalidTensorShape;
+
+    const transform: TensorTransform = if (source_is_onnx) .onnx_gru_zrh_to_rzn else .none;
+    try appendGlinerGruBiasTensorPlan(allocator, tensors, record.descriptor.name, "count_embed.gru.bias_ih_l0", split_elements, split_bytes, 0, dtype, transform);
+    try appendGlinerGruBiasTensorPlan(allocator, tensors, record.descriptor.name, "count_embed.gru.bias_hh_l0", split_elements, split_bytes, split_bytes, dtype, transform);
+    return true;
+}
+
+fn appendGlinerGruBiasTensorPlan(
+    allocator: std.mem.Allocator,
+    tensors: *std.ArrayListUnmanaged(TensorPlan),
+    source_name: []const u8,
+    output_name: []const u8,
+    split_elements: usize,
+    split_bytes: usize,
+    start: usize,
+    dtype: @import("backends/tensor.zig").DType,
+    transform: TensorTransform,
+) !void {
+    const dimensions = try allocator.alloc(u64, 1);
+    errdefer allocator.free(dimensions);
+    dimensions[0] = @intCast(split_elements);
+
+    const source_name_owned = try allocator.dupe(u8, source_name);
+    errdefer allocator.free(source_name_owned);
+    const output_name_owned = try allocator.dupe(u8, output_name);
+    errdefer allocator.free(output_name_owned);
+
+    try tensors.append(allocator, .{
+        .source_name = source_name_owned,
+        .output_name = output_name_owned,
+        .dimensions = dimensions,
+        .tensor_type = try denseTensorType(dtype),
+        .quantization = .none,
+        .transform = transform,
+        .source_byte_range = .{ .start = start, .len = split_bytes },
+    });
+}
+
+fn glinerHeadDimsForRecord(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    shape: []const i64,
+    transform: TensorTransform,
+) ![]u64 {
+    if (glinerHeadDropsLeadingSingletonDim(name, shape)) {
+        return reversedDimsFromShape(allocator, shape[1..]);
+    }
+    return dimsForTransform(allocator, shape, transform);
+}
+
+fn glinerHeadDropsLeadingSingletonDim(name: []const u8, shape: []const i64) bool {
+    if (shape.len != 3 or shape[0] != 1) return false;
+    return std.mem.eql(u8, name, "count_embed.gru.weight_ih_l0") or
+        std.mem.eql(u8, name, "count_embed.gru.weight_hh_l0");
+}
+
+fn dimsForTransform(allocator: std.mem.Allocator, shape: []const i64, transform: TensorTransform) ![]u64 {
+    return switch (transform) {
+        .none => reversedDimsFromShape(allocator, shape),
+        .transpose_2d_dense => dimsFromShape(allocator, shape),
+        .onnx_gru_zrh_to_rzn => reversedDimsFromShape(allocator, shape),
+    };
+}
+
+fn glinerHeadTransform(name: []const u8, shape: []const i64, source_is_onnx: bool) TensorTransform {
+    if (!source_is_onnx) return .none;
+    if (isGlinerOnnxGruGateTensorName(name, shape)) return .onnx_gru_zrh_to_rzn;
+    return glinerOnnxLinearWeightTransform(name, shape);
+}
+
+fn glinerOnnxLinearWeightTransform(name: []const u8, shape: []const i64) TensorTransform {
+    if (shape.len != 2) return .none;
+    if (isGlinerEncoderOnnxLinearWeightName(name) or isGlinerHeadOnnxLinearWeightName(name)) return .transpose_2d_dense;
+    return .none;
+}
+
+fn isGlinerOnnxGruGateTensorName(name: []const u8, shape: []const i64) bool {
+    if (shape.len != 3 or shape[0] != 1) return false;
+    return std.mem.eql(u8, name, "count_embed.gru.weight_ih_l0") or
+        std.mem.eql(u8, name, "count_embed.gru.weight_hh_l0");
+}
+
+fn isGlinerEncoderOnnxLinearWeightName(name: []const u8) bool {
+    var trimmed = name;
+    if (std.mem.startsWith(u8, trimmed, "deberta.")) trimmed = trimmed["deberta.".len..];
+    if (std.mem.startsWith(u8, trimmed, "encoder.")) trimmed = trimmed["encoder.".len..];
+    return std.mem.startsWith(u8, trimmed, "encoder.layer.") and std.mem.endsWith(u8, trimmed, ".weight");
+}
+
+fn isGlinerHeadOnnxLinearWeightName(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "span_rep.") and std.mem.endsWith(u8, name, ".weight")) return true;
+    if (!std.mem.startsWith(u8, name, "count_embed.transformer.")) return false;
+    if (std.mem.indexOf(u8, name, ".norm") != null) return false;
+    return std.mem.endsWith(u8, name, ".weight") or std.mem.endsWith(u8, name, "_weight");
 }
 
 fn copyGlinerBundleAssets(
@@ -2099,6 +2228,7 @@ fn buildClipPlannedExportFiltered(
         const dimensions = switch (transform) {
             .none => try reversedDimsFromShape(allocator, record.descriptor.shape),
             .transpose_2d_dense => try dimsFromShape(allocator, record.descriptor.shape),
+            .onnx_gru_zrh_to_rzn => return error.UnsupportedDenseArchitectureForGgufExport,
         };
         errdefer allocator.free(dimensions);
 
@@ -2219,6 +2349,7 @@ fn buildClapPlannedExportFiltered(
         const dimensions = switch (transform) {
             .none => try reversedDimsFromShape(allocator, record.descriptor.shape),
             .transpose_2d_dense => try dimsFromShape(allocator, record.descriptor.shape),
+            .onnx_gru_zrh_to_rzn => return error.UnsupportedDenseArchitectureForGgufExport,
         };
         errdefer allocator.free(dimensions);
 
@@ -2985,6 +3116,7 @@ fn denseExportDimsForTensor(
     return switch (denseExportTransformForTensor(config, source_name, shape)) {
         .none => reversedDimsFromShape(allocator, shape),
         .transpose_2d_dense => dimsFromShape(allocator, shape),
+        .onnx_gru_zrh_to_rzn => error.UnsupportedDenseArchitectureForGgufExport,
     };
 }
 
@@ -4608,7 +4740,12 @@ fn writeExportFile(
         if (tensor.quantization != .none) {
             try writeDenseRecordQuantized(allocator, io, &file, record, tensor.quantization, tensor.transform);
         } else if (tensor.source_byte_range) |byte_range| {
-            try file.writeStreamingAll(io, record.raw_bytes[byte_range.start .. byte_range.start + byte_range.len]);
+            if (byte_range.start > record.raw_bytes.len or byte_range.len > record.raw_bytes.len - byte_range.start) return error.InvalidTensorShape;
+            if (tensor.transform != .none) {
+                try writeTransformedDenseRecordRange(allocator, io, &file, record, tensor.transform, byte_range);
+            } else {
+                try file.writeStreamingAll(io, record.raw_bytes[byte_range.start .. byte_range.start + byte_range.len]);
+            }
         } else if (tensor.transform != .none) {
             try writeTransformedDenseRecord(allocator, io, &file, record, tensor.transform);
         } else {
@@ -4742,7 +4879,62 @@ fn writeTransformedDenseRecord(
     switch (transform) {
         .none => try file.writeStreamingAll(io, record.raw_bytes),
         .transpose_2d_dense => try writeDenseRecordTransposed2d(allocator, io, file, record),
+        .onnx_gru_zrh_to_rzn => try writeDenseRecordOnnxGruGateOrder(allocator, io, file, record.raw_bytes, try denseElementSizeForRecord(record)),
     }
+}
+
+fn writeTransformedDenseRecordRange(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: anytype,
+    record: tensor_access_mod.Record,
+    transform: TensorTransform,
+    byte_range: SourceByteRange,
+) !void {
+    const bytes = record.raw_bytes[byte_range.start .. byte_range.start + byte_range.len];
+    switch (transform) {
+        .none => try file.writeStreamingAll(io, bytes),
+        .onnx_gru_zrh_to_rzn => try writeDenseRecordOnnxGruGateOrder(allocator, io, file, bytes, try denseElementSizeForRecord(record)),
+        .transpose_2d_dense => return error.UnsupportedDenseArchitectureForGgufExport,
+    }
+}
+
+fn denseElementSizeForRecord(record: tensor_access_mod.Record) !usize {
+    const dense_dtype = switch (record.descriptor.encoding) {
+        .dense => |dtype| dtype,
+        else => return error.UnsupportedTensorType,
+    };
+    const elem_size = denseElementSize(dense_dtype);
+    if (elem_size == 0) return error.UnsupportedDenseTensorTypeForGgufExport;
+    return elem_size;
+}
+
+fn writeDenseRecordOnnxGruGateOrder(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: anytype,
+    bytes: []const u8,
+    elem_size: usize,
+) !void {
+    const reordered = try allocator.alloc(u8, bytes.len);
+    defer allocator.free(reordered);
+    try reorderOnnxGruZrhToRznBytes(reordered, bytes, elem_size);
+    try file.writeStreamingAll(io, reordered);
+}
+
+fn reorderOnnxGruZrhToRznBytes(output: []u8, input: []const u8, elem_size: usize) !void {
+    if (elem_size == 0 or input.len != output.len or input.len % (3 * elem_size) != 0) return error.InvalidTensorShape;
+    const gate_bytes = input.len / 3;
+    @memcpy(output[0..gate_bytes], input[gate_bytes .. 2 * gate_bytes]);
+    @memcpy(output[gate_bytes .. 2 * gate_bytes], input[0..gate_bytes]);
+    @memcpy(output[2 * gate_bytes .. 3 * gate_bytes], input[2 * gate_bytes .. 3 * gate_bytes]);
+}
+
+test "gliner ONNX GRU gate transform reorders zrh to rzn" {
+    const input = "zzzzrrrrhhhh".*;
+    var output: [input.len]u8 = undefined;
+    try reorderOnnxGruZrhToRznBytes(&output, &input, 1);
+    try std.testing.expectEqualStrings("rrrrzzzzhhhh", &output);
 }
 
 fn writeDenseRecordTransposed2d(
@@ -4809,6 +5001,7 @@ fn quantizedRowWidth(shape: []const i64, transform: TensorTransform) ?usize {
             if (rows <= 0) return null;
             break :blk @intCast(rows);
         },
+        .onnx_gru_zrh_to_rzn => null,
     };
 }
 
@@ -4830,6 +5023,7 @@ fn quantizedRowCount(shape: []const i64, transform: TensorTransform, row_width: 
             if (rows == 0 or cols == 0 or row_width != rows) return null;
             break :blk cols;
         },
+        .onnx_gru_zrh_to_rzn => null,
     };
 }
 
@@ -4885,6 +5079,7 @@ fn decodeDenseRowTyped(
                 output[i] = decodeDenseElemAsF32(T, raw_bytes, i * source_cols + row_index);
             }
         },
+        .onnx_gru_zrh_to_rzn => return error.UnsupportedQuantizedTensorShape,
     }
 }
 

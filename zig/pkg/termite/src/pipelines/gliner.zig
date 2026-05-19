@@ -510,10 +510,12 @@ pub const GlinerPipeline = struct {
             for (composite_labels.items) |label| alloc.free(label);
             composite_labels.deinit(alloc);
         }
-        for (entity_labels) |entity_label| {
-            for (relation_labels) |relation_label| {
-                try composite_labels.append(alloc, try std.fmt.allocPrint(alloc, "{s}::{s}", .{ entity_label, relation_label }));
-            }
+        try appendRelationCandidateLabels(alloc, &composite_labels, entity_labels, relation_labels);
+        if (composite_labels.items.len == 0) {
+            return .{
+                .entities = entities,
+                .relations = try alloc.alloc(Relation, 0),
+            };
         }
 
         const relation_token = if (self.config.token_r != 0) self.config.token_r else self.config.token_e;
@@ -784,20 +786,27 @@ pub const GlinerPipeline = struct {
         }
 
         for (relation_heads) |head_span| {
-            const sep_index = std.mem.indexOf(u8, head_span.label, "::") orelse continue;
-            const relation_label = head_span.label[sep_index + 2 ..];
+            const candidate = parseRelationCandidateLabel(head_span.label) orelse continue;
 
             var head_entity: ?Entity = null;
+            var exact_span_mismatched_label = false;
             for (entities) |entity| {
                 if (entity.start == head_span.start and entity.end == head_span.end) {
-                    head_entity = entity;
-                    break;
+                    if (std.ascii.eqlIgnoreCase(entity.label, candidate.head_label)) {
+                        head_entity = entity;
+                        break;
+                    }
+                    exact_span_mismatched_label = true;
                 }
             }
+            if (head_entity == null and exact_span_mismatched_label) continue;
 
             var best_tail: ?Entity = null;
             var best_distance: usize = std.math.maxInt(usize);
             for (entities) |entity| {
+                if (candidate.tail_label) |tail_label| {
+                    if (!std.ascii.eqlIgnoreCase(entity.label, tail_label)) continue;
+                }
                 if (overlapsSpan(head_span.start, head_span.end, entity.start, entity.end)) continue;
                 const distance = charDistance(head_span.start, head_span.end, entity.start, entity.end);
                 if (distance < best_distance) {
@@ -811,7 +820,7 @@ pub const GlinerPipeline = struct {
             const head_copy = if (head_entity) |entity|
                 try duplicateEntity(alloc, entity)
             else blk: {
-                owned_head_label = try alloc.dupe(u8, head_span.label[0..sep_index]);
+                owned_head_label = try alloc.dupe(u8, candidate.head_label);
                 break :blk Entity{
                     .text = try alloc.dupe(u8, head_span.text),
                     .label = owned_head_label.?,
@@ -821,12 +830,12 @@ pub const GlinerPipeline = struct {
                 };
             };
             errdefer alloc.free(head_copy.text);
-            errdefer if (owned_head_label) |head_label| alloc.free(head_label);
+            errdefer if (owned_head_label) |owned_label| alloc.free(owned_label);
 
             const tail_copy = try duplicateEntity(alloc, best_tail.?);
             errdefer alloc.free(tail_copy.text);
 
-            const relation_label_copy = try alloc.dupe(u8, relation_label);
+            const relation_label_copy = try alloc.dupe(u8, candidate.relation_label);
             errdefer alloc.free(relation_label_copy);
 
             try relations.append(alloc, .{
@@ -841,6 +850,73 @@ pub const GlinerPipeline = struct {
         return try relations.toOwnedSlice(alloc);
     }
 };
+
+fn appendRelationCandidateLabels(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    entity_labels: []const []const u8,
+    relation_labels: []const []const u8,
+) !void {
+    for (relation_labels) |relation_label| {
+        if (parseRelationCandidateLabel(relation_label)) |candidate| {
+            if (candidate.tail_label) |tail_label| {
+                if (!containsLabel(entity_labels, tail_label)) continue;
+            }
+            for (entity_labels) |entity_label| {
+                if (!std.ascii.eqlIgnoreCase(entity_label, candidate.head_label)) continue;
+                try appendOwnedRelationCandidateLabel(alloc, out, entity_label, candidate.relation_label, candidate.tail_label);
+                break;
+            }
+            continue;
+        }
+
+        for (entity_labels) |entity_label| {
+            try appendOwnedRelationCandidateLabel(alloc, out, entity_label, relation_label, null);
+        }
+    }
+}
+
+const RelationCandidateLabel = struct {
+    head_label: []const u8,
+    relation_label: []const u8,
+    tail_label: ?[]const u8 = null,
+};
+
+fn parseRelationCandidateLabel(label: []const u8) ?RelationCandidateLabel {
+    const first_sep = std.mem.indexOf(u8, label, "::") orelse return null;
+    const head_label = label[0..first_sep];
+    const rest = label[first_sep + 2 ..];
+    if (head_label.len == 0 or rest.len == 0) return null;
+    if (std.mem.indexOf(u8, rest, "::")) |second_sep| {
+        const relation_label = rest[0..second_sep];
+        const tail_label = rest[second_sep + 2 ..];
+        if (relation_label.len == 0 or tail_label.len == 0) return null;
+        return .{ .head_label = head_label, .relation_label = relation_label, .tail_label = tail_label };
+    }
+    return .{ .head_label = head_label, .relation_label = rest };
+}
+
+fn containsLabel(labels: []const []const u8, wanted: []const u8) bool {
+    for (labels) |label| {
+        if (std.ascii.eqlIgnoreCase(label, wanted)) return true;
+    }
+    return false;
+}
+
+fn appendOwnedRelationCandidateLabel(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    head_label: []const u8,
+    relation_label: []const u8,
+    tail_label: ?[]const u8,
+) !void {
+    const owned_label = if (tail_label) |tail|
+        try std.fmt.allocPrint(alloc, "{s}::{s}::{s}", .{ head_label, relation_label, tail })
+    else
+        try std.fmt.allocPrint(alloc, "{s}::{s}", .{ head_label, relation_label });
+    errdefer alloc.free(owned_label);
+    try out.append(alloc, owned_label);
+}
 
 fn scoreLabelsFromLogits(alloc: std.mem.Allocator, logits: []const f32, num_labels: usize) ![]f32 {
     const scores = try alloc.alloc(f32, num_labels);
@@ -978,6 +1054,149 @@ test "gliner supportsRelationExtraction checks model type and capabilities" {
 
     pipeline.config = .{};
     try std.testing.expect(!pipeline.supportsRelationExtraction());
+}
+
+test "gliner relation matching keeps labels scores and nearest non-overlapping tail" {
+    const allocator = std.testing.allocator;
+    var pipeline = GlinerPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+
+    const entities = [_]Entity{
+        .{ .text = "John Smith", .label = "person", .start = 0, .end = 10, .score = 0.91 },
+        .{ .text = "Acme", .label = "organization", .start = 20, .end = 24, .score = 0.88 },
+        .{ .text = "Paris", .label = "location", .start = 27, .end = 32, .score = 0.82 },
+    };
+    const relation_heads = [_]Entity{
+        .{ .text = "John Smith", .label = "person::works_for", .start = 0, .end = 10, .score = 0.73 },
+        .{ .text = "Acme", .label = "organization::located_in", .start = 20, .end = 24, .score = 0.64 },
+    };
+
+    const relations = try pipeline.matchRelations(&entities, &relation_heads);
+    defer {
+        for (relations) |*relation| relation.deinit(allocator);
+        allocator.free(relations);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), relations.len);
+    try std.testing.expectEqualStrings("John Smith", relations[0].head.text);
+    try std.testing.expectEqualStrings("Acme", relations[0].tail.text);
+    try std.testing.expectEqualStrings("works_for", relations[0].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.73), relations[0].score, 1e-6);
+    try std.testing.expect(relations[0].owned_head_label == null);
+
+    try std.testing.expectEqualStrings("Acme", relations[1].head.text);
+    try std.testing.expectEqualStrings("Paris", relations[1].tail.text);
+    try std.testing.expectEqualStrings("located_in", relations[1].label);
+}
+
+test "gliner relation matching preserves synthetic head label for unmatched head span" {
+    const allocator = std.testing.allocator;
+    var pipeline = GlinerPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+
+    const entities = [_]Entity{
+        .{ .text = "John", .label = "person", .start = 0, .end = 4, .score = 0.91 },
+        .{ .text = "Acme", .label = "organization", .start = 15, .end = 19, .score = 0.88 },
+    };
+    const relation_heads = [_]Entity{
+        .{ .text = "employee", .label = "person::works_for", .start = 6, .end = 14, .score = 0.71 },
+    };
+
+    const relations = try pipeline.matchRelations(&entities, &relation_heads);
+    defer {
+        for (relations) |*relation| relation.deinit(allocator);
+        allocator.free(relations);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), relations.len);
+    try std.testing.expectEqualStrings("employee", relations[0].head.text);
+    try std.testing.expectEqualStrings("person", relations[0].head.label);
+    try std.testing.expectEqualStrings("person", relations[0].owned_head_label.?);
+    try std.testing.expectEqualStrings("Acme", relations[0].tail.text);
+    try std.testing.expectEqualStrings("works_for", relations[0].label);
+}
+
+test "gliner relation matching skips exact head span with mismatched entity label" {
+    const allocator = std.testing.allocator;
+    var pipeline = GlinerPipeline{
+        .allocator = allocator,
+        .tok = undefined,
+        .session = undefined,
+        .config = .{},
+    };
+
+    const entities = [_]Entity{
+        .{ .text = "Boston", .label = "location", .start = 0, .end = 6, .score = 0.91 },
+        .{ .text = "Acme", .label = "organization", .start = 20, .end = 24, .score = 0.88 },
+    };
+    const relation_heads = [_]Entity{
+        .{ .text = "Boston", .label = "organization::located_in", .start = 0, .end = 6, .score = 0.73 },
+    };
+
+    const relations = try pipeline.matchRelations(&entities, &relation_heads);
+    defer allocator.free(relations);
+
+    try std.testing.expectEqual(@as(usize, 0), relations.len);
+}
+
+test "gliner relation matching honors qualified tail labels" {
+    const allocator = std.testing.allocator;
+    var pipeline = GlinerPipeline{
+        .allocator = allocator,
+        .tok = undefined,
+        .session = undefined,
+        .config = .{},
+    };
+
+    const entities = [_]Entity{
+        .{ .text = "Alice", .label = "person", .start = 0, .end = 5, .score = 0.91 },
+        .{ .text = "Bob", .label = "person", .start = 12, .end = 15, .score = 0.88 },
+        .{ .text = "Acme", .label = "organization", .start = 30, .end = 34, .score = 0.87 },
+    };
+    const relation_heads = [_]Entity{
+        .{ .text = "Alice", .label = "person::works_for::organization", .start = 0, .end = 5, .score = 0.73 },
+    };
+
+    const relations = try pipeline.matchRelations(&entities, &relation_heads);
+    defer {
+        for (relations) |*relation| relation.deinit(allocator);
+        allocator.free(relations);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), relations.len);
+    try std.testing.expectEqualStrings("Acme", relations[0].tail.text);
+    try std.testing.expectEqualStrings("works_for", relations[0].label);
+}
+
+test "gliner relation candidate labels support qualified head labels" {
+    const allocator = std.testing.allocator;
+    var labels = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (labels.items) |label| allocator.free(label);
+        labels.deinit(allocator);
+    }
+
+    try appendRelationCandidateLabels(
+        allocator,
+        &labels,
+        &.{ "person", "organization", "location" },
+        &.{ "person::works_for::organization", "organization::located_in::location", "person::mentors::team", "founded" },
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), labels.items.len);
+    try std.testing.expectEqualStrings("person::works_for::organization", labels.items[0]);
+    try std.testing.expectEqualStrings("organization::located_in::location", labels.items[1]);
+    try std.testing.expectEqualStrings("person::founded", labels.items[2]);
+    try std.testing.expectEqualStrings("organization::founded", labels.items[3]);
+    try std.testing.expectEqualStrings("location::founded", labels.items[4]);
 }
 
 test "gliner distributed mlx helpers mirror pipeline/session state" {

@@ -1282,14 +1282,14 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
                 // config.json and use termite_bundle/gliner_config sidecars
                 // to identify the GLiNER wrapper.
                 var cfg = try deberta_mod.parseConfig(allocator, config_bytes);
-                try applyGlinerEntityTokenId(allocator, model_path, &cfg);
+                try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
                 return .{ .gliner = cfg };
             }
             if (std.mem.eql(u8, model_type, "extractor")) {
                 // GLiNER2: DeBERTa encoder + span classification head
                 var cfg = deberta_mod.Config{};
 
-                try applyGlinerEntityTokenId(allocator, model_path, &cfg);
+                try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
 
                 return .{ .gliner = cfg };
             }
@@ -1339,15 +1339,25 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
     return .{ .bert = makeBertConfig(mf) };
 }
 
-fn applyGlinerEntityTokenId(allocator: std.mem.Allocator, model_path: []const u8, cfg: *deberta_mod.Config) !void {
+fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {
+    if (mf.gliner_token_c != 0) cfg.classification_token_id = mf.gliner_token_c;
+    if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
+    if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
+
     const at_path = try std.fmt.allocPrint(allocator, "{s}/added_tokens.json", .{model_path});
     defer allocator.free(at_path);
     if (c_file.readFile(allocator, at_path)) |at_bytes| {
         defer allocator.free(at_bytes);
         const at_parsed = try std.json.parseFromSlice(std.json.Value, allocator, at_bytes, .{});
         defer at_parsed.deinit();
+        if (at_parsed.value.object.get("[C]")) |v| {
+            if (v == .integer) cfg.classification_token_id = v.integer;
+        }
         if (at_parsed.value.object.get("[E]")) |v| {
             if (v == .integer) cfg.entity_token_id = v.integer;
+        }
+        if (at_parsed.value.object.get("[R]")) |v| {
+            if (v == .integer) cfg.relation_token_id = v.integer;
         }
     } else |_| {}
 }
@@ -3438,7 +3448,7 @@ test "detectArchitecture treats split gliner bundle encoder config as gliner" {
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "added_tokens.json",
-        .data = "{\"[E]\":128005}",
+        .data = "{\"[C]\":51,\"[E]\":52,\"[R]\":53}",
     });
 
     const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -3455,7 +3465,9 @@ test "detectArchitecture treats split gliner bundle encoder config as gliner" {
     switch (arch) {
         .gliner => |cfg| {
             try std.testing.expectEqual(@as(u32, 128011), cfg.vocab_size);
-            try std.testing.expectEqual(@as(i64, 128005), cfg.entity_token_id);
+            try std.testing.expectEqual(@as(i64, 51), cfg.classification_token_id);
+            try std.testing.expectEqual(@as(i64, 52), cfg.entity_token_id);
+            try std.testing.expectEqual(@as(i64, 53), cfg.relation_token_id);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -4784,7 +4796,9 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             if (use_graph_runtime) {
                 const head_cfg = gliner_head_graph.Config{
                     .hidden_size = cfg.hidden_size,
+                    .classification_token_id = cfg.classification_token_id,
                     .entity_token_id = cfg.entity_token_id,
+                    .relation_token_id = cfg.relation_token_id,
                 };
                 const graph_result = try gliner_head_graph.runFullGraph(
                     &cb,
@@ -4830,7 +4844,11 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             // Eager head path -- keeps the encoder/head boundary on the
             // backend (CT) so we skip the toFloat32 + fromFloat32Shape
             // round-trip the legacy []f32-typed APIs do.
-            const head_result = try gliner_head.forwardCt(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, cfg.entity_token_id);
+            const head_result = try gliner_head.forwardCtWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
+                .classification = cfg.classification_token_id,
+                .entity = cfg.entity_token_id,
+                .relation = cfg.relation_token_id,
+            });
             defer cb.free(head_result.logits);
 
             const logits_f32 = if (head_result.num_labels == 0)
