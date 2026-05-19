@@ -154,31 +154,19 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Operation == OperationRead && len(principal.RowFilter) > 0 {
-		table := firstNonEmpty(req.Table, route.TableName())
-		if secFilter := resolveRowFilter(principal.RowFilter, table); secFilter != nil {
-			var injectErr error
-			if isAgentPath(req.BackendPath) {
-				body, readErr := io.ReadAll(r.Body)
-				if readErr != nil {
-					http.Error(w, "failed to read request body", http.StatusInternalServerError)
-					return
-				}
-				r.Body.Close()
-				modified, modErr := injectFilterIntoAgentBody(body, secFilter)
-				if modErr != nil {
-					injectErr = modErr
-				} else {
-					r.Body = io.NopCloser(bytes.NewReader(modified))
-					r.ContentLength = int64(len(modified))
-				}
-			} else {
-				injectErr = injectRowFilterIntoRequest(r, secFilter)
+	if req.Operation == OperationRead && requiresStructuredDataAuth(principal) {
+		modified, err := authorizeAndRewriteReadBody(r, principal, req, route)
+		if err != nil {
+			status := http.StatusForbidden
+			if strings.Contains(err.Error(), "parse") || strings.Contains(err.Error(), "line ") || strings.Contains(err.Error(), "query ") {
+				status = http.StatusBadRequest
 			}
-			if injectErr != nil {
-				http.Error(w, "failed to inject row filter", http.StatusInternalServerError)
-				return
-			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		if modified != nil {
+			r.Body = io.NopCloser(bytes.NewReader(modified))
+			r.ContentLength = int64(len(modified))
 		}
 	}
 
@@ -203,6 +191,39 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if err := g.forwarder.Forward(w, outReq, targetBaseURL, adapter, req, route); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 	}
+}
+
+func requiresStructuredDataAuth(principal *Principal) bool {
+	if principal == nil || principal.Admin {
+		return false
+	}
+	return len(principal.AllowedTables) > 0 || len(principal.RowFilter) > 0
+}
+
+func authorizeAndRewriteReadBody(r *http.Request, principal *Principal, req RequestContext, route NamespaceRoute) ([]byte, error) {
+	defaultTable := firstNonEmpty(req.Table, route.TableName())
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read request body: %w", err)
+	}
+	r.Body.Close()
+
+	agentBody := isAgentPath(req.BackendPath)
+	accesses, err := extractTableAccessesFromBody(body, defaultTable, agentBody)
+	if err != nil {
+		return nil, fmt.Errorf("parse table accesses: %w", err)
+	}
+	if err := authorizeTableAccesses(principal, req, accesses); err != nil {
+		return nil, err
+	}
+
+	if len(principal.RowFilter) == 0 {
+		return body, nil
+	}
+	if agentBody {
+		return injectRowFiltersIntoAgentBody(body, defaultTable, principal.RowFilter)
+	}
+	return injectRowFiltersIntoBody(body, defaultTable, principal.RowFilter)
 }
 
 func requestContextFromHTTP(r *http.Request) (RequestContext, error) {
