@@ -201,7 +201,7 @@ func NewHarness(cfg HarnessConfig) (*Harness, error) {
 		leader: h.metadataLeaderNode,
 		run:    h.runWithProgress,
 	}
-	h.tableManager, err = tablemgr.NewTableManager(metadataProxy, httpClient, 0)
+	h.tableManager, err = tablemgr.NewTableManager(metadataProxy, httpClient, cfg.MaxShardSizeBytes)
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("creating leader-routed table manager: %w", err)
