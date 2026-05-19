@@ -18,6 +18,7 @@ const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const termite_provider = @import("../inference/termite.zig");
+const common_secrets = @import("../common/secrets.zig");
 
 pub const Config = lib.Config;
 pub const Provider = lib.Provider;
@@ -40,16 +41,39 @@ pub fn rerankDocumentsWithLocalTermite(
     query: []const u8,
     documents: []const []const u8,
 ) ![]f32 {
+    return try rerankDocumentsWithOptions(alloc, http, cfg, .{ .local_termite_provider = local_termite_provider }, query, documents);
+}
+
+pub const Options = struct {
+    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
+};
+
+pub fn rerankDocumentsWithOptions(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    options: Options,
+    query: []const u8,
+    documents: []const []const u8,
+) ![]f32 {
     try cfg.validate();
+    const api_key = if (try common_secrets.SecretValue.initConfig(alloc, cfg.api_key)) |secret_value| blk: {
+        var owned_secret = secret_value;
+        defer owned_secret.deinit(alloc);
+        break :blk try owned_secret.resolveOwned(alloc, options.secret_store);
+    } else null;
+    defer if (api_key) |value| alloc.free(value);
+
     switch (cfg.provider) {
         .antfly => {
-            const local = local_termite_provider orelse return error.UnsupportedRerankerProvider;
+            const local = options.local_termite_provider orelse return error.UnsupportedRerankerProvider;
             const rerank = local.rerank_texts orelse return error.UnsupportedRerankerProvider;
             return try rerank(local.ptr, alloc, cfg.model, query, documents);
         },
         .termite => {
             if (cfg.url.len == 0) {
-                if (local_termite_provider) |local| {
+                if (options.local_termite_provider) |local| {
                     if (local.rerank_texts) |rerank| {
                         return try rerank(local.ptr, alloc, cfg.model, query, documents);
                     }

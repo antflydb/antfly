@@ -6,14 +6,51 @@ Antfly-zig needs a small local secrets store for swarm mode. The store backs the
 `/secrets` API, resolves `${secret:key}` references in configuration, and lets
 operators keep provider credentials out of ordinary config files.
 
-The current implementation is intentionally simple: one JSON file on local disk
-is loaded into memory at process startup, then API writes update that in-memory
-map and persist it back to disk atomically. That works for API-managed secrets,
-but it does not notice external edits to the secrets file while Antfly is
-running.
+The implementation is intentionally simple: one JSON file on local disk is held
+as an in-memory snapshot. Reads refresh that snapshot when the file changes, and
+API writes refresh first, stage a replacement snapshot, persist it atomically,
+then publish the new in-memory state.
 
-This document captures the current design and the plan for dynamic reloads and
-runtime secret rotation.
+This document captures the current design, what is already implemented, and the
+remaining plan for runtime secret rotation.
+
+## Status Summary
+
+Implemented:
+
+- `FileStore` refreshes from disk on demand for `list()`, `getOwned()`, and
+  write paths.
+- Valid replacement files are authoritative, including deleted keys.
+- Missing or malformed files keep the last known good snapshot.
+- API writes refresh before mutation and only report success after persist.
+- Managed OpenAI embedders preserve secret references and resolve the API key at
+  request time through the live `FileStore`.
+- Provider registry generator/reranker config is parsed from the raw config tree
+  so API keys keep `${secret:key}` reference identity.
+- Generator API keys resolve immediately before each OpenAI-compatible request.
+- Reranker API keys are carried through the runtime options path and resolve
+  immediately before each rerank request where provider support exists.
+- Foreign DSNs from query requests resolve through the live `FileStore` for each
+  request path that has access to the API server secret store.
+- CDC runners now carry an optional `FileStore` and resolve replication DSNs
+  through it before each snapshot or streaming connection.
+- S3 backup locations can open through `openBackupLocationWithSecrets()` and use
+  live file-backed AWS credential overrides.
+- Remote-content S3 credentials and HTTP header values are preserved as secret
+  references in config instead of being eagerly flattened.
+
+Still needed:
+
+- API/runtime integration coverage for managed embedder key rotation with a fake
+  OpenAI-compatible endpoint.
+- Logs and metrics for reload generation, failed reloads, and stale snapshot
+  state.
+- Runtime tests for generator/reranker, foreign DSN, CDC DSN, S3 backup, and
+  remote-content credential rotation.
+- Wiring the remaining remote-content and metadata-service CDC/restore call
+  sites that do not yet have an API-server-owned `FileStore`.
+- A future encrypted-at-rest codec, if non-Kubernetes deployments need local
+  secret-file encryption.
 
 ## Current Implementation
 
@@ -61,19 +98,21 @@ Startup:
 Reads:
 
 1. `list()` returns stored secret metadata plus environment-only API key secrets.
-2. `getOwned()` returns the stored value if present.
-3. If the key is not stored, `getOwned()` maps the key to an environment variable
+2. `list()`, `getOwned()`, and `resolveValueOwned()` refresh from disk first if
+   the file metadata changed.
+3. `getOwned()` returns the stored value if present.
+4. If the key is not stored, `getOwned()` maps the key to an environment variable
    and returns the environment value if set.
-4. `resolveValueOwned()` resolves `${secret:key}` references through `getOwned()`.
-5. `resolveReferenceOwned()` resolves through a `FileStore` when one is supplied,
+5. `resolveValueOwned()` resolves `${secret:key}` references through `getOwned()`.
+6. `resolveReferenceOwned()` resolves through a `FileStore` when one is supplied,
    or through environment variables only when there is no store.
 
 Writes:
 
-1. `put()` validates the key, updates `entries`, calls `persist()`, and returns
-   metadata.
-2. `delete()` removes the entry from `entries`, calls `persist()`, and returns
-   whether an entry existed.
+1. `put()` validates the key, refreshes from disk, stages the mutation,
+   persists it, publishes the staged entries, and returns metadata.
+2. `delete()` refreshes from disk, stages removal from `entries`, persists it,
+   publishes the staged entries, and returns whether an entry existed.
 3. `persist()` serializes all entries, writes a temporary file, then renames it
    over the configured store path.
 
@@ -107,29 +146,22 @@ Lookup precedence is:
 
 ## Current Limitation
 
-`FileStore.load()` runs only during `FileStore.init()`. After startup, `entries`
-is the source of truth.
-
-That means:
-
-- API-managed writes are visible immediately because they update `entries`.
-- API-managed writes are persisted to disk.
-- External edits to `secrets.json` are not visible until process restart.
-- `GET /secrets` also reports the in-memory snapshot, not the externally edited
-  file.
-
-There is a second limitation: some runtime credentials are resolved and cached
-when config is parsed. Even if the file store learns to reload from disk, values
-already copied into long-lived runtime structs will not automatically change.
+The file store now notices external edits, but some runtime credentials are
+still resolved and cached when config is parsed. Values already copied into
+long-lived runtime structs will not automatically change unless that subsystem
+preserves the secret reference and resolves it at use time, or rebuilds the
+client/resource when the store generation changes.
 
 Known examples:
 
 - `Config.parseFromSliceWithSecrets()` walks JSON config and replaces
-  `${secret:key}` strings with the resolved value at parse time.
-- Managed embedding config stores OpenAI API keys as concrete `api_key` bytes in
-  `ManagedEmbeddingEntry`.
-- Foreign DSNs and remote-content credentials may be resolved into config structs
-  before runtime use, depending on the path.
+  `${secret:key}` strings with the resolved value at parse time, except for
+  credential-bearing registry, termite S3, and remote-content fields that need
+  live rotation.
+- Managed embedding config now keeps OpenAI API keys as `SecretValue` references
+  and resolves at request time.
+- Some backup, remote-content, and CDC call sites still need store ownership
+  plumbing before every process path can use live file-backed credentials.
 
 ## Dynamic File Reload Plan
 
@@ -314,48 +346,65 @@ credential-bearing fields.
 
 ### Secret Value Type
 
-Introduce a representation like:
+`common/secrets.zig` now provides:
 
 ```zig
 pub const SecretValue = union(enum) {
-    literal: []const u8,
-    secret_ref: []const u8,
+    literal: []u8,
+    secret_ref: []u8,
+    env_var: []u8,
 };
 ```
 
 Parsing should keep `${secret:key}` as `secret_ref` instead of replacing it with
 the concrete value for runtime credentials.
 
-For fields where an ordinary string is still needed, provide:
-
-```zig
-pub fn resolveSecretValueOwned(
-    alloc: std.mem.Allocator,
-    store: ?*FileStore,
-    value: SecretValue,
-) ![]u8
-```
+`resolveOwned()` returns an owned value at use time. For a `secret_ref`, it reads
+through `FileStore.getOwned()`, so external file edits are observed by the next
+resolution.
 
 ### Managed Embedders
 
 Managed embedders are the first high-value target because provider API keys need
 rotation without restart.
 
-Current shape:
-
-- `ManagedEmbeddingEntry.api_key` stores resolved bytes.
-- OpenAI request code builds `Authorization: Bearer <key>` from that cached
-  value.
-
-Target shape:
+Implemented shape:
 
 - store `api_key: ?SecretValue`
 - at request time, resolve the current key from `FileStore`
 - build the auth header from the resolved key for that request
 - avoid storing the cleartext key longer than necessary
 
-If per-request resolution is too expensive, cache the resolved auth header with
-the `FileStore` generation number and refresh it when the generation changes.
+Future optimization: if per-request resolution becomes too expensive, cache the
+resolved auth header with the `FileStore` generation number and refresh it when
+the generation changes.
+
+### Remaining Credential Consumers
+
+We want live rotation for all known credential-bearing subsystems, but each one
+needs an explicit ownership model because some hold long-lived clients or
+workers.
+
+| Subsystem | Current Status | Needed Semantics |
+| --- | --- | --- |
+| Managed OpenAI embedders | Implemented for request-time API key resolution. | Add fake-provider runtime test and consider generation-cached auth headers later. |
+| Generator providers | Implemented for OpenAI-compatible request-time API key resolution. | Add fake-provider runtime test; extend the same pattern when additional provider clients are implemented. |
+| Reranker providers | Runtime options now carry and resolve `api_key` references before rerank calls. | Add provider-specific tests once non-local reranker clients are implemented. |
+| Foreign DSNs | Implemented for API query paths that have the API server `FileStore`. | Add runtime tests and define pool invalidation behavior for any long-lived foreign clients. |
+| CDC replication DSNs | Runner supports optional `FileStore` and resolves before snapshot/stream connections. | Wire service-level store ownership and define reconnect/retry behavior for active workers. |
+| S3/backup credentials | Implemented for `openBackupLocationWithSecrets()` with AWS override keys, and wired through API/httpx backup handlers. | Add rotation tests and decide whether metadata-service-only restore planning should own a store. |
+| Remote-content S3 credentials | Config references are preserved instead of eagerly resolved. | Resolve before request or cache client by generation at the remote-content fetch call sites. |
+| Remote-content HTTP headers | Config header references are preserved instead of eagerly resolved. | Resolve immediately before issuing outbound HTTP requests at the remote-content fetch call sites. |
+
+Recommended implementation order:
+
+1. Finish remote-content fetch call-site wiring for HTTP headers and S3
+   credentials.
+2. Wire service-level secret-store ownership into CDC coordinators.
+3. Add runtime tests for generator/reranker, foreign DSN, CDC DSN, and S3 backup
+   rotation.
+4. Add generation-keyed client caches where per-request rebuilds become too
+   expensive.
 
 ### Config Parsing
 
@@ -375,7 +424,8 @@ credential fields and migrate more as needed.
 ### Foreign Sources And Remote Content
 
 Foreign DSNs, CDC replication DSNs, S3 credentials, and remote-content headers
-should follow the same reference-preserving model if they need live rotation.
+should follow the same reference-preserving model. We expect these to support
+live rotation, but the implementation needs subsystem-specific rebuild behavior.
 
 Some of these components may hold pooled clients or long-lived connections.
 Changing the secret value is not enough; the owning component may need to:
@@ -449,20 +499,38 @@ Runtime rotation tests:
 5. Issue another request without restarting Antfly.
 6. Observe the second key.
 
+Additional runtime tests:
+
+1. Generator and reranker fake providers observe changed Authorization headers
+   after editing `secrets.json`.
+2. Remote-content HTTP fetch observes changed secret header values without
+   restart.
+3. S3/backup client construction uses the new credential generation after file
+   rotation.
+4. Foreign DSN and CDC workers reconnect or restart when a referenced DSN
+   changes.
+
 ## Rollout Plan
 
-1. Add reload metadata, mutex, generation, and `refreshIfChanged()` to
+1. [done] Add reload metadata, mutex, generation, and `refreshIfChanged()` to
    `FileStore`.
-2. Call refresh from `list()`, `getOwned()`, and write paths.
-3. Add unit coverage for external file edits and malformed edits.
-4. Wire API tests around external edits.
-5. Add reference-preserving `SecretValue`.
-6. Migrate managed embedder API keys to resolve at request time or by generation
+2. [done] Call refresh from `list()`, `getOwned()`, and write paths.
+3. [done] Add unit coverage for external file edits and malformed edits.
+4. [todo] Wire API tests around external edits.
+5. [done] Add reference-preserving `SecretValue`.
+6. [done] Migrate managed embedder API keys to resolve at request time or by generation
    cache.
-7. Migrate foreign DSNs and remote-content credentials where live rotation is
-   operationally useful.
-8. Add logs and metrics for stale reload state.
-9. Document operational behavior for malformed files, file deletion, Kubernetes
+7. [todo] Add managed embedder runtime test with a fake OpenAI-compatible
+   endpoint.
+8. [done] Migrate generator and reranker provider credential plumbing.
+9. [partial] Preserve remote-content HTTP header references; resolve at fetch
+   call sites next.
+10. [partial] Preserve remote-content S3 references and wire S3/backup secret
+   overrides through API backup handlers; add tests next.
+11. [partial] Migrate foreign DSNs and CDC DSNs; CDC still needs service-level
+   secret-store ownership and reconnect tests.
+12. [todo] Add logs and metrics for stale reload state.
+13. [done] Document operational behavior for malformed files, file deletion, Kubernetes
    projection, and rotation of long-lived clients.
 
 ## Initial Decisions
@@ -481,9 +549,13 @@ Runtime rotation tests:
 6. Plaintext JSON remains the initial store format, protected by filesystem
    permissions. Add a codec boundary so encrypted-at-rest support can be added
    later.
-7. Start true live rotation with managed embedder API keys. Treat DSNs,
-   replication workers, pools, and remote clients as subsystem-specific follow
-   ups because they may need resource rebuild semantics.
+7. Start true live rotation with managed embedder API keys.
+8. Support live rotation for all credential-bearing integrations that Antfly
+   owns: generator/reranker providers, remote-content credentials, S3/backup
+   credentials, foreign DSNs, and CDC DSNs.
+9. Treat DSNs, replication workers, pools, and remote clients as
+   subsystem-specific implementations because they may need resource rebuild
+   semantics.
 
 ## Deferred Questions
 
@@ -493,5 +565,7 @@ Runtime rotation tests:
    metrics sufficient?
 3. What encrypted envelope format and key-source contract should the future
    encrypted codec use?
-4. Which long-lived clients should support live rotation versus restart-on-change
-   semantics?
+4. What exact reconnect contract should foreign DSNs and CDC workers expose when
+   a referenced secret changes?
+5. Should S3/backup and remote-content clients share a generation-keyed
+   credential cache, or should each subsystem own its own cache?

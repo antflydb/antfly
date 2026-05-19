@@ -1732,7 +1732,7 @@ pub const BoundTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyBoundQueryAggregations(self, alloc, req, &result, &meta, consistency);
-        try applyQueryPostProcessing(alloc, req, &result, &meta, null);
+        try applyQueryPostProcessing(alloc, req, &result, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, result);
     }
 
@@ -2090,7 +2090,7 @@ pub const ProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &result, &meta, consistency);
-            try applyQueryPostProcessing(alloc, req, &result, &meta, self.local_termite_provider);
+            try applyQueryPostProcessing(alloc, req, &result, &meta, self.local_termite_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, req, meta, result);
         }
 
@@ -2112,7 +2112,7 @@ pub const ProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
-            try applyQueryPostProcessing(alloc, req, &merged, &meta, self.local_termite_provider);
+            try applyQueryPostProcessing(alloc, req, &merged, &meta, self.local_termite_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
         }
         var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
@@ -2124,7 +2124,7 @@ pub const ProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, self.local_termite_provider);
+        try applyQueryPostProcessing(alloc, req, &merged, &meta, self.local_termite_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -2226,7 +2226,7 @@ pub const ProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, req, &result, &meta, consistency);
-        try applyQueryPostProcessing(alloc, req, &result, &meta, self.local_termite_provider);
+        try applyQueryPostProcessing(alloc, req, &result, &meta, self.local_termite_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, result);
     }
 
@@ -2559,7 +2559,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 };
                 defer meta.deinit(alloc);
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &result, &meta, consistency);
-                try applyQueryPostProcessing(alloc, req, &result, &meta, null);
+                try applyQueryPostProcessing(alloc, req, &result, &meta, null, null);
                 return try query_api.encodeQueryResponses(alloc, table_name, req, meta, result);
             }
         }
@@ -2582,7 +2582,7 @@ pub const HostedProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
-            try applyQueryPostProcessing(alloc, req, &merged, &meta, null);
+            try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null);
             return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
@@ -2594,7 +2594,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, null);
+        try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -2710,7 +2710,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, req, &result, &meta, consistency);
-        try applyQueryPostProcessing(alloc, req, &result, &meta, null);
+        try applyQueryPostProcessing(alloc, req, &result, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, result);
     }
 
@@ -10565,9 +10565,10 @@ fn applyQueryPostProcessing(
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
 ) !void {
     if (req.reranker == null or result.hits.len == 0) return;
-    try applyReranker(alloc, req, result, meta, local_termite_provider);
+    try applyReranker(alloc, req, result, meta, local_termite_provider, secret_store);
 }
 
 fn applyReranker(
@@ -10576,6 +10577,7 @@ fn applyReranker(
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
 ) !void {
     const cfg = req.reranker orelse return;
     if (req.reranker_query_text.len == 0) return error.UnsupportedQueryRequest;
@@ -10609,7 +10611,14 @@ fn applyReranker(
     defer http.deinit();
 
     const rerank_start_ns = platform_time.monotonicNs();
-    const scores = reranking_runtime.rerankDocumentsWithLocalTermite(alloc, &http, cfg, local_termite_provider, req.reranker_query_text, documents) catch |err| switch (err) {
+    const scores = reranking_runtime.rerankDocumentsWithOptions(
+        alloc,
+        &http,
+        cfg,
+        .{ .local_termite_provider = local_termite_provider, .secret_store = secret_store },
+        req.reranker_query_text,
+        documents,
+    ) catch |err| switch (err) {
         error.InvalidRerankerConfig, error.UnsupportedRerankerProvider => return error.InvalidQueryRequest,
         else => return err,
     };

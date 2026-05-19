@@ -58,6 +58,7 @@ pub const SnapshotBackfillRunner = struct {
     alloc: Allocator,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
 
     pub fn runTableSource(
@@ -125,7 +126,7 @@ pub const SnapshotBackfillRunner = struct {
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
         defer parsed.deinit(self.alloc);
 
-        const resolved_dsn = try secrets.resolveReferenceOwned(self.alloc, null, parsed.dsn);
+        const resolved_dsn = try secrets.resolveReferenceOwned(self.alloc, self.secret_store, parsed.dsn);
         defer self.alloc.free(resolved_dsn);
 
         const phase_snapshot = "snapshot";
@@ -512,6 +513,7 @@ pub const StreamingReplicationRunner = struct {
     alloc: Allocator,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
 
     pub fn runTableSourceFromCheckpoint(
@@ -582,7 +584,7 @@ pub const StreamingReplicationRunner = struct {
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
         defer parsed.deinit(self.alloc);
 
-        const resolved_dsn = try secrets.resolveReferenceOwned(self.alloc, null, parsed.dsn);
+        const resolved_dsn = try secrets.resolveReferenceOwned(self.alloc, self.secret_store, parsed.dsn);
         defer self.alloc.free(resolved_dsn);
 
         const config = foreign_mod.Config{

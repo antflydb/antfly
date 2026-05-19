@@ -147,6 +147,15 @@ pub const Config = struct {
         raw: []const u8,
         secret_store: ?*secrets.FileStore,
     ) !Config {
+        var raw_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
+            .allocate = .alloc_always,
+        });
+        defer raw_tree.deinit();
+        const raw_root = switch (raw_tree.value) {
+            .object => |object| object,
+            else => return error.InvalidConfig,
+        };
+
         var parsed_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
             .allocate = .alloc_always,
         });
@@ -168,7 +177,7 @@ pub const Config = struct {
         });
         defer validated.deinit();
 
-        var registry = try provider_registry.Registry.parseFromValue(alloc, parsed_tree.value);
+        var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
         var speech_to_text = if (root.get("speech_to_text")) |speech_to_text_value|
             try transcribing.Registry.parseFromValue(alloc, speech_to_text_value)
@@ -213,9 +222,9 @@ pub const Config = struct {
                 .api_url = if (termite.api_url.len > 0) try alloc.dupe(u8, termite.api_url) else null,
                 .models_dir = if (termite.models_dir) |value| try alloc.dupe(u8, value) else null,
                 .content_security = if (termite.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
-                .s3_credentials = if (termite.s3_credentials) |credentials| try s3CredentialsFromOpenApi(alloc, credentials) else null,
+                .s3_credentials = try parseRawTermiteS3Credentials(alloc, raw_root, termite.s3_credentials),
             } else .{},
-            .remote_content = if (root.get("remote_content")) |remote_content|
+            .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
             else
                 null,
@@ -503,6 +512,26 @@ fn s3CredentialsFromOpenApi(
         .secret_access_key = if (value.secret_access_key) |secret| try alloc.dupe(u8, secret) else null,
         .session_token = if (value.session_token) |token| try alloc.dupe(u8, token) else null,
     };
+}
+
+fn parseRawTermiteS3Credentials(
+    alloc: std.mem.Allocator,
+    raw_root: std.json.ObjectMap,
+    fallback: ?s3_openapi.Credentials,
+) !?Config.S3CredentialsConfig {
+    if (raw_root.get("termite")) |termite_value| {
+        if (termite_value == .object) {
+            if (termite_value.object.get("s3_credentials")) |credentials_value| {
+                const parsed = try std.json.parseFromValue(s3_openapi.Credentials, alloc, credentials_value, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                return try s3CredentialsFromOpenApi(alloc, parsed.value);
+            }
+        }
+    }
+    return if (fallback) |credentials| try s3CredentialsFromOpenApi(alloc, credentials) else null;
 }
 
 fn parseRemoteContentHttpCredential(alloc: std.mem.Allocator, value: std.json.Value) !Config.HTTPCredentialConfig {
@@ -1094,7 +1123,7 @@ test "common config treats empty termite content security as inheritable" {
     try std.testing.expectEqualStrings("cdn.example.com", effective.allowed_hosts.?[0]);
 }
 
-test "common config resolves secret references inside remote content credentials" {
+test "common config preserves live secret references inside remote content credentials" {
     const alloc = std.testing.allocator;
     const store_path = ".zig-cache/test-remote-content-secrets.json";
     defer {
@@ -1151,11 +1180,11 @@ test "common config resolves secret references inside remote content credentials
 
     const remote_content = cfg.remote_content.?;
     const s3_credential = remote_content.getS3("primary").?;
-    try std.testing.expectEqualStrings("AKIA-TEST", s3_credential.access_key_id.?);
-    try std.testing.expectEqualStrings("SECRET-TEST", s3_credential.secret_access_key.?);
+    try std.testing.expectEqualStrings("${secret:aws.key}", s3_credential.access_key_id.?);
+    try std.testing.expectEqualStrings("${secret:aws.secret}", s3_credential.secret_access_key.?);
 
     const http_credential = remote_content.getHttp("internal-api").?;
-    try std.testing.expectEqualStrings("Bearer super-secret", http_credential.headers.get("Authorization").?);
+    try std.testing.expectEqualStrings("${secret:remote.token}", http_credential.headers.get("Authorization").?);
 }
 
 test "common config resolves local role base dir from config" {

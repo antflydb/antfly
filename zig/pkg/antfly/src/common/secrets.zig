@@ -47,6 +47,14 @@ pub const SecretValue = union(enum) {
     secret_ref: []u8,
     env_var: []u8,
 
+    pub fn initConfig(alloc: std.mem.Allocator, configured_value: ?[]const u8) !?SecretValue {
+        const value = configured_value orelse return null;
+        if (parseSecretReference(value)) |key| {
+            return .{ .secret_ref = try alloc.dupe(u8, key) };
+        }
+        return .{ .literal = try alloc.dupe(u8, value) };
+    }
+
     pub fn initConfigOrEnv(alloc: std.mem.Allocator, configured_value: ?[]const u8, env_name: []const u8) !SecretValue {
         if (configured_value) |value| {
             if (parseSecretReference(value)) |key| {

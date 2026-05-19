@@ -3727,12 +3727,20 @@ pub fn parseSupportedJoinRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !?ParsedSupportedJoinRequest {
+    return try parseSupportedJoinRequestWithSecrets(alloc, body, null);
+}
+
+pub fn parseSupportedJoinRequestWithSecrets(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    secret_store: ?*@import("../common/secrets.zig").FileStore,
+) !?ParsedSupportedJoinRequest {
     var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer parsed_request.deinit();
     const join = parsed_request.value.join orelse return null;
     return .{
         .join = try supportedJoinRequestFromOpenApi(alloc, join),
-        .foreign_sources = foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolved(alloc, parsed_request.value.foreign_sources) catch |err| switch (err) {
+        .foreign_sources = foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, parsed_request.value.foreign_sources, secret_store) catch |err| switch (err) {
             error.UnsupportedSourceKind => return error.UnsupportedQueryRequest,
             else => return err,
         },
