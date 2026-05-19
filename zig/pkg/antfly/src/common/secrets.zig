@@ -626,7 +626,7 @@ pub fn resolveReferenceWithGenerationOwned(
     const env_var = try envVarForKey(alloc, key);
     defer alloc.free(env_var);
     return .{
-        .value = envValueOwned(alloc, env_var) orelse error.SecretNotFound,
+        .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
         .generation = 0,
         .source = .env_var,
     };

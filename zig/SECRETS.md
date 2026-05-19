@@ -440,36 +440,6 @@ and does not keep opening new work with the old credential.
 Deleting a key from a valid secrets file is revocation for new work. Malformed
 files do not advance generation and keep the last known good snapshot.
 
-### Reconnect and Cache Contract
-
-Secret-backed clients must be keyed by the generation of the `FileStore`
-snapshot used to build them. `FileStore` exposes generation-aware resolution so
-callers can resolve the credential and capture the generation under the same
-store lock. Literal values and environment-only fallback use generation `0`.
-
-Default behavior is per-operation resolution. A subsystem should add a
-generation-keyed cache only when rebuilding the client is expensive or when the
-client is inherently stateful. Cache keys must include non-secret config
-identity plus the resolved secret generation, never the raw secret value.
-
-Foreign DSNs currently resolve per request and create short-lived clients. If a
-long-lived pool is added later, the pool key should be `(logical source,
-non-secret source config, secret_generation)`. New work must use the newest
-generation. Checked-out connections may finish their current request, idle
-connections from older generations should close immediately, and the old pool
-should drain with a short TTL.
-
-CDC workers resolve the DSN before snapshot or stream connection creation and
-log the generation used. A stream may finish the current poll with the
-credential it started with, but any reconnect, retry, or next snapshot/stream
-connection must resolve again. If the resolved generation changed, the worker
-rebuilds the source connection and resumes from the persisted checkpoint. If the
-new secret is missing or invalid, the worker records a failed/retryable status
-and does not keep opening new work with the old credential.
-
-Deleting a key from a valid secrets file is revocation for new work. Malformed
-files do not advance generation and keep the last known good snapshot.
-
 Recommended implementation order:
 
 1. Add runtime tests for generator/reranker, foreign DSN, CDC DSN, S3 backup,
