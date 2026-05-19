@@ -14182,8 +14182,9 @@ fn allocStressDenseDocJson(alloc: Allocator, dims: usize, doc_index: usize) ![]u
 fn tempPath(buf: []u8) [*:0]const u8 {
     const base = "/tmp/antfly-db-test-";
     const ts = monotonicTimeNs();
+    const pid: u32 = @intCast(std.posix.system.getpid());
     const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}-{d}\x00", .{ base, pid, ts, nonce }) catch unreachable;
     return @ptrCast(path.ptr);
 }
 
