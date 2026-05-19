@@ -79,11 +79,11 @@ pub const SecretValue = union(enum) {
             .literal => |value| try alloc.dupe(u8, value),
             .secret_ref => |key| blk: {
                 if (secret_store) |store| {
-                    break :blk (try store.getOwned(alloc, key)) orelse error.SecretNotFound;
+                    break :blk (try store.getOwned(alloc, key)) orelse return error.SecretNotFound;
                 }
                 const env_var = try envVarForKey(alloc, key);
                 defer alloc.free(env_var);
-                break :blk envValueOwned(alloc, env_var) orelse error.SecretNotFound;
+                break :blk envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
             },
             .env_var => |env_var| envValueOwned(alloc, env_var),
         };
@@ -102,16 +102,20 @@ pub const SecretValue = union(enum) {
                 }
                 const env_var = try envVarForKey(alloc, key);
                 defer alloc.free(env_var);
+                const value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
                 break :blk .{
-                    .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
+                    .value = value,
                     .generation = 0,
                     .source = .env_var,
                 };
             },
-            .env_var => |env_var| .{
-                .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
-                .generation = 0,
-                .source = .env_var,
+            .env_var => |env_var| blk: {
+                const value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
+                break :blk .{
+                    .value = value,
+                    .generation = 0,
+                    .source = .env_var,
+                };
             },
         };
     }
@@ -364,8 +368,9 @@ pub const FileStore = struct {
         }
         const env_var = try envVarForKey(alloc, key);
         defer alloc.free(env_var);
+        const value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
         return .{
-            .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
+            .value = value,
             .generation = self.generation_value,
             .source = .env_var,
         };
@@ -373,7 +378,7 @@ pub const FileStore = struct {
 
     pub fn resolveValueOwned(self: *FileStore, alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
         const key = parseSecretReference(raw) orelse return try alloc.dupe(u8, raw);
-        return (try self.getOwned(alloc, key)) orelse error.SecretNotFound;
+        return (try self.getOwned(alloc, key)) orelse return error.SecretNotFound;
     }
 
     pub fn resolveValueWithGenerationOwned(self: *FileStore, alloc: std.mem.Allocator, raw: []const u8) !ResolvedSecret {
@@ -641,7 +646,7 @@ pub fn resolveReferenceOwned(
     if (secret_store) |store| return try store.resolveValueOwned(alloc, raw);
     const env_var = try envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    return envValueOwned(alloc, env_var) orelse error.SecretNotFound;
+    return envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
 }
 
 pub fn resolveReferenceWithGenerationOwned(
@@ -657,8 +662,9 @@ pub fn resolveReferenceWithGenerationOwned(
     if (secret_store) |store| return try store.getOwnedWithGeneration(alloc, key);
     const env_var = try envVarForKey(alloc, key);
     defer alloc.free(env_var);
+    const value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
     return .{
-        .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
+        .value = value,
         .generation = 0,
         .source = .env_var,
     };
