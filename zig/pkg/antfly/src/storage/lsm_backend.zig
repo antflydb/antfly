@@ -8440,3 +8440,34 @@ test "lsm backend ignores orphaned committed run files not referenced by manifes
         try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
     }
 }
+test "lsm backend mutable read snapshot retirement allocation failure keeps snapshot cleanup reachable" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var backend = Backend.init(alloc, .{});
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+    }
+
+    var read_a = try backend.beginRead();
+    defer read_a.abort();
+    try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
+    const first_snapshot = backend.mutable_read_snapshot orelse return error.TestUnexpectedResult;
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    backend.invalidateMutableReadSnapshot();
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expect(backend.retired_mutable_snapshots.items[0] == first_snapshot);
+
+    read_a.abort();
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
+    backend.close();
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
