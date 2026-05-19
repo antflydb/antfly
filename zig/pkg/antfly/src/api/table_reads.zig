@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
@@ -107,6 +108,16 @@ pub const ParsedTextStatsHttpResponse = union(enum) {
         self.* = undefined;
     }
 };
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn rejectResolvedDocFilterForCrossGroup(req: db_mod.types.SearchRequest, group_count: usize) !void {
+        return rejectCrossGroupResolvedDocFilter(req, group_count);
+    }
+
+    pub fn rejectResolvedDocFilterForRemoteRoute(req: db_mod.types.SearchRequest, route: table_router.GroupRoute) !void {
+        return rejectRemoteRouteResolvedDocFilter(req, route);
+    }
+} else struct {};
 
 pub const ProvisionedTableReadCache = struct {
     alloc: std.mem.Allocator,
@@ -2154,6 +2165,7 @@ pub const ProvisionedTableReadSource = struct {
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
+        try rejectCrossGroupResolvedDocFilter(req, group_ids.len);
         const plan = planFanout(.preflight, self.io_impl, group_ids.len);
         recordFanoutPlan(.preflight, plan);
         if (plan.parallel) {
@@ -2623,6 +2635,7 @@ pub const HostedProvisionedTableReadSource = struct {
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
+        try rejectCrossGroupResolvedDocFilter(req, group_ids.len);
         const plan = planFanout(.preflight, self.io_impl, group_ids.len);
         recordFanoutPlan(.preflight, plan);
         if (plan.parallel) {
@@ -3538,6 +3551,31 @@ fn preflightHostedGroupsParallel(
     return merged;
 }
 
+fn rejectCrossGroupResolvedDocFilter(req: db_mod.types.SearchRequest, group_count: usize) !void {
+    if (group_count > 1 and req.resolved_doc_filter != null) return error.UnsupportedQueryRequest;
+}
+
+fn rejectRemoteRouteResolvedDocFilter(req: db_mod.types.SearchRequest, route: table_router.GroupRoute) !void {
+    if (req.resolved_doc_filter == null) return;
+    switch (route) {
+        .local => {},
+        .remote => return error.UnsupportedQueryRequest,
+    }
+}
+
+fn rejectHostedRemoteResolvedDocFilter(
+    self: *HostedProvisionedTableReadSource,
+    alloc: std.mem.Allocator,
+    group_ids: []const u64,
+    req: db_mod.types.SearchRequest,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    if (req.resolved_doc_filter == null or group_ids.len != 1) return;
+    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+    defer route.deinit(alloc);
+    try rejectRemoteRouteResolvedDocFilter(req, route);
+}
+
 fn queryProvisionedAcrossGroups(
     self: *ProvisionedTableReadSource,
     alloc: std.mem.Allocator,
@@ -3546,6 +3584,7 @@ fn queryProvisionedAcrossGroups(
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
+    try rejectCrossGroupResolvedDocFilter(req, group_ids.len);
     const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
     const shard_limit = req.limit + req.offset;
@@ -3586,6 +3625,8 @@ fn queryHostedAcrossGroups(
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
+    try rejectCrossGroupResolvedDocFilter(req, group_ids.len);
+    try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, req, consistency);
     const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
     const shard_limit = req.limit + req.offset;
