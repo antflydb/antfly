@@ -89,12 +89,60 @@ pub const SecretValue = union(enum) {
         };
     }
 
+    pub fn resolveOwnedWithGeneration(self: *const SecretValue, alloc: std.mem.Allocator, secret_store: ?*FileStore) !ResolvedSecret {
+        return switch (self.*) {
+            .literal => |value| .{
+                .value = try alloc.dupe(u8, value),
+                .generation = 0,
+                .source = .literal,
+            },
+            .secret_ref => |key| blk: {
+                if (secret_store) |store| {
+                    break :blk try store.getOwnedWithGeneration(alloc, key);
+                }
+                const env_var = try envVarForKey(alloc, key);
+                defer alloc.free(env_var);
+                break :blk .{
+                    .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
+                    .generation = 0,
+                    .source = .env_var,
+                };
+            },
+            .env_var => |env_var| .{
+                .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
+                .generation = 0,
+                .source = .env_var,
+            },
+        };
+    }
+
     pub fn identityHash(self: *const SecretValue) u64 {
         return switch (self.*) {
             .literal => |value| std.hash.Wyhash.hash(0, value),
             .secret_ref => |value| std.hash.Wyhash.hash(1, value),
             .env_var => |value| std.hash.Wyhash.hash(2, value),
         };
+    }
+};
+
+pub const ResolvedSecretSource = enum {
+    literal,
+    file_store,
+    env_var,
+};
+
+pub const ResolvedSecret = struct {
+    value: []u8,
+    generation: u64,
+    source: ResolvedSecretSource,
+
+    pub fn deinit(self: *ResolvedSecret, alloc: std.mem.Allocator) void {
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+
+    pub fn cacheGeneration(self: ResolvedSecret) u64 {
+        return self.generation;
     }
 };
 
@@ -270,9 +318,39 @@ pub const FileStore = struct {
         return envValueOwned(alloc, env_var);
     }
 
+    pub fn getOwnedWithGeneration(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !ResolvedSecret {
+        self.lock();
+        defer self.unlock();
+        _ = try self.refreshIfChangedLocked();
+
+        if (self.entries.get(key)) |stored| {
+            return .{
+                .value = try alloc.dupe(u8, stored.value),
+                .generation = self.generation_value,
+                .source = .file_store,
+            };
+        }
+        const env_var = try envVarForKey(alloc, key);
+        defer alloc.free(env_var);
+        return .{
+            .value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound,
+            .generation = self.generation_value,
+            .source = .env_var,
+        };
+    }
+
     pub fn resolveValueOwned(self: *FileStore, alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
         const key = parseSecretReference(raw) orelse return try alloc.dupe(u8, raw);
         return (try self.getOwned(alloc, key)) orelse error.SecretNotFound;
+    }
+
+    pub fn resolveValueWithGenerationOwned(self: *FileStore, alloc: std.mem.Allocator, raw: []const u8) !ResolvedSecret {
+        const key = parseSecretReference(raw) orelse return .{
+            .value = try alloc.dupe(u8, raw),
+            .generation = 0,
+            .source = .literal,
+        };
+        return try self.getOwnedWithGeneration(alloc, key);
     }
 
     fn describeOneLocked(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !ListedSecret {
@@ -532,6 +610,26 @@ pub fn resolveReferenceOwned(
     const env_var = try envVarForKey(alloc, key);
     defer alloc.free(env_var);
     return envValueOwned(alloc, env_var) orelse error.SecretNotFound;
+}
+
+pub fn resolveReferenceWithGenerationOwned(
+    alloc: std.mem.Allocator,
+    secret_store: ?*FileStore,
+    raw: []const u8,
+) !ResolvedSecret {
+    const key = parseSecretReference(raw) orelse return .{
+        .value = try alloc.dupe(u8, raw),
+        .generation = 0,
+        .source = .literal,
+    };
+    if (secret_store) |store| return try store.getOwnedWithGeneration(alloc, key);
+    const env_var = try envVarForKey(alloc, key);
+    defer alloc.free(env_var);
+    return .{
+        .value = envValueOwned(alloc, env_var) orelse error.SecretNotFound,
+        .generation = 0,
+        .source = .env_var,
+    };
 }
 
 pub fn validateKey(key: []const u8) !void {
@@ -863,6 +961,42 @@ test "secret value resolves file-backed references at request time" {
 
     try writeFileAtomically(path, "{\"secrets\":[]}");
     try std.testing.expectError(error.SecretNotFound, value.resolveOwned(alloc, &store));
+}
+
+test "secret resolution reports file generation for cache invalidation" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secret-generation-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"pg.dsn","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    );
+
+    var store = try FileStore.init(alloc, path);
+    defer store.deinit();
+
+    var first = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:pg.dsn}");
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("first", first.value);
+    try std.testing.expectEqual(ResolvedSecretSource.file_store, first.source);
+    try std.testing.expectEqual(store.generation(), first.generation);
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"pg.dsn","value":"second-longer","created_at_ns":1,"updated_at_ns":2}]}
+    );
+
+    var second = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:pg.dsn}");
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("second-longer", second.value);
+    try std.testing.expectEqual(ResolvedSecretSource.file_store, second.source);
+    try std.testing.expect(second.generation > first.generation);
+
+    var literal = try resolveReferenceWithGenerationOwned(alloc, &store, "postgres://literal");
+    defer literal.deinit(alloc);
+    try std.testing.expectEqualStrings("postgres://literal", literal.value);
+    try std.testing.expectEqual(ResolvedSecretSource.literal, literal.source);
+    try std.testing.expectEqual(@as(u64, 0), literal.generation);
 }
 
 test "environment secret discovery maps API key env vars" {
