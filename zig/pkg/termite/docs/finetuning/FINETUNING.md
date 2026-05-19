@@ -40,8 +40,12 @@ All recipes use the same top-level sections:
   },
   "adapter": {
     "path": "/runs/gemma4/adapter-bootstrap",
-    "rank": 8,
-    "alpha": 16,
+    "rank": 16,
+    "alpha": 32,
+    "target_preset": "all-linear",
+    "scaling": "standard",
+    "init_lora_weights": "default",
+    "use_dora": false,
     "layer_name": "model.layers.0"
   },
   "optimizer": {
@@ -73,6 +77,19 @@ All recipes use the same top-level sections:
 ```
 
 Supported recipe names are `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo`, `reranker`, and `vlm-retrieval`. The parser accepts unknown future fields so recipe files can grow without breaking older runners.
+
+### LoRA Defaults
+
+Recipe-level LoRA defaults are intentionally PEFT-like:
+
+- SFT, QLoRA, VLM retrieval, and encoder/reranker LoRA bootstrap at `rank = 16`, `alpha = 32`.
+- GRPO adapter-training routes default to `rank = 8`, `alpha = 32`; raise rank for larger policy tasks after an eval sweep justifies the extra adapter capacity.
+- Scaling is standard LoRA `alpha / rank`. Recipe `adapter.scaling` currently accepts only `standard` aliases; rank-stabilized scaling is not enabled in the graph trainer path.
+- Gemma4 defaults to `target_preset = "all-linear"`, which expands to attention and MLP linear patterns. Explicit `target_modules` override the preset.
+- Qwen/ColQwen optimizer-backed routes default to their all-linear target module lists. They also accept `target_preset = "all-linear"`, `attention-only`, or `mlp-only`; `moe-experts` is rejected until expert-aware rank and routing policy is wired through those bootstraps.
+- `init_lora_weights` and `use_dora` are currently Gemma4-only recipe knobs.
+
+For learning-rate selection, do not copy full-finetune LRs directly. Start LoRA sweeps around `1e-4`, `3e-4`, and `1e-3` with the real target metric, then keep the smallest rank/target set that passes. Smaller micro-batches plus gradient accumulation are usually a better first move than shrinking rank below the defaults.
 
 Use `--dry-run` to print the routed tool plan without launching training:
 

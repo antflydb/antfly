@@ -11,8 +11,11 @@
     "max_seq_len": 128
   },
   "adapter": {
-    "rank": 4,
-    "alpha": 8
+    "rank": 16,
+    "alpha": 32,
+    "target_preset": "all-linear",
+    "scaling": "standard",
+    "init_lora_weights": "default"
   },
   "optimizer": {
     "learning_rate": 0.0002,
