@@ -217,6 +217,17 @@ pub const HfTokenizer = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    pub fn encodeWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !?EncodingWithOffsets {
+        if (text.len > std.math.maxInt(u32)) return null;
+        if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
+            return try self.encodeWordPieceWithOffsets(allocator, text);
+        }
+        if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split) {
+            return try self.encodeUnigramWithOffsets(allocator, text);
+        }
+        return null;
+    }
+
     pub fn applySpecialTokenIds(
         self: *HfTokenizer,
         bos_id: ?i32,
@@ -1912,15 +1923,17 @@ pub const HfTokenizer = struct {
 // Pre-tokenizer implementations
 // =========================================================================
 
-const RawWordPieceEncoding = struct {
+pub const EncodingWithOffsets = struct {
     ids: std.ArrayListUnmanaged(i32) = .empty,
     offsets: std.ArrayListUnmanaged([2]u32) = .empty,
 
-    fn deinit(self: *RawWordPieceEncoding, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *EncodingWithOffsets, allocator: std.mem.Allocator) void {
         self.ids.deinit(allocator);
         self.offsets.deinit(allocator);
     }
 };
+
+const RawWordPieceEncoding = EncodingWithOffsets;
 
 const PreTokenSpan = struct {
     text: []const u8,
