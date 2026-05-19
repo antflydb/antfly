@@ -581,7 +581,7 @@ pub const RecognizeRequest = struct {
     texts: []const []const u8,
     /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
     labels: ?[]const []const u8 = null,
-    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). If not provided, the model extracts all relations it can detect.
+    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). Relation extraction runs only when this array is provided and non-empty. GLiNER labels may be relation names (works_for), head-qualified labels (person::works_for), or head/tail-qualified labels (person::works_for::organization).
     relation_labels: ?[]const []const u8 = null,
     resolver: ?ResolverConfig = null,
 };
