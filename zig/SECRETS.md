@@ -104,14 +104,17 @@ Startup:
 Reads:
 
 1. `list()` returns stored secret metadata plus environment-only API key secrets.
-2. `list()`, `getOwned()`, and `resolveValueOwned()` refresh from disk first if
-   the file metadata changed.
+2. `list()`, `getOwned()`, `getOwnedWithGeneration()`,
+   `resolveValueOwned()`, and `resolveValueWithGenerationOwned()` refresh from
+   disk first if the file metadata changed.
 3. `getOwned()` returns the stored value if present.
 4. If the key is not stored, `getOwned()` maps the key to an environment variable
    and returns the environment value if set.
 5. `resolveValueOwned()` resolves `${secret:key}` references through `getOwned()`.
 6. `resolveReferenceOwned()` resolves through a `FileStore` when one is supplied,
    or through environment variables only when there is no store.
+7. `resolveReferenceWithGenerationOwned()` returns the resolved value, source,
+   and cache generation for generation-keyed clients.
 
 Writes:
 
@@ -402,6 +405,36 @@ workers.
 | Remote-content S3 credentials | Fetch helpers select configured credentials and resolve secret references immediately before S3 fetches. | Extend config ownership to standalone/local DB paths and add rotation tests. |
 | Remote-content HTTP headers | Fetch helpers select configured HTTP credentials and resolve header secret references immediately before outbound HTTP fetches. | Extend config ownership to standalone/local DB paths and add rotation tests. |
 
+### Reconnect and Cache Contract
+
+Secret-backed clients must be keyed by the generation of the `FileStore`
+snapshot used to build them. `FileStore` exposes generation-aware resolution so
+callers can resolve the credential and capture the generation under the same
+store lock. Literal values and environment-only fallback use generation `0`.
+
+Default behavior is per-operation resolution. A subsystem should add a
+generation-keyed cache only when rebuilding the client is expensive or when the
+client is inherently stateful. Cache keys must include non-secret config
+identity plus the resolved secret generation, never the raw secret value.
+
+Foreign DSNs currently resolve per request and create short-lived clients. If a
+long-lived pool is added later, the pool key should be `(logical source,
+non-secret source config, secret_generation)`. New work must use the newest
+generation. Checked-out connections may finish their current request, idle
+connections from older generations should close immediately, and the old pool
+should drain with a short TTL.
+
+CDC workers resolve the DSN before snapshot or stream connection creation and
+log the generation used. A stream may finish the current poll with the
+credential it started with, but any reconnect, retry, or next snapshot/stream
+connection must resolve again. If the resolved generation changed, the worker
+rebuilds the source connection and resumes from the persisted checkpoint. If the
+new secret is missing or invalid, the worker records a failed/retryable status
+and does not keep opening new work with the old credential.
+
+Deleting a key from a valid secrets file is revocation for new work. Malformed
+files do not advance generation and keep the last known good snapshot.
+
 Recommended implementation order:
 
 1. Extend remote-content config ownership to standalone/local DB paths that do
@@ -433,14 +466,9 @@ should follow the same reference-preserving model. We expect these to support
 live rotation, but the implementation needs subsystem-specific rebuild behavior.
 
 Some of these components may hold pooled clients or long-lived connections.
-Changing the secret value is not enough; the owning component may need to:
-
-- close and recreate a connection pool
-- rebuild an S3 client
-- restart a replication worker
-- retry failed auth with the latest generation
-
-Each subsystem should define what "rotation applied" means for its resources.
+They follow the generation contract above: new work resolves the current
+generation, old checked-out work may finish, and any retry/reconnect must use
+the latest generation.
 
 ## API Behavior
 
@@ -569,7 +597,5 @@ Additional runtime tests:
    metrics sufficient?
 3. What encrypted envelope format and key-source contract should the future
    encrypted codec use?
-4. What exact reconnect contract should foreign DSNs and CDC workers expose when
-   a referenced secret changes?
-5. Should S3/backup and remote-content clients share a generation-keyed
+4. Should S3/backup and remote-content clients share a generation-keyed
    credential cache, or should each subsystem own its own cache?
