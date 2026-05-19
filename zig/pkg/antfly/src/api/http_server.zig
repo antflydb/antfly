@@ -4231,6 +4231,18 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) ![]u8 {
+        return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null);
+    }
+
+    fn executePublicTableQueryDispatchWithIdentity(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        body: []const u8,
+        row_filter_json: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) ![]u8 {
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
             var result = self.executePlainPublicTableQuery(
                 alloc,
@@ -4253,7 +4265,7 @@ pub const ApiHttpServer = struct {
         var contract_req = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_req.deinit();
 
-        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json) catch |err| switch (err) {
+        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
@@ -4270,10 +4282,11 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        if (join_req) |parsed_join| {
-            defer {
-                var owned = parsed_join;
-                owned.deinit(alloc);
+        if (join_req) |owned_join| {
+            var parsed_join = owned_join;
+            defer parsed_join.deinit(alloc);
+            if (authenticated_identity) |identity| {
+                try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
             return distributed_join.executeSupportedJoinedPublicTableQueryRequest(self.joinContext(), &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources);
         }
@@ -4334,10 +4347,14 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
     ) anyerror!?[]u8 {
         var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
-        const request = parsed_request.value;
+        const request = &parsed_request.value;
+        if (row_filter_json) |value| {
+            try injectRowFilterIntoOpenApiQueryRequest(alloc, request, value);
+        }
 
         var foreign_sources = foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolved(alloc, request.foreign_sources) catch |err| switch (err) {
             error.UnsupportedSourceKind => return error.UnsupportedQueryRequest,
@@ -4349,10 +4366,10 @@ pub const ApiHttpServer = struct {
         try validateSupportedForeignPublicQueryRequest(request);
 
         if (request.join != null) {
-            const parsed_join = (try distributed_join.parseSupportedJoinRequest(alloc, body)) orelse return error.InvalidQueryRequest;
-            defer {
-                var owned = parsed_join;
-                owned.deinit(alloc);
+            var parsed_join = (try distributed_join.parseSupportedJoinRequest(alloc, body)) orelse return error.InvalidQueryRequest;
+            defer parsed_join.deinit(alloc);
+            if (authenticated_identity) |identity| {
+                try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
             return try self.executeSupportedJoinedForeignPublicTableQueryRequest(
                 alloc,
@@ -4366,7 +4383,7 @@ pub const ApiHttpServer = struct {
             );
         }
 
-        return try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, request, foreign_source);
+        return try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, request.*, foreign_source);
     }
 
     fn encodeForeignPublicTableQueryResponseAlloc(
@@ -4483,7 +4500,6 @@ pub const ApiHttpServer = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
     ) anyerror![]u8 {
-        if (row_filter_json != null) return error.InvalidQueryRequest;
         var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_request.deinit();
         const requested_left_fields = contract_request.value.fields orelse &.{};
@@ -4495,6 +4511,9 @@ pub const ApiHttpServer = struct {
 
         var primary_request = try metadata_openapi.server.parseQueryTableBody(alloc, primary_body);
         defer primary_request.deinit();
+        if (row_filter_json) |value| {
+            try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);
+        }
         const primary_json = try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, primary_request.value, foreign_source);
         defer alloc.free(primary_json);
 
@@ -5091,23 +5110,29 @@ pub const ApiHttpServer = struct {
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
-        var resp = try public_table_http.handleTableQueryRequest(
+
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const response_body = self.executePublicTableQueryDispatchWithIdentity(
             self.alloc,
+            source,
             table_name,
             body,
             row_filter_json,
-            self.tableApi(),
-        );
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.QueryResponses, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, parsed);
+            authenticated_identity,
+        ) catch |err| switch (err) {
+            error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            else => {
+                std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "query failed");
             },
-            else => try textResponse(self.alloc, resp.status, resp.body),
         };
+        defer self.alloc.free(response_body);
+
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const parsed = try parseJsonResponseBody(metadata_openapi.QueryResponses, arena_impl.allocator(), response_body);
+        return try jsonResponse(self.alloc, parsed);
     }
 
     pub fn handlePublicTableListIndexes(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
@@ -5538,6 +5563,24 @@ pub fn permissionsAllow(
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
+}
+
+fn applyAuthenticatedIdentityToJoinRequest(
+    alloc: std.mem.Allocator,
+    identity: AuthenticatedIdentity,
+    join: *distributed_join.SupportedJoinRequest,
+) !void {
+    if (!permissionsAllow(identity.permissions, .table, join.right_table, .read)) return error.InvalidQueryRequest;
+
+    const row_filter_json = try resolveEffectiveRowFilterJson(alloc, identity, join.right_table);
+    defer if (row_filter_json) |value| alloc.free(value);
+    if (row_filter_json) |value| {
+        try distributed_join.applyRightTableRowFilterJson(alloc, join, value);
+    }
+
+    if (join.nested_join) |nested| {
+        try applyAuthenticatedIdentityToJoinRequest(alloc, identity, nested);
+    }
 }
 
 fn jsonResponseWithStatus(alloc: std.mem.Allocator, status: u16, value: anytype) !http_common.HttpResponse {
@@ -6310,6 +6353,75 @@ test "effective resolved row filter prefers table filter before wildcard" {
     try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
 }
 
+test "join auth applies read permission and row filters to joined tables" {
+    const alloc = std.testing.allocator;
+    var permissions = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "customers", .read),
+        try usermgr.Permission.initOwned(alloc, .table, "addresses", .read),
+    };
+    defer {
+        for (&permissions) |*permission| permission.deinit(alloc);
+    }
+    var row_filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(alloc, "customers", "{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}}"),
+        try usermgr.RowFilterEntry.initOwned(alloc, "addresses", "{\"term\":{\"region\":\"us\"}}"),
+    };
+    defer {
+        for (&row_filters) |*entry| entry.deinit(alloc);
+    }
+    const nested = try alloc.create(distributed_join.SupportedJoinRequest);
+    nested.* = .{
+        .right_table = try alloc.dupe(u8, "addresses"),
+        .left_field = try alloc.dupe(u8, "address_id"),
+        .right_field = try alloc.dupe(u8, "id"),
+    };
+    var join = distributed_join.SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .left_field = try alloc.dupe(u8, "customer_id"),
+        .right_field = try alloc.dupe(u8, "id"),
+        .nested_join = nested,
+    };
+    defer join.deinit(alloc);
+    const identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .permissions = permissions[0..],
+        .row_filter = row_filters[0..],
+        .metadata_json = try alloc.dupe(u8, "{\"tenant_id\":\"acme\"}"),
+    };
+    defer {
+        alloc.free(identity.username);
+        alloc.free(identity.metadata_json);
+    }
+
+    try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &join);
+
+    const customer_filter = join.right_filters.?.filter_query orelse return error.TestExpectedEqual;
+    const customer_json = try distributed_join.stringifyJsonValueAlloc(alloc, customer_filter);
+    defer alloc.free(customer_json);
+    try std.testing.expect(std.mem.indexOf(u8, customer_json, "\"tenant_id\":\"acme\"") != null);
+
+    const nested_filter = join.nested_join.?.right_filters.?.filter_query orelse return error.TestExpectedEqual;
+    const nested_json = try distributed_join.stringifyJsonValueAlloc(alloc, nested_filter);
+    defer alloc.free(nested_json);
+    try std.testing.expect(std.mem.indexOf(u8, nested_json, "\"region\":\"us\"") != null);
+}
+
+test "join auth rejects joined table without read permission" {
+    const alloc = std.testing.allocator;
+    var join = distributed_join.SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .left_field = try alloc.dupe(u8, "customer_id"),
+        .right_field = try alloc.dupe(u8, "id"),
+    };
+    defer join.deinit(alloc);
+    const identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+    };
+    defer alloc.free(identity.username);
+
+    try std.testing.expectError(error.InvalidQueryRequest, applyAuthenticatedIdentityToJoinRequest(alloc, identity, &join));
+}
+
 fn injectRowFilterIntoSearchRequest(
     alloc: std.mem.Allocator,
     req: *db_mod.types.SearchRequest,
@@ -6326,6 +6438,17 @@ fn injectRowFilterIntoSearchRequest(
     );
     alloc.free(req.filter_query_json);
     req.filter_query_json = conjunction;
+}
+
+fn injectRowFilterIntoOpenApiQueryRequest(
+    alloc: std.mem.Allocator,
+    req: anytype,
+    row_filter_json: []const u8,
+) !void {
+    var combined = try distributed_join.combineFilterQueryWithRowFilterJson(alloc, req.filter_query, row_filter_json);
+    errdefer json_helpers.deinitJsonValue(alloc, &combined);
+    if (req.filter_query) |*existing| json_helpers.deinitJsonValue(alloc, existing);
+    req.filter_query = combined;
 }
 
 pub fn scanLineKey(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
