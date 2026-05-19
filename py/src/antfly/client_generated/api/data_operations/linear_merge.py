@@ -49,6 +49,16 @@ def _parse_response(
 
         return response_404
 
+    if response.status_code == 413:
+        response_413 = Error.from_dict(response.json())
+
+        return response_413
+
+    if response.status_code == 415:
+        response_415 = Error.from_dict(response.json())
+
+        return response_415
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -102,6 +112,12 @@ def sync_detailed(
         body (LinearMergeRequest): Linear merge operation for syncing sorted records from external
             sources.
             Use this to keep Antfly in sync with an external database or data source.
+
+            Requests may be sent as plain JSON or gzip-compressed JSON
+            (`Content-Encoding: gzip`).
+
+            Request bodies are limited to 64 MiB after decompression. Requests that
+            exceed this limit return HTTP 413.
 
             **How it works:**
             1. Send sorted records from your external source
@@ -163,6 +179,12 @@ def sync(
             sources.
             Use this to keep Antfly in sync with an external database or data source.
 
+            Requests may be sent as plain JSON or gzip-compressed JSON
+            (`Content-Encoding: gzip`).
+
+            Request bodies are limited to 64 MiB after decompression. Requests that
+            exceed this limit return HTTP 413.
+
             **How it works:**
             1. Send sorted records from your external source
             2. Server upserts records that exist in your batch
@@ -217,6 +239,12 @@ async def asyncio_detailed(
         body (LinearMergeRequest): Linear merge operation for syncing sorted records from external
             sources.
             Use this to keep Antfly in sync with an external database or data source.
+
+            Requests may be sent as plain JSON or gzip-compressed JSON
+            (`Content-Encoding: gzip`).
+
+            Request bodies are limited to 64 MiB after decompression. Requests that
+            exceed this limit return HTTP 413.
 
             **How it works:**
             1. Send sorted records from your external source
@@ -275,6 +303,12 @@ async def asyncio(
         body (LinearMergeRequest): Linear merge operation for syncing sorted records from external
             sources.
             Use this to keep Antfly in sync with an external database or data source.
+
+            Requests may be sent as plain JSON or gzip-compressed JSON
+            (`Content-Encoding: gzip`).
+
+            Request bodies are limited to 64 MiB after decompression. Requests that
+            exceed this limit return HTTP 413.
 
             **How it works:**
             1. Send sorted records from your external source

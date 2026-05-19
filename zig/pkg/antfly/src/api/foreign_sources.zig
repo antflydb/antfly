@@ -21,22 +21,42 @@ const json_helpers = @import("json_helpers.zig");
 const Allocator = std.mem.Allocator;
 
 pub fn postgresSourceMapFromPublicOpenApiResolved(alloc: Allocator, foreign_sources: anytype) !foreign_mod.PostgresSourceMap {
+    return try postgresSourceMapFromPublicOpenApiResolvedWithSecrets(alloc, foreign_sources, null);
+}
+
+pub fn postgresSourceMapFromPublicOpenApiResolvedWithSecrets(
+    alloc: Allocator,
+    foreign_sources: anytype,
+    secret_store: ?*secrets.FileStore,
+) !foreign_mod.PostgresSourceMap {
     var source_map = try foreign_mod.postgresSourceMapFromPublicOpenApi(alloc, foreign_sources);
     errdefer source_map.deinit(alloc);
-    try resolvePostgresSourceMapAlloc(alloc, &source_map);
+    try resolvePostgresSourceMapAlloc(alloc, &source_map, secret_store);
     return source_map;
 }
 
 pub fn postgresSourceMapFromMetadataOpenApiResolved(alloc: Allocator, foreign_sources: anytype) !foreign_mod.PostgresSourceMap {
+    return try postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, foreign_sources, null);
+}
+
+pub fn postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(
+    alloc: Allocator,
+    foreign_sources: anytype,
+    secret_store: ?*secrets.FileStore,
+) !foreign_mod.PostgresSourceMap {
     var source_map = try foreign_mod.postgresSourceMapFromMetadataOpenApi(alloc, foreign_sources);
     errdefer source_map.deinit(alloc);
-    try resolvePostgresSourceMapAlloc(alloc, &source_map);
+    try resolvePostgresSourceMapAlloc(alloc, &source_map, secret_store);
     return source_map;
 }
 
-pub fn resolvePostgresSourceMapAlloc(alloc: Allocator, source_map: *foreign_mod.PostgresSourceMap) !void {
+pub fn resolvePostgresSourceMapAlloc(
+    alloc: Allocator,
+    source_map: *foreign_mod.PostgresSourceMap,
+    secret_store: ?*secrets.FileStore,
+) !void {
     for (source_map.entries) |*entry| {
-        const resolved = try secrets.resolveReferenceOwned(alloc, null, entry.config.dsn);
+        const resolved = try secrets.resolveReferenceOwned(alloc, secret_store, entry.config.dsn);
         alloc.free(entry.config.dsn);
         entry.config.dsn = resolved;
     }

@@ -19,6 +19,7 @@ const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const openai_provider = @import("../inference/openai.zig");
 const termite_provider = @import("../inference/termite.zig");
+const common_secrets = @import("../common/secrets.zig");
 
 pub const Role = lib.Role;
 pub const ChatMessage = lib.ChatMessage;
@@ -37,6 +38,7 @@ pub const BackendFactory = struct {
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -47,10 +49,24 @@ pub const BackendFactory = struct {
         http: *httpx.Client,
         local_termite_provider: ?managed_embedder.LocalTermiteProvider,
     ) BackendFactory {
+        return initWithOptions(alloc, http, .{ .local_termite_provider = local_termite_provider });
+    }
+
+    pub const Options = struct {
+        local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+        secret_store: ?*common_secrets.FileStore = null,
+    };
+
+    pub fn initWithOptions(
+        alloc: std.mem.Allocator,
+        http: *httpx.Client,
+        options: Options,
+    ) BackendFactory {
         return .{
             .alloc = alloc,
             .http = http,
-            .local_termite_provider = local_termite_provider,
+            .local_termite_provider = options.local_termite_provider,
+            .secret_store = options.secret_store,
         };
     }
 
@@ -63,13 +79,16 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.local_termite_provider);
+        return try BackendState.init(alloc, self.http, cfg, self.local_termite_provider, self.secret_store);
     }
 };
 
 const BackendState = struct {
     alloc: std.mem.Allocator,
     cfg: GeneratorConfig,
+    api_key: ?common_secrets.SecretValue = null,
+    auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
+    secret_store: ?*common_secrets.FileStore = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
         termite: termite_provider.Provider,
@@ -81,16 +100,20 @@ const BackendState = struct {
         http: *httpx.Client,
         cfg: GeneratorConfig,
         local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+        secret_store: ?*common_secrets.FileStore,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
         state.alloc = alloc;
         state.cfg = cfg;
+        state.api_key = try common_secrets.SecretValue.initConfig(alloc, cfg.api_key);
+        errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
+        state.auth_header_cache = .{};
+        state.secret_store = secret_store;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
-                var provider = openai_provider.Provider.init(alloc, http, cfg.url);
-                if (cfg.api_key) |api_key| try provider.setApiKey(api_key);
+                const provider = openai_provider.Provider.init(alloc, http, cfg.url);
                 break :blk .{ .openai = provider };
             },
             .antfly => .{ .local_termite = local_termite_provider orelse return error.UnsupportedGeneratorProvider },
@@ -117,6 +140,8 @@ const BackendState = struct {
             .termite => |*provider| provider.deinit(),
             .local_termite => {},
         }
+        self.auth_header_cache.deinit(self.alloc);
+        if (self.api_key) |*api_key| api_key.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -137,7 +162,14 @@ const BackendState = struct {
         }
 
         var result = switch (self.provider) {
-            .openai => |*provider| try provider.generator().generate(alloc, model, inference_messages),
+            .openai => |*provider| blk: {
+                if (self.api_key) |*api_key_ref| {
+                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
+                    defer alloc.free(auth_header);
+                    try provider.setAuthorizationHeader(auth_header);
+                }
+                break :blk try provider.generator().generate(alloc, model, inference_messages);
+            },
             .termite => |*provider| try provider.generator().generate(alloc, model, inference_messages),
             .local_termite => |local| blk: {
                 const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
@@ -187,6 +219,17 @@ pub fn executeChainWithLocalTermite(
     messages: []const ChatMessage,
 ) !GenerateResult {
     var factory_impl = BackendFactory.initWithLocalTermite(alloc, http, local_termite_provider);
+    return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
+}
+
+pub fn executeChainWithOptions(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    chain: []const ChainLink,
+    options: BackendFactory.Options,
+    messages: []const ChatMessage,
+) !GenerateResult {
+    var factory_impl = BackendFactory.initWithOptions(alloc, http, options);
     return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
 }
 

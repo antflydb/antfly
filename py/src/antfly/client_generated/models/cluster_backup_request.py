@@ -4,6 +4,7 @@ from typing import Any, TypeVar, Union, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.cluster_backup_request_format import ClusterBackupRequestFormat
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="ClusterBackupRequest")
@@ -22,12 +23,20 @@ class ClusterBackupRequest:
 
             The backup includes all table data, indexes, and metadata.
              Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
+        format_ (Union[Unset, ClusterBackupRequestFormat]): Backup format to use:
+            - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
+            - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
+            restored by any Antfly backend)
+
+            On restore, the format is auto-detected from file magic bytes.
+             Default: ClusterBackupRequestFormat.PORTABLE. Example: portable.
         table_names (Union[Unset, list[str]]): Optional list of tables to backup. If omitted, all tables are backed up.
              Example: ['users', 'products'].
     """
 
     backup_id: str
     location: str
+    format_: Union[Unset, ClusterBackupRequestFormat] = ClusterBackupRequestFormat.PORTABLE
     table_names: Union[Unset, list[str]] = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -35,6 +44,10 @@ class ClusterBackupRequest:
         backup_id = self.backup_id
 
         location = self.location
+
+        format_: Union[Unset, str] = UNSET
+        if not isinstance(self.format_, Unset):
+            format_ = self.format_.value
 
         table_names: Union[Unset, list[str]] = UNSET
         if not isinstance(self.table_names, Unset):
@@ -48,6 +61,8 @@ class ClusterBackupRequest:
                 "location": location,
             }
         )
+        if format_ is not UNSET:
+            field_dict["format"] = format_
         if table_names is not UNSET:
             field_dict["table_names"] = table_names
 
@@ -60,11 +75,19 @@ class ClusterBackupRequest:
 
         location = d.pop("location")
 
+        _format_ = d.pop("format", UNSET)
+        format_: Union[Unset, ClusterBackupRequestFormat]
+        if isinstance(_format_, Unset):
+            format_ = UNSET
+        else:
+            format_ = ClusterBackupRequestFormat(_format_)
+
         table_names = cast(list[str], d.pop("table_names", UNSET))
 
         cluster_backup_request = cls(
             backup_id=backup_id,
             location=location,
+            format_=format_,
             table_names=table_names,
         )
 

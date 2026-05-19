@@ -18,6 +18,7 @@ const hbs = @import("handlebars");
 const template_mod = @import("template.zig");
 const pdf_mod = @import("antfly_pdf");
 const scraping = @import("antfly_scraping");
+const common_secrets = @import("common/secrets.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -29,10 +30,14 @@ pub const RenderError = error{
 const RenderContext = struct {
     alloc: Allocator,
     pdf_backend: pdf_mod.Backend,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    secret_store: ?*common_secrets.FileStore = null,
 };
 
 pub const RenderConfig = struct {
     pdf_backend: pdf_mod.Backend = pdf_mod.Backend.system(),
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    secret_store: ?*common_secrets.FileStore = null,
 };
 
 const remote_fetch_security = scraping.ContentSecurityConfig{
@@ -67,6 +72,8 @@ pub fn renderJsonToTextWithConfig(
     var render_ctx = RenderContext{
         .alloc = alloc,
         .pdf_backend = config.pdf_backend,
+        .remote_content = config.remote_content,
+        .secret_store = config.secret_store,
     };
     const prev_ctx = active_render_context;
     active_render_context = &render_ctx;
@@ -125,7 +132,7 @@ fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         return .{ .safe_string = result };
     };
 
-    const fetched = scraping.downloadContentOutcomeAlloc(render_ctx.alloc, url_str, &remote_fetch_security, null) catch |err| {
+    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
         return .{ .safe_string = result };
     };
@@ -186,7 +193,7 @@ fn remoteTextHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         return .{ .safe_string = result };
     };
 
-    const fetched = scraping.downloadContentOutcomeAlloc(render_ctx.alloc, url_str, &remote_fetch_security, null) catch |err| {
+    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
         return .{ .safe_string = result };
     };
@@ -222,7 +229,7 @@ fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         return .{ .safe_string = result };
     };
 
-    const fetched = scraping.downloadContentOutcomeAlloc(render_ctx.alloc, url_str, &remote_fetch_security, null) catch |err| {
+    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
         return .{ .safe_string = result };
     };
@@ -252,6 +259,163 @@ fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
 
     const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remotePDF requires an application/pdf response");
     return .{ .safe_string = result };
+}
+
+fn credentialName(ctx: hbs.HelperContext) ?[]const u8 {
+    const value = ctx.hash.get("credentials") orelse return null;
+    return switch (value) {
+        .string => |text| if (text.len > 0) text else null,
+        else => null,
+    };
+}
+
+fn downloadRemoteContentOutcomeAlloc(
+    render_ctx: *RenderContext,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !scraping.DownloadOutcome {
+    var resolved = try resolveRemoteContentFetchOptions(render_ctx.alloc, render_ctx.remote_content, render_ctx.secret_store, url, credential_name);
+    defer resolved.deinit(render_ctx.alloc);
+    return try scraping.downloadContentOutcomeAllocWithHeaders(
+        render_ctx.alloc,
+        url,
+        resolved.security orelse &remote_fetch_security,
+        if (resolved.s3_credentials) |*creds| creds else null,
+        resolved.http_headers,
+    );
+}
+
+const ResolvedRemoteContentFetchOptions = struct {
+    security: ?*const scraping.ContentSecurityConfig = null,
+    s3_credentials: ?scraping.S3CredentialsConfig = null,
+    http_headers: ?[]scraping.HTTPHeader = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.s3_credentials) |*creds| creds.deinit(alloc);
+        if (self.http_headers) |headers| {
+            for (headers) |header| {
+                alloc.free(@constCast(header.name));
+                alloc.free(@constCast(header.value));
+            }
+            alloc.free(headers);
+        }
+        self.* = undefined;
+    }
+};
+
+fn resolveRemoteContentFetchOptions(
+    alloc: Allocator,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    secret_store: ?*common_secrets.FileStore,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !ResolvedRemoteContentFetchOptions {
+    const cfg = remote_content orelse return .{};
+    const parsed = std.Uri.parse(url) catch return .{ .security = if (cfg.security) |*security| security else null };
+    if (std.mem.eql(u8, parsed.scheme, "s3")) {
+        const credential = selectS3Credential(cfg, parsed, credential_name);
+        return .{
+            .security = if (credential) |creds|
+                if (creds.security) |*security| security else if (cfg.security) |*security| security else null
+            else if (cfg.security) |*security| security else null,
+            .s3_credentials = if (credential) |creds| try resolveS3Credential(alloc, secret_store, creds) else null,
+        };
+    }
+    if (std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https")) {
+        const credential = selectHttpCredential(cfg, url, credential_name);
+        return .{
+            .security = if (credential) |creds|
+                if (creds.security) |*security| security else if (cfg.security) |*security| security else null
+            else if (cfg.security) |*security| security else null,
+            .http_headers = if (credential) |creds| try resolveHttpHeaders(alloc, secret_store, creds) else null,
+        };
+    }
+    return .{ .security = if (cfg.security) |*security| security else null };
+}
+
+fn selectS3Credential(
+    cfg: *const scraping.RemoteContentConfig,
+    parsed: std.Uri,
+    credential_name: ?[]const u8,
+) ?*const scraping.S3CredentialConfig {
+    if (credential_name) |name| return cfg.getS3(name);
+    const bucket = (parsed.host orelse return null).percent_encoded;
+    var it = cfg.s3.iterator();
+    while (it.next()) |entry| {
+        const credential = entry.value_ptr;
+        const patterns = credential.buckets orelse continue;
+        for (patterns) |pattern| {
+            if (bucketPatternMatches(pattern, bucket)) return credential;
+        }
+    }
+    if (cfg.default_s3) |name| return cfg.getS3(name);
+    return null;
+}
+
+fn selectHttpCredential(
+    cfg: *const scraping.RemoteContentConfig,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) ?*const scraping.HTTPCredentialConfig {
+    if (credential_name) |name| return cfg.getHttp(name);
+    var it = cfg.http.iterator();
+    while (it.next()) |entry| {
+        const credential = entry.value_ptr;
+        const base_url = credential.base_url orelse continue;
+        if (std.mem.startsWith(u8, url, base_url)) return credential;
+    }
+    return null;
+}
+
+fn resolveS3Credential(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    credential: *const scraping.S3CredentialConfig,
+) !scraping.S3CredentialsConfig {
+    return .{
+        .endpoint = if (credential.endpoint) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
+        .use_ssl = credential.use_ssl,
+        .access_key_id = if (credential.access_key_id) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
+        .secret_access_key = if (credential.secret_access_key) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
+        .session_token = if (credential.session_token) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
+    };
+}
+
+fn resolveHttpHeaders(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    credential: *const scraping.HTTPCredentialConfig,
+) ![]scraping.HTTPHeader {
+    var headers = try alloc.alloc(scraping.HTTPHeader, credential.headers.count());
+    errdefer alloc.free(headers);
+    var written: usize = 0;
+    errdefer {
+        for (headers[0..written]) |header| {
+            alloc.free(@constCast(header.name));
+            alloc.free(@constCast(header.value));
+        }
+    }
+    var it = credential.headers.iterator();
+    while (it.next()) |entry| {
+        const name = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(name);
+        const value = try common_secrets.resolveReferenceOwned(alloc, secret_store, entry.value_ptr.*);
+        errdefer alloc.free(value);
+        headers[written] = .{
+            .name = name,
+            .value = value,
+        };
+        written += 1;
+    }
+    return headers;
+}
+
+fn bucketPatternMatches(pattern: []const u8, bucket: []const u8) bool {
+    if (std.mem.eql(u8, pattern, "*")) return true;
+    const star = std.mem.indexOfScalar(u8, pattern, '*') orelse return std.mem.eql(u8, pattern, bucket);
+    const prefix = pattern[0..star];
+    const suffix = pattern[star + 1 ..];
+    return std.mem.startsWith(u8, bucket, prefix) and std.mem.endsWith(u8, bucket, suffix);
 }
 
 test "template remote renders remotePDF extract with injected pdf backend" {

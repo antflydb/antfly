@@ -19,6 +19,12 @@ class LinearMergeRequest:
     """Linear merge operation for syncing sorted records from external sources.
     Use this to keep Antfly in sync with an external database or data source.
 
+    Requests may be sent as plain JSON or gzip-compressed JSON
+    (`Content-Encoding: gzip`).
+
+    Request bodies are limited to 64 MiB after decompression. Requests that
+    exceed this limit return HTTP 413.
+
     **How it works:**
     1. Send sorted records from your external source
     2. Server upserts records that exist in your batch
@@ -32,8 +38,7 @@ class LinearMergeRequest:
                 "resource_id_2": {...}}
 
                 Requirements:
-                - Keys must be sorted lexicographically by your client
-                - Server will process keys in sorted order
+                - The server processes keys in lexicographic order
                 - Use consistent key naming (e.g., all start with same prefix)
 
                 This format avoids duplicate IDs and matches Antfly's batch write interface.

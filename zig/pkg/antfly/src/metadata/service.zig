@@ -15,6 +15,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fs_paths = @import("../common/fs_paths.zig");
+const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("mod.zig");
 const metadata_api = @import("api.zig");
 const raft_engine = @import("raft_engine");
@@ -213,6 +214,7 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     metadata_orchestration_urls: []const MetadataOrchestrationUrl = &.{},
+    secret_store: ?*common_secrets.FileStore = null,
 };
 
 pub const MetadataOrchestrationUrl = struct {
@@ -713,6 +715,7 @@ pub const MetadataService = struct {
     store_status_backfill_marker_cache: StoreStatusBackfillMarkerCache = .{},
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
+    secret_store: ?*common_secrets.FileStore = null,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -745,6 +748,7 @@ pub const MetadataService = struct {
             .reconcile_lease = metadata_reconcile_lease.State.init(host_cfg.host.local_node_id, cfg.reconcile_lease),
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
+            .secret_store = cfg.secret_store,
             .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, deps.host, cfg.raft, deps.raft),
         };
         errdefer service.deinit();
@@ -1689,12 +1693,14 @@ pub const MetadataService = struct {
             api_table_catalog.CatalogSource.fromMetadataService(self),
         );
         write_source.backend_runtime = try self.ensureBackendRuntime();
+        _ = write_source.withSecretStore(self.secret_store);
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
+                .secret_store = self.secret_store,
             },
         };
         const summary = coordinator.runRound(self) catch |err| switch (err) {
@@ -1741,6 +1747,7 @@ pub const MetadataService = struct {
                 .alloc = self.alloc,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
+                .secret_store = self.secret_store,
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| switch (err) {
@@ -1833,6 +1840,7 @@ pub const MetadataHttpService = struct {
     store_status_backfill_marker_cache: StoreStatusBackfillMarkerCache = .{},
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
+    secret_store: ?*common_secrets.FileStore = null,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -1866,6 +1874,7 @@ pub const MetadataHttpService = struct {
             .reconcile_lease = metadata_reconcile_lease.State.init(host_cfg.http.host.local_node_id, cfg.reconcile_lease),
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
+            .secret_store = cfg.secret_store,
             .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, deps.http, cfg.raft, deps.raft),
         };
@@ -3152,6 +3161,7 @@ pub const MetadataHttpService = struct {
             self.raft.host.http_host.request_executor,
         );
         _ = hosted_write_source.withBackendRuntime(try self.ensureBackendRuntime());
+        _ = hosted_write_source.withSecretStore(self.secret_store);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
@@ -3159,6 +3169,7 @@ pub const MetadataHttpService = struct {
                 .alloc = self.alloc,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
+                .secret_store = self.secret_store,
             },
         };
         const summary = coordinator.runRound(self) catch |err| switch (err) {
@@ -3208,6 +3219,7 @@ pub const MetadataHttpService = struct {
                 .alloc = self.alloc,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
+                .secret_store = self.secret_store,
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| switch (err) {

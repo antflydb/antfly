@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const AtomicU64 = platform.atomic.Value(u64);
 const fs_paths = @import("../../common/fs_paths.zig");
+const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
 const db_config = @import("config.zig");
@@ -70,6 +71,12 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test o
     @import("template_remote_stub.zig")
 else
     @import("../../template_remote.zig");
+const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+    struct {
+        pub const RemoteContentConfig = opaque {};
+    }
+else
+    @import("antfly_scraping");
 const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
@@ -136,6 +143,8 @@ pub const OpenOptions = struct {
     index_open_parallelism: ?usize = null,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
@@ -2047,6 +2056,8 @@ pub const DB = struct {
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     ttl_cleanup_context: ?*TtlCleanupContext,
@@ -2213,6 +2224,8 @@ pub const DB = struct {
                 .owned_backend_runtime = owned_backend_runtime,
                 .executor = executor,
                 .start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers,
+                .secret_store = opts.secret_store,
+                .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
                 .enrichment_runtime = null,
                 .ttl_cleanup_context = null,
@@ -2477,7 +2490,10 @@ pub const DB = struct {
     }
 
     fn initOptionalRuntimes(self: *DB, opts: OpenOptions) !void {
-        if (opts.enrichment) |enrichment_cfg| {
+        if (opts.enrichment) |raw_enrichment_cfg| {
+            var enrichment_cfg = raw_enrichment_cfg;
+            if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
+            if (enrichment_cfg.remote_content == null) enrichment_cfg.remote_content = opts.remote_content;
             try self.initOptionalEnrichmentRuntime(enrichment_cfg);
         }
         if (opts.ttl_cleanup.enabled) {
@@ -9183,6 +9199,53 @@ fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool
     return request.chunk_size > 0 or request.chunker_json.len > 0;
 }
 
+fn remoteRenderConfig(
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) template_remote.RenderConfig {
+    var config: template_remote.RenderConfig = .{};
+    if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
+        config.secret_store = secret_store;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
+        config.remote_content = remote_content;
+    }
+    return config;
+}
+
+fn renderSourceTemplateText(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    template_source: []const u8,
+    doc_value: []const u8,
+) ![]const u8 {
+    return try template_remote.renderJsonToTextWithConfig(
+        alloc,
+        template_source,
+        doc_value,
+        remoteRenderConfig(secret_store, remote_content),
+    );
+}
+
+fn renderSourceTemplateParts(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    template_source: []const u8,
+    doc_value: []const u8,
+) ![]template_mod.ContentPart {
+    if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig")) {
+        return try template_remote.renderJsonToPartsWithConfig(
+            alloc,
+            template_source,
+            doc_value,
+            remoteRenderConfig(secret_store, remote_content),
+        );
+    }
+    return try template_remote.renderJsonToParts(alloc, template_source, doc_value);
+}
+
 fn makeChunkCacheKey(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{d}\x1f{d}\x1f{s}", .{
         request.doc_key,
@@ -9196,6 +9259,7 @@ fn makeChunkCacheKey(alloc: Allocator, request: enrichment_types.GeneratedEnrich
 
 fn getOrCreateChunks(
     alloc: Allocator,
+    db: *DB,
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
@@ -9211,7 +9275,7 @@ fn getOrCreateChunks(
     }
 
     const source_text = if (request.source_template.len > 0)
-        template_remote.renderJsonToText(alloc, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -9340,7 +9404,7 @@ fn computeChunkRequestDerived(
     if (!requestHasChunking(request)) return;
 
     const artifact_name = requestArtifactName(request);
-    const chunks = try getOrCreateChunks(alloc, doc_value, request, cache);
+    const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
     if (chunks.len == 0) return;
 
     const persist_chunks = try shouldStoreChunkArtifacts(alloc, request);
@@ -9401,7 +9465,7 @@ fn computeChunkRequest(
     if (!requestHasChunking(request)) return;
 
     const artifact_name = requestArtifactName(request);
-    const chunks = try getOrCreateChunks(alloc, doc_value, request, cache);
+    const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
     if (chunks.len == 0) return;
 
     const persist_chunks = try shouldStoreChunkArtifacts(alloc, request);
@@ -9604,7 +9668,7 @@ fn computeDenseRequestImpl(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        const chunks = try getOrCreateChunks(alloc, doc_value, request, cache);
+        const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
         var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
         defer chunk_texts.deinit(alloc);
         var chunk_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -9643,7 +9707,7 @@ fn computeDenseRequestImpl(
     }
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = renderSourceParts(alloc, doc_value, request) catch null;
+        const source_parts = renderSourceParts(alloc, db, doc_value, request) catch null;
         if (source_parts) |parts| {
             defer template_mod.freeContentParts(alloc, parts);
 
@@ -9667,7 +9731,7 @@ fn computeDenseRequestImpl(
     }
 
     const source_text = if (request.source_template.len > 0)
-        template_remote.renderJsonToText(alloc, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -9716,7 +9780,7 @@ fn computeSparseRequestDerived(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        const chunks = try getOrCreateChunks(alloc, doc_value, request, cache);
+        const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
         var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
         defer chunk_texts.deinit(alloc);
         var chunk_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -9753,7 +9817,7 @@ fn computeSparseRequestDerived(
     }
 
     const source_text = if (request.source_template.len > 0)
-        template_remote.renderJsonToText(alloc, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -9910,11 +9974,12 @@ fn prepareGeneratedEnrichments(
 
 fn renderSourceParts(
     alloc: Allocator,
+    db: *DB,
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = template_remote.renderJsonToParts(alloc, request.source_template, doc_value) catch return null;
+    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
     if (parts.len == 0) {
         template_mod.freeContentParts(alloc, parts);
         return null;
@@ -14117,8 +14182,9 @@ fn allocStressDenseDocJson(alloc: Allocator, dims: usize, doc_index: usize) ![]u
 fn tempPath(buf: []u8) [*:0]const u8 {
     const base = "/tmp/antfly-db-test-";
     const ts = monotonicTimeNs();
+    const pid: u32 = @intCast(std.posix.system.getpid());
     const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}-{d}\x00", .{ base, pid, ts, nonce }) catch unreachable;
     return @ptrCast(path.ptr);
 }
 

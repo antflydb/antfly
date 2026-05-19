@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const backups_api = @import("backups.zig");
+const common_secrets = @import("../common/secrets.zig");
 
 pub const ClusterApi = struct {
     ptr: *anyopaque,
@@ -115,13 +116,14 @@ pub fn handleClusterBackup(
     alloc: std.mem.Allocator,
     body: []const u8,
     api: ClusterApi,
+    secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
     var req = backups_api.parseClusterBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     };
     defer backups_api.freeClusterBackupRequest(alloc, &req);
 
-    var location = backups_api.openBackupLocation(alloc, req.location) catch |err| {
+    var location = backups_api.openBackupLocationWithSecrets(alloc, req.location, secret_store) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -140,13 +142,14 @@ pub fn handleClusterRestore(
     alloc: std.mem.Allocator,
     body: []const u8,
     api: ClusterApi,
+    secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
     var req = backups_api.parseClusterRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
     defer backups_api.freeClusterRestoreRequest(alloc, &req);
 
-    var location = backups_api.openBackupLocation(alloc, req.location) catch |err| {
+    var location = backups_api.openBackupLocationWithSecrets(alloc, req.location, secret_store) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }

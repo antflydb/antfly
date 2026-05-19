@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
@@ -200,6 +201,7 @@ pub const ApiHttpServerConfig = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
@@ -407,7 +409,7 @@ pub const StatusSource = struct {
             }
 
             fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void {
-                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, backup_id);
+                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, backup_id, serviceSecretStore(cast(ptr)));
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
@@ -509,8 +511,9 @@ fn loadRestoreMetadataSpec(
     table_name: []const u8,
     location_uri: []const u8,
     backup_id: []const u8,
+    secret_store: ?*common_secrets.FileStore,
 ) !RestoreMetadataSpec {
-    var location = try backups_api.openBackupLocation(alloc, location_uri);
+    var location = try backups_api.openBackupLocationWithSecrets(alloc, location_uri, secret_store);
     defer location.deinit(alloc);
     var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
     errdefer manifest.deinit(alloc);
@@ -600,12 +603,21 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     try svc.runRound();
 }
 
-fn persistRestoreTableIntent(service: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+fn serviceSecretStore(service: anytype) ?*common_secrets.FileStore {
+    const Ptr = @TypeOf(service);
+    const Service = std.meta.Child(Ptr);
+    if (comptime @hasField(Service, "secret_store")) {
+        return service.secret_store;
+    }
+    return null;
+}
+
+fn persistRestoreTableIntent(service: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8, secret_store: ?*common_secrets.FileStore) !void {
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     if (tables_api.findTableByName(&snapshot, table_name) != null) return error.TableAlreadyExists;
 
-    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id);
+    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, secret_store);
     defer spec.deinit(alloc);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -1992,6 +2004,7 @@ pub const ApiHttpServer = struct {
             defer arena_impl.deinit();
             const QueryBuilderGenerationRunner = struct {
                 local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+                secret_store: ?*common_secrets.FileStore,
 
                 fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                     return .{
@@ -2011,10 +2024,10 @@ pub const ApiHttpServer = struct {
                     defer io_impl.deinit();
                     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                     defer client.deinit();
-                    return try generating_runtime.executeChainWithLocalTermite(alloc, &client, chain, runner.local_termite_provider, messages);
+                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
                 }
             };
-            var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.local_termite_provider };
+            var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
             var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
             const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
                 error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
@@ -2559,6 +2572,7 @@ pub const ApiHttpServer = struct {
 
         const RetrievalGenerationRunner = struct {
             local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -2578,10 +2592,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(inner_alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithLocalTermite(inner_alloc, &client, chain, runner.local_termite_provider, messages);
+                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider };
+        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -2729,6 +2743,7 @@ pub const ApiHttpServer = struct {
 
         const RetrievalGenerationRunner = struct {
             local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -2748,10 +2763,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithLocalTermite(alloc, &client, chain, runner.local_termite_provider, messages);
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider };
+        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -4263,7 +4278,7 @@ pub const ApiHttpServer = struct {
             return json;
         }
 
-        const join_req = distributed_join.parseSupportedJoinRequest(alloc, body) catch |err| switch (err) {
+        const join_req = distributed_join.parseSupportedJoinRequestWithSecrets(alloc, body, self.cfg.secret_store) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => {
                 std.log.err("public table join parse failed table={s} err={}", .{ table_name, err });
@@ -4339,7 +4354,7 @@ pub const ApiHttpServer = struct {
         defer parsed_request.deinit();
         const request = parsed_request.value;
 
-        var foreign_sources = foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolved(alloc, request.foreign_sources) catch |err| switch (err) {
+        var foreign_sources = foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, request.foreign_sources, self.cfg.secret_store) catch |err| switch (err) {
             error.UnsupportedSourceKind => return error.UnsupportedQueryRequest,
             else => return err,
         };
@@ -4349,7 +4364,7 @@ pub const ApiHttpServer = struct {
         try validateSupportedForeignPublicQueryRequest(request);
 
         if (request.join != null) {
-            const parsed_join = (try distributed_join.parseSupportedJoinRequest(alloc, body)) orelse return error.InvalidQueryRequest;
+            const parsed_join = (try distributed_join.parseSupportedJoinRequestWithSecrets(alloc, body, self.cfg.secret_store)) orelse return error.InvalidQueryRequest;
             defer {
                 var owned = parsed_join;
                 owned.deinit(alloc);
@@ -5157,7 +5172,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi());
+        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -5174,7 +5189,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableRestore(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi());
+        var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             202 => blk: {
@@ -5205,7 +5220,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterBackup(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi());
+        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => blk: {
@@ -5219,7 +5234,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterRestore(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi());
+        var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             202 => blk: {
@@ -14182,7 +14197,7 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
     defer manifest.deinit(alloc);
     try backups_api.writeManifest(alloc, backup_root, &manifest);
 
-    var spec = try loadRestoreMetadataSpec(alloc, "docs", location_uri, "snap1");
+    var spec = try loadRestoreMetadataSpec(alloc, "docs", location_uri, "snap1", null);
     defer spec.deinit(alloc);
 
     try std.testing.expectEqualStrings("", spec.table.restore_backup_id);

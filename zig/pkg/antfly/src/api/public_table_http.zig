@@ -17,6 +17,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const common_secrets = @import("../common/secrets.zig");
 
 pub const TableApi = struct {
     ptr: *anyopaque,
@@ -323,13 +324,14 @@ pub fn handleTableBackup(
     table_name: []const u8,
     body: []const u8,
     api: TableApi,
+    secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     };
     defer parsed_req.deinit();
 
-    var location = backups_api.openBackupLocation(alloc, parsed_req.value.location) catch |err| {
+    var location = backups_api.openBackupLocationWithSecrets(alloc, parsed_req.value.location, secret_store) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -356,13 +358,14 @@ pub fn handleTableRestore(
     table_name: []const u8,
     body: []const u8,
     api: TableApi,
+    secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
     defer parsed_req.deinit();
 
-    var location = backups_api.openBackupLocation(alloc, parsed_req.value.location) catch |err| {
+    var location = backups_api.openBackupLocationWithSecrets(alloc, parsed_req.value.location, secret_store) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -812,6 +815,7 @@ test "public table backup handler maps unsupported multi-range error" {
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
         Backend.iface(),
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -855,6 +859,7 @@ test "public table restore handler maps target already exists" {
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
         Backend.iface(),
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 

@@ -45,8 +45,17 @@ pub const Provider = struct {
 
     /// Set Bearer token for authentication (OpenAI API key).
     pub fn setApiKey(self: *Provider, api_key: []const u8) !void {
-        if (self.auth_header) |h| self.allocator.free(h[1]);
-        self.auth_header = .{ "Authorization", try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key}) };
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
+        defer self.allocator.free(auth_header);
+        try self.setAuthorizationHeader(auth_header);
+    }
+
+    pub fn setAuthorizationHeader(self: *Provider, auth_header: []const u8) !void {
+        if (self.auth_header) |h| {
+            if (std.mem.eql(u8, h[1], auth_header)) return;
+            self.allocator.free(h[1]);
+        }
+        self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
     }
 
     pub fn embedder(self: *Provider) inference.Embedder {

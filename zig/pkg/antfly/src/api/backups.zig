@@ -20,6 +20,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
 const tables_api = @import("tables.zig");
+const common_secrets = @import("../common/secrets.zig");
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
@@ -110,7 +111,7 @@ const RemoteBackupStore = struct {
     bucket: []u8,
     prefix: []u8,
 
-    fn initRemoteUri(alloc: std.mem.Allocator, location: []const u8) !RemoteBackupStore {
+    fn initRemoteUri(alloc: std.mem.Allocator, location: []const u8, secret_store: ?*common_secrets.FileStore) !RemoteBackupStore {
         const normalized = try normalizeRemoteLocationAlloc(alloc, location);
         defer alloc.free(normalized);
 
@@ -124,7 +125,7 @@ const RemoteBackupStore = struct {
         return switch (parsed) {
             .file => error.UnsupportedBackupLocation,
             .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix),
-            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix),
+            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix, secret_store),
         };
     }
 
@@ -143,10 +144,26 @@ const RemoteBackupStore = struct {
         };
     }
 
-    fn initS3Uri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8) !RemoteBackupStore {
+    fn initS3Uri(
+        alloc: std.mem.Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        secret_store: ?*common_secrets.FileStore,
+    ) !RemoteBackupStore {
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try object_storage.S3.fromEnvAlloc(alloc, null, true, null, null, null, null, .path);
+        var overrides = try loadS3SecretOverrides(alloc, secret_store);
+        defer overrides.deinit(alloc);
+        const cfg = try object_storage.S3.fromEnvAlloc(
+            alloc,
+            overrides.endpoint,
+            true,
+            overrides.access_key_id,
+            overrides.secret_access_key,
+            overrides.session_token,
+            overrides.region,
+            .path,
+        );
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
 
         return .{
@@ -275,6 +292,45 @@ const RemoteBackupStore = struct {
     }
 };
 
+const S3SecretOverrides = struct {
+    endpoint: ?[]u8 = null,
+    access_key_id: ?[]u8 = null,
+    secret_access_key: ?[]u8 = null,
+    session_token: ?[]u8 = null,
+    region: ?[]u8 = null,
+
+    fn deinit(self: *S3SecretOverrides, alloc: std.mem.Allocator) void {
+        if (self.endpoint) |value| alloc.free(value);
+        if (self.access_key_id) |value| alloc.free(value);
+        if (self.secret_access_key) |value| alloc.free(value);
+        if (self.session_token) |value| alloc.free(value);
+        if (self.region) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+fn loadS3SecretOverrides(alloc: std.mem.Allocator, secret_store: ?*common_secrets.FileStore) !S3SecretOverrides {
+    const store = secret_store orelse return .{};
+    return .{
+        .endpoint = try firstStoredSecretOwned(alloc, store, &.{ "aws.endpoint_url", "AWS_ENDPOINT_URL" }),
+        .access_key_id = try firstStoredSecretOwned(alloc, store, &.{ "aws.access_key_id", "AWS_ACCESS_KEY_ID" }),
+        .secret_access_key = try firstStoredSecretOwned(alloc, store, &.{ "aws.secret_access_key", "AWS_SECRET_ACCESS_KEY" }),
+        .session_token = try firstStoredSecretOwned(alloc, store, &.{ "aws.session_token", "AWS_SESSION_TOKEN" }),
+        .region = try firstStoredSecretOwned(alloc, store, &.{ "aws.region", "AWS_REGION" }),
+    };
+}
+
+fn firstStoredSecretOwned(
+    alloc: std.mem.Allocator,
+    store: *common_secrets.FileStore,
+    keys: []const []const u8,
+) !?[]u8 {
+    for (keys) |key| {
+        if (try store.getOwned(alloc, key)) |value| return value;
+    }
+    return null;
+}
+
 pub const ClusterTableBackupEntry = struct {
     name: []const u8,
     table_backup_id: []const u8,
@@ -329,11 +385,19 @@ pub const BackupInfo = struct {
 };
 
 pub fn openBackupLocation(alloc: std.mem.Allocator, location: []const u8) !BackupLocation {
+    return try openBackupLocationWithSecrets(alloc, location, null);
+}
+
+pub fn openBackupLocationWithSecrets(
+    alloc: std.mem.Allocator,
+    location: []const u8,
+    secret_store: ?*common_secrets.FileStore,
+) !BackupLocation {
     if (std.mem.startsWith(u8, location, "file://")) {
         return .{ .file = try alloc.dupe(u8, try parseFileLocation(location)) };
     }
     if (std.mem.startsWith(u8, location, "s3://") or std.mem.startsWith(u8, location, "gs://") or std.mem.startsWith(u8, location, "gcs://")) {
-        return .{ .remote = try RemoteBackupStore.initRemoteUri(alloc, location) };
+        return .{ .remote = try RemoteBackupStore.initRemoteUri(alloc, location, secret_store) };
     }
     return error.UnsupportedBackupLocation;
 }
