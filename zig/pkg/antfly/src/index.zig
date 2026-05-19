@@ -770,6 +770,7 @@ pub const IndexWriter = struct {
         }
 
         const new_segments = try self.alloc.alloc(SegmentEntry, keep_count);
+        errdefer self.alloc.free(new_segments);
         const retired = try self.alloc.alloc(SegmentEntry, retire_count);
         var idx: usize = 0;
         var ret_idx: usize = 0;

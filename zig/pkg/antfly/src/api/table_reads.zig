@@ -283,6 +283,7 @@ pub const ProvisionedTableReadCache = struct {
             if (!self.hasTableLocked(table_name) and self.cachedTableCountLocked() >= max_cached_tables) self.evictOldestTableLocked();
             const owned_table_name = try self.alloc.dupe(u8, table_name);
             errdefer self.alloc.free(owned_table_name);
+            try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
             const owned_entry = try self.alloc.create(Entry);
             errdefer self.alloc.destroy(owned_entry);
             owned_entry.* = .{
@@ -504,7 +505,7 @@ pub const ProvisionedTableReadCache = struct {
             self.alloc.destroy(entry);
             return;
         }
-        self.retired_entries.append(self.alloc, entry) catch @panic("OOM");
+        self.retired_entries.appendAssumeCapacity(entry);
     }
 
     fn destroyRetiredEntryLocked(self: *ProvisionedTableReadCache, entry: *Entry) void {
@@ -15834,7 +15835,7 @@ test "provisioned read cache retires invalidated entries until the last lease is
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
 }
 
-test "provisioned read cache keeps leased entry live when retirement bookkeeping allocation fails" {
+test "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
     const path = "/tmp/antfly-api-provisioned-read-cache-retire-oom";
@@ -15900,11 +15901,9 @@ test "provisioned read cache keeps leased entry live when retirement bookkeeping
 
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len + cache.retired_entries.items.len);
 
     lease.release();
-    cache.clear();
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
 }

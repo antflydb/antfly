@@ -550,6 +550,7 @@ pub const ProvisionedTableWriteCache = struct {
             try opened.db.beginBulkIngestSession();
             errdefer opened.db.abortBulkIngestSession();
         }
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
@@ -674,6 +675,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_table_name);
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
@@ -1146,7 +1148,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.alloc.destroy(entry);
             return;
         }
-        self.retired_entries.append(self.alloc, entry) catch @panic("OOM");
+        self.retired_entries.appendAssumeCapacity(entry);
     }
 
     fn destroyRetiredEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -15296,7 +15298,7 @@ test "write cache invalidation retires leased entry until release" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
-test "write cache keeps leased entry live when retirement bookkeeping allocation fails" {
+test "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
 
@@ -15357,11 +15359,9 @@ test "write cache keeps leased entry live when retirement bookkeeping allocation
 
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len + write_cache.retired_entries.items.len);
 
     cached.deinit(alloc);
-    write_cache.clear();
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
