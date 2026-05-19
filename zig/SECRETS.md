@@ -386,12 +386,8 @@ Implemented shape:
 
 - store `api_key: ?SecretValue`
 - at request time, resolve the current key from `FileStore`
-- build the auth header from the resolved key for that request
-- avoid storing the cleartext key longer than necessary
-
-Future optimization: if per-request resolution becomes too expensive, cache the
-resolved auth header with the `FileStore` generation number and refresh it when
-the generation changes.
+- cache the bearer auth header by `FileStore` generation
+- refresh the cached auth header when the generation changes
 
 ### Remaining Credential Consumers
 
@@ -401,8 +397,8 @@ workers.
 
 | Subsystem | Current Status | Needed Semantics |
 | --- | --- | --- |
-| Managed OpenAI embedders | Implemented for request-time API key resolution. | Add fake-provider runtime test and consider generation-cached auth headers later. |
-| Generator providers | Implemented for OpenAI-compatible request-time API key resolution. | Add fake-provider runtime test; extend the same pattern when additional provider clients are implemented. |
+| Managed OpenAI embedders | Implemented with generation-cached bearer auth headers. | Add fake-provider runtime test. |
+| Generator providers | Implemented for OpenAI-compatible providers with generation-cached bearer auth headers. | Add fake-provider runtime test; extend the same pattern when additional provider clients are implemented. |
 | Reranker providers | Runtime options now carry and resolve `api_key` references before rerank calls. | Add provider-specific tests once non-local reranker clients are implemented. |
 | Foreign DSNs | Implemented for API query paths that have the API server `FileStore`. | Add runtime tests and define pool invalidation behavior for any long-lived foreign clients. |
 | CDC replication DSNs | Metadata-service snapshot and streaming coordinators pass the service-owned `FileStore` into runners, which resolve before snapshot/stream connections. | Add reconnect/retry tests for active workers after DSN rotation. |
@@ -417,10 +413,12 @@ snapshot used to build them. `FileStore` exposes generation-aware resolution so
 callers can resolve the credential and capture the generation under the same
 store lock. Literal values and environment-only fallback use generation `0`.
 
-Default behavior is per-operation resolution. A subsystem should add a
-generation-keyed cache only when rebuilding the client is expensive or when the
-client is inherently stateful. Cache keys must include non-secret config
-identity plus the resolved secret generation, never the raw secret value.
+Default behavior is per-operation generation check, followed by cache reuse for
+stateful or expensive resources. Auth headers are cached by generation for
+OpenAI-compatible embedders and generators. Long-lived DB pools, S3 clients, and
+remote-content clients should use the same shape: cache keys must include
+non-secret config identity plus the resolved secret generation, never the raw
+secret value.
 
 Foreign DSNs currently resolve per request and create short-lived clients. If a
 long-lived pool is added later, the pool key should be `(logical source,
@@ -444,8 +442,7 @@ Recommended implementation order:
 
 1. Add runtime tests for generator/reranker, foreign DSN, CDC DSN, S3 backup,
    and remote-content credential rotation.
-2. Add generation-keyed client caches where per-request rebuilds become too
-   expensive.
+2. Add generation-keyed client caches for S3/backup and remote-content clients.
 
 ### Config Parsing
 

@@ -288,11 +288,13 @@ fn releaseSharedRequestPacer(scope_key: []const u8) void {
 }
 
 pub const ManagedEmbeddingEntry = struct {
+    alloc: std.mem.Allocator,
     index_name: []u8,
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
     api_key: ?common_secrets.SecretValue = null,
+    auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     dimensions: u32,
@@ -304,10 +306,12 @@ pub const ManagedEmbeddingEntry = struct {
     local_termite_provider: ?LocalTermiteProvider = null,
 
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
+        std.debug.assert(self.alloc.ptr == alloc.ptr);
         alloc.free(self.index_name);
         alloc.free(self.model);
         alloc.free(self.base_url);
         if (self.api_key) |*api_key| api_key.deinit(alloc);
+        self.auth_header_cache.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -834,6 +838,7 @@ fn parseManagedEmbeddingEntry(
         null;
 
     return .{
+        .alloc = alloc,
         .index_name = try alloc.dupe(u8, index_name),
         .provider = provider,
         .model = try alloc.dupe(u8, embedder_cfg.model),
@@ -1492,14 +1497,8 @@ fn embedBatchWithOpenAiCompatible(
     });
     defer alloc.free(json_body);
 
-    const api_key = if (entry.api_key) |*api_key_ref|
-        try api_key_ref.resolveOwned(alloc, entry.secret_store)
-    else
-        null;
-    defer if (api_key) |value| alloc.free(value);
-
-    const auth_header = if (api_key) |value|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{value})
+    const auth_header = if (entry.api_key) |*api_key_ref|
+        try @constCast(entry).auth_header_cache.getOwned(entry.alloc, alloc, api_key_ref, entry.secret_store)
     else
         null;
     defer if (auth_header) |value| alloc.free(value);

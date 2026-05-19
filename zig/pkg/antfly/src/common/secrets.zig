@@ -146,6 +146,38 @@ pub const ResolvedSecret = struct {
     }
 };
 
+pub const BearerAuthHeaderCache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    generation: u64 = 0,
+    header: ?[]u8 = null,
+
+    pub fn deinit(self: *BearerAuthHeaderCache, alloc: std.mem.Allocator) void {
+        if (self.header) |value| alloc.free(value);
+        self.* = undefined;
+    }
+
+    pub fn getOwned(
+        self: *BearerAuthHeaderCache,
+        cache_alloc: std.mem.Allocator,
+        out_alloc: std.mem.Allocator,
+        secret: *const SecretValue,
+        secret_store: ?*FileStore,
+    ) ![]u8 {
+        var resolved = try secret.resolveOwnedWithGeneration(out_alloc, secret_store);
+        defer resolved.deinit(out_alloc);
+
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+
+        if (self.header == null or self.generation != resolved.cacheGeneration()) {
+            if (self.header) |value| cache_alloc.free(value);
+            self.header = try std.fmt.allocPrint(cache_alloc, "Bearer {s}", .{resolved.value});
+            self.generation = resolved.cacheGeneration();
+        }
+        return try out_alloc.dupe(u8, self.header.?);
+    }
+};
+
 const StoredSecret = struct {
     value: []u8,
     created_at_ns: u64,
@@ -997,6 +1029,45 @@ test "secret resolution reports file generation for cache invalidation" {
     try std.testing.expectEqualStrings("postgres://literal", literal.value);
     try std.testing.expectEqual(ResolvedSecretSource.literal, literal.source);
     try std.testing.expectEqual(@as(u64, 0), literal.generation);
+}
+
+test "bearer auth header cache rebuilds on file generation change" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secret-auth-header-generation-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    );
+
+    var store = try FileStore.init(alloc, path);
+    defer store.deinit();
+
+    var secret = try SecretValue.initConfig(alloc, "${secret:openai.api_key}") orelse return error.TestUnexpectedResult;
+    defer secret.deinit(alloc);
+
+    var cache = BearerAuthHeaderCache{};
+    defer cache.deinit(alloc);
+
+    const first = try cache.getOwned(alloc, alloc, &secret, &store);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("Bearer first", first);
+    const first_generation = cache.generation;
+
+    const first_again = try cache.getOwned(alloc, alloc, &secret, &store);
+    defer alloc.free(first_again);
+    try std.testing.expectEqualStrings("Bearer first", first_again);
+    try std.testing.expectEqual(first_generation, cache.generation);
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"second","created_at_ns":1,"updated_at_ns":2}]}
+    );
+
+    const second = try cache.getOwned(alloc, alloc, &secret, &store);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("Bearer second", second);
+    try std.testing.expect(cache.generation > first_generation);
 }
 
 test "environment secret discovery maps API key env vars" {

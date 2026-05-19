@@ -87,6 +87,7 @@ const BackendState = struct {
     alloc: std.mem.Allocator,
     cfg: GeneratorConfig,
     api_key: ?common_secrets.SecretValue = null,
+    auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
@@ -108,6 +109,7 @@ const BackendState = struct {
         state.cfg = cfg;
         state.api_key = try common_secrets.SecretValue.initConfig(alloc, cfg.api_key);
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
+        state.auth_header_cache = .{};
         state.secret_store = secret_store;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
@@ -138,6 +140,7 @@ const BackendState = struct {
             .termite => |*provider| provider.deinit(),
             .local_termite => {},
         }
+        self.auth_header_cache.deinit(self.alloc);
         if (self.api_key) |*api_key| api_key.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -160,12 +163,11 @@ const BackendState = struct {
 
         var result = switch (self.provider) {
             .openai => |*provider| blk: {
-                const api_key = if (self.api_key) |*api_key_ref|
-                    try api_key_ref.resolveOwned(alloc, self.secret_store)
-                else
-                    null;
-                defer if (api_key) |value| alloc.free(value);
-                if (api_key) |value| try provider.setApiKey(value);
+                if (self.api_key) |*api_key_ref| {
+                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
+                    defer alloc.free(auth_header);
+                    try provider.setAuthorizationHeader(auth_header);
+                }
                 break :blk try provider.generator().generate(alloc, model, inference_messages);
             },
             .termite => |*provider| try provider.generator().generate(alloc, model, inference_messages),
