@@ -4,6 +4,7 @@ from typing import Any, TypeVar, Union
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="EmbeddingsIndexStats")
@@ -14,6 +15,7 @@ class EmbeddingsIndexStats:
     """Statistics for an embeddings index (dense or sparse)
 
     Attributes:
+        index_type (EmbeddingsIndexStatsIndexType): Discriminator for the index stats variant.
         error (Union[Unset, str]): Error message if stats could not be retrieved
         total_indexed (Union[Unset, int]): Number of vectors/documents in the index
         disk_usage (Union[Unset, int]): Size of the index in bytes
@@ -25,6 +27,7 @@ class EmbeddingsIndexStats:
         backfill_items_processed (Union[Unset, int]): Total items processed during backfill
     """
 
+    index_type: EmbeddingsIndexStatsIndexType
     error: Union[Unset, str] = UNSET
     total_indexed: Union[Unset, int] = UNSET
     disk_usage: Union[Unset, int] = UNSET
@@ -37,6 +40,8 @@ class EmbeddingsIndexStats:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        index_type = self.index_type.value
+
         error = self.error
 
         total_indexed = self.total_indexed
@@ -57,7 +62,11 @@ class EmbeddingsIndexStats:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
+        field_dict.update(
+            {
+                "index_type": index_type,
+            }
+        )
         if error is not UNSET:
             field_dict["error"] = error
         if total_indexed is not UNSET:
@@ -82,6 +91,8 @@ class EmbeddingsIndexStats:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        index_type = EmbeddingsIndexStatsIndexType(d.pop("index_type"))
+
         error = d.pop("error", UNSET)
 
         total_indexed = d.pop("total_indexed", UNSET)
@@ -101,6 +112,7 @@ class EmbeddingsIndexStats:
         backfill_items_processed = d.pop("backfill_items_processed", UNSET)
 
         embeddings_index_stats = cls(
+            index_type=index_type,
             error=error,
             total_indexed=total_indexed,
             disk_usage=disk_usage,

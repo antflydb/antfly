@@ -9,6 +9,7 @@ from dateutil.parser import isoparse
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.api_key_row_filter_type_0 import ApiKeyRowFilterType0
     from ..models.permission import Permission
 
 
@@ -30,6 +31,9 @@ class ApiKeyWithSecret:
             YUJjRGVGZ0hpSmtMbU5vUHFSc1Q6ZEdocGN5QnBjeUJoSUhObFkzSmxkQQ==.
         permissions (Union[None, Unset, list['Permission']]): Optional permission scoping. If empty, inherits owner's
             full permissions.
+        row_filter (Union['ApiKeyRowFilterType0', None, Unset]): Per-table row filter. Keys are table names (or '*' for
+            all tables). Values are bleve query JSON objects. Documents must match this query to be visible through this API
+            key.
         expires_at (Union[None, Unset, datetime.datetime]): When the API key expires. Null means never.
     """
 
@@ -40,10 +44,13 @@ class ApiKeyWithSecret:
     key_secret: str
     encoded: str
     permissions: Union[None, Unset, list["Permission"]] = UNSET
+    row_filter: Union["ApiKeyRowFilterType0", None, Unset] = UNSET
     expires_at: Union[None, Unset, datetime.datetime] = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.api_key_row_filter_type_0 import ApiKeyRowFilterType0
+
         key_id = self.key_id
 
         name = self.name
@@ -68,6 +75,14 @@ class ApiKeyWithSecret:
         else:
             permissions = self.permissions
 
+        row_filter: Union[None, Unset, dict[str, Any]]
+        if isinstance(self.row_filter, Unset):
+            row_filter = UNSET
+        elif isinstance(self.row_filter, ApiKeyRowFilterType0):
+            row_filter = self.row_filter.to_dict()
+        else:
+            row_filter = self.row_filter
+
         expires_at: Union[None, Unset, str]
         if isinstance(self.expires_at, Unset):
             expires_at = UNSET
@@ -90,6 +105,8 @@ class ApiKeyWithSecret:
         )
         if permissions is not UNSET:
             field_dict["permissions"] = permissions
+        if row_filter is not UNSET:
+            field_dict["row_filter"] = row_filter
         if expires_at is not UNSET:
             field_dict["expires_at"] = expires_at
 
@@ -97,6 +114,7 @@ class ApiKeyWithSecret:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.api_key_row_filter_type_0 import ApiKeyRowFilterType0
         from ..models.permission import Permission
 
         d = dict(src_dict)
@@ -134,6 +152,23 @@ class ApiKeyWithSecret:
 
         permissions = _parse_permissions(d.pop("permissions", UNSET))
 
+        def _parse_row_filter(data: object) -> Union["ApiKeyRowFilterType0", None, Unset]:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                row_filter_type_0 = ApiKeyRowFilterType0.from_dict(data)
+
+                return row_filter_type_0
+            except:  # noqa: E722
+                pass
+            return cast(Union["ApiKeyRowFilterType0", None, Unset], data)
+
+        row_filter = _parse_row_filter(d.pop("row_filter", UNSET))
+
         def _parse_expires_at(data: object) -> Union[None, Unset, datetime.datetime]:
             if data is None:
                 return data
@@ -159,6 +194,7 @@ class ApiKeyWithSecret:
             key_secret=key_secret,
             encoded=encoded,
             permissions=permissions,
+            row_filter=row_filter,
             expires_at=expires_at,
         )
 

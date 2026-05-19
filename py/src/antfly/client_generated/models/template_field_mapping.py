@@ -4,7 +4,7 @@ from typing import Any, TypeVar, Union
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.schemas_antfly_type import SchemasAntflyType
+from ..models.antfly_type_2 import AntflyType2
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="TemplateFieldMapping")
@@ -15,7 +15,7 @@ class TemplateFieldMapping:
     """Field mapping to apply when a dynamic template matches
 
     Attributes:
-        type_ (Union[Unset, SchemasAntflyType]): Field type annotations for schema fields
+        type_ (Union[Unset, AntflyType2]): Field type annotations for schema fields
         analyzer (Union[Unset, str]): Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer").
             Used for text fields to control tokenization and normalization.
         index (Union[Unset, bool]): Whether to index the field (default true) Default: True.
@@ -24,7 +24,7 @@ class TemplateFieldMapping:
         doc_values (Union[Unset, bool]): Whether to enable doc values for sorting/faceting Default: False.
     """
 
-    type_: Union[Unset, SchemasAntflyType] = UNSET
+    type_: Union[Unset, AntflyType2] = UNSET
     analyzer: Union[Unset, str] = UNSET
     index: Union[Unset, bool] = True
     store: Union[Unset, bool] = False
@@ -69,11 +69,11 @@ class TemplateFieldMapping:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         _type_ = d.pop("type", UNSET)
-        type_: Union[Unset, SchemasAntflyType]
+        type_: Union[Unset, AntflyType2]
         if isinstance(_type_, Unset):
             type_ = UNSET
         else:
-            type_ = SchemasAntflyType(_type_)
+            type_ = AntflyType2(_type_)
 
         analyzer = d.pop("analyzer", UNSET)
 

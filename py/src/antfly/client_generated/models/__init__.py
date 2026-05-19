@@ -14,6 +14,10 @@ from .aggregation_date_range import AggregationDateRange
 from .aggregation_range import AggregationRange
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
+from .algebraic_index_config import AlgebraicIndexConfig
+from .algebraic_index_stats import AlgebraicIndexStats
+from .algebraic_index_stats_index_type import AlgebraicIndexStatsIndexType
+from .algebraic_index_stats_planner_last_decision import AlgebraicIndexStatsPlannerLastDecision
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
@@ -21,13 +25,17 @@ from .answer_agent_steps import AnswerAgentSteps
 from .antfly_embedder_config import AntflyEmbedderConfig
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_type import AntflyType
+from .antfly_type_2 import AntflyType2
 from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
+from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
 from .audio_chunk_options import AudioChunkOptions
 from .backup_info import BackupInfo
+from .backup_info_format import BackupInfoFormat
 from .backup_list_response import BackupListResponse
 from .backup_request import BackupRequest
+from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
 from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
@@ -59,6 +67,7 @@ from .chunker_provider import ChunkerProvider
 from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
 from .cluster_backup_request import ClusterBackupRequest
+from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
 from .cluster_backup_response_status import ClusterBackupResponseStatus
 from .cluster_health import ClusterHealth
@@ -75,6 +84,7 @@ from .cohere_reranker_config import CohereRerankerConfig
 from .confidence_step_config import ConfidenceStepConfig
 from .conjunction_query import ConjunctionQuery
 from .create_api_key_request import CreateApiKeyRequest
+from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
 from .create_user_request import CreateUserRequest
 from .credentials import Credentials
 from .date_range_string_query import DateRangeStringQuery
@@ -100,6 +110,7 @@ from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
+from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -125,6 +136,7 @@ from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_index_config import FullTextIndexConfig
 from .full_text_index_stats import FullTextIndexStats
+from .full_text_index_stats_index_type import FullTextIndexStatsIndexType
 from .fuzziness_type_1 import FuzzinessType1
 from .fuzzy_query import FuzzyQuery
 from .generation_step_config import GenerationStepConfig
@@ -142,7 +154,10 @@ from .google_search_config import GoogleSearchConfig
 from .google_search_config_search_type import GoogleSearchConfigSearchType
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
+from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
+from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
 from .graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
+from .graph_index_stats_index_type import GraphIndexStatsIndexType
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -242,7 +257,8 @@ from .retrieval_agent_usage import RetrievalAgentUsage
 from .retrieval_strategy import RetrievalStrategy
 from .retry_config import RetryConfig
 from .route_type import RouteType
-from .schemas_antfly_type import SchemasAntflyType
+from .row_filter_entry import RowFilterEntry
+from .row_filter_entry_filter import RowFilterEntryFilter
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -251,6 +267,7 @@ from .semantic_query_mode import SemanticQueryMode
 from .serper_search_config import SerperSearchConfig
 from .serper_search_config_search_type import SerperSearchConfigSearchType
 from .serper_search_config_time_period import SerperSearchConfigTimePeriod
+from .set_row_filter_body import SetRowFilterBody
 from .shard_config import ShardConfig
 from .shards_profile import ShardsProfile
 from .significance_algorithm import SignificanceAlgorithm
@@ -323,6 +340,10 @@ __all__ = (
     "AggregationRange",
     "AggregationResult",
     "AggregationType",
+    "AlgebraicIndexConfig",
+    "AlgebraicIndexStats",
+    "AlgebraicIndexStatsIndexType",
+    "AlgebraicIndexStatsPlannerLastDecision",
     "Analyses",
     "AnalysesResult",
     "AnswerAgentResult",
@@ -330,13 +351,17 @@ __all__ = (
     "AntflyEmbedderConfig",
     "AntflyRerankerConfig",
     "AntflyType",
+    "AntflyType2",
     "AnthropicGeneratorConfig",
     "ApiKey",
+    "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
     "AudioChunkOptions",
     "BackupInfo",
+    "BackupInfoFormat",
     "BackupListResponse",
     "BackupRequest",
+    "BackupRequestFormat",
     "BackupTableResponse201",
     "BatchRequest",
     "BatchRequestInserts",
@@ -368,6 +393,7 @@ __all__ = (
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClusterBackupRequest",
+    "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
     "ClusterBackupResponseStatus",
     "ClusterHealth",
@@ -384,6 +410,7 @@ __all__ = (
     "ConfidenceStepConfig",
     "ConjunctionQuery",
     "CreateApiKeyRequest",
+    "CreateApiKeyRequestRowFilterType0",
     "CreateUserRequest",
     "Credentials",
     "DateRangeStringQuery",
@@ -407,6 +434,7 @@ __all__ = (
     "EmbedderProvider",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
+    "EmbeddingsIndexStatsIndexType",
     "EmbeddingType1",
     "EmbeddingType3",
     "Error",
@@ -434,6 +462,7 @@ __all__ = (
     "ForeignSourceType",
     "FullTextIndexConfig",
     "FullTextIndexStats",
+    "FullTextIndexStatsIndexType",
     "FuzzinessType1",
     "FuzzyQuery",
     "GenerationStepConfig",
@@ -451,7 +480,10 @@ __all__ = (
     "GoogleSearchConfigSearchType",
     "GraphIndexConfig",
     "GraphIndexStats",
+    "GraphIndexStatsAlgebraicGraph",
+    "GraphIndexStatsAlgebraicGraphTraversal",
     "GraphIndexStatsEdgeTypes",
+    "GraphIndexStatsIndexType",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",
@@ -551,7 +583,8 @@ __all__ = (
     "RetrievalStrategy",
     "RetryConfig",
     "RouteType",
-    "SchemasAntflyType",
+    "RowFilterEntry",
+    "RowFilterEntryFilter",
     "SecretEntry",
     "SecretList",
     "SecretStatus",
@@ -560,6 +593,7 @@ __all__ = (
     "SerperSearchConfig",
     "SerperSearchConfigSearchType",
     "SerperSearchConfigTimePeriod",
+    "SetRowFilterBody",
     "ShardConfig",
     "ShardsProfile",
     "SignificanceAlgorithm",

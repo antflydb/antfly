@@ -55,7 +55,8 @@ new record types must keep avoiding user-controlled bytes.
 - Keep the public API based on raw user document IDs, not encoded IDs.
 - Give the backend one canonical internal document identity that all index
   families can share.
-- Make query-time filters and exclusions bitmap-native internally.
+- Make query-time filters and exclusions document-set native internally, with
+  compact ordinal bitmaps used when they are the right physical representation.
 
 ## Non-Goals
 
@@ -63,7 +64,7 @@ new record types must keep avoiding user-controlled bytes.
 - A text-readable internal key format.
 - Reusing delimiter parsing for new code paths.
 - Exposing internal posting IDs in the public API.
-- Requiring every index family to migrate to bitmap-native filtering in a
+- Requiring every index family to migrate to ordinal-backed filtering in a
   single flag-day change.
 
 ## Design Summary
@@ -233,7 +234,7 @@ table / shard / range
   raw doc_id <-> canonical_doc_id <-> doc_ordinal
   doc_ordinal -> visibility / tombstone / generation
   indexes store doc_ordinal in postings, vectors, sparse rows, and graph edges
-  query planner exchanges bitmaps of doc_ordinal
+  query planner exchanges document sets keyed by doc_ordinal
   final projection maps doc_ordinal back to raw doc_id / source document
 ```
 
@@ -303,20 +304,22 @@ deterministic canonical identity + persisted compact ordinal
 
 This gives stable rebuild semantics without giving up bitmap performance.
 
-## Bitmap-Native Document Sets
+## Document-Set Native Planning
 
 Current internal query paths often resolve filters and exclusions into string
 document-ID lists. That works, but it forces every index family to repeatedly
 translate public IDs back into its own physical identity.
 
-Introduce an internal document-set abstraction:
+Introduce an internal document-set abstraction. Persisted compact ordinals are
+the canonical internal identity, but query-time sets should remain adaptive:
 
 ```zig
 const ResolvedDocSet = union(enum) {
     all,
     none,
-    doc_keys: []const []const u8,      // compatibility fallback
-    ordinals: RoaringBitmap,          // preferred internal form
+    doc_keys: []const []const u8,       // tiny sets and compatibility fallback
+    ordinals: []const DocOrdinal,       // small resolved ordinal sets
+    ordinal_bitmap: RoaringBitmap,      // medium/large or reusable sets
 };
 
 const ResolvedDocFilter = struct {
@@ -325,9 +328,25 @@ const ResolvedDocFilter = struct {
 };
 ```
 
-The planner should prefer `ordinals` whenever the shard has doc-ordinal
-coverage. `doc_keys` remains as a migration fallback and for index families that
-have not yet been converted.
+The planner should prefer ordinal-backed forms whenever the shard has
+doc-ordinal coverage, but it should not force every tiny set through a bitmap.
+`doc_keys` remains useful for explicit small ID filters, point lookups, API
+compatibility, and index families that have not yet been converted.
+
+A reasonable normalization policy is:
+
+```text
+0 docs                 -> none
+small explicit IDs     -> doc_keys or sorted ordinals
+small resolved sets    -> sorted ordinals
+medium/large sets      -> ordinal_bitmap
+reused/composed sets   -> ordinal_bitmap
+all visible docs       -> all plus live_docs_bitmap at execution
+```
+
+The first threshold should be empirical. A starting point around 32 to 128
+documents is reasonable, with instrumentation deciding whether a small
+doc-key/ordinal list or a bitmap is cheaper for a specific operator.
 
 Useful bitmap sets:
 
@@ -340,7 +359,8 @@ candidate_bitmap      index-produced candidate set
 ```
 
 Query execution should intersect and subtract these bitmaps before expensive
-scoring whenever possible.
+scoring whenever possible. Tiny lists can stay as lists until an operator needs
+set algebra, repeated reuse, or bitmap-only execution.
 
 ## Query Language and CTE Bindings
 
@@ -374,13 +394,17 @@ with.visible -> ResolvedDocSet
 query        -> expression tree that references visible
 ```
 
-If the shard has ordinal coverage:
+If the shard has ordinal coverage and the binding is large or reused:
 
 ```text
 visible_bitmap = bitmap(doc_id -> doc_ordinal)
 match(body, "renewal") -> scored stream or candidate bitmap
 must(match, ref visible) -> intersect with visible_bitmap
 ```
+
+If `visible` only contains a handful of explicit IDs, the binding can remain as
+`doc_keys` or sorted `ordinals` and be applied through a cheaper point-membership
+path.
 
 `ref` should point at the compiled binding, not re-expand the original JSON
 each time it appears. This lets a single expensive filter be reused across
@@ -447,14 +471,15 @@ doc_ordinal -> vector_id(s)
 Dense search should accept:
 
 ```text
-include_bitmap: ?RoaringBitmap(doc_ordinal)
-exclude_bitmap: ?RoaringBitmap(doc_ordinal)
+include: ?ResolvedDocSet
+exclude: ?ResolvedDocSet
 ```
 
 and apply them during candidate generation or immediately after candidate
-retrieval, before expensive reranking or projection. The vector index can keep
-its own vector IDs for physical layout, but those IDs should not be the shared
-query identity.
+retrieval, before expensive reranking or projection. Bitmap-backed sets are best
+for broad filters and exclusions; sorted ordinal lists are often cheaper for
+small explicit filters. The vector index can keep its own vector IDs for
+physical layout, but those IDs should not be the shared query identity.
 
 ### Sparse Vector
 
@@ -464,8 +489,9 @@ Sparse postings should store `doc_ordinal` instead of raw document keys:
 term / feature -> [(doc_ordinal, weight)]
 ```
 
-This makes sparse query filters the same bitmap intersection problem as
-full-text.
+This gives sparse query filters the same document-set boundary as full-text:
+small candidate sets can remain as ordinal lists, while broad term filters can
+use bitmaps.
 
 ### Algebraic
 
@@ -478,14 +504,16 @@ path / value / token -> RoaringBitmap(doc_ordinal)
 
 During migration, algebraic filters can continue returning `doc_keys` when
 ordinal coverage is missing. Once coverage exists, the preferred result is a
-bitmap that dense, sparse, full-text, and graph planning can all consume.
+`ResolvedDocSet` that dense, sparse, full-text, and graph planning can all
+consume. Small results may remain as sorted ordinals; composed or reusable
+results should promote to `ordinal_bitmap`.
 
 ### Graph
 
 Document-backed graph nodes and edges should reference `doc_ordinal` where the
 node is a document identity. Graph-native node IDs can remain separate, but any
 edge that is used as a document filter should be able to produce a
-`RoaringBitmap(doc_ordinal)`.
+`ResolvedDocSet`.
 
 ## Visibility, Deletes, and Generations
 
@@ -522,7 +550,7 @@ For distributed planning:
 ```text
 ShardDocSet = {
   shard_id: ShardId,
-  ordinals: RoaringBitmap,
+  docs: ResolvedDocSet,
 }
 ```
 
@@ -567,21 +595,25 @@ once.
 - Add `ResolvedDocSet`.
 - Convert request-level filters and exclusions to use `ResolvedDocSet`
   internally.
-- Keep `doc_keys` as a compatibility representation.
-- Add counters for ordinal fast path, string fallback, missing ordinal coverage,
-  and unsupported filter shapes.
+- Keep `doc_keys` as a compatibility and tiny-set representation.
+- Add sorted ordinal-list and ordinal-bitmap representations.
+- Add counters for doc-key list, ordinal-list, bitmap fast path, missing ordinal
+  coverage, bitmap promotion, and unsupported filter shapes.
 
 ### Phase 4: Algebraic Filter Bitmaps
 
-- Teach algebraic filter resolution to return `RoaringBitmap(doc_ordinal)` when
-  possible.
+- Teach algebraic filter resolution to return ordinal-backed `ResolvedDocSet`
+  values when possible.
 - Preserve the existing doc-key list path as fallback.
-- Add direct include/exclude bitmap plumbing into vector search requests.
+- Add direct include/exclude `ResolvedDocSet` plumbing into vector search
+  requests.
 
 ### Phase 5: Dense and Sparse Consumption
 
-- Teach dense vector search to consume include/exclude ordinal bitmaps.
-- Teach sparse vector search to consume include/exclude ordinal bitmaps.
+- Teach dense vector search to consume include/exclude ordinal lists and
+  bitmaps.
+- Teach sparse vector search to consume include/exclude ordinal lists and
+  bitmaps.
 - Avoid mapping every filter hit through string doc IDs on hot paths.
 
 ### Phase 6: Full-Text Projection
