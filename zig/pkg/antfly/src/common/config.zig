@@ -145,7 +145,7 @@ pub const Config = struct {
     pub fn parseFromSliceWithSecrets(
         alloc: std.mem.Allocator,
         raw: []const u8,
-        secret_store: ?*const secrets.FileStore,
+        secret_store: ?*secrets.FileStore,
     ) !Config {
         var parsed_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
             .allocate = .alloc_always,
@@ -266,7 +266,7 @@ pub fn loadFromPath(alloc: std.mem.Allocator, path: []const u8) !Config {
 pub fn loadFromPathWithSecrets(
     alloc: std.mem.Allocator,
     path: []const u8,
-    secret_store: ?*const secrets.FileStore,
+    secret_store: ?*secrets.FileStore,
 ) !Config {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -603,7 +603,7 @@ fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []u8) void {
 fn resolveSecretReferencesInValue(
     alloc: std.mem.Allocator,
     value: *std.json.Value,
-    secret_store: ?*const secrets.FileStore,
+    secret_store: ?*secrets.FileStore,
     replacement_strings: *std.ArrayList([]u8),
 ) !void {
     switch (value.*) {
