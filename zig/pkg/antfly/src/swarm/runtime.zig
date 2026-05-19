@@ -25,6 +25,7 @@ const platform_time = @import("../platform/time.zig");
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const http_common = antfly.common.http.http_common;
 const public_api_max_requests_per_connection: u32 = 64;
+const local_replica_reconcile_interval_ms: u64 = std.time.ms_per_s;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 
 const CliConfig = struct {
@@ -106,6 +107,7 @@ const LocalSwarmMetadata = struct {
     catalog_path: []const u8,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
     epoch: u64 = 1,
+    last_local_replica_reconcile_at_ms: u64 = 0,
     last_schema_migration_finalize_at_ms: u64 = 0,
 
     const PersistedCatalog = struct {
@@ -345,10 +347,49 @@ const LocalSwarmMetadata = struct {
 
     fn runRound(ptr: *anyopaque) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        self.reconcileLocalReplicaRoot() catch |err| switch (err) {
+            error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
+            else => return err,
+        };
         self.finalizeReadySchemaMigrations() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+    }
+
+    fn reconcileLocalReplicaRoot(self: *LocalSwarmMetadata) !void {
+        const now_ms = monotonicMs();
+        const snapshot = blk: {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            if (now_ms -| self.last_local_replica_reconcile_at_ms < local_replica_reconcile_interval_ms) return;
+            self.last_local_replica_reconcile_at_ms = now_ms;
+
+            const tables = try self.manager.listTables(self.alloc);
+            errdefer self.manager.freeTables(self.alloc, tables);
+            const ranges = try self.manager.listRanges(self.alloc);
+            errdefer self.manager.freeRanges(self.alloc, ranges);
+            break :blk .{ .tables = tables, .ranges = ranges };
+        };
+        defer self.manager.freeRanges(self.alloc, snapshot.ranges);
+        defer self.manager.freeTables(self.alloc, snapshot.tables);
+        if (snapshot.tables.len == 0 or snapshot.ranges.len == 0) return;
+
+        const hosted_group_ids = try self.alloc.alloc(u64, snapshot.ranges.len);
+        defer self.alloc.free(hosted_group_ids);
+        for (snapshot.ranges, 0..) |range, i| hosted_group_ids[i] = range.group_id;
+
+        _ = try antfly.metadata.table_provisioner.reconcileReplicaRootWithOptions(
+            self.alloc,
+            self.replica_root_dir,
+            group_ids.main_metadata_group_id,
+            hosted_group_ids,
+            snapshot.tables,
+            snapshot.ranges,
+            .{
+                .backend_runtime = self.backend_runtime,
+            },
+        );
     }
 
     fn finalizeReadySchemaMigrations(self: *LocalSwarmMetadata) !void {
