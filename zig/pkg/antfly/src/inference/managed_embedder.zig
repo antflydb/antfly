@@ -1498,7 +1498,7 @@ fn embedBatchWithOpenAiCompatible(
     defer alloc.free(json_body);
 
     const auth_header = if (entry.api_key) |*api_key_ref|
-        try @constCast(entry).auth_header_cache.getOwned(entry.alloc, alloc, api_key_ref, entry.secret_store)
+        try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)
     else
         null;
     defer if (auth_header) |value| alloc.free(value);
@@ -1546,6 +1546,20 @@ fn embedBatchWithOpenAiCompatible(
         initialized += 1;
     }
     return vectors;
+}
+
+fn optionalBearerAuthHeaderOwned(
+    entry: *ManagedEmbeddingEntry,
+    alloc: std.mem.Allocator,
+    api_key_ref: *const common_secrets.SecretValue,
+) !?[]u8 {
+    return entry.auth_header_cache.getOwned(entry.alloc, alloc, api_key_ref, entry.secret_store) catch |err| switch (err) {
+        error.SecretNotFound => switch (api_key_ref.*) {
+            .env_var => return null,
+            else => return err,
+        },
+        else => return err,
+    };
 }
 
 fn mapEmbedStatus(status: std.http.Status) anyerror {
