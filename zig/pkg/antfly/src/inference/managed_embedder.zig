@@ -83,6 +83,7 @@ pub const LocalTermiteProvider = struct {
 pub const InitOptions = struct {
     local_termite_provider: ?LocalTermiteProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
 };
 
 pub const QueryTemplateError = error{
@@ -293,6 +294,7 @@ pub const ManagedEmbeddingEntry = struct {
     base_url: []u8,
     api_key: ?common_secrets.SecretValue = null,
     secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     dimensions: u32,
     sparse: bool = false,
     multimodal: bool = false,
@@ -544,7 +546,7 @@ pub const ManagedEmbedder = struct {
         embedding_template: []const u8,
     ) ![]f32 {
         const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        const rendered = try renderQueryTemplate(alloc, embedding_template, text);
+        const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, entry);
         defer alloc.free(rendered);
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
@@ -849,6 +851,7 @@ fn parseManagedEmbeddingEntry(
             .ollama, .termite, .antfly => null,
         },
         .secret_store = options.secret_store,
+        .remote_content = options.remote_content,
         .dimensions = if (sparse) 0 else try resolveEmbeddingDimensions(cfg),
         .sparse = sparse,
         .multimodal = embedder_cfg.multimodal,
@@ -997,6 +1000,24 @@ fn renderQueryTemplate(
     defer active_query_template_render_context = prev_ctx;
 
     return try template_mod.renderDocumentWithHelpers(alloc, embedding_template, query_json, &extra_helpers);
+}
+
+fn renderQueryTemplateWithEntry(
+    alloc: std.mem.Allocator,
+    embedding_template: []const u8,
+    text: []const u8,
+    entry: *const ManagedEmbeddingEntry,
+) ![]const u8 {
+    var config: template_remote.RenderConfig = .{};
+    if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
+        config.remote_content = entry.remote_content;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
+        config.secret_store = entry.secret_store;
+    }
+    const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
+    defer alloc.free(query_json);
+    return try template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config);
 }
 
 fn validateRenderedTemplate(alloc: std.mem.Allocator, rendered: []const u8) !void {

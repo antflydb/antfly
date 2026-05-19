@@ -237,6 +237,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_cache.backend_runtime = storage.backend_runtime;
         self.write_cache.local_termite_provider = self.write_source.local_termite_provider;
         self.write_cache.secret_store = self.write_source.secret_store;
+        self.write_cache.remote_content = self.write_source.remote_content;
         self.write_source.read_cache = &storage.read_cache;
         self.write_source.write_cache = &self.write_cache;
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
@@ -1604,6 +1605,8 @@ pub const DataServer = struct {
         _ = self.read_source.withIo(&self.query_io_impl.?);
         _ = self.read_source.withSecretStore(api_server_cfg.secret_store);
         _ = self.write_source.withSecretStore(api_server_cfg.secret_store);
+        _ = self.read_source.withRemoteContent(api_server_cfg.remote_content);
+        _ = self.write_source.withRemoteContent(api_server_cfg.remote_content);
         if (self.backend_runtime) |runtime| {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }

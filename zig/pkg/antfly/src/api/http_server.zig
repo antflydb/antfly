@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
@@ -200,6 +201,7 @@ pub const ApiHttpServerConfig = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
