@@ -4823,7 +4823,7 @@ fn openProvisionedQueryDbForTableWithCache(
         // index from metadata. Reopen after reconcile so searches run against
         // the stabilized post-reconcile index-manager state.
         db.close();
-        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store);
+        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
         db = if (embedders.dense != null or embedders.sparse != null) blk: {
             const dense = embedders.dense;
             const sparse = embedders.sparse;

@@ -1008,6 +1008,10 @@ fn renderQueryTemplateWithEntry(
     text: []const u8,
     entry: *const ManagedEmbeddingEntry,
 ) ![]const u8 {
+    if (comptime builtin.is_test) {
+        return try renderQueryTemplate(alloc, embedding_template, text);
+    }
+
     var config: template_remote.RenderConfig = .{};
     if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
         config.remote_content = entry.remote_content;

@@ -4010,6 +4010,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.source.backend_runtime,
                 self.source.local_termite_provider,
                 self.source.secret_store,
+                self.source.remote_content,
             );
             defer db.close();
 
@@ -4987,6 +4988,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     foreground_derived_progress: bool = false,
 
     pub fn init(
@@ -5005,6 +5008,28 @@ pub const HostedProvisionedTableWriteSource = struct {
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableWriteSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableWriteSource {
         self.backend_runtime = backend_runtime;
+        return self;
+    }
+
+    pub fn withSecretStore(
+        self: *HostedProvisionedTableWriteSource,
+        secret_store: ?*common_secrets.FileStore,
+    ) *HostedProvisionedTableWriteSource {
+        self.secret_store = secret_store;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            cache.write_cache.secret_store = secret_store;
+        }
+        return self;
+    }
+
+    pub fn withRemoteContent(
+        self: *HostedProvisionedTableWriteSource,
+        remote_content: ?*const scraping.RemoteContentConfig,
+    ) *HostedProvisionedTableWriteSource {
+        self.remote_content = remote_content;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            cache.write_cache.remote_content = remote_content;
+        }
         return self;
     }
 
@@ -5034,6 +5059,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         const lsm_root_generation: u64 = 0;
         if (cache.write_cache.backend_runtime == null) cache.write_cache.backend_runtime = self.backend_runtime;
+        cache.write_cache.secret_store = self.secret_store;
+        cache.write_cache.remote_content = self.remote_content;
         if (mode == .status_only) {
             lockAtomic(&cache.mutex);
             defer cache.mutex.unlock();
