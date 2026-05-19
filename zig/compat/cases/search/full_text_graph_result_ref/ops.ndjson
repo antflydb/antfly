@@ -1,0 +1,1 @@
+{"op":"batch","writes":[{"key":"paper:1","value":{"title":"intro","body":"machine learning systems","_edges":{"gr_v1":{"cites":[{"target":"paper:2","weight":1.0}]}}}},{"key":"paper:2","value":{"title":"advanced","body":"graph retrieval"}}],"deletes":[]}

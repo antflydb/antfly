@@ -1,0 +1,11 @@
+storage-sim-fixture-v1
+mode persistent_crash
+label crash-default-after-data-sync-before-meta
+case_label crash-default-after-data-sync-before-meta
+origin_seed 0x5
+phase after_data_sync_before_meta
+expectation expected persistent reopen to recover the committed snapshot once the WAL append has completed
+expected_outcome committed
+
+action index_segment gamma_pair
+crash_action index_segment alpha

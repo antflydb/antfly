@@ -1,4 +1,4 @@
-// Copyright 2025 Antfly, Inc.
+// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -37,6 +37,11 @@ func TestIndexTypeValidate(t *testing.T) {
 		{
 			name:      "valid graph",
 			indexType: IndexTypeGraph,
+			wantErr:   false,
+		},
+		{
+			name:      "valid algebraic",
+			indexType: IndexTypeAlgebraic,
 			wantErr:   false,
 		},
 		{
@@ -101,6 +106,7 @@ func TestValidIndexTypes(t *testing.T) {
 		IndexTypeEmbeddings,
 		IndexTypeFullText,
 		IndexTypeGraph,
+		IndexTypeAlgebraic,
 	}
 
 	typeSet := make(map[IndexType]bool)

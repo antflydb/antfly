@@ -1,0 +1,23 @@
+storage-sim-fixture-v1
+# Index manager crash fixture for committed text batch recovery through persistent WAL replay.
+
+mode index_manager_crash
+label crash-right-beta-before-data-sync
+case_label crash-right-beta-before-data-sync
+origin_seed 0x2
+phase before_data_sync
+expectation expected index-manager reopen to preserve the committed text batch once the underlying persistent WAL append has completed
+expected_source_doc_count 2
+expected_dest_doc_count 2
+expected_source_alpha_hits 2
+expected_source_beta_hits 0
+expected_source_gamma_hits 0
+expected_dest_alpha_hits 0
+expected_dest_beta_hits 2
+expected_dest_gamma_hits 0
+expected_outcome committed
+
+action add_doc left_alpha
+action add_doc mixed_alpha_beta
+action split_handoff
+crash_action add_doc right_beta

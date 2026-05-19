@@ -1,0 +1,13 @@
+{
+  "name": "termite-web-electron",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^41.2.2"
+  }
+}

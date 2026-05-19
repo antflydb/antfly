@@ -1,0 +1,37 @@
+# Zig
+zig-cache/
+zig-out/
+.zig-cache/
+build
+*.obj
+*.o
+*.pdb
+*.lib
+*.exe
+httpx.lib
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# VitePress / Node
+node_modules/
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+.env
+
+# Package Managers
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+bun.lockb
+bun.lock
+docs/package-lock.json
+docs/pnpm-lock.yaml
+docs/yarn.lock
+docs/bun.lockb
+docs/bun.lock

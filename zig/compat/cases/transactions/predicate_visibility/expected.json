@@ -1,0 +1,14 @@
+{
+  "status_t1": {
+    "status": "committed"
+  },
+  "lookup_cas": {
+    "found": true,
+    "json": {
+      "title": "v2"
+    }
+  },
+  "timestamp_cas": {
+    "timestamp_ns": 11001
+  }
+}

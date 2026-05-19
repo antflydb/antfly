@@ -1,0 +1,22 @@
+storage-sim-fixture-v1
+mode differential
+label mapasync
+case_label diff-mapasync
+origin_seed 0xA17F3EED
+expectation expected C and Zig snapshots to stay aligned across reopen cycles
+max_dbs 4
+write_map true
+map_async true
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend sync
+expected_main_count 1
+expected_docs_count 0
+expected_dups_count 2
+
+action direct put_docs 4 401
+action direct put_dup 3 402
+action direct put_main 5 403
+action direct delete_docs 4
+action direct put_dup 3 404

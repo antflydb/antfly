@@ -1,0 +1,20 @@
+[project]
+name = "antfly-zig-e2e"
+version = "0.1.0"
+description = "Portable E2E tests for antfly-zig"
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=8.0",
+    "requests>=2.31",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-v"
+markers = [
+    "objectstore_integration: requires real S3 or GCS objectstore credentials and buckets",
+    "swarm_integration: requires local antfly swarm plus a live termite generator model",
+    "real_model: requires local or downloadable model weights",
+    "postgres_integration: requires a local PostgreSQL instance",
+    "slow: marks tests that are too long-running for required E2E base CI",
+]

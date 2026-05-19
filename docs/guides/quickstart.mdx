@@ -21,7 +21,7 @@ This guide walks you through installing Antfly, loading data, and running your f
 
   <TabsContent value="macos">
 ```bash
-brew install --cask antflydb/antfly/antfly
+brew install antflydb/taps/antfly
 
 # Verify
 antfly --version
@@ -54,6 +54,12 @@ Start Antfly in swarm mode:
 
 ```bash
 antfly swarm 2>&1 | tee "antfly.log"
+```
+
+If you installed with Homebrew, you can run Antfly as a service instead:
+
+```bash
+brew services start antfly
 ```
 
 <Callout type="info">

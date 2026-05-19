@@ -17,6 +17,7 @@ components:
         - anthropic
         - cohere
         - termite
+        - antfly
         - mock
       description: "The generative AI provider to use."
 

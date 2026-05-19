@@ -1,0 +1,1 @@
+{"op":"batch","writes":[{"key":"doc:a","value":{"body":"abcdefghijklmno"}}],"deletes":[],"sync_level":"async_index"}

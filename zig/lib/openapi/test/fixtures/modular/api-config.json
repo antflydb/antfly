@@ -1,0 +1,10 @@
+{
+  "spec": "test/fixtures/modular/api.json",
+  "package": "api",
+  "output": "/tmp/modular-gen/api",
+  "generate": ["types", "server"],
+  "import_mapping": {
+    "schema.json": "schema",
+    "embeddings.json": "embeddings"
+  }
+}

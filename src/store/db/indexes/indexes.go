@@ -1,4 +1,4 @@
-// Copyright 2025 Antfly, Inc.
+// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -146,6 +146,11 @@ func IsFullTextType(t IndexType) bool {
 // IsGraphType returns true if the IndexType is any graph variant (new or legacy).
 func IsGraphType(t IndexType) bool {
 	return t == IndexTypeGraph || t == IndexTypeGraphV0
+}
+
+// IsAlgebraicType returns true if the IndexType is the algebraic sidecar type.
+func IsAlgebraicType(t IndexType) bool {
+	return t == IndexTypeAlgebraic
 }
 
 // NormalizeIndexType converts legacy type names to their canonical forms.

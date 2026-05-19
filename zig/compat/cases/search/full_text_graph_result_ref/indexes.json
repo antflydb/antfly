@@ -1,0 +1,12 @@
+[
+  {
+    "name": "ft_v1",
+    "kind": "full_text",
+    "config": {}
+  },
+  {
+    "name": "gr_v1",
+    "kind": "graph",
+    "config": {}
+  }
+]

@@ -1,0 +1,26 @@
+{
+  "title_term_after_reopen": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:a",
+        "stored_data": {
+          "title": "alpha",
+          "body": "persistent alpha"
+        }
+      }
+    ]
+  },
+  "body_match_after_reopen": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:b",
+        "stored_data": {
+          "title": "beta",
+          "body": "persistent beta"
+        }
+      }
+    ]
+  }
+}

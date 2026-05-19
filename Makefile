@@ -1,4 +1,5 @@
 SHELL := /bin/bash
+ZIG_MAKE := $(MAKE) -C ./zig
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
@@ -39,6 +40,10 @@ help:
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
 	@echo "  tidy-check         Verify go.mod/go.sum are tidy across root and Go submodules"
+	@echo "  zig-build          Build the migrated Zig runtime"
+	@echo "  zig-test           Run the migrated Zig test aggregate"
+	@echo "  zig-generate       Regenerate migrated Zig generated sources"
+	@echo "  zig-generated-check  Verify migrated Zig generated sources"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
 	@echo "  cleanup-goreman    Clean up goreman logs and data"
@@ -82,6 +87,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-termite-dashboard sim-validate sim-validate-repo sim-soak
+.PHONY: zig-build zig-test zig-unit-test zig-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main build-termite-dashboard
 
@@ -119,6 +125,7 @@ generate: build-docs build-termite-dashboard tidy
 license-headers: ## Add ELv2 license headers to core files missing them
 	$(GO) run github.com/google/addlicense@latest \
 		-f .license-header.txt \
+		-ignore 'zig/**' \
 		-ignore 'lib/multirafthttp/**' \
 		-ignore 'lib/types/**' \
 		-ignore 'pkg/**' \
@@ -137,11 +144,13 @@ license-headers: ## Add ELv2 license headers to core files missing them
 		-ignore '**/*.yaml' \
 		-ignore '**/*.yml' \
 		.
+	$(ZIG_MAKE) license-headers
 
 license-check: ## Check that all core files have license headers
 	$(GO) run github.com/google/addlicense@latest \
 		-check \
 		-f .license-header.txt \
+		-ignore 'zig/**' \
 		-ignore 'lib/multirafthttp/**' \
 		-ignore 'lib/types/**' \
 		-ignore 'pkg/**' \
@@ -160,6 +169,37 @@ license-check: ## Check that all core files have license headers
 		-ignore '**/*.yaml' \
 		-ignore '**/*.yml' \
 		.
+	$(ZIG_MAKE) license-check
+
+zig-build:
+	$(ZIG_MAKE) build
+
+zig-test:
+	$(ZIG_MAKE) test
+
+zig-unit-test:
+	$(ZIG_MAKE) unit-test
+
+zig-generate:
+	$(ZIG_MAKE) generate
+
+zig-generated-check:
+	$(ZIG_MAKE) generated-check
+
+zig-openapi-check:
+	$(ZIG_MAKE) openapi-check
+
+zig-snowball-check:
+	$(ZIG_MAKE) snowball-check
+
+zig-license-headers:
+	$(ZIG_MAKE) license-headers
+
+zig-license-check:
+	$(ZIG_MAKE) license-check
+
+zig-tla-check:
+	$(ZIG_MAKE) tla-check
 
 lint:
 	$(GO) run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...

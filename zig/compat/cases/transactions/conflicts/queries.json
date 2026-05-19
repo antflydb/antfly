@@ -1,0 +1,18 @@
+[
+  {
+    "name": "lookup_shared",
+    "request": {
+      "lookup": {
+        "key": "doc:shared"
+      }
+    }
+  },
+  {
+    "name": "lookup_cas",
+    "request": {
+      "lookup": {
+        "key": "doc:cas"
+      }
+    }
+  }
+]

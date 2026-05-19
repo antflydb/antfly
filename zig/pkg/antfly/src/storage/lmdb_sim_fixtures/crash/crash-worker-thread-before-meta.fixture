@@ -1,0 +1,20 @@
+storage-sim-fixture-v1
+mode crash
+label crash-worker-thread-before-meta
+case_label crash-worker-thread
+origin_seed 0xBEEF1301
+phase after_data_sync_before_meta
+expectation expected reopen to preserve the previous committed snapshot
+max_dbs 4
+write_map false
+map_async false
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend worker_thread
+expected_outcome previous
+
+action put_main 5 721
+action put_docs 1 722
+action put_dup 2 723
+crash_action put_docs 2 8721

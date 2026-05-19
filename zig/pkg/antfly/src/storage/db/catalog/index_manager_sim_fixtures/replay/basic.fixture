@@ -1,0 +1,23 @@
+storage-sim-fixture-v1
+# Index manager replay fixture for source/destination text split behavior.
+
+mode index_manager
+label basic
+case_label basic
+origin_seed 0x1
+expectation expected index-manager replay to preserve text split routing and reopen semantics across source and destination managers
+expected_source_doc_count 2
+expected_dest_doc_count 2
+expected_source_alpha_hits 2
+expected_source_beta_hits 0
+expected_source_gamma_hits 0
+expected_dest_alpha_hits 0
+expected_dest_beta_hits 2
+expected_dest_gamma_hits 0
+
+action add_doc left_alpha
+action add_doc mixed_alpha_beta
+action split_handoff
+action reopen
+action add_doc right_beta
+action reopen

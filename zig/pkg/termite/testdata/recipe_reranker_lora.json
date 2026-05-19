@@ -1,0 +1,27 @@
+{
+  "recipe": "lora-sft",
+  "model": {
+    "path": "/tmp/termite-models/reranker",
+    "family": "reranker"
+  },
+  "dataset": {
+    "train_path": "/tmp/termite-data/reranker-train.jsonl",
+    "eval_path": "/tmp/termite-data/reranker-eval.jsonl",
+    "max_examples": 16,
+    "eval_max_examples": 8
+  },
+  "adapter": {
+    "rank": 8,
+    "alpha": 16
+  },
+  "optimizer": {
+    "learning_rate": 0.001,
+    "epochs": 1
+  },
+  "artifacts": {
+    "root": "/tmp/termite-recipe-reranker-lora",
+    "report_path": "/tmp/termite-recipe-reranker/head",
+    "materialized_dir": "/tmp/termite-recipe-reranker-lora/materialized"
+  },
+  "backend": "auto"
+}

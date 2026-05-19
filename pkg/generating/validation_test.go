@@ -1,4 +1,4 @@
-// Copyright 2025 Antfly, Inc.
+// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -60,6 +60,11 @@ func TestGeneratorProviderValidate(t *testing.T) {
 			wantErr:  false,
 		},
 		{
+			name:     "valid antfly",
+			provider: GeneratorProviderAntfly,
+			wantErr:  false,
+		},
+		{
 			name:     "empty provider",
 			provider: "",
 			wantErr:  true,
@@ -109,6 +114,7 @@ func TestValidGeneratorProviders(t *testing.T) {
 		GeneratorProviderOllama,
 		GeneratorProviderOpenai,
 		GeneratorProviderVertex,
+		GeneratorProviderAntfly,
 	}
 
 	providerSet := make(map[GeneratorProvider]bool)

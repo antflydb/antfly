@@ -1,0 +1,21 @@
+storage-sim-fixture-v1
+mode differential
+label worker-thread
+case_label diff-worker-thread
+origin_seed 0xA17F4EED
+expectation expected C and Zig snapshots to stay aligned across reopen cycles
+max_dbs 4
+write_map false
+map_async false
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend worker_thread
+expected_main_count 1
+expected_docs_count 2
+expected_dups_count 2
+
+action direct put_main 2 510
+action nested_commit put_docs 1 511 put_docs 2 512
+action reader_then_direct put_dup 4 513
+action nested_abort put_dup 4 514 put_dup 4 515

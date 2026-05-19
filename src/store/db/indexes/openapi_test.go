@@ -1,4 +1,4 @@
-// Copyright 2025 Antfly, Inc.
+// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -175,6 +175,18 @@ func TestIndexConfig_Equal(t *testing.T) {
 	t.Run("different types", func(t *testing.T) {
 		a := NewEmbeddingsConfig("idx", EmbeddingsIndexConfig{Dimension: 384})
 		b := NewFullTextIndexConfig("idx", false)
+		assert.False(t, a.Equal(*b))
+	})
+
+	t.Run("same algebraic config", func(t *testing.T) {
+		a := NewAlgebraicIndexConfig("alg", true)
+		b := NewAlgebraicIndexConfig("alg", true)
+		assert.True(t, a.Equal(*b))
+	})
+
+	t.Run("different algebraic config", func(t *testing.T) {
+		a := NewAlgebraicIndexConfig("alg", true)
+		b := NewAlgebraicIndexConfig("alg", false)
 		assert.False(t, a.Equal(*b))
 	})
 }

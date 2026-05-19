@@ -1,0 +1,20 @@
+storage-sim-fixture-v1
+mode differential
+label basic
+case_label basic
+expectation expected C and Zig snapshots to stay aligned across reopen cycles
+max_dbs 4
+write_map false
+map_async false
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend sync
+expected_main_count 1
+expected_docs_count 0
+expected_dups_count 1
+
+action direct put_main 1 101
+action direct put_docs 3 231
+action nested_abort put_dup 1 625 put_dup 1 494
+action reader_then_direct delete_docs 3

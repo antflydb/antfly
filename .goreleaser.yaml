@@ -32,6 +32,42 @@ builds:
       - goarch: "386"
       - goos: darwin
         goarch: amd64
+
+  # Zig Antfly runtime builds
+  - id: "antfly-zig-linux"
+    builder: zig
+    dir: ./zig
+    binary: antfly-zig
+    targets:
+      - x86_64-linux-gnu
+      - aarch64-linux-gnu
+    flags:
+      - -Doptimize=ReleaseFast
+      - -Dcpu=baseline
+      - -Dantfly-bin-name=antfly-zig
+      - -Donnx=false
+      - -Dmlx=false
+      - -Dmetal=false
+      - -Dsystem-blas=false
+      - install-antfly
+
+  - id: "antfly-zig-darwin-arm64"
+    builder: zig
+    dir: ./zig
+    binary: antfly-zig
+    targets:
+      - aarch64-macos
+    flags:
+      - -Doptimize=ReleaseFast
+      - -Dcpu=baseline
+      - -Dantfly-bin-name=antfly-zig
+      - -Donnx=false
+      - -Dmlx=false
+      - -Dmetal=true
+      - -Dsystem-blas=true
+      - --sysroot
+      - "{{ .Env.SDK_PATH }}"
+      - install-antfly
   # ============================================
   # OMNI builds (ONNX + XLA) for runtime backend selection
   # ============================================
@@ -175,6 +211,22 @@ archives:
         info:
           mode: 0755
 
+  # Zig Antfly runtime builds
+  - id: zig
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}-zig_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    ids:
+      - antfly-zig-linux
+      - antfly-zig-darwin-arm64
+    files:
+      - README.md
+      - LICENSE
+
 changelog:
   sort: asc
   use: github
@@ -242,34 +294,61 @@ release:
 
   # Upload metadata.json and artifacts.json to the release as well.
   include_meta: true
-homebrew_casks:
+brews:
   - name: antfly
     ids:
       - omni
     skip_upload: auto
+    directory: Formula
     repository:
       owner: antflydb
-      name: homebrew-antfly
+      name: homebrew-taps
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://docs.antfly.io"
-    description: "antfly - AntflyDB with ONNX Runtime + XLA multi-backend ML inference"
-    url:
-      template: "https://releases.antfly.io/antfly/{{ .Tag }}/{{ .ArtifactName }}"
-    binary: antfly
-    completions:
-      bash: completions/antfly.bash
-      zsh: completions/antfly.zsh
-      fish: completions/antfly.fish
+    description: "AntflyDB with ONNX Runtime and XLA multi-backend ML inference"
+    license: "Elastic-2.0"
+    url_template: "https://releases.antfly.io/antfly/{{ .Tag }}/{{ .ArtifactName }}"
+    install: |
+      libexec.install "antfly"
+      libexec.install "lib" if Dir.exist?("lib")
+      bin.write_exec_script libexec/"antfly"
+      bash_completion.install "completions/antfly.bash" => "antfly"
+      zsh_completion.install "completions/antfly.zsh" => "_antfly"
+      fish_completion.install "completions/antfly.fish"
+    service: |
+      run [opt_bin/"antfly", "--data-dir", var/"lib/antfly", "swarm"]
+      keep_alive true
+      working_dir var/"lib/antfly"
+      log_path var/"log/antfly.log"
+      error_log_path var/"log/antfly.err.log"
+    post_install: |
+      (var/"lib/antfly").mkpath
+    test: |
+      system "#{bin}/antfly", "--version"
     caveats: |
       antfly includes both ONNX Runtime and XLA backends for ML inference.
       Bundled libraries are auto-discovered from lib/ next to the binary.
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/bin/chmod", args: ["-R", "u+rw", "#{staged_path}/lib"]
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/antfly", "#{staged_path}/lib"]
-          end
+      Start the local single-node service with:
+        brew services start antflydb/taps/antfly
+  - name: antfly-zig
+    ids:
+      - zig
+    skip_upload: auto
+    directory: Formula
+    repository:
+      owner: antflydb
+      name: homebrew-taps
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://docs.antfly.io"
+    description: "Zig Antfly runtime"
+    license: "Elastic-2.0"
+    url_template: "https://releases.antfly.io/antfly/{{ .Tag }}/{{ .ArtifactName }}"
+    install: |
+      bin.install "antfly-zig"
+    test: |
+      system "#{bin}/antfly-zig", "--help"
+    caveats: |
+      antfly-zig is the native Zig Antfly runtime.
 nfpms:
   - file_name_template: "{{ .ConventionalFileName }}"
     # - file_name_template: >-
@@ -284,7 +363,7 @@ nfpms:
     homepage: https://antfly.io
     description: A command line interface for running AntfyDB indexing
     maintainer: Antfly Developers <contact@antfly.io>
-    license: Apache 2.0
+    license: Elastic-2.0
     vendor: Red Hat
     formats:
       - deb
@@ -300,6 +379,8 @@ blobs:
     endpoint: "{{ .Env.AWS_ENDPOINT_URL }}"
     region: auto  # Required for Cloudflare R2 (doesn't accept AWS region names like us-east-2)
     bucket: antfly-releases
+    # No ids filter: upload every generated artifact, including default,
+    # omni, Zig, checksums, and Linux packages.
     # You can add extra pre-existing files to the bucket.
     #
     # The filename on the release will be the last part of the path (base).
@@ -325,6 +406,8 @@ blobs:
     bucket: antfly-releases
     directory: "antfly/latest"
     disable: "{{ if .Prerelease }}true{{ end }}"
+    # No ids filter: publish all stable-release artifacts to the latest channel,
+    # including antfly-zig archives.
     extra_files:
       - glob: ./scripts/install.sh
       - glob: ./openapi.yaml

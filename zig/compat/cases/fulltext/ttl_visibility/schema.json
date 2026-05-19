@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "default_type": "default",
+  "ttl_duration": "1s",
+  "ttl_duration_ns": 1000000000,
+  "ttl_field": "_timestamp"
+}

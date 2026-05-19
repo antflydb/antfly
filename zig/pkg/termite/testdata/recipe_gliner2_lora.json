@@ -1,0 +1,28 @@
+{
+  "recipe": "lora-sft",
+  "model": {
+    "path": "/tmp/termite-models/gliner2",
+    "family": "gliner2"
+  },
+  "dataset": {
+    "train_path": "/tmp/termite-data/gliner-train.jsonl",
+    "eval_path": "/tmp/termite-data/gliner-eval.jsonl",
+    "labels": "person,organization,location",
+    "max_examples": 8,
+    "eval_max_examples": 4,
+    "max_seq_len": 256
+  },
+  "adapter": {
+    "rank": 8,
+    "alpha": 16
+  },
+  "optimizer": {
+    "learning_rate": 0.001,
+    "epochs": 1
+  },
+  "artifacts": {
+    "root": "/tmp/termite-recipe-gliner2",
+    "materialized_dir": "/tmp/termite-recipe-gliner2/materialized"
+  },
+  "backend": "blas"
+}

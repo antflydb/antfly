@@ -1,0 +1,13 @@
+[
+  {
+    "name": "match_all",
+    "request": {
+      "query": {
+        "match_all": {}
+      },
+      "limit": 10,
+      "offset": 0,
+      "include_stored": true
+    }
+  }
+]

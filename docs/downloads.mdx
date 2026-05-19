@@ -33,17 +33,23 @@ Antfly ships with bundled [ONNX Runtime](https://onnxruntime.ai/) and [XLA](http
 
   <TabsContent value="brew">
 ```bash
-brew install --cask antflydb/antfly/antfly
+brew install antflydb/taps/antfly
 ```
 
-or tap homebrew-antfly and install separately:
+or tap homebrew-taps and install separately:
 
 ```bash
-brew tap antflydb/antfly
-brew install --cask antfly
+brew tap antflydb/taps
+brew install antfly
 ```
 
 This installs `antfly` with bundled ONNX Runtime and XLA libraries for local ML inference. CLI commands are available directly as `antfly <command>` (e.g., `antfly query`, `antfly table create`).
+
+To run Antfly as a local service:
+
+```bash
+brew services start antfly
+```
   </TabsContent>
 
   <TabsContent value="macos-manual">

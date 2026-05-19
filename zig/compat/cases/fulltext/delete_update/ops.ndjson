@@ -1,0 +1,3 @@
+{"op":"batch","writes":[{"key":"doc:a","value":{"title":"alpha","body":"first alpha"}},{"key":"doc:b","value":{"title":"beta","body":"second alpha"}}],"deletes":[],"sync_level":"write"}
+{"op":"batch","writes":[],"deletes":["doc:a"],"sync_level":"write"}
+{"op":"batch","writes":[{"key":"doc:b","value":{"title":"beta","body":"replacement body"}}],"deletes":[],"sync_level":"write"}

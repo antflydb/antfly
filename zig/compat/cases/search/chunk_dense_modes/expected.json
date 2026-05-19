@@ -1,0 +1,23 @@
+{
+  "chunk_mode": {
+    "total_hits": 3,
+    "hits": [
+      {
+        "id": "doc:a:e:chunk:body_chunks_v1:0"
+      }
+    ]
+  },
+  "parent_with_chunks": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "doc:a",
+        "chunk_hits": [
+          {
+            "id": "doc:a:e:chunk:body_chunks_v1:0"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Embeddings", "version": "1.0.0" },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "EmbedderProvider": {
+        "type": "string",
+        "description": "Embedding model provider",
+        "enum": ["openai", "cohere", "bedrock", "termite"]
+      },
+      "EmbedderConfig": {
+        "type": "object",
+        "description": "Configuration for an embedding model",
+        "required": ["provider", "model"],
+        "properties": {
+          "provider": { "$ref": "#/components/schemas/EmbedderProvider" },
+          "model": { "type": "string", "description": "Model name" },
+          "dimensions": { "type": "integer", "format": "int32", "description": "Vector dimensions" },
+          "batch_size": { "type": "integer", "format": "int32" }
+        }
+      },
+      "EmbedRequest": {
+        "type": "object",
+        "required": ["texts"],
+        "properties": {
+          "texts": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "EmbedResponse": {
+        "type": "object",
+        "required": ["embeddings"],
+        "properties": {
+          "embeddings": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": { "type": "number", "format": "float" }
+            }
+          },
+          "model": { "type": "string" },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "total_tokens": { "type": "integer" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

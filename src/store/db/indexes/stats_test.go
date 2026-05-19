@@ -1,4 +1,4 @@
-// Copyright 2025 Antfly, Inc.
+// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -142,6 +142,72 @@ func TestMergeIndexStats_Graph(t *testing.T) {
 		got, _ := dst.AsGraphIndexStats()
 		assert.Equal(t, uint64(15), (*got.EdgeTypes)["parent"])
 		assert.Equal(t, uint64(3), (*got.EdgeTypes)["child"])
+	})
+}
+
+func TestMergeIndexStats_Algebraic(t *testing.T) {
+	t.Run("sum public counters", func(t *testing.T) {
+		dst := AlgebraicIndexStats{
+			TotalIndexed:          10,
+			DiskUsage:             100,
+			PlannerSelected:       2,
+			PlannerFallbackCount:  1,
+			AdaptiveProgressCount: 3,
+			Healthy:               true,
+		}.AsIndexStats()
+		src := AlgebraicIndexStats{
+			TotalIndexed:          20,
+			DiskUsage:             300,
+			PlannerSelected:       4,
+			PlannerFallbackCount:  5,
+			AdaptiveProgressCount: 6,
+			Healthy:               true,
+		}.AsIndexStats()
+		MergeIndexStats(&dst, src)
+		got, err := dst.AsAlgebraicIndexStats()
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(30), got.TotalIndexed)
+		assert.Equal(t, uint64(400), got.DiskUsage)
+		assert.Equal(t, uint64(6), got.PlannerSelected)
+		assert.Equal(t, uint64(6), got.PlannerFallbackCount)
+		assert.Equal(t, uint64(9), got.AdaptiveProgressCount)
+		assert.True(t, got.Healthy)
+	})
+
+	t.Run("keeps latest status fields", func(t *testing.T) {
+		dst := AlgebraicIndexStats{
+			CapabilityLifecycleStatus: "current",
+			PlannerLastDecision:       AlgebraicIndexStatsPlannerLastDecisionSelected,
+			PlannerLifecycleReady:     true,
+			Healthy:                   true,
+		}.AsIndexStats()
+		src := AlgebraicIndexStats{
+			CapabilityLifecycleStatus:      "stale",
+			PlannerLastDecision:            AlgebraicIndexStatsPlannerLastDecisionFallback,
+			PlannerLastFallbackReason:      "missing_materialization",
+			PlannerLastEstimatedScanRows:   100,
+			PlannerLifecycleBlockingReason: "rebuild_required",
+			ActiveProgressLifecycle:        "backfilling",
+			ActiveProgressRowsProcessed:    25,
+			ActiveProgressTargetRows:       50,
+			LastErrorReason:                "planner_disabled",
+			PlannerLifecycleReady:          false,
+			Healthy:                        false,
+		}.AsIndexStats()
+		MergeIndexStats(&dst, src)
+		got, err := dst.AsAlgebraicIndexStats()
+		assert.NoError(t, err)
+		assert.Equal(t, "stale", got.CapabilityLifecycleStatus)
+		assert.Equal(t, AlgebraicIndexStatsPlannerLastDecisionFallback, got.PlannerLastDecision)
+		assert.Equal(t, "missing_materialization", got.PlannerLastFallbackReason)
+		assert.Equal(t, uint64(100), got.PlannerLastEstimatedScanRows)
+		assert.Equal(t, "rebuild_required", got.PlannerLifecycleBlockingReason)
+		assert.Equal(t, "backfilling", got.ActiveProgressLifecycle)
+		assert.Equal(t, uint64(25), got.ActiveProgressRowsProcessed)
+		assert.Equal(t, uint64(50), got.ActiveProgressTargetRows)
+		assert.Equal(t, "planner_disabled", got.LastErrorReason)
+		assert.False(t, got.PlannerLifecycleReady)
+		assert.False(t, got.Healthy)
 	})
 }
 

@@ -1,0 +1,123 @@
+name: Zig Runtime Container
+
+on:
+  push:
+    tags:
+      - "zig/v*"
+
+env:
+  GCP_REGION: us-east5
+  GCP_PROJECT: antfly-image-artifacts
+  GCP_REPOSITORY: antfly-labs
+  GAR_REGISTRY: us-east5-docker.pkg.dev
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
+
+jobs:
+  publish:
+    runs-on: arc-antfly-publish
+    environment: container-publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#zig/}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Extracted version: ${VERSION}"
+
+      - name: Build and push GAR image with Cloud Build
+        run: |
+          submit_cloud_build() {
+            local attempt sleep_seconds
+            for attempt in 1 2 3; do
+              if gcloud builds submit "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                return 1
+              fi
+              sleep_seconds=$((attempt * 15))
+              echo "gcloud builds submit failed; retrying in ${sleep_seconds}s"
+              sleep "${sleep_seconds}"
+            done
+          }
+          VERSION="${{ steps.version.outputs.version }}"
+          ALIAS_TAG=zig
+          if [[ "$VERSION" == *-* ]]; then
+            ALIAS_TAG=__skip_alias__
+          fi
+          submit_cloud_build zig \
+            --project="${GCP_PROJECT}" \
+            --region="${GCP_REGION}" \
+            --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
+            --config=zig/cloudbuild.yaml \
+            --substitutions="_IMAGE_NAME=antfly,_DOCKERFILE=Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=zig-${VERSION},_CACHE_TAG=zig-buildcache,_DESCRIPTION=AntflyDB Zig runtime image"
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Mirror image GAR -> GHCR
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          TAGS=("zig-${VERSION}")
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS=(zig "${TAGS[@]}")
+          fi
+          for tag in "${TAGS[@]}"; do
+            crane copy \
+              "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${tag}" \
+              "ghcr.io/antflydb/antfly:${tag}"
+          done
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign GHCR images
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAGS=("zig-${VERSION}")
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS=(zig "${TAGS[@]}")
+          fi
+          for tag in "${TAGS[@]}"; do
+            cosign sign --yes \
+              -a "repo=${{ github.repository }}" \
+              -a "workflow=${{ github.workflow }}" \
+              -a "ref=${{ github.sha }}" \
+              "ghcr.io/antflydb/antfly:${tag}"
+          done
+
+      - name: Sign GAR images
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAGS=("zig-${VERSION}")
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS=(zig "${TAGS[@]}")
+          fi
+          for tag in "${TAGS[@]}"; do
+            cosign sign --yes \
+              -a "repo=${{ github.repository }}" \
+              -a "workflow=${{ github.workflow }}" \
+              -a "ref=${{ github.sha }}" \
+              "${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/antfly:${tag}"
+          done

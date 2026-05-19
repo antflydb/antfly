@@ -1,0 +1,28 @@
+{
+  "full_text_to_graph": {
+    "total_hits": 1,
+    "hits": [
+      {
+        "id": "paper:1",
+        "stored_data": {
+          "title": "intro",
+          "body": "machine learning systems"
+        }
+      }
+    ],
+    "graph_results": {
+      "citations": {
+        "total_hits": 1,
+        "hits": [
+          {
+            "id": "paper:2",
+            "stored_data": {
+              "title": "advanced",
+              "body": "graph retrieval"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

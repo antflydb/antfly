@@ -1,0 +1,20 @@
+storage-sim-fixture-v1
+mode crash
+label crash-async-io-after-meta
+case_label crash-async-io
+origin_seed 0xBEEF0E02
+phase after_meta_write_before_meta_sync
+expectation expected reopen to match either the previous or newly committed snapshot
+max_dbs 4
+write_map false
+map_async false
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend async_io
+expected_outcome previous_or_committed
+
+action put_docs 0 731
+action put_dup 1 732
+action put_main 3 733
+crash_action put_dup 1 8731

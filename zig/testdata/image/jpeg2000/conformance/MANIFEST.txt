@@ -1,0 +1,33 @@
+# JPEG 2000 Conformance Fixture Manifest
+#
+# This manifest lists external JPEG 2000 conformance fixtures expected to be
+# downloaded by a future build step. Each entry is one fixture per line in the
+# form:
+#
+#   <relative_path> SHA256=<hex-digest>
+#
+# The SHA256 value is a placeholder (<tbd>) until the upstream ISO/ITU
+# conformance suite fetch step is wired into build.zig. Until then these files
+# are NOT present in the repo and tests that consume them must be gated.
+#
+# TODO: add a build step that fetches and verifies these fixtures.
+
+p0_01.j2k SHA256=<tbd>
+p0_02.j2k SHA256=<tbd>
+p0_03.j2k SHA256=<tbd>
+p0_04.j2k SHA256=<tbd>
+p0_05.j2k SHA256=<tbd>
+p0_06.j2k SHA256=<tbd>
+p0_07.j2k SHA256=<tbd>
+p0_08.j2k SHA256=<tbd>
+p0_09.j2k SHA256=<tbd>
+p0_10.j2k SHA256=<tbd>
+p0_11.j2k SHA256=<tbd>
+p0_12.j2k SHA256=<tbd>
+p1_01.j2k SHA256=<tbd>
+p1_02.j2k SHA256=<tbd>
+p1_03.j2k SHA256=<tbd>
+p1_04.j2k SHA256=<tbd>
+p1_05.j2k SHA256=<tbd>
+p1_06.j2k SHA256=<tbd>
+p1_07.j2k SHA256=<tbd>

@@ -1,0 +1,21 @@
+storage-sim-fixture-v1
+mode differential
+label async-io
+case_label diff-async-io
+origin_seed 0xA17F5EED
+expectation expected C and Zig snapshots to stay aligned across reopen cycles
+max_dbs 4
+write_map false
+map_async false
+fixed_map false
+no_sync false
+no_meta_sync false
+commit_backend async_io
+expected_main_count 0
+expected_docs_count 1
+expected_dups_count 2
+
+action direct put_main 3 610
+action nested_commit put_dup 1 611 put_dup 1 612
+action reader_then_direct delete_main 3
+action direct put_docs 0 613

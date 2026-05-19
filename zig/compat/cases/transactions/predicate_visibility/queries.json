@@ -1,0 +1,26 @@
+[
+  {
+    "name": "status_t1",
+    "request": {
+      "get_transaction_status": {
+        "txn": "t1"
+      }
+    }
+  },
+  {
+    "name": "lookup_cas",
+    "request": {
+      "lookup": {
+        "key": "doc:cas"
+      }
+    }
+  },
+  {
+    "name": "timestamp_cas",
+    "request": {
+      "get_timestamp": {
+        "key": "doc:cas"
+      }
+    }
+  }
+]

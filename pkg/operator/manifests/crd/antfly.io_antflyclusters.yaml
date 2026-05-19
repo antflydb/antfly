@@ -1121,16 +1121,11 @@ spec:
                         type: integer
                     type: object
                   replicas:
-                    description: Replicas is the number of data nodes. Zero or omitted
-                      uses the controller default of 3; use suspend for intentional
-                      scale-to-zero.
+                    description: |-
+                      Replicas is the number of data nodes. Zero or omitted uses the controller
+                      default of 3; use suspend for intentional scale-to-zero.
                     format: int32
                     type: integer
-                  suspend:
-                    description: Suspend scales data nodes to zero while retaining
-                      PVCs. This is a pause/resume operation, not permanent node
-                      removal.
-                    type: boolean
                   resources:
                     description: Resources defines the resource requirements
                     properties:
@@ -1156,6 +1151,11 @@ spec:
                     required:
                     - limits
                     type: object
+                  suspend:
+                    description: |-
+                      Suspend scales data nodes to zero while retaining PVCs. This is a
+                      pause/resume operation, not permanent node removal.
+                    type: boolean
                   tolerations:
                     description: |-
                       Tolerations defines tolerations for pod scheduling.
@@ -6129,15 +6129,15 @@ spec:
                       StatefulSet for this step.
                     format: int32
                     type: integer
+                  drainingNodeID:
+                    description: DrainingNodeID is the Antfly node ID selected for
+                      this step.
+                    type: string
                   drainingOrdinal:
                     description: DrainingOrdinal is the StatefulSet ordinal selected
                       for this step.
                     format: int32
                     type: integer
-                  drainingNodeID:
-                    description: DrainingNodeID is the Antfly node ID selected for
-                      this step.
-                    type: string
                   fromReplicas:
                     description: FromReplicas is the observed/applied replica count
                       before this scale-down step.

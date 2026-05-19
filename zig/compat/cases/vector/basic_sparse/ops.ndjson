@@ -1,0 +1,1 @@
+{"op":"batch","writes":[{"key":"doc:a","value":{"title":"alpha","sparse":{"indices":[0,2],"values":[0.9,0.1]}}},{"key":"doc:b","value":{"title":"beta","sparse":{"indices":[1],"values":[0.9]}}},{"key":"doc:c","value":{"title":"gamma","sparse":{"indices":[0],"values":[0.4]}}}],"deletes":[],"sync_level":"write"}

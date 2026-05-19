@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 package sim
 
 import (
@@ -187,7 +201,7 @@ func NewHarness(cfg HarnessConfig) (*Harness, error) {
 		leader: h.metadataLeaderNode,
 		run:    h.runWithProgress,
 	}
-	h.tableManager, err = tablemgr.NewTableManager(metadataProxy, httpClient, 0)
+	h.tableManager, err = tablemgr.NewTableManager(metadataProxy, httpClient, cfg.MaxShardSizeBytes)
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("creating leader-routed table manager: %w", err)

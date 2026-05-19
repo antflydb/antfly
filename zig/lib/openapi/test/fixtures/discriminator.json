@@ -1,0 +1,87 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Discriminator Test",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/events": {
+      "post": {
+        "operationId": "createEvent",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Event"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Event"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ClickEvent": {
+        "type": "object",
+        "required": ["type", "x", "y"],
+        "properties": {
+          "type": { "type": "string" },
+          "x": { "type": "integer", "format": "int32" },
+          "y": { "type": "integer", "format": "int32" },
+          "element_id": { "type": "string" }
+        }
+      },
+      "KeyEvent": {
+        "type": "object",
+        "required": ["type", "key"],
+        "properties": {
+          "type": { "type": "string" },
+          "key": { "type": "string" },
+          "modifiers": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "ScrollEvent": {
+        "type": "object",
+        "required": ["type", "delta_x", "delta_y"],
+        "properties": {
+          "type": { "type": "string" },
+          "delta_x": { "type": "number", "format": "float" },
+          "delta_y": { "type": "number", "format": "float" }
+        }
+      },
+      "Event": {
+        "description": "A UI event with discriminator-based dispatch.",
+        "oneOf": [
+          { "$ref": "#/components/schemas/ClickEvent" },
+          { "$ref": "#/components/schemas/KeyEvent" },
+          { "$ref": "#/components/schemas/ScrollEvent" }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "click": "#/components/schemas/ClickEvent",
+            "key": "#/components/schemas/KeyEvent",
+            "scroll": "#/components/schemas/ScrollEvent"
+          }
+        }
+      }
+    }
+  }
+}

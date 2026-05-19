@@ -1,0 +1,16 @@
+storage-sim-fixture-v1
+mode wal_crash
+label crash-default-before-data-sync
+case_label crash-default-before-data-sync
+origin_seed 0xA17F3003
+phase before_data_sync
+expectation expected WAL reopen to preserve the previous committed snapshot
+no_sync false
+commit_backend adaptive
+expected_outcome previous
+
+action append
+action append_batch 2
+action verify_from 1
+action reopen_and_verify_from 1
+crash_action append

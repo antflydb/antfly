@@ -1,0 +1,2 @@
+{"schema":"gemma_chat/v1","id":"smoke-1","messages":[{"role":"user","content":"Reply with exactly: the sky is blue."},{"role":"assistant","content":"the sky is blue."}]}
+{"schema":"gemma_chat/v1","id":"smoke-2","messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"Reply with exactly: grass is green."},{"role":"assistant","content":"grass is green."}]}

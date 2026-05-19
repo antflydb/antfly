@@ -1,0 +1,7 @@
+[
+  "antfly-zig embedded adapter",
+  "Uses the embedded DB API with no server hop.",
+  "Full-text field uses the simple analyzer: Unicode word tokenization plus lowercase, with no stemming or stop words.",
+  "BM25 uses antfly-zig defaults k1=1.2 and b=0.75.",
+  "TOP_N commands return 1 per the search-benchmark-game protocol; TOP_N_COUNT and COUNT return exact counts via the filter path."
+]

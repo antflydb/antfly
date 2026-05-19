@@ -1,0 +1,37 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Schema Types", "version": "1.0.0" },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "AntflyType": {
+        "type": "string",
+        "description": "Index field type",
+        "enum": ["text", "keyword", "numeric", "boolean", "datetime", "embedding"]
+      },
+      "FieldSchema": {
+        "type": "object",
+        "description": "Schema for a single field",
+        "required": ["name", "type"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "$ref": "#/components/schemas/AntflyType" },
+          "index": { "type": "boolean", "description": "Whether to index this field" },
+          "include_in_all": { "type": "boolean" }
+        }
+      },
+      "TableSchema": {
+        "type": "object",
+        "description": "Schema definition for a table",
+        "required": ["fields"],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/FieldSchema" }
+          },
+          "default_analyzer": { "type": "string" }
+        }
+      }
+    }
+  }
+}
