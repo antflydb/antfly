@@ -3552,11 +3552,11 @@ fn preflightHostedGroupsParallel(
 }
 
 fn rejectCrossGroupResolvedDocFilter(req: db_mod.types.SearchRequest, group_count: usize) !void {
-    if (group_count > 1 and req.resolved_doc_filter != null) return error.UnsupportedQueryRequest;
+    if (group_count > 1 and searchRequestHasResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
 }
 
 fn rejectRemoteRouteResolvedDocFilter(req: db_mod.types.SearchRequest, route: table_router.GroupRoute) !void {
-    if (req.resolved_doc_filter == null) return;
+    if (!searchRequestHasResolvedDocFilter(req)) return;
     switch (route) {
         .local => {},
         .remote => return error.UnsupportedQueryRequest,
@@ -3570,10 +3570,17 @@ fn rejectHostedRemoteResolvedDocFilter(
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !void {
-    if (req.resolved_doc_filter == null or group_ids.len != 1) return;
+    if (!searchRequestHasResolvedDocFilter(req) or group_ids.len != 1) return;
     var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
     defer route.deinit(alloc);
     try rejectRemoteRouteResolvedDocFilter(req, route);
+}
+
+fn searchRequestHasResolvedDocFilter(req: db_mod.types.SearchRequest) bool {
+    if (comptime @hasField(db_mod.types.SearchRequest, "resolved_doc_filter")) {
+        return req.resolved_doc_filter != null;
+    }
+    return false;
 }
 
 fn queryProvisionedAcrossGroups(
