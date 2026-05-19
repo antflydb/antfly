@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
+const common_secrets = @import("../common/secrets.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
@@ -79,8 +80,9 @@ pub const LocalTermiteProvider = struct {
     ) anyerror![]u8 = null,
 };
 
-const InitOptions = struct {
+pub const InitOptions = struct {
     local_termite_provider: ?LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
 };
 
 pub const QueryTemplateError = error{
@@ -289,7 +291,8 @@ pub const ManagedEmbeddingEntry = struct {
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
-    api_key: ?[]u8 = null,
+    api_key: ?common_secrets.SecretValue = null,
+    secret_store: ?*common_secrets.FileStore = null,
     dimensions: u32,
     sparse: bool = false,
     multimodal: bool = false,
@@ -302,7 +305,7 @@ pub const ManagedEmbeddingEntry = struct {
         alloc.free(self.index_name);
         alloc.free(self.model);
         alloc.free(self.base_url);
-        if (self.api_key) |api_key| alloc.free(api_key);
+        if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -324,7 +327,7 @@ fn attachRequestPacers(
 
     for (entries) |*entry| {
         if (entry.requests_per_minute == 0) continue;
-        const scope_key = try requestPacerScopeKeyAlloc(alloc, entry.*);
+        const scope_key = try requestPacerScopeKeyAlloc(alloc, entry);
         defer alloc.free(scope_key);
 
         for (scopes.items) |scope| {
@@ -347,8 +350,8 @@ fn attachRequestPacers(
     }
 }
 
-fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: ManagedEmbeddingEntry) ![]u8 {
-    const api_key_hash = if (entry.api_key) |api_key| std.hash.Wyhash.hash(0, api_key) else 0;
+fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
+    const api_key_hash = if (entry.api_key) |*api_key| api_key.identityHash() else 0;
     return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
         @tagName(entry.provider),
         entry.base_url,
@@ -481,9 +484,17 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         local_termite_provider: ?LocalTermiteProvider,
     ) !?db_embedder.DenseEmbedder {
+        return try createDenseEmbedderWithOptions(alloc, indexes_json, .{ .local_termite_provider = local_termite_provider });
+    }
+
+    pub fn createDenseEmbedderWithOptions(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+        options: InitOptions,
+    ) !?db_embedder.DenseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithLocalTermite(alloc, indexes_json, local_termite_provider);
+        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
         if (!owned.hasDenseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -501,9 +512,17 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         local_termite_provider: ?LocalTermiteProvider,
     ) !?db_embedder.SparseEmbedder {
+        return try createSparseEmbedderWithOptions(alloc, indexes_json, .{ .local_termite_provider = local_termite_provider });
+    }
+
+    pub fn createSparseEmbedderWithOptions(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+        options: InitOptions,
+    ) !?db_embedder.SparseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithLocalTermite(alloc, indexes_json, local_termite_provider);
+        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
         if (!owned.hasSparseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -826,9 +845,10 @@ fn parseManagedEmbeddingEntry(
             .antfly => try alloc.dupe(u8, ""),
         },
         .api_key = switch (provider) {
-            .openai => try resolveOptionalConfigString(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+            .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
             .ollama, .termite, .antfly => null,
         },
+        .secret_store = options.secret_store,
         .dimensions = if (sparse) 0 else try resolveEmbeddingDimensions(cfg),
         .sparse = sparse,
         .multimodal = embedder_cfg.multimodal,
@@ -1447,8 +1467,14 @@ fn embedBatchWithOpenAiCompatible(
     });
     defer alloc.free(json_body);
 
-    const auth_header = if (entry.api_key) |api_key|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key})
+    const api_key = if (entry.api_key) |*api_key_ref|
+        try api_key_ref.resolveOwned(alloc, entry.secret_store)
+    else
+        null;
+    defer if (api_key) |value| alloc.free(value);
+
+    const auth_header = if (api_key) |value|
+        try std.fmt.allocPrint(alloc, "Bearer {s}", .{value})
     else
         null;
     defer if (auth_header) |value| alloc.free(value);

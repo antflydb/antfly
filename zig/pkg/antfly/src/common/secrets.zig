@@ -42,6 +42,54 @@ pub const ListedSecret = struct {
     }
 };
 
+pub const SecretValue = union(enum) {
+    literal: []u8,
+    secret_ref: []u8,
+    env_var: []u8,
+
+    pub fn initConfigOrEnv(alloc: std.mem.Allocator, configured_value: ?[]const u8, env_name: []const u8) !SecretValue {
+        if (configured_value) |value| {
+            if (parseSecretReference(value)) |key| {
+                return .{ .secret_ref = try alloc.dupe(u8, key) };
+            }
+            return .{ .literal = try alloc.dupe(u8, value) };
+        }
+        return .{ .env_var = try alloc.dupe(u8, env_name) };
+    }
+
+    pub fn deinit(self: *SecretValue, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .literal => |value| alloc.free(value),
+            .secret_ref => |value| alloc.free(value),
+            .env_var => |value| alloc.free(value),
+        }
+        self.* = undefined;
+    }
+
+    pub fn resolveOwned(self: *const SecretValue, alloc: std.mem.Allocator, secret_store: ?*FileStore) !?[]u8 {
+        return switch (self.*) {
+            .literal => |value| try alloc.dupe(u8, value),
+            .secret_ref => |key| blk: {
+                if (secret_store) |store| {
+                    break :blk (try store.getOwned(alloc, key)) orelse error.SecretNotFound;
+                }
+                const env_var = try envVarForKey(alloc, key);
+                defer alloc.free(env_var);
+                break :blk envValueOwned(alloc, env_var) orelse error.SecretNotFound;
+            },
+            .env_var => |env_var| envValueOwned(alloc, env_var),
+        };
+    }
+
+    pub fn identityHash(self: *const SecretValue) u64 {
+        return switch (self.*) {
+            .literal => |value| std.hash.Wyhash.hash(0, value),
+            .secret_ref => |value| std.hash.Wyhash.hash(1, value),
+            .env_var => |value| std.hash.Wyhash.hash(2, value),
+        };
+    }
+};
+
 const StoredSecret = struct {
     value: []u8,
     created_at_ns: u64,
@@ -776,6 +824,37 @@ test "parse secret reference extracts key name" {
     try std.testing.expectEqualStrings("pg_dsn", parseSecretReference("${secret:pg_dsn}").?);
     try std.testing.expect(parseSecretReference("plain") == null);
     try std.testing.expect(parseSecretReference("${secret:}") == null);
+}
+
+test "secret value resolves file-backed references at request time" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secret-value-reload-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    );
+
+    var store = try FileStore.init(alloc, path);
+    defer store.deinit();
+
+    var value = try SecretValue.initConfigOrEnv(alloc, "${secret:openai.api_key}", "OPENAI_API_KEY");
+    defer value.deinit(alloc);
+
+    const first = try value.resolveOwned(alloc, &store);
+    defer if (first) |resolved| alloc.free(resolved);
+    try std.testing.expectEqualStrings("first", first.?);
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"second-longer","created_at_ns":1,"updated_at_ns":2}]}
+    );
+    const second = try value.resolveOwned(alloc, &store);
+    defer if (second) |resolved| alloc.free(resolved);
+    try std.testing.expectEqualStrings("second-longer", second.?);
+
+    try writeFileAtomically(path, "{\"secrets\":[]}");
+    try std.testing.expectError(error.SecretNotFound, value.resolveOwned(alloc, &store));
 }
 
 test "environment secret discovery maps API key env vars" {

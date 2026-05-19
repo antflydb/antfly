@@ -18,6 +18,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/mod.zig");
+const common_secrets = @import("../common/secrets.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -114,6 +115,7 @@ pub const ProvisionedTableReadCache = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
     hit_count: std.atomic.Value(u64) = .init(0),
     miss_count: std.atomic.Value(u64) = .init(0),
     mutex: Io.Mutex = .init,
@@ -250,6 +252,7 @@ pub const ProvisionedTableReadCache = struct {
                 self.resource_manager,
                 self.backend_runtime,
                 self.local_termite_provider,
+                self.secret_store,
             ) catch |err| {
                 self.mutex.lockUncancelable(io);
                 self.removePendingOpenLocked(group_id, table_name);
@@ -1933,6 +1936,7 @@ pub const ProvisionedTableReadSource = struct {
     group_lsm_generation: ?GroupLsmGenerationSource = null,
     primary_lookup_db: ?PrimaryLookupDbSource = null,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -1957,6 +1961,15 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.local_termite_provider = provider;
         if (self.cache) |cache| cache.local_termite_provider = provider;
+        return self;
+    }
+
+    pub fn withSecretStore(
+        self: *ProvisionedTableReadSource,
+        secret_store: ?*common_secrets.FileStore,
+    ) *ProvisionedTableReadSource {
+        self.secret_store = secret_store;
+        if (self.cache) |cache| cache.secret_store = secret_store;
         return self;
     }
 
@@ -2067,7 +2080,7 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len == 0) return null;
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.lsmRootGeneration(group_ids[0]), self.backend_runtime, self.local_termite_provider, table_name, req, consistency);
+            const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.lsmRootGeneration(group_ids[0]), self.backend_runtime, self.local_termite_provider, self.secret_store, table_name, req, consistency);
             var result = execution.result;
             defer result.deinit();
             var meta: query_api.QueryResponseMeta = .{
@@ -2203,7 +2216,7 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, table_name, req, consistency);
+        const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, self.secret_store, table_name, req, consistency);
         var result = execution.result;
         defer result.deinit();
         var meta: query_api.QueryResponseMeta = .{
@@ -2227,7 +2240,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
-        return try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, table_name, req, consistency);
+        return try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, self.secret_store, table_name, req, consistency);
     }
 
     fn textStatsGroupLocal(
@@ -2270,7 +2283,7 @@ pub const ProvisionedTableReadSource = struct {
         for (req.frontier, 0..) |item, i| {
             const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
             defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-            var result = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, table_name, search_req, consistency);
+            var result = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, self.secret_store, table_name, search_req, consistency);
             defer result.deinit();
 
             expansions[i] = .{
@@ -2536,7 +2549,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local) {
-                const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], 0, self.backend_runtime, null, table_name, req, consistency);
+                const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], 0, self.backend_runtime, null, null, table_name, req, consistency);
                 var result = execution.result;
                 defer result.deinit();
                 var meta: query_api.QueryResponseMeta = .{
@@ -2687,7 +2700,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, table_name, req, consistency);
+        const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, table_name, req, consistency);
         var result = execution.result;
         defer result.deinit();
         var meta: query_api.QueryResponseMeta = .{
@@ -2714,7 +2727,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, table_name, req, consistency),
+            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, table_name, req, consistency),
             .remote => null,
         };
     }
@@ -2873,7 +2886,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 for (req.frontier, 0..) |item, i| {
                     const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
                     defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-                    var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, table_name, search_req, consistency);
+                    var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, table_name, search_req, consistency);
                     defer result.deinit();
 
                     expansions[i] = .{
@@ -3229,6 +3242,7 @@ fn queryProvisionedAcrossGroupsParallel(
                 source.lsmRootGeneration(group_id),
                 source.backend_runtime,
                 source.local_termite_provider,
+                source.secret_store,
                 table_name_inner,
                 shard_req_inner.*,
                 consistency_inner,
@@ -3300,6 +3314,7 @@ fn queryHostedAcrossGroupsParallel(
                     group_id,
                     0,
                     source.backend_runtime,
+                    null,
                     null,
                     table_name_inner,
                     shard_req_inner.*,
@@ -3542,7 +3557,7 @@ fn queryProvisionedAcrossGroups(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, table_name, shard_req, consistency);
+        shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.local_termite_provider, self.secret_store, table_name, shard_req, consistency);
         initialized += 1;
     }
     return try query_api.mergeSearchResults(alloc, req, shard_results[0..initialized], req.offset, req.limit);
@@ -3585,7 +3600,7 @@ fn queryHostedAcrossGroups(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, table_name, shard_req, consistency),
+            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, table_name, shard_req, consistency),
             .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, shard_req),
         };
         initialized += 1;
@@ -3663,7 +3678,7 @@ fn executeProvisionedGraphExpand(
     for (req.frontier, 0..) |item, i| {
         const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
         defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-        var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, table_name, search_req, consistency);
+        var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, table_name, search_req, consistency);
         defer result.deinit();
 
         expansions[i] = .{
@@ -4077,11 +4092,12 @@ fn queryLocal(
     lsm_root_generation: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
-    const detailed = try queryLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, table_name, req, consistency);
+    const detailed = try queryLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, secret_store, table_name, req, consistency);
     return detailed.result;
 }
 
@@ -4224,6 +4240,7 @@ fn queryLocalDetailed(
     lsm_root_generation: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
@@ -4245,7 +4262,7 @@ fn queryLocalDetailed(
         }
         return .{ .result = try reads.searchWithConsistency(alloc, db, req, consistency) };
     } else {
-        var db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, backend_runtime, local_termite_provider);
+        var db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, backend_runtime, local_termite_provider, secret_store);
         defer db.close();
 
         var reads = raft_mod.FeatureDBReads.init(group_id, requester);
@@ -4620,11 +4637,12 @@ fn queryHostedLocal(
     lsm_root_generation: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
-    const detailed = try queryHostedLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, table_name, req, consistency);
+    const detailed = try queryHostedLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, secret_store, table_name, req, consistency);
     return detailed.result;
 }
 
@@ -4638,12 +4656,13 @@ fn queryHostedLocalDetailed(
     lsm_root_generation: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !LocalQueryExecution {
-    return queryLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, table_name, req, consistency) catch |err| switch (err) {
-        error.NotLeader => if (consistency == .stale) err else try queryLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, table_name, req, .stale),
+    return queryLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, secret_store, table_name, req, consistency) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try queryLocalDetailed(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, local_termite_provider, secret_store, table_name, req, .stale),
         else => err,
     };
 }
@@ -4655,7 +4674,7 @@ fn openProvisionedQueryDbForTable(
     table_name: []const u8,
     lsm_root_generation: u64,
 ) !db_mod.DB {
-    return try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, null, null);
+    return try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, null, null, null);
 }
 
 fn openProvisionedQueryDbForTableWithRuntime(
@@ -4666,7 +4685,7 @@ fn openProvisionedQueryDbForTableWithRuntime(
     lsm_root_generation: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, backend_runtime, null);
+    return try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, backend_runtime, null, null);
 }
 
 fn openProvisionedWarmStatusDbForTable(
@@ -4710,6 +4729,7 @@ fn openProvisionedQueryDbForTableWithCache(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
 ) !db_mod.DB {
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse return try db_mod.DB.open(alloc, path, .{
         .open_mode = .query_readonly,
@@ -4736,15 +4756,16 @@ fn openProvisionedQueryDbForTableWithCache(
             allocator: std.mem.Allocator,
             raw_indexes_json: []const u8,
             local_provider: ?managed_embedder.LocalTermiteProvider,
+            store: ?*common_secrets.FileStore,
         ) !EmbedderSet {
             return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithLocalTermite(allocator, raw_indexes_json, local_provider),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithLocalTermite(allocator, raw_indexes_json, local_provider),
+                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store }),
+                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store }),
             };
         }
     }.run;
 
-    var embedders = try createEmbedders(alloc, indexes_json, local_termite_provider);
+    var embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store);
     errdefer embedders.deinit(alloc);
 
     var db = if (embedders.dense != null or embedders.sparse != null) blk: {
@@ -4781,7 +4802,7 @@ fn openProvisionedQueryDbForTableWithCache(
         // index from metadata. Reopen after reconcile so searches run against
         // the stabilized post-reconcile index-manager state.
         db.close();
-        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider);
+        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store);
         db = if (embedders.dense != null or embedders.sparse != null) blk: {
             const dense = embedders.dense;
             const sparse = embedders.sparse;
