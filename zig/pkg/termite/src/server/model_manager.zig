@@ -735,6 +735,7 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_text_prefix,
+            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest),
         });
         if (session_factory.getClipConfig(self.session)) |cfg| {
             pipeline.config.image_size = cfg.image_size;
@@ -895,6 +896,11 @@ pub const LoadedModel = struct {
         self.allocator.free(self.model_dir);
     }
 };
+
+fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
+    return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
+        (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
+}
 
 pub const ModelManager = struct {
     allocator: std.mem.Allocator,

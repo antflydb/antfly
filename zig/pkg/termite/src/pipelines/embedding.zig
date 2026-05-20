@@ -22,7 +22,9 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const linalg = @import("termite_linalg");
-const Tokenizer = @import("termite_tokenizer").Tokenizer;
+const tokenizer_mod = @import("termite_tokenizer");
+const Tokenizer = tokenizer_mod.Tokenizer;
+const EncodeResult = tokenizer_mod.EncodeResult;
 const Tensor = backends.Tensor;
 const session_mod = @import("../backends/session.zig");
 const ops_mod = @import("../ops/ops.zig");
@@ -49,6 +51,10 @@ pub const EmbeddingConfig = struct {
     /// Optional text prefix applied before tokenization. Jina v5 text models
     /// default to document embeddings by encoding "Document: " + text.
     text_prefix: []const u8 = "",
+    /// Trim padded text batches to the longest active sequence in the batch
+    /// before encoder execution. Useful for decoder-style embedders where
+    /// padding to the architectural context window is prohibitively expensive.
+    trim_padding_to_batch_max: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// For CLAP audio models: mel spectrogram configuration.
@@ -184,12 +190,14 @@ pub const EmbeddingPipeline = struct {
         const max_len = self.config.max_length;
         const batch = texts.len;
 
-        // Tokenize all texts with [CLS] + tokens + [SEP] + padding
-        const all_ids = try alloc.alloc(i32, batch * max_len);
-        defer alloc.free(all_ids);
-        const all_mask = try alloc.alloc(i32, batch * max_len);
-        defer alloc.free(all_mask);
+        const encoded = try alloc.alloc(EncodeResult, batch);
+        defer alloc.free(encoded);
+        var encoded_count: usize = 0;
+        defer {
+            for (encoded[0..encoded_count]) |*result| result.deinit();
+        }
 
+        var effective_len: usize = if (self.config.trim_padding_to_batch_max) 1 else max_len;
         for (texts, 0..) |text, i| {
             const token_text = if (self.config.text_prefix.len > 0)
                 try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.config.text_prefix, text })
@@ -197,26 +205,36 @@ pub const EmbeddingPipeline = struct {
                 text;
             defer if (self.config.text_prefix.len > 0) alloc.free(token_text);
 
-            var result = try self.tok.encodeForModel(alloc, token_text, max_len);
-            defer result.deinit();
+            encoded[i] = try self.tok.encodeForModel(alloc, token_text, max_len);
+            encoded_count += 1;
+            if (self.config.trim_padding_to_batch_max) {
+                effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
+            }
+        }
 
-            @memcpy(all_ids[i * max_len .. (i + 1) * max_len], result.ids);
-            @memcpy(all_mask[i * max_len .. (i + 1) * max_len], result.attention_mask);
+        const all_ids = try alloc.alloc(i32, batch * effective_len);
+        defer alloc.free(all_ids);
+        const all_mask = try alloc.alloc(i32, batch * effective_len);
+        defer alloc.free(all_mask);
+
+        for (encoded[0..batch], 0..) |result, i| {
+            @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], result.ids[0..effective_len]);
+            @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], result.attention_mask[0..effective_len]);
         }
 
         // Convert i32 token IDs to i64 for ONNX Runtime (expects int64 tensors)
-        const ids_i64 = try alloc.alloc(i64, batch * max_len);
+        const ids_i64 = try alloc.alloc(i64, batch * effective_len);
         defer alloc.free(ids_i64);
-        const mask_i64 = try alloc.alloc(i64, batch * max_len);
+        const mask_i64 = try alloc.alloc(i64, batch * effective_len);
         defer alloc.free(mask_i64);
 
-        for (0..batch * max_len) |j| {
+        for (0..batch * effective_len) |j| {
             ids_i64[j] = @intCast(all_ids[j]);
             mask_i64[j] = @intCast(all_mask[j]);
         }
 
         // Build input tensors
-        const shape = [_]i64{ @intCast(batch), @intCast(max_len) };
+        const shape = [_]i64{ @intCast(batch), @intCast(effective_len) };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, ids_i64);
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
@@ -237,7 +255,7 @@ pub const EmbeddingPipeline = struct {
 
         const inputs = if (needs_token_type) blk: {
             // Create zeros tensor for token_type_ids
-            const zeros = try alloc.alloc(i64, batch * max_len);
+            const zeros = try alloc.alloc(i64, batch * effective_len);
             defer alloc.free(zeros);
             @memset(zeros, 0);
             token_type_tensor = try Tensor.initInt64(alloc, "token_type_ids", &shape, zeros);
@@ -245,7 +263,7 @@ pub const EmbeddingPipeline = struct {
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
         if (self.text_projection) |proj| {
-            if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, max_len, proj)) |resident_embeddings| {
+            if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, effective_len, proj)) |resident_embeddings| {
                 return resident_embeddings;
             }
         }
@@ -266,7 +284,7 @@ pub const EmbeddingPipeline = struct {
         const output_shape = output.shape;
 
         const embeddings = switch (output_shape.len) {
-            3 => try self.pool3D(output, all_mask, batch, max_len, self.text_projection == null),
+            3 => try self.pool3D(output, all_mask, batch, effective_len, self.text_projection == null),
             2 => try self.extract2D(output, batch, self.text_projection == null),
             else => return error.UnexpectedOutputShape,
         };
@@ -277,6 +295,18 @@ pub const EmbeddingPipeline = struct {
         }
 
         return embeddings;
+    }
+
+    fn activeTokenLength(mask: []const i32) usize {
+        var last_active: usize = 0;
+        var found = false;
+        for (mask, 0..) |value, idx| {
+            if (value > 0) {
+                last_active = idx;
+                found = true;
+            }
+        }
+        return if (found) last_active + 1 else 1;
     }
 
     /// Pool 3D output [batch, seq, hidden] -> [batch][hidden]
@@ -1486,6 +1516,12 @@ test "pool3D last uses final non-padding token and normalizes" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), embeddings[0][1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), embeddings[1][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), embeddings[1][1], 1e-6);
+}
+
+test "active token length trims trailing padding but keeps at least one token" {
+    try std.testing.expectEqual(@as(usize, 3), EmbeddingPipeline.activeTokenLength(&.{ 1, 1, 1, 0, 0 }));
+    try std.testing.expectEqual(@as(usize, 4), EmbeddingPipeline.activeTokenLength(&.{ 1, 0, 0, 1, 0 }));
+    try std.testing.expectEqual(@as(usize, 1), EmbeddingPipeline.activeTokenLength(&.{ 0, 0, 0 }));
 }
 
 test "resident projected input selection supports 3d cls pooling" {
