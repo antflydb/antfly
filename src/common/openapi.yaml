@@ -135,11 +135,6 @@ components:
           type: boolean
           description: "Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node."
           default: false
-        registry_url:
-          type: string
-          format: uri
-          description: "Deprecated compatibility field. Antfarm now reads live models from Termite."
-          example: "https://models.example.com/v1"
         embedders:
           type: object
           additionalProperties:

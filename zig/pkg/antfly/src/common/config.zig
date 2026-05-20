@@ -31,7 +31,6 @@ pub const Config = struct {
     auth_enabled: bool = false,
     swarm_mode: bool = false,
     health_port: ?u16 = null,
-    registry_url: ?[]u8 = null,
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
@@ -200,7 +199,6 @@ pub const Config = struct {
                 std.math.cast(u16, value) orelse return error.InvalidConfig
             else
                 null,
-            .registry_url = if (validated.value.registry_url) |value| try alloc.dupe(u8, value) else null,
             .log = validated.value.log,
             .tls = if (validated.value.tls) |tls| .{
                 .cert = if (tls.cert) |value| try alloc.dupe(u8, value) else null,
@@ -251,7 +249,6 @@ pub const Config = struct {
         self.termite.deinit(self.registry.allocator);
         self.speech_to_text.deinit();
         self.text_to_speech.deinit();
-        if (self.registry_url) |value| self.registry.allocator.free(value);
         if (self.remote_content) |*remote_content| remote_content.deinit(self.registry.allocator);
         self.registry.deinit();
         self.* = undefined;
@@ -798,7 +795,7 @@ test "common config treats go orchestration urls as metadata api discovery urls"
     try std.testing.expectEqual(@as(usize, 0), cfg.metadata.raft_urls.len);
 }
 
-test "common config preserves remote content logging storage and deprecated registry fields" {
+test "common config preserves remote content logging and storage fields" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -812,7 +809,6 @@ test "common config preserves remote content logging storage and deprecated regi
         \\    "style": "json"
         \\  },
         \\  "health_port": 4200,
-        \\  "registry_url": "https://models.example.com/v1",
         \\  "swarm_mode": true,
         \\  "storage": {
         \\    "local": { "base_dir": "antflydb" },
@@ -857,7 +853,6 @@ test "common config preserves remote content logging storage and deprecated regi
 
     try std.testing.expectEqual(true, cfg.swarm_mode);
     try std.testing.expectEqual(@as(?u16, 4200), cfg.health_port);
-    try std.testing.expectEqualStrings("https://models.example.com/v1", cfg.registry_url.?);
     try std.testing.expectEqual(logging_openapi.Level.debug, cfg.log.?.level.?);
     try std.testing.expectEqual(logging_openapi.Style.json, cfg.log.?.style.?);
     try std.testing.expectEqual(common_openapi.StorageBackend.s3, cfg.storage.data_backend.?);
