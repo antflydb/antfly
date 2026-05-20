@@ -6703,6 +6703,10 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    const data_dir = try antfly.common.config.resolveLocalBaseDir(alloc, if (loaded_config) |*cfg| cfg else null);
+    defer alloc.free(data_dir);
+    try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
 

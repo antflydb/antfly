@@ -285,12 +285,18 @@ pub fn loadFromPathWithSecrets(
 }
 
 pub fn resolveLocalRoleBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config, role: []const u8) ![]u8 {
+    const base = try resolveLocalBaseDir(alloc, cfg);
+    defer alloc.free(base);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, role });
+}
+
+pub fn resolveLocalBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config) ![]u8 {
     if (cfg) |loaded| {
         if (loaded.storage.local_base_dir) |dir| {
-            return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, role });
+            return try alloc.dupe(u8, dir);
         }
     }
-    return try std.fmt.allocPrint(alloc, ".zig-cache/{s}", .{role});
+    return try alloc.dupe(u8, ".zig-cache");
 }
 
 fn parseMetadataConfig(

@@ -19,6 +19,7 @@ pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");
 pub const health_server = @import("health_server.zig");
 pub const group_ids = @import("group_ids.zig");
+pub const data_format = @import("data_format.zig");
 
 test {
     _ = provider_registry;
@@ -28,4 +29,5 @@ test {
     _ = secrets;
     _ = health_server;
     _ = group_ids;
+    _ = data_format;
 }
