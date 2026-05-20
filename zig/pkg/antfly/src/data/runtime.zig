@@ -6741,6 +6741,9 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
         try ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
@@ -7204,6 +7207,18 @@ test "data runtime parses auth flag" {
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, parsed.auth_enabled.?);
+}
+
+test "data runtime leaves auth disabled unless config or cli enables it" {
+    var cli = CliConfig{};
+    defer cli.deinit(std.testing.allocator);
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = true;
+    try std.testing.expect(resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = false;
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
 }
 
 test "data runtime local group status uses injected leadership source" {

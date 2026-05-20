@@ -600,6 +600,9 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
         try ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
@@ -1388,6 +1391,12 @@ const RecordingServer = struct {
 test "swarm runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "swarm runtime leaves auth disabled unless config or cli enables it" {
+    try std.testing.expect(!resolveAuthEnabled(.{}, null));
+    try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
+    try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
