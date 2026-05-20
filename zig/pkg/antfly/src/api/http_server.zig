@@ -5425,6 +5425,7 @@ fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
 pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
