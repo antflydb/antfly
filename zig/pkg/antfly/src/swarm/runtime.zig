@@ -603,7 +603,7 @@ pub fn runFromIterator(
         // This seeds only the local auth store and must remain auth-gated.
         // Raft-backed metadata writes during metadata bootstrap can block
         // clustered startup before raft listeners are running.
-        try ensureDefaultAdminUser(&user_manager.?);
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -1277,21 +1277,6 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     if (cli.auth_enabled) |value| return value;
     if (cfg) |loaded| return loaded.auth_enabled;
     return false;
-}
-
-fn ensureDefaultAdminUser(manager: *antfly.usermgr.UserManager) !void {
-    _ = manager.getUser("admin") catch |err| switch (err) {
-        error.UserNotFound => {
-            var admin_permission = [_]antfly.usermgr.Permission{
-                try antfly.usermgr.Permission.initOwned(manager.alloc, .@"*", "*", .admin),
-            };
-            defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
-            user.deinit(manager.alloc);
-            return;
-        },
-        else => return err,
-    };
 }
 
 fn resolveTermiteModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
