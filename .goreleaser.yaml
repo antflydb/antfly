@@ -41,6 +41,7 @@ builds:
       - -Doptimize=ReleaseFast
       - -Dcpu=baseline
       - -Dantfly-bin-name=antfly
+      - -Dantfly-version={{ .Version }}
       - -Donnx=false
       - -Dmlx=false
       - -Dmetal=false
@@ -57,6 +58,7 @@ builds:
       - -Doptimize=ReleaseFast
       - -Dcpu=baseline
       - -Dantfly-bin-name=antfly
+      - -Dantfly-version={{ .Version }}
       - -Donnx=false
       - -Dmlx=false
       - -Dmetal=true
