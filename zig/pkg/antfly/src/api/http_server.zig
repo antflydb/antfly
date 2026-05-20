@@ -1488,6 +1488,12 @@ pub const ApiHttpServer = struct {
             defer public_status.deinit(self.alloc);
             public_status.auth_enabled = self.cfg.auth_enabled;
             public_status.swarm_mode = self.cfg.swarm_mode;
+            if (self.cfg.secret_store) |secret_store| {
+                _ = secret_store.refreshIfChanged() catch |err| {
+                    std.log.warn("secret store status refresh skipped err={}", .{err});
+                };
+                cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            }
             return try jsonResponse(self.alloc, public_status);
         }
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
@@ -7097,12 +7103,95 @@ test "api http server serves secrets crud when backed by a local store" {
     }
     try std.testing.expect(found_openai);
 
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{\"secrets\":[{\"key\":\"gemini.api_key\",\"value\":\"externally-managed\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
+    });
+
+    var external_list_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/secrets",
+    });
+    defer external_list_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), external_list_resp.status);
+    var external_list = try std.json.parseFromSlice(metadata_openapi.SecretList, alloc, external_list_resp.body, .{});
+    defer external_list.deinit();
+    var found_external_gemini = false;
+    var found_deleted_openai = false;
+    for (external_list.value.secrets) |secret| {
+        if (std.mem.eql(u8, secret.key, "gemini.api_key")) found_external_gemini = true;
+        if (std.mem.eql(u8, secret.key, "openai.api_key")) found_deleted_openai = true;
+    }
+    try std.testing.expect(found_external_gemini);
+    try std.testing.expect(!found_deleted_openai);
+
+    var restored = try store.put(alloc, "openai.api_key", "sk-test");
+    defer restored.deinit(alloc);
+
     var delete_resp = try server.handle(.{
         .method = .DELETE,
         .uri = "/secrets/openai.api_key",
     });
     defer delete_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_resp.status);
+}
+
+test "api http server status includes secret store reload health" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-status-{d}.json", .{platform_time.monotonicNs()});
+    defer alloc.free(store_path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"stable\",\"created_at_ns\":1,\"updated_at_ns\":1}]}",
+    });
+
+    var source = FakeSource{};
+    var store = try common_secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+
+    var server = ApiHttpServer.init(alloc, .{
+        .swarm_mode = true,
+        .secret_store = &store,
+    }, source.iface(), null, null);
+
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{not-json",
+    });
+
+    var status_resp = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.status,
+    });
+    defer status_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), status_resp.status);
+    var parsed = try std.json.parseFromSlice(cluster.ClusterStatus, alloc, status_resp.body, .{});
+    defer parsed.deinit();
+    const secret_store = parsed.value.secret_store orelse return error.TestUnexpectedResult;
+    try std.testing.expect(secret_store.stale);
 }
 
 test "api http server lists secrets status without a local secret store" {

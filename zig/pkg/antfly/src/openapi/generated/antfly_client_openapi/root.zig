@@ -11,6 +11,7 @@ pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const ClusterHealth = types.ClusterHealth;
 pub const ClusterStatus = types.ClusterStatus;
+pub const SecretStoreStatus = types.SecretStoreStatus;
 pub const SecretStatus = types.SecretStatus;
 pub const SecretEntry = types.SecretEntry;
 pub const SecretList = types.SecretList;
