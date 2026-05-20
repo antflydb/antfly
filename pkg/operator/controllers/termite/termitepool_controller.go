@@ -238,11 +238,7 @@ func (r *TermitePoolReconciler) reconcileConfigMap(ctx context.Context, pool *an
 	// Build model list for environment variables (backward compatibility)
 	models := make([]string, 0, len(pool.Spec.Models.Preload))
 	for _, m := range pool.Spec.Models.Preload {
-		name := m.Name
-		if m.Variant != "" {
-			name = name + ":" + m.Variant
-		}
-		models = append(models, name)
+		models = append(models, m.Name)
 	}
 
 	cm := &corev1.ConfigMap{
@@ -302,11 +298,7 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 	// Build preload model list
 	preload := make([]string, 0, len(pool.Spec.Models.Preload))
 	for _, m := range pool.Spec.Models.Preload {
-		name := m.Name
-		if m.Variant != "" {
-			name = name + ":" + m.Variant
-		}
-		preload = append(preload, name)
+		preload = append(preload, m.Name)
 	}
 
 	// Set auto-generated config (don't override if user specified)
@@ -316,16 +308,12 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 
 	// Build per-model loading strategies map
 	// Only include models that have an explicit strategy override
-	// Key format: "name" or "name-variant" (matches lazy registry naming)
+	// Key format is the canonical model ref from spec.models.preload[].name.
 	if _, exists := config["model_strategies"]; !exists {
 		modelStrategies := make(map[string]string)
 		for _, m := range pool.Spec.Models.Preload {
 			if m.Strategy != "" {
-				key := m.Name
-				if m.Variant != "" {
-					key = m.Name + "-" + m.Variant
-				}
-				modelStrategies[key] = string(m.Strategy)
+				modelStrategies[m.Name] = string(m.Strategy)
 			}
 		}
 		if len(modelStrategies) > 0 {
@@ -407,45 +395,25 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
 	replicas := initialTermiteReplicas(pool)
 
-	// Build model list for init container pull command.
-	// Group models by variant to use --variants flag.
-	// Example:
-	//   /antfly termite pull --models-dir /models --variants i8 bge-small-en-v1.5 mxbai-rerank-base-v1
-	variantGroups := make(map[string][]string) // variant -> []model names
-	for _, m := range pool.Spec.Models.Preload {
-		variant := m.Variant
-		if variant == "" {
-			variant = "f32" // default variant
-		}
-		variantGroups[variant] = append(variantGroups[variant], m.Name)
-	}
-
-	// Build preload init containers - one per variant group, sorted for deterministic ordering.
-	variants := make([]string, 0, len(variantGroups))
-	for v := range variantGroups {
-		variants = append(variants, v)
-	}
-	slices.Sort(variants)
-
 	// Determine image
 	image := r.AntflyImage
 	if pool.Spec.Image != "" {
 		image = pool.Spec.Image
 	}
 
-	initContainers := make([]corev1.Container, 0, len(variants))
-	for i, variant := range variants {
-		names := variantGroups[variant]
-		slices.Sort(names) // Sort model names too for consistency
+	modelRefs := make([]string, 0, len(pool.Spec.Models.Preload))
+	for _, m := range pool.Spec.Models.Preload {
+		modelRefs = append(modelRefs, m.Name)
+	}
+	slices.Sort(modelRefs)
 
-		args := []string{"termite", "pull", "--models-dir", "/models", "--variants", variant}
-		args = append(args, names...)
-
+	initContainers := make([]corev1.Container, 0, len(modelRefs))
+	for i, ref := range modelRefs {
 		initContainers = append(initContainers, corev1.Container{
 			Name:    fmt.Sprintf("model-puller-%d", i),
 			Image:   image,
 			Command: []string{"/antfly"},
-			Args:    args,
+			Args:    []string{"termite", "pull", ref, "--models-dir", "/models"},
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "models", MountPath: "/models"},
 			},

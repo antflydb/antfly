@@ -5605,7 +5605,10 @@ spec:
                           description: ModelSpec defines a single model to load
                           properties:
                             name:
-                              description: Name is the model name (e.g., "bge-small-en-v1.5")
+                              description: |-
+                                Name is the model reference, including an optional tag/variant suffix
+                                (e.g., "BAAI/bge-small-en-v1.5:i8" or "hf:antflydb/clipclap:gguf:Q4_K").
+                              minLength: 1
                               type: string
                             priority:
                               default: medium
@@ -5624,10 +5627,6 @@ spec:
                               - eager
                               - lazy
                               - bounded
-                              type: string
-                            variant:
-                              description: Variant specifies a model variant (e.g.,
-                                "quantized")
                               type: string
                           required:
                           - name
