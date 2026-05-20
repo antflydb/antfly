@@ -469,6 +469,8 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	mcpAdapter := newMCPAdapter(NewTableApi(r.logger, r.node, r.tableManager))
 	mcpServer := antflymcp.NewMCPServer(mcpAdapter)
 	mcpHandler := antflymcp.NewMCPHandler(mcpServer)
+	// Ensure MCP routes receive the same authentication gate as other public APIs.
+	mcpHandler = r.node.authnMiddleware(mcpHandler)
 	apiRoutes.Handle("/mcp/v1/", http.StripPrefix("/mcp/v1", mcpHandler))
 	r.logger.Info("MCP server mounted", zap.String("path", "/mcp/v1/"))
 
