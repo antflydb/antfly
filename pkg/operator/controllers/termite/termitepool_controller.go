@@ -454,7 +454,7 @@ func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *
 							Name:    "termite",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    []string{"termite", "run", "--config", "/config/config.json"},
+							Args:    []string{"termite", "run", "--host", "0.0.0.0", "--port", strconv.Itoa(TermiteAPIPort), "--models-dir", "/models"},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: TermiteAPIPort, Protocol: corev1.ProtocolTCP},
 							},

@@ -1997,6 +1997,8 @@ func TestGenerateCompleteConfig(t *testing.T) {
 	// Verify the full URL format
 	expectedURL := "http://test-cluster-metadata-0.test-cluster-metadata.default.svc.cluster.local:12377"
 	g.Expect(url1).To(Equal(expectedURL))
+	g.Expect(config["default_shards_per_table"]).To(Equal(float64(1)))
+	g.Expect(config["max_shards_per_table"]).To(Equal(float64(0)))
 }
 
 func TestGenerateCompleteConfig_Swarm(t *testing.T) {

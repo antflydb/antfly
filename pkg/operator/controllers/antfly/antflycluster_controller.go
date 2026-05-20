@@ -1691,10 +1691,12 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 		"metadata": map[string]any{
 			"orchestration_urls": orchestrationURLs,
 		},
-		"max_shard_size_bytes": 67108864, // Default 64MB
-		"replication_factor":   3,        // Default
-		"enable_auth":          false,    // Default
-		"disable_shard_alloc":  true,     // Default
+		"max_shard_size_bytes":     67108864, // Default 64MB
+		"replication_factor":       3,        // Default
+		"enable_auth":              false,    // Default
+		"disable_shard_alloc":      true,     // Default
+		"default_shards_per_table": uint64(1),
+		"max_shards_per_table":     uint64(0),
 	}
 
 	// Merge user configuration on top of defaults
