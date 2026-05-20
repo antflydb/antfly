@@ -79,7 +79,7 @@ Concrete examples:
 termite finetune dataset generate gemma4-pilot /tmp/pilot.jsonl --count 1000 --split train
 termite finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json
 
-termite finetune adapter bootstrap gemma4 /models/gemma4 /tmp/adapter --rank 16 --alpha 32
+termite finetune adapter bootstrap gemma4 /models/gemma4 /tmp/adapter --rank 16 --alpha 32 --target-preset all-linear
 termite finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff --backend mlx
 termite finetune adapter materialize gemma4 /models/gemma4 /tmp/out /tmp/merged
 
