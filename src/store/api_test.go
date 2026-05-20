@@ -399,7 +399,8 @@ func TestHandleBackup_FileLocation_Success(t *testing.T) {
 
 	shardID := types.ID(123)
 	backupID := "test-backup-1"
-	tempDir := t.TempDir() // Create a temporary directory for the backup file
+	tempDir := filepath.Join(baseDir, "backup-location") // local file backup roots must be under baseDir
+	require.NoError(t, os.MkdirAll(tempDir, 0o755))
 
 	backupLocation := "file://" + tempDir
 	// expectedBackupFileName := fmt.Sprintf("%s-%s.tar.sz", shardID, backupID)
@@ -471,7 +472,8 @@ func TestHandleBackup_DefaultsToPortable(t *testing.T) {
 
 	shardID := types.ID(123)
 	backupID := "test-default-portable"
-	tempDir := t.TempDir()
+	tempDir := filepath.Join(baseDir, "portable-backup-location")
+	require.NoError(t, os.MkdirAll(tempDir, 0o755))
 	backupLocation := "file://" + tempDir
 
 	mockShard.On("ExportPortable", mock.Anything, mock.Anything).
@@ -590,12 +592,14 @@ func TestHandleBackup_ShardBackupFails(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 	mockShard := new(MockShard)
 	mockStore := &MockStore{logger: logger}
-	sapi := &StoreAPI{logger: logger, store: mockStore}
+	baseDir := t.TempDir()
+	sapi := &StoreAPI{logger: logger, store: mockStore, antflyConfig: &common.Config{Storage: common.StorageConfig{Local: common.LocalStorageConfig{BaseDir: baseDir}}}}
 	api := sapi.setupRoutes()
 
 	shardID := types.ID(123)
 	backupID := "test-backup-fail"
-	tempDir := t.TempDir()
+	tempDir := filepath.Join(baseDir, "backup-fail-location")
+	require.NoError(t, os.MkdirAll(tempDir, 0o755))
 	backupLocation := "file://" + tempDir
 
 	mockStore.On("Shard", shardID).Return(mockShard, true)
@@ -632,11 +636,13 @@ func TestHandleBackup_FileLocation_BackupFileNotCreated(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 	mockShard := new(MockShard)
 	mockStore := &MockStore{logger: logger}
-	api := &StoreAPI{logger: logger, store: mockStore}
+	baseDir := t.TempDir()
+	api := &StoreAPI{logger: logger, store: mockStore, antflyConfig: &common.Config{Storage: common.StorageConfig{Local: common.LocalStorageConfig{BaseDir: baseDir}}}}
 
 	shardID := types.ID(789)
 	backupID := "test-backup-nofile"
-	tempDir := t.TempDir()
+	tempDir := filepath.Join(baseDir, "backup-missing-location")
+	require.NoError(t, os.MkdirAll(tempDir, 0o755))
 	backupLocation := "file://" + tempDir
 
 	// Simulate Shard.Backup succeeding but somehow not creating the file (or it gets deleted)
@@ -1079,7 +1085,7 @@ func TestHandleStartShard_Success_RestoreConfig_File(t *testing.T) {
 	backupID := "filebackup"
 	expectedArchiveName := fmt.Sprintf("%s-%s.tar.zst", backupID, newShardID)
 
-	tempDir := t.TempDir()
+	tempDir := filepath.Join(baseDir, "restore-source-root")
 	srcBackupDir := filepath.Join(tempDir, "source_backups")
 	err := os.MkdirAll(srcBackupDir, os.ModePerm)
 	require.NoError(t, err)
@@ -1331,7 +1337,7 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 	newShardID := types.ID(204)
 	backupID := "filenotfoundbackup"
 
-	nonExistentSrcDir := filepath.Join(t.TempDir(), "non_existent_source_backups")
+	nonExistentSrcDir := filepath.Join(baseDir, "non_existent_source_backups")
 	restoreLocation := "file://" + nonExistentSrcDir
 	expectedArchiveName := fmt.Sprintf("%s-%s.tar.zst", backupID, newShardID)
 
@@ -1416,4 +1422,80 @@ func TestHandleStartShard_Failure_Multipart_CreateSnapDirFails(t *testing.T) {
 		mock.Anything,
 	)
 	mockStore.AssertExpectations(t)
+}
+
+func TestHandleStartShard_RejectsTraversalBackupID(t *testing.T) {
+	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
+	newShardID := types.ID(310)
+	startReq := ShardStartRequest{
+		ShardConfig: ShardConfig{
+			RestoreConfig: &common.BackupConfig{BackupID: "../../tmp/owned", Location: "s3://bucket/backups"},
+		},
+		Peers: []common.Peer{{ID: 1}},
+	}
+	body, err := json.Marshal(startReq)
+	require.NoError(t, err)
+	mockStore.On("Shard", newShardID).Return(nil, false)
+
+	req := httptest.NewRequest(http.MethodPost, "/shard", bytes.NewReader(body))
+	req.Header.Set("X-Raft-Shard-Id", newShardID.String())
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	api.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid backup ID")
+	mockStore.AssertNotCalled(t, "StartRaftGroup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestHandleBackup_RejectsLocalLocationOutsideBaseDir(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	mockShard := new(MockShard)
+	baseDir := t.TempDir()
+	outsideDir := t.TempDir()
+	mockStore := &MockStore{logger: logger, nodeID: types.ID(1)}
+	api := (&StoreAPI{
+		logger: logger,
+		store:  mockStore,
+		antflyConfig: &common.Config{Storage: common.StorageConfig{Local: common.LocalStorageConfig{
+			BaseDir: baseDir,
+		}}},
+	}).setupRoutes()
+
+	shardID := types.ID(311)
+	mockStore.On("Shard", shardID).Return(mockShard, true)
+	body, err := json.Marshal(common.BackupConfig{BackupID: "safe-id", Location: "file://" + outsideDir, Format: common.BackupFormatNative})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/shard/backup", bytes.NewReader(body))
+	req.Header.Set("X-Raft-Shard-Id", shardID.String())
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	api.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "must be under antfly base directory")
+	mockShard.AssertNotCalled(t, "Backup", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestHandleBackup_RejectsTraversalBackupID(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	mockShard := new(MockShard)
+	mockStore := &MockStore{logger: logger, nodeID: types.ID(1)}
+	api := (&StoreAPI{logger: logger, store: mockStore}).setupRoutes()
+
+	shardID := types.ID(312)
+	mockStore.On("Shard", shardID).Return(mockShard, true)
+	body, err := json.Marshal(common.BackupConfig{BackupID: "../../owned", Location: "s3://bucket/backups", Format: common.BackupFormatNative})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/shard/backup", bytes.NewReader(body))
+	req.Header.Set("X-Raft-Shard-Id", shardID.String())
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	api.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "Invalid backup ID")
+	mockShard.AssertNotCalled(t, "Backup", mock.Anything, mock.Anything, mock.Anything)
 }
