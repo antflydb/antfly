@@ -1197,14 +1197,13 @@ fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 
             else => return err,
         };
         if (resolved_z) |resolved| {
+            defer alloc.free(resolved);
             const resolved_prefix = resolved[0..resolved.len];
-            if (probe.len == path.len) return resolved_prefix;
+            if (probe.len == path.len) return try alloc.dupe(u8, resolved_prefix);
 
             const suffix_start: usize = if (probe.len == 1) 1 else probe.len + 1;
             const suffix = path[suffix_start..];
-            const joined = try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
-            alloc.free(resolved_prefix);
-            return joined;
+            return try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
         }
 
         const parent = std.fs.path.dirname(probe) orelse return try alloc.dupe(u8, path);
@@ -1561,8 +1560,18 @@ test "swarm runtime resolves paths from common storage base dir" {
 
     const resolved = try resolvePaths(alloc, .{}, &cfg);
     defer resolved.deinit(alloc);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/replicas", resolved.replica_root_dir);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/catalog.txt", resolved.replica_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/local-metadata.json", resolved.local_metadata_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/snapshots", resolved.snapshot_root_dir);
+    const expected_base = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/swarm");
+    defer alloc.free(expected_base);
+    const expected_replica_root = try std.fs.path.join(alloc, &.{ expected_base, "replicas" });
+    defer alloc.free(expected_replica_root);
+    const expected_replica_catalog = try std.fs.path.join(alloc, &.{ expected_base, "catalog.txt" });
+    defer alloc.free(expected_replica_catalog);
+    const expected_local_metadata = try std.fs.path.join(alloc, &.{ expected_base, "local-metadata.json" });
+    defer alloc.free(expected_local_metadata);
+    const expected_snapshot_root = try std.fs.path.join(alloc, &.{ expected_base, "snapshots" });
+    defer alloc.free(expected_snapshot_root);
+    try std.testing.expectEqualStrings(expected_replica_root, resolved.replica_root_dir);
+    try std.testing.expectEqualStrings(expected_replica_catalog, resolved.replica_catalog_path);
+    try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
+    try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
 }

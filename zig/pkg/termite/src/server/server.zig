@@ -839,6 +839,13 @@ pub const Node = struct {
         self.metrics.setQueueDepth(self.request_queue.depth());
     }
 
+    fn estimateHttpRequestQueueUnits(self: *Node, ctx: *httpx.Context) usize {
+        _ = self;
+        const body_len = if (ctx.request.body) |body| body.len else 0;
+        const bytes_per_unit: usize = 1024 * 1024;
+        return 1 + (body_len / bytes_per_unit);
+    }
+
     fn estimateGenerateQueueUnits(self: *Node, messages: []const generation.Message, max_tokens: i32) usize {
         _ = self;
         var text_bytes: usize = 0;
@@ -929,8 +936,9 @@ pub const Node = struct {
             });
         };
 
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("embed");
         defer self.metrics.decActive();
 
@@ -1181,8 +1189,9 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("chunk");
         defer self.metrics.decActive();
 
@@ -3114,8 +3123,9 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("classify");
         defer self.metrics.decActive();
 
@@ -3166,8 +3176,10 @@ pub const Node = struct {
             const all_results = pipeline.classifyBatch(body.texts, body.labels, .{
                 .threshold = 0.0,
                 .multi_label = body.multi_label orelse false,
-            }) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            }) catch |err| switch (err) {
+                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = @errorName(err) }),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            };
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
                 ctx.allocator.free(all_results);
