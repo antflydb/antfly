@@ -22,6 +22,8 @@ pub const ServerBudgetOverrides = termite.server.BudgetOverrides;
 
 /// Returns ~/.termite/models if $HOME is set, otherwise falls back to ./models.
 pub fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
+    if (platform.env.getenv("ANTFLY_TERMITE_MODELS_DIR")) |value| return value;
+    if (platform.env.getenv("TERMITE_MODELS_DIR")) |value| return value;
     const home = platform.env.getenv("HOME") orelse return "./models";
     return std.fs.path.join(allocator, &.{ home, ".termite", "models" }) catch "./models";
 }
