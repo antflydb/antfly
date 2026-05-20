@@ -266,6 +266,12 @@ pub const AntflyApiHandler = struct {
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
         public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        if (self.api_server.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+        }
         return ctx.json(public_status);
     }
 
