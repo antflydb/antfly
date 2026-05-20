@@ -492,6 +492,10 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     } else |_| {}
 
     // Load special tokens from tokenizer_config.json
+    if (c_file.readFileFromDir(allocator, model_dir_path, "tokenizer.json")) |tok_bytes| {
+        defer allocator.free(tok_bytes);
+        parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes) catch {};
+    } else |_| {}
     if (c_file.readFileFromDir(allocator, model_dir_path, "tokenizer_config.json")) |tc_bytes| {
         defer allocator.free(tc_bytes);
         parseTokenizerConfig(&manifest, allocator, tc_bytes) catch {};
@@ -1353,6 +1357,46 @@ fn parseAddedTokens(manifest: *ModelManifest, json_bytes: []const u8) !void {
     }
 }
 
+fn setGlinerSpecialToken(manifest: *ModelManifest, content: []const u8, token_id: i32) void {
+    if (std.mem.eql(u8, content, "[P]")) manifest.gliner_token_p = token_id;
+    if (std.mem.eql(u8, content, "[C]")) manifest.gliner_token_c = token_id;
+    if (std.mem.eql(u8, content, "[E]")) manifest.gliner_token_e = token_id;
+    if (std.mem.eql(u8, content, "[R]")) manifest.gliner_token_r = token_id;
+    if (std.mem.eql(u8, content, "[SEP_TEXT]")) manifest.gliner_token_sep_text = token_id;
+}
+
+fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+
+    if (obj.get("added_tokens")) |tokens| {
+        if (tokens == .array) {
+            for (tokens.array.items) |entry| {
+                if (entry != .object) continue;
+                const id_val = entry.object.get("id") orelse continue;
+                const content_val = entry.object.get("content") orelse continue;
+                if (id_val != .integer or content_val != .string) continue;
+                setGlinerSpecialToken(manifest, content_val.string, @intCast(id_val.integer));
+            }
+        }
+    }
+
+    if (obj.get("added_tokens_decoder")) |decoder| {
+        if (decoder == .object) {
+            var it = decoder.object.iterator();
+            while (it.next()) |entry| {
+                const token_id = std.fmt.parseInt(i32, entry.key_ptr.*, 10) catch continue;
+                if (entry.value_ptr.* != .object) continue;
+                const content_val = entry.value_ptr.object.get("content") orelse continue;
+                if (content_val != .string) continue;
+                setGlinerSpecialToken(manifest, content_val.string, token_id);
+            }
+        }
+    }
+}
+
 test "inferModelTypeFromPath detects classifier directory" {
     try std.testing.expectEqual(@as(?ModelType, .classifier), inferModelTypeFromPath("/tmp/models/classifiers/cross-encoder/nli-distilroberta-base"));
 }
@@ -1391,12 +1435,7 @@ fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, 
                 if (entry.value_ptr.* != .object) continue;
                 const content_v = entry.value_ptr.object.get("content") orelse continue;
                 if (content_v != .string) continue;
-                const content = content_v.string;
-                if (std.mem.eql(u8, content, "[P]")) manifest.gliner_token_p = token_id;
-                if (std.mem.eql(u8, content, "[C]")) manifest.gliner_token_c = token_id;
-                if (std.mem.eql(u8, content, "[E]")) manifest.gliner_token_e = token_id;
-                if (std.mem.eql(u8, content, "[R]")) manifest.gliner_token_r = token_id;
-                if (std.mem.eql(u8, content, "[SEP_TEXT]")) manifest.gliner_token_sep_text = token_id;
+                setGlinerSpecialToken(manifest, content_v.string, token_id);
             }
         }
     }
@@ -1553,6 +1592,43 @@ test "manifest detects gliner gguf head sidecar" {
     defer manifest.deinit();
     try std.testing.expect(manifest.gliner_head_gguf_path != null);
     try std.testing.expect(std.mem.endsWith(u8, manifest.gliner_head_gguf_path.?, "gliner_head.gguf"));
+}
+
+test "manifest reads gliner special tokens from tokenizer json" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-gliner-tokenizer-json");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    const gliner_config_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_config.json" });
+    defer allocator.free(gliner_config_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gliner_config_path, .data = "{\"model_type\":\"gliner2\"}" });
+
+    const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
+    defer allocator.free(tokenizer_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = tokenizer_path,
+        .data =
+        \\{"version":"1.0","added_tokens":[
+        \\{"id":32000,"content":"[P]"},
+        \\{"id":32001,"content":"[E]"},
+        \\{"id":32002,"content":"[SEP_TEXT]"},
+        \\{"id":32003,"content":"[C]"},
+        \\{"id":32004,"content":"[R]"}],
+        \\"model":{"type":"BPE","vocab":{},"merges":[]}}
+        ,
+    });
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+    try std.testing.expectEqual(@as(i32, 32000), manifest.gliner_token_p);
+    try std.testing.expectEqual(@as(i32, 32001), manifest.gliner_token_e);
+    try std.testing.expectEqual(@as(i32, 32002), manifest.gliner_token_sep_text);
+    try std.testing.expectEqual(@as(i32, 32003), manifest.gliner_token_c);
+    try std.testing.expectEqual(@as(i32, 32004), manifest.gliner_token_r);
+    try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
 }
 
 test "manifest detects incomplete colqwen bundle" {

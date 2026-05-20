@@ -77,6 +77,19 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn respondWithAllocator(ctx: *httpx.Context, resp: *http_common.HttpResponse, alloc: std.mem.Allocator) !httpx.Response {
+        defer resp.deinit(alloc);
+        _ = ctx.status(resp.status);
+        if (resp.content_type) |ct| {
+            try ctx.setHeader("content-type", ct);
+        }
+        for (resp.headers) |hdr| {
+            try ctx.setHeader(hdr.name, hdr.value);
+        }
+        _ = ctx.response.body(resp.body);
+        return ctx.response.build();
+    }
+
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
         defer resp.deinit(ctx.allocator);
         return respondApiResponseBody(ctx, resp.status, resp.body);
@@ -266,6 +279,12 @@ pub const AntflyApiHandler = struct {
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
         public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        if (self.api_server.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+        }
         return ctx.json(public_status);
     }
 
@@ -1033,16 +1052,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(ctx.allocator, authenticated_identity, "");
-        defer if (row_filter_json) |value| ctx.allocator.free(value);
-        var resp = try public_table_http.handleTableQueryRequest(
-            ctx.allocator,
+        var resp = try self.api_server.handlePublicTableQuery(
             "",
             body_data,
-            row_filter_json,
-            self.api_server.tableApi(),
+            authenticated_identity,
         );
-        return respondOwnedApiResponse(ctx, &resp);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn evaluate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -1511,16 +1526,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(ctx.allocator, authenticated_identity, table_name);
-        defer if (row_filter_json) |value| ctx.allocator.free(value);
-        var resp = try public_table_http.handleTableQueryRequest(
-            ctx.allocator,
+        var resp = try self.api_server.handlePublicTableQuery(
             table_name,
             body_data,
-            row_filter_json,
-            self.api_server.tableApi(),
+            authenticated_identity,
         );
-        return respondOwnedApiResponse(ctx, &resp);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn batchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

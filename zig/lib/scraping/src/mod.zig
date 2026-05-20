@@ -188,7 +188,9 @@ pub fn downloadContentOutcomeAllocWithHeaders(
         return try downloadHttpOutcomeAlloc(alloc, parsed, security, http_headers);
     }
     if (std.mem.eql(u8, parsed.scheme, "file")) {
-        const path = parsed.path.percent_encoded;
+        const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
+        defer alloc.free(path_buf);
+        const path = std.Uri.percentDecodeInPlace(path_buf);
         try validatePathSecurity(path, security);
         return .{ .ok = try downloadFileAlloc(alloc, path, security) };
     }
@@ -523,6 +525,32 @@ test "download content parses data uri" {
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
     try std.testing.expectEqualStrings("hello", downloaded.data);
+}
+
+test "download content reads percent encoded file uri" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "image file.png",
+        .data = "png-bytes",
+    });
+
+    const rel_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "image file.png" });
+    defer alloc.free(rel_path);
+    const abs_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, rel_path, alloc);
+    defer alloc.free(abs_path);
+
+    const raw_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{abs_path});
+    defer alloc.free(raw_uri);
+    const uri = try std.mem.replaceOwned(u8, alloc, raw_uri, " ", "%20");
+    defer alloc.free(uri);
+
+    var downloaded = try downloadContentAlloc(alloc, uri, null, null);
+    defer downloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("image/png", downloaded.content_type);
+    try std.testing.expectEqualStrings("png-bytes", downloaded.data);
 }
 
 test "download content blocks disallowed hosts" {

@@ -46,9 +46,4 @@ jobs:
 
       - name: Run tests
         working-directory: py
-        run: uv run pytest tests --cov=antfly --cov-report=xml
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-        with:
-          file: py/coverage.xml
+        run: uv run pytest tests
