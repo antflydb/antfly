@@ -53,14 +53,51 @@ fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []con
     return b.fmt("onnxruntime/{s}-{s}", .{ platform_str, arch_str });
 }
 
-fn defaultMlxRoot(b: *std.Build) ?[]const u8 {
+const required_mlx_symbols = [_][]const u8{
+    "mlx_distributed_is_available",
+    "mlx_distributed_group_new",
+    "mlx_distributed_group_free",
+    "mlx_distributed_init",
+    "mlx_distributed_group_rank",
+    "mlx_distributed_group_size",
+    "mlx_distributed_all_sum",
+    "mlx_distributed_all_gather",
+};
+
+fn mlxLibraryHasRequiredSymbols(b: *std.Build, library_path: []const u8) bool {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        library_path,
+        b.allocator,
+        std.Io.Limit.limited(128 * 1024 * 1024),
+    ) catch return false;
+    defer b.allocator.free(bytes);
+
+    for (required_mlx_symbols) |symbol| {
+        if (std.mem.indexOf(u8, bytes, symbol) == null) return false;
+    }
+    return true;
+}
+
+fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
+    if (target.result.os.tag != .macos) return false;
+    const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
+    const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
+    return pathExists(b, header) and
+        pathExists(b, library) and
+        mlxLibraryHasRequiredSymbols(b, library);
+}
+
+fn defaultMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
     const roots = [_][]const u8{
         "/opt/homebrew",
+        "/opt/homebrew/opt/mlx-c",
         "/usr/local",
+        "/usr/local/opt/mlx-c",
         "/usr",
     };
     for (roots) |root| {
-        if (pathExists(b, b.fmt("{s}/lib/libmlxc.dylib", .{root}))) return root;
+        if (mlxRootAvailable(b, target, root)) return root;
     }
     return null;
 }
@@ -180,15 +217,19 @@ pub fn build(b: *std.Build) void {
         pathExists(b, b.fmt("{s}/lib", .{effective_onnx_root}));
     const enable_onnx = if (enable_wasm or !link_libc) false else (b.option(bool, "onnx", "Enable ONNX Runtime backend") orelse onnx_runtime_available);
     const mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with lib/libmlxc.dylib");
-    const default_mlx_root = defaultMlxRoot(b);
+    const default_mlx_root = defaultMlxRoot(b, target);
     const effective_mlx_root = mlx_root_opt orelse default_mlx_root;
     const mlx_runtime_available = !enable_wasm and link_libc and target.result.os.tag == .macos and
-        if (effective_mlx_root) |root| pathExists(b, b.fmt("{s}/lib/libmlxc.dylib", .{root})) else false;
-    const mlx_requested = if (enable_wasm or !link_libc) false else (b.option(bool, "mlx", "Enable MLX backend (macOS only)") orelse mlx_runtime_available);
+        if (effective_mlx_root) |root| mlxRootAvailable(b, target, root) else false;
+    const mlx_option = b.option(bool, "mlx", "Enable MLX backend (macOS only)");
+    const mlx_requested = if (enable_wasm or !link_libc) false else (mlx_option orelse mlx_runtime_available);
     // Metal kernels are independent of MLX, but MLX decoder paths currently
     // dispatch through Metal kernels. Disabling Metal therefore disables MLX.
     const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (mlx_requested or target.result.os.tag == .macos));
     const enable_mlx = enable_metal and mlx_requested;
+    if ((mlx_option orelse false) and !mlx_runtime_available) {
+        @panic("-Dmlx=true requires an MLX C install with Termite's distributed runtime symbols; update mlx-c or pass -Dmlx-root=<path>");
+    }
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
     const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
     if (!std.mem.eql(u8, cuda_artifacts, "portable")) {

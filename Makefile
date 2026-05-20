@@ -1,8 +1,6 @@
 SHELL := /bin/bash
 ZIG_MAKE := $(MAKE) -C ./zig
-# Keep the default Zig build portable until the MLX C version gate rejects
-# installs that are missing the distributed runtime symbols Termite references.
-ZIG_BUILD_FLAGS ?= -Dmlx=false
+ZIG_BUILD_FLAGS ?=
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================

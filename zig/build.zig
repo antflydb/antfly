@@ -70,6 +70,41 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+const required_mlx_symbols = [_][]const u8{
+    "mlx_distributed_is_available",
+    "mlx_distributed_group_new",
+    "mlx_distributed_group_free",
+    "mlx_distributed_init",
+    "mlx_distributed_group_rank",
+    "mlx_distributed_group_size",
+    "mlx_distributed_all_sum",
+    "mlx_distributed_all_gather",
+};
+
+fn mlxLibraryHasRequiredSymbols(b: *std.Build, library_path: []const u8) bool {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        library_path,
+        b.allocator,
+        std.Io.Limit.limited(128 * 1024 * 1024),
+    ) catch return false;
+    defer b.allocator.free(bytes);
+
+    for (required_mlx_symbols) |symbol| {
+        if (std.mem.indexOf(u8, bytes, symbol) == null) return false;
+    }
+    return true;
+}
+
+fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
+    if (target.result.os.tag != .macos) return false;
+    const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
+    const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
+    return pathExists(b, header) and
+        pathExists(b, library) and
+        mlxLibraryHasRequiredSymbols(b, library);
+}
+
 fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{
         "uv",
@@ -244,9 +279,7 @@ fn detectMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
         "/usr/local/opt/mlx-c",
     };
     for (candidates) |root| {
-        const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
-        const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
-        if (pathExists(b, header) and pathExists(b, library)) return root;
+        if (mlxRootAvailable(b, target, root)) return root;
     }
     return null;
 }
@@ -1033,13 +1066,12 @@ pub fn build(b: *std.Build) void {
     const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
         pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
     const termite_mlx_available = if (termite_mlx_root) |root|
-        target.result.os.tag == .macos and
-            pathExists(b, b.fmt("{s}/include/mlx/c/mlx.h", .{root})) and
-            pathExists(b, b.fmt("{s}/lib/libmlxc.dylib", .{root}))
+        mlxRootAvailable(b, target, root)
     else
         false;
+    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX termite support when available");
     const termite_mlx_requested = if (link_libc)
-        b.option(bool, "mlx", "Enable MLX termite support when available") orelse termite_mlx_available
+        termite_mlx_option orelse termite_mlx_available
     else
         false;
     const termite_enable_onnx = if (link_libc)
@@ -1066,8 +1098,8 @@ pub fn build(b: *std.Build) void {
         termite_blas_root_opt
     else
         null;
-    if (termite_enable_mlx and termite_mlx_root == null) {
-        @panic("-Dmlx=true requires MLX C to be available; install mlx-c or pass -Dmlx-root=<path>");
+    if ((termite_mlx_option orelse false) and !termite_mlx_available) {
+        @panic("-Dmlx=true requires an MLX C install with Termite's distributed runtime symbols; update mlx-c or pass -Dmlx-root=<path>");
     }
     const delegated_termite_steps = addDelegatedTermiteBuildSteps(
         b,
