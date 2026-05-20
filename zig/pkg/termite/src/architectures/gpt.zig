@@ -7004,11 +7004,29 @@ pub fn getModelWeight(cb: *const ComputeBackend, config: Config, name: []const u
         var buf: [256]u8 = undefined;
         const prefixed = try maybePrefixedModelName(config, name, &buf);
         return cb.getWeight(prefixed) catch |err| switch (err) {
-            error.MissingWeight => cb.getWeight(name),
+            error.MissingWeight => getModelWeightUnprefixedFallback(cb, name),
             else => err,
         };
     }
-    return cb.getWeight(name);
+    return getModelWeightUnprefixedFallback(cb, name);
+}
+
+fn getModelWeightUnprefixedFallback(cb: *const ComputeBackend, name: []const u8) !CT {
+    return cb.getWeight(name) catch |err| switch (err) {
+        error.MissingWeight => if (modelPrefixStrippedName(name)) |stripped| cb.getWeight(stripped) else err,
+        else => err,
+    };
+}
+
+fn modelPrefixStrippedName(name: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, "model.")) return null;
+    return name["model.".len..];
+}
+
+test "model weight fallback strips model prefix for bare Jina/Qwen backbones" {
+    try std.testing.expectEqualStrings("embed_tokens.weight", modelPrefixStrippedName("model.embed_tokens.weight") orelse return error.MissingFallback);
+    try std.testing.expectEqualStrings("layers.0.self_attn.q_proj.weight", modelPrefixStrippedName("model.layers.0.self_attn.q_proj.weight") orelse return error.MissingFallback);
+    try std.testing.expect(modelPrefixStrippedName("embed_tokens.weight") == null);
 }
 
 pub fn getFFNWeight(cb: *const ComputeBackend, config: Config, layer: usize, proj: []const u8, buf: *[256]u8) !CT {

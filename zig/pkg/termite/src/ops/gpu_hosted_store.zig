@@ -18,6 +18,7 @@ const runtime = @import("../runtime/root.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
+const native_linalg = @import("../backends/native.zig");
 const tier_planner = runtime.tier.planner;
 const tier_cache_mod = runtime.tier.cache;
 const prefetch_mod = runtime.tier.prefetch;
@@ -207,18 +208,16 @@ fn mergeLoraPairIntoWeight(base_weight: *LoadedWeight, adapter_a: Tensor, adapte
     if (@as(usize, @intCast(adapter_b.shape[0])) != out_dim) return error.AdapterOutputDimMismatch;
     if (@as(usize, @intCast(adapter_b.shape[1])) != rank) return error.AdapterRankMismatch;
 
-    const base = base_weight.tensor.asFloat32Mut();
-    const a = adapter_a.asFloat32();
-    const b = adapter_b.asFloat32();
-    for (0..out_dim) |out_idx| {
-        for (0..in_dim) |in_idx| {
-            var sum: f32 = 0.0;
-            for (0..rank) |r| {
-                sum += b[out_idx * rank + r] * a[r * in_dim + in_idx];
-            }
-            base[out_idx * in_dim + in_idx] += sum * scale;
-        }
-    }
+    native_linalg.sgemmSync(
+        out_dim,
+        in_dim,
+        rank,
+        scale,
+        adapter_b.asFloat32(),
+        adapter_a.asFloat32(),
+        1.0,
+        base_weight.tensor.asFloat32Mut(),
+    );
 }
 
 pub const WeightStore = struct {
