@@ -255,7 +255,7 @@ func TestReconcileTermitePoolPreservesCustomImage(t *testing.T) {
 		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
 	cluster := baseClusterWithTermiteSpec()
-	cluster.Spec.Termite.Image = "registry.example.com/antfly:custom-termite"
+	cluster.Spec.Termite.ManagedPools[0].Spec.Image = "registry.example.com/antfly:custom-termite"
 
 	err := reconciler.reconcileTermitePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -392,6 +392,65 @@ func TestReconcileTermitePoolManagementDisabledLeavesOwnedPool(t *testing.T) {
 	})))
 }
 
+func TestReconcileTermitePoolSharedRefDoesNotCreatePool(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	cluster := baseClusterWithTermiteSpec()
+	cluster.Spec.Termite = &antflyv1.AntflyTermiteSpec{
+		Mode: antflyv1.AntflyTermiteModeSharedRef,
+		SharedPools: []antflyv1.TermitePoolReference{{
+			Name:      "customer-shared-embeddings",
+			Namespace: "inference",
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:             s,
+		ManageTermitePools: true,
+	}
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+	g.Expect(cluster.Status.Conditions).To(ContainElement(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+		"Type":   Equal(antflyv1.TypeTermitePoolReady),
+		"Status": Equal(metav1.ConditionTrue),
+		"Reason": Equal(antflyv1.ReasonTermitePoolReady),
+	})))
+}
+
+func TestReconcileTermitePoolPlatformSharedDeletesOwnedPool(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	cluster := baseClusterWithTermiteSpec()
+	managedPool := &termitev1alpha1.TermitePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-termite",
+			Namespace: "default",
+		},
+	}
+	g.Expect(controllerutil.SetControllerReference(cluster, managedPool, s)).To(Succeed())
+	cluster.Spec.Termite = &antflyv1.AntflyTermiteSpec{
+		Mode: antflyv1.AntflyTermiteModePlatformShared,
+		PlatformPools: []antflyv1.TermitePoolReference{{
+			Name: "default-embeddings",
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool).Build(),
+		Scheme:             s,
+		ManageTermitePools: true,
+	}
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
 func newOperatorTestScheme(g *WithT) *runtime.Scheme {
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
@@ -411,10 +470,15 @@ func baseClusterWithTermiteSpec() *antflyv1.AntflyCluster {
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			Image: "antfly:test",
-			Termite: &termitev1alpha1.TermitePoolSpec{
-				Models:   termitev1alpha1.ModelConfig{},
-				Replicas: termitev1alpha1.ReplicaConfig{Min: 1, Max: 2},
-				Hardware: termitev1alpha1.HardwareConfig{},
+			Termite: &antflyv1.AntflyTermiteSpec{
+				Mode: antflyv1.AntflyTermiteModeManaged,
+				ManagedPools: []antflyv1.ManagedTermitePoolSpec{{
+					Spec: termitev1alpha1.TermitePoolSpec{
+						Models:   termitev1alpha1.ModelConfig{},
+						Replicas: termitev1alpha1.ReplicaConfig{Min: 1, Max: 2},
+						Hardware: termitev1alpha1.HardwareConfig{},
+					},
+				}},
 			},
 		},
 	}

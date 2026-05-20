@@ -168,14 +168,91 @@ func (r *AntflyCluster) validateTermiteSpec() error {
 		return nil
 	}
 
-	pool := &termitev1alpha1.TermitePool{
-		Spec: *r.Spec.Termite.DeepCopy(),
+	termite := r.Spec.Termite
+	mode := termite.modeOrDefault()
+	var validationErrors []string
+
+	switch mode {
+	case AntflyTermiteModeDisabled:
+		if len(termite.ManagedPools) > 0 || len(termite.SharedPools) > 0 || len(termite.PlatformPools) > 0 {
+			validationErrors = append(validationErrors, "spec.termite must not set pools when mode=Disabled")
+		}
+	case AntflyTermiteModeManaged:
+		if len(termite.ManagedPools) == 0 {
+			validationErrors = append(validationErrors, "spec.termite.managedPools is required when mode=Managed")
+		}
+		if len(termite.SharedPools) > 0 || len(termite.PlatformPools) > 0 {
+			validationErrors = append(validationErrors, "spec.termite shared pool references are only valid when mode=SharedRef or mode=PlatformShared")
+		}
+		for i, managed := range termite.ManagedPools {
+			if len(termite.ManagedPools) > 1 && strings.TrimSpace(managed.Name) == "" {
+				validationErrors = append(validationErrors, fmt.Sprintf("spec.termite.managedPools[%d].name is required when multiple managed pools are set", i))
+			}
+			pool := &termitev1alpha1.TermitePool{
+				Spec: *managed.Spec.DeepCopy(),
+			}
+			if err := pool.ValidateTermitePool(); err != nil {
+				validationErrors = append(validationErrors, fmt.Sprintf("spec.termite.managedPools[%d].spec is invalid: %v", i, err))
+			}
+		}
+	case AntflyTermiteModeSharedRef:
+		if len(termite.SharedPools) == 0 {
+			validationErrors = append(validationErrors, "spec.termite.sharedPools is required when mode=SharedRef")
+		}
+		if len(termite.ManagedPools) > 0 || len(termite.PlatformPools) > 0 {
+			validationErrors = append(validationErrors, "spec.termite.managedPools and platformPools are not valid when mode=SharedRef")
+		}
+		validateTermitePoolRefs("spec.termite.sharedPools", termite.SharedPools, &validationErrors)
+	case AntflyTermiteModePlatformShared:
+		if len(termite.PlatformPools) == 0 {
+			validationErrors = append(validationErrors, "spec.termite.platformPools is required when mode=PlatformShared")
+		}
+		if len(termite.ManagedPools) > 0 || len(termite.SharedPools) > 0 {
+			validationErrors = append(validationErrors, "spec.termite.managedPools and sharedPools are not valid when mode=PlatformShared")
+		}
+		validateTermitePoolRefs("spec.termite.platformPools", termite.PlatformPools, &validationErrors)
+	default:
+		validationErrors = append(validationErrors, fmt.Sprintf("spec.termite.mode %q is invalid", mode))
 	}
-	if err := pool.ValidateTermitePool(); err != nil {
-		return fmt.Errorf("spec.termite is invalid: %w", err)
+
+	if len(validationErrors) > 0 {
+		return fmt.Errorf("spec.termite is invalid:\n  - %s", strings.Join(validationErrors, "\n  - "))
 	}
 
 	return nil
+}
+
+func (s *AntflyTermiteSpec) modeOrDefault() AntflyTermiteMode {
+	if s == nil {
+		return AntflyTermiteModeDisabled
+	}
+	if s.Mode != "" {
+		return s.Mode
+	}
+	if len(s.SharedPools) > 0 {
+		return AntflyTermiteModeSharedRef
+	}
+	if len(s.PlatformPools) > 0 {
+		return AntflyTermiteModePlatformShared
+	}
+	if len(s.ManagedPools) > 0 {
+		return AntflyTermiteModeManaged
+	}
+	return AntflyTermiteModeManaged
+}
+
+func validateTermitePoolRefs(path string, refs []TermitePoolReference, validationErrors *[]string) {
+	for i, ref := range refs {
+		if strings.TrimSpace(ref.Name) == "" {
+			*validationErrors = append(*validationErrors, fmt.Sprintf("%s[%d].name is required", path, i))
+		}
+		if strings.TrimSpace(ref.APIURL) != "" {
+			parsed, err := url.Parse(ref.APIURL)
+			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+				*validationErrors = append(*validationErrors, fmt.Sprintf("%s[%d].apiURL must include a scheme and host", path, i))
+			}
+		}
+	}
 }
 
 // validateGKEConfig validates GKE-specific configuration
@@ -981,11 +1058,18 @@ func (r *AntflyCluster) validateProductTierMapping() error {
 		}
 	}
 
-	if tier.TermiteTier != "" && r.Spec.Termite == nil {
-		errors = append(errors, "spec.termite is required when spec.productTier.termiteTier is set")
-	}
-	if r.Spec.Termite != nil && tier.TermiteTier != "" && r.Spec.Termite.Resources == nil {
-		errors = append(errors, "spec.termite.resources is required when spec.productTier.termiteTier is set")
+	if tier.TermiteTier != "" {
+		if r.Spec.Termite == nil {
+			errors = append(errors, "spec.termite is required when spec.productTier.termiteTier is set")
+		} else if r.Spec.Termite.modeOrDefault() != AntflyTermiteModeManaged {
+			errors = append(errors, "spec.termite.mode must be Managed when spec.productTier.termiteTier is set")
+		} else {
+			for i, pool := range r.Spec.Termite.ManagedPools {
+				if pool.Spec.Resources == nil {
+					errors = append(errors, fmt.Sprintf("spec.termite.managedPools[%d].spec.resources is required when spec.productTier.termiteTier is set", i))
+				}
+			}
+		}
 	}
 
 	if len(errors) > 0 {

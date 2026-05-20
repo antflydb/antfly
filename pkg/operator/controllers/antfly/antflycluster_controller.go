@@ -1405,8 +1405,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	mode := antflyTermiteMode(cluster.Spec.Termite)
 	if !r.ManageTermitePools {
-		if cluster.Spec.Termite != nil {
+		if mode == antflyv1.AntflyTermiteModeManaged {
 			r.setTermitePoolReadyCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonTermitePoolManagementDisabled,
 				"TermitePool management is disabled by --enable-termite-controllers=false; existing owned pools are left unchanged")
 		}
@@ -1414,32 +1415,79 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 	}
 
 	logger := log.FromContext(ctx)
-	name := cluster.Name + "-termite"
-	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
 
-	if cluster.Spec.Termite == nil {
-		pool := &termitev1alpha1.TermitePool{}
-		if err := r.Get(ctx, key, pool); err != nil {
-			if errors.IsNotFound(err) {
-				return nil
+	desired := map[string]struct{}{}
+	if mode == antflyv1.AntflyTermiteModeManaged && cluster.Spec.Termite != nil {
+		for i, managed := range cluster.Spec.Termite.ManagedPools {
+			name := managedTermitePoolName(cluster, managed, len(cluster.Spec.Termite.ManagedPools), i)
+			key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
+			desired[name] = struct{}{}
+			if err := r.reconcileManagedTermitePool(ctx, cluster, managed, name); err != nil {
+				var conflictErr *termitePoolNameConflictError
+				if stderrors.As(err, &conflictErr) {
+					logger.Info("Refusing to adopt same-name TermitePool because it is not controlled by this AntflyCluster", "termitePool", key.String())
+					r.setTermitePoolReadyCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonTermitePoolNameConflict, conflictErr.Error())
+					return nil
+				}
+				return err
 			}
-			return fmt.Errorf("failed to get managed TermitePool %s: %w", name, err)
+			if i == len(cluster.Spec.Termite.ManagedPools)-1 {
+				r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
+					fmt.Sprintf("%d managed TermitePool(s) reconciled", len(cluster.Spec.Termite.ManagedPools)))
+			}
 		}
-
-		if !metav1.IsControlledBy(pool, cluster) {
-			logger.Info("Leaving same-name TermitePool unchanged because it is not controlled by this AntflyCluster", "termitePool", key.String())
-			r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
-				"No operator-managed TermitePool is requested")
-			return nil
-		}
-		if err := client.IgnoreNotFound(r.Delete(ctx, pool)); err != nil {
-			return fmt.Errorf("failed to delete managed TermitePool %s: %w", name, err)
-		}
-		r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
-			"Managed TermitePool deleted because spec.termite is not set")
-		return nil
 	}
 
+	if err := r.deleteStaleOwnedTermitePools(ctx, cluster, desired); err != nil {
+		return err
+	}
+
+	switch mode {
+	case antflyv1.AntflyTermiteModeDisabled:
+		r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady, "Termite integration is disabled")
+	case antflyv1.AntflyTermiteModeSharedRef:
+		r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
+			fmt.Sprintf("%d shared TermitePool reference(s) configured", len(cluster.Spec.Termite.SharedPools)))
+	case antflyv1.AntflyTermiteModePlatformShared:
+		r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
+			fmt.Sprintf("%d platform TermitePool reference(s) configured", len(cluster.Spec.Termite.PlatformPools)))
+	}
+	return nil
+}
+
+func antflyTermiteMode(spec *antflyv1.AntflyTermiteSpec) antflyv1.AntflyTermiteMode {
+	if spec == nil {
+		return antflyv1.AntflyTermiteModeDisabled
+	}
+	if spec.Mode != "" {
+		return spec.Mode
+	}
+	if len(spec.SharedPools) > 0 {
+		return antflyv1.AntflyTermiteModeSharedRef
+	}
+	if len(spec.PlatformPools) > 0 {
+		return antflyv1.AntflyTermiteModePlatformShared
+	}
+	return antflyv1.AntflyTermiteModeManaged
+}
+
+func managedTermitePoolName(cluster *antflyv1.AntflyCluster, managed antflyv1.ManagedTermitePoolSpec, total, index int) string {
+	if managed.Name != "" {
+		return managed.Name
+	}
+	if total == 1 {
+		return cluster.Name + "-termite"
+	}
+	return fmt.Sprintf("%s-termite-%d", cluster.Name, index)
+}
+
+func (r *AntflyClusterReconciler) reconcileManagedTermitePool(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	managed antflyv1.ManagedTermitePoolSpec,
+	name string,
+) error {
+	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
 	pool := &termitev1alpha1.TermitePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -1463,10 +1511,10 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		pool.Labels["app.kubernetes.io/instance"] = cluster.Name
 		pool.Labels["app.kubernetes.io/managed-by"] = "antfly-operator"
 
-		// AntflyCluster.spec.termite is authoritative for managed pools.
+		// AntflyCluster.spec.termite.managedPools is authoritative for managed pools.
 		// Do not add TermitePool mutating-webhook defaults for spec fields
 		// unless the same defaults are applied before this assignment.
-		pool.Spec = *cluster.Spec.Termite.DeepCopy()
+		pool.Spec = *managed.Spec.DeepCopy()
 		if pool.Spec.Image == "" {
 			pool.Spec.Image = r.DefaultTermiteImage
 		}
@@ -1476,17 +1524,46 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 		return nil
 	})
 	if err != nil {
-		var conflictErr *termitePoolNameConflictError
-		if stderrors.As(err, &conflictErr) {
-			logger.Info("Refusing to adopt same-name TermitePool because it is not controlled by this AntflyCluster", "termitePool", key.String())
-			r.setTermitePoolReadyCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonTermitePoolNameConflict, conflictErr.Error())
-			return nil
-		}
 		return fmt.Errorf("failed to reconcile managed TermitePool %s: %w", name, err)
 	}
+	return nil
+}
 
-	r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
-		fmt.Sprintf("Managed TermitePool %s is reconciled", key.String()))
+func (r *AntflyClusterReconciler) deleteStaleOwnedTermitePools(ctx context.Context, cluster *antflyv1.AntflyCluster, desired map[string]struct{}) error {
+	defaultName := cluster.Name + "-termite"
+	if _, ok := desired[defaultName]; !ok {
+		pool := &termitev1alpha1.TermitePool{}
+		key := types.NamespacedName{Name: defaultName, Namespace: cluster.Namespace}
+		if err := r.Get(ctx, key, pool); err != nil {
+			if !errors.IsNotFound(err) {
+				return fmt.Errorf("failed to get managed TermitePool %s: %w", key.String(), err)
+			}
+		} else if metav1.IsControlledBy(pool, cluster) {
+			if err := client.IgnoreNotFound(r.Delete(ctx, pool)); err != nil {
+				return fmt.Errorf("failed to delete stale managed TermitePool %s: %w", key.String(), err)
+			}
+		}
+	}
+
+	var pools termitev1alpha1.TermitePoolList
+	if err := r.List(ctx, &pools, client.InNamespace(cluster.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/instance":   cluster.Name,
+		"app.kubernetes.io/managed-by": "antfly-operator",
+	}); err != nil {
+		return fmt.Errorf("failed to list managed TermitePools for %s/%s: %w", cluster.Namespace, cluster.Name, err)
+	}
+	for i := range pools.Items {
+		pool := &pools.Items[i]
+		if !metav1.IsControlledBy(pool, cluster) {
+			continue
+		}
+		if _, ok := desired[pool.Name]; ok {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, pool)); err != nil {
+			return fmt.Errorf("failed to delete stale managed TermitePool %s/%s: %w", pool.Namespace, pool.Name, err)
+		}
+	}
 	return nil
 }
 
@@ -3194,7 +3271,7 @@ func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.Antf
 		MetadataTier:       tier.MetadataTier,
 		DataTier:           tier.DataTier,
 		TermiteTier:        tier.TermiteTier,
-		TermiteEnabled:     cluster.Spec.Termite != nil,
+		TermiteEnabled:     cluster.Spec.Termite != nil && antflyTermiteMode(cluster.Spec.Termite) != antflyv1.AntflyTermiteModeDisabled,
 		ObservedGeneration: cluster.Generation,
 	}
 
@@ -3222,7 +3299,16 @@ func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.Antf
 	}
 
 	if cluster.Spec.Termite != nil {
-		status.TermiteReplicas = fmt.Sprintf("min=%d max=%d", cluster.Spec.Termite.Replicas.Min, cluster.Spec.Termite.Replicas.Max)
+		switch antflyTermiteMode(cluster.Spec.Termite) {
+		case antflyv1.AntflyTermiteModeManaged:
+			status.TermiteReplicas = fmt.Sprintf("managed=%d", len(cluster.Spec.Termite.ManagedPools))
+		case antflyv1.AntflyTermiteModeSharedRef:
+			status.TermiteReplicas = fmt.Sprintf("shared=%d", len(cluster.Spec.Termite.SharedPools))
+		case antflyv1.AntflyTermiteModePlatformShared:
+			status.TermiteReplicas = fmt.Sprintf("platform=%d", len(cluster.Spec.Termite.PlatformPools))
+		default:
+			status.TermiteReplicas = "disabled"
+		}
 	}
 
 	cluster.Status.ProductTierStatus = status

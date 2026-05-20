@@ -34,6 +34,7 @@ Supported intent includes:
 - metadata node count and resources
 - data node count and resources
 - swarm-mode resources
+- inference pool attachment through Termite
 - metadata, data, and swarm storage sizes
 - data-node autoscaling bounds
 - cloud-specific placement and service settings
@@ -43,6 +44,53 @@ The operator reports progress through `status.observedGeneration` and status
 conditions. Consumers should use those fields to determine whether a requested
 operation has completed. Inspecting child StatefulSets, PVCs, or HPAs directly is
 useful for debugging, but should not be the primary completion signal.
+
+## Termite Inference Pools
+
+The operator exposes Termite inference as part of the Antfly cluster contract
+without collapsing Termite and Antfly into one reconciler. `AntflyCluster` is the
+product-level API a user or cloud control plane can submit, while `TermitePool`
+remains the reusable inference primitive with its own reconciliation loop,
+autoscaling, model pullers, scheduling, and readiness conditions.
+
+`spec.termite.mode` selects how inference capacity is provided:
+
+- `PlatformShared`: use platform-operated shared TermitePools. These pools are
+  managed outside the customer cluster and are suitable for common models,
+  zero-config onboarding, and shared warm capacity.
+- `Managed`: create TermitePools owned by this AntflyCluster. This is suitable
+  for customer-specific models, dedicated capacity, stricter isolation, and
+  cluster-local scaling rules.
+- `SharedRef`: reference existing customer-managed TermitePools. This is useful
+  when multiple AntflyClusters share one inference tier.
+- `Disabled`: do not configure cluster-level Termite inference.
+
+Managed pools are declared under `spec.termite.managedPools`. The operator
+creates child `TermitePool` resources, sets owner references, applies the
+default Termite image when the pool does not specify one, and deletes stale
+owned pools when the AntflyCluster no longer requests them. The TermitePool
+controller remains responsible for creating the StatefulSet, model-puller init
+containers, service, HPA, scheduling, and status.
+
+Shared and platform pools are declared under `spec.termite.sharedPools` and
+`spec.termite.platformPools`. The AntflyCluster reconciler records that the
+references are configured but does not mutate or delete those pools. Ownership
+is explicit: referenced pools may be reused across clusters, while managed pools
+belong to the declaring AntflyCluster.
+
+Model references in TermitePool specs are canonical tags in
+`models.preload[].name`, for example:
+
+```yaml
+models:
+  preload:
+    - name: BAAI/bge-small-en-v1.5:i8
+    - name: hf:antflydb/clipclap:gguf:Q4_K
+```
+
+The operator should not synthesize a separate model `variant` field. The Zig
+runtime contract is `/antfly termite pull <model-ref> --models-dir /models`,
+with optional task or capability flags added by future API fields when needed.
 
 ## Storage Resize
 
