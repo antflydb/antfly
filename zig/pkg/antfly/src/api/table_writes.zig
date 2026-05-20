@@ -8502,12 +8502,10 @@ test "provisioned read preparation invalidates readers without closing dirty wri
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
 
-    lockAtomic(&source.local_db_mutex);
     {
         var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default, null, null);
         defer cached.deinit(alloc);
     }
-    source.local_db_mutex.unlock();
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
 
@@ -13833,27 +13831,27 @@ test "provisioned table read source survives many external write-sync batches be
     write_source.runtime_status_cache = &snapshot_cache;
 
     const dense_doc_json = blk: {
-        var out = std.ArrayList(u8).init(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.appendSlice("{\"_embeddings\":{\"semantic_idx\":[");
+        try out.writer.writeAll("{\"_embeddings\":{\"semantic_idx\":[");
         for (0..dims) |i| {
-            if (i != 0) try out.append(',');
-            try out.appendSlice("1");
+            if (i != 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("1");
         }
-        try out.appendSlice("]}}");
+        try out.writer.writeAll("]}}");
         break :blk try out.toOwnedSlice();
     };
     defer alloc.free(dense_doc_json);
 
     const query_json = blk: {
-        var out = std.ArrayList(u8).init(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.appendSlice("{\"embeddings\":{\"semantic_idx\":[");
+        try out.writer.writeAll("{\"embeddings\":{\"semantic_idx\":[");
         for (0..dims) |i| {
-            if (i != 0) try out.append(',');
-            try out.appendSlice("1.0");
+            if (i != 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("1.0");
         }
-        try out.appendSlice("]},\"indexes\":[\"semantic_idx\"],\"limit\":10,\"profile\":true}");
+        try out.writer.writeAll("]},\"indexes\":[\"semantic_idx\"],\"limit\":10,\"profile\":true}");
         break :blk try out.toOwnedSlice();
     };
     defer alloc.free(query_json);
@@ -13939,7 +13937,7 @@ test "provisioned table read source survives many external write-sync batches be
                 break;
             }
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        sleepNs(10 * std.time.ns_per_ms);
     }
     try std.testing.expect(ready);
 
@@ -15543,11 +15541,11 @@ test "provisioned table write source drop table does not hold local db mutex dur
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    try std.Io.Dir.cwd().makePath(io_impl.io(), path);
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), path);
     const marker_path = try std.fmt.allocPrint(alloc, "{s}/marker.txt", .{path});
     defer alloc.free(marker_path);
-    var marker = try std.fs.cwd().createFile(marker_path, .{});
-    marker.close();
+    var marker = try std.Io.Dir.cwd().createFile(io_impl.io(), marker_path, .{});
+    marker.close(io_impl.io());
 
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -15574,7 +15572,7 @@ test "provisioned table write source drop table does not hold local db mutex dur
     probe.release.store(true, .release);
     source.drainDroppedTableDeletes();
 
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path, .{}));
 }
 
 test "provisioned table write source drop table waits for in-flight group batch on same table" {
@@ -15927,7 +15925,7 @@ test "provisioned table write source restore table does not hold local db mutex 
 
     const Worker = struct {
         source: *ProvisionedTableWriteSource,
-        manifest: *const backups_api.Manifest,
+        manifest: *const backups_api.TableBackupManifest,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {

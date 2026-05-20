@@ -13,7 +13,11 @@
 // limitations.
 
 pub const runtime = @import("swarm/runtime.zig");
+pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
 test {
     _ = runtime;
+    _ = storage_backend_erased;
+    _ = lsm_backend;
 }

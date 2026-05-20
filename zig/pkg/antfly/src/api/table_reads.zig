@@ -12787,7 +12787,7 @@ test "provisioned table read source serves profiled public dense query requests 
     const hits = parsed.value.responses.?[0].hits.?.hits.?;
     try std.testing.expectEqualStrings("doc:a", hits[0]._id);
     try std.testing.expectEqualStrings("doc:c", hits[1]._id);
-    try std.testing.expect(parsed.value.responses.?[0].meta.?.dense_search != null);
+    try std.testing.expect(parsed.value.responses.?[0].profile != null);
 }
 
 test "provisioned table read source serves public dense query requests without explicit indexes" {
@@ -15682,7 +15682,7 @@ test "hosted table read source preflights mixed local and remote groups" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.call_count += 1;
             try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/groups/8/tables/docs/query-preflight"));
-            try std.testing.expectEqual(http_common.HttpMethod.POST, req.method);
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
             return .{
                 .status = 400,
                 .body = try alloc_inner.dupe(u8, "IndexNotFound"),

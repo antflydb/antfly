@@ -572,7 +572,7 @@ fn metadataValidateQueryRequestAgainstContext(
     query_request: metadata_openapi.QueryRequest,
     retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
 ) !?[]const u8 {
-    var preflight = try preflightQueryRequestAgainstContext(alloc, context, .{}, query_request, retrieval_query_request, "query_builder", .{});
+    var preflight = try preflightQueryRequestAgainstContext(alloc, context, .{ .intent = "" }, query_request, retrieval_query_request, "query_builder", .{});
     defer preflight.deinit(alloc);
     for (preflight.diagnostics) |diagnostic| {
         if (diagnostic.severity == .@"error") return try alloc.dupe(u8, diagnostic.message);
