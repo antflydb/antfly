@@ -26,6 +26,13 @@ Formal verification of the multi-raft snapshot creation, transfer, GC, and error
 - `AntflySnapshotTransfer.cfg` -- Full TLC configuration (safety + liveness)
 - `AntflySnapshotTransfer-safety.cfg` -- Safety-only configuration (fast, ~90s)
 
+### Zig Retirement Lifecycle OOM Safety
+
+Formal verification of allocator-failure safety for migrated Zig cleanup ownership handoffs.
+
+- `AntflyZigRetirementLifecycle.tla` -- Provisioned read/write cache entry retirement, LSM mutable read snapshot retirement, and `IndexWriter.removeSegments` temporary allocation cleanup.
+- `AntflyZigRetirementLifecycle.cfg` -- TLC configuration for safety invariants.
+
 ## Installation
 
 ### macOS
@@ -202,6 +209,46 @@ Set `MCMaxRetries == 1` and `MCMaxSnapshots == 1`, then:
 **Strong fairness (SF)**: Transfer-related actions (`TransferSucceeds`, `TransferPermanentFailure`, `TransferRetry`) use SF instead of WF. Peer crashes make these actions intermittently enabled/disabled. WF only guarantees firing for *continuously* enabled actions, which is insufficient when peers crash and restart. SF reflects the real system's retry loop eventually hitting a window where the peer is available.
 
 **RaftSendsSnapshot guard**: The spec requires `persistedSnap[leader] > persistedSnap[n]` — Raft only sends snapshots to followers that are actually behind. Without this, TLC found a scenario where Raft redundantly sends an already-applied snapshot, the recipient becomes leader and GCs it, violating `AppliedSnapshotIsValid`.
+
+---
+
+## Zig Retirement Lifecycle OOM Safety
+
+### Running
+
+```bash
+make tla-check-zig-lifecycle
+```
+
+or directly:
+
+```bash
+cd specs/tla
+java -XX:+UseParallelGC -cp /path/to/tla2tools.jar tlc2.TLC \
+    AntflyZigRetirementLifecycle.tla \
+    -config AntflyZigRetirementLifecycle.cfg -workers auto -deadlock
+```
+
+### What it Verifies
+
+| Invariant | What it catches |
+|---|---|
+| `CacheActiveLeaseReachable` | A leased provisioned read/write cache entry must remain live or retired-reachable. |
+| `CachePublishedEntryHasRetireCapacity` | Every published cache entry has a reserved cleanup slot before unlink-time retirement. |
+| `SnapshotActiveReaderReachable` | An active LSM reader must have the mutable snapshot reachable through current or retired ownership. |
+| `SnapshotPublishedHasRetireCapacity` | Every published mutable read snapshot has a reserved retired-snapshot cleanup slot. |
+| `IndexFailedOpFreedTemps` | Failed `IndexWriter.removeSegments` operations free temporary `SegmentEntry` arrays. |
+
+### Mapping to Zig Implementation
+
+| TLA+ action | Zig code |
+|---|---|
+| `CacheOpenSucceeds` | `ProvisionedTableReadCache.getOrOpen`, `ProvisionedTableWriteCache.getOrOpenLockedMode`, `adoptPreparedOpenLocked` reserve `retired_entries` capacity before publishing `Entry`. |
+| `CacheRetireActive` | Read cache `clear`, table invalidation, eviction; write cache `clear`, stale root pruning, table removal, write-source/status pruning. |
+| `CacheReleaseRetiredLease` | `releaseEntry` calls `destroyRetiredEntryLocked` on final lease. |
+| `BeginReadSnapshotSucceeds` | `Backend.snapshotMutableState` creates/clones state, reserves `retired_mutable_snapshots`, then publishes `mutable_read_snapshot`. |
+| `InvalidateMutableSnapshotWithActiveReader` | `invalidateMutableReadSnapshot` from mutable rotation/flush and direct bulk-ingest finish. |
+| `IndexRetiredAllocationFails` / `IndexRebuildFails` | `IndexWriter.removeSegments` OOM paths after `new_segments` and/or `retired` temporary allocation. |
 
 ### Model Configuration
 

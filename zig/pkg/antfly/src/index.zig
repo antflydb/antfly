@@ -772,6 +772,7 @@ pub const IndexWriter = struct {
         const new_segments = try self.alloc.alloc(SegmentEntry, keep_count);
         errdefer self.alloc.free(new_segments);
         const retired = try self.alloc.alloc(SegmentEntry, retire_count);
+        errdefer self.alloc.free(retired);
         var idx: usize = 0;
         var ret_idx: usize = 0;
         for (old.segments) |seg| {
@@ -1160,6 +1161,31 @@ test "index writer removeSegments frees staged segment list when retired allocat
     try writer.addSegment(seg2);
 
     failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, writer.removeSegments(&.{1}));
+    failing.fail_index = std.math.maxInt(usize);
+
+    try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
+}
+
+test "index writer removeSegments frees staged segment lists when rebuild allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+
+    const seg1 = try buildTestSegment(alloc, &.{
+        .{ .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg1);
+    const seg2 = try buildTestSegment(alloc, &.{
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg2);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg1);
+    try writer.addSegment(seg2);
+
+    failing.fail_index = failing.alloc_index + 2;
     try std.testing.expectError(error.OutOfMemory, writer.removeSegments(&.{1}));
     failing.fail_index = std.math.maxInt(usize);
 
