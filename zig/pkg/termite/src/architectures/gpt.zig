@@ -5394,14 +5394,16 @@ fn feedForward(
             // Gated FFN: gate = silu(x @ gate_w), up = x @ up_w, out = (gate * up) @ down_w
             const gate_w = try getFFNWeight(cb, config, layer, "gate", name_buf);
             defer cb.free(gate_w);
-            const gate_proj = try cb.linearNoBias(input, gate_w, total, hidden_size, inter_size);
+            const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
+            defer cb.free(up_w);
+            debug_timing_stats.ffn_project_pair_calls += 1;
+            const gate_up = try cb.linearNoBiasPair(input, gate_w, up_w, total, hidden_size, inter_size);
+            const gate_proj = gate_up.first;
             defer cb.free(gate_proj);
             const gate_act = try applyActivation(cb, config, gate_proj);
             defer cb.free(gate_act);
 
-            const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
-            defer cb.free(up_w);
-            const up_proj = try cb.linearNoBias(input, up_w, total, hidden_size, inter_size);
+            const up_proj = gate_up.second;
             defer cb.free(up_proj);
 
             const gated = try cb.multiply(gate_act, up_proj);

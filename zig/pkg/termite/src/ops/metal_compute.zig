@@ -17064,12 +17064,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer input.deinit();
-        const rows: usize = @intCast(input.dim(0));
+        var linear_input = try retainedLinearInputView(&input, request.in_dim);
+        defer linear_input.deinit();
+        const rows: usize = @intCast(linear_input.dim(0));
         if (try metal_runtime.tryApplyQuantizedRuntimeLinearPair(
             self.provider_impl,
             request.slot_a,
             request.slot_b,
-            input,
+            linear_input,
             rows,
             request.in_dim,
             request.out_dim,
@@ -17083,7 +17085,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.provider_impl,
             request.slot_a,
             request.slot_b,
-            input,
+            linear_input,
             rows,
             request.in_dim,
             request.out_dim,
