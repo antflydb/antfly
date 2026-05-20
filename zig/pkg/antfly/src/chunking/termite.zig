@@ -42,8 +42,8 @@ pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8)
         chunks[i] = .{
             .chunk_id = shared.id,
             .text = try alloc.dupe(u8, shared_text),
-            .start_offset = shared.start_char orelse 0,
-            .end_offset = shared.end_char orelse @as(u32, @intCast(shared_text.len)),
+            .start_offset = shared.start_char,
+            .end_offset = shared.end_char orelse std.math.cast(u32, shared_text.len),
         };
     }
     return chunks;

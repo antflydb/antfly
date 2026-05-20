@@ -21,8 +21,8 @@ import (
 
 func TestResolveRowFilter(t *testing.T) {
 	filters := map[string]json.RawMessage{
-		"docs":    json.RawMessage(`{"term":{"dept":"eng"}}`),
-		"*":       json.RawMessage(`{"term":{"active":"true"}}`),
+		"docs": json.RawMessage(`{"term":{"dept":"eng"}}`),
+		"*":    json.RawMessage(`{"term":{"active":"true"}}`),
 	}
 
 	t.Run("table specific", func(t *testing.T) {
@@ -198,6 +198,132 @@ func TestInjectFilterIntoAgentBody_NoQueriesField(t *testing.T) {
 	}
 	if string(parsed["filter_query"]) != `{"term":{"dept":"eng"}}` {
 		t.Fatalf("unexpected filter_query: %s", parsed["filter_query"])
+	}
+}
+
+func TestExtractTableAccessesFromBody_JoinAndNestedJoin(t *testing.T) {
+	body := []byte(`{
+		"table": "orders",
+		"join": {
+			"right_table": "customers",
+			"on": {"left_field": "customer_id", "right_field": "id"},
+			"nested_join": {
+				"right_table": "addresses",
+				"on": {"left_field": "customers.address_id", "right_field": "id"}
+			}
+		}
+	}`)
+
+	accesses, err := extractTableAccessesFromBody(body, "orders", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := make([]string, 0, len(accesses))
+	for _, access := range accesses {
+		got = append(got, access.Table)
+	}
+	want := []string{"addresses", "customers", "orders"}
+	if len(got) != len(want) {
+		t.Fatalf("got accesses %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got accesses %v want %v", got, want)
+		}
+	}
+}
+
+func TestInjectRowFiltersIntoBody_AppliesPerTableJoinFilters(t *testing.T) {
+	body := []byte(`{
+		"table": "orders",
+		"filter_query": {"query": "status:pending"},
+		"join": {
+			"right_table": "customers",
+			"right_filters": {"filter_query": {"query": "tier:premium"}},
+			"nested_join": {
+				"right_table": "addresses"
+			}
+		}
+	}`)
+	filters := map[string]json.RawMessage{
+		"orders":    json.RawMessage(`{"term":{"tenant_id":"t1"}}`),
+		"customers": json.RawMessage(`{"term":{"region":"na"}}`),
+		"addresses": json.RawMessage(`{"term":{"country":"us"}}`),
+	}
+
+	result, err := injectRowFiltersIntoBody(body, "orders", filters)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("parse result: %v", err)
+	}
+	var primary map[string][]json.RawMessage
+	if err := json.Unmarshal(parsed["filter_query"], &primary); err != nil {
+		t.Fatalf("parse primary filter: %v", err)
+	}
+	if len(primary["conjuncts"]) != 2 {
+		t.Fatalf("expected primary conjunction, got %s", parsed["filter_query"])
+	}
+
+	var join map[string]json.RawMessage
+	if err := json.Unmarshal(parsed["join"], &join); err != nil {
+		t.Fatalf("parse join: %v", err)
+	}
+	var rightFilters map[string]json.RawMessage
+	if err := json.Unmarshal(join["right_filters"], &rightFilters); err != nil {
+		t.Fatalf("parse right filters: %v", err)
+	}
+	var right map[string][]json.RawMessage
+	if err := json.Unmarshal(rightFilters["filter_query"], &right); err != nil {
+		t.Fatalf("parse right filter: %v", err)
+	}
+	if len(right["conjuncts"]) != 2 {
+		t.Fatalf("expected right conjunction, got %s", rightFilters["filter_query"])
+	}
+
+	var nested map[string]json.RawMessage
+	if err := json.Unmarshal(join["nested_join"], &nested); err != nil {
+		t.Fatalf("parse nested join: %v", err)
+	}
+	var nestedFilters map[string]json.RawMessage
+	if err := json.Unmarshal(nested["right_filters"], &nestedFilters); err != nil {
+		t.Fatalf("parse nested right filters: %v", err)
+	}
+	if string(nestedFilters["filter_query"]) != `{"term":{"country":"us"}}` {
+		t.Fatalf("unexpected nested filter: %s", nestedFilters["filter_query"])
+	}
+}
+
+func TestInjectRowFiltersIntoAgentBody_UsesPerQueryTable(t *testing.T) {
+	body := []byte(`{"queries":[{"table":"orders"},{"table":"customers","filter_query":{"query":"active:true"}}]}`)
+	filters := map[string]json.RawMessage{
+		"orders":    json.RawMessage(`{"term":{"tenant_id":"t1"}}`),
+		"customers": json.RawMessage(`{"term":{"region":"na"}}`),
+	}
+
+	result, err := injectRowFiltersIntoAgentBody(body, "orders", filters)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed struct {
+		Queries []map[string]json.RawMessage `json:"queries"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("parse result: %v", err)
+	}
+	if string(parsed.Queries[0]["filter_query"]) != `{"term":{"tenant_id":"t1"}}` {
+		t.Fatalf("unexpected orders filter: %s", parsed.Queries[0]["filter_query"])
+	}
+	var conjunction map[string][]json.RawMessage
+	if err := json.Unmarshal(parsed.Queries[1]["filter_query"], &conjunction); err != nil {
+		t.Fatalf("parse customers conjunction: %v", err)
+	}
+	if len(conjunction["conjuncts"]) != 2 {
+		t.Fatalf("expected customers conjunction, got %s", parsed.Queries[1]["filter_query"])
 	}
 }
 
