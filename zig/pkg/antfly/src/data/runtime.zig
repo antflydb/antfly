@@ -1732,6 +1732,7 @@ pub const DataServer = struct {
                     error.ConnectionRefused,
                     error.BrokenPipe,
                     error.EndOfStream,
+                    error.UnexpectedHttpStatus,
                     => {},
                     error.UnknownStore => {
                         self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
