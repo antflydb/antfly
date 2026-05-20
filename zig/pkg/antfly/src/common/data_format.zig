@@ -36,6 +36,8 @@ const FormatMarker = struct {
     min_reader_storage_format: u32 = 1,
 };
 
+var marker_tmp_counter = std.atomic.Value(u64).init(0);
+
 pub const Error = error{
     IncompatibleAntflyDataDir,
     UnsupportedAntflyDataFormat,
@@ -142,7 +144,9 @@ fn metadataLooksLikeGoRuntime(alloc: std.mem.Allocator, io: std.Io, metadata_pat
 }
 
 fn writeMarkerAtomically(alloc: std.mem.Allocator, io: std.Io, marker_path: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{marker_path});
+    const pid = std.posix.system.getpid();
+    const counter = marker_tmp_counter.fetchAdd(1, .monotonic);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.{d}.{d}.tmp", .{ marker_path, pid, counter });
     defer alloc.free(tmp_path);
 
     {
@@ -156,6 +160,7 @@ fn writeMarkerAtomically(alloc: std.mem.Allocator, io: std.Io, marker_path: []co
 
     std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), marker_path, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        if (pathExists(io, marker_path)) return;
         return err;
     };
 }
@@ -225,6 +230,43 @@ test "ensureCompatible accepts existing marker" {
 
     try ensureCompatible(alloc, data_dir);
     try ensureCompatible(alloc, data_dir);
+}
+
+test "ensureCompatible tolerates concurrent marker creation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const alloc = std.testing.allocator;
+    const data_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer alloc.free(data_dir);
+
+    const Worker = struct {
+        data_dir: []const u8,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            ensureCompatible(std.heap.smp_allocator, self.data_dir) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+
+    var workers: [8]Worker = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .data_dir = data_dir };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    }
+    for (&threads) |*thread| thread.join();
+    for (&workers) |worker| {
+        if (worker.result) |err| return err;
+    }
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const marker_path = try std.fs.path.join(alloc, &.{ data_dir, marker_file_name });
+    defer alloc.free(marker_path);
+    try std.testing.expect(pathExists(io_impl.io(), marker_path));
 }
 
 test "ensureCompatible rejects newer storage format" {
