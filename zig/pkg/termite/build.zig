@@ -134,6 +134,9 @@ fn configureOnnxRuntime(
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
     module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
+    if (std.mem.startsWith(u8, onnx_root, "onnxruntime/")) {
+        module.addRPath(.{ .cwd_relative = b.fmt("zig/pkg/termite/{s}/lib", .{onnx_root}) });
+    }
     module.linkSystemLibrary("onnxruntime", .{});
     module.linkSystemLibrary("onnxruntime-genai", .{});
 }

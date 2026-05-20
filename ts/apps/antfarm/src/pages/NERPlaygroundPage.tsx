@@ -424,7 +424,7 @@ const RecognizePlaygroundPage: React.FC = () => {
     setSelectedModel((prev: string) => (prev && models.includes(prev) ? prev : models[0] || ""));
   }, [mode, recognizerModels, extractorModels]);
 
-  // Handle ?model= URL param from Model Registry "Open in Playground"
+  // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
     const modelParam = searchParams.get("model");
     if (modelParam && modelsLoaded && recognizerModels.includes(modelParam)) {

@@ -119,7 +119,7 @@ pub const Config = struct {
     default_shards_per_table: i64,
     /// Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node.
     swarm_mode: ?bool = null,
-    /// URL of the model registry for the Antfarm dashboard. Defaults to https://registry.antfly.io/v1
+    /// Deprecated compatibility field. Antfarm now reads live models from Termite.
     registry_url: ?[]const u8 = null,
     /// Named embedder configurations for embedding operations. Define named embedders that can be referenced by indexes, templates, and API calls. The first embedder defined becomes the default when no embedder name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add openai.api_key ``` Then reference in config: `api_key: ${secret:openai.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - OpenAI: `OPENAI_API_KEY` - Gemini: `GEMINI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` - Cohere: `COHERE_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml embedders: openai-small: provider: openai model: text-embedding-3-small termite-local: provider: termite model: bge-base-en-v1.5 api_url: "http://localhost:8082" ```
     embedders: ?std.json.ArrayHashMap(antfly_embeddings_openapi.EmbedderConfig) = null,

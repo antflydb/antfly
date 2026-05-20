@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 
 ZIG ?= zig
+ZIG_BUILD_FLAGS ?=
 UV ?= uv
 SCRIPTS_PY := $(UV) run --project scripts --locked python
 TERMITE_BIN ?= ./pkg/termite/zig-out/bin/termite
@@ -30,7 +31,7 @@ force-download-onnx: ## Force re-download of ONNX Runtime + GenAI.
 	$(MAKE) download-onnx
 
 build: download-onnx ## Build antfly with embedded Termite + ONNX inference.
-	$(ZIG) build install-antfly
+	$(ZIG) build install-antfly $(ZIG_BUILD_FLAGS)
 
 test: ## Run the default Zig test aggregate.
 	$(ZIG) build test

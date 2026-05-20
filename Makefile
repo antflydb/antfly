@@ -1,5 +1,8 @@
 SHELL := /bin/bash
 ZIG_MAKE := $(MAKE) -C ./zig
+# Keep the default Zig build portable until the MLX C version gate rejects
+# installs that are missing the distributed runtime symbols Termite references.
+ZIG_BUILD_FLAGS ?= -Dmlx=false
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
@@ -32,9 +35,10 @@ help:
 	@echo "Usage: make <target>"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build              Build the antfly binary"
+	@echo "  build              Build the Zig antfly binary"
+	@echo "  build-go           Build the legacy Go antfly binary"
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
-	@echo "  build-termite-dashboard  Build the termite dashboard (termite-only antfarm)"
+	@echo "  build-termite-dashboard  Build the legacy Go termite dashboard (termite-only antfarm)"
 	@echo "  build-docs         Join and lint OpenAPI specifications"
 	@echo "  generate           Generate code, client SDKs, and all website documentation (API, config, changelog)"
 	@echo "  lint               Run golangci-lint with auto-fix"
@@ -86,26 +90,30 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-termite-dashboard sim-validate sim-validate-repo sim-soak
+.PHONY: build build-go build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-termite-dashboard sim-validate sim-validate-repo sim-soak
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
-build-antfarm: build-antfarm-main build-termite-dashboard
+build-antfarm: build-antfarm-main
 
 build-antfarm-main:
 	@echo "Building antfarm frontend..."
-	cd ts && pnpm install && pnpm --filter antfarm build
+	cd ts && pnpm install && pnpm --filter antfarm... build
 	@echo "Copying dist files to src/metadata/antfarm..."
 	rm -rf src/metadata/antfarm/*
 	cp -r ts/apps/antfarm/dist/* src/metadata/antfarm/
 
 build-termite-dashboard:
 	@echo "Building termite dashboard (antfarm with VITE_PRODUCTS=termite)..."
-	cd ts && pnpm install && VITE_PRODUCTS=termite pnpm --filter antfarm build
+	cd ts && pnpm install && VITE_PRODUCTS=termite pnpm --filter antfarm... build
 	@echo "Copying dist files to pkg/termite/dashboard..."
 	rm -rf pkg/termite/dashboard/*
 	cp -r ts/apps/antfarm/dist/* pkg/termite/dashboard/
 
-build: build-antfarm generate
+build: build-antfarm
+	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
+	cp zig/zig-out/bin/antfly ./antfly
+
+build-go: build-antfarm generate
 	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
 
 build-docs:
@@ -172,7 +180,7 @@ license-check: ## Check that all core files have license headers
 	$(ZIG_MAKE) license-check
 
 zig-build:
-	$(ZIG_MAKE) build
+	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 
 zig-test:
 	$(ZIG_MAKE) test

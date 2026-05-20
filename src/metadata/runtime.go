@@ -29,7 +29,6 @@ import (
 	"github.com/antflydb/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/lib/workerpool"
-	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
 	"github.com/antflydb/antfly/src/common"
 	antflymcp "github.com/antflydb/antfly/src/mcp"
 	"github.com/antflydb/antfly/src/metadata/foreign"
@@ -445,12 +444,6 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	apiRoutes.Handle("/api/v1/", http.StripPrefix("/api/v1", publicMux))
 	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
 	addAntfarmRoutes(apiRoutes)
-
-	registryURL := r.config.RegistryUrl
-	if registryURL == "" {
-		registryURL = modelregistry.DefaultRegistryURL
-	}
-	addRegistryProxy(apiRoutes, registryURL)
 
 	if r.termiteMLHandler != nil {
 		// Mount in-process termite handler at /ml/v1/. The handler's own

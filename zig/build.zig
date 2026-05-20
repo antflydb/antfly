@@ -5416,7 +5416,13 @@ pub fn build(b: *std.Build) void {
         .root_module = antfly_main_mod,
     });
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
+    const install_antfarm_assets = b.addInstallDirectory(.{
+        .source_dir = b.path("../src/metadata/antfarm"),
+        .install_dir = .prefix,
+        .install_subdir = "share/antfly/antfarm",
+    });
     b.getInstallStep().dependOn(&install_antfly.step);
+    b.getInstallStep().dependOn(&install_antfarm_assets.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
@@ -5426,6 +5432,7 @@ pub fn build(b: *std.Build) void {
     antfly_step.dependOn(&run_antfly.step);
     const install_antfly_step = b.step("install-antfly", "Build and install the top-level Antfly CLI");
     install_antfly_step.dependOn(&install_antfly.step);
+    install_antfly_step.dependOn(&install_antfarm_assets.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
     run_recall_harness_default.addArgs(&.{

@@ -138,8 +138,8 @@ components:
         registry_url:
           type: string
           format: uri
-          description: "URL of the model registry for the Antfarm dashboard. Defaults to https://registry.antfly.io/v1"
-          example: "https://registry.antfly.io/v1"
+          description: "Deprecated compatibility field. Antfarm now reads live models from Termite."
+          example: "https://models.example.com/v1"
         embedders:
           type: object
           additionalProperties:

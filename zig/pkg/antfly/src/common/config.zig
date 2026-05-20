@@ -798,7 +798,7 @@ test "common config treats go orchestration urls as metadata api discovery urls"
     try std.testing.expectEqual(@as(usize, 0), cfg.metadata.raft_urls.len);
 }
 
-test "common config preserves remote content logging storage and registry fields" {
+test "common config preserves remote content logging storage and deprecated registry fields" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -812,7 +812,7 @@ test "common config preserves remote content logging storage and registry fields
         \\    "style": "json"
         \\  },
         \\  "health_port": 4200,
-        \\  "registry_url": "https://registry.antfly.io/v1",
+        \\  "registry_url": "https://models.example.com/v1",
         \\  "swarm_mode": true,
         \\  "storage": {
         \\    "local": { "base_dir": "antflydb" },
@@ -857,7 +857,7 @@ test "common config preserves remote content logging storage and registry fields
 
     try std.testing.expectEqual(true, cfg.swarm_mode);
     try std.testing.expectEqual(@as(?u16, 4200), cfg.health_port);
-    try std.testing.expectEqualStrings("https://registry.antfly.io/v1", cfg.registry_url.?);
+    try std.testing.expectEqualStrings("https://models.example.com/v1", cfg.registry_url.?);
     try std.testing.expectEqual(logging_openapi.Level.debug, cfg.log.?.level.?);
     try std.testing.expectEqual(logging_openapi.Style.json, cfg.log.?.style.?);
     try std.testing.expectEqual(common_openapi.StorageBackend.s3, cfg.storage.data_backend.?);
