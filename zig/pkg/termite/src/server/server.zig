@@ -1140,6 +1140,12 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
 
         var pipeline = model.embeddingPipeline(ctx.allocator);
+        applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, request) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = embedRequestOptionErrorMessage(err),
+            });
+        };
         const pipeline_start = embedTimingStart();
         const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
@@ -5067,6 +5073,8 @@ const ParsedEmbedRequest = struct {
     input: std.json.Value,
     encoding_format: ?[]const u8,
     dimensions: ?i64,
+    task: ?[]const u8,
+    prompt_name: ?[]const u8,
 };
 
 const ParsedTextEmbedInput = struct {
@@ -5114,11 +5122,23 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         break :blk value.integer;
     } else null;
 
+    const task: ?[]const u8 = if (obj.get("task")) |value| blk: {
+        if (value != .string) return error.TaskMustBeString;
+        break :blk value.string;
+    } else null;
+
+    const prompt_name: ?[]const u8 = if (obj.get("prompt_name")) |value| blk: {
+        if (value != .string) return error.PromptNameMustBeString;
+        break :blk value.string;
+    } else null;
+
     return .{
         .model = model_value.string,
         .input = input_value,
         .encoding_format = encoding_format,
         .dimensions = dimensions,
+        .task = task,
+        .prompt_name = prompt_name,
     };
 }
 
@@ -5129,7 +5149,43 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
         error.InputRequired => "input is required",
         error.EncodingFormatMustBeString => "encoding_format must be a string",
         error.DimensionsMustBeInteger => "dimensions must be an integer",
+        error.TaskMustBeString => "task must be a string",
+        error.PromptNameMustBeString => "prompt_name must be a string",
         else => "invalid embedding request",
+    };
+}
+
+fn isJinaV5EmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
+    return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
+        (manifest.pooling == .last and
+            std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
+}
+
+fn applyDenseEmbeddingRequestOptions(
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    manifest: *const manifest_mod.ModelManifest,
+    request: ParsedEmbedRequest,
+) !void {
+    if (!isJinaV5EmbeddingManifest(manifest)) return;
+
+    const task = request.task orelse "retrieval";
+    if (!std.mem.eql(u8, task, "retrieval")) return error.UnsupportedEmbeddingTask;
+
+    const prompt_name = request.prompt_name orelse "document";
+    if (std.mem.eql(u8, prompt_name, "query")) {
+        pipeline.config.text_prefix = "Query: ";
+    } else if (std.mem.eql(u8, prompt_name, "document")) {
+        pipeline.config.text_prefix = "Document: ";
+    } else {
+        return error.UnsupportedEmbeddingPromptName;
+    }
+}
+
+fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.UnsupportedEmbeddingTask => "only task=\"retrieval\" is supported for this embedding model in this runtime",
+        error.UnsupportedEmbeddingPromptName => "prompt_name must be \"query\" or \"document\"",
+        else => "invalid embedding options",
     };
 }
 
@@ -5434,6 +5490,74 @@ test "termite embeddings validates encoding format and dimensions" {
     try std.testing.expectEqual(@as(?usize, 128), try parseRequestedEmbeddingDimensions(128));
     try std.testing.expectError(error.InvalidEmbeddingDimensions, parseRequestedEmbeddingDimensions(0));
     try std.testing.expectError(error.InvalidEmbeddingDimensions, parseRequestedEmbeddingDimensions(-1));
+}
+
+test "jina embedding request options switch query and document prefixes" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .pooling = .last,
+    };
+    defer manifest.deinit();
+    manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+    manifest.tasks = try allocator.alloc([]const u8, 1);
+    manifest.tasks[0] = try allocator.dupe(u8, "retrieval");
+
+    var pipeline = embedding_mod.EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+
+    const query_request = ParsedEmbedRequest{
+        .model = "jina",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task = "retrieval",
+        .prompt_name = "query",
+    };
+    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, query_request);
+    try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
+
+    const bad_task = ParsedEmbedRequest{
+        .model = "jina",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task = "classification",
+        .prompt_name = "document",
+    };
+    try std.testing.expectError(error.UnsupportedEmbeddingTask, applyDenseEmbeddingRequestOptions(&pipeline, &manifest, bad_task));
+}
+
+test "jina embedding request options support merged qwen3 task repos without manifest tasks" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .pooling = .last,
+    };
+    defer manifest.deinit();
+    manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+
+    var pipeline = embedding_mod.EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+
+    const request = ParsedEmbedRequest{
+        .model = "jina-merged",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task = "retrieval",
+        .prompt_name = "query",
+    };
+    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, request);
+    try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
 }
 
 fn expectJsonNumber(expected: f64, value: std.json.Value) !void {

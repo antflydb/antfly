@@ -732,7 +732,9 @@ pub const LoadedModel = struct {
                 .mean => .mean,
                 .cls => .cls,
                 .max => .max,
+                .last => .last,
             },
+            .text_prefix = self.manifest.embedding_text_prefix,
         });
         if (session_factory.getClipConfig(self.session)) |cfg| {
             pipeline.config.image_size = cfg.image_size;

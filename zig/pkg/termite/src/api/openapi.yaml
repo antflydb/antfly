@@ -1121,6 +1121,15 @@ components:
         dimensions:
           type: integer
           description: Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+        task:
+          type: string
+          description: Optional model-specific embedding task. Jina v5 currently supports retrieval in this runtime.
+        prompt_name:
+          type: string
+          description: Optional model-specific prompt role. For Jina v5 retrieval embeddings, use "query" or "document".
+          enum:
+            - query
+            - document
     EmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors

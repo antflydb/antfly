@@ -993,6 +993,10 @@ pub const EmbedRequest = struct {
     encoding_format: ?[]const u8 = null,
     /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
     dimensions: ?i64 = null,
+    /// Optional model-specific embedding task. Jina v5 currently supports retrieval in this runtime.
+    task: ?[]const u8 = null,
+    /// Optional model-specific prompt role. For Jina v5 retrieval embeddings, use "query" or "document".
+    prompt_name: ?[]const u8 = null,
 };
 
 /// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]

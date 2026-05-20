@@ -91,6 +91,7 @@ pub const PoolingStrategy = enum {
     mean,
     cls,
     max,
+    last,
 };
 
 pub const Sparse3DOutputLayout = enum {
@@ -162,6 +163,7 @@ pub const ModelManifest = struct {
     // Pipeline config
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
+    embedding_text_prefix: []const u8 = "",
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
 
@@ -229,6 +231,7 @@ pub const ModelManifest = struct {
             self.allocator.free(labels);
         }
         if (self.chat_template) |t| self.allocator.free(t);
+        if (self.embedding_text_prefix.len > 0) self.allocator.free(self.embedding_text_prefix);
         if (self.gliner_model_type.len > 0) self.allocator.free(self.gliner_model_type);
         if (self.config_model_arch.len > 0) self.allocator.free(self.config_model_arch);
         if (self.gliner_default_labels.len > 0) {
@@ -867,6 +870,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     defer parsed.deinit();
 
     const obj = parsed.value.object;
+    const jina_v5_embedding_config = isJinaV5TextEmbeddingConfig(&obj);
 
     if (obj.get("hidden_size")) |v| {
         if (jsonU32(v)) |val| manifest.hidden_size = val;
@@ -966,8 +970,18 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             } else if (std.mem.eql(u8, s, "layoutlmv3")) {
                 manifest.native_arch_hint = .layoutlmv3;
                 if (manifest.model_type == .embedder) manifest.model_type = .classifier;
+            } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
+                manifest.model_type = .embedder;
             }
         }
+    }
+
+    if (jina_v5_embedding_config) {
+        manifest.model_type = .embedder;
+        manifest.pooling = .last;
+        manifest.normalize = true;
+        if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
+        manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
     }
 
     // For CLIP/CLAP/multimodal models, text_config contains the text encoder's
@@ -980,6 +994,32 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             }
         }
     }
+}
+
+fn jsonStringArrayContains(value: std.json.Value, needle: []const u8) bool {
+    if (value != .array) return false;
+    for (value.array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, needle)) return true;
+    }
+    return false;
+}
+
+fn isJinaV5TextEmbeddingConfig(obj: *const std.json.ObjectMap) bool {
+    if (obj.get("model_type")) |v| {
+        if (v == .string and std.mem.eql(u8, v.string, "jina_embeddings_v5")) return true;
+    }
+
+    const task_names = obj.get("task_names") orelse return false;
+    if (!jsonStringArrayContains(task_names, "retrieval") or
+        !jsonStringArrayContains(task_names, "text-matching") or
+        !jsonStringArrayContains(task_names, "clustering"))
+    {
+        return false;
+    }
+
+    const arch = obj.get("architectures") orelse return false;
+    return jsonStringArrayContains(arch, "Qwen3Model") or
+        jsonStringArrayContains(arch, "JinaEmbeddingsV5Model");
 }
 
 fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
@@ -1482,6 +1522,52 @@ test "manifest from config.json" {
     try std.testing.expectEqual(@as(u32, 6), manifest.num_hidden_layers);
     try std.testing.expectEqual(bert.ModelType.bert, manifest.bert_model_type);
     try std.testing.expectEqualStrings("bert", manifest.config_model_arch);
+}
+
+test "manifest treats jina embeddings v5 as qwen3 embedder with last pooling" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const config_json =
+        \\{
+        \\  "architectures": ["JinaEmbeddingsV5Model"],
+        \\  "task_names": ["retrieval", "text-matching", "clustering", "classification"],
+        \\  "model_type": "jina_embeddings_v5",
+        \\  "hidden_size": 1024,
+        \\  "max_position_embeddings": 32768,
+        \\  "num_hidden_layers": 28,
+        \\  "num_attention_heads": 16
+        \\}
+    ;
+    try parseConfigJson(&manifest, allocator, config_json);
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expect(manifest.normalize);
+    try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
+    try std.testing.expectEqualStrings("jina_embeddings_v5", manifest.config_model_arch);
+    try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
+}
+
+test "manifest treats merged jina qwen3 task repo as embedder" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const config_json =
+        \\{
+        \\  "architectures": ["Qwen3Model"],
+        \\  "task_names": ["retrieval", "text-matching", "clustering", "classification"],
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024
+        \\}
+    ;
+    try parseConfigJson(&manifest, allocator, config_json);
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
 }
 
 test "load sparse fixture preserves max position embeddings" {

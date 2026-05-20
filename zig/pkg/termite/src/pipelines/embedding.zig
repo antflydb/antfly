@@ -35,6 +35,7 @@ pub const PoolingStrategy = enum {
     mean,
     cls,
     max,
+    last,
 };
 
 pub const EmbeddingConfig = struct {
@@ -45,6 +46,9 @@ pub const EmbeddingConfig = struct {
     /// When true, resident encoder/projection paths fail instead of silently
     /// falling back to host-session projection.
     resident_projection_required: bool = false,
+    /// Optional text prefix applied before tokenization. Jina v5 text models
+    /// default to document embeddings by encoding "Document: " + text.
+    text_prefix: []const u8 = "",
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// For CLAP audio models: mel spectrogram configuration.
@@ -187,7 +191,13 @@ pub const EmbeddingPipeline = struct {
         defer alloc.free(all_mask);
 
         for (texts, 0..) |text, i| {
-            var result = try self.tok.encodeForModel(alloc, text, max_len);
+            const token_text = if (self.config.text_prefix.len > 0)
+                try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.config.text_prefix, text })
+            else
+                text;
+            defer if (self.config.text_prefix.len > 0) alloc.free(token_text);
+
+            var result = try self.tok.encodeForModel(alloc, token_text, max_len);
             defer result.deinit();
 
             @memcpy(all_ids[i * max_len .. (i + 1) * max_len], result.ids);
@@ -316,6 +326,14 @@ pub const EmbeddingPipeline = struct {
                             }
                         }
                     }
+                },
+                .last => {
+                    var last_idx: usize = 0;
+                    for (0..seq_len) |s| {
+                        if (mask[b * seq_len + s] > 0) last_idx = s;
+                    }
+                    const offset = (b * seq_len + last_idx) * hidden;
+                    @memcpy(emb, data[offset .. offset + hidden]);
                 },
             }
 
@@ -975,6 +993,7 @@ pub const EmbeddingPipeline = struct {
         return switch (self.config.pooling) {
             .mean => try residentMaskedMeanPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
             .cls => try residentClsPool(backend, output, batch, @intCast(shape[2])),
+            .last => try residentLastTokenPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
             .max => error.UnsupportedResidentTextPooling,
         };
     }
@@ -1034,6 +1053,53 @@ pub const EmbeddingPipeline = struct {
         const sliced = try backend.primSlice(output, &starts, &limits, &strides, &input_shape);
         defer backend.free(sliced);
         const pooled = try backend.primReshape(sliced, &pooled_shape);
+        return .{ .value = pooled, .backend = backend, .owns_value = true };
+    }
+
+    fn residentLastTokenPool(
+        allocator: std.mem.Allocator,
+        backend: *const ops_mod.ComputeBackend,
+        output: ops_mod.CT,
+        mask: []const i32,
+        batch: usize,
+        seq_len: usize,
+        hidden: usize,
+    ) !ResidentPooled {
+        if (mask.len != batch * seq_len) return error.ShapeMismatch;
+
+        const row_ids = try allocator.alloc(u32, batch);
+        defer allocator.free(row_ids);
+        for (0..batch) |b| {
+            var last_idx: usize = 0;
+            for (0..seq_len) |s| {
+                if (mask[b * seq_len + s] > 0) last_idx = s;
+            }
+            row_ids[b] = @intCast(b * seq_len + last_idx);
+        }
+
+        const flat_shape = [_]i64{ @intCast(batch * seq_len), @intCast(hidden) };
+        const flat = backend.primReshape(output, &flat_shape) catch null;
+        if (flat) |flat_output| {
+            defer backend.free(flat_output);
+            if (try backend.takeRows(flat_output, row_ids, batch, hidden)) |pooled| {
+                return .{ .value = pooled, .backend = backend, .owns_value = true };
+            }
+        }
+
+        const host = try backend.toFloat32(output, allocator);
+        defer allocator.free(host);
+        if (host.len != batch * seq_len * hidden) return error.ShapeMismatch;
+
+        const pooled_values = try allocator.alloc(f32, batch * hidden);
+        errdefer allocator.free(pooled_values);
+        for (0..batch) |b| {
+            const src_offset = @as(usize, row_ids[b]) * hidden;
+            const dst_offset = b * hidden;
+            @memcpy(pooled_values[dst_offset .. dst_offset + hidden], host[src_offset .. src_offset + hidden]);
+        }
+
+        const pooled = try backend.fromFloat32Shape(pooled_values, &.{ @intCast(batch), @intCast(hidden) });
+        allocator.free(pooled_values);
         return .{ .value = pooled, .backend = backend, .owns_value = true };
     }
 
@@ -1388,6 +1454,38 @@ test "resident masked mean pooling uses backend primitives" {
     const host = try cb.toFloat32(pooled.value, allocator);
     defer allocator.free(host);
     try std.testing.expectEqualSlices(f32, &.{ 2.0, 3.0, 7.0, 8.0 }, host);
+}
+
+test "pool3D last uses final non-padding token and normalizes" {
+    const allocator = std.testing.allocator;
+
+    const shape = [_]i64{ 2, 3, 2 };
+    const values = [_]f32{
+        1.0, 0.0,
+        3.0, 4.0,
+        9.0, 9.0,
+        0.0, 2.0,
+        8.0, 8.0,
+        0.0, 5.0,
+    };
+    var output = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, &values);
+    defer output.deinit();
+
+    var pipeline = EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{ .pooling = .last, .normalize = true },
+    };
+
+    const mask = [_]i32{ 1, 1, 0, 1, 0, 1 };
+    const embeddings = try pipeline.pool3D(&output, &mask, 2, 3, true);
+    defer freeEmbeddingSlices(allocator, embeddings);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), embeddings[0][0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), embeddings[0][1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), embeddings[1][0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), embeddings[1][1], 1e-6);
 }
 
 test "resident projected input selection supports 3d cls pooling" {
