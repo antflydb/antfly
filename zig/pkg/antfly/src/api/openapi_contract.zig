@@ -205,6 +205,7 @@ test "bleve and metadata openapi modules are generated and wired" {
     try std.testing.expect(@hasDecl(metadata_generated, "QueryRequest"));
     try std.testing.expect(@hasDecl(metadata_generated, "QueryResponses"));
     try std.testing.expect(@hasDecl(metadata_generated, "QueryBuilderResult"));
+    try std.testing.expect(@hasDecl(metadata_generated, "SecretStoreStatus"));
     try std.testing.expect(@hasDecl(metadata_generated, "SecretEntry"));
     try std.testing.expect(@hasDecl(metadata_generated, "SecretList"));
     try std.testing.expect(@hasDecl(metadata_generated, "ClusterBackupResponse"));

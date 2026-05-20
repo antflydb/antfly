@@ -33,8 +33,8 @@ pub const Chunk = struct {
             .id = id,
             .mime_type = "text/plain",
             .text = text,
-            .start_char = @intCast(start),
-            .end_char = @intCast(end),
+            .start_char = std.math.cast(u32, start),
+            .end_char = std.math.cast(u32, end),
         };
     }
 
@@ -95,4 +95,11 @@ pub const Input = union(enum) {
 pub fn freeChunks(alloc: std.mem.Allocator, chunks: []Chunk) void {
     for (chunks) |*chunk| chunk.deinit(alloc);
     alloc.free(chunks);
+}
+
+test "text chunk offsets are nullable when they exceed u32 range" {
+    const too_large = @as(usize, std.math.maxInt(u32)) + 1;
+    const chunk = Chunk.initText(0, "", too_large, too_large + 1);
+    try std.testing.expectEqual(@as(?u32, null), chunk.start_char);
+    try std.testing.expectEqual(@as(?u32, null), chunk.end_char);
 }

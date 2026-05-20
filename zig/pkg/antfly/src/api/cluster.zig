@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const common_secrets = @import("../common/secrets.zig");
 const metadata_api = @import("../metadata/api.zig");
 
 pub const ClusterHealth = enum {
@@ -26,11 +27,16 @@ pub const ClusterStatus = struct {
     message: ?[]u8 = null,
     auth_enabled: bool = false,
     swarm_mode: bool = false,
+    secret_store: ?SecretStoreStatus = null,
 
     pub fn deinit(self: *ClusterStatus, alloc: std.mem.Allocator) void {
         if (self.message) |message| alloc.free(message);
         self.* = undefined;
     }
+};
+
+pub const SecretStoreStatus = struct {
+    stale: bool = false,
 };
 
 pub fn fromMetadataStatus(alloc: std.mem.Allocator, status: metadata_api.MetadataStatus) !ClusterStatus {
@@ -70,6 +76,12 @@ pub fn fromMetadataStatus(alloc: std.mem.Allocator, status: metadata_api.Metadat
     };
 }
 
+pub fn applySecretStoreHealth(status: *ClusterStatus, health: common_secrets.ReloadHealth) void {
+    status.secret_store = .{
+        .stale = health.stale_snapshot,
+    };
+}
+
 test "cluster status derives degraded and error states from metadata status" {
     var error_status = try fromMetadataStatus(std.testing.allocator, .{
         .metadata_group_id = 1,
@@ -99,4 +111,20 @@ test "cluster status derives degraded and error states from metadata status" {
     });
     defer healthy.deinit(std.testing.allocator);
     try std.testing.expectEqual(ClusterHealth.healthy, healthy.health);
+}
+
+test "cluster status carries non-secret secret store health" {
+    var status = ClusterStatus{ .health = .healthy };
+    applySecretStoreHealth(&status, .{
+        .generation = 7,
+        .entry_count = 3,
+        .last_reload_failed = true,
+        .stale_snapshot = true,
+        .reload_successes = 2,
+        .reload_failures = 1,
+        .last_success_ns = 123,
+        .last_failure_ns = 456,
+    });
+    const secret_store = status.secret_store orelse return error.TestUnexpectedResult;
+    try std.testing.expect(secret_store.stale);
 }

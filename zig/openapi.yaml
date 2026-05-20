@@ -821,6 +821,18 @@ components:
           description: Indicates whether the cluster is running in single-node swarm
             mode
           x-omitzero: false
+        secret_store:
+          $ref: '#/components/schemas/SecretStoreStatus'
+    SecretStoreStatus:
+      type: object
+      description: Non-secret status for the local secrets file store, when one is
+        available.
+      properties:
+        stale:
+          type: boolean
+          description: Whether Antfly is serving a last-known-good secrets snapshot
+            after a failed refresh.
+          x-omitzero: false
     SecretStatus:
       type: string
       enum:

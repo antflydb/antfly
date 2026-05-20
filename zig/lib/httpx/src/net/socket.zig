@@ -145,13 +145,32 @@ pub const Socket = struct {
     fn setTimeout(self: *Self, opt: u32, ms: u64) !void {
         if (is_windows) {
             const value_ms: u32 = @intCast(@min(ms, @as(u64, std.math.maxInt(u32))));
-            try posix.setsockopt(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&value_ms));
+            try setSocketOption(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&value_ms));
         } else {
             const tv = posix.timeval{
                 .sec = @intCast(ms / 1000),
                 .usec = @intCast((ms % 1000) * 1000),
             };
-            try posix.setsockopt(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv));
+            try setSocketOption(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv));
+        }
+    }
+
+    fn setSocketOption(fd: net.Socket.Handle, level: i32, optname: u32, opt: []const u8) !void {
+        if (is_windows) {
+            try posix.setsockopt(fd, level, optname, opt);
+            return;
+        }
+        switch (posix.errno(posix.system.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len)))) {
+            .SUCCESS => {},
+            .BADF, .NOTSOCK, .INVAL, .FAULT => return error.InvalidSocketOption,
+            .DOM => return error.TimeoutTooBig,
+            .ISCONN => return error.AlreadyConnected,
+            .NOPROTOOPT => return error.InvalidProtocolOption,
+            .NOMEM, .NOBUFS => return error.SystemResources,
+            .PERM => return error.PermissionDenied,
+            .NODEV => return error.NoDevice,
+            .OPNOTSUPP => return error.OperationUnsupported,
+            else => |err| return posix.unexpectedErrno(err),
         }
     }
 

@@ -88,7 +88,7 @@ pub const Provider = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
-        if (!resp.ok()) return mapEmbedStatus(resp.status);
+        if (!resp.ok()) return mapEmbedStatus(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
         const EmbeddingResponse = struct {
             data: []const struct {

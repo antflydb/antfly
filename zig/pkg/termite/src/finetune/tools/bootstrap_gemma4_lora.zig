@@ -26,22 +26,40 @@ pub fn main(init: std.process.Init) !void {
 
     const model_dir = args.next() orelse return usageError();
     const out_dir = args.next() orelse return usageError();
-    const rank_arg = args.next() orelse "8";
-    const alpha_arg = args.next() orelse "16";
+    var rank: usize = 16;
+    var alpha: f32 = 32.0;
+    var rank_set = false;
+    var alpha_set = false;
+    var rank_alpha_flag_seen = false;
     var base_model_name_or_path: ?[]const u8 = null;
     var layer_name: ?[]const u8 = null;
     var target_preset: ?peft.TargetPreset = null;
+    var target_modules: ?[]const []const u8 = null;
+    defer if (target_modules) |modules| allocator.free(modules);
     var use_dora = false;
     var init_lora_weights: ?[]const u8 = null;
     var eva_stats_path: ?[]const u8 = null;
     var lora_ga_stats_path: ?[]const u8 = null;
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--layer-name") or std.mem.eql(u8, arg, "--layer")) {
+        if (std.mem.eql(u8, arg, "--rank")) {
+            if (rank_set) return usageError();
+            rank = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+            rank_set = true;
+            rank_alpha_flag_seen = true;
+        } else if (std.mem.eql(u8, arg, "--alpha")) {
+            if (alpha_set) return usageError();
+            alpha = try std.fmt.parseFloat(f32, args.next() orelse return usageError());
+            alpha_set = true;
+            rank_alpha_flag_seen = true;
+        } else if (std.mem.eql(u8, arg, "--layer-name") or std.mem.eql(u8, arg, "--layer")) {
             layer_name = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--target-preset")) {
             const preset_name = args.next() orelse return usageError();
             target_preset = peft.parseTargetPreset(preset_name) orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--target-modules")) {
+            if (target_modules != null) return usageError();
+            target_modules = try parseTargetModules(allocator, args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--use-dora")) {
             use_dora = true;
         } else if (std.mem.eql(u8, arg, "--init-lora-weights")) {
@@ -50,6 +68,12 @@ pub fn main(init: std.process.Init) !void {
             eva_stats_path = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--lora-ga-stats")) {
             lora_ga_stats_path = args.next() orelse return usageError();
+        } else if (!rank_alpha_flag_seen and !rank_set) {
+            rank = try std.fmt.parseUnsigned(usize, arg, 10);
+            rank_set = true;
+        } else if (!rank_alpha_flag_seen and !alpha_set) {
+            alpha = try std.fmt.parseFloat(f32, arg);
+            alpha_set = true;
         } else if (base_model_name_or_path == null) {
             base_model_name_or_path = arg;
         } else {
@@ -57,15 +81,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const rank = try std.fmt.parseUnsigned(usize, rank_arg, 10);
-    const alpha = try std.fmt.parseFloat(f32, alpha_arg);
+    if (target_modules != null and target_preset != null) return usageError();
+    const effective_target_preset = if (target_modules == null) target_preset orelse .all_linear else null;
 
     var summary = try finetune.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .base_model_name_or_path = base_model_name_or_path,
         .layer_name = layer_name,
-        .target_preset = target_preset,
+        .target_modules = target_modules,
+        .target_preset = effective_target_preset,
         .use_dora = use_dora,
         .init_lora_weights = init_lora_weights,
         .eva_stats_path = eva_stats_path,
@@ -84,10 +109,12 @@ pub fn main(init: std.process.Init) !void {
 fn usageError() error{InvalidArguments} {
     std.debug.print(
         \\usage: bootstrap-gemma4-lora <model_dir> <out_dir> [rank] [alpha] [base_model_name_or_path]
+        \\       [--rank <n>] [--alpha <float>]
         \\       [--layer-name <substring>] [--target-preset all-linear|attention-only|mlp-only|moe-experts]
+        \\       [--target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
         \\       [--use-dora] [--init-lora-weights default|pissa|eva|lora-ga|loftq|loftq-nf4]
         \\       [--eva-stats <safetensors>] [--lora-ga-stats <safetensors>]
-        \\example: bootstrap-gemma4-lora /tmp/gemma4-base /tmp/gemma4-lora 8 16 google/gemma-4 --target-preset all-linear
+        \\example: bootstrap-gemma4-lora /tmp/gemma4-base /tmp/gemma4-lora 16 32 google/gemma-4 --target-preset all-linear
         \\EVA stats tensors are named <base_tensor>.eva_activation_covariance with shape [in,in].
         \\LoRA-GA stats tensors are named <base_tensor>.lora_ga_gradient with shape [out,in].
         \\

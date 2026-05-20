@@ -40,3 +40,7 @@ test "inference module compiles" {
     _ = openai;
     _ = managed_embedder;
 }
+
+test "managed embedder resolves file-backed api key rotation at request time" {
+    try managed_embedder.testFileBackedApiKeyRotation();
+}
