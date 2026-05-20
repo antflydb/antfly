@@ -5,6 +5,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
+    from ..models.algebraic_index_stats import AlgebraicIndexStats
     from ..models.embeddings_index_stats import EmbeddingsIndexStats
     from ..models.full_text_index_stats import FullTextIndexStats
     from ..models.graph_index_stats import GraphIndexStats
@@ -17,19 +18,22 @@ T = TypeVar("T", bound="IndexStatusShardStatus")
 class IndexStatusShardStatus:
     """ """
 
-    additional_properties: dict[str, Union["EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"]] = (
-        _attrs_field(init=False, factory=dict)
-    )
+    additional_properties: dict[
+        str, Union["AlgebraicIndexStats", "EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"]
+    ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
         from ..models.full_text_index_stats import FullTextIndexStats
+        from ..models.graph_index_stats import GraphIndexStats
 
         field_dict: dict[str, Any] = {}
         for prop_name, prop in self.additional_properties.items():
             if isinstance(prop, FullTextIndexStats):
                 field_dict[prop_name] = prop.to_dict()
             elif isinstance(prop, EmbeddingsIndexStats):
+                field_dict[prop_name] = prop.to_dict()
+            elif isinstance(prop, GraphIndexStats):
                 field_dict[prop_name] = prop.to_dict()
             else:
                 field_dict[prop_name] = prop.to_dict()
@@ -38,6 +42,7 @@ class IndexStatusShardStatus:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.algebraic_index_stats import AlgebraicIndexStats
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
         from ..models.full_text_index_stats import FullTextIndexStats
         from ..models.graph_index_stats import GraphIndexStats
@@ -50,7 +55,7 @@ class IndexStatusShardStatus:
 
             def _parse_additional_property(
                 data: object,
-            ) -> Union["EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"]:
+            ) -> Union["AlgebraicIndexStats", "EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"]:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
@@ -67,11 +72,19 @@ class IndexStatusShardStatus:
                     return componentsschemas_index_stats_type_1
                 except:  # noqa: E722
                     pass
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_index_stats_type_2 = GraphIndexStats.from_dict(data)
+
+                    return componentsschemas_index_stats_type_2
+                except:  # noqa: E722
+                    pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_index_stats_type_2 = GraphIndexStats.from_dict(data)
+                componentsschemas_index_stats_type_3 = AlgebraicIndexStats.from_dict(data)
 
-                return componentsschemas_index_stats_type_2
+                return componentsschemas_index_stats_type_3
 
             additional_property = _parse_additional_property(prop_dict)
 
@@ -84,11 +97,15 @@ class IndexStatusShardStatus:
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> Union["EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"]:
+    def __getitem__(
+        self, key: str
+    ) -> Union["AlgebraicIndexStats", "EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"]:
         return self.additional_properties[key]
 
     def __setitem__(
-        self, key: str, value: Union["EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"]
+        self,
+        key: str,
+        value: Union["AlgebraicIndexStats", "EmbeddingsIndexStats", "FullTextIndexStats", "GraphIndexStats"],
     ) -> None:
         self.additional_properties[key] = value
 

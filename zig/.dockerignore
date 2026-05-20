@@ -1,0 +1,15 @@
+.git
+.zig-cache
+**/.zig-cache
+.zig-global-cache
+**/.zig-global-cache
+zig-out
+**/zig-out
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+.pytest_cache
+**/.pytest_cache
+.DS_Store
+**/.DS_Store

@@ -26,6 +26,8 @@ class GraphResultNode:
         document (Union[Unset, GraphResultNodeDocument]): Full document (if include_documents=true)
         path (Union[Unset, list[str]]): Keys in path from start to this node
         path_edges (Union[Unset, list['PathEdge']]): Edges in path from start to this node
+        provenance (Union[Unset, list[str]]): Algebraic provenance labels folded into this result, when requested by an
+            algebraic graph executor
         edges (Union[Unset, list['Edge']]): Connected edges (when include_edges=true)
     """
 
@@ -35,6 +37,7 @@ class GraphResultNode:
     document: Union[Unset, "GraphResultNodeDocument"] = UNSET
     path: Union[Unset, list[str]] = UNSET
     path_edges: Union[Unset, list["PathEdge"]] = UNSET
+    provenance: Union[Unset, list[str]] = UNSET
     edges: Union[Unset, list["Edge"]] = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -60,6 +63,10 @@ class GraphResultNode:
                 path_edges_item = path_edges_item_data.to_dict()
                 path_edges.append(path_edges_item)
 
+        provenance: Union[Unset, list[str]] = UNSET
+        if not isinstance(self.provenance, Unset):
+            provenance = self.provenance
+
         edges: Union[Unset, list[dict[str, Any]]] = UNSET
         if not isinstance(self.edges, Unset):
             edges = []
@@ -84,6 +91,8 @@ class GraphResultNode:
             field_dict["path"] = path
         if path_edges is not UNSET:
             field_dict["path_edges"] = path_edges
+        if provenance is not UNSET:
+            field_dict["provenance"] = provenance
         if edges is not UNSET:
             field_dict["edges"] = edges
 
@@ -118,6 +127,8 @@ class GraphResultNode:
 
             path_edges.append(path_edges_item)
 
+        provenance = cast(list[str], d.pop("provenance", UNSET))
+
         edges = []
         _edges = d.pop("edges", UNSET)
         for edges_item_data in _edges or []:
@@ -132,6 +143,7 @@ class GraphResultNode:
             document=document,
             path=path,
             path_edges=path_edges,
+            provenance=provenance,
             edges=edges,
         )
 

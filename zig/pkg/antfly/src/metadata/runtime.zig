@@ -191,6 +191,7 @@ pub const ServerConfig = struct {
     admin_bind_port: u16 = 0,
     reconciler_config: antfly.metadata.reconciler.Reconciler.Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+    secret_store: ?*antfly.common.secrets.FileStore = null,
 };
 
 pub const Server = struct {
@@ -234,6 +235,7 @@ pub const Server = struct {
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .backend_runtime = cfg.backend_runtime,
             .metadata_orchestration_urls = cfg.metadata_orchestration_urls,
+            .secret_store = cfg.secret_store,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
             .http = .{

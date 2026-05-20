@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
+const common_secrets = @import("../common/secrets.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
@@ -79,8 +80,10 @@ pub const LocalTermiteProvider = struct {
     ) anyerror![]u8 = null,
 };
 
-const InitOptions = struct {
+pub const InitOptions = struct {
     local_termite_provider: ?LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
 };
 
 pub const QueryTemplateError = error{
@@ -285,11 +288,15 @@ fn releaseSharedRequestPacer(scope_key: []const u8) void {
 }
 
 pub const ManagedEmbeddingEntry = struct {
+    alloc: std.mem.Allocator,
     index_name: []u8,
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
-    api_key: ?[]u8 = null,
+    api_key: ?common_secrets.SecretValue = null,
+    auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     dimensions: u32,
     sparse: bool = false,
     multimodal: bool = false,
@@ -299,10 +306,12 @@ pub const ManagedEmbeddingEntry = struct {
     local_termite_provider: ?LocalTermiteProvider = null,
 
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
+        std.debug.assert(self.alloc.ptr == alloc.ptr);
         alloc.free(self.index_name);
         alloc.free(self.model);
         alloc.free(self.base_url);
-        if (self.api_key) |api_key| alloc.free(api_key);
+        if (self.api_key) |*api_key| api_key.deinit(alloc);
+        self.auth_header_cache.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -324,7 +333,7 @@ fn attachRequestPacers(
 
     for (entries) |*entry| {
         if (entry.requests_per_minute == 0) continue;
-        const scope_key = try requestPacerScopeKeyAlloc(alloc, entry.*);
+        const scope_key = try requestPacerScopeKeyAlloc(alloc, entry);
         defer alloc.free(scope_key);
 
         for (scopes.items) |scope| {
@@ -347,8 +356,8 @@ fn attachRequestPacers(
     }
 }
 
-fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: ManagedEmbeddingEntry) ![]u8 {
-    const api_key_hash = if (entry.api_key) |api_key| std.hash.Wyhash.hash(0, api_key) else 0;
+fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
+    const api_key_hash = if (entry.api_key) |*api_key| api_key.identityHash() else 0;
     return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
         @tagName(entry.provider),
         entry.base_url,
@@ -481,9 +490,17 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         local_termite_provider: ?LocalTermiteProvider,
     ) !?db_embedder.DenseEmbedder {
+        return try createDenseEmbedderWithOptions(alloc, indexes_json, .{ .local_termite_provider = local_termite_provider });
+    }
+
+    pub fn createDenseEmbedderWithOptions(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+        options: InitOptions,
+    ) !?db_embedder.DenseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithLocalTermite(alloc, indexes_json, local_termite_provider);
+        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
         if (!owned.hasDenseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -501,9 +518,17 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         local_termite_provider: ?LocalTermiteProvider,
     ) !?db_embedder.SparseEmbedder {
+        return try createSparseEmbedderWithOptions(alloc, indexes_json, .{ .local_termite_provider = local_termite_provider });
+    }
+
+    pub fn createSparseEmbedderWithOptions(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+        options: InitOptions,
+    ) !?db_embedder.SparseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithLocalTermite(alloc, indexes_json, local_termite_provider);
+        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
         if (!owned.hasSparseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -525,7 +550,7 @@ pub const ManagedEmbedder = struct {
         embedding_template: []const u8,
     ) ![]f32 {
         const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        const rendered = try renderQueryTemplate(alloc, embedding_template, text);
+        const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, entry);
         defer alloc.free(rendered);
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
@@ -813,6 +838,7 @@ fn parseManagedEmbeddingEntry(
         null;
 
     return .{
+        .alloc = alloc,
         .index_name = try alloc.dupe(u8, index_name),
         .provider = provider,
         .model = try alloc.dupe(u8, embedder_cfg.model),
@@ -826,9 +852,11 @@ fn parseManagedEmbeddingEntry(
             .antfly => try alloc.dupe(u8, ""),
         },
         .api_key = switch (provider) {
-            .openai => try resolveOptionalConfigString(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+            .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
             .ollama, .termite, .antfly => null,
         },
+        .secret_store = options.secret_store,
+        .remote_content = options.remote_content,
         .dimensions = if (sparse) 0 else try resolveEmbeddingDimensions(cfg),
         .sparse = sparse,
         .multimodal = embedder_cfg.multimodal,
@@ -977,6 +1005,28 @@ fn renderQueryTemplate(
     defer active_query_template_render_context = prev_ctx;
 
     return try template_mod.renderDocumentWithHelpers(alloc, embedding_template, query_json, &extra_helpers);
+}
+
+fn renderQueryTemplateWithEntry(
+    alloc: std.mem.Allocator,
+    embedding_template: []const u8,
+    text: []const u8,
+    entry: *const ManagedEmbeddingEntry,
+) ![]const u8 {
+    if (comptime builtin.is_test) {
+        return try renderQueryTemplate(alloc, embedding_template, text);
+    }
+
+    var config: template_remote.RenderConfig = .{};
+    if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
+        config.remote_content = entry.remote_content;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
+        config.secret_store = entry.secret_store;
+    }
+    const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
+    defer alloc.free(query_json);
+    return try template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config);
 }
 
 fn validateRenderedTemplate(alloc: std.mem.Allocator, rendered: []const u8) !void {
@@ -1447,8 +1497,8 @@ fn embedBatchWithOpenAiCompatible(
     });
     defer alloc.free(json_body);
 
-    const auth_header = if (entry.api_key) |api_key|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key})
+    const auth_header = if (entry.api_key) |*api_key_ref|
+        try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)
     else
         null;
     defer if (auth_header) |value| alloc.free(value);
@@ -1496,6 +1546,20 @@ fn embedBatchWithOpenAiCompatible(
         initialized += 1;
     }
     return vectors;
+}
+
+fn optionalBearerAuthHeaderOwned(
+    entry: *ManagedEmbeddingEntry,
+    alloc: std.mem.Allocator,
+    api_key_ref: *const common_secrets.SecretValue,
+) !?[]u8 {
+    return entry.auth_header_cache.getOwned(entry.alloc, alloc, api_key_ref, entry.secret_store) catch |err| switch (err) {
+        error.SecretNotFound => switch (api_key_ref.*) {
+            .env_var => return null,
+            else => return err,
+        },
+        else => return err,
+    };
 }
 
 fn mapEmbedStatus(status: std.http.Status) anyerror {

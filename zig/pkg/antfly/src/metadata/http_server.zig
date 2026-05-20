@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const common_secrets = @import("../common/secrets.zig");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
 const metadata_admin = @import("admin.zig");
@@ -1366,8 +1367,9 @@ fn loadRestoreMetadataSpec(
     table_name: []const u8,
     location_uri: []const u8,
     backup_id: []const u8,
+    secret_store: ?*common_secrets.FileStore,
 ) !RestoreMetadataSpec {
-    var location = try backups_api.openBackupLocation(alloc, location_uri);
+    var location = try backups_api.openBackupLocationWithSecrets(alloc, location_uri, secret_store);
     defer location.deinit(alloc);
     var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
     defer manifest.deinit(alloc);
@@ -1387,12 +1389,21 @@ fn loadRestoreMetadataSpec(
     };
 }
 
+fn serviceSecretStore(service_impl: anytype) ?*common_secrets.FileStore {
+    const Ptr = @TypeOf(service_impl);
+    const Service = std.meta.Child(Ptr);
+    if (comptime @hasField(Service, "secret_store")) {
+        return service_impl.secret_store;
+    }
+    return null;
+}
+
 fn persistRestoreTableIntent(service_impl: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
     var snapshot = try service_impl.adminSnapshot();
     defer service_impl.freeAdminSnapshot(&snapshot);
     if (findTableByName(&snapshot, table_name) != null) return error.TableAlreadyExists;
 
-    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id);
+    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, serviceSecretStore(service_impl));
     defer spec.deinit(alloc);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);

@@ -16,6 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const backends = @import("backends/backends.zig");
 const model_manager_mod = @import("server/model_manager.zig");
+const gliner_mod = @import("pipelines/gliner.zig");
 const ner_mod = @import("pipelines/ner.zig");
 
 const print = std.debug.print;
@@ -32,10 +33,16 @@ const Options = struct {
     text: []const u8,
     schema_json: []const u8,
     backend: BackendChoice = .auto,
+    relation_labels: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+        self.relation_labels.deinit(allocator);
+    }
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    const opts = try parseArgs(args);
+    var opts = try parseArgs(allocator, args);
+    defer opts.deinit(allocator);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, opts.schema_json, .{});
     defer parsed.deinit();
@@ -57,19 +64,28 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         try schema_labels.append(allocator, entry.key_ptr.*);
     }
 
-    const entities = if (model.isGlinerModel()) blk: {
+    if (model.isGlinerModel()) {
         var gliner = model.glinerPipeline(allocator);
-        break :blk try gliner.recognizeBatch(&texts, schema_labels.items);
-    } else blk: {
+        if (opts.relation_labels.items.len > 0) {
+            const extracted = try gliner.extractRelationsBatch(&texts, schema_labels.items, opts.relation_labels.items);
+            defer freeEntities(allocator, extracted.entities);
+            defer freeRelations(allocator, extracted.relations);
+            try writeExtractJson(allocator, opts.model_dir, parsed.value.object, extracted.entities, extracted.relations);
+        } else {
+            const entities = try gliner.recognizeBatch(&texts, schema_labels.items);
+            defer freeEntities(allocator, entities);
+            try writeExtractJson(allocator, opts.model_dir, parsed.value.object, entities, null);
+        }
+    } else {
+        if (opts.relation_labels.items.len > 0) return error.RelationExtractionNotSupported;
         var pipeline = model.nerPipeline(allocator);
-        break :blk try pipeline.recognizeBatch(&texts);
-    };
-    defer freeEntities(allocator, entities);
-
-    try writeExtractJson(allocator, opts.model_dir, parsed.value.object, entities);
+        const entities = try pipeline.recognizeBatch(&texts);
+        defer freeEntities(allocator, entities);
+        try writeExtractJson(allocator, opts.model_dir, parsed.value.object, entities, null);
+    }
 }
 
-fn parseArgs(args: []const []const u8) !Options {
+fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
     if (args.len < 3) {
         printUsage();
         return error.InvalidArguments;
@@ -80,6 +96,7 @@ fn parseArgs(args: []const []const u8) !Options {
         .text = args[1],
         .schema_json = args[2],
     };
+    errdefer opts.deinit(allocator);
 
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -88,6 +105,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingBackendValue;
             opts.backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
+        } else if (std.mem.eql(u8, arg, "--relation-label")) {
+            i += 1;
+            if (i >= args.len) return error.MissingRelationLabelValue;
+            try opts.relation_labels.append(allocator, args[i]);
         } else {
             printUsage();
             return error.InvalidArguments;
@@ -102,6 +123,7 @@ fn writeExtractJson(
     model_name: []const u8,
     schema: std.json.ObjectMap,
     all_entities: []const []const ner_mod.Entity,
+    all_relations: ?[]const []const gliner_mod.Relation,
 ) !void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
@@ -143,6 +165,24 @@ fn writeExtractJson(
             try buf.append(allocator, ']');
         }
 
+        if (all_relations) |rels_by_text| {
+            const relations = if (ti < rels_by_text.len) rels_by_text[ti] else &.{};
+            try buf.appendSlice(allocator, ",\"relations\":[");
+            for (relations, 0..) |relation, ri| {
+                if (ri > 0) try buf.append(allocator, ',');
+                try buf.appendSlice(allocator, "{\"head\":");
+                try writeRelationEntityJson(&buf, allocator, relation.head);
+                try buf.appendSlice(allocator, ",\"tail\":");
+                try writeRelationEntityJson(&buf, allocator, relation.tail);
+                try buf.appendSlice(allocator, ",\"label\":");
+                try jsonEncodeString(&buf, allocator, relation.label);
+                const meta = try std.fmt.allocPrint(allocator, ",\"score\":{d}}}", .{relation.score});
+                defer allocator.free(meta);
+                try buf.appendSlice(allocator, meta);
+            }
+            try buf.append(allocator, ']');
+        }
+
         try buf.append(allocator, '}');
     }
     try buf.appendSlice(allocator, "]}\n");
@@ -158,6 +198,14 @@ fn freeEntities(allocator: std.mem.Allocator, all_entities: [][]ner_mod.Entity) 
     allocator.free(all_entities);
 }
 
+fn freeRelations(allocator: std.mem.Allocator, all_relations: [][]gliner_mod.Relation) void {
+    for (all_relations) |relations| {
+        for (relations) |*relation| relation.deinit(allocator);
+        allocator.free(relations);
+    }
+    allocator.free(all_relations);
+}
+
 fn labelMatchesSchema(label: []const u8, schema_name: []const u8) bool {
     if (label.len == 0 or schema_name.len == 0) return false;
     if (std.ascii.eqlIgnoreCase(label, schema_name)) return true;
@@ -165,6 +213,20 @@ fn labelMatchesSchema(label: []const u8, schema_name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(label[2..], schema_name)) return true;
     }
     return false;
+}
+
+fn writeRelationEntityJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, entity: ner_mod.Entity) !void {
+    try buf.appendSlice(allocator, "{\"text\":");
+    try jsonEncodeString(buf, allocator, entity.text);
+    try buf.appendSlice(allocator, ",\"label\":");
+    try jsonEncodeString(buf, allocator, entity.label);
+    const meta = try std.fmt.allocPrint(
+        allocator,
+        ",\"start\":{d},\"end\":{d},\"score\":{d}}}",
+        .{ entity.start, entity.end, entity.score },
+    );
+    defer allocator.free(meta);
+    try buf.appendSlice(allocator, meta);
 }
 
 fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -216,23 +278,41 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 
 fn printUsage() void {
     print(
-        \\usage: termite extract <model-dir> <text> <schema-json> [--backend auto|native|metal|mlx]
+        \\usage: termite extract <model-dir> <text> <schema-json> [--backend auto|native|metal|mlx] [--relation-label LABEL]...
         \\  Runs native local extraction and prints a JSON response to stdout.
         \\
     , .{});
 }
 
 test "parseArgs accepts schema json and backend" {
-    const opts = try parseArgs(&.{
+    var opts = try parseArgs(std.testing.allocator, &.{
         "/tmp/model",
         "John works at Google",
         "{\"person\":[\"name::str\"]}",
         "--backend",
         "native",
     });
+    defer opts.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("/tmp/model", opts.model_dir);
     try std.testing.expectEqualStrings("John works at Google", opts.text);
     try std.testing.expectEqualStrings("{\"person\":[\"name::str\"]}", opts.schema_json);
     try std.testing.expectEqual(BackendChoice.native, opts.backend);
+}
+
+test "parseArgs accepts repeated relation labels" {
+    var opts = try parseArgs(std.testing.allocator, &.{
+        "/tmp/model",
+        "John works at Google",
+        "{\"person\":[\"name::str\"]}",
+        "--relation-label",
+        "works_for",
+        "--relation-label",
+        "located_in",
+    });
+    defer opts.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), opts.relation_labels.items.len);
+    try std.testing.expectEqualStrings("works_for", opts.relation_labels.items[0]);
+    try std.testing.expectEqualStrings("located_in", opts.relation_labels.items[1]);
 }

@@ -49,6 +49,16 @@ pub const ForwardCtResult = struct {
     num_labels: usize,
 };
 
+pub const LabelMarkerTokens = struct {
+    classification: i64 = 0,
+    entity: i64,
+    relation: i64 = 0,
+
+    pub fn fromEntityToken(entity_token_id: i64) LabelMarkerTokens {
+        return .{ .entity = entity_token_id };
+    }
+};
+
 pub const ForwardProfile = struct {
     materialize_hidden_ns: u64 = 0,
     extract_words_ns: u64 = 0,
@@ -128,7 +138,22 @@ pub fn forwardCt(
     hidden_size: u32,
     entity_token_id: i64,
 ) !ForwardCtResult {
-    return forwardCtProfiled(cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, hidden_size, entity_token_id, null);
+    return forwardCtProfiledWithLabelMarkers(cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, hidden_size, LabelMarkerTokens.fromEntityToken(entity_token_id), null);
+}
+
+pub fn forwardCtWithLabelMarkers(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    hidden: CT,
+    input_ids: []const i64,
+    words_mask: []const i64,
+    span_idx: []const i64,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: u32,
+    label_markers: LabelMarkerTokens,
+) !ForwardCtResult {
+    return forwardCtProfiledWithLabelMarkers(cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, hidden_size, label_markers, null);
 }
 
 pub fn forwardCtProfiled(
@@ -144,10 +169,26 @@ pub fn forwardCtProfiled(
     entity_token_id: i64,
     profile: ?*ForwardProfile,
 ) !ForwardCtResult {
+    return forwardCtProfiledWithLabelMarkers(cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, hidden_size, LabelMarkerTokens.fromEntityToken(entity_token_id), profile);
+}
+
+pub fn forwardCtProfiledWithLabelMarkers(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    hidden: CT,
+    input_ids: []const i64,
+    words_mask: []const i64,
+    span_idx: []const i64,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: u32,
+    label_markers: LabelMarkerTokens,
+    profile: ?*ForwardProfile,
+) !ForwardCtResult {
     const H: usize = hidden_size;
 
     const num_words = countWords(words_mask);
-    const label_positions = try collectLabelPositions(allocator, input_ids, seq_len, entity_token_id);
+    const label_positions = try collectLabelPositions(allocator, input_ids, seq_len, label_markers);
     defer allocator.free(label_positions);
     const num_labels = label_positions.len;
 
@@ -207,7 +248,7 @@ pub fn forwardCtProfiled(
     if (profile) |p| p.extract_words_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
-    const label_result = try extractLabelEmbeddings(allocator, hidden_f32, input_ids, batch, seq_len, H, entity_token_id);
+    const label_result = try extractLabelEmbeddings(allocator, hidden_f32, input_ids, batch, seq_len, H, label_markers);
     defer allocator.free(label_result.embeddings);
     if (profile) |p| p.extract_labels_ns += profileElapsed(timer);
 
@@ -240,11 +281,11 @@ fn countWords(words_mask: []const i64) usize {
     return @intCast(max_word_id);
 }
 
-fn collectLabelPositions(allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize, entity_token_id: i64) ![]u32 {
+fn collectLabelPositions(allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize, label_markers: LabelMarkerTokens) ![]u32 {
     var label_positions = std.ArrayListUnmanaged(u32).empty;
     defer label_positions.deinit(allocator);
     for (0..@min(seq_len, input_ids.len)) |t| {
-        if (input_ids[t] == entity_token_id) {
+        if (isGlinerLabelMarkerToken(input_ids[t], label_markers)) {
             try label_positions.append(allocator, @intCast(t));
         }
     }
@@ -266,11 +307,26 @@ pub fn forward(
     hidden_size: u32,
     entity_token_id: i64,
 ) !ForwardResult {
+    return forwardWithLabelMarkers(cb, allocator, hidden_f32, input_ids, words_mask, span_idx, batch, seq_len, hidden_size, LabelMarkerTokens.fromEntityToken(entity_token_id));
+}
+
+pub fn forwardWithLabelMarkers(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    hidden_f32: []const f32,
+    input_ids: []const i64,
+    words_mask: []const i64,
+    span_idx: []const i64,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: u32,
+    label_markers: LabelMarkerTokens,
+) !ForwardResult {
     const total = batch * seq_len;
     const shape = [_]i32{ @intCast(total), @intCast(hidden_size) };
     const hidden = try cb.fromFloat32Shape(hidden_f32, &shape);
     defer cb.free(hidden);
-    const ct_result = try forwardCt(cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, hidden_size, entity_token_id);
+    const ct_result = try forwardCtWithLabelMarkers(cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, hidden_size, label_markers);
     defer cb.free(ct_result.logits);
     const logits_f32 = if (ct_result.num_labels == 0)
         try allocator.alloc(f32, 0)
@@ -374,19 +430,18 @@ fn extractLabelEmbeddings(
     batch: usize,
     seq_len: usize,
     H: usize,
-    entity_token_id: i64,
+    label_markers: LabelMarkerTokens,
 ) !LabelEmbResult {
     _ = batch;
-    // GLiNER2 uses [E] tokens to mark label positions in the input.
+    // GLiNER2 uses [E]/[C]/[R] tokens to mark label positions in the input.
     // Extract hidden states at those positions.
-    const E_TOKEN = entity_token_id;
 
     var label_positions = std.ArrayListUnmanaged(usize).empty;
     defer label_positions.deinit(allocator);
 
     // Only look at first batch item (labels are same across batch)
     for (0..seq_len) |t| {
-        if (input_ids[t] == E_TOKEN) {
+        if (isGlinerLabelMarkerToken(input_ids[t], label_markers)) {
             try label_positions.append(allocator, t);
         }
     }
@@ -403,6 +458,12 @@ fn extractLabelEmbeddings(
     }
 
     return .{ .embeddings = output, .num_labels = num_labels };
+}
+
+fn isGlinerLabelMarkerToken(token_id: i64, label_markers: LabelMarkerTokens) bool {
+    return token_id == label_markers.entity or
+        (label_markers.classification != 0 and token_id == label_markers.classification) or
+        (label_markers.relation != 0 and token_id == label_markers.relation);
 }
 
 const SpanInfo = struct {
@@ -1065,11 +1126,33 @@ test "extractLabelEmbeddings uses entity marker positions" {
     };
     const input_ids = [_]i64{ 7, 99, 5, 99 };
 
-    const result = try extractLabelEmbeddings(allocator, &hidden, &input_ids, 1, 4, 2, 99);
+    const result = try extractLabelEmbeddings(allocator, &hidden, &input_ids, 1, 4, 2, .{ .entity = 99 });
     defer allocator.free(result.embeddings);
 
     try std.testing.expectEqual(@as(usize, 2), result.num_labels);
     try std.testing.expectEqualSlices(f32, &.{ 2, 20, 4, 40 }, result.embeddings);
+}
+
+test "extractLabelEmbeddings accepts GLiNER classification and relation markers" {
+    const allocator = std.testing.allocator;
+    const hidden = [_]f32{
+        1, 10,
+        2, 20,
+        3, 30,
+        4, 40,
+        5, 50,
+    };
+    const input_ids = [_]i64{ 52, 7, 51, 8, 53 };
+
+    const result = try extractLabelEmbeddings(allocator, &hidden, &input_ids, 1, 5, 2, .{
+        .classification = 52,
+        .entity = 51,
+        .relation = 53,
+    });
+    defer allocator.free(result.embeddings);
+
+    try std.testing.expectEqual(@as(usize, 3), result.num_labels);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 10, 3, 30, 5, 50 }, result.embeddings);
 }
 
 test "collectLabelPositions mirrors first-batch label extraction" {
@@ -1079,7 +1162,7 @@ test "collectLabelPositions mirrors first-batch label extraction" {
         99, 8,  99, 9,
     };
 
-    const positions = try collectLabelPositions(allocator, &input_ids, 4, 99);
+    const positions = try collectLabelPositions(allocator, &input_ids, 4, .{ .entity = 99 });
     defer allocator.free(positions);
 
     try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, positions);

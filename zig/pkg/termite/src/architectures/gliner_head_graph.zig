@@ -83,12 +83,14 @@ const deberta_config = @import("../models/deberta.zig");
 
 /// Configuration for the GLiNER2 head graph.  Mirrors the runtime
 /// `gliner_head.zig` parameters and reuses `deberta_config.Config`'s
-/// hidden_size + entity_token_id fields directly.
+/// hidden size and GLiNER label-marker token ids directly.
 pub const Config = struct {
     /// DeBERTa hidden dim (H).  Span/label embeddings are sized H.
     hidden_size: u32,
-    /// Special token marking labels in the input prompt.
+    /// Special tokens marking labels in the input prompt.
+    classification_token_id: i64 = 0,
     entity_token_id: i64,
+    relation_token_id: i64 = 0,
     /// Downscaled-transformer hidden dim (D=128 in stock GLiNER2).
     downscaled_dim: u32 = 128,
     /// FFN inner dim of the downscaled transformer (D_FFN=256).
@@ -97,6 +99,24 @@ pub const Config = struct {
     downscaled_num_layers: u32 = 2,
     /// Number of attention heads in the mini-transformer (4).
     downscaled_num_heads: u32 = 4,
+};
+
+pub const LabelMarkerTokens = struct {
+    classification: i64 = 0,
+    entity: i64,
+    relation: i64 = 0,
+
+    fn fromEntityToken(entity_token_id: i64) LabelMarkerTokens {
+        return .{ .entity = entity_token_id };
+    }
+
+    fn fromConfig(config: Config) LabelMarkerTokens {
+        return .{
+            .classification = config.classification_token_id,
+            .entity = config.entity_token_id,
+            .relation = config.relation_token_id,
+        };
+    }
 };
 
 /// Result of `buildForwardGraph`.  All node IDs are graph placeholders
@@ -865,6 +885,19 @@ pub fn prepGlinerInputs(
     H: u32,
     entity_token_id: i64,
 ) !PreparedInputs {
+    return prepGlinerInputsWithLabelMarkers(allocator, input_ids, words_mask, span_idx, batch, seq_len, H, LabelMarkerTokens.fromEntityToken(entity_token_id));
+}
+
+pub fn prepGlinerInputsWithLabelMarkers(
+    allocator: std.mem.Allocator,
+    input_ids: []const i64,
+    words_mask: []const i64,
+    span_idx: []const i64,
+    batch: usize,
+    seq_len: usize,
+    H: u32,
+    label_markers: LabelMarkerTokens,
+) !PreparedInputs {
     // 1. Walk words_mask once to derive num_words + count valid tokens.
     var max_word_id: i64 = 0;
     var num_valid: usize = 0;
@@ -892,13 +925,13 @@ pub fn prepGlinerInputs(
         }
     }
 
-    // 3. Label positions: token offsets where input_ids == entity_token_id.
+    // 3. Label positions: token offsets where input_ids is a GLiNER label marker.
     //    Eager `extractLabelEmbeddings` only checks the first batch item
     //    (labels are shared across batch); we follow that.
     var label_pos: std.ArrayListUnmanaged(i64) = .empty;
     errdefer label_pos.deinit(allocator);
     for (0..seq_len) |t| {
-        if (input_ids[t] == entity_token_id) {
+        if (isGlinerLabelMarkerToken(input_ids[t], label_markers)) {
             try label_pos.append(allocator, @intCast(t));
         }
     }
@@ -961,6 +994,12 @@ pub fn prepGlinerInputs(
     };
 }
 
+fn isGlinerLabelMarkerToken(token_id: i64, label_markers: LabelMarkerTokens) bool {
+    return token_id == label_markers.entity or
+        (label_markers.classification != 0 and token_id == label_markers.classification) or
+        (label_markers.relation != 0 and token_id == label_markers.relation);
+}
+
 // ── Head-only graph executor ─────────────────────────────────────────
 //
 // Runs the GLiNER head as a graph, given an already-computed encoder
@@ -1007,7 +1046,7 @@ pub fn runHeadGraph(
     batch: usize,
     seq_len: usize,
 ) !HeadGraphResult {
-    var prep = try prepGlinerInputs(allocator, input_ids, words_mask, span_idx, batch, seq_len, config.hidden_size, config.entity_token_id);
+    var prep = try prepGlinerInputsWithLabelMarkers(allocator, input_ids, words_mask, span_idx, batch, seq_len, config.hidden_size, LabelMarkerTokens.fromConfig(config));
     errdefer prep.deinit(allocator);
 
     var graph = ml.graph.Graph.init(allocator);
@@ -1170,7 +1209,7 @@ pub fn runFullGraph(
     seq_len: usize,
     strategy: graph_runtime.Strategy,
 ) !FullGraphResult {
-    var prep = try prepGlinerInputs(allocator, input_ids, words_mask, span_idx, batch, seq_len, head_cfg.hidden_size, head_cfg.entity_token_id);
+    var prep = try prepGlinerInputsWithLabelMarkers(allocator, input_ids, words_mask, span_idx, batch, seq_len, head_cfg.hidden_size, LabelMarkerTokens.fromConfig(head_cfg));
     errdefer prep.deinit(allocator);
 
     var graph = ml.graph.Graph.init(allocator);
@@ -1403,4 +1442,26 @@ test "prepGlinerInputs derives the right index slices for a tiny case" {
     try std.testing.expectEqualSlices(i64, &.{ 0, 0 }, prep.start_indices);
     try std.testing.expectEqualSlices(i64, &.{ 0, 1 }, prep.end_indices);
     try std.testing.expectEqualSlices(i64, &.{0}, prep.pos_zero_indices);
+}
+
+test "prepGlinerInputs accepts GLiNER classification and relation markers" {
+    const allocator = std.testing.allocator;
+    const input_ids = [_]i64{ 52, 11, 51, 12, 53 };
+    const words_mask = [_]i64{ 0, 1, 0, 2, 0 };
+    const span_idx = [_]i64{ 0, 0, 0, 1 };
+
+    var prep = try prepGlinerInputsWithLabelMarkers(
+        allocator,
+        &input_ids,
+        &words_mask,
+        &span_idx,
+        1,
+        5,
+        4,
+        .{ .classification = 52, .entity = 51, .relation = 53 },
+    );
+    defer prep.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), prep.num_labels);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 2, 4 }, prep.label_positions);
 }

@@ -22,7 +22,7 @@ export interface paths {
          *     ## Models
          *
          *     Models are auto-discovered from `models_dir/embedders/` at startup.
-         *     Use the `/api/models` endpoint to list available models.
+         *     Use the `/ml/v1/models` endpoint to list available models.
          *
          *     - **Text-only models** (e.g., BAAI/bge-small-en-v1.5): Accept text strings
          *     - **Multimodal models** (e.g., CLIP): Accept text and images via data URIs
@@ -143,7 +143,7 @@ export interface paths {
          *     ## Models
          *
          *     Models are auto-discovered from `models_dir/generators/` at startup.
-         *     Use the `/api/models` endpoint to list available models.
+         *     Use the `/ml/v1/models` endpoint to list available models.
          *
          *     ## Streaming
          *
@@ -291,7 +291,7 @@ export interface paths {
          *     ## Models
          *
          *     Models are auto-discovered from `models_dir/readers/` at startup.
-         *     Use the `/api/models` endpoint to list available models.
+         *     Use the `/ml/v1/models` endpoint to list available models.
          *
          *     - **TrOCR**: Pure OCR for printed/handwritten text
          *     - **Donut**: Document understanding with structured output (receipts, forms)
@@ -329,7 +329,7 @@ export interface paths {
          *     ## Models
          *
          *     Models are auto-discovered from `models_dir/transcribers/` at startup.
-         *     Use the `/api/models` endpoint to list available models.
+         *     Use the `/ml/v1/models` endpoint to list available models.
          *
          *     - **Whisper**: OpenAI's Whisper models (multilingual, automatic language detection)
          *     - **Wav2Vec2**: Facebook's Wav2Vec 2.0 models (English-focused)

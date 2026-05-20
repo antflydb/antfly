@@ -5,6 +5,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.algebraic_index_config import AlgebraicIndexConfig
 from ...models.embeddings_index_config import EmbeddingsIndexConfig
 from ...models.error import Error
 from ...models.full_text_index_config import FullTextIndexConfig
@@ -16,7 +17,7 @@ def _get_kwargs(
     table_name: str,
     index_name: str,
     *,
-    body: Union["EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
+    body: Union["AlgebraicIndexConfig", "EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -29,6 +30,8 @@ def _get_kwargs(
     if isinstance(body, FullTextIndexConfig):
         _kwargs["json"] = body.to_dict()
     elif isinstance(body, EmbeddingsIndexConfig):
+        _kwargs["json"] = body.to_dict()
+    elif isinstance(body, GraphIndexConfig):
         _kwargs["json"] = body.to_dict()
     else:
         _kwargs["json"] = body.to_dict()
@@ -78,15 +81,15 @@ def sync_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: Union["EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
+    body: Union["AlgebraicIndexConfig", "EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
 ) -> Response[Union[Any, Error]]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (Union['EmbeddingsIndexConfig', 'FullTextIndexConfig', 'GraphIndexConfig']):
-            Configuration for an index
+        body (Union['AlgebraicIndexConfig', 'EmbeddingsIndexConfig', 'FullTextIndexConfig',
+            'GraphIndexConfig']): Configuration for an index
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -114,15 +117,15 @@ def sync(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: Union["EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
+    body: Union["AlgebraicIndexConfig", "EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
 ) -> Optional[Union[Any, Error]]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (Union['EmbeddingsIndexConfig', 'FullTextIndexConfig', 'GraphIndexConfig']):
-            Configuration for an index
+        body (Union['AlgebraicIndexConfig', 'EmbeddingsIndexConfig', 'FullTextIndexConfig',
+            'GraphIndexConfig']): Configuration for an index
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -145,15 +148,15 @@ async def asyncio_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: Union["EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
+    body: Union["AlgebraicIndexConfig", "EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
 ) -> Response[Union[Any, Error]]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (Union['EmbeddingsIndexConfig', 'FullTextIndexConfig', 'GraphIndexConfig']):
-            Configuration for an index
+        body (Union['AlgebraicIndexConfig', 'EmbeddingsIndexConfig', 'FullTextIndexConfig',
+            'GraphIndexConfig']): Configuration for an index
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -179,15 +182,15 @@ async def asyncio(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: Union["EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
+    body: Union["AlgebraicIndexConfig", "EmbeddingsIndexConfig", "FullTextIndexConfig", "GraphIndexConfig"],
 ) -> Optional[Union[Any, Error]]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (Union['EmbeddingsIndexConfig', 'FullTextIndexConfig', 'GraphIndexConfig']):
-            Configuration for an index
+        body (Union['AlgebraicIndexConfig', 'EmbeddingsIndexConfig', 'FullTextIndexConfig',
+            'GraphIndexConfig']): Configuration for an index
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
