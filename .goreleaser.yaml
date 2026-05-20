@@ -332,13 +332,13 @@ brews:
     install: |
       bin.install "antfly"
     service: |
-      run [opt_bin/"antfly", "--data-dir", var/"lib/antfly-zig", "swarm"]
+      run [opt_bin/"antfly", "swarm", "--data-dir", var/"lib/antfly"]
       keep_alive true
-      working_dir var/"lib/antfly-zig"
+      working_dir var/"lib/antfly"
       log_path var/"log/antfly.log"
       error_log_path var/"log/antfly.err.log"
     post_install: |
-      (var/"lib/antfly-zig").mkpath
+      (var/"lib/antfly").mkpath
     test: |
       system "#{bin}/antfly", "--help"
     caveats: |
