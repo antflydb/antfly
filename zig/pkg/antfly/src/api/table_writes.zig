@@ -15,6 +15,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const scraping = @import("antfly_scraping");
+const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const backups_api = @import("backups.zig");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -202,6 +204,8 @@ pub const ProvisionedTableWriteCache = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -449,6 +453,8 @@ pub const ProvisionedTableWriteCache = struct {
                 open_mode: ManagedDbOpenMode,
                 runtime: ?*db_mod.background_runtime.BackendRuntime,
                 local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+                secret_store: ?*common_secrets.FileStore,
+                remote_content: ?*const scraping.RemoteContentConfig,
             ) !OpenedDb {
                 var db = if (indexes_json) |managed_indexes_json|
                     try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
@@ -462,6 +468,8 @@ pub const ProvisionedTableWriteCache = struct {
                         open_mode,
                         runtime,
                         local_termite_provider,
+                        secret_store,
+                        remote_content,
                     )
                 else
                     try db_mod.DB.open(allocator, db_path, .{
@@ -503,6 +511,8 @@ pub const ProvisionedTableWriteCache = struct {
                 mode,
                 self.backend_runtime,
                 self.local_termite_provider,
+                self.secret_store,
+                self.remote_content,
             );
             const owned_db = try self.alloc.create(db_mod.DB);
             errdefer self.alloc.destroy(owned_db);
@@ -543,6 +553,8 @@ pub const ProvisionedTableWriteCache = struct {
             mode,
             self.backend_runtime,
             self.local_termite_provider,
+            self.secret_store,
+            self.remote_content,
         );
         errdefer opened.db.close();
         const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionActiveForTable(table_name);
@@ -2048,6 +2060,8 @@ pub const ProvisionedTableWriteSource = struct {
     raft_batcher: ?RaftBatcher = null,
     group_lsm_generation: ?table_reads.GroupLsmGenerationSource = null,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
@@ -2079,6 +2093,26 @@ pub const ProvisionedTableWriteSource = struct {
         self.local_termite_provider = provider;
         if (self.write_cache) |cache| cache.local_termite_provider = provider;
         if (self.startup_write_cache) |cache| cache.local_termite_provider = provider;
+        return self;
+    }
+
+    pub fn withSecretStore(
+        self: *ProvisionedTableWriteSource,
+        secret_store: ?*common_secrets.FileStore,
+    ) *ProvisionedTableWriteSource {
+        self.secret_store = secret_store;
+        if (self.write_cache) |cache| cache.secret_store = secret_store;
+        if (self.startup_write_cache) |cache| cache.secret_store = secret_store;
+        return self;
+    }
+
+    pub fn withRemoteContent(
+        self: *ProvisionedTableWriteSource,
+        remote_content: ?*const scraping.RemoteContentConfig,
+    ) *ProvisionedTableWriteSource {
+        self.remote_content = remote_content;
+        if (self.write_cache) |cache| cache.remote_content = remote_content;
+        if (self.startup_write_cache) |cache| cache.remote_content = remote_content;
         return self;
     }
 
@@ -2463,6 +2497,7 @@ pub const ProvisionedTableWriteSource = struct {
         _ = alloc;
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.local_termite_provider = self.local_termite_provider;
+        cache.remote_content = self.remote_content;
         const lsm_root_generation = self.lsmRootGeneration(group_id);
         if (mode == .status_only) {
             lockAtomic(&self.local_db_mutex);
@@ -2530,7 +2565,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(cache.alloc, path, value, cache.lsm_cache, cache.hbc_cache, lsm_root_generation, cache.resource_manager, mode, cache.backend_runtime, self.local_termite_provider)
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(cache.alloc, path, value, cache.lsm_cache, cache.hbc_cache, lsm_root_generation, cache.resource_manager, mode, cache.backend_runtime, self.local_termite_provider, self.secret_store, cache.remote_content)
         else
             try db_mod.DB.open(cache.alloc, path, .{
                 .lsm_cache = cache.lsm_cache,
@@ -2923,7 +2958,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
 
             uncached_db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntime(alloc, path, value, null, null, lsm_root_generation, null, startup_open_mode, self.backend_runtime)
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(alloc, path, value, null, null, lsm_root_generation, null, startup_open_mode, self.backend_runtime, self.local_termite_provider, self.secret_store, self.remote_content)
             else
                 try db_mod.DB.open(alloc, path, .{
                     .open_mode = .writer_no_replay,
@@ -3974,6 +4009,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .restore_repair,
                 self.source.backend_runtime,
                 self.source.local_termite_provider,
+                self.source.secret_store,
+                self.source.remote_content,
             );
             defer db.close();
 
@@ -4109,7 +4146,7 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntime(alloc, path, indexes_json, null, null, 0, null, .default, self.backend_runtime);
+            var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(alloc, path, indexes_json, null, null, 0, null, .default, self.backend_runtime, self.local_termite_provider, self.secret_store, self.remote_content);
             defer db.close();
             try applyLocalTableSchemaJson(alloc, &db, schema_json);
             std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
@@ -4951,6 +4988,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     foreground_derived_progress: bool = false,
 
     pub fn init(
@@ -4969,6 +5008,28 @@ pub const HostedProvisionedTableWriteSource = struct {
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableWriteSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableWriteSource {
         self.backend_runtime = backend_runtime;
+        return self;
+    }
+
+    pub fn withSecretStore(
+        self: *HostedProvisionedTableWriteSource,
+        secret_store: ?*common_secrets.FileStore,
+    ) *HostedProvisionedTableWriteSource {
+        self.secret_store = secret_store;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            cache.write_cache.secret_store = secret_store;
+        }
+        return self;
+    }
+
+    pub fn withRemoteContent(
+        self: *HostedProvisionedTableWriteSource,
+        remote_content: ?*const scraping.RemoteContentConfig,
+    ) *HostedProvisionedTableWriteSource {
+        self.remote_content = remote_content;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            cache.write_cache.remote_content = remote_content;
+        }
         return self;
     }
 
@@ -4998,6 +5059,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         const lsm_root_generation: u64 = 0;
         if (cache.write_cache.backend_runtime == null) cache.write_cache.backend_runtime = self.backend_runtime;
+        cache.write_cache.secret_store = self.secret_store;
+        cache.write_cache.remote_content = self.remote_content;
         if (mode == .status_only) {
             lockAtomic(&cache.mutex);
             defer cache.mutex.unlock();
@@ -5037,7 +5100,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntime(
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                 cache.write_cache.alloc,
                 path,
                 value,
@@ -5047,6 +5110,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 cache.write_cache.resource_manager,
                 mode,
                 cache.write_cache.backend_runtime,
+                cache.write_cache.local_termite_provider,
+                cache.write_cache.secret_store,
+                cache.write_cache.remote_content,
             )
         else
             try db_mod.DB.open(cache.write_cache.alloc, path, .{
@@ -6257,6 +6323,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntime(
         mode,
         backend_runtime,
         null,
+        null,
+        null,
     );
 }
 
@@ -6271,6 +6339,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
     mode: ManagedDbOpenMode,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
 ) !db_mod.DB {
     const EmbedderSet = struct {
         dense: ?db_embedder.DenseEmbedder = null,
@@ -6287,10 +6357,12 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
             allocator: std.mem.Allocator,
             raw_indexes_json: []const u8,
             local_provider: ?managed_embedder.LocalTermiteProvider,
+            store: ?*common_secrets.FileStore,
+            remote: ?*const scraping.RemoteContentConfig,
         ) !EmbedderSet {
             return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithLocalTermite(allocator, raw_indexes_json, local_provider),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithLocalTermite(allocator, raw_indexes_json, local_provider),
+                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
+                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
             };
         }
     }.run;
@@ -6298,7 +6370,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
     var embedders = if (mode == .startup_catch_up)
         EmbedderSet{}
     else
-        try createEmbedders(alloc, indexes_json, local_termite_provider);
+        try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
     errdefer embedders.deinit(alloc);
 
     const openDb = struct {
@@ -6313,6 +6385,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
             manager: ?*resource_manager_mod.ResourceManager,
             open_mode: ManagedDbOpenMode,
             runtime: ?*db_mod.background_runtime.BackendRuntime,
+            store: ?*common_secrets.FileStore,
+            remote: ?*const scraping.RemoteContentConfig,
         ) !db_mod.DB {
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,
@@ -6320,6 +6394,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                 .lsm_root_generation = root_generation,
                 .resource_manager = manager,
                 .backend_runtime = runtime,
+                .secret_store = store,
+                .remote_content = remote,
                 .enrichment = .{
                     .dense_embedder = dense,
                     .sparse_embedder = sparse,
@@ -6335,6 +6411,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                     }),
                 .default_async, .writer_no_replay => if (dense != null or sparse != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -6343,6 +6421,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .enrichment = .{
                             .dense_embedder = dense,
                             .sparse_embedder = sparse,
@@ -6361,6 +6441,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),
@@ -6370,6 +6452,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                     .lsm_root_generation = root_generation,
                     .resource_manager = manager,
                     .backend_runtime = runtime,
+                    .secret_store = store,
+                    .remote_content = remote,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
                     .ttl_cleanup = .{ .enabled = false },
@@ -6383,6 +6467,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .enrichment = .{
                             .dense_embedder = dense,
                             .sparse_embedder = sparse,
@@ -6400,6 +6486,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = true,
                         .ttl_cleanup = .{ .enabled = false },
@@ -6413,6 +6501,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .enrichment = .{
                             .dense_embedder = dense,
                             .sparse_embedder = sparse,
@@ -6430,6 +6520,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
+                        .secret_store = store,
+                        .remote_content = remote,
                         .open_mode = .status_only,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -6443,7 +6535,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
     var db = blk: {
         const dense = embedders.dense;
         const sparse = embedders.sparse;
-        const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime);
+        const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content);
         embedders.dense = null;
         embedders.sparse = null;
         break :blk opened;
@@ -6459,11 +6551,11 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
-        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider);
+        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
         db = blk: {
             const dense = embedders.dense;
             const sparse = embedders.sparse;
-            const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime);
+            const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content);
             embedders.dense = null;
             embedders.sparse = null;
             break :blk opened;

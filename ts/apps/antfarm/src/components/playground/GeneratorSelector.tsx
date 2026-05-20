@@ -15,6 +15,7 @@ import { useId } from "react";
 import { cn } from "@/lib/utils";
 
 export const GENERATOR_PROVIDER_DEFAULTS: Record<GeneratorProvider, string> = {
+  antfly: "gemma-3-1b-it",
   ollama: "llama3.3:70b",
   gemini: "gemini-2.5-flash",
   openai: "gpt-4.1",
@@ -28,6 +29,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Record<GeneratorProvider, string> = {
 };
 
 export const GENERATOR_PROVIDER_LABELS: Record<GeneratorProvider, string> = {
+  antfly: "Antfly (Local)",
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
   openai: "OpenAI",

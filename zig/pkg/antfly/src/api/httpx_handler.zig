@@ -1017,7 +1017,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi());
+        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store);
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -1026,7 +1026,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try cluster_api_http.handleClusterRestore(ctx.allocator, body_data, self.api_server.clusterApi());
+        var resp = try cluster_api_http.handleClusterRestore(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store);
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -1130,6 +1130,7 @@ pub const AntflyApiHandler = struct {
         defer arena_impl.deinit();
         const QueryBuilderGenerationRunner = struct {
             local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                 return .{
@@ -1149,10 +1150,10 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithLocalTermite(a, &client, chain, runner.local_termite_provider, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider };
+        var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
             error.InvalidQueryBuilderRequest => {
@@ -1255,6 +1256,7 @@ pub const AntflyApiHandler = struct {
 
         const RetrievalGenerationRunner = struct {
             local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -1274,10 +1276,10 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithLocalTermite(a, &client, chain, runner.local_termite_provider, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider };
+        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self.api_server,
@@ -1602,7 +1604,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableBackup(ctx.allocator, table_name, body_data, self.api_server.tableApi());
+        var resp = try public_table_http.handleTableBackup(ctx.allocator, table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store);
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -1611,7 +1613,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableRestore(ctx.allocator, table_name, body_data, self.api_server.tableApi());
+        var resp = try public_table_http.handleTableRestore(ctx.allocator, table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store);
         return respondOwnedApiResponse(ctx, &resp);
     }
 

@@ -7,6 +7,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
     from ..models.permission import Permission
 
 
@@ -23,14 +24,20 @@ class CreateApiKeyRequest:
             Example: 720h.
         permissions (Union[None, Unset, list['Permission']]): Optional permission scoping. Each permission must be a
             subset of the creator's permissions.
+        row_filter (Union['CreateApiKeyRequestRowFilterType0', None, Unset]): Per-table row filter. Keys are table names
+            (or '*' for all tables). Values are bleve query JSON objects. Documents must match this query to be visible
+            through this API key.
     """
 
     name: str
     expires_in: Union[Unset, str] = UNSET
     permissions: Union[None, Unset, list["Permission"]] = UNSET
+    row_filter: Union["CreateApiKeyRequestRowFilterType0", None, Unset] = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
+
         name = self.name
 
         expires_in = self.expires_in
@@ -47,6 +54,14 @@ class CreateApiKeyRequest:
         else:
             permissions = self.permissions
 
+        row_filter: Union[None, Unset, dict[str, Any]]
+        if isinstance(self.row_filter, Unset):
+            row_filter = UNSET
+        elif isinstance(self.row_filter, CreateApiKeyRequestRowFilterType0):
+            row_filter = self.row_filter.to_dict()
+        else:
+            row_filter = self.row_filter
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -58,11 +73,14 @@ class CreateApiKeyRequest:
             field_dict["expires_in"] = expires_in
         if permissions is not UNSET:
             field_dict["permissions"] = permissions
+        if row_filter is not UNSET:
+            field_dict["row_filter"] = row_filter
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
         from ..models.permission import Permission
 
         d = dict(src_dict)
@@ -92,10 +110,28 @@ class CreateApiKeyRequest:
 
         permissions = _parse_permissions(d.pop("permissions", UNSET))
 
+        def _parse_row_filter(data: object) -> Union["CreateApiKeyRequestRowFilterType0", None, Unset]:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                row_filter_type_0 = CreateApiKeyRequestRowFilterType0.from_dict(data)
+
+                return row_filter_type_0
+            except:  # noqa: E722
+                pass
+            return cast(Union["CreateApiKeyRequestRowFilterType0", None, Unset], data)
+
+        row_filter = _parse_row_filter(d.pop("row_filter", UNSET))
+
         create_api_key_request = cls(
             name=name,
             expires_in=expires_in,
             permissions=permissions,
+            row_filter=row_filter,
         )
 
         create_api_key_request.additional_properties = d

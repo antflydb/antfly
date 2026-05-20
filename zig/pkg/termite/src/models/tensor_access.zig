@@ -439,17 +439,27 @@ pub const OnnxInitializerAccess = struct {
     }
 };
 
+pub fn isOnnxInitializerAccess(access: TensorAccess) bool {
+    return access.vtable == &OnnxInitializerAccess.vtable;
+}
+
 fn inferInitializerExportName(
     allocator: std.mem.Allocator,
     graph: *const onnx_graph.proto.GraphProto,
     initializer_name: []const u8,
 ) !?[]const u8 {
     if (try inferPyTorchParameterExportName(allocator, initializer_name)) |name| return name;
+    if (try inferGlinerCountEmbedExportName(allocator, graph, initializer_name)) |name| return name;
     if (try inferDownsampleReductionExportName(allocator, graph, initializer_name)) |name| return name;
     const matmul_output = findMatMulOutputForInitializer(graph, initializer_name) orelse return null;
     const bias_name = findAddBiasForMatMulOutput(graph, matmul_output) orelse return null;
-    if (!std.mem.endsWith(u8, bias_name, ".bias")) return null;
-    return try std.fmt.allocPrint(allocator, "{s}.weight", .{bias_name[0 .. bias_name.len - ".bias".len]});
+    if (std.mem.endsWith(u8, bias_name, ".bias")) {
+        return try std.fmt.allocPrint(allocator, "{s}.weight", .{bias_name[0 .. bias_name.len - ".bias".len]});
+    }
+    if (std.mem.endsWith(u8, bias_name, "_bias")) {
+        return try std.fmt.allocPrint(allocator, "{s}_weight", .{bias_name[0 .. bias_name.len - "_bias".len]});
+    }
+    return null;
 }
 
 fn inferPyTorchParameterExportName(
@@ -486,6 +496,55 @@ fn inferDownsampleReductionExportName(
     const next_stage = findLayerNormBeforeStageForInput(graph, matmul_output) orelse return null;
     if (next_stage == 0) return null;
     return try std.fmt.allocPrint(allocator, "audio_encoder.layers.{d}.downsample.reduction.weight", .{next_stage - 1});
+}
+
+fn inferGlinerCountEmbedExportName(
+    allocator: std.mem.Allocator,
+    graph: *const onnx_graph.proto.GraphProto,
+    initializer_name: []const u8,
+) !?[]const u8 {
+    for (graph.nodes) |node| {
+        if (std.mem.eql(u8, node.op_type, "Expand")) {
+            if (node.inputs.len > 0 and node.outputs.len > 0 and
+                std.mem.eql(u8, node.inputs[0], initializer_name) and
+                expandOutputFeedsGlinerCountGru(graph, node.outputs[0]))
+            {
+                return try allocator.dupe(u8, "count_embed.pos_embedding.weight");
+            }
+        }
+
+        if (!std.mem.eql(u8, node.op_type, "GRU")) continue;
+        if (!nodeReferencesFragment(node, "count_embed")) continue;
+        if (node.inputs.len > 1 and std.mem.eql(u8, node.inputs[1], initializer_name)) {
+            return try allocator.dupe(u8, "count_embed.gru.weight_ih_l0");
+        }
+        if (node.inputs.len > 2 and std.mem.eql(u8, node.inputs[2], initializer_name)) {
+            return try allocator.dupe(u8, "count_embed.gru.weight_hh_l0");
+        }
+        if (node.inputs.len > 3 and std.mem.eql(u8, node.inputs[3], initializer_name)) {
+            return try allocator.dupe(u8, "count_embed.gru.bias");
+        }
+    }
+    return null;
+}
+
+fn expandOutputFeedsGlinerCountGru(graph: *const onnx_graph.proto.GraphProto, expand_output: []const u8) bool {
+    for (graph.nodes) |node| {
+        if (!std.mem.eql(u8, node.op_type, "GRU")) continue;
+        if (!nodeReferencesFragment(node, "count_embed")) continue;
+        if (node.inputs.len > 0 and std.mem.eql(u8, node.inputs[0], expand_output)) return true;
+    }
+    return false;
+}
+
+fn nodeReferencesFragment(node: onnx_graph.proto.NodeProto, fragment: []const u8) bool {
+    for (node.inputs) |input| {
+        if (std.mem.indexOf(u8, input, fragment) != null) return true;
+    }
+    for (node.outputs) |output| {
+        if (std.mem.indexOf(u8, output, fragment) != null) return true;
+    }
+    return false;
 }
 
 fn findLayerNormBeforeStageForInput(graph: *const onnx_graph.proto.GraphProto, input_name: []const u8) ?usize {
@@ -533,6 +592,51 @@ test "infers no-bias CLAP downsample reduction MatMul names" {
     try std.testing.expectEqualStrings("audio_encoder.layers.0.downsample.reduction.weight", name);
 }
 
+test "infers ONNX MatMul names with underscore bias" {
+    const allocator = std.testing.allocator;
+    var matmul_inputs = [_][]const u8{ "hidden", "onnx::MatMul_1" };
+    var matmul_outputs = [_][]const u8{"matmul_out"};
+    var add_inputs = [_][]const u8{ "matmul_out", "count_embed.transformer.transformer.layers.0.self_attn.in_proj_bias" };
+    var add_outputs = [_][]const u8{"add_out"};
+    var nodes = [_]onnx_graph.proto.NodeProto{
+        .{ .inputs = &matmul_inputs, .outputs = &matmul_outputs, .op_type = "MatMul" },
+        .{ .inputs = &add_inputs, .outputs = &add_outputs, .op_type = "Add" },
+    };
+    const graph = onnx_graph.proto.GraphProto{ .nodes = &nodes };
+    const name = try inferInitializerExportName(allocator, &graph, "onnx::MatMul_1") orelse return error.TestUnexpectedResult;
+    defer allocator.free(name);
+    try std.testing.expectEqualStrings("count_embed.transformer.transformer.layers.0.self_attn.in_proj_weight", name);
+}
+
+test "infers GLiNER count embedding ONNX helper names" {
+    const allocator = std.testing.allocator;
+    var expand_inputs = [_][]const u8{ "onnx::Expand_1", "shape" };
+    var expand_outputs = [_][]const u8{"/count_embed/Expand_output_0"};
+    var gru_inputs = [_][]const u8{ "/count_embed/Expand_output_0", "onnx::GRU_W", "onnx::GRU_R", "onnx::GRU_B", "", "h0" };
+    var gru_outputs = [_][]const u8{"/count_embed/gru/GRU_output_0"};
+    var nodes = [_]onnx_graph.proto.NodeProto{
+        .{ .inputs = &expand_inputs, .outputs = &expand_outputs, .op_type = "Expand" },
+        .{ .inputs = &gru_inputs, .outputs = &gru_outputs, .op_type = "GRU" },
+    };
+    const graph = onnx_graph.proto.GraphProto{ .nodes = &nodes };
+
+    const pos_name = try inferInitializerExportName(allocator, &graph, "onnx::Expand_1") orelse return error.TestUnexpectedResult;
+    defer allocator.free(pos_name);
+    try std.testing.expectEqualStrings("count_embed.pos_embedding.weight", pos_name);
+
+    const w_name = try inferInitializerExportName(allocator, &graph, "onnx::GRU_W") orelse return error.TestUnexpectedResult;
+    defer allocator.free(w_name);
+    try std.testing.expectEqualStrings("count_embed.gru.weight_ih_l0", w_name);
+
+    const r_name = try inferInitializerExportName(allocator, &graph, "onnx::GRU_R") orelse return error.TestUnexpectedResult;
+    defer allocator.free(r_name);
+    try std.testing.expectEqualStrings("count_embed.gru.weight_hh_l0", r_name);
+
+    const b_name = try inferInitializerExportName(allocator, &graph, "onnx::GRU_B") orelse return error.TestUnexpectedResult;
+    defer allocator.free(b_name);
+    try std.testing.expectEqualStrings("count_embed.gru.bias", b_name);
+}
+
 fn findMatMulOutputForInitializer(graph: *const onnx_graph.proto.GraphProto, initializer_name: []const u8) ?[]const u8 {
     for (graph.nodes) |node| {
         if (!std.mem.eql(u8, node.op_type, "MatMul")) continue;
@@ -548,10 +652,14 @@ fn findAddBiasForMatMulOutput(graph: *const onnx_graph.proto.GraphProto, matmul_
     for (graph.nodes) |node| {
         if (!std.mem.eql(u8, node.op_type, "Add")) continue;
         if (node.inputs.len < 2) continue;
-        if (std.mem.eql(u8, node.inputs[0], matmul_output) and std.mem.endsWith(u8, node.inputs[1], ".bias")) return node.inputs[1];
-        if (std.mem.eql(u8, node.inputs[1], matmul_output) and std.mem.endsWith(u8, node.inputs[0], ".bias")) return node.inputs[0];
+        if (std.mem.eql(u8, node.inputs[0], matmul_output) and isOnnxBiasInputName(node.inputs[1])) return node.inputs[1];
+        if (std.mem.eql(u8, node.inputs[1], matmul_output) and isOnnxBiasInputName(node.inputs[0])) return node.inputs[0];
     }
     return null;
+}
+
+fn isOnnxBiasInputName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".bias") or std.mem.endsWith(u8, name, "_bias");
 }
 
 pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.ModelManifest) !TensorAccess {

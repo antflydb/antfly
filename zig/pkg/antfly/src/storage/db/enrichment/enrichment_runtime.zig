@@ -18,6 +18,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -49,6 +50,12 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test o
     @import("../template_remote_stub.zig")
 else
     @import("../../../template_remote.zig");
+const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+    struct {
+        pub const RemoteContentConfig = opaque {};
+    }
+else
+    @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
@@ -60,6 +67,8 @@ pub const Config = struct {
     lease_ttl_ms: u64 = 30_000,
     dense_embedder: ?embedder_mod.DenseEmbedder = null,
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
@@ -624,7 +633,7 @@ fn getOrCreateRequestChunks(
     }
     defer runtime.alloc.free(raw.?);
 
-    const source_text = try extractSourceText(runtime.alloc, raw.?, request) orelse {
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw.?, request) orelse {
         const empty = try runtime.alloc.alloc(chunker_mod.Chunk, 0);
         try cache.append(runtime.alloc, .{
             .key = cache_key,
@@ -715,6 +724,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
+                .secret_store = config.secret_store,
+                .remote_content = config.remote_content,
                 .clock = config.clock,
             },
         };
@@ -1336,7 +1347,7 @@ fn collectPlainDenseBatchItem(
     };
     defer runtime.alloc.free(raw);
 
-    const source_text = try extractSourceText(runtime.alloc, raw, request) orelse return null;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return null;
     errdefer runtime.alloc.free(@constCast(source_text));
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
@@ -1938,7 +1949,7 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = renderSourceParts(runtime.alloc, raw, request) catch null;
+        const source_parts = renderSourceParts(runtime.alloc, runtime.config, raw, request) catch null;
         if (source_parts) |parts| {
             defer template.freeContentParts(runtime.alloc, parts);
 
@@ -1967,7 +1978,7 @@ fn processDenseEmbedding(
         }
     }
 
-    const source_text = try extractSourceText(runtime.alloc, raw, request) orelse return;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
     defer runtime.alloc.free(source_text);
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
@@ -2059,7 +2070,7 @@ fn processSparseEmbedding(
     };
     defer runtime.alloc.free(raw);
 
-    const source_text = try extractSourceText(runtime.alloc, raw, request) orelse return;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
     defer runtime.alloc.free(source_text);
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
@@ -2777,17 +2788,37 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
     try batch.commit();
 }
 
+fn remoteRenderConfig(
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) template_remote.RenderConfig {
+    var config: template_remote.RenderConfig = .{};
+    if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
+        config.secret_store = secret_store;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
+        config.remote_content = remote_content;
+    }
+    return config;
+}
+
 /// Extract the source text for an enrichment request from a document.
 /// If the request has a source_template, renders the full document through the
 /// Handlebars template. Otherwise, extracts the single source_field from the JSON.
 fn extractSourceText(
     alloc: Allocator,
+    config: Config,
     raw_doc: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
         // Render via Handlebars template
-        const rendered = template_remote.renderJsonToText(alloc, request.source_template, raw_doc) catch return null;
+        const rendered = template_remote.renderJsonToTextWithConfig(
+            alloc,
+            request.source_template,
+            raw_doc,
+            remoteRenderConfig(config.secret_store, config.remote_content),
+        ) catch return null;
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
@@ -2806,11 +2837,15 @@ fn extractSourceText(
 
 fn renderSourceParts(
     alloc: Allocator,
+    config: Config,
     raw_doc: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch return null;
+    const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch return null
+    else
+        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch return null;
     if (parts.len == 0) {
         template.freeContentParts(alloc, parts);
         return null;
@@ -2852,7 +2887,7 @@ test "extractSourceText with template renders all document fields" {
         .source_field = "body",
         .source_template = "{{title}} {{body}}",
     };
-    const result = try extractSourceText(alloc, doc, request) orelse return error.TestUnexpectedResult;
+    const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("Hello World", result);
 }
@@ -2866,7 +2901,7 @@ test "extractSourceText without template extracts single field" {
         .doc_key = "doc:1",
         .source_field = "body",
     };
-    const result = try extractSourceText(alloc, doc, request) orelse return error.TestUnexpectedResult;
+    const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("World", result);
 }
@@ -2880,7 +2915,7 @@ test "extractSourceText without template returns null for missing field" {
         .doc_key = "doc:1",
         .source_field = "body",
     };
-    const result = try extractSourceText(alloc, doc, request);
+    const result = try extractSourceText(alloc, .{}, doc, request);
     try std.testing.expect(result == null);
 }
 
@@ -2894,7 +2929,7 @@ test "extractSourceText with template skips _embeddings field" {
         .source_field = "title",
         .source_template = "{{title}}{{_embeddings}}",
     };
-    const result = try extractSourceText(alloc, doc, request) orelse return error.TestUnexpectedResult;
+    const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("Hello", result);
 }
@@ -2908,7 +2943,7 @@ test "extractSourceText with template and invalid JSON returns null" {
         .source_field = "body",
         .source_template = "{{body}}",
     };
-    const result = try extractSourceText(alloc, "not json", request);
+    const result = try extractSourceText(alloc, .{}, "not json", request);
     try std.testing.expect(result == null);
 }
 
@@ -2922,7 +2957,7 @@ test "extractSourceText with template and scrubHtml helper" {
         .source_field = "body",
         .source_template = "{{scrubHtml body}}",
     };
-    const result = try extractSourceText(alloc, doc, request) orelse return error.TestUnexpectedResult;
+    const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("HelloWorld", result);
 }

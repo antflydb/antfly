@@ -29,8 +29,10 @@ pub const Config = struct {
     max_position_embeddings: u32 = 512,
     position_buckets: u32 = 256,
     layer_norm_eps: f32 = 1e-7,
-    // GLiNER entity marker token ID (from added_tokens.json "[E]")
+    // GLiNER label marker token IDs (from added_tokens.json).
+    classification_token_id: i64 = 128004,
     entity_token_id: i64 = 128005,
+    relation_token_id: i64 = 128006,
     num_labels: u32 = 1,
 };
 

@@ -12,8 +12,7 @@ class LinearMergeRequestRecords:
     """Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}}
 
     Requirements:
-    - Keys must be sorted lexicographically by your client
-    - Server will process keys in sorted order
+    - The server processes keys in lexicographic order
     - Use consistent key naming (e.g., all start with same prefix)
 
     This format avoids duplicate IDs and matches Antfly's batch write interface.

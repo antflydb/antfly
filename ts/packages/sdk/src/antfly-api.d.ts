@@ -904,6 +904,62 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/users/{userName}/row-filters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The username. */
+                userName: components["parameters"]["UserNamePathParameter"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List row filters for a user
+         * @description Returns all row filter policies for the specified user.
+         */
+        get: operations["listRowFilters"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{userName}/row-filters/{table}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The username. */
+                userName: components["parameters"]["UserNamePathParameter"];
+                /** @description Table name (or '*' for all tables). */
+                table: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get row filter for a user on a table
+         * @description Returns the row filter policy for the specified user and table.
+         */
+        get: operations["getRowFilter"];
+        /**
+         * Set row filter for a user on a table
+         * @description Sets or replaces the row filter policy for the specified user and table. The request body is the bleve query JSON.
+         */
+        put: operations["setRowFilter"];
+        post?: never;
+        /**
+         * Remove row filter for a user on a table
+         * @description Removes the row filter policy for the specified user and table.
+         */
+        delete: operations["removeRowFilter"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/users/{userName}/api-keys": {
         parameters: {
             query?: never;
@@ -1051,7 +1107,7 @@ export interface components {
              *
              *     Use the internal `/reallocate` endpoint to trigger automatic shard splitting:
              *     ```bash
-             *     POST /_internal/v1/reallocate
+             *     POST /internal/v1/reallocate
              *     ```
              *
              *     This enqueues a reallocation request that the leader processes asynchronously, splitting
@@ -1748,6 +1804,17 @@ export interface components {
              * @example s3://mybucket/antfly-backups/users-table/2025-01-15
              */
             location: string;
+            /**
+             * @description Backup format to use:
+             *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
+             *     - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend)
+             *
+             *     On restore, the format is auto-detected from file magic bytes.
+             * @default portable
+             * @example portable
+             * @enum {string}
+             */
+            format?: "native" | "portable";
         };
         RestoreRequest: components["schemas"]["BackupRequest"];
         ClusterBackupRequest: {
@@ -1766,6 +1833,17 @@ export interface components {
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
              */
             location: string;
+            /**
+             * @description Backup format to use:
+             *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
+             *     - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend)
+             *
+             *     On restore, the format is auto-detected from file magic bytes.
+             * @default portable
+             * @example portable
+             * @enum {string}
+             */
+            format?: "native" | "portable";
             /**
              * @description Optional list of tables to backup. If omitted, all tables are backed up.
              * @example [
@@ -1890,6 +1968,12 @@ export interface components {
              * @example v1.0.0
              */
             antfly_version?: string;
+            /**
+             * @description Backup format used
+             * @example portable
+             * @enum {string}
+             */
+            format?: "native" | "portable";
         };
         BackupListResponse: {
             /** @description List of available backups */
@@ -3287,6 +3371,12 @@ export interface components {
          * @description Linear merge operation for syncing sorted records from external sources.
          *     Use this to keep Antfly in sync with an external database or data source.
          *
+         *     Requests may be sent as plain JSON or gzip-compressed JSON
+         *     (`Content-Encoding: gzip`).
+         *
+         *     Request bodies are limited to 64 MiB after decompression. Requests that
+         *     exceed this limit return HTTP 413.
+         *
          *     **How it works:**
          *     1. Send sorted records from your external source
          *     2. Server upserts records that exist in your batch
@@ -3300,8 +3390,7 @@ export interface components {
              * @description Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}}
              *
              *     Requirements:
-             *     - Keys must be sorted lexicographically by your client
-             *     - Server will process keys in sorted order
+             *     - The server processes keys in lexicographic order
              *     - Use consistent key naming (e.g., all start with same prefix)
              *
              *     This format avoids duplicate IDs and matches Antfly's batch write interface.
@@ -4285,6 +4374,8 @@ export interface components {
             path?: string[];
             /** @description Edges in path from start to this node */
             path_edges?: components["schemas"]["PathEdge"][];
+            /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
+            provenance?: string[];
             /** @description Connected edges (when include_edges=true) */
             edges?: components["schemas"]["Edge"][];
         };
@@ -4625,7 +4716,7 @@ export interface components {
          * @description The generative AI provider to use.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "anthropic" | "cohere" | "termite" | "mock";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "anthropic" | "cohere" | "termite" | "antfly" | "mock";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -6119,11 +6210,16 @@ export interface components {
             /** @description Maximum number of edges per document (0 = unlimited) */
             max_edges_per_document?: number;
         };
+        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicIndexConfig: {
+            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            derive_from_schema?: boolean;
+        };
         /**
          * @description The type of the index.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph";
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -6144,7 +6240,7 @@ export interface components {
              *     ]
              */
             enrichments?: string[];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"]);
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */
@@ -6161,10 +6257,10 @@ export interface components {
          * @description Field type annotations for schema fields
          * @enum {string}
          */
-        "schemas-AntflyType": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
         /** @description Field mapping to apply when a dynamic template matches */
         TemplateFieldMapping: {
-            type?: components["schemas"]["schemas-AntflyType"];
+            type?: components["schemas"]["AntflyType-2"];
             /**
              * @description Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer").
              *     Used for text fields to control tokenization and normalization.
@@ -6258,6 +6354,11 @@ export interface components {
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
         };
         FullTextIndexStats: {
+            /**
+             * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            index_type: "full_text";
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -6285,6 +6386,11 @@ export interface components {
         };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
+            /**
+             * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            index_type: "embeddings";
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -6327,6 +6433,11 @@ export interface components {
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {
+            /**
+             * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            index_type: "graph";
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -6350,9 +6461,103 @@ export interface components {
              * @description Number of edges indexed during current rebuild
              */
             backfill_items_processed?: number;
+            /** @description Algebraic graph execution health for bounded semiring traversal. */
+            algebraic_graph?: {
+                traversal?: {
+                    /** Format: uint64 */
+                    attempted?: number;
+                    /** Format: uint64 */
+                    proven?: number;
+                    /** Format: uint64 */
+                    rejected?: number;
+                    /** Format: uint64 */
+                    fallback?: number;
+                    /** Format: uint64 */
+                    result_nodes?: number;
+                };
+            };
+        };
+        /** @description Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics. */
+        AlgebraicIndexStats: {
+            /**
+             * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            index_type: "algebraic";
+            /** @description Error message if stats could not be retrieved */
+            error?: string;
+            /**
+             * Format: uint64
+             * @description Number of documents reflected in the algebraic sidecar
+             */
+            total_indexed?: number;
+            /**
+             * Format: uint64
+             * @description Size of the index in bytes
+             */
+            disk_usage?: number;
+            /** @description Whether the sidecar is currently rebuilding */
+            rebuilding?: boolean;
+            /**
+             * Format: double
+             * @description Backfill progress as a ratio from 0.0 to 1.0
+             */
+            backfill_progress?: number;
+            /**
+             * Format: uint64
+             * @description Number of documents processed during current backfill
+             */
+            backfill_items_processed?: number;
+            healthy?: boolean;
+            /** Format: uint64 */
+            parse_error_count?: number;
+            /** Format: uint64 */
+            schema_version?: number;
+            /** @description Schema-derived algebraic capability lifecycle, for example current, stale, or rebuild_required. */
+            capability_lifecycle_status?: string;
+            /** Format: uint64 */
+            planner_selected?: number;
+            /** Format: uint64 */
+            planner_fallback_count?: number;
+            /** @enum {string} */
+            planner_last_decision?: "selected" | "fallback";
+            planner_last_fallback_reason?: string;
+            /**
+             * Format: uint64
+             * @description Latest algebraic planner scan-row estimate for the last selected or fallback decision.
+             */
+            planner_last_estimated_scan_rows?: number;
+            /**
+             * Format: uint64
+             * @description Latest algebraic planner result-bucket estimate for the last selected or fallback decision.
+             */
+            planner_last_estimated_result_buckets?: number;
+            planner_lifecycle_ready?: boolean;
+            planner_lifecycle_blocking_reason?: string;
+            /** Format: uint64 */
+            adaptive_progress_count?: number;
+            /**
+             * Format: uint64
+             * @description Number of currently recommended algebraic shapes.
+             */
+            recommendation_count?: number;
+            /** Format: uint64 */
+            adaptive_backfilling_count?: number;
+            /** Format: uint64 */
+            adaptive_ready_count?: number;
+            /** Format: uint64 */
+            adaptive_stale_count?: number;
+            /** Format: uint64 */
+            adaptive_cleanup_recommended_count?: number;
+            last_error_reason?: string;
+            active_progress_lifecycle?: string;
+            /** Format: uint64 */
+            active_progress_rows_processed?: number;
+            /** Format: uint64 */
+            active_progress_target_rows?: number;
         };
         /** @description Statistics for an index */
-        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"];
+        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
         User: {
             /** @example johndoe */
             username: string;
@@ -6428,6 +6633,10 @@ export interface components {
             username: string;
             /** @description Optional permission scoping. If empty, inherits owner's full permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
+            /** @description Per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects. Documents must match this query to be visible through this API key. */
+            row_filter?: {
+                [key: string]: unknown;
+            } | null;
             /**
              * Format: date-time
              * @description When the API key was created.
@@ -6452,6 +6661,25 @@ export interface components {
              */
             encoded: string;
         };
+        /** @description A row filter policy for a user on a specific table. */
+        RowFilterEntry: {
+            /**
+             * @description Table name (or '*' for all tables).
+             * @example orders
+             */
+            table: string;
+            /**
+             * @description Bleve query JSON that documents must match to be visible.
+             * @example {
+             *       "term": {
+             *         "department": "engineering"
+             *       }
+             *     }
+             */
+            filter: {
+                [key: string]: unknown;
+            };
+        };
         /** @description Request to create a new API key. */
         CreateApiKeyRequest: {
             /**
@@ -6466,6 +6694,10 @@ export interface components {
             expires_in?: string;
             /** @description Optional permission scoping. Each permission must be a subset of the creator's permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
+            /** @description Per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects. Documents must match this query to be visible through this API key. */
+            row_filter?: {
+                [key: string]: unknown;
+            } | null;
         };
     };
     responses: {
@@ -6478,8 +6710,26 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Request body exceeds the configured size limit */
+        PayloadTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description Resource not found */
         NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Unsupported request media or content encoding */
+        UnsupportedMediaType: {
             headers: {
                 [name: string]: unknown;
             };
@@ -7175,6 +7425,8 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
+            415: components["responses"]["UnsupportedMediaType"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -7896,6 +8148,190 @@ export interface operations {
                 };
             };
             /** @description User not found or Role not found for the given resource */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listRowFilters: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The username. */
+                userName: components["parameters"]["UserNamePathParameter"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowFilterEntry"][];
+                };
+            };
+            /** @description User not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getRowFilter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The username. */
+                userName: components["parameters"]["UserNamePathParameter"];
+                /** @description Table name (or '*' for all tables). */
+                table: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowFilterEntry"];
+                };
+            };
+            /** @description User or row filter not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    setRowFilter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The username. */
+                userName: components["parameters"]["UserNamePathParameter"];
+                /** @description Table name (or '*' for all tables). */
+                table: string;
+            };
+            cookie?: never;
+        };
+        /** @description Bleve query JSON for filtering documents */
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Row filter set successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowFilterEntry"];
+                };
+            };
+            /** @description Bad Request (e.g., invalid filter JSON) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description User not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    removeRowFilter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The username. */
+                userName: components["parameters"]["UserNamePathParameter"];
+                /** @description Table name (or '*' for all tables). */
+                table: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Row filter removed successfully */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description User or row filter not found */
             404: {
                 headers: {
                     [name: string]: unknown;

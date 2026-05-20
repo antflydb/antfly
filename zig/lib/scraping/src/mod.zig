@@ -38,6 +38,11 @@ pub const DownloadOutcome = union(enum) {
     http_error: HttpError,
 };
 
+pub const HTTPHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const ContentSecurityConfig = struct {
     allowed_hosts: ?[]const []u8 = null,
     block_private_ips: ?bool = null,
@@ -163,6 +168,16 @@ pub fn downloadContentOutcomeAlloc(
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadOutcome {
+    return try downloadContentOutcomeAllocWithHeaders(alloc, uri, security, s3_credentials, null);
+}
+
+pub fn downloadContentOutcomeAllocWithHeaders(
+    alloc: Allocator,
+    uri: []const u8,
+    security: ?*const ContentSecurityConfig,
+    s3_credentials: ?*const S3CredentialsConfig,
+    http_headers: ?[]const HTTPHeader,
+) !DownloadOutcome {
     if (std.mem.startsWith(u8, uri, "data:")) {
         return .{ .ok = try parseDataUriAlloc(alloc, uri) };
     }
@@ -170,7 +185,7 @@ pub fn downloadContentOutcomeAlloc(
     const parsed = try std.Uri.parse(uri);
     if (std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https")) {
         try validateUrlSecurity(parsed, security);
-        return try downloadHttpOutcomeAlloc(alloc, parsed, security);
+        return try downloadHttpOutcomeAlloc(alloc, parsed, security, http_headers);
     }
     if (std.mem.eql(u8, parsed.scheme, "file")) {
         const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
@@ -244,6 +259,7 @@ fn downloadHttpOutcomeAlloc(
     alloc: Allocator,
     uri: std.Uri,
     security: ?*const ContentSecurityConfig,
+    http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -254,14 +270,22 @@ fn downloadHttpOutcomeAlloc(
     };
     defer client.deinit();
 
-    var headers: [1]std.http.Header = .{.{
+    var headers = std.ArrayListUnmanaged(std.http.Header).empty;
+    defer headers.deinit(alloc);
+    try headers.append(alloc, .{
         .name = "User-Agent",
         .value = if (security) |cfg| cfg.user_agent orelse "AntflyDB/1.0" else "AntflyDB/1.0",
-    }};
+    });
+    if (http_headers) |extra_headers| {
+        for (extra_headers) |header| {
+            if (header.name.len == 0) continue;
+            try headers.append(alloc, .{ .name = header.name, .value = header.value });
+        }
+    }
 
     var request = try std.http.Client.request(&client, .GET, uri, .{
         .keep_alive = false,
-        .extra_headers = &headers,
+        .extra_headers = headers.items,
     });
     defer request.deinit();
 

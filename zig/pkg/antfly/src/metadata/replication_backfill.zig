@@ -58,6 +58,7 @@ pub const SnapshotBackfillRunner = struct {
     alloc: Allocator,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
 
     pub fn runTableSource(
@@ -125,14 +126,18 @@ pub const SnapshotBackfillRunner = struct {
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
         defer parsed.deinit(self.alloc);
 
-        const resolved_dsn = try secrets.resolveReferenceOwned(self.alloc, null, parsed.dsn);
-        defer self.alloc.free(resolved_dsn);
+        var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
+        defer resolved_dsn.deinit(self.alloc);
+        std.log.info(
+            "metadata cdc snapshot dsn resolved table={s} source={d} secret_generation={d} secret_source={s}",
+            .{ table.name, source_ordinal, resolved_dsn.cacheGeneration(), @tagName(resolved_dsn.source) },
+        );
 
         const phase_snapshot = "snapshot";
         const phase_complete = "cutover_prepared";
         const config = foreign_mod.Config{
             .kind = .postgres,
-            .dsn = try self.alloc.dupe(u8, resolved_dsn),
+            .dsn = try self.alloc.dupe(u8, resolved_dsn.value),
         };
         var source = try self.registry.create(self.alloc, config);
         defer source.deinit(self.alloc);
@@ -512,6 +517,7 @@ pub const StreamingReplicationRunner = struct {
     alloc: Allocator,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
 
     pub fn runTableSourceFromCheckpoint(
@@ -582,12 +588,16 @@ pub const StreamingReplicationRunner = struct {
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
         defer parsed.deinit(self.alloc);
 
-        const resolved_dsn = try secrets.resolveReferenceOwned(self.alloc, null, parsed.dsn);
-        defer self.alloc.free(resolved_dsn);
+        var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
+        defer resolved_dsn.deinit(self.alloc);
+        std.log.info(
+            "metadata cdc stream dsn resolved table={s} source={d} secret_generation={d} secret_source={s}",
+            .{ table.name, source_ordinal, resolved_dsn.cacheGeneration(), @tagName(resolved_dsn.source) },
+        );
 
         const config = foreign_mod.Config{
             .kind = .postgres,
-            .dsn = try self.alloc.dupe(u8, resolved_dsn),
+            .dsn = try self.alloc.dupe(u8, resolved_dsn.value),
         };
         var source = try self.registry.create(self.alloc, config);
         defer source.deinit(self.alloc);
