@@ -160,6 +160,16 @@ type ModelSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
+	// Tasks declares the model tasks to write into the pulled model manifest.
+	// For example: ["embed"].
+	// +optional
+	Tasks []string `json:"tasks,omitempty"`
+
+	// Capabilities declares modality/runtime capabilities to write into the
+	// pulled model manifest. For example: ["text", "image", "audio"].
+	// +optional
+	Capabilities []string `json:"capabilities,omitempty"`
+
 	// Priority determines loading order and eviction priority
 	// +kubebuilder:validation:Enum=high;medium;low
 	// +kubebuilder:default=medium

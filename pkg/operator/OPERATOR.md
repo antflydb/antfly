@@ -86,11 +86,14 @@ models:
   preload:
     - name: BAAI/bge-small-en-v1.5:i8
     - name: hf:antflydb/clipclap:gguf:Q4_K
+      tasks: ["embed"]
+      capabilities: ["text", "image", "audio"]
 ```
 
 The operator should not synthesize a separate model `variant` field. The Zig
 runtime contract is `/antfly termite pull <model-ref> --models-dir /models`,
-with optional task or capability flags added by future API fields when needed.
+with `--tasks` and `--capabilities` added when the model preload spec declares
+them.
 
 ## Storage Resize
 

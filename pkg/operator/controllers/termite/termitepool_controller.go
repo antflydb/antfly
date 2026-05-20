@@ -401,19 +401,25 @@ func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *
 		image = pool.Spec.Image
 	}
 
-	modelRefs := make([]string, 0, len(pool.Spec.Models.Preload))
-	for _, m := range pool.Spec.Models.Preload {
-		modelRefs = append(modelRefs, m.Name)
-	}
-	slices.Sort(modelRefs)
+	preloadModels := slices.Clone(pool.Spec.Models.Preload)
+	slices.SortFunc(preloadModels, func(a, b antflyaiv1alpha1.ModelSpec) int {
+		return strings.Compare(a.Name, b.Name)
+	})
 
-	initContainers := make([]corev1.Container, 0, len(modelRefs))
-	for i, ref := range modelRefs {
+	initContainers := make([]corev1.Container, 0, len(preloadModels))
+	for i, model := range preloadModels {
+		args := []string{"termite", "pull", model.Name, "--models-dir", "/models"}
+		if len(model.Tasks) > 0 {
+			args = append(args, "--tasks", strings.Join(model.Tasks, ","))
+		}
+		if len(model.Capabilities) > 0 {
+			args = append(args, "--capabilities", strings.Join(model.Capabilities, ","))
+		}
 		initContainers = append(initContainers, corev1.Container{
 			Name:    fmt.Sprintf("model-puller-%d", i),
 			Image:   image,
 			Command: []string{"/antfly"},
-			Args:    []string{"termite", "pull", ref, "--models-dir", "/models"},
+			Args:    args,
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "models", MountPath: "/models"},
 			},

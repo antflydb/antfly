@@ -105,6 +105,13 @@ spec:
                 items:
                   description: ModelSpec defines a single model to load
                   properties:
+                    capabilities:
+                      description: |-
+                        Capabilities declares modality/runtime capabilities to write into the
+                        pulled model manifest. For example: ["text", "image", "audio"].
+                      items:
+                        type: string
+                      type: array
                     name:
                       description: |-
                         Name is the model reference, including an optional tag/variant suffix
@@ -129,6 +136,13 @@ spec:
                       - lazy
                       - bounded
                       type: string
+                    tasks:
+                      description: |-
+                        Tasks declares the model tasks to write into the pulled model manifest.
+                        For example: ["embed"].
+                      items:
+                        type: string
+                      type: array
                   required:
                   - name
                   type: object

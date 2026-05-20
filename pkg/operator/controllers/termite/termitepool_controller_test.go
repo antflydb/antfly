@@ -49,8 +49,10 @@ var _ = Describe("TermitePool Controller", func() {
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
-								Name:     "bge-small-en-v1.5",
-								Priority: antflyaiv1alpha1.ModelPriorityHigh,
+								Name:         "bge-small-en-v1.5",
+								Tasks:        []string{"embed"},
+								Capabilities: []string{"text"},
+								Priority:     antflyaiv1alpha1.ModelPriorityHigh,
 							},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
@@ -120,6 +122,7 @@ var _ = Describe("TermitePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
 				"termite", "pull", "bge-small-en-v1.5", "--models-dir", "/models",
+				"--tasks", "embed", "--capabilities", "text",
 			}))
 
 			// Verify TPU node selector
