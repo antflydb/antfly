@@ -31,6 +31,12 @@ type Principal struct {
 	RowFilter         map[string]json.RawMessage
 }
 
+type TableAccess struct {
+	Table     string
+	Alias     string
+	Operation OperationKind
+}
+
 type Authenticator interface {
 	Authenticate(r *http.Request) (*Principal, error)
 }
@@ -95,6 +101,35 @@ func (TenantAuthorizer) Authorize(principal *Principal, req RequestContext, rout
 	}
 	if !allowsOperation(principal.AllowedOperations, req.Operation) {
 		return fmt.Errorf("principal %q cannot perform operation %q", principal.Subject, req.Operation)
+	}
+	return nil
+}
+
+func authorizeTableAccesses(principal *Principal, req RequestContext, accesses []TableAccess) error {
+	if principal == nil {
+		return fmt.Errorf("missing principal")
+	}
+	if principal.Admin {
+		return nil
+	}
+	if !allowsOperation(principal.AllowedOperations, req.Operation) {
+		return fmt.Errorf("principal %q cannot perform operation %q", principal.Subject, req.Operation)
+	}
+	for _, access := range accesses {
+		table := strings.TrimSpace(access.Table)
+		if table == "" {
+			continue
+		}
+		if len(principal.AllowedTables) > 0 && !allowsResource(principal.AllowedTables, table) {
+			return fmt.Errorf("principal %q cannot access table %q", principal.Subject, table)
+		}
+		op := access.Operation
+		if op == "" {
+			op = req.Operation
+		}
+		if !allowsOperation(principal.AllowedOperations, op) {
+			return fmt.Errorf("principal %q cannot perform operation %q on table %q", principal.Subject, op, table)
+		}
 	}
 	return nil
 }

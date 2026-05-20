@@ -778,7 +778,11 @@ test "entity cleanup head learns simple cleanup task" {
     var eval = try cloneCachedSummary(allocator, &train);
     defer freeCachedSummary(allocator, &eval);
 
-    const out_dir = "/tmp/entity-cleanup-head-test";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "entity-cleanup-head-test" });
+    defer allocator.free(out_dir);
+
     const summary = try trainEvalCached(allocator, &train, &eval, out_dir, .{
         .epochs = 20,
         .learning_rate = 0.1,

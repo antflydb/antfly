@@ -17,6 +17,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -382,5 +383,124 @@ func TestGatewayServeHTTPProxyForwardRoutesServerlessWritesToAPI(t *testing.T) {
 	}
 	if rec.Body.String() != `{"accepted":1}` {
 		t.Fatalf("unexpected body %q", rec.Body.String())
+	}
+}
+
+func TestGatewayDeniesJoinedTableOutsideScope(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("backend should not be called")
+	}))
+	defer backend.Close()
+
+	gateway := NewGateway(NewRouter([]NamespaceRoute{
+		{
+			Tenant:             "t1",
+			Table:              "orders",
+			Namespace:          "orders",
+			AllowServerless:    true,
+			ServerlessQueryURL: backend.URL,
+			ServerlessAPIURL:   backend.URL,
+		},
+	}))
+	gateway.authenticator = StaticBearerAuthenticator{
+		Required: true,
+		Tokens: map[string]Principal{
+			"test-token": {
+				Subject:           "user-1",
+				Tenant:            "t1",
+				AllowedTables:     []string{"orders"},
+				AllowedOperations: []OperationKind{OperationRead},
+			},
+		},
+	}
+
+	body := `{"join":{"right_table":"customers","on":{"left_field":"customer_id","right_field":"id"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/tenants/t1/tables/orders/query/search", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	gateway.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("got status %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `cannot access table "customers"`) {
+		t.Fatalf("unexpected body %q", rec.Body.String())
+	}
+}
+
+func TestGatewayInjectsJoinedTableRowFilters(t *testing.T) {
+	var forwardedBody string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read forwarded body: %v", err)
+		}
+		forwardedBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"namespace":"orders","version":1,"view":"published","hit_count":0,"hits":[]}`))
+	}))
+	defer backend.Close()
+
+	gateway := NewGateway(NewRouter([]NamespaceRoute{
+		{
+			Tenant:             "t1",
+			Table:              "orders",
+			Namespace:          "orders",
+			AllowServerless:    true,
+			ServerlessQueryURL: backend.URL,
+			ServerlessAPIURL:   backend.URL,
+		},
+	}))
+	gateway.authenticator = StaticBearerAuthenticator{
+		Required: true,
+		Tokens: map[string]Principal{
+			"test-token": {
+				Subject:           "user-1",
+				Tenant:            "t1",
+				AllowedTables:     []string{"orders", "customers"},
+				AllowedOperations: []OperationKind{OperationRead},
+				RowFilter: map[string]json.RawMessage{
+					"orders":    json.RawMessage(`{"term":{"tenant_id":"t1"}}`),
+					"customers": json.RawMessage(`{"term":{"region":"na"}}`),
+				},
+			},
+		},
+	}
+
+	body := `{"filter_query":{"query":"status:pending"},"join":{"right_table":"customers","right_filters":{"filter_query":{"query":"tier:premium"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/tenants/t1/tables/orders/query/search", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	gateway.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got status %d body=%s", rec.Code, rec.Body.String())
+	}
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(forwardedBody), &parsed); err != nil {
+		t.Fatalf("parse forwarded body: %v body=%s", err, forwardedBody)
+	}
+	var primary map[string][]json.RawMessage
+	if err := json.Unmarshal(parsed["filter_query"], &primary); err != nil {
+		t.Fatalf("parse primary filter: %v", err)
+	}
+	if len(primary["conjuncts"]) != 2 {
+		t.Fatalf("expected primary conjunction, got %s", parsed["filter_query"])
+	}
+	var join map[string]json.RawMessage
+	if err := json.Unmarshal(parsed["join"], &join); err != nil {
+		t.Fatalf("parse join: %v", err)
+	}
+	var rightFilters map[string]json.RawMessage
+	if err := json.Unmarshal(join["right_filters"], &rightFilters); err != nil {
+		t.Fatalf("parse right filters: %v", err)
+	}
+	var right map[string][]json.RawMessage
+	if err := json.Unmarshal(rightFilters["filter_query"], &right); err != nil {
+		t.Fatalf("parse right conjunction: %v", err)
+	}
+	if len(right["conjuncts"]) != 2 {
+		t.Fatalf("expected right conjunction, got %s", rightFilters["filter_query"])
 	}
 }
