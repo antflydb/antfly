@@ -600,7 +600,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try ensureDefaultAdminUser(&user_manager.?);
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -1276,21 +1279,6 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
-fn ensureDefaultAdminUser(manager: *antfly.usermgr.UserManager) !void {
-    _ = manager.getUser("admin") catch |err| switch (err) {
-        error.UserNotFound => {
-            var admin_permission = [_]antfly.usermgr.Permission{
-                try antfly.usermgr.Permission.initOwned(manager.alloc, .@"*", "*", .admin),
-            };
-            defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
-            user.deinit(manager.alloc);
-            return;
-        },
-        else => return err,
-    };
-}
-
 fn resolveTermiteModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.termite_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.termite.models_dir;
@@ -1387,6 +1375,12 @@ const RecordingServer = struct {
 test "swarm runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "swarm runtime leaves auth disabled unless config or cli enables it" {
+    try std.testing.expect(!resolveAuthEnabled(.{}, null));
+    try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
+    try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {

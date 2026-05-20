@@ -191,6 +191,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating metadata runtime: %w", err)
 	}
 	metaRuntime.StartRaft()
+	metaRuntime.StartDefaultAdminSeed(ctx)
 	defer func() {
 		if err := metaRuntime.Close(); err != nil {
 			logger.Error("failed to close metadata runtime", zap.Error(err))

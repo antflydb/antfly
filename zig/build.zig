@@ -2936,6 +2936,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "metadata http cluster simulation serves public lifecycle from a non-host node after public create",
+            "metadata http cluster simulation seeds default admin for auth-enabled public api",
             "metadata http cluster simulation forwards public split flow from a non-host node after public create",
             "metadata http cluster simulation forwards public merge flow from a non-host node after public create",
         },
