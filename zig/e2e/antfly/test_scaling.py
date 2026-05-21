@@ -660,9 +660,51 @@ class MultiNodeScalingCluster:
             f"{self.debug_logs()}"
         )
 
-    def request_node_shutdown(self, node_id: int) -> None:
-        response = self.put_metadata(f"/internal/v1/nodes/{node_id}/shutdown", json_body={"type": "remove", "reason": "e2e"})
-        response.raise_for_status()
+    def request_node_shutdown(self, node_id: int, *, timeout_s: float = 30.0) -> None:
+        last_error: str | None = None
+
+        def intent_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
+            nonlocal last_error
+            try:
+                snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
+            except (AssertionError, requests.RequestException) as exc:
+                last_error = repr(exc)
+                return None
+            for snapshot in snapshots:
+                nodes = [node for node in snapshot.get("nodes", []) if isinstance(node, dict)]
+                stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
+                node_draining = any(
+                    int(node.get("node_id", 0)) == node_id and node.get("lifecycle") == "draining"
+                    for node in nodes
+                )
+                store_draining = any(
+                    int(store.get("node_id", 0)) == node_id and store.get("drain_requested") is True
+                    for store in stores
+                )
+                if not node_draining and not store_draining:
+                    return None
+            return snapshots[0]
+
+        def request_until_visible() -> dict[str, Any] | None:
+            nonlocal last_error
+            try:
+                response = self.put_metadata(
+                    f"/internal/v1/nodes/{node_id}/shutdown",
+                    json_body={"type": "remove", "reason": "e2e"},
+                )
+                response.raise_for_status()
+            except (AssertionError, requests.RequestException) as exc:
+                last_error = repr(exc)
+                return None
+            return intent_visible_on_all_metadata_nodes()
+
+        visible = wait_until(request_until_visible, timeout_s=timeout_s, interval_s=0.5)
+        assert visible is not None, (
+            f"node shutdown intent did not become visible on all metadata nodes for {node_id}: {last_error}\n"
+            f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
+            f"snapshot: {self.metadata_snapshot()}\n"
+            f"{self.debug_logs()}"
+        )
 
     def finalize_node_shutdown(self, node_id: int) -> None:
         response = self.delete_metadata(f"/internal/v1/nodes/{node_id}")

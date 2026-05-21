@@ -167,9 +167,10 @@ pub const Config = struct {
         }
         try resolveSecretReferencesInValue(alloc, &parsed_tree.value, secret_store, &replacement_strings);
         const root = switch (parsed_tree.value) {
-            .object => |object| object,
+            .object => |*object| object,
             else => return error.InvalidConfig,
         };
+        try applyCommonConfigDefaults(parsed_tree.arena.allocator(), root);
 
         var validated = try std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
             .allocate = .alloc_always,
@@ -194,8 +195,8 @@ pub const Config = struct {
             .registry = registry,
             .speech_to_text = speech_to_text,
             .text_to_speech = text_to_speech,
-            .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
-            .swarm_mode = try optionalBoolField(root, "swarm_mode") orelse false,
+            .auth_enabled = try optionalBoolField(root.*, "enable_auth") orelse false,
+            .swarm_mode = try optionalBoolField(root.*, "swarm_mode") orelse false,
             .health_port = if (validated.value.health_port) |value|
                 std.math.cast(u16, value) orelse return error.InvalidConfig
             else
@@ -207,7 +208,7 @@ pub const Config = struct {
                 .key = if (tls.key) |value| try alloc.dupe(u8, value) else null,
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
-            .metadata = try parseMetadataConfig(alloc, root, validated.value.metadata.orchestration_urls),
+            .metadata = try parseMetadataConfig(alloc, root.*, validated.value.metadata.orchestration_urls),
             .storage = .{
                 .local_base_dir = try alloc.dupe(u8, validated.value.storage.local.base_dir),
                 .data_backend = validated.value.storage.data,
@@ -229,16 +230,16 @@ pub const Config = struct {
             else
                 null,
             .shard_allocation = .{
-                .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse 1,
-                .max_shard_size_bytes = try optionalU64Field(root, "max_shard_size_bytes") orelse 0,
-                .min_shard_size_bytes = try optionalU64Field(root, "min_shard_size_bytes") orelse 0,
-                .min_shards_per_table = try optionalU32Field(root, "min_shards_per_table") orelse 1,
-                .max_shards_per_table = try optionalU32Field(root, "max_shards_per_table") orelse 0,
-                .disable_shard_alloc = try optionalBoolField(root, "disable_shard_alloc") orelse false,
-                .auto_range_transition_per_table_limit = try optionalU32Field(root, "auto_range_transition_per_table_limit") orelse 1,
-                .auto_range_transition_cluster_limit = try optionalU32Field(root, "auto_range_transition_cluster_limit") orelse 1,
-                .shard_cooldown_millis = try optionalU64Field(root, "shard_cooldown_millis") orelse 60 * std.time.ms_per_s,
-                .min_shard_merge_age_millis = try optionalU64Field(root, "min_shard_merge_age_millis") orelse 5 * 60 * std.time.ms_per_s,
+                .default_shards_per_table = try optionalU32Field(root.*, "default_shards_per_table") orelse 1,
+                .max_shard_size_bytes = try optionalU64Field(root.*, "max_shard_size_bytes") orelse 0,
+                .min_shard_size_bytes = try optionalU64Field(root.*, "min_shard_size_bytes") orelse 0,
+                .min_shards_per_table = try optionalU32Field(root.*, "min_shards_per_table") orelse 1,
+                .max_shards_per_table = try optionalU32Field(root.*, "max_shards_per_table") orelse 0,
+                .disable_shard_alloc = try optionalBoolField(root.*, "disable_shard_alloc") orelse false,
+                .auto_range_transition_per_table_limit = try optionalU32Field(root.*, "auto_range_transition_per_table_limit") orelse 1,
+                .auto_range_transition_cluster_limit = try optionalU32Field(root.*, "auto_range_transition_cluster_limit") orelse 1,
+                .shard_cooldown_millis = try optionalU64Field(root.*, "shard_cooldown_millis") orelse 60 * std.time.ms_per_s,
+                .min_shard_merge_age_millis = try optionalU64Field(root.*, "min_shard_merge_age_millis") orelse 5 * 60 * std.time.ms_per_s,
             },
         };
     }
@@ -380,6 +381,25 @@ fn parseNodeId(raw: []const u8) !u64 {
     return std.fmt.parseInt(u64, raw, 10) catch
         std.fmt.parseInt(u64, raw, 16) catch
         error.InvalidConfig;
+}
+
+fn applyCommonConfigDefaults(alloc: std.mem.Allocator, root: *std.json.ObjectMap) !void {
+    try putIntegerDefault(alloc, root, "replication_factor", 1);
+    try putIntegerDefault(alloc, root, "max_shard_size_bytes", 0);
+    try putIntegerDefault(alloc, root, "default_shards_per_table", 1);
+    try putIntegerDefault(alloc, root, "max_shards_per_table", 0);
+}
+
+fn putIntegerDefault(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    field_name: []const u8,
+    value: i64,
+) !void {
+    if (root.get(field_name) != null) return;
+    const owned_field_name = try alloc.dupe(u8, field_name);
+    errdefer alloc.free(owned_field_name);
+    try root.put(alloc, owned_field_name, .{ .integer = value });
 }
 
 fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
@@ -766,6 +786,28 @@ test "common config extracts termite settings" {
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.termite.s3_credentials.?.endpoint.?);
     try std.testing.expectEqualStrings("termite-key", cfg.termite.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("termite-secret", cfg.termite.s3_credentials.?.secret_access_key.?);
+}
+
+test "common config defaults shard scalar fields" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:7001"
+        \\    }
+        \\  },
+        \\  "storage": {
+        \\    "local": { "base_dir": "antflydb" }
+        \\  }
+        \\}
+    ;
+    var cfg = try Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), cfg.shard_allocation.default_shards_per_table);
+    try std.testing.expectEqual(@as(u64, 0), cfg.shard_allocation.max_shard_size_bytes);
+    try std.testing.expectEqual(@as(u32, 0), cfg.shard_allocation.max_shards_per_table);
 }
 
 test "common config treats go orchestration urls as metadata api discovery urls" {

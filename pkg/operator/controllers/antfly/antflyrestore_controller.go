@@ -257,7 +257,7 @@ func (r *AntflyRestoreReconciler) buildRestoreJob(restore *antflyv1.AntflyRestor
 							// directly as argv without shell interpretation —
 							// no quoting needed (unlike the backup controller
 							// which uses shell form for $(date) expansion).
-							Command: []string{"/antfly", "cli"},
+							Command: []string{"/antfly"},
 							Args:    args,
 							EnvFrom: envFrom,
 						},

@@ -41,7 +41,12 @@ func TestBuildRestoreJob_SwarmStillUsesPublicAPIService(t *testing.T) {
 	}
 
 	job := r.buildRestoreJob(restore, cluster)
-	args := job.Spec.Template.Spec.Containers[0].Args
+	container := job.Spec.Template.Spec.Containers[0]
+	args := container.Args
+
+	if len(container.Command) != 1 || container.Command[0] != "/antfly" {
+		t.Fatalf("expected restore job to invoke zig antfly directly, got command: %#v", container.Command)
+	}
 
 	if len(args) < 3 {
 		t.Fatalf("expected restore args to include URL, got: %#v", args)

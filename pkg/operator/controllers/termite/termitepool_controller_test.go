@@ -49,8 +49,10 @@ var _ = Describe("TermitePool Controller", func() {
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
-								Name:     "bge-small-en-v1.5",
-								Priority: antflyaiv1alpha1.ModelPriorityHigh,
+								Name:         "bge-small-en-v1.5",
+								Tasks:        []string{"embed"},
+								Capabilities: []string{"text"},
+								Priority:     antflyaiv1alpha1.ModelPriorityHigh,
 							},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
@@ -115,11 +117,12 @@ var _ = Describe("TermitePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("termite"))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"termite", "run", "--config", "/config/config.json"}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"termite", "run", "--host", "0.0.0.0", "--port", "8080", "--models-dir", "/models"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
-				"termite", "pull", "--models-dir", "/models", "--variants", "f32", "bge-small-en-v1.5",
+				"termite", "pull", "bge-small-en-v1.5", "--models-dir", "/models",
+				"--tasks", "embed", "--capabilities", "text",
 			}))
 
 			// Verify TPU node selector
@@ -133,6 +136,12 @@ var _ = Describe("TermitePool Controller", func() {
 			Expect(container.StartupProbe).NotTo(BeNil())
 			Expect(container.ReadinessProbe).NotTo(BeNil())
 			Expect(container.LivenessProbe).NotTo(BeNil())
+			Expect(container.StartupProbe.HTTPGet.Path).To(Equal("/readyz"))
+			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/readyz"))
+			Expect(container.LivenessProbe.HTTPGet.Path).To(Equal("/healthz"))
+			Expect(container.StartupProbe.TimeoutSeconds).To(Equal(int32(5)))
+			Expect(container.ReadinessProbe.TimeoutSeconds).To(Equal(int32(5)))
+			Expect(container.LivenessProbe.TimeoutSeconds).To(Equal(int32(5)))
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
@@ -308,13 +317,13 @@ var _ = Describe("TermitePool Controller", func() {
 		})
 	})
 
-	Context("When creating a TermitePool with model variants", func() {
-		It("Should include variant in the ConfigMap", func() {
+	Context("When creating a TermitePool with tagged model refs", func() {
+		It("Should preserve the tag in the ConfigMap", func() {
 			ctx := context.Background()
 
 			pool := &antflyaiv1alpha1.TermitePool{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "variant-test-pool",
+					Name:      "tagged-ref-test-pool",
 					Namespace: poolNamespace,
 				},
 				Spec: antflyaiv1alpha1.TermitePoolSpec{
@@ -322,8 +331,7 @@ var _ = Describe("TermitePool Controller", func() {
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
-								Name:    "bge-small-en-v1.5",
-								Variant: "quantized",
+								Name: "bge-small-en-v1.5:quantized",
 							},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
@@ -338,8 +346,8 @@ var _ = Describe("TermitePool Controller", func() {
 
 			Expect(k8sClient.Create(ctx, pool)).Should(Succeed())
 
-			// Verify the ConfigMap includes the variant
-			configMapLookupKey := types.NamespacedName{Name: "variant-test-pool-config", Namespace: poolNamespace}
+			// Verify the ConfigMap includes the full model ref.
+			configMapLookupKey := types.NamespacedName{Name: "tagged-ref-test-pool-config", Namespace: poolNamespace}
 			createdConfigMap := &corev1.ConfigMap{}
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, configMapLookupKey, createdConfigMap)
@@ -396,22 +404,22 @@ var _ = Describe("TermitePool Controller", func() {
 		})
 	})
 
-	Context("When creating a TermitePool with multiple preload variants", func() {
-		It("Should create one direct-exec init container per variant group", func() {
+	Context("When creating a TermitePool with multiple preload refs", func() {
+		It("Should create one direct-exec init container per model ref", func() {
 			ctx := context.Background()
 
 			pool := &antflyaiv1alpha1.TermitePool{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "multi-variant-pool",
+					Name:      "multi-ref-pool",
 					Namespace: poolNamespace,
 				},
 				Spec: antflyaiv1alpha1.TermitePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "model-a", Variant: "i8"},
+							{Name: "model-a:i8"},
 							{Name: "model-b"},
-							{Name: "model-c", Variant: "i8"},
+							{Name: "model-c:i8"},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -424,21 +432,25 @@ var _ = Describe("TermitePool Controller", func() {
 
 			Expect(k8sClient.Create(ctx, pool)).Should(Succeed())
 
-			stsLookupKey := types.NamespacedName{Name: "multi-variant-pool", Namespace: poolNamespace}
+			stsLookupKey := types.NamespacedName{Name: "multi-ref-pool", Namespace: poolNamespace}
 			createdSts := &appsv1.StatefulSet{}
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, stsLookupKey, createdSts)
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(2))
+			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(3))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
-				"termite", "pull", "--models-dir", "/models", "--variants", "f32", "model-b",
+				"termite", "pull", "model-a:i8", "--models-dir", "/models",
 			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Args).To(Equal([]string{
-				"termite", "pull", "--models-dir", "/models", "--variants", "i8", "model-a", "model-c",
+				"termite", "pull", "model-b", "--models-dir", "/models",
+			}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Command).To(Equal([]string{"/antfly"}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Args).To(Equal([]string{
+				"termite", "pull", "model-c:i8", "--models-dir", "/models",
 			}))
 
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
