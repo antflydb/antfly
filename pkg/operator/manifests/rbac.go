@@ -24,6 +24,14 @@ const (
 	// ClusterRoleBindingName is the name of the operator's ClusterRoleBinding.
 	ClusterRoleBindingName = "antfly-operator-cluster-role-binding"
 
+	// StorageAutoGrowClusterRoleName is the name of the optional ClusterRole
+	// that grants kubelet stats access for storage auto-grow.
+	StorageAutoGrowClusterRoleName = "antfly-operator-storage-auto-grow-cluster-role"
+
+	// StorageAutoGrowClusterRoleBindingName is the name of the optional
+	// ClusterRoleBinding for storage auto-grow.
+	StorageAutoGrowClusterRoleBindingName = "antfly-operator-storage-auto-grow-cluster-role-binding"
+
 	// LeaderElectionRoleName is the name of the leader election Role.
 	LeaderElectionRoleName = "antfly-operator-leader-election-role"
 
@@ -104,6 +112,65 @@ func ClusterRoleBinding() *rbacv1.ClusterRoleBinding {
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
 			Name:     ClusterRoleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      ServiceAccountName,
+				Namespace: OperatorNamespace,
+			},
+		},
+	}
+}
+
+// StorageAutoGrowClusterRole returns the optional ClusterRole needed only when
+// spec.storage.storageAutoGrow.enabled is true.
+func StorageAutoGrowClusterRole() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "ClusterRole",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: StorageAutoGrowClusterRoleName,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":       "antfly-operator",
+				"app.kubernetes.io/component":  "rbac",
+				"app.kubernetes.io/managed-by": "antfly-operator",
+				"antfly.io/rbac-purpose":       "storage-auto-grow",
+			},
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"nodes/proxy"},
+				Verbs:     []string{"get"},
+			},
+		},
+	}
+}
+
+// StorageAutoGrowClusterRoleBinding returns the optional ClusterRoleBinding
+// needed only when spec.storage.storageAutoGrow.enabled is true.
+func StorageAutoGrowClusterRoleBinding() *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "ClusterRoleBinding",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: StorageAutoGrowClusterRoleBindingName,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":       "antfly-operator",
+				"app.kubernetes.io/component":  "rbac",
+				"app.kubernetes.io/managed-by": "antfly-operator",
+				"antfly.io/rbac-purpose":       "storage-auto-grow",
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     StorageAutoGrowClusterRoleName,
 		},
 		Subjects: []rbacv1.Subject{
 			{
@@ -218,6 +285,15 @@ func AllClusterScopedRBAC() []any {
 	return []any{
 		ClusterRole(),
 		ClusterRoleBinding(),
+	}
+}
+
+// StorageAutoGrowRBACResources returns the optional RBAC resources needed when
+// spec.storage.storageAutoGrow.enabled is true.
+func StorageAutoGrowRBACResources() []any {
+	return []any{
+		StorageAutoGrowClusterRole(),
+		StorageAutoGrowClusterRoleBinding(),
 	}
 }
 

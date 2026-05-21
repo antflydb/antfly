@@ -24,7 +24,7 @@ metadata:
 
 ### ClusterRole
 
-The operator's ClusterRole (`antfly-operator-cluster-role`) grants permissions for:
+The operator's default ClusterRole (`antfly-operator-cluster-role`) grants permissions for:
 
 | Resource | Permissions |
 |----------|-------------|
@@ -32,8 +32,7 @@ The operator's ClusterRole (`antfly-operator-cluster-role`) grants permissions f
 | Services | create, delete, get, list, patch, update, watch |
 | ConfigMaps | create, delete, get, list, patch, update, watch |
 | PersistentVolumeClaims | create, delete, get, list, patch, update, watch |
-| Pods | get, list, watch |
-| Secrets | get, list, watch |
+| Pods | delete, get, list, watch |
 | Events | create, patch |
 | PodDisruptionBudgets | create, delete, get, list, patch, update, watch |
 | AntflyClusters | get, list, watch, create, update, patch, delete |
@@ -58,10 +57,7 @@ rules:
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["delete", "get", "list", "watch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
@@ -86,6 +82,36 @@ rules:
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
     verbs: ["get", "list"]
+```
+
+The default ClusterRole intentionally does not grant access to Kubernetes Secrets or `nodes/proxy`. Storage auto-grow is the only operator feature that needs `nodes/proxy` to read kubelet volume usage from `/stats/summary`; apply this optional add-on only for clusters using `spec.storage.storageAutoGrow.enabled: true`:
+
+| Resource | Permissions |
+|----------|-------------|
+| Nodes proxy | get |
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: antfly-operator-storage-auto-grow-cluster-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: antfly-operator-storage-auto-grow-cluster-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: antfly-operator-storage-auto-grow-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: antfly-operator-service-account
+    namespace: antfly-operator-namespace
 ```
 
 ### ClusterRoleBinding
