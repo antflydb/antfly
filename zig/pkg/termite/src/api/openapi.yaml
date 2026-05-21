@@ -1121,13 +1121,12 @@ components:
         dimensions:
           type: integer
           description: Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
-        task:
+        input_type:
           type: string
-          description: Optional model-specific embedding task. Jina v5 currently supports retrieval in this runtime.
-        prompt_name:
-          type: string
-          description: Optional model-specific prompt role. For Jina v5 retrieval embeddings, use "query" or "document".
+          description: Optional embedding input role. Uses Cohere-style retrieval values; query/document are accepted aliases for Jina-style callers.
           enum:
+            - search_query
+            - search_document
             - query
             - document
     EmbedResponse:

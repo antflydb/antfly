@@ -5073,8 +5073,7 @@ const ParsedEmbedRequest = struct {
     input: std.json.Value,
     encoding_format: ?[]const u8,
     dimensions: ?i64,
-    task: ?[]const u8,
-    prompt_name: ?[]const u8,
+    input_type: ?[]const u8,
 };
 
 const ParsedTextEmbedInput = struct {
@@ -5122,13 +5121,8 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         break :blk value.integer;
     } else null;
 
-    const task: ?[]const u8 = if (obj.get("task")) |value| blk: {
-        if (value != .string) return error.TaskMustBeString;
-        break :blk value.string;
-    } else null;
-
-    const prompt_name: ?[]const u8 = if (obj.get("prompt_name")) |value| blk: {
-        if (value != .string) return error.PromptNameMustBeString;
+    const input_type: ?[]const u8 = if (obj.get("input_type")) |value| blk: {
+        if (value != .string) return error.InputTypeMustBeString;
         break :blk value.string;
     } else null;
 
@@ -5137,8 +5131,7 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         .input = input_value,
         .encoding_format = encoding_format,
         .dimensions = dimensions,
-        .task = task,
-        .prompt_name = prompt_name,
+        .input_type = input_type,
     };
 }
 
@@ -5149,8 +5142,7 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
         error.InputRequired => "input is required",
         error.EncodingFormatMustBeString => "encoding_format must be a string",
         error.DimensionsMustBeInteger => "dimensions must be an integer",
-        error.TaskMustBeString => "task must be a string",
-        error.PromptNameMustBeString => "prompt_name must be a string",
+        error.InputTypeMustBeString => "input_type must be a string",
         else => "invalid embedding request",
     };
 }
@@ -5168,23 +5160,19 @@ fn applyDenseEmbeddingRequestOptions(
 ) !void {
     if (!isJinaV5EmbeddingManifest(manifest)) return;
 
-    const task = request.task orelse "retrieval";
-    if (!std.mem.eql(u8, task, "retrieval")) return error.UnsupportedEmbeddingTask;
-
-    const prompt_name = request.prompt_name orelse "document";
-    if (std.mem.eql(u8, prompt_name, "query")) {
+    const input_type = request.input_type orelse "search_document";
+    if (std.mem.eql(u8, input_type, "search_query") or std.mem.eql(u8, input_type, "query")) {
         pipeline.config.text_prefix = "Query: ";
-    } else if (std.mem.eql(u8, prompt_name, "document")) {
+    } else if (std.mem.eql(u8, input_type, "search_document") or std.mem.eql(u8, input_type, "document")) {
         pipeline.config.text_prefix = "Document: ";
     } else {
-        return error.UnsupportedEmbeddingPromptName;
+        return error.UnsupportedEmbeddingInputType;
     }
 }
 
 fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.UnsupportedEmbeddingTask => "only task=\"retrieval\" is supported for this embedding model in this runtime",
-        error.UnsupportedEmbeddingPromptName => "prompt_name must be \"query\" or \"document\"",
+        error.UnsupportedEmbeddingInputType => "input_type must be \"search_query\" or \"search_document\" (\"query\"/\"document\" aliases are also accepted)",
         else => "invalid embedding options",
     };
 }
@@ -5515,21 +5503,29 @@ test "jina embedding request options switch query and document prefixes" {
         .input = .{ .string = "hello" },
         .encoding_format = null,
         .dimensions = null,
-        .task = "retrieval",
-        .prompt_name = "query",
+        .input_type = "search_query",
     };
     try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, query_request);
     try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
 
-    const bad_task = ParsedEmbedRequest{
+    const document_request = ParsedEmbedRequest{
         .model = "jina",
         .input = .{ .string = "hello" },
         .encoding_format = null,
         .dimensions = null,
-        .task = "classification",
-        .prompt_name = "document",
+        .input_type = "document",
     };
-    try std.testing.expectError(error.UnsupportedEmbeddingTask, applyDenseEmbeddingRequestOptions(&pipeline, &manifest, bad_task));
+    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, document_request);
+    try std.testing.expectEqualStrings("Document: ", pipeline.config.text_prefix);
+
+    const bad_input_type = ParsedEmbedRequest{
+        .model = "jina",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .input_type = "classification",
+    };
+    try std.testing.expectError(error.UnsupportedEmbeddingInputType, applyDenseEmbeddingRequestOptions(&pipeline, &manifest, bad_input_type));
 }
 
 test "jina embedding request options support merged qwen3 task repos without manifest tasks" {
@@ -5553,8 +5549,7 @@ test "jina embedding request options support merged qwen3 task repos without man
         .input = .{ .string = "hello" },
         .encoding_format = null,
         .dimensions = null,
-        .task = "retrieval",
-        .prompt_name = "query",
+        .input_type = "query",
     };
     try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, request);
     try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
