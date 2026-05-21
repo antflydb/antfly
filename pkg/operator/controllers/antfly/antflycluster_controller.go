@@ -68,8 +68,8 @@ const (
 
 	antflySecretStoreVolumeName  = "secret-store"
 	antflySecretStoreDefaultKey  = "secrets.json"
-	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json"
-	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"
+	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
+	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
