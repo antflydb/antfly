@@ -704,9 +704,10 @@ pub fn runFromIterator(
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
     else
         null;
-    const health_server = antfly.common.health_server.HealthServer.startIfConfigured(
+    const health_server = antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
         alloc,
         "swarm",
+        public_listener.bind_host,
         health_port,
         swarm_health.readiness(),
         swarm_health.metricsWriter(),
@@ -1323,7 +1324,7 @@ fn printUsage() void {
         \\  --port <port>                         Public API port (default: 0)
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
-        \\  --health-port <port>                  Dedicated health/metrics bind port (default: 4200)
+        \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
         \\  --models-dir <path>                   Embedded termite models directory (default: ~/.termite/models)
         \\  --termite-host-budget-mb <n>          Embedded termite native generation host budget override
