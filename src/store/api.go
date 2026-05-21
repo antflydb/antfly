@@ -90,6 +90,8 @@ func (h *StoreAPI) finishShardStart(shardID types.ID) {
 	delete(h.startingShards, shardID)
 }
 
+const allowedFileBackupDirsEnv = "ANTFLY_ALLOWED_FILE_BACKUP_DIRS"
+
 func pathWithinBase(path, base string) bool {
 	cleanPath := filepath.Clean(path)
 	cleanBase := filepath.Clean(base)
@@ -110,6 +112,28 @@ func safeJoinUnder(base, name string) (string, error) {
 	return joined, nil
 }
 
+func (h *StoreAPI) allowedLocalBackupDirs() ([]string, error) {
+	baseDir, err := filepath.Abs(h.antflyConfig.GetBaseDir())
+	if err != nil {
+		return nil, fmt.Errorf("resolving antfly base directory: %w", err)
+	}
+
+	allowed := []string{filepath.Clean(baseDir)}
+	for _, configured := range filepath.SplitList(os.Getenv(allowedFileBackupDirsEnv)) {
+		configured = strings.TrimSpace(configured)
+		if configured == "" {
+			continue
+		}
+		abs, err := filepath.Abs(configured)
+		if err != nil {
+			return nil, fmt.Errorf("resolving allowed file backup directory %q: %w", configured, err)
+		}
+		allowed = append(allowed, filepath.Clean(abs))
+	}
+
+	return allowed, nil
+}
+
 func (h *StoreAPI) localBackupDir(location string) (string, error) {
 	after, ok := strings.CutPrefix(location, "file://")
 	if !ok {
@@ -122,14 +146,16 @@ func (h *StoreAPI) localBackupDir(location string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolving file backup location: %w", err)
 	}
-	baseDir, err := filepath.Abs(h.antflyConfig.GetBaseDir())
+	allowedDirs, err := h.allowedLocalBackupDirs()
 	if err != nil {
-		return "", fmt.Errorf("resolving antfly base directory: %w", err)
+		return "", err
 	}
-	if !pathWithinBase(dir, baseDir) {
-		return "", fmt.Errorf("file backup location %s must be under antfly base directory %s", dir, baseDir)
+	for _, allowedDir := range allowedDirs {
+		if pathWithinBase(dir, allowedDir) {
+			return filepath.Clean(dir), nil
+		}
 	}
-	return filepath.Clean(dir), nil
+	return "", fmt.Errorf("file backup location %s must be under antfly base directory or a directory listed in %s", dir, allowedFileBackupDirsEnv)
 }
 
 func validateBackupIDForHTTP(w http.ResponseWriter, backupID string) bool {

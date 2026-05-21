@@ -1478,6 +1478,42 @@ func TestHandleBackup_RejectsLocalLocationOutsideBaseDir(t *testing.T) {
 	mockShard.AssertNotCalled(t, "Backup", mock.Anything, mock.Anything, mock.Anything)
 }
 
+func TestHandleBackup_AllowsConfiguredLocalBackupDir(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	mockShard := new(MockShard)
+	baseDir := t.TempDir()
+	allowedDir := t.TempDir()
+	t.Setenv(allowedFileBackupDirsEnv, allowedDir)
+
+	mockStore := &MockStore{logger: logger, nodeID: types.ID(1)}
+	api := (&StoreAPI{
+		logger: logger,
+		store:  mockStore,
+		antflyConfig: &common.Config{Storage: common.StorageConfig{Local: common.LocalStorageConfig{
+			BaseDir: baseDir,
+		}}},
+	}).setupRoutes()
+
+	shardID := types.ID(313)
+	mockStore.On("Shard", shardID).Return(mockShard, true)
+	mockShard.On("Backup", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		backupName := args.String(2) + ".tar.zst"
+		require.NoError(t, os.WriteFile(filepath.Join(allowedDir, backupName), []byte("backup"), 0o600))
+	}).Return(nil)
+
+	body, err := json.Marshal(common.BackupConfig{BackupID: "safe-id", Location: "file://" + allowedDir, Format: common.BackupFormatNative})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/shard/backup", bytes.NewReader(body))
+	req.Header.Set("X-Raft-Shard-Id", shardID.String())
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	api.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	mockShard.AssertCalled(t, "Backup", mock.Anything, mock.Anything, mock.Anything)
+}
+
 func TestHandleBackup_RejectsTraversalBackupID(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 	mockShard := new(MockShard)

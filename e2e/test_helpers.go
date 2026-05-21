@@ -20,10 +20,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -441,6 +441,11 @@ func GetBackupDir(t *testing.T) string {
 	if err := os.MkdirAll(backupDir, 0755); err != nil { //nolint:gosec // G301: standard permissions for data directory
 		t.Fatalf("Failed to create backup directory: %v", err)
 	}
+
+	// Store APIs only allow file:// backups under configured local backup roots.
+	// E2E tests run the servers in-process, so set the allowlist here before
+	// issuing backup/restore requests that target the shared e2e backup cache.
+	t.Setenv("ANTFLY_ALLOWED_FILE_BACKUP_DIRS", backupDir)
 
 	return backupDir
 }
