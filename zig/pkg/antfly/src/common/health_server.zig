@@ -150,8 +150,22 @@ pub const HealthServer = struct {
         ready: ?ReadinessChecker,
         metrics: ?MetricsWriter,
     ) !?*HealthServer {
+        return try startIfConfiguredOnHost(alloc, label, null, port, ready, metrics);
+    }
+
+    pub fn startIfConfiguredOnHost(
+        alloc: std.mem.Allocator,
+        label: []const u8,
+        bind_host: ?[]const u8,
+        port: ?u16,
+        ready: ?ReadinessChecker,
+        metrics: ?MetricsWriter,
+    ) !?*HealthServer {
         const p = port orelse return null;
-        const hs = try HealthServer.init(alloc, .{ .bind_port = p }, ready, metrics);
+        const hs = try HealthServer.init(alloc, .{
+            .bind_host = bind_host orelse "0.0.0.0",
+            .bind_port = p,
+        }, ready, metrics);
         errdefer hs.deinit();
         try hs.start();
         const uri = try hs.baseUri(alloc);
@@ -516,6 +530,14 @@ test "health server metrics request path does not refresh stale cache" {
 
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expectEqual(@as(usize, 1), fake.call_count);
+}
+
+test "health server startIfConfiguredOnHost uses provided bind host" {
+    const alloc = testing.allocator;
+    const hs = (try HealthServer.startIfConfiguredOnHost(alloc, "test", "127.0.0.1", 0, null, null)).?;
+    defer hs.deinit();
+
+    try testing.expectEqualStrings("127.0.0.1", hs.listener.cfg.bind_host);
 }
 
 test "health server unknown path returns 404" {

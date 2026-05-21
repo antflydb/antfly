@@ -13,7 +13,9 @@
 // limitations.
 
 pub const template = @import("template.zig");
+pub const template_remote = @import("template_remote.zig");
 
 test {
     _ = template;
+    _ = template_remote;
 }

@@ -6733,7 +6733,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try ensureDefaultAdminUser(&user_manager.?);
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -7000,21 +7003,6 @@ fn parseBoolFlag(value: []const u8) ?bool {
     return null;
 }
 
-fn ensureDefaultAdminUser(manager: *antfly.usermgr.UserManager) !void {
-    _ = manager.getUser("admin") catch |err| switch (err) {
-        error.UserNotFound => {
-            var admin_permission = [_]antfly.usermgr.Permission{
-                try antfly.usermgr.Permission.initOwned(manager.alloc, .@"*", "*", .admin),
-            };
-            defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
-            user.deinit(manager.alloc);
-            return;
-        },
-        else => return err,
-    };
-}
-
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
         \\Usage: {s} [options]
@@ -7196,6 +7184,18 @@ test "data runtime parses auth flag" {
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, parsed.auth_enabled.?);
+}
+
+test "data runtime leaves auth disabled unless config or cli enables it" {
+    var cli = CliConfig{};
+    defer cli.deinit(std.testing.allocator);
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = true;
+    try std.testing.expect(resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = false;
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
 }
 
 test "data runtime local group status uses injected leadership source" {

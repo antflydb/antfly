@@ -600,7 +600,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try ensureDefaultAdminUser(&user_manager.?);
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -696,9 +699,10 @@ pub fn runFromIterator(
         .data_server = &data_server,
     };
     const health_port = cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else null;
-    const health_server = antfly.common.health_server.HealthServer.startIfConfigured(
+    const health_server = antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
         alloc,
         "swarm",
+        public_listener.bind_host,
         health_port,
         swarm_health.readiness(),
         swarm_health.metricsWriter(),
@@ -1276,21 +1280,6 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
-fn ensureDefaultAdminUser(manager: *antfly.usermgr.UserManager) !void {
-    _ = manager.getUser("admin") catch |err| switch (err) {
-        error.UserNotFound => {
-            var admin_permission = [_]antfly.usermgr.Permission{
-                try antfly.usermgr.Permission.initOwned(manager.alloc, .@"*", "*", .admin),
-            };
-            defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
-            user.deinit(manager.alloc);
-            return;
-        },
-        else => return err,
-    };
-}
-
 fn resolveTermiteModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.termite_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.termite.models_dir;
@@ -1320,7 +1309,7 @@ fn printUsage() void {
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 0)
         \\  --id <node-id>                        Local node id (default: 1)
-        \\  --health-port <port>                  Dedicated health/metrics bind port (default: unset)
+        \\  --health-port <port>                  Dedicated health/metrics port on --host (default: unset)
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
         \\  --models-dir <path>                   Embedded termite models directory (default: ~/.termite/models)
         \\  --termite-host-budget-mb <n>          Embedded termite native generation host budget override
@@ -1387,6 +1376,12 @@ const RecordingServer = struct {
 test "swarm runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "swarm runtime leaves auth disabled unless config or cli enables it" {
+    try std.testing.expect(!resolveAuthEnabled(.{}, null));
+    try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
+    try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {

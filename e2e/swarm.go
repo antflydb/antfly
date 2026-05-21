@@ -29,11 +29,11 @@ import (
 
 	"github.com/antflydb/antfly/lib/types"
 	antfly "github.com/antflydb/antfly/pkg/client"
+	"github.com/antflydb/antfly/pkg/termite"
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata"
 	"github.com/antflydb/antfly/src/store"
 	"github.com/antflydb/antfly/src/store/db"
-	"github.com/antflydb/antfly/pkg/termite"
 	"go.uber.org/zap"
 )
 
@@ -281,6 +281,7 @@ func startSwarmWithLocalBypass(
 		t.Fatalf("creating metadata runtime: %v", err)
 	}
 	metaRuntime.StartRaft()
+	metaRuntime.StartDefaultAdminSeed(ctx)
 	t.Cleanup(func() { _ = metaRuntime.Close() })
 
 	// Start metadata HTTP server.
