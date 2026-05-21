@@ -1800,12 +1800,10 @@ pub const SparseIndex = struct {
         // Read forward entry
         var key_buf: [256]u8 = undefined;
         const fk = fwdKey(&key_buf, doc_id);
-        const fwd_data = self.lookupFwdDataByDocId(txn, doc_id) catch |err| switch (err) {
+        const fwd = self.lookupFwdEntryByDocIdAlloc(alloc, txn, doc_id) catch |err| switch (err) {
             error.NotFound => return .{}, // doc not found, nothing to delete
             else => return err,
         };
-
-        const fwd = try decodeFwdEntry(alloc, fwd_data);
         defer alloc.free(fwd.term_ids);
         defer alloc.free(fwd.weights);
 
@@ -2293,24 +2291,24 @@ pub const SparseIndex = struct {
         }
     }
 
-    fn lookupFwdDataByDocId(self: *SparseIndex, txn: anytype, doc_id: []const u8) ![]const u8 {
+    fn lookupDocNumByDocId(self: *SparseIndex, txn: anytype, doc_id: []const u8) !u64 {
         var key_buf: [256]u8 = undefined;
         if (txnGet(txn, self.dbi, fwdKey(&key_buf, doc_id))) |fwd_data| {
             const doc_num = try decodeFwdDocNum(fwd_data);
             if (self.docNumDeleted(txn, doc_num)) return error.NotFound;
-            return fwd_data;
+            return doc_num;
         } else |_| {}
 
         const LookupContext = struct {
             wanted_doc_id: []const u8,
             index: *SparseIndex,
             txn: @TypeOf(txn),
-            found: ?[]const u8 = null,
+            found: ?u64 = null,
 
             fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
                 if (std.mem.eql(u8, entry.doc_id, ctx.wanted_doc_id)) {
                     if (ctx.index.docNumDeleted(ctx.txn, entry.doc_num)) return false;
-                    ctx.found = entry.fwd_data;
+                    ctx.found = entry.doc_num;
                     return true;
                 }
                 return false;
@@ -2323,6 +2321,43 @@ pub const SparseIndex = struct {
         while (maybe_entry) |entry| {
             if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
             var ctx = LookupContext{ .wanted_doc_id = doc_id, .index = self, .txn = txn };
+            if (try forEachDocMapEntry(entry.value, &ctx, LookupContext.visit)) return ctx.found.?;
+            maybe_entry = try cur.next();
+        }
+        return error.NotFound;
+    }
+
+    fn lookupFwdEntryByDocIdAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_id: []const u8) !DecodedFwdEntry {
+        var key_buf: [256]u8 = undefined;
+        if (txnGet(txn, self.dbi, fwdKey(&key_buf, doc_id))) |fwd_data| {
+            const doc_num = try decodeFwdDocNum(fwd_data);
+            if (self.docNumDeleted(txn, doc_num)) return error.NotFound;
+            return try decodeFwdEntry(alloc, fwd_data);
+        } else |_| {}
+
+        const LookupContext = struct {
+            alloc: Allocator,
+            wanted_doc_id: []const u8,
+            index: *SparseIndex,
+            txn: @TypeOf(txn),
+            found: ?DecodedFwdEntry = null,
+
+            fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                if (std.mem.eql(u8, entry.doc_id, ctx.wanted_doc_id)) {
+                    if (ctx.index.docNumDeleted(ctx.txn, entry.doc_num)) return false;
+                    ctx.found = try decodeFwdEntry(ctx.alloc, entry.fwd_data);
+                    return true;
+                }
+                return false;
+            }
+        };
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
+        while (maybe_entry) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
+            var ctx = LookupContext{ .alloc = alloc, .wanted_doc_id = doc_id, .index = self, .txn = txn };
             if (try forEachDocMapEntry(entry.value, &ctx, LookupContext.visit)) return ctx.found.?;
             maybe_entry = try cur.next();
         }
@@ -2577,8 +2612,7 @@ pub const SparseIndex = struct {
         var out = std.AutoHashMapUnmanaged(u32, void).empty;
         errdefer out.deinit(alloc);
         for (doc_ids) |doc_id| {
-            const fwd_data = self.lookupFwdDataByDocId(txn, doc_id) catch continue;
-            const doc_num = try decodeFwdDocNum(fwd_data);
+            const doc_num = self.lookupDocNumByDocId(txn, doc_id) catch continue;
             if (doc_num > std.math.maxInt(u32)) continue;
             try out.put(alloc, @intCast(doc_num), {});
         }
@@ -2600,11 +2634,10 @@ pub const SparseIndex = struct {
     pub fn debugDocNumForDocId(self: *SparseIndex, doc_id: []const u8) !?u32 {
         var txn = try self.beginReadTxn();
         defer txn.abort();
-        const fwd_data = self.lookupFwdDataByDocId(&txn, doc_id) catch |err| switch (err) {
+        const doc_num = self.lookupDocNumByDocId(&txn, doc_id) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
-        const doc_num = try decodeFwdDocNum(fwd_data);
         if (doc_num > std.math.maxInt(u32)) return error.DocNumOverflow;
         return @intCast(doc_num);
     }

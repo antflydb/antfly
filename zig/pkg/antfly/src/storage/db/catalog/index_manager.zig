@@ -6376,7 +6376,10 @@ pub const IndexManager = struct {
             const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
             defer self.alloc.free(parent_doc_id);
             if (entry.chunk_name == null) {
-                const doc_num = (try entry.index.debugDocNumForDocId(parent_doc_id)) orelse continue;
+                const doc_num = (entry.index.debugDocNumForDocId(parent_doc_id) catch |err| switch (err) {
+                    error.DocNumOverflow => continue,
+                    else => return err,
+                }) orelse continue;
                 if (!containsU32(out.items, doc_num)) try out.append(alloc, doc_num);
                 continue;
             }
@@ -6388,7 +6391,10 @@ pub const IndexManager = struct {
             defer backend_scan.freeResults(alloc, chunk_rows);
             for (chunk_rows) |row| {
                 if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
-                const doc_num = (try entry.index.debugDocNumForDocId(row.key)) orelse continue;
+                const doc_num = (entry.index.debugDocNumForDocId(row.key) catch |err| switch (err) {
+                    error.DocNumOverflow => continue,
+                    else => return err,
+                }) orelse continue;
                 if (!containsU32(out.items, doc_num)) try out.append(alloc, doc_num);
             }
         }
@@ -8076,6 +8082,8 @@ pub const IndexManager = struct {
             sort_ns: u64 = 0,
             artifact_read_ns: u64 = 0,
             artifact_decode_ns: u64 = 0,
+            artifact_view_count: u64 = 0,
+            artifact_copy_count: u64 = 0,
             delete_batch_ns: u64 = 0,
             sparse_batch_ns: u64 = 0,
             corrupt_delete_ns: u64 = 0,
@@ -8147,6 +8155,27 @@ pub const IndexManager = struct {
             const decode_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             for (pending_artifact_loads.items, 0..) |item, i| {
                 const raw = read_values[i] orelse continue;
+                const maybe_view = enrichment_artifact_codec.sparseEmbeddingVectorView(raw) catch |err| {
+                    if (isRecoverableEmbeddingArtifactError(err)) {
+                        try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                        continue;
+                    }
+                    return err;
+                };
+                if (maybe_view) |view| {
+                    if (profile_enabled) profile.artifact_view_count += 1;
+                    try delete_keys.append(self.alloc, item.doc_key);
+                    try sparse_writes.append(self.alloc, .{
+                        .doc_id = item.doc_key,
+                        .vec = .{
+                            .indices = view.indices,
+                            .values = view.values,
+                        },
+                    });
+                    continue;
+                }
+
+                if (profile_enabled) profile.artifact_copy_count += 1;
                 var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(self.alloc, raw) catch |err| {
                     if (isRecoverableEmbeddingArtifactError(err)) {
                         try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
@@ -8174,9 +8203,28 @@ pub const IndexManager = struct {
                 });
             }
             if (profile_enabled) profile.artifact_decode_ns = platform_time.monotonicNs() - decode_start_ns;
+
+            if (delete_keys.items.len > 0) {
+                const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+                try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
+                    .defer_term_range_updates = true,
+                    .backend_batch_options = batch_options,
+                });
+                if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
+            }
+            if (sparse_writes.items.len > 0) {
+                const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+                try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+                    .defer_term_range_updates = true,
+                    .backend_batch_options = batch_options,
+                    .prefer_bulk_build = batch_options.mode == .bulk_ingest,
+                    .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
+                });
+                if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+            }
         }
 
-        if (delete_keys.items.len > 0) {
+        if (pending_artifact_loads.items.len == 0 and delete_keys.items.len > 0) {
             const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
                 .defer_term_range_updates = true,
@@ -8184,7 +8232,7 @@ pub const IndexManager = struct {
             });
             if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
         }
-        if (sparse_writes.items.len > 0) {
+        if (pending_artifact_loads.items.len == 0 and sparse_writes.items.len > 0) {
             const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
                 .defer_term_range_updates = true,
@@ -8201,7 +8249,7 @@ pub const IndexManager = struct {
         }
         if (profile_enabled and (pending_artifact_loads.items.len > 0 or sparse_writes.items.len > 0 or delete_keys.items.len > 0)) {
             std.log.info(
-                "antfly_bench_sparse_replay index={s} mode={s} input_writes={d} pending_artifacts={d} sparse_writes={d} delete_keys={d} corrupt_artifacts={d} total_ms={d} scan_ms={d} sort_ms={d} artifact_read_ms={d} artifact_decode_ms={d} delete_batch_ms={d} sparse_batch_ms={d} corrupt_delete_ms={d}",
+                "antfly_bench_sparse_replay index={s} mode={s} input_writes={d} pending_artifacts={d} sparse_writes={d} delete_keys={d} corrupt_artifacts={d} total_ms={d} scan_ms={d} sort_ms={d} artifact_read_ms={d} artifact_decode_ms={d} artifact_views={d} artifact_copies={d} delete_batch_ms={d} sparse_batch_ms={d} corrupt_delete_ms={d}",
                 .{
                     entry.config.name,
                     @tagName(batch_options.mode),
@@ -8215,6 +8263,8 @@ pub const IndexManager = struct {
                     nsToMs(profile.sort_ns),
                     nsToMs(profile.artifact_read_ns),
                     nsToMs(profile.artifact_decode_ns),
+                    profile.artifact_view_count,
+                    profile.artifact_copy_count,
                     nsToMs(profile.delete_batch_ns),
                     nsToMs(profile.sparse_batch_ns),
                     nsToMs(profile.corrupt_delete_ns),

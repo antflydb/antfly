@@ -1517,6 +1517,33 @@ Status as of 2026-05-19:
   lever if we need more: persist field-backed sparse vectors, or a compact
   sparse replay artifact, at write time so catch-up does not have to reread and
   reparse full JSON documents.
+  Field-backed dense and sparse vectors now follow the artifact-backed write
+  path: configured vector fields are extracted at write time, stored as
+  embedding artifacts, and stripped from the persisted document. If stripping
+  removes every top-level field, the DB stores `{}` so document identity and
+  ordinal mappings still exist for vector hits and resolved filters. Dense and
+  sparse replay now collect artifact-backed embedding writes before document
+  field replay, then skip document-field vector extraction only for doc keys
+  already covered by those embedding artifacts. Legacy/backfill documents that
+  still carry vector fields in stored JSON continue to replay through the
+  document-field path. The sparse doc-map fallback now decodes doc numbers and
+  forward entries before closing the backing cursor, avoiding poisoned borrowed
+  slices during reopened bulk-segment filter projection. Zig intentionally
+  rejects `_summaries`; supported enrichment-backed document fields are
+  `_chunks` (generated chunk artifacts), `_embeddings`, and `_edges`.
+  Sparse embedding artifacts now use a planar compact payload
+  (`count | indices[] | values[]`) instead of interleaved `(index,value)` pairs.
+  That keeps the artifact binary and lets replay borrow validated `[]const u32`
+  and `[]const f32` slices directly from batched artifact reads when alignment
+  and endian constraints allow it, falling back to allocated decode otherwise.
+  Replay keeps the artifact read transaction open while the sparse bulk loader
+  consumes borrowed slices. On the 10k deferred DOCID query profile after
+  field-backed vectors moved to artifacts, sparse artifact apply dropped from
+  about `3.5s` (`artifact_decode_ms ~= 3341`) to about `147ms`
+  (`artifact_decode_ms ~= 3`, `artifact_views=10000`,
+  `artifact_copies=0`); total sparse replay is now dominated by artifact-key
+  collection/read orchestration rather than sparse vector decode or sparse
+  index apply.
   The first
   optimization from that evidence specialized
   `ResolvedDocSet` ordinal set algebra: list/list operators now use direct

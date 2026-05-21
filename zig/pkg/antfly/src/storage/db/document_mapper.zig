@@ -1040,6 +1040,7 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
             .summaries = &.{},
         };
     }
+    if (root.object.contains("_summaries")) return error.UnsupportedSummaryField;
 
     var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
@@ -1073,16 +1074,6 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         }
         sparse_embeddings.deinit(alloc);
     }
-    var summaries = std.ArrayListUnmanaged(SummaryWrite).empty;
-    errdefer {
-        for (summaries.items) |summary| {
-            alloc.free(summary.index_name);
-            alloc.free(summary.doc_key);
-            alloc.free(summary.text);
-        }
-        summaries.deinit(alloc);
-    }
-
     var mentioned_indexes = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (mentioned_indexes.items) |index_name| alloc.free(index_name);
@@ -1169,24 +1160,7 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         }
     }
 
-    if (root.object.get("_summaries")) |summaries_field| {
-        if (summaries_field != .object) return error.InvalidSummaryField;
-
-        var summary_it = summaries_field.object.iterator();
-        while (summary_it.next()) |summary_entry| {
-            const index_name = summary_entry.key_ptr.*;
-            const summary_value = summary_entry.value_ptr.*;
-            if (summary_value != .string) return error.InvalidSummaryField;
-
-            try summaries.append(alloc, .{
-                .index_name = try alloc.dupe(u8, index_name),
-                .doc_key = try alloc.dupe(u8, key),
-                .text = try alloc.dupe(u8, summary_value.string),
-            });
-        }
-    }
-
-    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings") or root.object.contains("_summaries");
+    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings");
     const has_non_special_fields = hasNonSpecialFields(root);
     const cleaned_value = if (has_special_fields) blk: {
         if (!has_non_special_fields) break :blk null;
@@ -1201,7 +1175,7 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         .mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-        .summaries = try summaries.toOwnedSlice(alloc),
+        .summaries = &.{},
     };
 }
 
@@ -1255,7 +1229,8 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
             saw_embeddings = true;
             continue;
         }
-        if (std.mem.eql(u8, field_name, "_edges") or std.mem.eql(u8, field_name, "_summaries")) return null;
+        if (std.mem.eql(u8, field_name, "_summaries")) return error.UnsupportedSummaryField;
+        if (std.mem.eql(u8, field_name, "_edges")) return null;
         if (!(try appendFastScalarField(alloc, &scanner, field_name, &json_writer))) return null;
         has_non_special_fields = true;
     }
@@ -2218,8 +2193,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 
 fn isSpecialField(field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "_edges") or
-        std.mem.eql(u8, field_name, "_embeddings") or
-        std.mem.eql(u8, field_name, "_summaries");
+        std.mem.eql(u8, field_name, "_embeddings");
 }
 
 fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), value: []const u8) !void {
