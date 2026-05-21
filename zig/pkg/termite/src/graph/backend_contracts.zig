@@ -894,7 +894,6 @@ pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
     ple_vectors: ?CT = null,
     layers: []const DecoderRuntimeLayerSpec,
     output_hidden: *?CT,
-    output_embeddings: ?*?CT = null,
 };
 
 test "tensor storage classes classify host and device residency" {

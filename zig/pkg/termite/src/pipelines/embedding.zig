@@ -35,6 +35,8 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
 
+const qwen3_embedding_resident_override_level = 4;
+
 pub const PoolingStrategy = enum {
     mean,
     cls,
@@ -271,7 +273,7 @@ pub const EmbeddingPipeline = struct {
             if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, effective_len, proj)) |resident_embeddings| {
                 return resident_embeddings;
             }
-        } else if (try self.tryEmbedTextResidentQwen3(inputs, all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
+        } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
             return resident_embeddings;
         }
 
@@ -890,27 +892,19 @@ pub const EmbeddingPipeline = struct {
 
     fn tryEmbedTextResidentQwen3(
         self: *EmbeddingPipeline,
-        inputs: []const Tensor,
         mask: []const i32,
         input_ids: []const i64,
         batch: usize,
         seq_len: usize,
     ) !?[][]f32 {
-        _ = inputs;
-        if (residentQwen3EmbeddingDisabled()) {
-            if (residentQwen3EmbeddingRequired()) {
-                return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "disabled");
-            }
-            return null;
-        }
         const cfg = session_factory.getGptConfig(self.session) orelse {
-            if (residentQwen3EmbeddingRequired()) {
+            if (self.residentProjectionRequired()) {
                 return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "not_gpt_session");
             }
             return null;
         };
         if (!residentQwen3EmbeddingEligible(self.session, cfg, self.config)) {
-            if (residentQwen3EmbeddingRequired()) {
+            if (self.residentProjectionRequired()) {
                 return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "ineligible");
             }
             return null;
@@ -935,14 +929,11 @@ pub const EmbeddingPipeline = struct {
         if (try self.tryEmbedTextResidentQwen3Graph(&cb, cfg, mask, input_ids, batch, seq_len)) |graph_embeddings| {
             return graph_embeddings;
         }
-        if (residentQwen3EmbeddingGraphRequired()) {
-            return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "graph_fallback");
-        }
 
         const overrides = decoder_gated_runtime.buildOverridesWithLevel(
             cfg,
             cfg.num_hidden_layers,
-            residentQwen3EmbeddingOverrideLevel(),
+            qwen3_embedding_resident_override_level,
         );
         const encoder_start = embedTimingStart(self.print_timing);
         const hidden = try gpt_arch.hiddenForwardResidentWithOverrides(
@@ -999,16 +990,7 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         seq_len: usize,
     ) !?[][]f32 {
-        if (residentQwen3EmbeddingGraphDisabled()) {
-            if (residentQwen3EmbeddingGraphRequired()) {
-                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "disabled");
-            }
-            return null;
-        }
         if (cfg.num_hidden_layers == 0 or cfg.num_hidden_layers > 256) {
-            if (residentQwen3EmbeddingGraphRequired()) {
-                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "unsupported_layer_count");
-            }
             return null;
         }
         if (input_ids.len != batch * seq_len) return error.ShapeMismatch;
@@ -1018,10 +1000,7 @@ pub const EmbeddingPipeline = struct {
             cfg,
             cfg.num_hidden_layers,
             &layer_storage,
-        ) catch |err| {
-            if (residentQwen3EmbeddingGraphRequired()) {
-                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, @errorName(err));
-            }
+        ) catch {
             return null;
         };
 
@@ -1042,9 +1021,6 @@ pub const EmbeddingPipeline = struct {
             .layers = layers,
         });
         if (!planned) {
-            if (residentQwen3EmbeddingGraphRequired()) {
-                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "plan_failed");
-            }
             return null;
         }
 
@@ -1055,9 +1031,6 @@ pub const EmbeddingPipeline = struct {
 
         var active = try cb.decoderRuntimeBeginFrame();
         if (!active) {
-            if (residentQwen3EmbeddingGraphRequired()) {
-                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "begin_frame_failed");
-            }
             return null;
         }
         errdefer if (active) cb.decoderRuntimeCancelFrame() catch {};
@@ -1095,9 +1068,6 @@ pub const EmbeddingPipeline = struct {
         if (!executed) {
             try cb.decoderRuntimeCancelFrame();
             active = false;
-            if (residentQwen3EmbeddingGraphRequired()) {
-                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "execute_failed");
-            }
             return null;
         }
         try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -1120,12 +1090,7 @@ pub const EmbeddingPipeline = struct {
             error.UnsupportedPrimitiveOp,
             error.UnsupportedOperation,
             error.UnsupportedShape,
-            => {
-                if (residentQwen3EmbeddingGraphRequired()) {
-                    return self.residentProjectionFallback(.text, "text.pool.qwen3.graph", batch, @errorName(err));
-                }
-                return null;
-            },
+            => return null,
             else => return err,
         };
         defer pooled.deinit();
@@ -1564,45 +1529,7 @@ fn embedResidentFailClosedEnabled() bool {
     if (platform.env.getenvSlice("TERMITE_EMBED_RESIDENT_REQUIRED")) |value| {
         if (envFlagEnabled(value)) return true;
     }
-    if (platform.env.getenvSlice("TERMITE_REQUIRE_RESIDENT_QWEN3_EMBED")) |value| {
-        if (envFlagEnabled(value)) return true;
-    }
-    if (platform.env.getenvSlice("TERMITE_REQUIRE_QWEN3_EMBED_GRAPH")) |value| {
-        if (envFlagEnabled(value)) return true;
-    }
     return false;
-}
-
-fn residentQwen3EmbeddingDisabled() bool {
-    if (platform.env.getenvSlice("TERMITE_DISABLE_RESIDENT_QWEN3_EMBED")) |value| {
-        return envFlagEnabled(value);
-    }
-    return false;
-}
-
-fn residentQwen3EmbeddingRequired() bool {
-    if (platform.env.getenvSlice("TERMITE_REQUIRE_RESIDENT_QWEN3_EMBED")) |value| {
-        return envFlagEnabled(value);
-    }
-    return false;
-}
-
-fn residentQwen3EmbeddingGraphDisabled() bool {
-    if (platform.env.getenvSlice("TERMITE_DISABLE_QWEN3_EMBED_GRAPH")) |value| {
-        return envFlagEnabled(value);
-    }
-    return false;
-}
-
-fn residentQwen3EmbeddingGraphRequired() bool {
-    if (platform.env.getenvSlice("TERMITE_REQUIRE_QWEN3_EMBED_GRAPH")) |value| {
-        return envFlagEnabled(value);
-    }
-    return false;
-}
-
-fn residentQwen3EmbeddingOverrideLevel() usize {
-    return 4;
 }
 
 fn residentQwen3EmbeddingEligible(session: backends.Session, cfg: gpt_arch.Config, embedding_config: EmbeddingConfig) bool {
