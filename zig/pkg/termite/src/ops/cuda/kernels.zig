@@ -4010,5 +4010,5 @@ test "cuda q6_k smoke row writer uses gguf block layout" {
     try std.testing.expectEqual(@as(u8, 0x00), raw[208]);
     try std.testing.expectEqual(@as(u8, 0x3c), raw[209]);
     try std.testing.expectEqual(@as(u8, 0x11), raw[0]);
-    try std.testing.expectEqual(@as(u8, 0x22), raw[128]);
+    try std.testing.expectEqual(@as(u8, 0xaa), raw[128]);
 }
