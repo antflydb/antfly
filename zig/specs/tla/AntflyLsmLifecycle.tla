@@ -1,6 +1,6 @@
------------------------- MODULE AntflyZigRetirementLifecycle ------------------------
+------------------------------ MODULE AntflyLsmLifecycle ------------------------------
 (*
-  Allocation-failure lifecycle model for the migrated Zig runtime.
+  Allocation-failure lifecycle model for the migrated Zig LSM runtime.
 
   This model is intentionally scoped to the concrete ownership handoff bugs from
   the OOM retirement investigation, as they exist under zig/pkg/antfly/src in

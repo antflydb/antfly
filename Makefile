@@ -68,7 +68,6 @@ help:
 	@echo "  tla-check-txn      Model check transaction spec only (~10s)"
 	@echo "  tla-check-split    Model check shard split spec only"
 	@echo "  tla-check-snap     Model check snapshot transfer spec only (~90s)"
-	@echo "  tla-check-zig-lifecycle  Model check Zig retirement lifecycle OOM safety"
 	@echo "  tla-trace-raft     Validate raft ndjson traces against etcd/raft TLA+ spec"
 	@echo "                     Options: TRACE_FILES=path/to/*.ndjson"
 	@echo "  tla-trace-txn      Validate transaction ndjson traces against AntflyTransaction"
@@ -369,12 +368,12 @@ endif
 GOMODCACHE := $(shell go env GOMODCACHE)
 RAFT_TLA := $(GOMODCACHE)/go.etcd.io/raft/v3@v3.6.0/tla
 
-.PHONY: tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-zig-lifecycle tla-trace-raft tla-trace-txn
+.PHONY: tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft tla-trace-txn
 
 tla-tools:
 	@bash scripts/tla-tools.sh
 
-tla-check: tla-check-txn tla-check-split tla-check-snap tla-check-zig-lifecycle
+tla-check: tla-check-txn tla-check-split tla-check-snap
 
 tla-check-txn: tla-tools
 	@echo "==> Model checking transaction spec..."
@@ -395,13 +394,6 @@ tla-check-snap: tla-tools
 	source scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \
-	  -workers auto -deadlock
-
-tla-check-zig-lifecycle: tla-tools
-	@echo "==> Model checking Zig retirement lifecycle OOM safety..."
-	source scripts/tla-tools.sh && \
-	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflyZigRetirementLifecycle.cfg specs/tla/AntflyZigRetirementLifecycle.tla \
 	  -workers auto -deadlock
 
 tla-trace-raft: tla-tools
