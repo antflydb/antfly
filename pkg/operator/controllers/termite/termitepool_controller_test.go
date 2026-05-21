@@ -136,6 +136,12 @@ var _ = Describe("TermitePool Controller", func() {
 			Expect(container.StartupProbe).NotTo(BeNil())
 			Expect(container.ReadinessProbe).NotTo(BeNil())
 			Expect(container.LivenessProbe).NotTo(BeNil())
+			Expect(container.StartupProbe.HTTPGet.Path).To(Equal("/readyz"))
+			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/readyz"))
+			Expect(container.LivenessProbe.HTTPGet.Path).To(Equal("/healthz"))
+			Expect(container.StartupProbe.TimeoutSeconds).To(Equal(int32(5)))
+			Expect(container.ReadinessProbe.TimeoutSeconds).To(Equal(int32(5)))
+			Expect(container.LivenessProbe.TimeoutSeconds).To(Equal(int32(5)))
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())

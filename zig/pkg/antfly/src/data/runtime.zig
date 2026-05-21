@@ -1660,16 +1660,7 @@ pub const DataServer = struct {
         }
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
-        self.registerNodeIfConfigured() catch |err| switch (err) {
-            error.HttpConnectionClosing,
-            error.ConnectionResetByPeer,
-            error.ConnectionRefused,
-            error.BrokenPipe,
-            error.EndOfStream,
-            error.UnexpectedHttpStatus,
-            => {},
-            else => return err,
-        };
+        if (self.store_registration != null) self.store_status_dirty = true;
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
             error.SystemResources,

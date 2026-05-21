@@ -1477,32 +1477,35 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.StartupProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/ml/v1/models",
+				Path: "/readyz",
 				Port: intstr.FromString("http"),
 			},
 		},
 		FailureThreshold: failureThreshold,
 		PeriodSeconds:    periodSeconds,
+		TimeoutSeconds:   5,
 	}
 
 	container.ReadinessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/ml/v1/models",
+				Path: "/readyz",
 				Port: intstr.FromString("http"),
 			},
 		},
-		PeriodSeconds: 5,
+		PeriodSeconds:  5,
+		TimeoutSeconds: 5,
 	}
 
 	container.LivenessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/ml/v1/models",
+				Path: "/healthz",
 				Port: intstr.FromString("http"),
 			},
 		},
-		PeriodSeconds: 30,
+		PeriodSeconds:  30,
+		TimeoutSeconds: 5,
 	}
 }
 
