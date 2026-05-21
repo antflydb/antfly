@@ -13,34 +13,14 @@
 // limitations under the License.
 
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
-import { createReadStream, existsSync, statSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
-import { createServer } from 'node:http';
-import { extname, join, normalize, relative, resolve, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
+
+import { createStaticServer, pathIsInside } from './file_server.mjs';
 
 const webRoot = resolve(new URL('../web/', import.meta.url).pathname);
 const defaultModelsDir = resolve(join(homedir(), '.termite/models'));
-
-const contentTypes = new Map([
-  ['.html', 'text/html; charset=utf-8'],
-  ['.js', 'text/javascript; charset=utf-8'],
-  ['.mjs', 'text/javascript; charset=utf-8'],
-  ['.json', 'application/json; charset=utf-8'],
-  ['.css', 'text/css; charset=utf-8'],
-  ['.wgsl', 'text/plain; charset=utf-8'],
-  ['.wasm', 'application/wasm'],
-  ['.txt', 'text/plain; charset=utf-8'],
-  ['.png', 'image/png'],
-  ['.jpg', 'image/jpeg'],
-  ['.jpeg', 'image/jpeg'],
-  ['.gif', 'image/gif'],
-  ['.svg', 'image/svg+xml'],
-  ['.webp', 'image/webp'],
-  ['.mp3', 'audio/mpeg'],
-  ['.wav', 'audio/wav'],
-  ['.ogg', 'audio/ogg'],
-]);
 
 let serverOrigin = null;
 let mainWindow = null;
@@ -85,115 +65,25 @@ async function collectModelFiles(rootDir, currentDir = rootDir, out = []) {
   return out;
 }
 
-function writeStandardHeaders(res, extra = {}) {
-  res.writeHead(200, {
-    'Cross-Origin-Opener-Policy': 'same-origin',
-    'Cross-Origin-Embedder-Policy': 'require-corp',
-    'Cross-Origin-Resource-Policy': 'cross-origin',
-    'Cache-Control': 'no-store',
-    ...extra,
-  });
+const allowedModelRoots = new Set([defaultModelsDir]);
+
+function rememberAllowedModelRoot(dirPath) {
+  allowedModelRoots.add(resolve(dirPath));
 }
 
-function parseRangeHeader(rangeHeader, size) {
-  if (typeof rangeHeader !== 'string' || !rangeHeader.startsWith('bytes=')) return null;
-  const [spec] = rangeHeader.slice('bytes='.length).split(',');
-  if (!spec) return null;
-  const [startPart, endPart] = spec.split('-');
-
-  if (startPart === '' && endPart === '') return null;
-
-  let start;
-  let end;
-  if (startPart === '') {
-    const suffixLength = Number.parseInt(endPart, 10);
-    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
-    start = Math.max(0, size - suffixLength);
-    end = size - 1;
-  } else {
-    start = Number.parseInt(startPart, 10);
-    end = endPart === '' ? size - 1 : Number.parseInt(endPart, 10);
+function modelRootIsAllowed(dirPath) {
+  const resolved = resolve(dirPath);
+  for (const root of allowedModelRoots) {
+    if (pathIsInside(resolved, root)) return true;
   }
-
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= size) {
-    return null;
-  }
-  return {
-    start,
-    end: Math.min(end, size - 1),
-  };
-}
-
-function streamFile(req, res, filePath) {
-  const stats = statSync(filePath);
-  const contentType = contentTypes.get(extname(filePath).toLowerCase()) || 'application/octet-stream';
-  const range = parseRangeHeader(req.headers.range, stats.size);
-  const commonHeaders = {
-    'Accept-Ranges': 'bytes',
-    'Content-Type': contentType,
-  };
-
-  if (range) {
-    const contentLength = range.end - range.start + 1;
-    res.writeHead(206, {
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
-      'Cross-Origin-Resource-Policy': 'cross-origin',
-      'Cache-Control': 'no-store',
-      ...commonHeaders,
-      'Content-Length': contentLength,
-      'Content-Range': `bytes ${range.start}-${range.end}/${stats.size}`,
-    });
-    createReadStream(filePath, { start: range.start, end: range.end }).pipe(res);
-    return;
-  }
-
-  writeStandardHeaders(res, {
-    ...commonHeaders,
-    'Content-Length': stats.size,
-  });
-  createReadStream(filePath).pipe(res);
-}
-
-function createStaticServer() {
-  return createServer((req, res) => {
-    const url = new URL(req.url || '/', 'http://localhost');
-    if (url.pathname === '/__termite__/file') {
-      const absPath = url.searchParams.get('path');
-      if (!absPath) {
-        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Missing path\n');
-        return;
-      }
-      const normalizedPath = resolve(absPath);
-      if (!existsSync(normalizedPath) || !statSync(normalizedPath).isFile()) {
-        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Not found\n');
-        return;
-      }
-      streamFile(req, res, normalizedPath);
-      return;
-    }
-
-    const requested = url.pathname === '/' ? '/index.html' : url.pathname;
-    const filePath = normalize(join(webRoot, requested));
-    if (!filePath.startsWith(webRoot) || !existsSync(filePath)) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Not found\n');
-      return;
-    }
-    const stats = statSync(filePath);
-    if (!stats.isFile()) {
-      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Forbidden\n');
-      return;
-    }
-    streamFile(req, res, filePath);
-  });
+  return false;
 }
 
 async function startServer() {
-  const server = createStaticServer();
+  const server = createStaticServer({
+    webRoot,
+    getAllowedFileRoots: () => Array.from(allowedModelRoots),
+  });
   await new Promise((resolvePromise, rejectPromise) => {
     server.once('error', rejectPromise);
     server.listen(0, '127.0.0.1', () => resolvePromise());
@@ -229,11 +119,16 @@ ipcMain.handle('termite-electron:choose-models-dir', async () => {
     defaultPath: defaultModelsDir,
   });
   if (result.canceled || result.filePaths.length === 0) return null;
-  return resolve(result.filePaths[0]);
+  const chosen = resolve(result.filePaths[0]);
+  rememberAllowedModelRoot(chosen);
+  return chosen;
 });
 
 ipcMain.handle('termite-electron:scan-models-dir', async (_event, dirPath) => {
   const resolved = resolve(dirPath || defaultModelsDir);
+  if (!modelRootIsAllowed(resolved)) {
+    throw new Error(`models directory ${resolved} has not been selected by the user`);
+  }
   const files = await collectModelFiles(resolved);
   return {
     directoryPath: resolved,
