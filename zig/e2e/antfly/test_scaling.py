@@ -638,19 +638,29 @@ class MultiNodeScalingCluster:
     def create_table(self, table_name: str, *, num_shards: int) -> None:
         last_error: str | None = None
 
+        def table_created_in_metadata() -> bool:
+            try:
+                group_ids = _table_group_ids(self, table_name)
+            except (AssertionError, requests.RequestException, ValueError):
+                return False
+            return group_ids is not None and len(group_ids) >= num_shards
+
         def create_once() -> bool | None:
             nonlocal last_error
-            try:
-                response = requests.post(
-                    f"{self.data_api_urls[0]}/tables/{table_name}",
-                    json={"num_shards": num_shards},
-                    timeout=10,
-                )
-                if response.ok:
+            for api_url in self.live_data_api_urls or self.data_api_urls:
+                try:
+                    response = requests.post(
+                        f"{api_url}/tables/{table_name}",
+                        json={"num_shards": num_shards},
+                        timeout=10,
+                    )
+                    if response.ok:
+                        return True
+                    last_error = f"{response.status_code}: {response.text}"
+                except requests.RequestException as exc:
+                    last_error = repr(exc)
+                if table_created_in_metadata():
                     return True
-                last_error = f"{response.status_code}: {response.text}"
-            except requests.RequestException as exc:
-                last_error = repr(exc)
             return None
 
         created = wait_until(create_once, timeout_s=60.0, interval_s=0.5)
@@ -808,19 +818,70 @@ def _lookup_from_any_data_node(
     return None
 
 
-def _insert_docs(cluster: MultiNodeScalingCluster, table_name: str, docs: dict[str, dict[str, Any]]) -> None:
-    api_url = wait_until(lambda: _data_api_url_for_table(cluster, table_name), timeout_s=30.0, interval_s=0.5)
-    if api_url is None:
-        api_url = cluster.live_data_api_urls[0]
-    response = requests.post(
-        f"{api_url}/tables/{table_name}/batch",
-        json={"inserts": docs, "sync_level": "write"},
-        timeout=30,
+def _insert_docs(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    docs: dict[str, dict[str, Any]],
+    *,
+    min_group_count: int = 1,
+) -> None:
+    last_error: str | None = None
+
+    def route_ready() -> str | None:
+        try:
+            return _data_api_url_for_table(
+                cluster,
+                table_name,
+                require_all_group_leaders=True,
+                min_group_count=min_group_count,
+            )
+        except (AssertionError, requests.RequestException, ValueError):
+            return None
+
+    api_url = wait_until(route_ready, timeout_s=60.0, interval_s=0.5)
+    assert api_url is not None, (
+        f"table {table_name} never became write-routable before seed batch\n"
+        f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
+        f"snapshot: {cluster.metadata_snapshot()}\n"
+        f"{cluster.debug_logs()}"
     )
-    response.raise_for_status()
+
+    def post_once() -> bool | None:
+        nonlocal api_url, last_error
+        api_url = route_ready() or api_url
+        try:
+            response = requests.post(
+                f"{api_url}/tables/{table_name}/batch",
+                json={"inserts": docs, "sync_level": "write"},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            last_error = repr(exc)
+            return None
+        if response.ok:
+            return True
+        last_error = f"{response.status_code}: {response.text}"
+        if response.status_code in {429, 500, 503}:
+            return None
+        response.raise_for_status()
+        return None
+
+    inserted = wait_until(post_once, timeout_s=90.0, interval_s=0.5)
+    assert inserted is True, (
+        f"failed to insert seed docs for {table_name}: {last_error}\n"
+        f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
+        f"snapshot: {cluster.metadata_snapshot()}\n"
+        f"{cluster.debug_logs()}"
+    )
 
 
-def _data_api_url_for_table(cluster: MultiNodeScalingCluster, table_name: str) -> str | None:
+def _data_api_url_for_table(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    *,
+    require_all_group_leaders: bool = False,
+    min_group_count: int = 1,
+) -> str | None:
     snapshot = cluster.metadata_snapshot()
     table_id: int | None = None
     for table in snapshot.get("tables", []):
@@ -829,20 +890,31 @@ def _data_api_url_for_table(cluster: MultiNodeScalingCluster, table_name: str) -
             break
     if table_id is None:
         return None
-    group_id: int | None = None
+    group_ids: list[int] = []
     for table_range in snapshot.get("ranges", []):
         if isinstance(table_range, dict) and int(table_range.get("table_id", 0)) == table_id:
-            group_id = int(table_range.get("group_id", 0))
-            break
-    if group_id is None:
+            group_ids.append(int(table_range.get("group_id", 0)))
+    if len(group_ids) < min_group_count:
         return None
-    leader_store_id: int | None = None
+    group_ids.sort()
+
+    leader_store_by_group: dict[int, int] = {}
     for status in snapshot.get("merged_group_statuses", []):
-        if isinstance(status, dict) and int(status.get("group_id", 0)) == group_id:
-            raw_leader = int(status.get("leader_store_id", 0))
-            if raw_leader != 0:
-                leader_store_id = raw_leader
-            break
+        if not isinstance(status, dict):
+            continue
+        group_id = int(status.get("group_id", 0))
+        if group_id not in group_ids:
+            continue
+        raw_leader = int(status.get("leader_store_id", 0))
+        if raw_leader != 0:
+            leader_store_by_group[group_id] = raw_leader
+    if require_all_group_leaders and any(group_id not in leader_store_by_group for group_id in group_ids):
+        return None
+
+    group_id = group_ids[0]
+    leader_store_id: int | None = None
+    if group_id in leader_store_by_group:
+        leader_store_id = leader_store_by_group[group_id]
     if leader_store_id is not None:
         for store in snapshot.get("stores", []):
             if not isinstance(store, dict) or int(store.get("store_id", 0)) != leader_store_id:
@@ -1133,7 +1205,7 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
     cluster.create_table(table_name, num_shards=5)
 
     docs = {f"doc-{i:02d}": {"title": f"doc {i}", "rank": i} for i in range(12)}
-    _insert_docs(cluster, table_name, docs)
+    _insert_docs(cluster, table_name, docs, min_group_count=5)
 
     group_ids = _wait_for_group_count(cluster, table_name, min_count=5)
     initial_nodes = wait_until(
@@ -1194,7 +1266,7 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
         }
         for i in range(48)
     }
-    _insert_docs(cluster, table_name, docs)
+    _insert_docs(cluster, table_name, docs, min_group_count=1)
 
     def split_completed() -> set[int] | None:
         try:
@@ -1224,7 +1296,7 @@ def test_autoscaling_node_churn_keeps_reads_available(
     cluster.create_table(table_name, num_shards=6)
 
     docs = {f"doc-{i:02d}": {"title": f"churn doc {i}", "rank": i} for i in range(18)}
-    _insert_docs(cluster, table_name, docs)
+    _insert_docs(cluster, table_name, docs, min_group_count=6)
     _assert_docs_readable(cluster, table_name, docs)
 
     group_ids = _wait_for_group_count(cluster, table_name, min_count=6)
