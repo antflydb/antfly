@@ -259,6 +259,7 @@ const CudaRuntimeMetadata = struct {
     compute_major: i32,
     compute_minor: i32,
     total_memory_bytes: u64,
+    host_training_fallbacks_allowed: bool,
 };
 
 const CudaMetadata = CudaRuntimeMetadata;
@@ -2390,6 +2391,7 @@ fn collectBackendMetadata(allocator: std.mem.Allocator, recipe: Recipe) !Backend
             .compute_major = cuda.compute_major,
             .compute_minor = cuda.compute_minor,
             .total_memory_bytes = cuda.total_memory_bytes,
+            .host_training_fallbacks_allowed = platform.env.getenvBoolDefault("TERMITE_CUDA_ALLOW_HOST_TRAINING_FALLBACKS", true),
         },
     };
 }
@@ -2407,6 +2409,7 @@ fn collectCudaMetadata() CudaMetadata {
         .compute_major = cuda.compute_major,
         .compute_minor = cuda.compute_minor,
         .total_memory_bytes = cuda.total_memory_bytes,
+        .host_training_fallbacks_allowed = platform.env.getenvBoolDefault("TERMITE_CUDA_ALLOW_HOST_TRAINING_FALLBACKS", true),
     };
 }
 
@@ -5489,6 +5492,20 @@ fn cudaAvailableForFinetune() bool {
     return build_options.enable_cuda and backends.gpu_inventory.cudaRuntimeAvailable();
 }
 
+const AutodiffBackendResolveError = error{
+    CudaNotAvailable,
+    CudaRuntimeUnavailable,
+    MlxNotAvailable,
+    InvalidBackend,
+};
+
+const RecipeBackendResolveError = error{
+    CudaBackendUnavailable,
+    CudaRuntimeUnavailable,
+    MlxNotAvailable,
+    InvalidBackend,
+};
+
 fn recipeFamilyOrNull(recipe: Recipe) ?[]const u8 {
     if (recipe.model.family) |family| return family;
     if (recipe.model.path) |path| return inferFamilyFromModelPath(path);
@@ -5526,13 +5543,13 @@ fn resolvedRecipeBackendName(recipe: Recipe) []const u8 {
     return raw;
 }
 
-fn requireCudaFinetuneAvailable() !void {
+fn requireCudaFinetuneAvailable() AutodiffBackendResolveError!void {
     if (!build_options.enable_cuda) return error.CudaNotAvailable;
     const status = backends.gpu_inventory.cudaStatus();
     if (!status.runtime_available) return error.CudaRuntimeUnavailable;
 }
 
-fn resolveQwenAutodiffBackend(value: ?[]const u8) !qwen2_real_autodiff.BackendKind {
+fn resolveQwenAutodiffBackend(value: ?[]const u8) AutodiffBackendResolveError!qwen2_real_autodiff.BackendKind {
     const raw = value orelse "auto";
     if (backendNameEquals(raw, "auto")) {
         if (cudaAvailableForFinetune()) return .cuda;
@@ -5551,14 +5568,16 @@ fn resolveQwenAutodiffBackend(value: ?[]const u8) !qwen2_real_autodiff.BackendKi
     return error.InvalidBackend;
 }
 
-fn resolveQwenBackendKind(value: ?[]const u8) !qwen2_real_autodiff.BackendKind {
+fn resolveQwenBackendKind(value: ?[]const u8) RecipeBackendResolveError!qwen2_real_autodiff.BackendKind {
     return resolveQwenAutodiffBackend(value) catch |err| switch (err) {
         error.CudaNotAvailable => error.CudaBackendUnavailable,
-        else => err,
+        error.CudaRuntimeUnavailable => error.CudaRuntimeUnavailable,
+        error.MlxNotAvailable => error.MlxNotAvailable,
+        error.InvalidBackend => error.InvalidBackend,
     };
 }
 
-fn resolveGemmaAutodiffBackend(value: ?[]const u8) !gemma4_real_autodiff.BackendKind {
+fn resolveGemmaAutodiffBackend(value: ?[]const u8) AutodiffBackendResolveError!gemma4_real_autodiff.BackendKind {
     const raw = value orelse "auto";
     if (backendNameEquals(raw, "auto")) {
         if (cudaAvailableForFinetune()) return .cuda;
@@ -5577,10 +5596,12 @@ fn resolveGemmaAutodiffBackend(value: ?[]const u8) !gemma4_real_autodiff.Backend
     return error.InvalidBackend;
 }
 
-fn resolveGemmaBackendKind(value: ?[]const u8) !gemma4_real_autodiff.BackendKind {
+fn resolveGemmaBackendKind(value: ?[]const u8) RecipeBackendResolveError!gemma4_real_autodiff.BackendKind {
     return resolveGemmaAutodiffBackend(value) catch |err| switch (err) {
         error.CudaNotAvailable => error.CudaBackendUnavailable,
-        else => err,
+        error.CudaRuntimeUnavailable => error.CudaRuntimeUnavailable,
+        error.MlxNotAvailable => error.MlxNotAvailable,
+        error.InvalidBackend => error.InvalidBackend,
     };
 }
 

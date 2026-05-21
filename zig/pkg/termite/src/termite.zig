@@ -45,6 +45,7 @@ pub const quantize = @import("quantize/root.zig");
 pub const client = if (build_options.skip_openapi) struct {} else @import("termite_client");
 pub const linalg = @import("termite_linalg");
 pub const native_generate = @import("native_generate.zig");
+pub const native_backend_choice = @import("native_backend_choice.zig");
 pub const native_compile = @import("native_compile.zig");
 pub const native_export = @import("native_export.zig");
 pub const native_quantize = @import("native_quantize.zig");

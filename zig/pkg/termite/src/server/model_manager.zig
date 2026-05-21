@@ -1161,7 +1161,9 @@ fn loadSessionForPreferredBackends(
         var backend_session_manager = sessionManagerForPreferredBackends(allocator, single_backend[0..], source_session_manager);
         if (backend_session_manager.loadModel(candidate_path)) |session| {
             return session;
-        } else |_| {}
+        } else |err| {
+            std.log.err("backend {s} failed to load {s}: {s}", .{ @tagName(backend), candidate_path, @errorName(err) });
+        }
     }
 
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});

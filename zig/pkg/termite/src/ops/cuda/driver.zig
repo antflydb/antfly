@@ -21,8 +21,27 @@ pub const CUcontext = ?*anyopaque;
 pub const CUstream = ?*anyopaque;
 pub const CUmodule = ?*anyopaque;
 pub const CUfunction = ?*anyopaque;
+pub const CUgraph = ?*anyopaque;
+pub const CUgraphExec = ?*anyopaque;
+pub const CUgraphNode = ?*anyopaque;
+pub const CUgraphNodeType = c_uint;
 pub const CUjit_option = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
+pub const CU_STREAM_CAPTURE_MODE_RELAXED: c_uint = 2;
+pub const CU_GRAPH_NODE_TYPE_KERNEL: CUgraphNodeType = 0;
+
+pub const CUDA_KERNEL_NODE_PARAMS = extern struct {
+    func: CUfunction,
+    gridDimX: c_uint,
+    gridDimY: c_uint,
+    gridDimZ: c_uint,
+    blockDimX: c_uint,
+    blockDimY: c_uint,
+    blockDimZ: c_uint,
+    sharedMemBytes: c_uint,
+    kernelParams: ?[*]?*anyopaque,
+    extra: ?[*]?*anyopaque,
+};
 
 pub const CU_JIT_INFO_LOG_BUFFER: CUjit_option = 3;
 pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: CUjit_option = 4;
@@ -55,6 +74,8 @@ pub const CudaDriver = struct {
         cuStreamCreate: *const fn (phStream: *CUstream, flags: c_uint) callconv(.c) CUresult,
         cuStreamSynchronize: *const fn (hStream: CUstream) callconv(.c) CUresult,
         cuStreamDestroy: *const fn (hStream: CUstream) callconv(.c) CUresult,
+        cuStreamBeginCapture: ?*const fn (hStream: CUstream, mode: c_uint) callconv(.c) CUresult,
+        cuStreamEndCapture: ?*const fn (hStream: CUstream, phGraph: *CUgraph) callconv(.c) CUresult,
         cuMemAlloc: *const fn (dptr: *CUdeviceptr, bytesize: usize) callconv(.c) CUresult,
         cuMemFree: *const fn (dptr: CUdeviceptr) callconv(.c) CUresult,
         cuMemcpyHtoDAsync: *const fn (dstDevice: CUdeviceptr, srcHost: ?*const anyopaque, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
@@ -63,6 +84,13 @@ pub const CudaDriver = struct {
         cuModuleLoadDataEx: *const fn (module: *CUmodule, image: ?*const anyopaque, numOptions: c_uint, options: ?[*]CUjit_option, optionValues: ?[*]?*anyopaque) callconv(.c) CUresult,
         cuModuleUnload: *const fn (hmod: CUmodule) callconv(.c) CUresult,
         cuModuleGetFunction: *const fn (hfunc: *CUfunction, hmod: CUmodule, name: [*:0]const u8) callconv(.c) CUresult,
+        cuGraphInstantiateWithFlags: ?*const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: u64) callconv(.c) CUresult,
+        cuGraphGetNodes: ?*const fn (hGraph: CUgraph, nodes: ?[*]CUgraphNode, numNodes: *usize) callconv(.c) CUresult,
+        cuGraphNodeGetType: ?*const fn (hNode: CUgraphNode, type_: *CUgraphNodeType) callconv(.c) CUresult,
+        cuGraphExecKernelNodeSetParams: ?*const fn (hGraphExec: CUgraphExec, hNode: CUgraphNode, nodeParams: *const CUDA_KERNEL_NODE_PARAMS) callconv(.c) CUresult,
+        cuGraphLaunch: ?*const fn (hGraphExec: CUgraphExec, hStream: CUstream) callconv(.c) CUresult,
+        cuGraphExecDestroy: ?*const fn (hGraphExec: CUgraphExec) callconv(.c) CUresult,
+        cuGraphDestroy: ?*const fn (hGraph: CUgraph) callconv(.c) CUresult,
         cuLaunchKernel: *const fn (
             f: CUfunction,
             gridDimX: c_uint,
@@ -99,6 +127,8 @@ pub const CudaDriver = struct {
                 .cuStreamCreate = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamCreate), "cuStreamCreate") catch return error.CudaSymbolMissing,
                 .cuStreamSynchronize = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamSynchronize), "cuStreamSynchronize") catch return error.CudaSymbolMissing,
                 .cuStreamDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamDestroy), "cuStreamDestroy") catch return error.CudaSymbolMissing,
+                .cuStreamBeginCapture = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuStreamBeginCapture)), "cuStreamBeginCapture") catch null,
+                .cuStreamEndCapture = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuStreamEndCapture)), "cuStreamEndCapture") catch null,
                 .cuMemAlloc = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemAlloc), "cuMemAlloc_v2") catch return error.CudaSymbolMissing,
                 .cuMemFree = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemFree), "cuMemFree_v2") catch return error.CudaSymbolMissing,
                 .cuMemcpyHtoDAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyHtoDAsync), "cuMemcpyHtoDAsync_v2") catch return error.CudaSymbolMissing,
@@ -107,6 +137,13 @@ pub const CudaDriver = struct {
                 .cuModuleLoadDataEx = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleLoadDataEx), "cuModuleLoadDataEx") catch return error.CudaSymbolMissing,
                 .cuModuleUnload = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleUnload), "cuModuleUnload") catch return error.CudaSymbolMissing,
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,
+                .cuGraphInstantiateWithFlags = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuGraphInstantiateWithFlags)), "cuGraphInstantiateWithFlags") catch null,
+                .cuGraphGetNodes = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuGraphGetNodes)), "cuGraphGetNodes") catch null,
+                .cuGraphNodeGetType = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuGraphNodeGetType)), "cuGraphNodeGetType") catch null,
+                .cuGraphExecKernelNodeSetParams = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuGraphExecKernelNodeSetParams)), "cuGraphExecKernelNodeSetParams") catch null,
+                .cuGraphLaunch = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuGraphLaunch)), "cuGraphLaunch") catch null,
+                .cuGraphExecDestroy = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuGraphExecDestroy)), "cuGraphExecDestroy") catch null,
+                .cuGraphDestroy = lookup(&lib, NonOptional(@TypeOf(@as(Table, undefined).cuGraphDestroy)), "cuGraphDestroy") catch null,
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
                 .cuGetErrorName = lookup(&lib, @TypeOf(@as(Table, undefined).cuGetErrorName), "cuGetErrorName") catch return error.CudaSymbolMissing,
                 .cuGetErrorString = lookup(&lib, @TypeOf(@as(Table, undefined).cuGetErrorString), "cuGetErrorString") catch return error.CudaSymbolMissing,
@@ -116,6 +153,36 @@ pub const CudaDriver = struct {
 
     pub fn deinit(self: *CudaDriver) void {
         self.lib.close();
+    }
+
+    pub const GraphFns = struct {
+        cuStreamBeginCapture: NonOptional(@TypeOf(@as(Table, undefined).cuStreamBeginCapture)),
+        cuStreamEndCapture: NonOptional(@TypeOf(@as(Table, undefined).cuStreamEndCapture)),
+        cuGraphInstantiateWithFlags: NonOptional(@TypeOf(@as(Table, undefined).cuGraphInstantiateWithFlags)),
+        cuGraphGetNodes: NonOptional(@TypeOf(@as(Table, undefined).cuGraphGetNodes)),
+        cuGraphNodeGetType: NonOptional(@TypeOf(@as(Table, undefined).cuGraphNodeGetType)),
+        cuGraphExecKernelNodeSetParams: NonOptional(@TypeOf(@as(Table, undefined).cuGraphExecKernelNodeSetParams)),
+        cuGraphLaunch: NonOptional(@TypeOf(@as(Table, undefined).cuGraphLaunch)),
+        cuGraphExecDestroy: NonOptional(@TypeOf(@as(Table, undefined).cuGraphExecDestroy)),
+        cuGraphDestroy: NonOptional(@TypeOf(@as(Table, undefined).cuGraphDestroy)),
+    };
+
+    pub fn graphFns(self: *const CudaDriver) ?GraphFns {
+        return .{
+            .cuStreamBeginCapture = self.fns.cuStreamBeginCapture orelse return null,
+            .cuStreamEndCapture = self.fns.cuStreamEndCapture orelse return null,
+            .cuGraphInstantiateWithFlags = self.fns.cuGraphInstantiateWithFlags orelse return null,
+            .cuGraphGetNodes = self.fns.cuGraphGetNodes orelse return null,
+            .cuGraphNodeGetType = self.fns.cuGraphNodeGetType orelse return null,
+            .cuGraphExecKernelNodeSetParams = self.fns.cuGraphExecKernelNodeSetParams orelse return null,
+            .cuGraphLaunch = self.fns.cuGraphLaunch orelse return null,
+            .cuGraphExecDestroy = self.fns.cuGraphExecDestroy orelse return null,
+            .cuGraphDestroy = self.fns.cuGraphDestroy orelse return null,
+        };
+    }
+
+    pub fn supportsGraphs(self: *const CudaDriver) bool {
+        return self.graphFns() != null;
     }
 
     pub fn check(self: *const CudaDriver, result: CUresult) Error!void {
@@ -139,6 +206,13 @@ pub const CudaDriver = struct {
         return "";
     }
 };
+
+fn NonOptional(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |opt| opt.child,
+        else => T,
+    };
+}
 
 fn lookup(lib: *std.DynLib, comptime T: type, name: [:0]const u8) Error!T {
     return lib.lookup(T, name) orelse error.CudaSymbolMissing;

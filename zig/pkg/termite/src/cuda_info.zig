@@ -88,7 +88,7 @@ fn printUsage() void {
         \\usage: termite cuda-info [--json] [--smoke]
         \\
         \\  --json    Print structured CUDA inventory JSON. With --smoke, smoke results are embedded in JSON.
-        \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, Q8_0, and Q4_0.
+        \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, attention, and quantized linear kernels.
         \\
     , .{});
 }
@@ -108,6 +108,10 @@ fn runSmoke(allocator: std.mem.Allocator, emit_text: bool) SmokeStatus {
         if (emit_text) print("smoke: q4_0_f32 ok\n", .{});
         cuda_kernels.smokeQ4_K(allocator) catch |err| return smokeFailed("q4_k_f32", err, emit_text);
         if (emit_text) print("smoke: q4_k_f32 ok\n", .{});
+        cuda_kernels.smokeQ5_K(allocator) catch |err| return smokeFailed("q5_k_f32", err, emit_text);
+        if (emit_text) print("smoke: q5_k_f32 ok\n", .{});
+        cuda_kernels.smokeQ6_K(allocator) catch |err| return smokeFailed("q6_k_f32", err, emit_text);
+        if (emit_text) print("smoke: q6_k_f32 ok\n", .{});
         return .{ .requested = true, .ok = true };
     }
 }

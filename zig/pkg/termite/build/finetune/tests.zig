@@ -45,6 +45,7 @@ const tests = [_]common.TestSpec{
         .root_source_file = "src/test_entity_cleanup_model.zig",
         .description = "Run isolated learned entity cleanup model tests",
         .imports = &.{ .build_options, .termite_hf_tokenizer },
+        .link_libc = true,
     },
     .{
         .step_name = "test-entity-cleanup-gliner-cache",

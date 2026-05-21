@@ -7,7 +7,7 @@
 //
 
 .version 9.0
-.target sm_75
+.target sm_61
 .address_size 64
 
 	// .globl	termite_fill_f32
@@ -23096,3 +23096,4 @@ $L__BB58_2:
 	ret;
 
 }
+

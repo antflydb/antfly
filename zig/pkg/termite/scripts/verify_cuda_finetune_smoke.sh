@@ -14,6 +14,29 @@ echo "checking CUDA source/PTX artifacts"
 export TERMITE_CUDA_REQUIRE_PTXAS="${TERMITE_CUDA_REQUIRE_PTXAS:-1}"
 scripts/check_cuda_artifacts.sh
 
+system_blas="${TERMITE_CUDA_SYSTEM_BLAS:-auto}"
+case "${system_blas}" in
+  auto)
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      system_blas=true
+    elif [[ -n "${TERMITE_CUDA_BLAS_ROOT:-}" ]]; then
+      system_blas=true
+    else
+      system_blas=false
+    fi
+    ;;
+  1|true|TRUE|yes|YES)
+    system_blas=true
+    ;;
+  0|false|FALSE|no|NO)
+    system_blas=false
+    ;;
+  *)
+    echo "invalid TERMITE_CUDA_SYSTEM_BLAS=${TERMITE_CUDA_SYSTEM_BLAS}" >&2
+    exit 1
+    ;;
+esac
+
 cuda_build_flags=(
   -Dshared-lib-root=../..
   -Dmlx=false
@@ -21,9 +44,12 @@ cuda_build_flags=(
   -Donnx=false
   -Dcuda=true
   -Dcuda-artifacts=portable
-  -Dsystem-blas=true
+  -Dsystem-blas="${system_blas}"
   -Dskip-openapi=true
 )
+if [[ -n "${TERMITE_CUDA_BLAS_ROOT:-}" ]]; then
+  cuda_build_flags+=(-Dblas-root="${TERMITE_CUDA_BLAS_ROOT}")
+fi
 
 echo "building CUDA-enabled termite test binary"
 ZIG_GLOBAL_CACHE_DIR="${global_cache}" ZIG_LOCAL_CACHE_DIR="${local_cache}" \
@@ -45,7 +71,7 @@ fi
 
 cuda_info_json="${out_root}/cuda-info-smoke.json"
 echo "running CUDA runtime/kernel preflight"
-if ! "${termite_bin}" cuda-info --json --smoke > "${cuda_info_json}"; then
+if ! "${termite_bin}" cuda-info --json --smoke > "${cuda_info_json}" 2>&1; then
   cat "${cuda_info_json}" >&2
   exit 1
 fi

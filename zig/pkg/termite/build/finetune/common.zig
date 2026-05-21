@@ -121,6 +121,7 @@ pub const TestSpec = struct {
     description: []const u8,
     imports: []const Import = &.{},
     native_link: NativeLink = .none,
+    link_libc: bool = false,
 };
 
 pub fn addCommand(ctx: Context, spec: CommandSpec) void {
@@ -156,6 +157,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
     test_exe.root_module.addImport("antfly_platform", ctx.antfly_platform_mod);
     addImports(ctx, test_exe.root_module, spec.imports);
     configureNative(ctx, test_exe, spec.native_link);
+    if (spec.link_libc) test_exe.root_module.link_libc = true;
 
     const run = b.addRunArtifact(test_exe);
     const step = b.step(spec.step_name, spec.description);

@@ -912,28 +912,193 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
 pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
 
-    var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, override);
-    defer native_session.close();
-    const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
-    if (native_impl.backend_type != .native) return error.InvalidBackend;
-    if (!cudaSupportsArch(native_impl.arch_config)) return error.UnsupportedCudaArchitecture;
+    const direct_quant_enabled = directQuantEnabled();
+    const plan_context = defaultPlanContextForBackend(.gpu);
+    const progress = platform.env.getenvBoolDefault("TERMITE_CUDA_LOAD_PROGRESS", false);
+
+    var mf = try manifest_mod.loadFromDir(allocator, model_path);
+    defer mf.deinit();
+
+    var arch_config = try detectArchitecture(allocator, model_path, mf);
+    if (!cudaSupportsArch(arch_config)) return error.UnsupportedCudaArchitecture;
+
+    var store = try tensor_store_mod.openFromManifest(allocator, mf);
+    var store_owned = true;
+    errdefer if (store_owned) store.deinit();
+    if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
+        defer {
+            var r = report;
+            r.deinit();
+        }
+        try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
+    }
+    const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
+    const all_names = try source.listNames(allocator);
+    defer allocator.free(all_names);
+    try maybeInferGptAttentionLayoutFromStore(allocator, store, all_names, &arch_config);
+
+    const actual_prefix = detected: {
+        switch (arch_config) {
+            .gpt => |cfg| if (cfg.weight_prefix.len != 0) break :detected "",
+            else => {},
+        }
+        var detected_prefix: []const u8 = switch (arch_config) {
+            .bert => |cfg| cfg.effectivePrefix(),
+            .deberta => "deberta",
+            .layoutlmv3 => |cfg| cfg.effectivePrefix(),
+            else => "",
+        };
+        for (all_names) |name| {
+            if (std.mem.startsWith(u8, name, "bert.")) {
+                detected_prefix = "bert";
+                break;
+            } else if (std.mem.startsWith(u8, name, "deberta.")) {
+                detected_prefix = "deberta";
+                break;
+            } else if (std.mem.startsWith(u8, name, "roberta.")) {
+                detected_prefix = "roberta";
+                break;
+            } else if (std.mem.startsWith(u8, name, "distilbert.")) {
+                detected_prefix = "distilbert";
+                break;
+            } else if (std.mem.startsWith(u8, name, "layoutlmv3.")) {
+                detected_prefix = "layoutlmv3";
+                break;
+            } else if (arch_config == .gpt and std.mem.startsWith(u8, name, "model.language_model.")) {
+                detected_prefix = "model.language_model";
+                break;
+            } else if (arch_config == .gpt and std.mem.startsWith(u8, name, "language_model.")) {
+                detected_prefix = "language_model";
+                break;
+            }
+        }
+        break :detected detected_prefix;
+    };
 
     var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
     errdefer cuda_compute.deinit();
-    var it = native_impl.backend_data.native.resident_weights.iterator();
-    while (it.next()) |entry| {
-        const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
-        cuda_compute.insertWeightFromLoaded(owned_key, entry.value_ptr) catch |err| {
-            allocator.free(owned_key);
-            return err;
+
+    var lazy_weights = std.StringHashMapUnmanaged(LazyWeightEntry){};
+    errdefer {
+        var lazy_it = lazy_weights.iterator();
+        while (lazy_it.next()) |entry| {
+            if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
+            entry.value_ptr.tensor_ref.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        lazy_weights.deinit(allocator);
+    }
+
+    var resident_count: usize = 0;
+    var resident_bytes: usize = 0;
+    for (all_names) |full_name| {
+        if (try appendPackedMoeLazyWeights(allocator, &lazy_weights, store, arch_config, full_name, plan_context)) {
+            continue;
+        }
+        const base_key = if (actual_prefix.len > 0 and std.mem.startsWith(u8, full_name, actual_prefix) and full_name.len > actual_prefix.len and full_name[actual_prefix.len] == '.')
+            full_name[actual_prefix.len + 1 ..]
+        else
+            full_name;
+        var key_buf: [256]u8 = undefined;
+        const key = try normalizeWeightKey(store.kind(), arch_config, base_key, &key_buf);
+        if (shouldLazyLoadWeight(store.kind(), arch_config, key)) {
+            if (lazy_weights.contains(key)) continue;
+            const expert_coord = parseMoeExpertCoord(key);
+            const tensor_ref = try store.describeTensor(allocator, full_name);
+            try lazy_weights.put(allocator, try allocator.dupe(u8, key), .{
+                .tensor_ref = tensor_ref,
+                .expert_coord = expert_coord,
+                .projection_mask = if (expert_coord != null) projectionMaskForWeightKey(key) else 0,
+                .placement = runtime.tier.planner.planForContext(plan_context, key, tensor_ref.byte_len),
+            });
+            continue;
+        }
+
+        const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
+        if (progress) {
+            std.log.info("cuda loading resident weight key={s} source={s}", .{ key, full_name });
+        }
+        const uploaded_bytes: usize = uploaded: {
+            if (direct_quant_enabled and try shouldKeepCudaResidentWeightQuantizedOnly(allocator, store, arch_config, key, full_name)) {
+                const tensor_ref = try store.describeTensor(allocator, full_name);
+                defer {
+                    var ref = tensor_ref;
+                    ref.deinit(allocator);
+                }
+                const storage = (try store.loadQuantizedStorageRef(&tensor_ref)) orelse return error.UnsupportedTensorType;
+                const bytes = storage.raw_bytes.len;
+                var weight: LoadedWeight = .{
+                    .tensor = .{
+                        .data = &.{},
+                        .dtype = .f32,
+                        .shape = &.{},
+                        .name = owned_key,
+                        .allocator = allocator,
+                        .owns_data = false,
+                        .owns_shape = false,
+                    },
+                    .quantized = true,
+                    .quantized_storage = storage,
+                };
+                defer weight.deinit();
+                try cuda_compute.insertWeightFromLoaded(owned_key, &weight);
+                break :uploaded bytes;
+            }
+
+            var tensor_ref = store.describeTensor(allocator, full_name) catch {
+                allocator.free(owned_key);
+                continue;
+            };
+            defer {
+                var ref = tensor_ref;
+                ref.deinit(allocator);
+            }
+            var weight = store.loadTensorRef(&tensor_ref) catch {
+                allocator.free(owned_key);
+                continue;
+            };
+            defer weight.deinit();
+            if (!direct_quant_enabled) {
+                if (weight.quantized_storage) |*storage| {
+                    storage.deinit();
+                    weight.quantized_storage = null;
+                    weight.quantized = false;
+                }
+            }
+            const bytes = if (weight.quantized_storage) |storage| storage.raw_bytes.len else weight.tensor.data.len;
+            try cuda_compute.insertWeightFromLoaded(owned_key, &weight);
+            break :uploaded bytes;
         };
+        resident_count += 1;
+        resident_bytes += uploaded_bytes;
+        if (progress and resident_count % 32 == 0) {
+            std.log.info("cuda loaded resident weights count={d} bytes={d} lazy={d}", .{ resident_count, resident_bytes, lazy_weights.count() });
+        }
+    }
+    if (store.kind() != .gguf) {
+        return error.UnsupportedCudaArchitecture;
+    }
+    const retained_store = if (lazy_weights.count() > 0) blk: {
+        store_owned = false;
+        break :blk store;
+    } else blk: {
+        try cuda_compute.finishPendingWeightUploads();
+        store.deinit();
+        store_owned = false;
+        break :blk null;
+    };
+    cuda_compute.adoptLazyWeights(lazy_weights, retained_store, direct_quant_enabled);
+    lazy_weights = .{};
+    if (progress) {
+        std.log.info("cuda session loaded resident={d} resident_bytes={d} lazy={d}", .{ resident_count, resident_bytes, cuda_compute.lazy_weights.count() });
     }
 
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
-        .arch_config = native_impl.arch_config,
-        .task = native_impl.task,
+        .arch_config = arch_config,
+        .task = sessionTaskForModelType(mf.model_type, override),
         .backend_type = .cuda,
         .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
     };
@@ -943,6 +1108,7 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
     return switch (arch_config) {
         .deberta, .gliner, .clip, .clap => true,
+        .gpt => |cfg| cfg.family == .gemma,
         else => false,
     };
 }
@@ -2601,6 +2767,44 @@ fn shouldKeepResidentWeightQuantizedOnly(
     return switch (arch_config) {
         .gpt => |cfg| shouldKeepResidentGptWeightQuantizedOnly(cfg, key, tensor_type),
         .clip, .clap => shouldKeepResidentClipClapWeightQuantizedOnly(key, tensor_type),
+        else => false,
+    };
+}
+
+fn shouldKeepCudaResidentWeightQuantizedOnly(
+    allocator: std.mem.Allocator,
+    store: tensor_store_mod.TensorStore,
+    arch_config: ArchConfig,
+    key: []const u8,
+    source_name: []const u8,
+) !bool {
+    if (store.kind() != .gguf) return false;
+    const tensor_ref = try store.describeTensor(allocator, source_name);
+    defer {
+        var ref = tensor_ref;
+        ref.deinit(allocator);
+    }
+    if (!tensor_ref.quantized) return false;
+    const tensor_type = if (store.ggufFile()) |file| blk: {
+        const tensor = gguf_mod.tensor_catalog.Catalog.init(file).find(source_name) orelse break :blk null;
+        break :blk tensor.tensor_type;
+    } else null;
+    if (cudaSupportsQuantizedWeightType(tensor_type)) return true;
+    return switch (arch_config) {
+        .gpt => |cfg| shouldKeepResidentGptWeightQuantizedOnly(cfg, key, tensor_type) or
+            (isGptEmbeddingTableKey(key) and tensor_type != null and cudaSupportsQuantizedWeightType(tensor_type)),
+        .clip, .clap => shouldKeepResidentClipClapWeightQuantizedOnly(key, tensor_type),
+        else => false,
+    };
+}
+
+fn cudaSupportsQuantizedWeightType(tensor_type: ?gguf_mod.tensor_types.TensorType) bool {
+    const known = switch (tensor_type orelse return false) {
+        .known => |value| value,
+        else => return false,
+    };
+    return switch (known) {
+        .Q8_0, .Q4_0, .Q4_K, .Q5_K, .Q6_K => true,
         else => false,
     };
 }
