@@ -120,7 +120,7 @@ func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
 	}}
 }
 
-func secretStoreSwarmArg(store *antflyv1.SecretStoreSpec) string {
+func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 	if store == nil {
 		return ""
 	}
@@ -2161,7 +2161,7 @@ exec /antfly swarm --id %d --config /config/config.json \
 								swarm.NodeID,
 								swarm.MetadataAPI.Port,
 								swarm.Health.Port,
-								secretStoreSwarmArg(cluster.Spec.SecretStore),
+								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources: r.buildResourceRequirements(swarm.Resources),
@@ -2381,12 +2381,13 @@ exec /antfly metadata --id $ID --config /config/config.json \
   --raft-host 0.0.0.0 \
   --raft-port %d \
   --health-port %d \
-  --cluster '%s'
-							`,
+  --cluster '%s'%s
+								`,
 								cluster.Spec.MetadataNodes.MetadataAPI.Port,
 								cluster.Spec.MetadataNodes.MetadataRaft.Port,
 								cluster.Spec.MetadataNodes.Health.Port,
 								metadataCluster,
+								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources: r.buildResourceRequirements(cluster.Spec.MetadataNodes.Resources),
@@ -2603,11 +2604,12 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
   --api-port %d \
   --raft-host ${POD_IP} \
   --raft-port %d \
-  --health-port %d
-							`,
+  --health-port %d%s
+								`,
 								cluster.Spec.DataNodes.API.Port,
 								cluster.Spec.DataNodes.Raft.Port,
 								cluster.Spec.DataNodes.Health.Port,
+								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources: r.buildResourceRequirements(cluster.Spec.DataNodes.Resources),
