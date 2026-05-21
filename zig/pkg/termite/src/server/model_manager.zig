@@ -736,6 +736,7 @@ pub const LoadedModel = struct {
             },
             .text_prefix = self.manifest.embedding_text_prefix,
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest),
+            .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
         });
         if (session_factory.getClipConfig(self.session)) |cfg| {
             pipeline.config.image_size = cfg.image_size;

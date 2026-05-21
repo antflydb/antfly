@@ -31,6 +31,8 @@ const ops_mod = @import("../ops/ops.zig");
 const image = @import("image.zig");
 const audio = @import("audio.zig");
 const session_factory = @import("../architectures/session_factory.zig");
+const gpt_arch = @import("../architectures/gpt.zig");
+const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
 
 pub const PoolingStrategy = enum {
@@ -55,6 +57,9 @@ pub const EmbeddingConfig = struct {
     /// before encoder execution. Useful for decoder-style embedders where
     /// padding to the architectural context window is prohibitively expensive.
     trim_padding_to_batch_max: bool = false,
+    /// Enable the direct resident Qwen3/Jina embedding encoder. This is set
+    /// from Jina/Qwen3 embedding manifests, not merely from the backbone family.
+    resident_qwen3_embedding: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// For CLAP audio models: mel spectrogram configuration.
@@ -266,6 +271,8 @@ pub const EmbeddingPipeline = struct {
             if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, effective_len, proj)) |resident_embeddings| {
                 return resident_embeddings;
             }
+        } else if (try self.tryEmbedTextResidentQwen3(inputs, all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
+            return resident_embeddings;
         }
 
         // Run inference
@@ -881,6 +888,261 @@ pub const EmbeddingPipeline = struct {
         return self.config.resident_projection_required or embedResidentFailClosedEnabled();
     }
 
+    fn tryEmbedTextResidentQwen3(
+        self: *EmbeddingPipeline,
+        inputs: []const Tensor,
+        mask: []const i32,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+    ) !?[][]f32 {
+        _ = inputs;
+        if (residentQwen3EmbeddingDisabled()) {
+            if (residentQwen3EmbeddingRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "disabled");
+            }
+            return null;
+        }
+        const cfg = session_factory.getGptConfig(self.session) orelse {
+            if (residentQwen3EmbeddingRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "not_gpt_session");
+            }
+            return null;
+        };
+        if (!residentQwen3EmbeddingEligible(self.session, cfg, self.config)) {
+            if (residentQwen3EmbeddingRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "ineligible");
+            }
+            return null;
+        }
+
+        var cb = try session_factory.getComputeBackend(self.session, self.allocator);
+        defer cb.deinit();
+        if (cb.kind() != .metal) {
+            return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "not_metal_backend");
+        }
+
+        const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
+            self.allocator,
+            cfg,
+            0,
+            cfg.num_hidden_layers,
+        );
+        if (!prepare.prepared) {
+            return self.residentProjectionFallback(.text, "text.prepare.qwen3.resident", batch, "prepare_failed");
+        }
+
+        if (try self.tryEmbedTextResidentQwen3Graph(&cb, cfg, mask, input_ids, batch, seq_len)) |graph_embeddings| {
+            return graph_embeddings;
+        }
+        if (residentQwen3EmbeddingGraphRequired()) {
+            return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "graph_fallback");
+        }
+
+        const overrides = decoder_gated_runtime.buildOverridesWithLevel(
+            cfg,
+            cfg.num_hidden_layers,
+            residentQwen3EmbeddingOverrideLevel(),
+        );
+        const encoder_start = embedTimingStart(self.print_timing);
+        const hidden = try gpt_arch.hiddenForwardResidentWithOverrides(
+            &cb,
+            self.allocator,
+            cfg,
+            input_ids,
+            batch,
+            seq_len,
+            null,
+            overrides,
+        );
+        logEmbedTiming("text.encoder.qwen3.resident", batch, encoder_start);
+
+        const output_storage = try self.allocator.alloc(ops_mod.CT, 1);
+        defer self.allocator.free(output_storage);
+        output_storage[0] = hidden;
+        var encoder_outputs = session_mod.ResidentOutputs{
+            .outputs = output_storage,
+            .backend = &cb,
+            .allocator = self.allocator,
+        };
+        defer encoder_outputs.deinit();
+
+        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+            error.UnsupportedResidentTextPooling,
+            error.UnsupportedPrimitiveOp,
+            error.UnsupportedOperation,
+            error.UnsupportedShape,
+            => return self.residentProjectionFallback(.text, "text.pool.qwen3.resident", batch, @errorName(err)),
+            else => return err,
+        };
+        defer pooled.deinit();
+
+        const pooled_storage = try self.allocator.alloc(ops_mod.CT, 1);
+        defer self.allocator.free(pooled_storage);
+        pooled_storage[0] = pooled.value;
+        var pooled_outputs = session_mod.ResidentOutputs{
+            .outputs = pooled_storage,
+            .backend = pooled.backend,
+            .allocator = self.allocator,
+        };
+        const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
+        self.recordResidentProjection(.text, .success, "text.encoder.qwen3.resident", batch, null);
+        return embeddings;
+    }
+
+    fn tryEmbedTextResidentQwen3Graph(
+        self: *EmbeddingPipeline,
+        cb: *const ops_mod.ComputeBackend,
+        cfg: gpt_arch.Config,
+        mask: []const i32,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+    ) !?[][]f32 {
+        if (residentQwen3EmbeddingGraphDisabled()) {
+            if (residentQwen3EmbeddingGraphRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "disabled");
+            }
+            return null;
+        }
+        if (cfg.num_hidden_layers == 0 or cfg.num_hidden_layers > 256) {
+            if (residentQwen3EmbeddingGraphRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "unsupported_layer_count");
+            }
+            return null;
+        }
+        if (input_ids.len != batch * seq_len) return error.ShapeMismatch;
+
+        var layer_storage: [256]ops_mod.DecoderRuntimeLayerSpec = undefined;
+        const layers = decoder_gated_runtime.fillDenseQwen3LayerSpecs(
+            cfg,
+            cfg.num_hidden_layers,
+            &layer_storage,
+        ) catch |err| {
+            if (residentQwen3EmbeddingGraphRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, @errorName(err));
+            }
+            return null;
+        };
+
+        const planned = try cb.decoderRuntimePlanPrefillFrame(&.{
+            .contract = .qwen3_dense_text_embedding,
+            .layer_count = layers.len,
+            .rows = batch * seq_len,
+            .batch = batch,
+            .seq_len = seq_len,
+            .hidden_size = cfg.hidden_size,
+            .vocab_size = cfg.vocab_size,
+            .num_attention_heads = cfg.num_attention_heads,
+            .global_head_dim = cfg.global_head_dim,
+            .ple_hidden_size = 0,
+            .final_norm_slot = decoder_gated_runtime.finalNormSlot(cfg.num_hidden_layers),
+            .final_lm_head_slot = 0,
+            .include_tail = false,
+            .layers = layers,
+        });
+        if (!planned) {
+            if (residentQwen3EmbeddingGraphRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "plan_failed");
+            }
+            return null;
+        }
+
+        const embed_w = try gpt_arch.getEmbeddingWeight(cb, cfg);
+        defer cb.free(embed_w);
+        const hidden = try cb.embeddingLookup(embed_w, input_ids, batch * seq_len, cfg.hidden_size);
+        defer cb.free(hidden);
+
+        var active = try cb.decoderRuntimeBeginFrame();
+        if (!active) {
+            if (residentQwen3EmbeddingGraphRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "begin_frame_failed");
+            }
+            return null;
+        }
+        errdefer if (active) cb.decoderRuntimeCancelFrame() catch {};
+
+        var graph_hidden: ?ops_mod.CT = null;
+        const attention = ops_mod.AttentionContext{
+            .mode = .dense_causal,
+            .total_sequence_len = seq_len,
+            .query_sequence_len = seq_len,
+            .kv_sequence_len = seq_len,
+        };
+        const encoder_start = embedTimingStart(self.print_timing);
+        const executed = try cb.decoderRuntimeExecuteGraphCommandPlanFrame(&.{
+            .contract = .qwen3_dense_text_embedding,
+            .layer_count = layers.len,
+            .rows = batch * seq_len,
+            .batch = batch,
+            .seq_len = seq_len,
+            .hidden_size = cfg.hidden_size,
+            .vocab_size = cfg.vocab_size,
+            .num_attention_heads = cfg.num_attention_heads,
+            .global_head_dim = cfg.global_head_dim,
+            .ple_hidden_size = 0,
+            .final_norm_slot = decoder_gated_runtime.finalNormSlot(cfg.num_hidden_layers),
+            .norm_eps = cfg.norm_eps,
+            .rope_freq_scale = cfg.rope_freq_scale,
+            .rope_consecutive_pairs = cfg.rope_layout == .consecutive_pairs,
+            .activation = gpt_arch.decoderRuntimeActivationKind(cfg.activation),
+            .attention = attention,
+            .hidden = hidden,
+            .ple_vectors = null,
+            .layers = layers,
+            .output_hidden = &graph_hidden,
+        });
+        if (!executed) {
+            try cb.decoderRuntimeCancelFrame();
+            active = false;
+            if (residentQwen3EmbeddingGraphRequired()) {
+                return self.residentProjectionFallback(.text, "text.encoder.qwen3.graph", batch, "execute_failed");
+            }
+            return null;
+        }
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        active = false;
+        logEmbedTiming("text.encoder.qwen3.graph", batch, encoder_start);
+
+        const output = graph_hidden orelse return error.NoOutputTensors;
+        const output_storage = try self.allocator.alloc(ops_mod.CT, 1);
+        defer self.allocator.free(output_storage);
+        output_storage[0] = output;
+        var encoder_outputs = session_mod.ResidentOutputs{
+            .outputs = output_storage,
+            .backend = cb,
+            .allocator = self.allocator,
+        };
+        defer encoder_outputs.deinit();
+
+        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+            error.UnsupportedResidentTextPooling,
+            error.UnsupportedPrimitiveOp,
+            error.UnsupportedOperation,
+            error.UnsupportedShape,
+            => {
+                if (residentQwen3EmbeddingGraphRequired()) {
+                    return self.residentProjectionFallback(.text, "text.pool.qwen3.graph", batch, @errorName(err));
+                }
+                return null;
+            },
+            else => return err,
+        };
+        defer pooled.deinit();
+
+        const pooled_storage = try self.allocator.alloc(ops_mod.CT, 1);
+        defer self.allocator.free(pooled_storage);
+        pooled_storage[0] = pooled.value;
+        var pooled_outputs = session_mod.ResidentOutputs{
+            .outputs = pooled_storage,
+            .backend = pooled.backend,
+            .allocator = self.allocator,
+        };
+        const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
+        self.recordResidentProjection(.text, .success, "text.encoder.qwen3.graph", batch, null);
+        return embeddings;
+    }
+
     fn tryEmbedTextResidentProjection(
         self: *EmbeddingPipeline,
         inputs: []const Tensor,
@@ -1013,7 +1275,22 @@ pub const EmbeddingPipeline = struct {
         defer outputs.allocator.free(shape);
 
         if (shape.len == 2) {
-            return .{ .value = output, .backend = backend, .owns_value = false };
+            if (shape[0] == @as(i64, @intCast(batch)) and shape[1] > 0) {
+                return .{ .value = output, .backend = backend, .owns_value = false };
+            }
+            if (shape[0] == @as(i64, @intCast(batch * seq_len)) and shape[1] > 0) {
+                const hidden: usize = @intCast(shape[1]);
+                const output_shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(hidden) };
+                const reshaped = try backend.primReshape(output, &output_shape);
+                defer backend.free(reshaped);
+                return switch (self.config.pooling) {
+                    .mean => try residentMaskedMeanPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
+                    .cls => try residentClsPool(backend, reshaped, batch, hidden),
+                    .last => try residentLastTokenPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
+                    .max => error.UnsupportedResidentTextPooling,
+                };
+            }
+            return error.ShapeMismatch;
         }
         if (shape.len != 3) return error.UnexpectedOutputShape;
         if (shape[0] != @as(i64, @intCast(batch)) or shape[1] != @as(i64, @intCast(seq_len)) or shape[2] <= 0) {
@@ -1287,7 +1564,60 @@ fn embedResidentFailClosedEnabled() bool {
     if (platform.env.getenvSlice("TERMITE_EMBED_RESIDENT_REQUIRED")) |value| {
         if (envFlagEnabled(value)) return true;
     }
+    if (platform.env.getenvSlice("TERMITE_REQUIRE_RESIDENT_QWEN3_EMBED")) |value| {
+        if (envFlagEnabled(value)) return true;
+    }
+    if (platform.env.getenvSlice("TERMITE_REQUIRE_QWEN3_EMBED_GRAPH")) |value| {
+        if (envFlagEnabled(value)) return true;
+    }
     return false;
+}
+
+fn residentQwen3EmbeddingDisabled() bool {
+    if (platform.env.getenvSlice("TERMITE_DISABLE_RESIDENT_QWEN3_EMBED")) |value| {
+        return envFlagEnabled(value);
+    }
+    return false;
+}
+
+fn residentQwen3EmbeddingRequired() bool {
+    if (platform.env.getenvSlice("TERMITE_REQUIRE_RESIDENT_QWEN3_EMBED")) |value| {
+        return envFlagEnabled(value);
+    }
+    return false;
+}
+
+fn residentQwen3EmbeddingGraphDisabled() bool {
+    if (platform.env.getenvSlice("TERMITE_DISABLE_QWEN3_EMBED_GRAPH")) |value| {
+        return envFlagEnabled(value);
+    }
+    return false;
+}
+
+fn residentQwen3EmbeddingGraphRequired() bool {
+    if (platform.env.getenvSlice("TERMITE_REQUIRE_QWEN3_EMBED_GRAPH")) |value| {
+        return envFlagEnabled(value);
+    }
+    return false;
+}
+
+fn residentQwen3EmbeddingOverrideLevel() usize {
+    return 4;
+}
+
+fn residentQwen3EmbeddingEligible(session: backends.Session, cfg: gpt_arch.Config, embedding_config: EmbeddingConfig) bool {
+    return residentQwen3EmbeddingEligibleForBackend(session.backend(), cfg, embedding_config);
+}
+
+fn residentQwen3EmbeddingEligibleForBackend(backend: backends.BackendType, cfg: gpt_arch.Config, embedding_config: EmbeddingConfig) bool {
+    if (!embedding_config.resident_qwen3_embedding) return false;
+    if (backend != .metal) return false;
+    if (cfg.family != .qwen3) return false;
+    if (cfg.usesMoe() or cfg.hasPle() or cfg.isMultimodal()) return false;
+    if (cfg.num_kv_shared_layers != 0) return false;
+    if (cfg.global_head_dim != 0 or cfg.num_global_key_value_heads != 0) return false;
+    if (cfg.sliding_window != 0) return false;
+    return true;
 }
 
 fn envFlagEnabled(value: []const u8) bool {
@@ -1486,6 +1816,61 @@ test "resident masked mean pooling uses backend primitives" {
     try std.testing.expectEqualSlices(f32, &.{ 2.0, 3.0, 7.0, 8.0 }, host);
 }
 
+test "resident text pooling handles flattened batch sequence hidden states" {
+    const allocator = std.testing.allocator;
+    const native_mod = @import("../ops/native_compute.zig");
+
+    var weight_store = native_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer {
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+        native_mod.deinitPrefetchQueue(&weight_store);
+    }
+    var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const values = [_]f32{
+        1.0,  2.0,
+        3.0,  4.0,
+        5.0,  6.0,
+        7.0,  8.0,
+        9.0,  10.0,
+        11.0, 12.0,
+    };
+    const output_ct = try cb.fromFloat32Shape(&values, &.{ 6, 2 });
+    const output_storage = try allocator.alloc(ops_mod.CT, 1);
+    output_storage[0] = output_ct;
+    var resident_outputs = session_mod.ResidentOutputs{
+        .outputs = output_storage,
+        .backend = &cb,
+        .allocator = allocator,
+    };
+    defer resident_outputs.deinit();
+
+    var pipeline = EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{ .pooling = .last, .normalize = false },
+    };
+
+    const mask = [_]i32{ 1, 1, 0, 1, 0, 0 };
+    const pooled = try pipeline.residentPoolTextOutput(&resident_outputs, &mask, 2, 3);
+    defer pooled.deinit();
+
+    const shape = try cb.tensorShape(pooled.value, allocator);
+    defer allocator.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, shape);
+
+    const host = try cb.toFloat32(pooled.value, allocator);
+    defer allocator.free(host);
+    try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0, 7.0, 8.0 }, host);
+}
+
 test "pool3D last uses final non-padding token and normalizes" {
     const allocator = std.testing.allocator;
 
@@ -1522,6 +1907,51 @@ test "active token length trims trailing padding but keeps at least one token" {
     try std.testing.expectEqual(@as(usize, 3), EmbeddingPipeline.activeTokenLength(&.{ 1, 1, 1, 0, 0 }));
     try std.testing.expectEqual(@as(usize, 4), EmbeddingPipeline.activeTokenLength(&.{ 1, 0, 0, 1, 0 }));
     try std.testing.expectEqual(@as(usize, 1), EmbeddingPipeline.activeTokenLength(&.{ 0, 0, 0 }));
+}
+
+test "resident qwen3 embedding eligibility accepts dense metal qwen3 only" {
+    var cfg = gpt_arch.Config{
+        .family = .qwen3,
+        .hidden_size = 1024,
+        .num_hidden_layers = 28,
+        .num_attention_heads = 16,
+        .num_key_value_heads = 8,
+        .intermediate_size = 3072,
+    };
+
+    const embedding_cfg = EmbeddingConfig{
+        .pooling = .last,
+        .text_prefix = "Document: ",
+        .trim_padding_to_batch_max = true,
+        .resident_qwen3_embedding = true,
+    };
+
+    try std.testing.expect(residentQwen3EmbeddingEligibleForBackend(.metal, cfg, embedding_cfg));
+    try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.metal, cfg, .{}));
+    try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.native, cfg, embedding_cfg));
+
+    cfg.family = .qwen3_5;
+    try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.metal, cfg, embedding_cfg));
+    cfg.family = .qwen3;
+
+    cfg.num_local_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.metal, cfg, embedding_cfg));
+    cfg.num_local_experts = 0;
+    cfg.num_experts_per_tok = 0;
+
+    cfg.image_token_index = 151655;
+    cfg.mm_tokens_per_image = 256;
+    try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.metal, cfg, embedding_cfg));
+    cfg.image_token_index = -1;
+    cfg.mm_tokens_per_image = 0;
+
+    cfg.ple_hidden_size = 1024;
+    try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.metal, cfg, embedding_cfg));
+    cfg.ple_hidden_size = 0;
+
+    cfg.sliding_window = 4096;
+    try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.metal, cfg, embedding_cfg));
 }
 
 test "resident projected input selection supports 3d cls pooling" {

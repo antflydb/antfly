@@ -651,7 +651,7 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
             return decoderRuntimeRmsNormSlotPrepared(self, decoder_bitnet_runtime.finalNormSlot(gpt_config.num_hidden_layers), gpt_config.hidden_size) and
                 decoderRuntimeLinearSlotPrepared(self, decoder_bitnet_runtime.finalLmHeadSlot(gpt_config.num_hidden_layers), gpt_config.hidden_size, gpt_config.vocab_size);
         },
-        .llama, .mistral, .qwen2, .gemma => {
+        .llama, .mistral, .qwen2, .qwen3, .gemma => {
             for (0..gpt_config.num_hidden_layers) |layer| {
                 const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
                 const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
@@ -735,7 +735,7 @@ pub fn supportsDecoderRuntimeConfig(gpt_config: anytype) bool {
     return switch (gpt_config.family) {
         .gpt2 => decoder_gpt_runtime.supportsConfig(gpt_config),
         .bitnet => decoder_bitnet_runtime.supportsConfig(gpt_config),
-        .llama, .mistral, .qwen2 => decoder_gated_runtime.supportsConfig(gpt_config),
+        .llama, .mistral, .qwen2, .qwen3 => decoder_gated_runtime.supportsConfig(gpt_config),
         // The Metal whole-model executor can still own text-only runs for
         // multimodal/PLE Gemma variants even when the deepest family-local
         // decoder-runtime fast path declines and falls back to the generic GPT
@@ -767,7 +767,7 @@ pub fn prepareDecodeRuntimeFamily(
             kv_tokens,
             configured_layer_count,
         ),
-        .llama, .mistral, .qwen2, .gemma => try decoder_gated_runtime.prepareDecodeRuntime(
+        .llama, .mistral, .qwen2, .qwen3, .gemma => try decoder_gated_runtime.prepareDecodeRuntime(
             cb,
             allocator,
             gpt_config,
@@ -1410,6 +1410,40 @@ pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?Met
         request.eps,
         request.value_scale,
         if (request.consecutive_pairs) 1 else 0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output;
+}
+
+pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype, heads_per_row: usize, position_period: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.total_heads == 0 or request.head_dim == 0 or request.rope_dim == 0 or heads_per_row == 0 or position_period == 0) return null;
+    if (request.position > std.math.maxInt(u32) or heads_per_row > std.math.maxInt(u32) or position_period > std.math.maxInt(u32)) return null;
+    if (!request.input.isDevice()) return null;
+    const total_values = request.input.elemCount();
+    if (total_values != request.total_heads * request.head_dim) return null;
+
+    var output = try MetalTensor.deviceAllocate(runtime, total_values * @sizeOf(f32), .private, request.input.shape());
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_apply_head_rms_rope_batched_device(
+        runtime,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.slot,
+        request.total_heads,
+        request.head_dim,
+        request.rope_dim,
+        request.position,
+        request.theta,
+        request.freq_scale,
+        request.eps,
+        request.value_scale,
+        if (request.consecutive_pairs) 1 else 0,
+        heads_per_row,
+        position_period,
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
@@ -5634,6 +5668,25 @@ pub extern fn termite_metal_decode_runtime_apply_head_rms_rope_device(
     eps: f32,
     value_scale: f32,
     consecutive_pairs: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_head_rms_rope_batched_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    norm_slot: usize,
+    total_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    theta: f32,
+    freq_scale: f32,
+    eps: f32,
+    value_scale: f32,
+    consecutive_pairs: u32,
+    heads_per_row: usize,
+    position_period: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
