@@ -1121,14 +1121,29 @@ components:
         dimensions:
           type: integer
           description: Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+        task_type:
+          type: string
+          description: Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+          enum:
+            - RETRIEVAL_QUERY
+            - RETRIEVAL_DOCUMENT
+            - QUESTION_ANSWERING
+            - FACT_VERIFICATION
+            - CODE_RETRIEVAL_QUERY
+            - CLASSIFICATION
+            - CLUSTERING
+            - SEMANTIC_SIMILARITY
         input_type:
           type: string
-          description: Optional embedding input role. Uses Cohere-style retrieval values; query/document are accepted aliases for Jina-style callers.
+          deprecated: true
+          description: Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
           enum:
             - search_query
             - search_document
             - query
             - document
+            - classification
+            - clustering
     EmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors

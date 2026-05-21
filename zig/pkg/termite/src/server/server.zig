@@ -5073,8 +5073,57 @@ const ParsedEmbedRequest = struct {
     input: std.json.Value,
     encoding_format: ?[]const u8,
     dimensions: ?i64,
-    input_type: ?[]const u8,
+    task_type: ?EmbeddingTaskType,
 };
+
+const EmbeddingTaskType = enum {
+    RETRIEVAL_QUERY,
+    RETRIEVAL_DOCUMENT,
+    QUESTION_ANSWERING,
+    FACT_VERIFICATION,
+    CODE_RETRIEVAL_QUERY,
+    CLASSIFICATION,
+    CLUSTERING,
+    SEMANTIC_SIMILARITY,
+
+    fn usesQueryPrefix(self: EmbeddingTaskType) bool {
+        return switch (self) {
+            .RETRIEVAL_QUERY,
+            .QUESTION_ANSWERING,
+            .FACT_VERIFICATION,
+            .CODE_RETRIEVAL_QUERY,
+            => true,
+            else => false,
+        };
+    }
+
+    fn usesDocumentPrefix(self: EmbeddingTaskType) bool {
+        return switch (self) {
+            .RETRIEVAL_DOCUMENT => true,
+            else => false,
+        };
+    }
+};
+
+fn parseEmbeddingTaskType(value: []const u8) ?EmbeddingTaskType {
+    if (std.mem.eql(u8, value, "RETRIEVAL_QUERY")) return .RETRIEVAL_QUERY;
+    if (std.mem.eql(u8, value, "RETRIEVAL_DOCUMENT")) return .RETRIEVAL_DOCUMENT;
+    if (std.mem.eql(u8, value, "QUESTION_ANSWERING")) return .QUESTION_ANSWERING;
+    if (std.mem.eql(u8, value, "FACT_VERIFICATION")) return .FACT_VERIFICATION;
+    if (std.mem.eql(u8, value, "CODE_RETRIEVAL_QUERY")) return .CODE_RETRIEVAL_QUERY;
+    if (std.mem.eql(u8, value, "CLASSIFICATION")) return .CLASSIFICATION;
+    if (std.mem.eql(u8, value, "CLUSTERING")) return .CLUSTERING;
+    if (std.mem.eql(u8, value, "SEMANTIC_SIMILARITY")) return .SEMANTIC_SIMILARITY;
+    return null;
+}
+
+fn parseLegacyEmbeddingInputType(value: []const u8) ?EmbeddingTaskType {
+    if (std.mem.eql(u8, value, "search_query") or std.mem.eql(u8, value, "query")) return .RETRIEVAL_QUERY;
+    if (std.mem.eql(u8, value, "search_document") or std.mem.eql(u8, value, "document")) return .RETRIEVAL_DOCUMENT;
+    if (std.mem.eql(u8, value, "classification")) return .CLASSIFICATION;
+    if (std.mem.eql(u8, value, "clustering")) return .CLUSTERING;
+    return null;
+}
 
 const ParsedTextEmbedInput = struct {
     index: usize,
@@ -5121,17 +5170,26 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         break :blk value.integer;
     } else null;
 
-    const input_type: ?[]const u8 = if (obj.get("input_type")) |value| blk: {
-        if (value != .string) return error.InputTypeMustBeString;
-        break :blk value.string;
+    const task_type: ?EmbeddingTaskType = if (obj.get("task_type")) |value| blk: {
+        if (value != .string) return error.TaskTypeMustBeString;
+        break :blk parseEmbeddingTaskType(value.string) orelse return error.UnsupportedEmbeddingTaskType;
     } else null;
+
+    const legacy_task_type: ?EmbeddingTaskType = if (obj.get("input_type")) |value| blk: {
+        if (value != .string) return error.InputTypeMustBeString;
+        break :blk parseLegacyEmbeddingInputType(value.string) orelse return error.UnsupportedEmbeddingInputType;
+    } else null;
+
+    if (task_type != null and legacy_task_type != null and task_type.? != legacy_task_type.?) {
+        return error.ConflictingEmbeddingTaskTypes;
+    }
 
     return .{
         .model = model_value.string,
         .input = input_value,
         .encoding_format = encoding_format,
         .dimensions = dimensions,
-        .input_type = input_type,
+        .task_type = task_type orelse legacy_task_type,
     };
 }
 
@@ -5142,7 +5200,11 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
         error.InputRequired => "input is required",
         error.EncodingFormatMustBeString => "encoding_format must be a string",
         error.DimensionsMustBeInteger => "dimensions must be an integer",
+        error.TaskTypeMustBeString => "task_type must be a string",
+        error.UnsupportedEmbeddingTaskType => "task_type must be one of RETRIEVAL_QUERY, RETRIEVAL_DOCUMENT, QUESTION_ANSWERING, FACT_VERIFICATION, CODE_RETRIEVAL_QUERY, CLASSIFICATION, CLUSTERING, or SEMANTIC_SIMILARITY",
         error.InputTypeMustBeString => "input_type must be a string",
+        error.UnsupportedEmbeddingInputType => "input_type must be a legacy alias for a supported embedding task type",
+        error.ConflictingEmbeddingTaskTypes => "task_type and input_type specify different embedding task types",
         else => "invalid embedding request",
     };
 }
@@ -5160,19 +5222,19 @@ fn applyDenseEmbeddingRequestOptions(
 ) !void {
     if (!isJinaV5EmbeddingManifest(manifest)) return;
 
-    const input_type = request.input_type orelse "search_document";
-    if (std.mem.eql(u8, input_type, "search_query") or std.mem.eql(u8, input_type, "query")) {
+    const task_type = request.task_type orelse EmbeddingTaskType.RETRIEVAL_DOCUMENT;
+    if (task_type.usesQueryPrefix()) {
         pipeline.config.text_prefix = "Query: ";
-    } else if (std.mem.eql(u8, input_type, "search_document") or std.mem.eql(u8, input_type, "document")) {
+    } else if (task_type.usesDocumentPrefix()) {
         pipeline.config.text_prefix = "Document: ";
     } else {
-        return error.UnsupportedEmbeddingInputType;
+        return error.UnsupportedEmbeddingTaskType;
     }
 }
 
 fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.UnsupportedEmbeddingInputType => "input_type must be \"search_query\" or \"search_document\" (\"query\"/\"document\" aliases are also accepted)",
+        error.UnsupportedEmbeddingTaskType => "task_type must be a query/document retrieval task for this embedding model",
         else => "invalid embedding options",
     };
 }
@@ -5503,9 +5565,19 @@ test "jina embedding request options switch query and document prefixes" {
         .input = .{ .string = "hello" },
         .encoding_format = null,
         .dimensions = null,
-        .input_type = "search_query",
+        .task_type = .RETRIEVAL_QUERY,
     };
     try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, query_request);
+    try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
+
+    const qa_request = ParsedEmbedRequest{
+        .model = "jina",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .QUESTION_ANSWERING,
+    };
+    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, qa_request);
     try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
 
     const document_request = ParsedEmbedRequest{
@@ -5513,22 +5585,22 @@ test "jina embedding request options switch query and document prefixes" {
         .input = .{ .string = "hello" },
         .encoding_format = null,
         .dimensions = null,
-        .input_type = "document",
+        .task_type = .RETRIEVAL_DOCUMENT,
     };
     try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, document_request);
     try std.testing.expectEqualStrings("Document: ", pipeline.config.text_prefix);
 
-    const bad_input_type = ParsedEmbedRequest{
+    const bad_task_type = ParsedEmbedRequest{
         .model = "jina",
         .input = .{ .string = "hello" },
         .encoding_format = null,
         .dimensions = null,
-        .input_type = "classification",
+        .task_type = .CLASSIFICATION,
     };
-    try std.testing.expectError(error.UnsupportedEmbeddingInputType, applyDenseEmbeddingRequestOptions(&pipeline, &manifest, bad_input_type));
+    try std.testing.expectError(error.UnsupportedEmbeddingTaskType, applyDenseEmbeddingRequestOptions(&pipeline, &manifest, bad_task_type));
 }
 
-test "jina embedding request options support merged qwen3 task repos without manifest tasks" {
+test "jina embedding request options support legacy input_type aliases" {
     const allocator = std.testing.allocator;
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -5544,15 +5616,52 @@ test "jina embedding request options support merged qwen3 task repos without man
         .config = .{},
     };
 
-    const request = ParsedEmbedRequest{
-        .model = "jina-merged",
-        .input = .{ .string = "hello" },
-        .encoding_format = null,
-        .dimensions = null,
-        .input_type = "query",
-    };
+    const body =
+        \\{
+        \\  "model": "jina-merged",
+        \\  "input": "hello",
+        \\  "input_type": "query"
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const request = try parseEmbedRequest(parsed.value);
+    try std.testing.expectEqual(EmbeddingTaskType.RETRIEVAL_QUERY, request.task_type.?);
     try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, request);
     try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
+}
+
+test "embedding request parser uses Google task_type as canonical field" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "jina",
+        \\  "input": "hello",
+        \\  "task_type": "RETRIEVAL_DOCUMENT"
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const request = try parseEmbedRequest(parsed.value);
+    try std.testing.expectEqual(EmbeddingTaskType.RETRIEVAL_DOCUMENT, request.task_type.?);
+}
+
+test "embedding request parser rejects conflicting task aliases" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "jina",
+        \\  "input": "hello",
+        \\  "task_type": "RETRIEVAL_QUERY",
+        \\  "input_type": "search_document"
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.ConflictingEmbeddingTaskTypes, parseEmbedRequest(parsed.value));
 }
 
 fn expectJsonNumber(expected: f64, value: std.json.Value) !void {

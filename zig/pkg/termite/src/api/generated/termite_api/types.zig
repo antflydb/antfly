@@ -993,7 +993,9 @@ pub const EmbedRequest = struct {
     encoding_format: ?[]const u8 = null,
     /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
     dimensions: ?i64 = null,
-    /// Optional embedding input role. Uses Cohere-style retrieval values; query/document are accepted aliases for Jina-style callers.
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    task_type: ?[]const u8 = null,
+    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
     input_type: ?[]const u8 = null,
 };
 
