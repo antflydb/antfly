@@ -572,7 +572,7 @@ fn metadataValidateQueryRequestAgainstContext(
     query_request: metadata_openapi.QueryRequest,
     retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
 ) !?[]const u8 {
-    var preflight = try preflightQueryRequestAgainstContext(alloc, context, .{}, query_request, retrieval_query_request, "query_builder", .{});
+    var preflight = try preflightQueryRequestAgainstContext(alloc, context, .{ .intent = "" }, query_request, retrieval_query_request, "query_builder", .{});
     defer preflight.deinit(alloc);
     for (preflight.diagnostics) |diagnostic| {
         if (diagnostic.severity == .@"error") return try alloc.dupe(u8, diagnostic.message);
@@ -639,7 +639,10 @@ fn preflightQueryRequestAgainstContext(
     var runtime_preflight: ?db_mod.RuntimePreflightSummary = null;
     defer if (runtime_preflight) |*summary| summary.deinit(alloc);
     var contract_preflight = query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
-        const feedback = try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
+        const feedback = if (query_request.graph_searches != null)
+            try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
+        else
+            try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
         defer alloc.free(feedback);
         try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "query_contract_preflight_failed", "query_request", feedback);
         break :blk null;
@@ -1309,6 +1312,7 @@ fn metadataValidateGraphSearchesAgainstContext(
             }
         }
     }
+    if (try metadataPreflightGraphSearchesAgainstExecutorParser(alloc, graph_searches)) |feedback| return feedback;
     return null;
 }
 

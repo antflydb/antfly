@@ -413,6 +413,18 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.json(response);
             },
+            error.DocIdentityNamespaceMismatch => {
+                var arena_impl = std.heap.ArenaAllocator.init(alloc);
+                defer arena_impl.deinit();
+                const response = try transactions_api.buildCommitResponse(
+                    arena_impl.allocator(),
+                    "aborted",
+                    transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                    null,
+                );
+                _ = ctx.status(409);
+                return ctx.json(response);
+            },
             error.TxnNotFound, error.InvalidTxnRecord => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
@@ -918,6 +930,19 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.json(response);
             },
+            error.DocIdentityNamespaceMismatch => {
+                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer arena_impl.deinit();
+                const response = try transactions_api.buildSessionCommitResponse(
+                    arena_impl.allocator(),
+                    txn_id,
+                    "aborted",
+                    transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                    null,
+                );
+                _ = ctx.status(409);
+                return ctx.json(response);
+            },
             error.UnsupportedOperation => {
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
@@ -1151,6 +1176,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid query builder request");
             },
+            error.DocIdentityNamespaceMismatch => {
+                _ = ctx.status(503);
+                return ctx.text("doc identity unavailable");
+            },
             else => return err,
         };
         return ctx.json(response);
@@ -1192,7 +1221,7 @@ pub const AntflyApiHandler = struct {
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
                 var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .local_termite_provider = runner.server.local_termite_provider };
-                var query_req = query_api.parseQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
+                var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
@@ -1208,6 +1237,7 @@ pub const AntflyApiHandler = struct {
                     query_req.req,
                     .read_index,
                 ) catch |err| {
+                    if (err == error.DocIdentityNamespaceMismatch) return err;
                     std.log.err("retrieval query failed table={s} query={s} err={}", .{ table_name, query_json, err });
                     return err;
                 }) orelse error.TableNotFound;
@@ -1284,6 +1314,10 @@ pub const AntflyApiHandler = struct {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
+            },
+            error.DocIdentityNamespaceMismatch => {
+                _ = ctx.status(503);
+                return ctx.text("doc identity unavailable");
             },
             else => {
                 std.log.err("public retrieval failed err={}", .{err});

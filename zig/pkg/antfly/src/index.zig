@@ -388,6 +388,11 @@ pub const IndexSnapshot = struct {
         return self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
     }
 
+    pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
+        const resolved = self.resolveDocId(global_id) orelse return null;
+        return try self.segments[resolved.seg_idx].reader.docOrdinal(resolved.local_id);
+    }
+
     /// Get and decompress a stored document by global doc ID. Caller owns returned data.
     pub const DecompressedDoc = struct { id: []const u8, data: []u8 };
 
@@ -395,6 +400,48 @@ pub const IndexSnapshot = struct {
         const resolved = self.resolveDocId(global_id) orelse return null;
         const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
+    }
+
+    pub fn docNumsForOrdinalsAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: []const u32) ![]u32 {
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+
+        var doc_offset: u32 = 0;
+        for (self.segments) |*seg| {
+            for (0..seg.reader.doc_count) |local_usize| {
+                const local_doc: u32 = @intCast(local_usize);
+                if (seg.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const ordinal = (try seg.reader.docOrdinal(local_doc)) orelse continue;
+                if (!containsOrdinal(ordinals, ordinal)) continue;
+                const global_doc = doc_offset + local_doc;
+                if (!containsDocNum(out.items, global_doc)) try out.append(alloc, global_doc);
+            }
+            doc_offset += seg.reader.doc_count;
+        }
+
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn docOrdinalsForDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, doc_nums: []const u32) !?[]u32 {
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+
+        for (doc_nums) |doc_num| {
+            const ordinal = (try self.docOrdinal(doc_num)) orelse return null;
+            if (!containsOrdinal(out.items, ordinal)) try out.append(alloc, ordinal);
+        }
+
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) bool {
+        for (self.segments) |*seg| {
+            if (seg.reader.doc_count == 0) continue;
+            if (seg.reader.getSection(segment_mod.doc_ordinals_field, .doc_ordinals) == null) return false;
+        }
+        return true;
     }
 
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
@@ -460,6 +507,20 @@ pub const IndexSnapshot = struct {
         return @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(self.global_doc_count));
     }
 };
+
+fn containsOrdinal(ordinals: []const u32, expected: u32) bool {
+    for (ordinals) |ordinal| {
+        if (ordinal == expected) return true;
+    }
+    return false;
+}
+
+fn containsDocNum(doc_nums: []const u32, expected: u32) bool {
+    for (doc_nums) |doc_num| {
+        if (doc_num == expected) return true;
+    }
+    return false;
+}
 
 /// Coordinates writes and maintains the current snapshot.
 /// Reads are lock-free (atomic snapshot pointer).

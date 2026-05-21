@@ -16,6 +16,7 @@ const std = @import("std");
 const metadata_api = @import("../metadata/api.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const distributed_graph = @import("distributed_graph.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -182,14 +183,18 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             var lookup_opts = try http_route_helpers.parseLookupOptions(alloc, query);
             defer lookup_opts.deinit(alloc);
 
-            var result = (try reads.lookupGroupLocal(
+            var result = (reads.lookupGroupLocal(
                 alloc,
                 lookup.group_id,
                 lookup.table_name,
                 decoded_key,
                 lookup_opts.opts,
                 .read_index,
-            )) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
             return try http_route_helpers.jsonWithHeadersResponse(alloc, 200, result.json, &.{
                 .{
@@ -206,7 +211,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             var scan_req = try http_route_helpers.parseScanKeysRequest(alloc, req.body);
             defer scan_req.deinit(alloc);
 
-            var result = (try reads.scanGroupLocal(
+            var result = (reads.scanGroupLocal(
                 alloc,
                 scan.group_id,
                 scan.table_name,
@@ -214,7 +219,11 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 scan_req.to,
                 scan_req.opts,
                 .read_index,
-            )) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
             return try http_route_helpers.ndjsonResponse(alloc, 200, result.ndjson);
         }
@@ -233,7 +242,9 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 expand_req,
                 .read_index,
             ) catch |err| switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -262,6 +273,8 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -291,6 +304,8 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -330,6 +345,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, @errorName(err)),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer summary.deinit(alloc);
@@ -351,6 +367,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -373,6 +390,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 error.InvalidQueryRequest, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, "invalid graph edges request"),
                 else => return err,
@@ -385,6 +403,8 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             var text_stats_result = reads.textStatsGroupLocal(alloc, text_stats_route.group_id, text_stats_route.table_name, req.body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "invalid text stats request"),
                 error.TableNotFound, error.UnknownGroup => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             } orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer text_stats_result.deinit(alloc);
@@ -404,6 +424,8 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             var partials_result = reads.algebraicPartialsGroupLocal(alloc, partials_route.group_id, partials_route.table_name, req.body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "invalid algebraic partials request"),
                 error.TableNotFound, error.UnknownGroup => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             } orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer partials_result.deinit(alloc);
@@ -495,6 +517,311 @@ test "internal group read routes handle text stats errors" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("invalid text stats request", resp.body);
+}
+
+test "internal group read routes map doc identity mismatch to conflict" {
+    const alloc = std.testing.allocator;
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .query_group_local = queryGroupLocal,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn queryGroupLocal(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?query_api.QueryResponse {
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            return error.DocIdentityNamespaceMismatch;
+        }
+    };
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .reads = FakeReads.source(),
+        .catalog = .{
+            .ptr = undefined,
+        },
+        .query_router = .{
+            .ptr = undefined,
+            .route_query_to_read_schema = struct {
+                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+            }.route,
+        },
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/query",
+        .body = "{\"full_text_search\":{\"query\":\"hello\"}}",
+    }, "/internal/v1/groups/7/tables/docs/query", "")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", resp.body);
+}
+
+test "internal group vector worker rejects unsupported identity generation" {
+    const alloc = std.testing.allocator;
+
+    const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
+    const candidate_input = algebraic_ir.TensorExpr{
+        .fragment = .slice,
+        .output_dims = &.{.doc},
+        .semantic_id = "native_doc_id_constraints",
+    };
+    const program = algebraic_ir.TensorProgram{
+        .inputs = &.{candidate_input},
+        .steps = &.{.{
+            .expr = .{
+                .fragment = .vector_search,
+                .input_dims = &.{.doc},
+                .output_dims = &.{ .doc, .score },
+                .owner = "dense_idx",
+                .layout = .dense_vector,
+            },
+            .inputs = &.{.{ .input = 0 }},
+        }},
+        .output = .{ .step = 0 },
+    };
+    const body = try query_contract.encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+        alloc,
+        "dense_idx",
+        .dense_vector,
+        .{ .dense = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
+        .{ .identity_read_generation = 12345 },
+        .{
+            .positive_filter = true,
+            .include_doc_ids = &.{"doc:a"},
+        },
+        null,
+        null,
+        &.{access_path},
+        program,
+    );
+    defer alloc.free(body);
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .query_group_local = queryGroupLocal,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn queryGroupLocal(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?query_api.QueryResponse {
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            return error.UnsupportedQueryRequest;
+        }
+    };
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .reads = FakeReads.source(),
+        .catalog = .{
+            .ptr = undefined,
+        },
+        .query_router = .{
+            .ptr = undefined,
+            .route_query_to_read_schema = struct {
+                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+            }.route,
+        },
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/vector-worker",
+        .body = body,
+    }, "/internal/v1/groups/7/tables/docs/vector-worker", "")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqualStrings("UnsupportedQueryRequest", resp.body);
+}
+
+test "internal group graph expand rejects unsupported identity generation" {
+    const alloc = std.testing.allocator;
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .graph_expand_group_local = graphExpandGroupLocal,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn graphExpandGroupLocal(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: distributed_graph.GraphExpandRequest,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?distributed_graph.GraphExpandResponse {
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            return error.UnsupportedQueryRequest;
+        }
+    };
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .reads = FakeReads.source(),
+        .catalog = .{
+            .ptr = undefined,
+        },
+        .query_router = .{
+            .ptr = undefined,
+            .route_query_to_read_schema = struct {
+                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+            }.route,
+        },
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/graph-expand",
+        .body =
+        \\{
+        \\  "name":"g",
+        \\  "index_name":"graph_idx",
+        \\  "frontier":[{"id":0,"key":"doc:a"}],
+        \\  "identity_read_generation":12345,
+        \\  "params":{"direction":"out","edge_types":[],"max_depth":1}
+        \\}
+        ,
+    }, "/internal/v1/groups/7/tables/docs/graph-expand", "")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqualStrings("UnsupportedQueryRequest", resp.body);
 }
 
 test "internal group read routes handle query preflight" {

@@ -58,6 +58,7 @@ pub const SparseVector = struct {
 pub const SparseWrite = struct {
     doc_id: []const u8,
     vec: SparseVector,
+    doc_num: ?u32 = null,
 };
 
 pub const BatchOptions = struct {
@@ -66,12 +67,15 @@ pub const BatchOptions = struct {
 
 pub const SearchResult = struct {
     doc_id: []u8,
+    doc_num: ?u32 = null,
     score: f32,
 };
 
 pub const SearchConstraints = struct {
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    exclude_doc_nums: []const u32 = &.{},
 };
 
 pub const SplitRebuildResult = struct {
@@ -542,6 +546,18 @@ fn sortAndDedupU32(items: []u32) []u32 {
     return items[0..out_len];
 }
 
+fn sortDocNumsAndWeights(doc_nums: []u32, weights: []f32) void {
+    std.debug.assert(doc_nums.len == weights.len);
+    if (doc_nums.len <= 1) return;
+    for (1..doc_nums.len) |i| {
+        var j = i;
+        while (j > 0 and doc_nums[j] < doc_nums[j - 1]) : (j -= 1) {
+            std.mem.swap(u32, &doc_nums[j], &doc_nums[j - 1]);
+            std.mem.swap(f32, &weights[j], &weights[j - 1]);
+        }
+    }
+}
+
 // ============================================================================
 // Key builders
 // ============================================================================
@@ -893,7 +909,7 @@ pub const SparseIndex = struct {
 
         // Process inserts
         for (writes) |w| {
-            try self.processInsert(scratch, &txn, w.doc_id, w.vec, touched_terms_ptr);
+            try self.processInsert(scratch, &txn, w.doc_id, w.vec, w.doc_num, touched_terms_ptr);
             _ = scratch_arena.reset(.retain_capacity);
         }
 
@@ -961,13 +977,13 @@ pub const SparseIndex = struct {
         txn: anytype,
         doc_id: []const u8,
         vec: SparseVector,
+        preferred_doc_num: ?u32,
         touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
     ) !void {
         // If doc_id already exists, delete the old mapping first to avoid orphaning
         self.applyDeleteEffect(try self.processDelete(alloc, txn, doc_id, touched_terms));
 
-        const doc_num = self.next_doc_num;
-        self.next_doc_num += 1;
+        const doc_num = try self.allocateDocNumForInsert(txn, doc_id, preferred_doc_num);
         self.doc_count += 1;
 
         // Write forward entry
@@ -990,6 +1006,25 @@ pub const SparseIndex = struct {
                 self.term_count += 1;
             }
         }
+    }
+
+    fn allocateDocNumForInsert(self: *SparseIndex, txn: anytype, doc_id: []const u8, preferred_doc_num: ?u32) !u64 {
+        if (preferred_doc_num) |doc_num_u32| {
+            const doc_num: u64 = doc_num_u32;
+            var rev_buf: [256]u8 = undefined;
+            const existing = txn.get(revKey(&rev_buf, doc_num)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (existing == null or std.mem.eql(u8, existing.?, doc_id)) {
+                if (doc_num >= self.next_doc_num) self.next_doc_num = doc_num + 1;
+                return doc_num;
+            }
+        }
+
+        const doc_num = self.next_doc_num;
+        self.next_doc_num += 1;
+        return doc_num;
     }
 
     fn addToPostings(
@@ -1053,6 +1088,7 @@ pub const SparseIndex = struct {
                 new_doc_nums[decoded.doc_nums.len] = doc_num;
                 @memcpy(new_weights[0..decoded.weights.len], decoded.weights);
                 new_weights[decoded.weights.len] = weight;
+                sortDocNumsAndWeights(new_doc_nums, new_weights);
 
                 const existing_range = self.readChunkRangeMeta(txn, term_id, last_chunk_idx) catch null;
                 const min_doc_id = if (existing_range) |range|
@@ -1315,9 +1351,13 @@ pub const SparseIndex = struct {
         if (constraints.filter_doc_ids.len > 0 and filter_doc_nums.count() == 0) {
             return try alloc.alloc(SearchResult, 0);
         }
+        var direct_filter_doc_nums = try self.docNumSetFromSliceAlloc(alloc, constraints.filter_doc_nums);
+        defer direct_filter_doc_nums.deinit(alloc);
 
         var exclude_doc_nums = try self.resolveDocNumSetAlloc(alloc, &txn, constraints.exclude_doc_ids);
         defer exclude_doc_nums.deinit(alloc);
+        var direct_exclude_doc_nums = try self.docNumSetFromSliceAlloc(alloc, constraints.exclude_doc_nums);
+        defer direct_exclude_doc_nums.deinit(alloc);
 
         // Accumulate scores: docNum → score
         var scores = std.AutoHashMapUnmanaged(u32, f32).empty;
@@ -1344,7 +1384,9 @@ pub const SparseIndex = struct {
 
                 for (decoded.doc_nums, 0..) |doc_num, di| {
                     if (filter_doc_nums.count() > 0 and !filter_doc_nums.contains(doc_num)) continue;
+                    if (direct_filter_doc_nums.count() > 0 and !direct_filter_doc_nums.contains(doc_num)) continue;
                     if (exclude_doc_nums.contains(doc_num)) continue;
+                    if (direct_exclude_doc_nums.contains(doc_num)) continue;
                     const doc_weight = decoded.weights[di];
                     const gop = try scores.getOrPut(alloc, doc_num);
                     if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -1380,6 +1422,7 @@ pub const SparseIndex = struct {
             const doc_id = txn.get(rk) catch continue;
             results[valid] = .{
                 .doc_id = try alloc.dupe(u8, doc_id),
+                .doc_num = entry.doc_num,
                 .score = entry.score,
             };
             valid += 1;
@@ -1409,6 +1452,31 @@ pub const SparseIndex = struct {
             try out.put(alloc, @intCast(doc_num), {});
         }
         return out;
+    }
+
+    fn docNumSetFromSliceAlloc(
+        self: *SparseIndex,
+        alloc: Allocator,
+        doc_nums: []const u32,
+    ) !std.AutoHashMapUnmanaged(u32, void) {
+        _ = self;
+        var out = std.AutoHashMapUnmanaged(u32, void).empty;
+        errdefer out.deinit(alloc);
+        for (doc_nums) |doc_num| try out.put(alloc, doc_num, {});
+        return out;
+    }
+
+    pub fn debugDocNumForDocId(self: *SparseIndex, doc_id: []const u8) !?u32 {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const fwd_data = txn.get(fwdKey(&key_buf, doc_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const doc_num = try decodeFwdDocNum(fwd_data);
+        if (doc_num > std.math.maxInt(u32)) return error.DocNumOverflow;
+        return @intCast(doc_num);
     }
 
     /// Free search results.
@@ -2474,6 +2542,44 @@ test "sparse constrained search filters before top-k ranking" {
 
     try std.testing.expectEqual(@as(usize, 1), filtered.len);
     try std.testing.expectEqualStrings("doc:b", filtered[0].doc_id);
+}
+
+test "sparse search supports caller supplied ordinal doc nums" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "s2-ordinal-doc-nums");
+    defer cleanupTmp(path);
+
+    var idx = try SparseIndex.open(alloc, path, .{});
+    defer idx.close();
+
+    const writes = [_]SparseWrite{
+        .{ .doc_id = "doc:a", .doc_num = 42, .vec = .{ .indices = &.{1}, .values = &.{1.0} } },
+        .{ .doc_id = "doc:b", .doc_num = 7, .vec = .{ .indices = &.{1}, .values = &.{0.5} } },
+    };
+    try idx.batch(&writes, &.{});
+
+    try std.testing.expectEqual(@as(?u32, 42), try idx.debugDocNumForDocId("doc:a"));
+    try std.testing.expectEqual(@as(?u32, 7), try idx.debugDocNumForDocId("doc:b"));
+
+    const query = SparseVector{ .indices = &.{1}, .values = &.{1.0} };
+    const filtered = try idx.searchConstrained(alloc, &query, 10, .{
+        .filter_doc_nums = &.{42},
+    });
+    defer SparseIndex.freeResults(alloc, filtered);
+
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("doc:a", filtered[0].doc_id);
+    try std.testing.expectEqual(@as(?u32, 42), filtered[0].doc_num);
+
+    const excluded = try idx.searchConstrained(alloc, &query, 10, .{
+        .exclude_doc_nums = &.{42},
+    });
+    defer SparseIndex.freeResults(alloc, excluded);
+
+    try std.testing.expectEqual(@as(usize, 1), excluded.len);
+    try std.testing.expectEqualStrings("doc:b", excluded[0].doc_id);
+    try std.testing.expectEqual(@as(?u32, 7), excluded[0].doc_num);
 }
 
 test "sparse handoff range preserves doc numbers and postings" {

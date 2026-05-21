@@ -20,6 +20,7 @@ pub const version: u16 = 1;
 
 // Packed search wire responses deliberately stay minimal: opaque hit IDs plus scores.
 // Callers that need artifact structure should decode artifact IDs separately.
+// Responses may include an 8-byte identity_read_generation footer after the ID blob.
 
 pub const Op = enum(u16) {
     dense_search = 1,
@@ -171,6 +172,15 @@ pub fn encodeDenseResponse(
     ids: []const []const u8,
     scores: []const f32,
 ) !capi.Buffer {
+    return try encodeDenseResponseAtGeneration(total_hits, ids, scores, null);
+}
+
+pub fn encodeDenseResponseAtGeneration(
+    total_hits: u32,
+    ids: []const []const u8,
+    scores: []const f32,
+    identity_read_generation: ?u64,
+) !capi.Buffer {
     std.debug.assert(ids.len == scores.len);
 
     var ids_len: usize = 0;
@@ -178,7 +188,8 @@ pub fn encodeDenseResponse(
 
     const header_len: usize = 4 + 2 + 2 + 4 + 4 + 4;
     const hits_len: usize = ids.len * @sizeOf(PackedHit);
-    const total_len = header_len + hits_len + ids_len;
+    const footer_len: usize = if (identity_read_generation == null) 0 else @sizeOf(u64);
+    const total_len = header_len + hits_len + ids_len + footer_len;
     const out = try std.heap.c_allocator.alloc(u8, total_len);
     errdefer std.heap.c_allocator.free(out);
 
@@ -203,8 +214,75 @@ pub fn encodeDenseResponse(
         @memcpy(out[cursor..][0..id.len], id);
         cursor += id.len;
     }
+    if (identity_read_generation) |generation| {
+        writeInt(out, &cursor, u64, generation);
+    }
 
     return .{ .ptr = out.ptr, .len = out.len };
+}
+
+pub fn denseResponseIdentityReadGeneration(payload: []const u8) !?u64 {
+    var reader = Reader{ .buf = payload };
+    try reader.expectMagicAndVersion(.dense_search);
+    _ = try reader.readInt(u32); // total_hits
+    const hit_count = try reader.readInt(u32);
+    const ids_len = try reader.readInt(u32);
+    const hits_len = @as(usize, @intCast(hit_count)) * @sizeOf(PackedHit);
+    const payload_len = reader.pos + hits_len + @as(usize, @intCast(ids_len));
+    if (payload_len > payload.len) return error.InvalidArgument;
+    if (payload.len == payload_len) return null;
+    if (payload.len != payload_len + @sizeOf(u64)) return error.InvalidArgument;
+    return std.mem.readInt(u64, payload[payload_len..][0..@sizeOf(u64)], .little);
+}
+
+test "packed dense response exposes public ids not doc ordinals" {
+    const ids = [_][]const u8{ "doc:b", "doc:a" };
+    const scores = [_]f32{ 0.75, 0.25 };
+    var out = try encodeDenseResponseAtGeneration(2, ids[0..], scores[0..], 99);
+    defer std.heap.c_allocator.free(out.ptr.?[0..out.len]);
+
+    const header_len: usize = 4 + 2 + 2 + 4 + 4 + 4;
+    const hits_len = ids.len * @sizeOf(PackedHit);
+    const ids_len = ids[0].len + ids[1].len;
+    try std.testing.expectEqual(header_len + hits_len + ids_len + @sizeOf(u64), out.len);
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(PackedHit));
+    try std.testing.expectEqual(@as(?u64, 99), try denseResponseIdentityReadGeneration(out.ptr.?[0..out.len]));
+
+    var cursor: usize = 0;
+    try std.testing.expectEqual(magic, std.mem.readInt(u32, out.ptr.?[cursor..][0..4], .little));
+    cursor += 4;
+    try std.testing.expectEqual(version, std.mem.readInt(u16, out.ptr.?[cursor..][0..2], .little));
+    cursor += 2;
+    try std.testing.expectEqual(@intFromEnum(Op.dense_search), std.mem.readInt(u16, out.ptr.?[cursor..][0..2], .little));
+    cursor += 2;
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, out.ptr.?[cursor..][0..4], .little));
+    cursor += 4;
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, out.ptr.?[cursor..][0..4], .little));
+    cursor += 4;
+    try std.testing.expectEqual(@as(u32, @intCast(ids_len)), std.mem.readInt(u32, out.ptr.?[cursor..][0..4], .little));
+    cursor += 4;
+
+    const first_id_offset = std.mem.readInt(u32, out.ptr.?[cursor..][0..4], .little);
+    const first_id_len = std.mem.readInt(u16, out.ptr.?[cursor + 4 ..][0..2], .little);
+    const first_reserved = std.mem.readInt(u16, out.ptr.?[cursor + 6 ..][0..2], .little);
+    const first_score: f32 = @bitCast(std.mem.readInt(u32, out.ptr.?[cursor + 8 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), first_id_offset);
+    try std.testing.expectEqual(@as(u16, @intCast(ids[0].len)), first_id_len);
+    try std.testing.expectEqual(@as(u16, 0), first_reserved);
+    try std.testing.expectEqual(scores[0], first_score);
+    cursor += @sizeOf(PackedHit);
+
+    const second_id_offset = std.mem.readInt(u32, out.ptr.?[cursor..][0..4], .little);
+    const second_id_len = std.mem.readInt(u16, out.ptr.?[cursor + 4 ..][0..2], .little);
+    const second_reserved = std.mem.readInt(u16, out.ptr.?[cursor + 6 ..][0..2], .little);
+    const second_score: f32 = @bitCast(std.mem.readInt(u32, out.ptr.?[cursor + 8 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, @intCast(ids[0].len)), second_id_offset);
+    try std.testing.expectEqual(@as(u16, @intCast(ids[1].len)), second_id_len);
+    try std.testing.expectEqual(@as(u16, 0), second_reserved);
+    try std.testing.expectEqual(scores[1], second_score);
+    cursor += @sizeOf(PackedHit);
+
+    try std.testing.expectEqualStrings("doc:bdoc:a", out.ptr.?[cursor..][0..ids_len]);
 }
 
 fn writeInt(buf: []u8, cursor: *usize, comptime T: type, value: T) void {
@@ -254,6 +332,21 @@ test "round-trip dense response header" {
     try std.testing.expectEqual(@as(u32, 7), try reader.readInt(u32));
     try std.testing.expectEqual(@as(u32, 2), try reader.readInt(u32));
     try std.testing.expectEqual(@as(u32, ids[0].len + ids[1].len), try reader.readInt(u32));
+    try std.testing.expectEqual(@as(?u64, null), try denseResponseIdentityReadGeneration(buf.ptr.?[0..buf.len]));
+}
+
+test "dense response identity generation footer" {
+    const ids = [_][]const u8{ "doc1", "doc-two" };
+    const scores = [_]f32{ 1.25, 2.5 };
+    const buf = try encodeDenseResponseAtGeneration(7, &ids, &scores, 42);
+    defer std.heap.c_allocator.free(buf.ptr.?[0..buf.len]);
+
+    var reader = Reader{ .buf = buf.ptr.?[0..buf.len] };
+    try reader.expectMagicAndVersion(.dense_search);
+    try std.testing.expectEqual(@as(u32, 7), try reader.readInt(u32));
+    try std.testing.expectEqual(@as(u32, 2), try reader.readInt(u32));
+    try std.testing.expectEqual(@as(u32, ids[0].len + ids[1].len), try reader.readInt(u32));
+    try std.testing.expectEqual(@as(?u64, 42), try denseResponseIdentityReadGeneration(buf.ptr.?[0..buf.len]));
 }
 
 test "decode text match request" {

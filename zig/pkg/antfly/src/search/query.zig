@@ -62,6 +62,7 @@ pub const Filter = union(enum) {
     geo_bbox: GeoBBoxFilter,
     wildcard: WildcardFilter,
     doc_id: DocIdFilter,
+    doc_num: DocNumFilter,
     bool_field: BoolFieldFilter,
     multi_phrase: MultiPhraseFilter,
     date_range: DateRangeFilter,
@@ -85,6 +86,7 @@ pub const Filter = union(enum) {
             .geo_bbox => |f| f.execute(alloc, seg),
             .wildcard => |f| f.execute(alloc, seg),
             .doc_id => |f| f.execute(alloc, seg),
+            .doc_num => |f| f.executeWithOffset(alloc, seg, 0),
             .bool_field => |f| f.execute(alloc, seg),
             .multi_phrase => |f| f.execute(alloc, seg),
             .date_range => |f| f.execute(alloc, seg),
@@ -94,6 +96,14 @@ pub const Filter = union(enum) {
             .geo_shape => |f| f.execute(alloc, seg),
             .match_none => matchNone(alloc),
             .match_all => matchAll(alloc, seg),
+        };
+    }
+
+    pub fn executeWithOffset(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
+        return switch (self) {
+            .bool_filter => |f| f.executeWithOffset(alloc, seg, doc_offset),
+            .doc_num => |f| f.executeWithOffset(alloc, seg, doc_offset),
+            else => self.execute(alloc, seg),
         };
     }
 
@@ -185,12 +195,16 @@ pub const BoolFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithOffset(alloc, seg, 0);
+    }
+
+    pub fn executeWithOffset(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
         var result: ?roaring.RoaringBitmap = null;
         errdefer if (result) |*r| r.deinit();
 
         // Process must clauses (AND)
         for (self.must) |clause| {
-            var clause_bm = try clause.execute(alloc, seg);
+            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -203,7 +217,7 @@ pub const BoolFilter = struct {
         if (self.should.len > 0) {
             const required_should: u32 = if (self.min_should_match == 0 and result == null) 1 else self.min_should_match;
             if (required_should > 0) {
-                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg);
+                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset);
                 errdefer should_bm.deinit();
                 if (result) |*r| {
                     r.andWith(&should_bm);
@@ -221,7 +235,7 @@ pub const BoolFilter = struct {
 
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
-            var clause_bm = try clause.execute(alloc, seg);
+            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -235,6 +249,7 @@ fn executeShouldClauses(
     should: []const Filter,
     min_should_match: u32,
     seg: *const index_mod.SegmentEntry,
+    doc_offset: u32,
 ) FilterError!roaring.RoaringBitmap {
     if (min_should_match > should.len) {
         return roaring.RoaringBitmap.init(alloc);
@@ -244,7 +259,7 @@ fn executeShouldClauses(
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         for (should) |clause| {
-            var clause_bm = try clause.execute(alloc, seg);
+            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             try result.orWith(&clause_bm);
         }
@@ -255,7 +270,7 @@ fn executeShouldClauses(
     defer counts.deinit(alloc);
 
     for (should) |clause| {
-        var clause_bm = try clause.execute(alloc, seg);
+        var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
         defer clause_bm.deinit();
 
         var iter = clause_bm.iterator();
@@ -1251,6 +1266,24 @@ pub const DocIdFilter = struct {
     }
 };
 
+/// Global numeric document filter: matches documents by snapshot-global doc ID.
+pub const DocNumFilter = struct {
+    doc_nums: []const u32,
+
+    pub fn executeWithOffset(self: DocNumFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
+        var result = roaring.RoaringBitmap.init(alloc);
+        errdefer result.deinit();
+
+        const upper = doc_offset + seg.reader.doc_count;
+        for (self.doc_nums) |doc_num| {
+            if (doc_num < doc_offset or doc_num >= upper) continue;
+            try result.add(doc_num - doc_offset);
+        }
+
+        return result;
+    }
+};
+
 /// Boolean field filter: matches documents by a boolean typed doc value.
 pub const BoolFieldFilter = struct {
     field: []const u8,
@@ -1295,7 +1328,7 @@ pub fn executeFilter(
 
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
-        var bm = try filter.execute(alloc, seg);
+        var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
         // Remove deleted docs
@@ -1952,6 +1985,33 @@ test "doc_id filter finds specific documents" {
     try testing.expect(bm.contains(0));
     try testing.expect(!bm.contains(1));
     try testing.expect(bm.contains(2));
+}
+
+test "doc_num filter matches snapshot global document numbers" {
+    const alloc = testing.allocator;
+
+    const seg_a = try buildTestSegmentWithTerms(alloc, &.{
+        .{ .terms = &.{.{ .term = "a", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "b", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg_a);
+    const seg_b = try buildTestSegmentWithTerms(alloc, &.{
+        .{ .terms = &.{.{ .term = "c", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "d", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg_b);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_a);
+    try writer.addSegment(seg_b);
+
+    const doc_ids = try writer.snapshot().executeFilter(alloc, .{ .doc_num = .{ .doc_nums = &.{ 1, 2 } } });
+    defer alloc.free(doc_ids);
+
+    try testing.expectEqual(@as(usize, 2), doc_ids.len);
+    try testing.expectEqual(@as(u32, 1), doc_ids[0]);
+    try testing.expectEqual(@as(u32, 2), doc_ids[1]);
 }
 
 test "bool_field filter matches true/false" {

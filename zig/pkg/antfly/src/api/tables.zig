@@ -462,8 +462,10 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
+    const group_id = deriveDataGroupId(table.name, 0x47525031);
     return .{
-        .group_id = deriveDataGroupId(table.name, 0x47525031),
+        .group_id = group_id,
+        .range_id = group_id,
         .table_id = table.table_id,
         .start_key = "",
         .end_key = null,
@@ -475,9 +477,11 @@ pub fn deriveInitialRanges(
     table: metadata_table_manager.TableRecord,
 ) ![]metadata_table_manager.RangeRecord {
     if (table.min_ranges <= 1) {
+        const initial_range = deriveInitialRange(table);
         const out = try alloc.alloc(metadata_table_manager.RangeRecord, 1);
         out[0] = .{
-            .group_id = deriveInitialRange(table).group_id,
+            .group_id = initial_range.group_id,
+            .range_id = initial_range.range_id,
             .table_id = table.table_id,
             .start_key = try alloc.dupe(u8, ""),
             .end_key = null,
@@ -509,8 +513,10 @@ pub fn deriveInitialRanges(
             try deriveShardBoundaryKey(alloc, i + 1, shard_count);
         errdefer if (end_key) |value| alloc.free(value);
 
+        const group_id = deriveShardGroupId(table.name, i);
         out[i] = .{
-            .group_id = deriveShardGroupId(table.name, i),
+            .group_id = group_id,
+            .range_id = group_id,
             .table_id = table.table_id,
             .start_key = start_key,
             .end_key = end_key,

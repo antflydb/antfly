@@ -500,6 +500,9 @@ fn addBatchProfile(total: *db_mod.BatchProfile, delta: db_mod.BatchProfile) void
     total.extract_writes_ns += delta.extract_writes_ns;
     total.delete_artifacts_ns += delta.delete_artifacts_ns;
     total.precompute_generated_ns += delta.precompute_generated_ns;
+    total.identity_capacity_check_ns += delta.identity_capacity_check_ns;
+    total.identity_metadata_ns += delta.identity_metadata_ns;
+    total.identity_metadata_writes += delta.identity_metadata_writes;
     total.store_write_ns += delta.store_write_ns;
     total.split_delta_ns += delta.split_delta_ns;
     total.build_derived_ns += delta.build_derived_ns;
@@ -555,10 +558,13 @@ fn printSummary(cfg: Config, summary: Summary) void {
         },
     );
     std.debug.print(
-        "batch_bench_profile resolve_ms={d:.3} merge_req_ms={d:.3} store_write_ms={d:.3} build_derived_ms={d:.3} append_replay_journal_ms={d:.3} full_text_apply_ms={d:.3} dense_apply_ms={d:.3}\n",
+        "batch_bench_profile resolve_ms={d:.3} merge_req_ms={d:.3} identity_capacity_ms={d:.3} identity_metadata_ms={d:.3} identity_metadata_writes={d} store_write_ms={d:.3} build_derived_ms={d:.3} append_replay_journal_ms={d:.3} full_text_apply_ms={d:.3} dense_apply_ms={d:.3}\n",
         .{
             nsToMsFloat(summary.profile.resolve_transforms_ns),
             nsToMsFloat(summary.profile.merge_effective_req_ns),
+            nsToMsFloat(summary.profile.identity_capacity_check_ns),
+            nsToMsFloat(summary.profile.identity_metadata_ns),
+            summary.profile.identity_metadata_writes,
             nsToMsFloat(summary.profile.store_write_ns),
             nsToMsFloat(summary.profile.build_derived_ns),
             nsToMsFloat(summary.profile.append_replay_journal_ns),

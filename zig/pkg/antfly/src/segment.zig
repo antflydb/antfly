@@ -60,7 +60,10 @@ pub const SectionType = enum(u16) {
     synonym = 2,
     columnar_stored = 3,
     typed_doc_values = 4,
+    doc_ordinals = 5,
 };
+
+pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
 
 // ============================================================================
 // Segment writer
@@ -130,6 +133,16 @@ pub const SegmentWriter = struct {
             .is_compressed = true,
         });
         self.doc_count += 1;
+    }
+
+    pub fn addDocOrdinals(self: *SegmentWriter, ordinals: []const u32) !void {
+        if (ordinals.len != self.doc_count) return error.InvalidSegment;
+        const data = try encodeDocOrdinalsAlloc(self.alloc, ordinals);
+        defer self.alloc.free(data);
+        if (data.len == 0) return;
+
+        const field_idx = try self.addField(doc_ordinals_field);
+        try self.addSection(field_idx, .doc_ordinals, data);
     }
 
     /// Build the final segment file bytes. Caller owns result.
@@ -473,6 +486,11 @@ pub const SegmentReader = struct {
     pub fn storedDocsAreCompressed(self: *const SegmentReader) bool {
         return self.data[@intCast(self.stored_offset)] >= 2;
     }
+
+    pub fn docOrdinal(self: *const SegmentReader, doc_idx: u32) !?u32 {
+        const section = self.getSection(doc_ordinals_field, .doc_ordinals) orelse return null;
+        return try decodeDocOrdinal(section, doc_idx);
+    }
 };
 
 // ============================================================================
@@ -662,6 +680,7 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
 
     for (inputs) |input| {
         for (input.reader.fields) |*f| {
+            if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -721,6 +740,14 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
             try appendBuiltSection(alloc, sink, &built_field, .typed_doc_values, merged);
         }
 
+        try built_fields.append(alloc, built_field);
+    }
+
+    if (try mergeDocOrdinalSectionsAlloc(alloc, inputs, doc_count)) |merged_doc_ordinals| {
+        defer alloc.free(merged_doc_ordinals);
+        var built_field = BuiltField{ .name = doc_ordinals_field };
+        errdefer built_field.deinit(alloc);
+        try appendBuiltSection(alloc, sink, &built_field, .doc_ordinals, merged_doc_ordinals);
         try built_fields.append(alloc, built_field);
     }
 
@@ -871,6 +898,58 @@ fn mergeTypedDocValuesSections(
         return try w.build();
     }
     return null;
+}
+
+pub fn encodeDocOrdinalsAlloc(alloc: Allocator, ordinals: []const u32) ![]u8 {
+    var has_ordinal = false;
+    for (ordinals) |ordinal| {
+        if (ordinal != 0) {
+            has_ordinal = true;
+            break;
+        }
+    }
+    if (!has_ordinal) return try alloc.alloc(u8, 0);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, 1);
+    try appendU32BE(alloc, &out, @intCast(ordinals.len));
+    for (ordinals) |ordinal| try appendU32BE(alloc, &out, ordinal);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeDocOrdinal(section: []const u8, doc_idx: u32) !?u32 {
+    if (section.len < 5) return error.InvalidSegment;
+    const version = section[0];
+    if (version != 1) return error.UnsupportedVersion;
+    const count = std.mem.readInt(u32, section[1..5], .big);
+    if (doc_idx >= count) return null;
+    const expected_len = 5 + @as(usize, count) * 4;
+    if (section.len != expected_len) return error.InvalidSegment;
+    const offset = 5 + @as(usize, doc_idx) * 4;
+    const ordinal = std.mem.readInt(u32, section[offset..][0..4], .big);
+    return if (ordinal == 0) null else ordinal;
+}
+
+fn mergeDocOrdinalSectionsAlloc(alloc: Allocator, inputs: []const MergeInput, doc_count: u32) !?[]u8 {
+    if (doc_count == 0) return null;
+    var ordinals = try alloc.alloc(u32, doc_count);
+    defer alloc.free(ordinals);
+
+    var out_doc_id: usize = 0;
+    var has_ordinal = false;
+    for (inputs) |input| {
+        for (0..input.reader.doc_count) |doc_id_usize| {
+            const doc_id: u32 = @intCast(doc_id_usize);
+            if (input.isDeleted(doc_id)) continue;
+            const ordinal = (try input.reader.docOrdinal(doc_id)) orelse 0;
+            ordinals[out_doc_id] = ordinal;
+            has_ordinal = has_ordinal or ordinal != 0;
+            out_doc_id += 1;
+        }
+    }
+    if (!has_ordinal) return null;
+    return try encodeDocOrdinalsAlloc(alloc, ordinals);
 }
 
 // ============================================================================
@@ -1040,6 +1119,48 @@ test "segment merge" {
     try std.testing.expect(reader.storedDoc(1) != null);
     try std.testing.expect(reader.storedDoc(2) != null);
     try std.testing.expect(reader.storedDoc(3) == null);
+}
+
+test "segment doc ordinal sidecar roundtrip and merge preserve live order" {
+    const alloc = std.testing.allocator;
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    try sw1.addStoredDoc("a", "{}");
+    try sw1.addStoredDoc("b", "{}");
+    try sw1.addDocOrdinals(&.{ 7, 11 });
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    try sw2.addStoredDoc("c", "{}");
+    try sw2.addDocOrdinals(&.{13});
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    var reader1 = try SegmentReader.init(alloc, seg1);
+    defer reader1.deinit();
+    try std.testing.expectEqual(@as(?u32, 7), try reader1.docOrdinal(0));
+    try std.testing.expectEqual(@as(?u32, 11), try reader1.docOrdinal(1));
+
+    var reader2 = try SegmentReader.init(alloc, seg2);
+    defer reader2.deinit();
+    var deleted = roaring.RoaringBitmap.init(alloc);
+    defer deleted.deinit();
+    try deleted.add(0);
+
+    const merged = try mergeSegmentInputs(alloc, &.{
+        .{ .reader = &reader1, .deleted = deleted },
+        .{ .reader = &reader2 },
+    });
+    defer alloc.free(merged);
+
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqual(@as(u32, 2), merged_reader.doc_count);
+    try std.testing.expectEqual(@as(?u32, 11), try merged_reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(?u32, 13), try merged_reader.docOrdinal(1));
 }
 
 test "multi-field segment" {

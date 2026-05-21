@@ -43,7 +43,7 @@ RUN case "${TARGETARCH}" in \
 FROM --platform=$TARGETPLATFORM alpine:3.21 AS model-puller
 
 ARG INCLUDE_CLIPCLAP=true
-ARG CLIPCLAP_REF=hf:antflydb/clipclap:gguf:Q4_K_M
+ARG CLIPCLAP_REF=hf:antflydb/clipclap:gguf:Q4_K
 ARG CLIPCLAP_TASKS=embed
 ARG CLIPCLAP_CAPABILITIES=text,image,audio
 
@@ -68,9 +68,14 @@ LABEL org.opencontainers.image.description="AntflyDB Zig ML runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
 ENV ANTFLY_TERMITE_MODELS_DIR="/models"
+ENV TERMITE_MODELS_DIR="/models"
 
-RUN addgroup -S antfly && \
-    adduser -S -G antfly -h /home/antfly antfly && \
+# Create non-root user with a stable UID/GID so Kubernetes fsGroup and init
+# container ownership fixes match the runtime user across images.
+ARG ANTFLY_UID=10001
+ARG ANTFLY_GID=10001
+RUN addgroup -S -g ${ANTFLY_GID} antfly && \
+    adduser -S -u ${ANTFLY_UID} -G antfly -h /home/antfly antfly && \
     mkdir -p /models
 
 WORKDIR /

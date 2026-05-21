@@ -154,6 +154,7 @@ pub const SearchQuery = union(enum) {
     numeric_range: NumericRangeQuery,
     date_range: DateRangeQuery,
     doc_id: DocIdQuery,
+    doc_num: DocNumQuery,
     bool_field: BoolFieldQuery,
     geo_distance: GeoDistanceQuery,
     geo_bbox: GeoBBoxQuery,
@@ -267,6 +268,11 @@ pub const DateRangeQuery = struct {
 
 pub const DocIdQuery = struct {
     ids: []const []const u8,
+    boost: f32 = 1.0,
+};
+
+pub const DocNumQuery = struct {
+    ids: []const u32,
     boost: f32 = 1.0,
 };
 
@@ -450,6 +456,7 @@ pub fn execute(
         .numeric_range => |rq| try executeNumericRange(alloc, snap, rq, request),
         .date_range => |rq| try executeDateRange(alloc, snap, rq, request),
         .doc_id => |dq| try executeDocID(alloc, snap, dq, request),
+        .doc_num => |dq| try executeDocNum(alloc, snap, dq, request),
         .bool_field => |bq| try executeBoolField(alloc, snap, bq, request),
         .geo_distance => |gq| try executeGeoDistance(alloc, snap, gq, request),
         .geo_bbox => |gq| try executeGeoBBox(alloc, snap, gq, request),
@@ -878,6 +885,15 @@ fn executeDocID(
     request: SearchRequest,
 ) !SearchResult {
     return executeFilterQuery(alloc, snap, .{ .doc_id = .{ .doc_ids = dq.ids } }, request, dq.boost);
+}
+
+fn executeDocNum(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    dq: DocNumQuery,
+    request: SearchRequest,
+) !SearchResult {
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids } }, request, dq.boost);
 }
 
 fn executeBoolField(
@@ -1700,6 +1716,7 @@ fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mo
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -1845,6 +1862,11 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
         },
         .doc_id => |dq| .{
             .filter = .{ .doc_id = .{ .doc_ids = dq.ids } },
+            .duped_terms = &.{},
+            .filter_slice = &.{},
+        },
+        .doc_num => |dq| .{
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },

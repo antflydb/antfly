@@ -23,6 +23,7 @@ const backend_types = @import("../../backend_types.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
+const doc_identity = @import("../doc_identity.zig");
 const apply_state = @import("../derived/apply_state.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -1392,6 +1393,12 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 try store.syncReplayState();
                 try entry.index.syncReplayState();
+                return;
+            }
+        }
+        for (self.algebraic_indexes.items) |*entry| {
+            if (std.mem.eql(u8, entry.config.name, name)) {
+                try entry.index.sync(false);
                 return;
             }
         }
@@ -2996,9 +3003,12 @@ pub const IndexManager = struct {
     }
 
     fn deleteDenseIndexMetadata(self: *IndexManager, store: anytype, index_name: []const u8) !void {
-        const prefix = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata__:dense:{s}:", .{index_name});
+        const prefix = try denseIndexMetadataPrefixAlloc(self.alloc, index_name);
         defer self.alloc.free(prefix);
         try self.deleteKeysWithPrefix(store, prefix);
+        const legacy_prefix = try legacyDenseIndexMetadataPrefixAlloc(self.alloc, index_name);
+        defer self.alloc.free(legacy_prefix);
+        try self.deleteKeysWithPrefix(store, legacy_prefix);
     }
 
     fn deleteOwnedGeneratedArtifacts(
@@ -3590,7 +3600,7 @@ pub const IndexManager = struct {
         }
 
         for (self.sparse_indexes.items) |*entry| {
-            try self.indexSparseBatchEntry(entry, writes);
+            try self.indexSparseBatchEntry(store, entry, writes);
         }
     }
 
@@ -3627,7 +3637,7 @@ pub const IndexManager = struct {
 
         for (self.sparse_indexes.items) |*entry| {
             const handoff = findSparseSplitHandoff(sparse_handoffs, entry.config.name);
-            try self.indexSparseBatchEntryWithSkip(entry, writes, handoff);
+            try self.indexSparseBatchEntryWithSkip(store, entry, writes, handoff);
         }
     }
 
@@ -3956,8 +3966,15 @@ pub const IndexManager = struct {
         can_assume_absent: bool,
     };
 
+    const DenseVectorMetadataState = enum {
+        absent,
+        matches,
+        conflicts,
+    };
+
     const PendingDenseVectorMapping = struct {
         doc_key: []const u8,
+        parent_doc_key: ?[]const u8 = null,
         vector_id: u64,
     };
 
@@ -3994,15 +4011,14 @@ pub const IndexManager = struct {
                     const artifact_name = entry.embedding_name orelse entry.config.name;
                     try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, write.vector);
                 }
-                const assignment = try self.ensureDenseVectorIdTxn(store_txn, write.index_name, write.doc_key);
+                const assignment = try self.ensureDenseVectorIdTxn(store_txn, write.index_name, write.doc_key, write.parent_doc_key);
                 all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
                 try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, write.doc_key);
-                if (assignment.needs_mapping) {
-                    try pending_mappings.append(self.alloc, .{
-                        .doc_key = items.items.items[items.items.items.len - 1].metadata,
-                        .vector_id = assignment.vector_id,
-                    });
-                }
+                try pending_mappings.append(self.alloc, .{
+                    .doc_key = items.items.items[items.items.items.len - 1].metadata,
+                    .parent_doc_key = write.parent_doc_key,
+                    .vector_id = assignment.vector_id,
+                });
             }
 
             if (items.items.items.len == 0) continue;
@@ -4112,10 +4128,10 @@ pub const IndexManager = struct {
         try self.deleteDenseBatchEntry(store, entry, keys, batch_options);
     }
 
-    pub fn indexSparseBatchByName(self: *IndexManager, index_name: []const u8, writes: []const types.BatchWrite) !void {
+    pub fn indexSparseBatchByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite) !void {
         if (writes.len == 0) return;
         const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
-        try self.indexSparseBatchEntry(entry, writes);
+        try self.indexSparseBatchEntry(store, entry, writes);
     }
 
     pub fn deleteSparseBatchByName(self: *IndexManager, index_name: []const u8, keys: []const []const u8) !void {
@@ -4207,6 +4223,8 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        var identity_txn = try runtime_store.store.beginRead();
+        defer identity_txn.abort();
 
         var mapped_docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
         defer mapped_docs.deinit(self.alloc);
@@ -4270,6 +4288,7 @@ pub const IndexManager = struct {
             try mapped_docs.append(self.alloc, .{
                 .key = doc_id,
                 .value = doc.value,
+                .doc_ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, &identity_txn, doc_id),
             });
             last_key = doc.key;
 
@@ -5339,18 +5358,17 @@ pub const IndexManager = struct {
             const vector_values = (try mapper.extractDenseVectorField(self.alloc, doc.value, entry.field_name, entry.dims)) orelse continue;
             errdefer self.alloc.free(vector_values);
 
-            const assignment = try self.ensureDenseVectorIdTxn(&mapping_batch, entry.config.name, raw_key);
+            const assignment = try self.ensureDenseVectorIdTxn(&mapping_batch, entry.config.name, raw_key, null);
             try items.append(self.alloc, .{
                 .vector_id = assignment.vector_id,
                 .vector = vector_values,
                 .metadata = try self.alloc.dupe(u8, raw_key),
             });
-            if (assignment.needs_mapping) {
-                try pending_mappings.append(self.alloc, .{
-                    .doc_key = items.items[items.items.len - 1].metadata,
-                    .vector_id = assignment.vector_id,
-                });
-            }
+            try pending_mappings.append(self.alloc, .{
+                .doc_key = items.items[items.items.len - 1].metadata,
+                .parent_doc_key = null,
+                .vector_id = assignment.vector_id,
+            });
         }
 
         try self.insertDenseItems(entry, items.items);
@@ -5471,10 +5489,60 @@ pub const IndexManager = struct {
         return present;
     }
 
+    fn denseVectorIdMetadataState(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        vector_id: u64,
+        doc_key: []const u8,
+        memo: ?*DenseVectorMetadataPresenceMemo,
+    ) !DenseVectorMetadataState {
+        if (memo) |cache| {
+            if (cache.getMetadata(vector_id)) |metadata| {
+                return if (std.mem.eql(u8, metadata, doc_key)) .matches else .conflicts;
+            }
+            if (cache.get(vector_id) == false) return .absent;
+        }
+        const existing_metadata = entry.index.getMetadata(vector_id) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing_metadata) |metadata| {
+            defer self.alloc.free(metadata);
+            if (memo) |cache| try cache.notePresent(self.alloc, vector_id, metadata);
+            return if (std.mem.eql(u8, metadata, doc_key)) .matches else .conflicts;
+        }
+        if (memo) |cache| try cache.noteAbsent(self.alloc, vector_id);
+        return .absent;
+    }
+
+    fn legacyOrdinalDenseVectorIdAssignmentTxn(
+        self: *IndexManager,
+        txn: anytype,
+        entry: *DenseIndex,
+        doc_key: []const u8,
+        parent_doc_key: ?[]const u8,
+        metadata_presence_memo: ?*DenseVectorMetadataPresenceMemo,
+    ) !?DenseVectorIdAssignment {
+        if (parent_doc_key != null) return null;
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return null;
+        const vector_id: u64 = ordinal;
+        // Compatibility only: pre-DOCID dense vectors may have used the document
+        // ordinal as the HBC vector ID. New assignments use deterministic IDs.
+        return switch (try self.denseVectorIdMetadataState(entry, vector_id, doc_key, metadata_presence_memo)) {
+            .matches => .{
+                .vector_id = vector_id,
+                .needs_mapping = false,
+                .can_assume_absent = false,
+            },
+            .absent, .conflicts => null,
+        };
+    }
+
     fn prefetchDenseExistingMetadataTxn(
         self: *IndexManager,
         entry: *DenseIndex,
-        txn: anytype,
+        identity_txn: anytype,
+        index_txn: anytype,
         writes: []const mapper.DenseEmbeddingWrite,
         keep_write: []const bool,
         memo: *DenseVectorMetadataPresenceMemo,
@@ -5492,11 +5560,12 @@ pub const IndexManager = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const vector_ids_storage = try arena.alloc(u64, candidate_count);
-        const out_metadata = try arena.alloc(?[]const u8, candidate_count);
-        const lookups = try arena.alloc(hbc_mod.FixedKeyLookup, candidate_count);
-        const key_views = try arena.alloc([]const u8, candidate_count);
-        const values = try arena.alloc(?[]const u8, candidate_count);
+        const max_candidate_ids = candidate_count * 2;
+        const vector_ids_storage = try arena.alloc(u64, max_candidate_ids);
+        const out_metadata = try arena.alloc(?[]const u8, max_candidate_ids);
+        const lookups = try arena.alloc(hbc_mod.FixedKeyLookup, max_candidate_ids);
+        const key_views = try arena.alloc([]const u8, max_candidate_ids);
+        const values = try arena.alloc(?[]const u8, max_candidate_ids);
 
         var filled: usize = 0;
         for (writes, 0..) |write, write_index| {
@@ -5505,12 +5574,19 @@ pub const IndexManager = struct {
             if (write.vector.len == 0 and write.artifact_key == null) continue;
             vector_ids_storage[filled] = deterministicDenseVectorId(write.doc_key);
             filled += 1;
+            if (write.parent_doc_key == null) {
+                if (try doc_identity.lookupOrdinalTxn(self.alloc, identity_txn, write.doc_key)) |ordinal| {
+                    vector_ids_storage[filled] = ordinal;
+                    filled += 1;
+                }
+            }
         }
 
-        std.mem.sort(u64, vector_ids_storage, {}, std.sort.asc(u64));
+        const candidate_vector_ids = vector_ids_storage[0..filled];
+        std.mem.sort(u64, candidate_vector_ids, {}, std.sort.asc(u64));
         var unique_count: usize = 0;
         var previous: ?u64 = null;
-        for (vector_ids_storage) |vector_id| {
+        for (candidate_vector_ids) |vector_id| {
             if (previous != null and previous.? == vector_id) continue;
             vector_ids_storage[unique_count] = vector_id;
             unique_count += 1;
@@ -5518,9 +5594,9 @@ pub const IndexManager = struct {
         }
         const vector_ids = vector_ids_storage[0..unique_count];
 
-        if (comptime @hasDecl(@TypeOf(txn.*), "getManySorted")) {
+        if (comptime @hasDecl(@TypeOf(index_txn.*), "getManySorted")) {
             try entry.index.getMetadataManySortedInTxnWithScratch(
-                txn,
+                index_txn,
                 vector_ids,
                 out_metadata[0..unique_count],
                 lookups,
@@ -5529,7 +5605,7 @@ pub const IndexManager = struct {
             );
         } else {
             for (vector_ids, 0..) |vector_id, i| {
-                out_metadata[i] = try entry.index.getMetadataInTxn(txn, vector_id);
+                out_metadata[i] = try entry.index.getMetadataInTxn(index_txn, vector_id);
             }
         }
         for (vector_ids, out_metadata[0..unique_count]) |vector_id, maybe_metadata| {
@@ -5541,8 +5617,8 @@ pub const IndexManager = struct {
         }
     }
 
-    fn ensureDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !DenseVectorIdAssignment {
-        return try self.ensureDenseVectorIdTxnWithMemo(txn, index_name, doc_key, null);
+    fn ensureDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8, parent_doc_key: ?[]const u8) !DenseVectorIdAssignment {
+        return try self.ensureDenseVectorIdTxnWithMemo(txn, index_name, doc_key, parent_doc_key, null);
     }
 
     fn ensureDenseVectorIdTxnWithMemo(
@@ -5550,6 +5626,7 @@ pub const IndexManager = struct {
         txn: anytype,
         index_name: []const u8,
         doc_key: []const u8,
+        parent_doc_key: ?[]const u8,
         metadata_presence_memo: ?*DenseVectorMetadataPresenceMemo,
     ) !DenseVectorIdAssignment {
         const mutable_txn = txn;
@@ -5560,8 +5637,11 @@ pub const IndexManager = struct {
                 .can_assume_absent = false,
             };
         }
-        const vector_id = deterministicDenseVectorId(doc_key);
         if (self.denseIndex(index_name)) |entry| {
+            if (try self.legacyOrdinalDenseVectorIdAssignmentTxn(mutable_txn, entry, doc_key, parent_doc_key, metadata_presence_memo)) |assignment| {
+                return assignment;
+            }
+            const vector_id = deterministicDenseVectorId(doc_key);
             if (try self.denseVectorIdHasExistingMetadata(entry, vector_id, metadata_presence_memo)) {
                 return .{
                     .vector_id = vector_id,
@@ -5569,7 +5649,13 @@ pub const IndexManager = struct {
                     .can_assume_absent = false,
                 };
             }
+            return .{
+                .vector_id = vector_id,
+                .needs_mapping = false,
+                .can_assume_absent = true,
+            };
         }
+        const vector_id = deterministicDenseVectorId(doc_key);
         return .{
             .vector_id = vector_id,
             .needs_mapping = false,
@@ -5583,6 +5669,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         index_name: []const u8,
         doc_key: []const u8,
+        parent_doc_key: ?[]const u8,
         replacement_deletes: *std.ArrayListUnmanaged(u64),
     ) !DenseVectorIdAssignment {
         return try self.replaceDenseVectorIdTxnWithMemo(
@@ -5590,6 +5677,7 @@ pub const IndexManager = struct {
             entry,
             index_name,
             doc_key,
+            parent_doc_key,
             replacement_deletes,
             null,
         );
@@ -5601,6 +5689,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         index_name: []const u8,
         doc_key: []const u8,
+        parent_doc_key: ?[]const u8,
         replacement_deletes: *std.ArrayListUnmanaged(u64),
         metadata_presence_memo: ?*DenseVectorMetadataPresenceMemo,
     ) !DenseVectorIdAssignment {
@@ -5612,6 +5701,10 @@ pub const IndexManager = struct {
                 .needs_mapping = false,
                 .can_assume_absent = false,
             };
+        }
+
+        if (try self.legacyOrdinalDenseVectorIdAssignmentTxn(mutable_txn, entry, doc_key, parent_doc_key, metadata_presence_memo)) |assignment| {
+            return assignment;
         }
 
         const vector_id = deterministicDenseVectorId(doc_key);
@@ -5633,6 +5726,8 @@ pub const IndexManager = struct {
         var mutable_txn = txn;
         const next_key = try denseNextIdKey(self.alloc, index_name);
         defer self.alloc.free(next_key);
+        const legacy_next_key = try legacyDenseNextIdKey(self.alloc, index_name);
+        defer self.alloc.free(legacy_next_key);
 
         var next_id: u64 = 1;
         const next_raw = mutable_txn.get(next_key) catch |err| switch (err) {
@@ -5642,6 +5737,14 @@ pub const IndexManager = struct {
         if (next_raw) |raw| {
             if (raw.len != 8) return error.InvalidDenseVectorMetadata;
             next_id = std.mem.readInt(u64, raw[0..8], .little);
+        }
+        const legacy_next_raw = mutable_txn.get(legacy_next_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (legacy_next_raw) |raw| {
+            if (raw.len != 8) return error.InvalidDenseVectorMetadata;
+            next_id = @max(next_id, std.mem.readInt(u64, raw[0..8], .little));
         }
 
         var next_buf: [8]u8 = undefined;
@@ -5664,6 +5767,8 @@ pub const IndexManager = struct {
         var mutable_txn = txn;
         const next_key = try denseNextIdKey(self.alloc, index_name);
         defer self.alloc.free(next_key);
+        const legacy_next_key = try legacyDenseNextIdKey(self.alloc, index_name);
+        defer self.alloc.free(legacy_next_key);
 
         const next_raw = mutable_txn.get(next_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -5673,6 +5778,14 @@ pub const IndexManager = struct {
         if (next_raw) |raw| {
             if (raw.len != 8) return error.InvalidDenseVectorMetadata;
             current_next_id = std.mem.readInt(u64, raw[0..8], .little);
+        }
+        const legacy_next_raw = mutable_txn.get(legacy_next_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (legacy_next_raw) |raw| {
+            if (raw.len != 8) return error.InvalidDenseVectorMetadata;
+            current_next_id = @max(current_next_id, std.mem.readInt(u64, raw[0..8], .little));
         }
         if (current_next_id >= next_id) return;
 
@@ -5690,6 +5803,10 @@ pub const IndexManager = struct {
         if (try self.lookupDenseVectorIdTxn(&txn, index_name, doc_key)) |mapped| return mapped;
 
         const entry = self.denseIndex(index_name) orelse return null;
+        if (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, doc_key)) |ordinal| {
+            const vector_id: u64 = ordinal;
+            if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches) return vector_id;
+        }
         const vector_id = deterministicDenseVectorId(doc_key);
         const metadata = (try entry.index.getMetadata(vector_id)) orelse return null;
         self.alloc.free(metadata);
@@ -5700,9 +5817,17 @@ pub const IndexManager = struct {
         var mutable_txn = txn;
         const key = try denseDocMappingKey(self.alloc, index_name, doc_key);
         defer self.alloc.free(key);
+        const legacy_key = try legacyDenseDocMappingKey(self.alloc, index_name, doc_key);
+        defer self.alloc.free(legacy_key);
 
         const raw = mutable_txn.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => legacy: {
+                const legacy_raw = mutable_txn.get(legacy_key) catch |legacy_err| switch (legacy_err) {
+                    error.NotFound => return null,
+                    else => return legacy_err,
+                };
+                break :legacy legacy_raw;
+            },
             else => return err,
         };
         if (raw.len != 8) return error.InvalidDenseVectorMetadata;
@@ -5711,7 +5836,11 @@ pub const IndexManager = struct {
 
     fn resolveDenseVectorIdForDeleteTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
         if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |mapped| return mapped;
-        _ = self.denseIndex(index_name) orelse return null;
+        const entry = self.denseIndex(index_name) orelse return null;
+        if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
+            const vector_id: u64 = ordinal;
+            if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches) return vector_id;
+        }
         return deterministicDenseVectorId(doc_key);
     }
 
@@ -5720,6 +5849,8 @@ pub const IndexManager = struct {
 
         var docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
         defer docs.deinit(self.alloc);
+        var identity_txn = try store.beginProbeTxn();
+        defer identity_txn.abort();
 
         for (writes) |write| {
             if (!self.keyInRange(write.key)) continue;
@@ -5727,6 +5858,7 @@ pub const IndexManager = struct {
             try docs.append(self.alloc, .{
                 .key = write.key,
                 .value = write.value,
+                .doc_ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, &identity_txn, write.key),
             });
         }
 
@@ -5799,7 +5931,19 @@ pub const IndexManager = struct {
         if (source_docs.len == 0) return .{};
 
         var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
-        const projection_batch = try mapper.buildTextProjectionBatchFromSource(arena, source_docs, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
+        var identity_txn = try store.beginProbeTxn();
+        defer identity_txn.abort();
+        var source_docs_with_ordinals = std.ArrayListUnmanaged(mapper.TextProjectionSourceDoc).empty;
+        defer source_docs_with_ordinals.deinit(arena);
+        for (source_docs) |source_doc| {
+            var doc = source_doc;
+            if (doc.doc_ordinal == null) {
+                doc.doc_ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, &identity_txn, doc.key);
+            }
+            try source_docs_with_ordinals.append(arena, doc);
+        }
+
+        const projection_batch = try mapper.buildTextProjectionBatchFromSource(arena, source_docs_with_ordinals.items, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
         if (projection_batch.observed_field_analyzers.len > 0) {
             try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
         }
@@ -5905,6 +6049,7 @@ pub const IndexManager = struct {
                 entry,
                 entry.config.name,
                 write.key,
+                null,
                 &replacement_deletes,
                 &metadata_presence_memo,
             );
@@ -5914,12 +6059,11 @@ pub const IndexManager = struct {
                 .vector = vector_values,
                 .metadata = write.key,
             });
-            if (assignment.needs_mapping) {
-                try pending_mappings.append(self.alloc, .{
-                    .doc_key = write.key,
-                    .vector_id = assignment.vector_id,
-                });
-            }
+            try pending_mappings.append(self.alloc, .{
+                .doc_key = write.key,
+                .parent_doc_key = null,
+                .vector_id = assignment.vector_id,
+            });
         }
 
         try self.applyDenseItemsWithOptions(entry, items.items, replacement_deletes.items, batch_options, all_vector_ids_new, store_txn);
@@ -5952,16 +6096,18 @@ pub const IndexManager = struct {
         try store_batch.commit();
     }
 
-    fn indexSparseBatchEntry(self: *IndexManager, entry: *SparseIndex, writes: []const types.BatchWrite) !void {
-        return self.indexSparseBatchEntryWithSkip(entry, writes, null);
+    fn indexSparseBatchEntry(self: *IndexManager, store: ?*docstore_mod.DocStore, entry: *SparseIndex, writes: []const types.BatchWrite) !void {
+        return self.indexSparseBatchEntryWithSkip(store, entry, writes, null);
     }
 
     fn indexSparseBatchEntryWithSkip(
         self: *IndexManager,
+        store: ?*docstore_mod.DocStore,
         entry: *SparseIndex,
         writes: []const types.BatchWrite,
         skip: ?*const SparseSplitHandoff,
     ) !void {
+        _ = store;
         var sparse_writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         defer {
             for (sparse_writes.items) |item| {
@@ -6005,6 +6151,45 @@ pub const IndexManager = struct {
             try filtered.append(self.alloc, key);
         }
         try entry.index.batch(&.{}, filtered.items);
+    }
+
+    pub fn lookupSparseDocNumsForOrdinalsAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: anytype,
+        index_name: []const u8,
+        ordinals: []const doc_identity.DocOrdinal,
+    ) ![]const u32 {
+        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+        for (ordinals) |ordinal| {
+            const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
+            defer self.alloc.free(parent_doc_id);
+            if (entry.chunk_name == null) {
+                const doc_num = (try entry.index.debugDocNumForDocId(parent_doc_id)) orelse continue;
+                if (!containsU32(out.items, doc_num)) try out.append(alloc, doc_num);
+                continue;
+            }
+            const prefix = try internal_keys.artifactNamedPrefixAlloc(self.alloc, parent_doc_id, "chunk", entry.chunk_name.?);
+            defer self.alloc.free(prefix);
+            const upper = try internal_keys.nextPrefixAlloc(self.alloc, prefix);
+            defer if (upper) |buf| self.alloc.free(buf);
+            const chunk_rows = try backend_scan.scanRange(alloc, &runtime_store.store, prefix, if (upper) |buf| buf else "");
+            defer backend_scan.freeResults(alloc, chunk_rows);
+            for (chunk_rows) |row| {
+                if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
+                const doc_num = (try entry.index.debugDocNumForDocId(row.key)) orelse continue;
+                if (!containsU32(out.items, doc_num)) try out.append(alloc, doc_num);
+            }
+        }
+        return try out.toOwnedSlice(alloc);
     }
 
     fn deleteGraphDocsEntry(self: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
@@ -6166,7 +6351,7 @@ pub const IndexManager = struct {
         {
             var existing_index_write_txn = try entry.index.beginRuntimeWriteTxn();
             defer existing_index_write_txn.abort();
-            try self.prefetchDenseExistingMetadataTxn(entry, &existing_index_write_txn, writes, keep_write, &metadata_presence_memo);
+            try self.prefetchDenseExistingMetadataTxn(entry, store_txn, &existing_index_write_txn, writes, keep_write, &metadata_presence_memo);
 
             for (writes, 0..) |write, write_index| {
                 if (!keep_write[write_index]) continue;
@@ -6179,6 +6364,7 @@ pub const IndexManager = struct {
                         entry,
                         write.index_name,
                         write.doc_key,
+                        write.parent_doc_key,
                         &replacement_deletes,
                         &metadata_presence_memo,
                     );
@@ -6195,12 +6381,11 @@ pub const IndexManager = struct {
                     item_vector_bytes += @as(u64, @intCast(write.vector.len * @sizeOf(f32)));
                     item_metadata_bytes += @intCast(write.doc_key.len);
                     self.observeDenseApplyWorkingBytes(&dense_apply_working_bytes, preloaded_vector_bytes + item_vector_bytes + item_metadata_bytes);
-                    if (assignment.needs_mapping or entry.external) {
-                        try pending_mappings.append(self.alloc, .{
-                            .doc_key = items.items.items[items.items.items.len - 1].metadata,
-                            .vector_id = assignment.vector_id,
-                        });
-                    }
+                    try pending_mappings.append(self.alloc, .{
+                        .doc_key = items.items.items[items.items.items.len - 1].metadata,
+                        .parent_doc_key = write.parent_doc_key,
+                        .vector_id = assignment.vector_id,
+                    });
                 } else if (write.artifact_key != null) {
                     const vector = preloaded_artifact_vectors[write_index] orelse continue;
                     const assignment = try self.replaceDenseVectorIdTxnWithMemo(
@@ -6208,6 +6393,7 @@ pub const IndexManager = struct {
                         entry,
                         write.index_name,
                         write.doc_key,
+                        write.parent_doc_key,
                         &replacement_deletes,
                         &metadata_presence_memo,
                     );
@@ -6221,12 +6407,11 @@ pub const IndexManager = struct {
                     }
                     item_metadata_bytes += @intCast(write.doc_key.len);
                     self.observeDenseApplyWorkingBytes(&dense_apply_working_bytes, preloaded_vector_bytes + item_vector_bytes + item_metadata_bytes);
-                    if (assignment.needs_mapping or entry.external) {
-                        try pending_mappings.append(self.alloc, .{
-                            .doc_key = items.items.items[items.items.items.len - 1].metadata,
-                            .vector_id = assignment.vector_id,
-                        });
-                    }
+                    try pending_mappings.append(self.alloc, .{
+                        .doc_key = items.items.items[items.items.items.len - 1].metadata,
+                        .parent_doc_key = write.parent_doc_key,
+                        .vector_id = assignment.vector_id,
+                    });
                 } else {
                     continue;
                 }
@@ -6494,14 +6679,14 @@ pub const IndexManager = struct {
         var batch = try runtime_store.store.beginBatch();
         errdefer batch.abort();
         for (pending) |mapping| {
-            try self.writeDenseVectorMappingTxn(&batch, index_name, mapping.doc_key, mapping.vector_id);
+            try self.writeDenseVectorMappingTxn(&batch, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id);
         }
         try batch.commit();
     }
 
     fn commitDenseVectorMappingsTxn(self: *IndexManager, txn: anytype, index_name: []const u8, pending: []const PendingDenseVectorMapping) !void {
         for (pending) |mapping| {
-            try self.writeDenseVectorMappingTxn(txn, index_name, mapping.doc_key, mapping.vector_id);
+            try self.writeDenseVectorMappingTxn(txn, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id);
         }
     }
 
@@ -7729,11 +7914,18 @@ pub const IndexManager = struct {
         var batch = try store.beginWriteBatch();
         errdefer batch.abort();
         const txn = batch.asTxn();
-        try self.writeDenseVectorMappingTxn(txn, index_name, doc_key, vector_id);
+        try self.writeDenseVectorMappingTxn(txn, index_name, doc_key, null, vector_id);
         try batch.commit();
     }
 
-    fn writeDenseVectorMappingTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8, vector_id: u64) !void {
+    fn writeDenseVectorMappingTxn(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        doc_key: []const u8,
+        parent_doc_key: ?[]const u8,
+        vector_id: u64,
+    ) !void {
         var mutable_txn = txn;
         const doc_map_key = try denseDocMappingKey(self.alloc, index_name, doc_key);
         defer self.alloc.free(doc_map_key);
@@ -7744,6 +7936,22 @@ pub const IndexManager = struct {
         std.mem.writeInt(u64, &buf, vector_id, .little);
         try mutable_txn.put(doc_map_key, &buf);
         try mutable_txn.put(vector_map_key, doc_key);
+
+        const ordinal_doc_key = parent_doc_key orelse doc_key;
+        if (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key)) |ordinal| {
+            const ordinal_map_key = try denseOrdinalMappingKey(self.alloc, index_name, ordinal);
+            defer self.alloc.free(ordinal_map_key);
+            const vector_ordinal_map_key = try denseVectorOrdinalMappingKey(self.alloc, index_name, vector_id);
+            defer self.alloc.free(vector_ordinal_map_key);
+            const ordinal_member_key = try denseOrdinalMemberKey(self.alloc, index_name, ordinal, vector_id);
+            defer self.alloc.free(ordinal_member_key);
+
+            var ordinal_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &ordinal_buf, ordinal, .little);
+            try mutable_txn.put(ordinal_map_key, &buf);
+            try mutable_txn.put(ordinal_member_key, &buf);
+            try mutable_txn.put(vector_ordinal_map_key, &ordinal_buf);
+        }
     }
 
     fn clearDenseVectorMapping(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, doc_key: []const u8, vector_id: u64) !void {
@@ -7760,6 +7968,12 @@ pub const IndexManager = struct {
         defer self.alloc.free(doc_map_key);
         const vector_map_key = try denseVectorIdMappingKey(self.alloc, index_name, vector_id);
         defer self.alloc.free(vector_map_key);
+        const legacy_doc_map_key = try legacyDenseDocMappingKey(self.alloc, index_name, doc_key);
+        defer self.alloc.free(legacy_doc_map_key);
+        const legacy_vector_map_key = try legacyDenseVectorIdMappingKey(self.alloc, index_name, vector_id);
+        defer self.alloc.free(legacy_vector_map_key);
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, doc_key)) orelse
+            try self.lookupDenseVectorOrdinalTxn(mutable_txn, index_name, vector_id);
 
         mutable_txn.delete(doc_map_key) catch |err| switch (err) {
             error.NotFound => {},
@@ -7769,18 +7983,189 @@ pub const IndexManager = struct {
             error.NotFound => {},
             else => return err,
         };
+        mutable_txn.delete(legacy_doc_map_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        mutable_txn.delete(legacy_vector_map_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        if (ordinal) |doc_ordinal| {
+            const ordinal_map_key = try denseOrdinalMappingKey(self.alloc, index_name, doc_ordinal);
+            defer self.alloc.free(ordinal_map_key);
+            const vector_ordinal_map_key = try denseVectorOrdinalMappingKey(self.alloc, index_name, vector_id);
+            defer self.alloc.free(vector_ordinal_map_key);
+            const ordinal_member_key = try denseOrdinalMemberKey(self.alloc, index_name, doc_ordinal, vector_id);
+            defer self.alloc.free(ordinal_member_key);
+            const legacy_ordinal_map_key = try legacyDenseOrdinalMappingKey(self.alloc, index_name, doc_ordinal);
+            defer self.alloc.free(legacy_ordinal_map_key);
+            const legacy_vector_ordinal_map_key = try legacyDenseVectorOrdinalMappingKey(self.alloc, index_name, vector_id);
+            defer self.alloc.free(legacy_vector_ordinal_map_key);
+            const legacy_ordinal_member_key = try legacyDenseOrdinalMemberKey(self.alloc, index_name, doc_ordinal, vector_id);
+            defer self.alloc.free(legacy_ordinal_member_key);
+            mutable_txn.delete(ordinal_map_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            mutable_txn.delete(ordinal_member_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            mutable_txn.delete(vector_ordinal_map_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            mutable_txn.delete(legacy_ordinal_map_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            mutable_txn.delete(legacy_ordinal_member_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            mutable_txn.delete(legacy_vector_ordinal_map_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
     }
 
     fn lookupDenseDocKeyByVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, vector_id: u64) !?[]u8 {
         var mutable_txn = txn;
         const key = try denseVectorIdMappingKey(self.alloc, index_name, vector_id);
         defer self.alloc.free(key);
+        const legacy_key = try legacyDenseVectorIdMappingKey(self.alloc, index_name, vector_id);
+        defer self.alloc.free(legacy_key);
 
         const raw = mutable_txn.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => legacy: {
+                const legacy_raw = mutable_txn.get(legacy_key) catch |legacy_err| switch (legacy_err) {
+                    error.NotFound => return null,
+                    else => return legacy_err,
+                };
+                break :legacy legacy_raw;
+            },
             else => return err,
         };
         return try self.alloc.dupe(u8, raw);
+    }
+
+    pub fn lookupDenseVectorIdsForOrdinalsAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: anytype,
+        index_name: []const u8,
+        ordinals: []const doc_identity.DocOrdinal,
+    ) ![]u64 {
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+
+        var out = std.ArrayListUnmanaged(u64).empty;
+        errdefer out.deinit(alloc);
+        for (ordinals) |ordinal| {
+            const before_len = out.items.len;
+            try self.appendDenseVectorIdsForOrdinalAlloc(alloc, &out, &runtime_store.store, index_name, ordinal);
+            if (out.items.len != before_len) continue;
+            const vector_id = (try self.lookupDenseVectorIdByOrdinalTxn(&txn, index_name, ordinal)) orelse fallback: {
+                const doc_key = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
+                defer self.alloc.free(doc_key);
+                break :fallback (try self.lookupDenseVectorIdForDocKeyTxn(&txn, index_name, doc_key)) orelse continue;
+            };
+            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn appendDenseVectorIdsForOrdinalAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(u64),
+        store: anytype,
+        index_name: []const u8,
+        ordinal: doc_identity.DocOrdinal,
+    ) !void {
+        const prefix = try denseOrdinalMemberPrefix(self.alloc, index_name, ordinal);
+        defer self.alloc.free(prefix);
+        var scan_txn = try store.beginCurrentScan();
+        defer scan_txn.abort();
+        var cursor = try scan_txn.openCursor();
+        defer cursor.close();
+        var maybe_entry = try cursor.seekAtOrAfter(prefix);
+        while (maybe_entry) |row| : (maybe_entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
+            const vector_id = std.mem.readInt(u64, row.value[0..8], .little);
+            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+        }
+
+        const legacy_prefix = try legacyDenseOrdinalMemberPrefix(self.alloc, index_name, ordinal);
+        defer self.alloc.free(legacy_prefix);
+        maybe_entry = try cursor.seekAtOrAfter(legacy_prefix);
+        while (maybe_entry) |row| : (maybe_entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, legacy_prefix)) break;
+            if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
+            const vector_id = std.mem.readInt(u64, row.value[0..8], .little);
+            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+        }
+    }
+
+    fn lookupDenseVectorIdByOrdinalTxn(self: *IndexManager, txn: anytype, index_name: []const u8, ordinal: doc_identity.DocOrdinal) !?u64 {
+        var mutable_txn = txn;
+        const key = try denseOrdinalMappingKey(self.alloc, index_name, ordinal);
+        defer self.alloc.free(key);
+        const legacy_key = try legacyDenseOrdinalMappingKey(self.alloc, index_name, ordinal);
+        defer self.alloc.free(legacy_key);
+
+        const raw = mutable_txn.get(key) catch |err| switch (err) {
+            error.NotFound => legacy: {
+                const legacy_raw = mutable_txn.get(legacy_key) catch |legacy_err| switch (legacy_err) {
+                    error.NotFound => return null,
+                    else => return legacy_err,
+                };
+                break :legacy legacy_raw;
+            },
+            else => return err,
+        };
+        if (raw.len != 8) return error.InvalidDenseVectorMetadata;
+        return std.mem.readInt(u64, raw[0..8], .little);
+    }
+
+    fn lookupDenseVectorOrdinalTxn(self: *IndexManager, txn: anytype, index_name: []const u8, vector_id: u64) !?doc_identity.DocOrdinal {
+        var mutable_txn = txn;
+        const key = try denseVectorOrdinalMappingKey(self.alloc, index_name, vector_id);
+        defer self.alloc.free(key);
+        const legacy_key = try legacyDenseVectorOrdinalMappingKey(self.alloc, index_name, vector_id);
+        defer self.alloc.free(legacy_key);
+
+        const raw = mutable_txn.get(key) catch |err| switch (err) {
+            error.NotFound => legacy: {
+                const legacy_raw = mutable_txn.get(legacy_key) catch |legacy_err| switch (legacy_err) {
+                    error.NotFound => return null,
+                    else => return legacy_err,
+                };
+                break :legacy legacy_raw;
+            },
+            else => return err,
+        };
+        if (raw.len != 4) return error.InvalidDenseVectorMetadata;
+        return std.mem.readInt(u32, raw[0..4], .little);
+    }
+
+    fn lookupDenseVectorIdForDocKeyTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
+        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |mapped| return mapped;
+        const entry = self.denseIndex(index_name) orelse return null;
+        if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
+            const vector_id: u64 = ordinal;
+            if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches) return vector_id;
+        }
+        const vector_id = deterministicDenseVectorId(doc_key);
+        const metadata = (try entry.index.getMetadata(vector_id)) orelse return null;
+        self.alloc.free(metadata);
+        return vector_id;
     }
 
     fn keyInRange(self: *const IndexManager, key: []const u8) bool {
@@ -7885,6 +8270,7 @@ fn buildSplitSegment(
         try docs.append(alloc, .{
             .key = key,
             .value = stored.data,
+            .doc_ordinal = try reader.docOrdinal(doc_idx),
         });
         if (collect_doc_keys) {
             try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
@@ -8873,6 +9259,84 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
 }
 
 fn denseDocMappingKey(alloc: Allocator, index_name: []const u8, doc_key: []const u8) ![]u8 {
+    return try denseMetadataKeyAlloc(alloc, index_name, "doc", &.{doc_key}, &.{});
+}
+
+fn denseVectorIdMappingKey(alloc: Allocator, index_name: []const u8, vector_id: u64) ![]u8 {
+    var id_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &id_buf, vector_id, .big);
+    return try denseMetadataKeyAlloc(alloc, index_name, "vector", &.{}, &.{&id_buf});
+}
+
+fn denseOrdinalMappingKey(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
+    var ordinal_buf: [@sizeOf(doc_identity.DocOrdinal)]u8 = undefined;
+    std.mem.writeInt(doc_identity.DocOrdinal, &ordinal_buf, ordinal, .big);
+    return try denseMetadataKeyAlloc(alloc, index_name, "ordinal", &.{}, &.{&ordinal_buf});
+}
+
+fn denseOrdinalMemberPrefix(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
+    var ordinal_buf: [@sizeOf(doc_identity.DocOrdinal)]u8 = undefined;
+    std.mem.writeInt(doc_identity.DocOrdinal, &ordinal_buf, ordinal, .big);
+    return try denseMetadataKeyAlloc(alloc, index_name, "ordinal_member", &.{}, &.{&ordinal_buf});
+}
+
+fn denseOrdinalMemberKey(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal, vector_id: u64) ![]u8 {
+    var ordinal_buf: [@sizeOf(doc_identity.DocOrdinal)]u8 = undefined;
+    var id_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(doc_identity.DocOrdinal, &ordinal_buf, ordinal, .big);
+    std.mem.writeInt(u64, &id_buf, vector_id, .big);
+    return try denseMetadataKeyAlloc(alloc, index_name, "ordinal_member", &.{}, &.{ &ordinal_buf, &id_buf });
+}
+
+fn denseVectorOrdinalMappingKey(alloc: Allocator, index_name: []const u8, vector_id: u64) ![]u8 {
+    var id_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &id_buf, vector_id, .big);
+    return try denseMetadataKeyAlloc(alloc, index_name, "vector_ordinal", &.{}, &.{&id_buf});
+}
+
+fn denseNextIdKey(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return try denseMetadataKeyAlloc(alloc, index_name, "next_id", &.{}, &.{});
+}
+
+fn denseIndexMetadataPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var out = try denseMetadataPrefixAlloc(alloc, index_name, null);
+    errdefer out.deinit(alloc);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn denseMetadataKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    kind: []const u8,
+    encoded_components: []const []const u8,
+    fixed_components: []const []const u8,
+) ![]u8 {
+    var out = try denseMetadataPrefixAlloc(alloc, index_name, kind);
+    errdefer out.deinit(alloc);
+    for (encoded_components) |component| {
+        try internal_keys.appendEncodedComponent(&out, alloc, component);
+    }
+    for (fixed_components) |component| {
+        try out.appendSlice(alloc, component);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn denseMetadataPrefixAlloc(alloc: Allocator, index_name: []const u8, kind: ?[]const u8) !std.ArrayListUnmanaged(u8) {
+    const prefix = "\x00\x00__metadata__:dense2:";
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, prefix);
+    try internal_keys.appendEncodedComponent(&out, alloc, index_name);
+    if (kind) |kind_name| try internal_keys.appendEncodedComponent(&out, alloc, kind_name);
+    return out;
+}
+
+fn legacyDenseIndexMetadataPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:", .{index_name});
+}
+
+fn legacyDenseDocMappingKey(alloc: Allocator, index_name: []const u8, doc_key: []const u8) ![]u8 {
     const prefix = "\x00\x00__metadata__:dense:";
     const infix = ":doc:";
     const total_len = prefix.len + index_name.len + infix.len + internal_keys.encodedComponentLen(doc_key);
@@ -8888,17 +9352,136 @@ fn denseDocMappingKey(alloc: Allocator, index_name: []const u8, doc_key: []const
     return out;
 }
 
-fn denseVectorIdMappingKey(alloc: Allocator, index_name: []const u8, vector_id: u64) ![]u8 {
+fn legacyDenseVectorIdMappingKey(alloc: Allocator, index_name: []const u8, vector_id: u64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:vector:{d}", .{ index_name, vector_id });
 }
 
-fn denseNextIdKey(alloc: Allocator, index_name: []const u8) ![]u8 {
+fn legacyDenseOrdinalMappingKey(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:ordinal:{d}", .{ index_name, ordinal });
+}
+
+fn legacyDenseOrdinalMemberPrefix(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:ordinal_member:{d}:", .{ index_name, ordinal });
+}
+
+fn legacyDenseOrdinalMemberKey(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal, vector_id: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:ordinal_member:{d}:{d}", .{ index_name, ordinal, vector_id });
+}
+
+fn legacyDenseVectorOrdinalMappingKey(alloc: Allocator, index_name: []const u8, vector_id: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:vector_ordinal:{d}", .{ index_name, vector_id });
+}
+
+fn legacyDenseNextIdKey(alloc: Allocator, index_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:next_id", .{index_name});
+}
+
+test "dense metadata keys preserve embedded index separators" {
+    const alloc = std.testing.allocator;
+
+    const parent_prefix = try denseOrdinalMemberPrefix(alloc, "idx", 7);
+    defer alloc.free(parent_prefix);
+    const child_key = try denseOrdinalMemberKey(alloc, "idx:ordinal_member", 7, 11);
+    defer alloc.free(child_key);
+    try std.testing.expect(!std.mem.startsWith(u8, child_key, parent_prefix));
+
+    const parent_delete_prefix = try denseIndexMetadataPrefixAlloc(alloc, "idx");
+    defer alloc.free(parent_delete_prefix);
+    const child_next = try denseNextIdKey(alloc, "idx:next_id");
+    defer alloc.free(child_next);
+    try std.testing.expect(!std.mem.startsWith(u8, child_next, parent_delete_prefix));
+}
+
+test "dense metadata lookups read legacy textual rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+
+    const index_name = "semantic_idx";
+    const doc_key = "doc:legacy";
+    const vector_id: u64 = 77;
+    const ordinal: doc_identity.DocOrdinal = 5;
+
+    const doc_map_key = try legacyDenseDocMappingKey(alloc, index_name, doc_key);
+    defer alloc.free(doc_map_key);
+    const vector_map_key = try legacyDenseVectorIdMappingKey(alloc, index_name, vector_id);
+    defer alloc.free(vector_map_key);
+    const ordinal_map_key = try legacyDenseOrdinalMappingKey(alloc, index_name, ordinal);
+    defer alloc.free(ordinal_map_key);
+    const ordinal_member_key = try legacyDenseOrdinalMemberKey(alloc, index_name, ordinal, vector_id);
+    defer alloc.free(ordinal_member_key);
+    const vector_ordinal_key = try legacyDenseVectorOrdinalMappingKey(alloc, index_name, vector_id);
+    defer alloc.free(vector_ordinal_key);
+    const next_id_key = try legacyDenseNextIdKey(alloc, index_name);
+    defer alloc.free(next_id_key);
+
+    var vector_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &vector_buf, vector_id, .little);
+    var ordinal_buf: [@sizeOf(doc_identity.DocOrdinal)]u8 = undefined;
+    std.mem.writeInt(doc_identity.DocOrdinal, &ordinal_buf, ordinal, .little);
+    var next_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &next_buf, 99, .little);
+    try store.putBatch(&.{
+        .{ .key = doc_map_key, .value = &vector_buf },
+        .{ .key = vector_map_key, .value = doc_key },
+        .{ .key = ordinal_map_key, .value = &vector_buf },
+        .{ .key = ordinal_member_key, .value = &vector_buf },
+        .{ .key = vector_ordinal_key, .value = &ordinal_buf },
+        .{ .key = next_id_key, .value = &next_buf },
+    }, &.{});
+
+    var read_txn = try store.beginProbeTxn();
+    defer read_txn.abort();
+    try std.testing.expectEqual(@as(?u64, vector_id), try manager.lookupDenseVectorIdTxn(&read_txn, index_name, doc_key));
+    const mapped_doc = (try manager.lookupDenseDocKeyByVectorIdTxn(&read_txn, index_name, vector_id)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(mapped_doc);
+    try std.testing.expectEqualStrings(doc_key, mapped_doc);
+    try std.testing.expectEqual(@as(?u64, vector_id), try manager.lookupDenseVectorIdByOrdinalTxn(&read_txn, index_name, ordinal));
+    try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, ordinal), try manager.lookupDenseVectorOrdinalTxn(&read_txn, index_name, vector_id));
+
+    var vector_ids = std.ArrayListUnmanaged(u64).empty;
+    defer vector_ids.deinit(alloc);
+    var runtime_store = try initRuntimeStore(alloc, &store);
+    defer runtime_store.deinit();
+    try manager.appendDenseVectorIdsForOrdinalAlloc(alloc, &vector_ids, &runtime_store.store, index_name, ordinal);
+    try std.testing.expectEqual(@as(usize, 1), vector_ids.items.len);
+    try std.testing.expectEqual(vector_id, vector_ids.items[0]);
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    const write_txn = batch.asTxn();
+    try std.testing.expectEqual(@as(u64, 99), try manager.reserveDenseVectorIdTxn(write_txn, index_name));
+    try batch.commit();
 }
 
 fn deterministicDenseVectorId(doc_key: []const u8) u64 {
     const id = std.hash.XxHash64.hash(0, doc_key);
     return if (id == 0) 1 else id;
+}
+
+fn containsU64(items: []const u64, id: u64) bool {
+    for (items) |item| {
+        if (item == id) return true;
+    }
+    return false;
+}
+
+fn containsU32(items: []const u32, id: u32) bool {
+    for (items) |item| {
+        if (item == id) return true;
+    }
+    return false;
 }
 
 fn textFieldAnalyzersKey(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -10428,7 +11011,7 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
 
     var batch = try store.beginWriteBatch();
     errdefer batch.abort();
-    const assignment = try manager.ensureDenseVectorIdTxn(batch.asTxn(), "dv_v1", "doc:a");
+    const assignment = try manager.ensureDenseVectorIdTxn(batch.asTxn(), "dv_v1", "doc:a", null);
     try std.testing.expect(!assignment.needs_mapping);
     try std.testing.expectEqual(deterministicDenseVectorId("doc:a"), assignment.vector_id);
     try batch.commit();
@@ -10440,10 +11023,191 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
 
     var second_batch = try store.beginWriteBatch();
     errdefer second_batch.abort();
-    const second = try manager.ensureDenseVectorIdTxn(second_batch.asTxn(), "dv_v1", "doc:a");
+    const second = try manager.ensureDenseVectorIdTxn(second_batch.asTxn(), "dv_v1", "doc:a", null);
     try std.testing.expect(!second.needs_mapping);
     try std.testing.expectEqual(@as(u64, 42), second.vector_id);
     second_batch.abort();
+}
+
+test "dense vector id ignores ordinal metadata for a different doc" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
+    defer alloc.free(absolute_path);
+    const path_z = try alloc.dupeZ(u8, absolute_path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, absolute_path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"dv_v1\",\"external\":true}",
+        },
+    });
+
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        &.{"doc:target"},
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try entry.index.batchInsertWithMetadata(&.{
+        .{
+            .vector_id = 1,
+            .vector = &[_]f32{ 1.0, 0.0, 0.0 },
+            .metadata = "doc:other",
+        },
+    });
+
+    const stable_vector_id = deterministicDenseVectorId("doc:target");
+    try std.testing.expect(stable_vector_id != 1);
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    const assignment = try manager.ensureDenseVectorIdTxn(batch.asTxn(), "dv_v1", "doc:target", null);
+    try std.testing.expectEqual(stable_vector_id, assignment.vector_id);
+    try std.testing.expect(assignment.can_assume_absent);
+    try batch.commit();
+
+    const dense_index_name = try alloc.dupe(u8, "dv_v1");
+    defer alloc.free(dense_index_name);
+    const dense_doc_key = try alloc.dupe(u8, "doc:target");
+    defer alloc.free(dense_doc_key);
+    const dense_vector = try alloc.dupe(f32, &[_]f32{ 0.0, 1.0, 0.0 });
+    defer alloc.free(dense_vector);
+    const writes = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = dense_index_name,
+        .doc_key = dense_doc_key,
+        .vector = dense_vector,
+        .artifact_key = null,
+    }};
+    try manager.applyDenseEmbeddingWritesByName(&store, "dv_v1", &writes);
+
+    try std.testing.expectEqual(@as(?u64, stable_vector_id), try manager.lookupDenseVectorId(&store, "dv_v1", "doc:target"));
+    const vector_ids = try manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, &store, "dv_v1", &.{1});
+    defer alloc.free(vector_ids);
+    try std.testing.expectEqual(@as(usize, 1), vector_ids.len);
+    try std.testing.expectEqual(stable_vector_id, vector_ids[0]);
+}
+
+test "dense metadata prefetch includes legacy ordinal vector ids" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
+    defer alloc.free(absolute_path);
+    const path_z = try alloc.dupeZ(u8, absolute_path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, absolute_path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"dv_v1\",\"external\":true}",
+        },
+    });
+
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        &.{"doc:legacy"},
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try entry.index.batchInsertWithMetadata(&.{
+        .{
+            .vector_id = 1,
+            .vector = &[_]f32{ 1.0, 0.0, 0.0 },
+            .metadata = "doc:legacy",
+        },
+    });
+
+    const stable_vector_id = deterministicDenseVectorId("doc:legacy");
+    try std.testing.expect(stable_vector_id != 1);
+
+    const dense_index_name = try alloc.dupe(u8, "dv_v1");
+    defer alloc.free(dense_index_name);
+    const dense_doc_key = try alloc.dupe(u8, "doc:legacy");
+    defer alloc.free(dense_doc_key);
+    const dense_vector = try alloc.dupe(f32, &[_]f32{ 0.0, 1.0, 0.0 });
+    defer alloc.free(dense_vector);
+    const writes = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = dense_index_name,
+        .doc_key = dense_doc_key,
+        .vector = dense_vector,
+        .artifact_key = null,
+    }};
+    const keep_write = [_]bool{true};
+
+    var identity_txn = try store.beginWriteBatch();
+    defer identity_txn.abort();
+    var index_txn = try entry.index.beginRuntimeWriteTxn();
+    defer index_txn.abort();
+
+    var memo: IndexManager.DenseVectorMetadataPresenceMemo = .{};
+    defer memo.deinit(alloc);
+    try manager.prefetchDenseExistingMetadataTxn(entry, identity_txn.asTxn(), &index_txn, &writes, &keep_write, &memo);
+
+    try std.testing.expectEqualStrings("doc:legacy", memo.getMetadata(1).?);
+    try std.testing.expectEqual(@as(?bool, false), memo.get(stable_vector_id));
 }
 
 test "dense vector metadata presence memo stores present and absent ids" {
@@ -11809,6 +12573,197 @@ test "external dense embedding writes persist deterministic vector mappings" {
 
     const mapped_vector_id = (try manager.lookupDenseVectorId(&store, "semantic_idx", "doc:00000000")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(vector_id, mapped_vector_id);
+}
+
+test "external dense embedding writes use stable vector ids and ordinal member rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "semantic_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
+        },
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "doc:primary");
+    defer alloc.free(primary_key);
+    try store.put(primary_key, "{\"title\":\"dense\"}");
+    const chunk_key = try internal_keys.documentKeyAlloc(alloc, "doc:chunked");
+    defer alloc.free(chunk_key);
+    try store.put(chunk_key, "{\"title\":\"chunked\"}");
+
+    const doc_ids = [_][]const u8{ "doc:primary", "doc:chunked" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_ids[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
+    const writes = [_]mapper.DenseEmbeddingWrite{
+        .{
+            .index_name = try alloc.dupe(u8, "semantic_idx"),
+            .doc_key = try alloc.dupe(u8, "doc:primary"),
+            .vector = try alloc.dupe(f32, &[_]f32{ 1.0, 0.0, 0.0 }),
+            .artifact_key = null,
+        },
+        .{
+            .index_name = try alloc.dupe(u8, "semantic_idx"),
+            .doc_key = try alloc.dupe(u8, "chunk:doc:chunked:0"),
+            .parent_doc_key = "doc:chunked",
+            .vector = try alloc.dupe(f32, &[_]f32{ 0.0, 1.0, 0.0 }),
+            .artifact_key = null,
+        },
+    };
+    defer {
+        for (writes) |write| {
+            alloc.free(write.index_name);
+            alloc.free(write.doc_key);
+            alloc.free(write.vector);
+        }
+    }
+
+    try manager.applyDenseEmbeddingWritesByName(&store, "semantic_idx", &writes);
+
+    const primary_vector_id = deterministicDenseVectorId("doc:primary");
+    try std.testing.expectEqual(@as(?u64, primary_vector_id), try manager.lookupDenseVectorId(&store, "semantic_idx", "doc:primary"));
+    const primary_doc = try manager.lookupDenseDocKey(&store, "semantic_idx", primary_vector_id);
+    defer if (primary_doc) |doc_key| alloc.free(doc_key);
+    try std.testing.expectEqualStrings("doc:primary", primary_doc.?);
+
+    const chunk_vector_id = deterministicDenseVectorId("chunk:doc:chunked:0");
+    try std.testing.expectEqual(@as(?u64, chunk_vector_id), try manager.lookupDenseVectorId(&store, "semantic_idx", "chunk:doc:chunked:0"));
+
+    const primary_vectors = try manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, &store, "semantic_idx", &.{1});
+    defer alloc.free(primary_vectors);
+    try std.testing.expectEqual(@as(usize, 1), primary_vectors.len);
+    try std.testing.expectEqual(primary_vector_id, primary_vectors[0]);
+
+    const chunk_vectors = try manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, &store, "semantic_idx", &.{2});
+    defer alloc.free(chunk_vectors);
+    try std.testing.expectEqual(@as(usize, 1), chunk_vectors.len);
+    try std.testing.expectEqual(chunk_vector_id, chunk_vectors[0]);
+}
+
+test "primary dense stable vector ids survive identity namespace reassignment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "semantic_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
+        },
+    });
+
+    const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:primary");
+    defer alloc.free(doc_key);
+    try store.put(doc_key, "{\"title\":\"dense\"}");
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 9, .shard_id = 901, .range_id = 9001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 9, .shard_id = 902, .range_id = 9002 };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+        alloc,
+        &store,
+        old_namespace,
+        1,
+        &identity_writes,
+        &.{"doc:primary"},
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
+    const writes = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = try alloc.dupe(u8, "semantic_idx"),
+        .doc_key = try alloc.dupe(u8, "doc:primary"),
+        .vector = try alloc.dupe(f32, &[_]f32{ 1.0, 0.0, 0.0 }),
+        .artifact_key = null,
+    }};
+    defer {
+        alloc.free(writes[0].index_name);
+        alloc.free(writes[0].doc_key);
+        alloc.free(writes[0].vector);
+    }
+
+    try manager.applyDenseEmbeddingWritesByName(&store, "semantic_idx", &writes);
+
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:primary")).?;
+        try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 1), ordinal);
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(old_namespace, "doc:primary"), state.canonical_doc_id);
+    }
+    const primary_vector_id = deterministicDenseVectorId("doc:primary");
+    try std.testing.expectEqual(@as(?u64, primary_vector_id), try manager.lookupDenseVectorId(&store, "semantic_idx", "doc:primary"));
+
+    try doc_identity.reassignNamespaceAlloc(alloc, &store, new_namespace);
+
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:primary")).?;
+        try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 1), ordinal);
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:primary"), state.canonical_doc_id);
+    }
+    try std.testing.expectEqual(@as(?u64, primary_vector_id), try manager.lookupDenseVectorId(&store, "semantic_idx", "doc:primary"));
+
+    const vectors = try manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, &store, "semantic_idx", &.{1});
+    defer alloc.free(vectors);
+    try std.testing.expectEqual(@as(usize, 1), vectors.len);
+    try std.testing.expectEqual(primary_vector_id, vectors[0]);
 }
 
 test "external dense embedding writes keep search working after incremental replay-style applies" {

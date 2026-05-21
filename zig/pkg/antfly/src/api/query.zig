@@ -23,6 +23,7 @@ pub const QueryResponseMeta = query_contract.QueryResponseMeta;
 pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
+pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parseAggregationRequestsJson = query_contract.parseAggregationRequestsJson;
 pub const freeAggregationRequests = query_contract.freeAggregationRequests;
 pub const encodeQueryResponses = query_contract.encodeQueryResponses;
@@ -131,12 +132,39 @@ pub fn mergeSearchResults(
         if (graph_results.len > 0) alloc.free(graph_results);
     }
 
+    if (results.len > 1) {
+        clearMergedDocOrdinals(final_hits);
+        for (graph_results) |*graph_result| clearMergedDocOrdinals(graph_result.hits);
+    }
+
     return .{
         .alloc = alloc,
         .hits = final_hits,
         .total_hits = total_hits,
+        .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
         .graph_results = graph_results,
     };
+}
+
+fn mergedSearchResultIdentityReadGeneration(
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+) ?u64 {
+    if (req.identity_read_generation) |generation| return generation;
+    var common: ?u64 = null;
+    for (results) |result| {
+        const generation = result.identity_read_generation orelse return null;
+        if (common) |existing| {
+            if (existing != generation) return null;
+        } else {
+            common = generation;
+        }
+    }
+    return common;
+}
+
+fn clearMergedDocOrdinals(hits: []db_mod.types.SearchHit) void {
+    for (hits) |*hit| hit.doc_ordinal = null;
 }
 
 fn isPureDenseRequest(req: db_mod.types.SearchRequest) bool {
@@ -869,6 +897,29 @@ test "query encoder emits antfly-style response envelope" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"table\":\"docs\"") != null);
 }
 
+test "query encoder does not expose internal doc ordinals" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .doc_ordinal = 42,
+        .score = 1.25,
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
+    defer encoded.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "doc_ordinal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "ordinal") == null);
+}
+
 test "query encoder emits aggregations" {
     const alloc = std.testing.allocator;
     var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
@@ -1069,11 +1120,13 @@ test "query merge applies global score ordering and offset" {
     var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
     left_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:b"),
+        .doc_ordinal = 2,
         .score = 2.0,
         .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
     };
     left_hits[1] = .{
         .id = try alloc.dupe(u8, "doc:a"),
+        .doc_ordinal = 1,
         .score = 3.0,
         .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
     };
@@ -1095,6 +1148,71 @@ test "query merge applies global score ordering and offset" {
     try std.testing.expectEqual(@as(u32, 3), merged.total_hits);
     try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
     try std.testing.expectEqualStrings("doc:b", merged.hits[0].id);
+    try std.testing.expectEqual(@as(?u32, null), merged.hits[0].doc_ordinal);
+}
+
+test "query merge preserves single-result doc ordinals" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .doc_ordinal = 9,
+        .score = 1.0,
+    };
+
+    var single = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+    defer single.deinit();
+
+    var merged = try mergeSearchResults(alloc, .{}, &.{single}, 0, 1);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+    try std.testing.expectEqual(@as(?u32, 9), merged.hits[0].doc_ordinal);
+}
+
+test "query merge preserves common identity read generation" {
+    const alloc = std.testing.allocator;
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 1.0,
+    };
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = 0.5,
+    };
+
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = left_hits,
+        .total_hits = 1,
+        .identity_read_generation = 17,
+    };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = right_hits,
+        .total_hits = 1,
+        .identity_read_generation = 17,
+    };
+    defer right.deinit();
+
+    var merged = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(?u64, 17), merged.identity_read_generation);
+
+    var stamped = try mergeSearchResults(alloc, .{ .identity_read_generation = 19 }, &.{ left, right }, 0, 10);
+    defer stamped.deinit();
+    try std.testing.expectEqual(@as(?u64, 19), stamped.identity_read_generation);
+
+    right.identity_read_generation = 18;
+    var mixed = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(?u64, null), mixed.identity_read_generation);
 }
 
 test "query merge orders pure dense results by ascending distance" {

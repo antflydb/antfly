@@ -287,15 +287,44 @@ const SimSplitRuntime = struct {
 
             const coord = try alloc.create(data_mod.SplitSyncCoordinator);
             errdefer alloc.destroy(coord);
+            var dest_db_options = db_mod.OpenOptions{};
+            if (try splitDestinationIdentityNamespaceFromSource(alloc, source_root_dir, destination_group_id)) |namespace| {
+                dest_db_options.identity_namespace = namespace;
+            }
             coord.* = try data_mod.SplitSyncCoordinator.init(alloc, .{
                 .source_root_dir = source_root_dir,
                 .dest_root_dir = destination_root_dir,
                 .source_group_id = source_group_id,
                 .dest_group_id = destination_group_id,
+                .dest = .{ .root_dir = destination_root_dir, .db = dest_db_options },
             });
             entry.coord = coord;
         }
         return @call(.auto, Func, .{entry.coord.?} ++ args);
+    }
+
+    fn splitDestinationIdentityNamespaceFromSource(
+        alloc: std.mem.Allocator,
+        source_root_dir: []const u8,
+        destination_group_id: u64,
+    ) !?db_mod.DocIdentityNamespace {
+        _ = destination_group_id;
+        var db = db_mod.DB.open(alloc, source_root_dir, .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer db.close();
+
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
+        if (stats.doc_identity.namespace_table_id == 0) return null;
+        return .{
+            .table_id = stats.doc_identity.namespace_table_id,
+            .shard_id = stats.doc_identity.namespace_shard_id,
+            .range_id = stats.doc_identity.namespace_range_id,
+        };
     }
 
     fn ensureSourceApplyStoreSeeded(
@@ -361,18 +390,104 @@ const SimSplitRuntime = struct {
     }
 };
 
+test "metadata sim split runtime preserves source identity namespace" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-sim-split-identity", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const source_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 701);
+    defer alloc.free(source_root_dir);
+    const destination_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 702);
+    defer alloc.free(destination_root_dir);
+
+    const source_namespace = db_mod.DocIdentityNamespace{
+        .table_id = 70,
+        .shard_id = 701,
+        .range_id = 9001,
+    };
+
+    {
+        var db = try db_mod.DB.open(alloc, source_root_dir, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right\"}" }},
+        });
+    }
+
+    var runtime = SimSplitRuntime{ .replica_root_dir = replica_root_dir };
+    defer runtime.deinit();
+    var split = runtime.iface();
+
+    try std.testing.expect(try split.prepareSource(701, 702, "doc:m", "doc:z"));
+    try std.testing.expect(try split.startSource(701, 702));
+    try std.testing.expect(try split.bootstrapDestination(701, 702));
+    _ = try split.catchUpDestination(701, 702);
+
+    var dest = try db_mod.DB.open(alloc, destination_root_dir, .{
+        .identity_namespace = source_namespace,
+        .start_index_workers = false,
+    });
+    defer dest.close();
+    const value = (try dest.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"v\":\"right\"}", value);
+
+    const stats = try dest.runtimeStatusStatsConsistent(alloc);
+    try std.testing.expectEqual(source_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(source_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
+    try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
 const EnsureGroupTextIndexProgressContext = struct {
     replica_root_dir: []const u8,
     group_id: u64,
     index_name: []const u8,
 };
 
+fn projectedIdentityNamespaceForGroup(
+    cluster: *MetadataHttpClusterSimulation,
+    group_id: u64,
+) !?db_mod.DocIdentityNamespace {
+    const preferred_index = currentMetadataLeaderIndex(cluster);
+    for (0..cluster.cluster.nodes.len) |offset| {
+        const index = if (offset == 0 and preferred_index != null)
+            preferred_index.?
+        else if (preferred_index != null and offset <= preferred_index.?)
+            offset - 1
+        else
+            offset;
+        if (index >= cluster.cluster.nodes.len) continue;
+        const ranges = try cluster.node(index).listProjectedRanges(cluster.alloc);
+        defer cluster.node(index).freeProjectedRanges(cluster.alloc, ranges);
+        for (ranges) |range| {
+            if (range.group_id != group_id) continue;
+            return .{
+                .table_id = range.table_id,
+                .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+                .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+            };
+        }
+    }
+    return null;
+}
+
 fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     const ctx: *EnsureGroupTextIndexProgressContext = @ptrCast(@alignCast(ptr));
     const path = try metadata_mod.groupDbPathFromReplicaRoot(cluster.alloc, ctx.replica_root_dir, ctx.group_id);
     defer cluster.alloc.free(path);
+    const identity_namespace = try projectedIdentityNamespaceForGroup(cluster, ctx.group_id);
 
-    var db = db_mod.DB.open(cluster.alloc, path, .{}) catch |err| switch (err) {
+    var db = db_mod.DB.open(cluster.alloc, path, .{
+        .identity_namespace = identity_namespace,
+    }) catch |err| switch (err) {
         error.PathAlreadyExists, error.FileNotFound => return false,
         else => return err,
     };
@@ -402,6 +517,137 @@ fn ensureGroupTextIndex(
     };
     if (try cluster.runUntil(max_rounds, &ctx, ensureGroupTextIndexProgressPredicate)) return;
     return error.FileNotFound;
+}
+
+fn ensureGroupTextIndexOnActiveReplicas(
+    cluster: *MetadataHttpClusterSimulation,
+    replica_root_dirs: []const []const u8,
+    group_id: u64,
+    index_name: []const u8,
+    max_rounds: usize,
+) !void {
+    var ensured: usize = 0;
+    for (0..cluster.cluster.nodes.len) |i| {
+        if (cluster.node(i).status(group_id) != .active) continue;
+        try ensureGroupTextIndex(cluster, replica_root_dirs[i], group_id, index_name, max_rounds);
+        ensured += 1;
+    }
+    if (ensured == 0) return error.TestExpectedEqual;
+}
+
+fn runtimeDocIdentityStatusReportFromStats(
+    stats: db_mod.types.DocIdentityStats,
+) metadata_table_manager.RuntimeDocIdentityStatusReport {
+    return .{
+        .namespace_table_id = stats.namespace_table_id,
+        .namespace_shard_id = stats.namespace_shard_id,
+        .namespace_range_id = stats.namespace_range_id,
+        .next_ordinal = stats.next_ordinal,
+        .allocated_ordinals = stats.allocated_ordinals,
+        .ordinal_capacity_remaining = stats.ordinal_capacity_remaining,
+        .ordinal_capacity_exhausted = stats.ordinal_capacity_exhausted,
+        .rebuild_required = stats.rebuild_required,
+        .state_rows = stats.state_rows,
+        .live_ordinals = stats.live_ordinals,
+        .tombstone_ordinals = stats.tombstone_ordinals,
+        .min_created_generation = stats.min_created_generation,
+        .max_created_generation = stats.max_created_generation,
+        .min_deleted_generation = stats.min_deleted_generation,
+        .max_deleted_generation = stats.max_deleted_generation,
+        .scanned_primary_docs = stats.scanned_primary_docs,
+        .primary_docs_missing_ordinals = stats.primary_docs_missing_ordinals,
+        .primary_docs_missing_identity_state = stats.primary_docs_missing_identity_state,
+        .primary_docs_with_tombstone_ordinals = stats.primary_docs_with_tombstone_ordinals,
+        .complete = stats.complete,
+    };
+}
+
+fn reportRuntimeDocIdentityForActiveReplicas(
+    cluster: *MetadataHttpClusterSimulation,
+    node: anytype,
+    replica_root_dirs: []const []const u8,
+    table_name: []const u8,
+    group_ids: []const u64,
+) !void {
+    const alloc = std.testing.allocator;
+    var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
+    defer {
+        for (reports.items) |report| {
+            metadata_table_manager.freeGroupStatuses(alloc, report.group_statuses);
+            metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
+        }
+        reports.deinit(alloc);
+    }
+
+    for (0..cluster.cluster.nodes.len) |i| {
+        var group_statuses = std.ArrayListUnmanaged(metadata_table_manager.GroupStatusReport).empty;
+        defer group_statuses.deinit(alloc);
+        var runtime_statuses = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+        defer {
+            for (runtime_statuses.items) |status| metadata_table_manager.freeRuntimeGroupStatusReport(alloc, status);
+            runtime_statuses.deinit(alloc);
+        }
+
+        for (group_ids) |group_id| {
+            if (cluster.node(i).status(group_id) != .active) continue;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dirs[i], group_id);
+            defer alloc.free(path);
+            var db = db_mod.DB.open(alloc, path, .{
+                .open_mode = .status_only,
+                .start_index_workers = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer db.close();
+            const stats = try db.runtimeStatusStatsConsistent(alloc);
+            defer db_mod.types.freeDBStats(alloc, stats);
+            const now_ms = currentGroupStatusTimestampMs();
+            try group_statuses.append(alloc, .{
+                .group_id = group_id,
+                .doc_count = stats.doc_count,
+                .disk_bytes = 1,
+                .empty = stats.doc_count == 0,
+                .updated_at_millis = now_ms,
+                .local_leader = currentGroupLeaderIndex(cluster, group_id) == i,
+                .local_voter = true,
+                .voter_count = 1,
+            });
+            try runtime_statuses.append(alloc, .{
+                .table_id = stats.doc_identity.namespace_table_id,
+                .table_name = try alloc.dupe(u8, table_name),
+                .group_id = group_id,
+                .store_id = @intCast(i + 1),
+                .node_id = @intCast(i + 1),
+                .updated_at_ns = now_ms * std.time.ns_per_ms,
+                .source = try alloc.dupe(u8, "metadata-sim"),
+                .freshness = try alloc.dupe(u8, "fresh"),
+                .doc_count = stats.doc_count,
+                .disk_bytes = 1,
+                .created_at_millis = now_ms,
+                .index_count = stats.index_count,
+                .doc_identity = runtimeDocIdentityStatusReportFromStats(stats.doc_identity),
+            });
+        }
+
+        if (runtime_statuses.items.len == 0 and group_statuses.items.len == 0) continue;
+        const owned_group_statuses = try group_statuses.toOwnedSlice(alloc);
+        errdefer metadata_table_manager.freeGroupStatuses(alloc, owned_group_statuses);
+        const owned_runtime_statuses = try runtime_statuses.toOwnedSlice(alloc);
+        errdefer metadata_table_manager.freeRuntimeGroupStatusReports(alloc, owned_runtime_statuses);
+        try reports.append(alloc, .{
+            .store_id = @intCast(i + 1),
+            .live = true,
+            .health_class = "healthy",
+            .capacity_bytes = 1024,
+            .available_bytes = 900,
+            .group_statuses = owned_group_statuses,
+            .runtime_statuses = owned_runtime_statuses,
+        });
+    }
+
+    if (reports.items.len == 0) return error.TestExpectedEqual;
+    try std.testing.expectEqual(reports.items.len, try node.reportStoreStatuses(reports.items));
 }
 
 fn seedGroupDocsAcrossReplicaRoots(
@@ -498,7 +744,7 @@ fn countProfileProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *
     _ = cluster;
     const ctx: *CountProfileProgressContext = @ptrCast(@alignCast(ptr));
     expectCountProfile(ctx.client, ctx.client_base, ctx.table_name, ctx.query_text, ctx.expected_total_hits, ctx.expected_shards, ctx.expected_merged) catch |err| switch (err) {
-        error.TestExpectedEqual, error.TestUnexpectedResult => return false,
+        error.TestExpectedEqual, error.TestUnexpectedResult, error.UnexpectedHttpStatus => return false,
         else => return err,
     };
     return true;
@@ -578,6 +824,49 @@ fn waitForLookupContains(
         .needle = needle,
     };
     return try cluster.runUntil(max_rounds, &ctx, lookupContainsProgressPredicate);
+}
+
+const QueryContainsAllProgressContext = struct {
+    client: *api_http_client.ApiHttpClient,
+    client_base: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    needles: []const []const u8,
+};
+
+fn queryContainsAllProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+    _ = cluster;
+    const ctx: *QueryContainsAllProgressContext = @ptrCast(@alignCast(ptr));
+    if (ctx.client.fetchQuery(ctx.client_base, ctx.table_name, ctx.body)) |query| {
+        var owned_query = query;
+        defer owned_query.deinit(std.heap.page_allocator);
+        expectBodyContainsAll(owned_query.body, ctx.needles) catch |err| switch (err) {
+            error.TestUnexpectedResult => return false,
+        };
+        return true;
+    } else |err| switch (err) {
+        error.UnexpectedHttpStatus => return false,
+        else => return err,
+    }
+}
+
+fn waitForQueryContainsAll(
+    cluster: *MetadataHttpClusterSimulation,
+    client: *api_http_client.ApiHttpClient,
+    client_base: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    needles: []const []const u8,
+    max_rounds: usize,
+) !bool {
+    var ctx = QueryContainsAllProgressContext{
+        .client = client,
+        .client_base = client_base,
+        .table_name = table_name,
+        .body = body,
+        .needles = needles,
+    };
+    return try cluster.runUntil(max_rounds, &ctx, queryContainsAllProgressPredicate);
 }
 
 const MedianKeyEqualsProgressContext = struct {
@@ -1010,10 +1299,14 @@ fn verifySplitPublicTraffic(
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.left_group, table_name, split_left_cutover_body);
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.right_group, table_name, split_right_cutover_body);
 
-    const left_leader_index = (try waitForGroupLeaderIndex(cluster, groups.left_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
-    const right_leader_index = (try waitForGroupLeaderIndex(cluster, groups.right_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(cluster, roots[left_leader_index], groups.left_group, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(cluster, roots[right_leader_index], groups.right_group, api_tables.default_full_text_index_name, 40);
+    _ = (try waitForGroupLeaderIndex(cluster, groups.left_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
+    _ = (try waitForGroupLeaderIndex(cluster, groups.right_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.left_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.right_group, api_tables.default_full_text_index_name, 40);
+    const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
+    const split_groups = [_]u64{ groups.left_group, groups.right_group };
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, split_groups[0..]);
+    try cluster.stepAll();
 
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:a", "\"alpha\"", cfg.lookup_rounds));
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:z", "\"zeta\"", cfg.lookup_rounds));
@@ -1024,9 +1317,15 @@ fn verifySplitPublicTraffic(
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.left_group, table_name, split_left_post_batch_body);
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.right_group, table_name, split_right_post_batch_body);
 
-    var query = try client.fetchQuery(client_base, table_name, shared_hello_query_body);
-    defer query.deinit(std.heap.page_allocator);
-    try expectBodyContainsAll(query.body, if (cfg.expect_mid_doc) split_query_needles[0..] else split_query_needles_without_mid[0..]);
+    try std.testing.expect(try waitForQueryContainsAll(
+        cluster,
+        client,
+        client_base,
+        table_name,
+        shared_hello_query_body,
+        if (cfg.expect_mid_doc) split_query_needles[0..] else split_query_needles_without_mid[0..],
+        cfg.lookup_rounds,
+    ));
 
     if (cfg.count_profile_rounds) |count_rounds| {
         try std.testing.expect(try waitForHelloCountProfile(cluster, client, client_base, table_name, 5, 2, true, count_rounds));
@@ -1054,8 +1353,12 @@ fn verifyMergePublicTraffic(
     // Repair the merged replica set with the right-side document before checking public reads.
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, merged_group, table_name, merge_seed_right_batch_body);
 
-    const merged_leader_index = (try waitForGroupLeaderIndex(cluster, merged_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(cluster, roots[merged_leader_index], merged_group, api_tables.default_full_text_index_name, 40);
+    _ = (try waitForGroupLeaderIndex(cluster, merged_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, api_tables.default_full_text_index_name, 40);
+    const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
+    const merge_groups = [_]u64{merged_group};
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..]);
+    try cluster.stepAll();
 
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:a", "\"alpha\"", cfg.lookup_rounds));
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:z", "\"zeta\"", cfg.lookup_rounds));
@@ -1065,9 +1368,15 @@ fn verifyMergePublicTraffic(
     try expectBodyContainsAll(post_merge_batch.body, &.{"\"inserted\":1"});
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, merged_group, table_name, merge_post_batch_body);
 
-    var query = try client.fetchQuery(client_base, table_name, shared_hello_query_body);
-    defer query.deinit(std.heap.page_allocator);
-    try expectBodyContainsAll(query.body, merge_query_needles[0..]);
+    try std.testing.expect(try waitForQueryContainsAll(
+        cluster,
+        client,
+        client_base,
+        table_name,
+        shared_hello_query_body,
+        merge_query_needles[0..],
+        cfg.lookup_rounds,
+    ));
 
     if (cfg.expect_profile) {
         try expectHelloCountProfile(client, client_base, table_name, 3, 1, true);
@@ -1803,6 +2112,7 @@ const SimMergeRuntime = struct {
             .ptr = self,
             .vtable = &.{
                 .observe_status = observeStatus,
+                .record_doc_identity_reassignment = recordDocIdentityReassignment,
                 .accept_receiver = acceptReceiver,
                 .catch_up_receiver = catchUpReceiver,
                 .finalize_merge = finalizeMerge,
@@ -1840,6 +2150,12 @@ const SimMergeRuntime = struct {
     fn observeStatus(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data_mod.MergeTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return self.entryFor(donor_group_id, receiver_group_id).status;
+    }
+
+    fn recordDocIdentityReassignment(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const entry = self.entryFor(donor_group_id, receiver_group_id);
+        entry.status.allow_doc_identity_reassignment = true;
     }
 
     fn acceptReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
@@ -1884,6 +2200,25 @@ const SimMergeRuntime = struct {
         return true;
     }
 };
+
+test "metadata sim merge runtime records doc identity reassignment opt-in" {
+    var sim = SimMergeRuntime{};
+    var runtime = transition_runtime.TransitionRuntime{ .merge = sim.iface() };
+
+    try runtime.execute(.{ .accept_merge_receiver = .{
+        .transition_id = 901,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+        .allow_doc_identity_reassignment = true,
+    } });
+
+    const observation = try runtime.observeMerge(.{
+        .transition_id = 901,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+    });
+    try std.testing.expect(observation.receiver.allow_doc_identity_reassignment);
+}
 
 const TestDescriptorFactory = struct {
     alloc: std.mem.Allocator,
@@ -3880,6 +4215,7 @@ const MetadataAdminSimSource = struct {
             .table_id = table.table_id,
             .donor_group_id = req.donor_group_id,
             .receiver_group_id = req.receiver_group_id,
+            .allow_doc_identity_reassignment = req.allow_doc_identity_reassignment,
         });
         try target.runRound();
     }
@@ -4171,6 +4507,7 @@ fn startBootstrappedMetadataCluster(
     try cluster.node(leader_index).campaignMetadataGroup();
     try cluster.stepAll();
     try cluster.publishClusterNodes(leader_index);
+    try cluster.publishClusterStores(leader_index);
     if (publish_stores) try cluster.publishClusterStores(leader_index);
     return leader_index;
 }
@@ -4522,6 +4859,7 @@ fn metadataVoprRunSmokeLivenessWorkload(
 
     try metadataVoprCreateActiveTable(cluster, &workflow, cfg.table_id, "vopr-docs", cfg.range_group_id, 3, 64);
     const split_leader_index = try metadataVoprLeaderIndex(cluster);
+    try reportSplitCandidateStatus(cluster.node(split_leader_index), cfg.range_group_id, 256, 180, "doc:m");
     const split_summary = try workflow.requestSplit(&cluster.node(split_leader_index), .{
         .transition_id = cfg.split_transition_id,
         .table_id = cfg.table_id,
@@ -4609,7 +4947,9 @@ fn metadataVoprRunExpandedLivenessWorkload(
     }, 16);
     try std.testing.expect(try cluster.waitForGroupStatusCount(merge_left_group, .active, 1, 64));
     try std.testing.expect(try cluster.waitForGroupStatusCount(merge_right_group, .active, 1, 64));
-    const merge_summary = try merge_workflow.requestMerge(&cluster.node(try metadataVoprLeaderIndex(cluster)), .{
+    const merge_leader_index = try metadataVoprLeaderIndex(cluster);
+    try reportMergeCandidateStatuses(cluster.node(merge_leader_index), merge_left_group, 16, 10, merge_right_group, 12, 12);
+    const merge_summary = try merge_workflow.requestMerge(&cluster.node(merge_leader_index), .{
         .transition_id = merge_transition_id,
         .table_id = merge_table_id,
         .donor_group_id = merge_right_group,
@@ -4637,6 +4977,7 @@ fn metadataVoprRunExpandedLivenessWorkload(
     try metadataVoprHealAll(cluster, state);
 
     const split_leader_index = try metadataVoprLeaderIndex(cluster);
+    try reportSplitCandidateStatus(cluster.node(split_leader_index), cfg.range_group_id, 256, 180, "doc:m");
     try metadataVoprStartFollowerPartition(cluster, state);
     const split_summary = try workflow.requestSplit(&cluster.node(split_leader_index), .{
         .transition_id = cfg.split_transition_id,
@@ -5186,6 +5527,8 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     const source_group_id = created_range.group_id;
     try std.testing.expect(table_id != 0);
     try std.testing.expect(source_group_id != 0);
+    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, api_tables.default_full_text_index_name, 40);
+    try reportSplitCandidateStatus(&cluster.node(leader_index), source_group_id, 12, 4096, "doc:m");
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":486101,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
         source_group_id,
@@ -5219,6 +5562,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group, 96)) orelse return error.TestExpectedEqual;
     try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, api_tables.default_full_text_index_name, 40);
     try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, api_tables.default_full_text_index_name, 40);
+    try reportMergeCandidateStatuses(&cluster.node(leader_index), left_group, 16, 4096, right_group, 12, 3072);
 
     var batch = try client.fetchBatch(client_base, "docs",
         \\{"inserts":{"doc:a":{"title":"alpha","body":"hello left side","status":"published"},"doc:b":{"title":"beta","body":"hello left beta","status":"published"},"doc:y":{"title":"gamma","body":"hello right gamma","status":"published"},"doc:z":{"title":"zeta","body":"hello right side","status":"published"}}}
@@ -5379,6 +5723,8 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     const source_group_id = created_range.group_id;
     try std.testing.expect(table_id != 0);
     try std.testing.expect(source_group_id != 0);
+    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, api_tables.default_full_text_index_name, 40);
+    try reportSplitCandidateStatus(&cluster.node(leader_index), source_group_id, 12, 4096, "doc:m");
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":486201,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
         source_group_id,
@@ -5412,6 +5758,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group, 96)) orelse return error.TestExpectedEqual;
     try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, api_tables.default_full_text_index_name, 40);
     try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, api_tables.default_full_text_index_name, 40);
+    try reportMergeCandidateStatuses(&cluster.node(leader_index), left_group, 16, 4096, right_group, 12, 3072);
 
     var pre_merge_batch = try client.fetchBatch(api_base_uris[0], "docs",
         \\{"inserts":{"doc:a":{"title":"alpha","body":"hello left side"},"doc:z":{"title":"zeta","body":"hello right side"}}}
@@ -5779,6 +6126,7 @@ test "metadata http cluster simulation drives split intent through the control l
     try cluster.node(leader_index).campaignMetadataGroup();
     try cluster.stepAll();
     try cluster.publishClusterNodes(leader_index);
+    try cluster.publishClusterStores(leader_index);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
@@ -5794,6 +6142,7 @@ test "metadata http cluster simulation drives split intent through the control l
         .end_key = "doc:z",
     });
     try std.testing.expect(try cluster.waitForGroupStatus(4501, .active, 32));
+    try reportSplitCandidateStatus(&cluster.node(leader_index), 4501, 12, 4096, "doc:m");
 
     const split_summary = try workflow.requestSplit(&cluster.node(leader_index), .{
         .transition_id = 45001,
@@ -5865,6 +6214,7 @@ test "metadata http cluster simulation drives merge intent through the control l
     try cluster.node(leader_index).campaignMetadataGroup();
     try cluster.stepAll();
     try cluster.publishClusterNodes(leader_index);
+    try cluster.publishClusterStores(leader_index);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
@@ -5887,6 +6237,7 @@ test "metadata http cluster simulation drives merge intent through the control l
     });
     try std.testing.expect(try cluster.waitForGroupStatus(4601, .active, 32));
     try std.testing.expect(try cluster.waitForGroupStatus(4602, .active, 32));
+    try reportMergeCandidateStatuses(&cluster.node(leader_index), 4601, 16, 4096, 4602, 12, 3072);
 
     const merge_summary = try workflow.requestMerge(&cluster.node(leader_index), .{
         .transition_id = 46001,
@@ -8233,6 +8584,7 @@ test "metadata http cluster simulation publishes split topology after finalize" 
     try cluster.node(leader_index).campaignMetadataGroup();
     try cluster.stepAll();
     try cluster.publishClusterNodes(leader_index);
+    try cluster.publishClusterStores(leader_index);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
@@ -8248,6 +8600,7 @@ test "metadata http cluster simulation publishes split topology after finalize" 
         .desired_replica_count = 3,
         .min_ranges = 1,
     }, initial_ranges[0..], 32);
+    try reportSplitCandidateStatus(&cluster.node(leader_index), 4701, 12, 4096, "doc:m");
 
     _ = try workflow.requestSplit(&cluster.node(leader_index), .{
         .transition_id = 47001,
@@ -8322,6 +8675,7 @@ test "metadata http cluster simulation publishes merge topology after finalize" 
     try cluster.node(leader_index).campaignMetadataGroup();
     try cluster.stepAll();
     try cluster.publishClusterNodes(leader_index);
+    try cluster.publishClusterStores(leader_index);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
@@ -8345,6 +8699,7 @@ test "metadata http cluster simulation publishes merge topology after finalize" 
         .desired_replica_count = 3,
         .min_ranges = 2,
     }, initial_ranges[0..], 32);
+    try reportMergeCandidateStatuses(&cluster.node(leader_index), 4801, 16, 4096, 4802, 12, 3072);
 
     _ = try workflow.requestMerge(&cluster.node(leader_index), .{
         .transition_id = 48001,
@@ -8419,6 +8774,7 @@ test "metadata http cluster simulation provisions split destination replicas acr
     try cluster.node(leader_index).campaignMetadataGroup();
     try cluster.stepAll();
     try cluster.publishClusterNodes(leader_index);
+    try cluster.publishClusterStores(leader_index);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
@@ -8435,6 +8791,7 @@ test "metadata http cluster simulation provisions split destination replicas acr
         .min_ranges = 1,
     }, initial_ranges[0..], 40);
     try std.testing.expectEqual(@as(usize, 3), create_summary.placement_upserts);
+    try reportSplitCandidateStatus(&cluster.node(leader_index), 4811, 12, 4096, "doc:m");
 
     _ = try workflow.requestSplit(&cluster.node(leader_index), .{
         .transition_id = 48101,
@@ -8504,6 +8861,7 @@ test "metadata http cluster simulation retires merge donor replicas across nodes
     try cluster.node(leader_index).campaignMetadataGroup();
     try cluster.stepAll();
     try cluster.publishClusterNodes(leader_index);
+    try cluster.publishClusterStores(leader_index);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
@@ -8529,6 +8887,7 @@ test "metadata http cluster simulation retires merge donor replicas across nodes
     }, initial_ranges[0..], 40);
     try std.testing.expectEqual(@as(usize, 2), create_summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 6), create_summary.placement_upserts);
+    try reportMergeCandidateStatuses(&cluster.node(leader_index), 4821, 16, 4096, 4822, 12, 3072);
 
     _ = try workflow.requestMerge(&cluster.node(leader_index), .{
         .transition_id = 48201,
@@ -8980,6 +9339,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         .min_ranges = 1,
     }, initial_ranges[0..], 40);
     try std.testing.expectEqual(@as(usize, 1), create_summary.placement_upserts);
+    try reportSplitCandidateStatus(&cluster.node(leader_index), 4841, 12, 4096, "doc:m");
 
     _ = try workflow.requestSplit(&cluster.node(leader_index), .{
         .transition_id = 48401,
@@ -9267,6 +9627,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     }, initial_ranges[0..], 40);
     try std.testing.expectEqual(@as(usize, 2), create_summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 2), create_summary.placement_upserts);
+    try reportMergeCandidateStatuses(&cluster.node(leader_index), 4851, 16, 4096, 4852, 12, 3072);
 
     _ = try workflow.requestMerge(&cluster.node(leader_index), .{
         .transition_id = 48501,

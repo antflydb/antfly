@@ -593,6 +593,7 @@ fn cloneProjectedMergeTransitionsOwned(
             .donor_group_id = record.donor_group_id,
             .receiver_group_id = record.receiver_group_id,
             .phase = record.phase,
+            .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
         };
         errdefer metadata_table_manager.freeMergeTransitionRecord(alloc, out[i]);
         out[i].rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null;
@@ -5174,6 +5175,25 @@ pub fn snapshotStatus(
         .repair_placement_groups = plan.repair_placement_groups,
         .rebalance_placement_groups = plan.rebalance_placement_groups,
     };
+    var doc_identity_lifecycle_unknown: usize = 0;
+    var doc_identity_lifecycle_preserving: usize = 0;
+    var doc_identity_lifecycle_reassigning: usize = 0;
+    var doc_identity_lifecycle_rebuild_required: usize = 0;
+    var doc_identity_lifecycle_ready: usize = 0;
+    for (current.current.merged_group_statuses) |merged_status| {
+        const lifecycle = metadata_reconciler.deriveDocIdentityLifecycle(merged_status);
+        if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_unknown)) {
+            doc_identity_lifecycle_unknown += 1;
+        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_preserving)) {
+            doc_identity_lifecycle_preserving += 1;
+        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_reassigning)) {
+            doc_identity_lifecycle_reassigning += 1;
+        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_rebuild_required)) {
+            doc_identity_lifecycle_rebuild_required += 1;
+        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_ready)) {
+            doc_identity_lifecycle_ready += 1;
+        }
+    }
 
     return .{
         .metadata_group_id = metadata_group_id,
@@ -5252,6 +5272,11 @@ pub fn snapshotStatus(
         .projected_restore_progress = projected_restore_progress.len,
         .projected_split_transitions = projected_split_transitions.len,
         .projected_merge_transitions = projected_merge_transitions.len,
+        .projected_doc_identity_lifecycle_unknown = doc_identity_lifecycle_unknown,
+        .projected_doc_identity_lifecycle_preserving = doc_identity_lifecycle_preserving,
+        .projected_doc_identity_lifecycle_reassigning = doc_identity_lifecycle_reassigning,
+        .projected_doc_identity_lifecycle_rebuild_required = doc_identity_lifecycle_rebuild_required,
+        .projected_doc_identity_lifecycle_ready = doc_identity_lifecycle_ready,
         .preferred_stores = preferred_stores,
         .constrained_stores = constrained_stores,
         .overloaded_stores = overloaded_stores,

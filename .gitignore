@@ -81,6 +81,9 @@ e2e/backups/*.afb
 .specify/
 scripts/__pycache__/
 
+# Local package/worktree caches
+.pnpm-store/
+.worktrees/
 
 /datasets/
 

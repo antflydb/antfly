@@ -25,6 +25,7 @@ const types = @import("types.zig");
 pub const MapperDoc = struct {
     key: []const u8,
     value: []const u8,
+    doc_ordinal: ?u32 = null,
 };
 
 pub const SparseVectorData = struct {
@@ -86,6 +87,7 @@ pub const ExtractedWrite = struct {
 pub const DenseEmbeddingWrite = struct {
     index_name: []u8,
     doc_key: []u8,
+    parent_doc_key: ?[]const u8 = null,
     artifact_key: ?[]u8 = null,
     vector: []f32,
 };
@@ -158,6 +160,7 @@ pub const TextProjectionSourceDoc = struct {
     root: std.json.Value,
     stored_data: []const u8,
     typed_source: ?std.json.Value,
+    doc_ordinal: ?u32 = null,
 };
 
 pub const TextProjectionSourceBatch = struct {
@@ -269,7 +272,7 @@ pub fn buildTextProjectionSourceBatchWithOptions(
     defer source_docs.deinit(arena);
 
     for (docs) |doc| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, opts);
     }
 
     return .{
@@ -293,7 +296,7 @@ pub fn buildTextProjectionSourceBatchFromWritesWithOptions(
     defer source_docs.deinit(arena);
 
     for (writes) |write| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, opts);
     }
 
     return .{
@@ -306,6 +309,7 @@ fn appendTextProjectionSourceDoc(
     source_docs: *std.ArrayListUnmanaged(TextProjectionSourceDoc),
     key: []const u8,
     value: []const u8,
+    doc_ordinal: ?u32,
     opts: TextProjectionOptions,
 ) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{});
@@ -316,6 +320,7 @@ fn appendTextProjectionSourceDoc(
         .root = root,
         .stored_data = stored_projection.stored_data,
         .typed_source = stored_projection.typed_source,
+        .doc_ordinal = doc_ordinal,
     });
 }
 
@@ -337,6 +342,7 @@ pub fn buildTextProjectionBatchFromSource(
         try text_docs.append(arena, .{
             .id = doc.key,
             .stored_data = doc.stored_data,
+            .doc_ordinal = doc.doc_ordinal,
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,

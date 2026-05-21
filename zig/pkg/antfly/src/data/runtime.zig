@@ -22,6 +22,7 @@ const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend_mod = @import("../storage/lsm_backend.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
+const doc_identity = @import("../storage/db/doc_identity.zig");
 const data_raft_batch = @import("raft_batch.zig");
 const platform_clock = @import("../platform/clock.zig");
 const process_memory_mod = @import("../platform/process_memory.zig");
@@ -1615,6 +1616,8 @@ pub const DataServer = struct {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
             apply_sm.write_cache.secret_store = api_server_cfg.secret_store;
+            _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
+            apply_sm.write_cache.remote_content = api_server_cfg.remote_content;
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
@@ -2626,8 +2629,11 @@ pub const DataServer = struct {
 
     fn localObserveMerge(ptr: *anyopaque, record: antfly.metadata.MergeTransitionRecord) !antfly.metadata.transition_state.MergeObservation {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        return try runtime.shardOperationAdapter().observeMerge(record);
+        if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeMerge(record);
+        var runtime = try self.initLocalMergeRuntime(record.donor_group_id, record.receiver_group_id);
+        defer runtime.deinit();
+        const status = try runtime.runtime().observeStatus(record.donor_group_id, record.receiver_group_id);
+        return .{ .donor = status, .receiver = status };
     }
 
     fn localPrepareSplitSource(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "prepare_split_source")) !void {
@@ -2707,13 +2713,55 @@ pub const DataServer = struct {
         defer self.alloc.free(source_root_dir);
         const dest_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, destination_group_id);
         defer self.alloc.free(dest_root_dir);
+        var dest_db_options = antfly.db.OpenOptions{};
+        if (try self.identityNamespaceForSplitDestination(source_group_id, destination_group_id)) |namespace| {
+            dest_db_options.identity_namespace = namespace;
+        }
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
         return try antfly.raft.SplitCoordinatorRuntime.init(self.alloc, .{
             .source_root_dir = source_root_dir,
             .dest_root_dir = dest_root_dir,
             .source_group_id = source_group_id,
             .dest_group_id = destination_group_id,
+            .dest = .{ .root_dir = dest_root_dir, .db = dest_db_options },
         });
+    }
+
+    fn initLocalMergeRuntime(self: *DataServer, donor_group_id: u64, receiver_group_id: u64) !antfly.raft.MergeCoordinatorRuntime {
+        const donor_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, donor_group_id);
+        defer self.alloc.free(donor_root_dir);
+        const receiver_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, receiver_group_id);
+        defer self.alloc.free(receiver_root_dir);
+        var receiver_db_options = antfly.db.OpenOptions{};
+        const receiver_namespace = try self.identityNamespaceForLocalGroup(receiver_group_id);
+        if (receiver_namespace) |namespace| {
+            receiver_db_options.identity_namespace = namespace;
+            receiver_db_options.prefer_existing_identity_namespace = true;
+        }
+        try self.ensureSplitSourceApplyStoreSeeded(donor_root_dir, donor_group_id);
+        return try antfly.raft.MergeCoordinatorRuntime.init(self.alloc, .{
+            .donor_root_dir = donor_root_dir,
+            .receiver_root_dir = receiver_root_dir,
+            .donor_group_id = donor_group_id,
+            .receiver_group_id = receiver_group_id,
+            .receiver = .{ .root_dir = receiver_root_dir, .db = receiver_db_options },
+            .receiver_identity_reassignment_namespace = receiver_namespace,
+        });
+    }
+
+    fn identityNamespaceForLocalGroup(self: *DataServer, group_id: u64) !?antfly.db.DocIdentityNamespace {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return null;
+        return identityNamespaceFromRange(range);
+    }
+
+    fn identityNamespaceForSplitDestination(self: *DataServer, source_group_id: u64, destination_group_id: u64) !?antfly.db.DocIdentityNamespace {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        if (findRangeByGroupId(snapshot.ranges, destination_group_id)) |range| return identityNamespaceFromRange(range);
+        const source = findRangeByGroupId(snapshot.ranges, source_group_id) orelse return null;
+        return identityNamespaceFromRange(source);
     }
 
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {
@@ -2776,29 +2824,61 @@ pub const DataServer = struct {
 
     fn localAcceptMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            const merge = runtime.runtime();
+            if (op.allow_doc_identity_reassignment) {
+                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            }
+            try merge.acceptReceiver(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn localCatchUpMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            const merge = runtime.runtime();
+            if (op.allow_doc_identity_reassignment) {
+                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            }
+            _ = try merge.catchUpReceiver(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn localFinalizeMerge(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            const merge = runtime.runtime();
+            if (op.allow_doc_identity_reassignment) {
+                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            }
+            _ = try merge.finalizeMerge(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn localRollbackMerge(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "rollback_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            _ = try runtime.runtime().rollbackMerge(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
@@ -5831,7 +5911,56 @@ fn runtimeStatusReportFromLocalStatus(
         .async_startup_active = status.stats.async_indexing.startup.active,
         .async_dense_catch_up_active = status.stats.async_indexing.dense_catch_up.active,
         .async_bulk_coalescing_active = status.stats.async_indexing.bulk_coalescing.active_session,
+        .doc_identity = runtimeDocIdentityStatusReportFromStats(status.stats.doc_identity),
+        .doc_set_planning = runtimeDocSetPlanningStatusReportFromStats(status.stats.doc_set_planning),
         .indexes = indexes,
+    };
+}
+
+fn runtimeDocIdentityStatusReportFromStats(
+    stats: antfly.db.types.DocIdentityStats,
+) antfly.metadata.table_manager.RuntimeDocIdentityStatusReport {
+    return .{
+        .namespace_table_id = stats.namespace_table_id,
+        .namespace_shard_id = stats.namespace_shard_id,
+        .namespace_range_id = stats.namespace_range_id,
+        .next_ordinal = stats.next_ordinal,
+        .allocated_ordinals = stats.allocated_ordinals,
+        .ordinal_capacity_remaining = stats.ordinal_capacity_remaining,
+        .ordinal_capacity_exhausted = stats.ordinal_capacity_exhausted,
+        .rebuild_required = stats.rebuild_required,
+        .state_rows = stats.state_rows,
+        .live_ordinals = stats.live_ordinals,
+        .tombstone_ordinals = stats.tombstone_ordinals,
+        .min_created_generation = stats.min_created_generation,
+        .max_created_generation = stats.max_created_generation,
+        .min_deleted_generation = stats.min_deleted_generation,
+        .max_deleted_generation = stats.max_deleted_generation,
+        .scanned_primary_docs = stats.scanned_primary_docs,
+        .primary_docs_missing_ordinals = stats.primary_docs_missing_ordinals,
+        .primary_docs_missing_identity_state = stats.primary_docs_missing_identity_state,
+        .primary_docs_with_tombstone_ordinals = stats.primary_docs_with_tombstone_ordinals,
+        .complete = stats.complete,
+    };
+}
+
+fn runtimeDocSetPlanningStatusReportFromStats(
+    stats: antfly.db.types.DocSetPlanningStats,
+) antfly.metadata.table_manager.RuntimeDocSetPlanningStatusReport {
+    return .{
+        .resolved_set_count = stats.resolved_set_count,
+        .all_set_count = stats.all_set_count,
+        .none_set_count = stats.none_set_count,
+        .doc_key_list_count = stats.doc_key_list_count,
+        .ordinal_list_count = stats.ordinal_list_count,
+        .ordinal_bitmap_count = stats.ordinal_bitmap_count,
+        .doc_key_list_docs = stats.doc_key_list_docs,
+        .ordinal_list_docs = stats.ordinal_list_docs,
+        .ordinal_bitmap_docs = stats.ordinal_bitmap_docs,
+        .missing_ordinal_coverage_count = stats.missing_ordinal_coverage_count,
+        .bitmap_promotion_count = stats.bitmap_promotion_count,
+        .unsupported_filter_shape_count = stats.unsupported_filter_shape_count,
+        .stale_identity_generation_rejection_count = stats.stale_identity_generation_rejection_count,
     };
 }
 
@@ -5930,6 +6059,14 @@ fn findRangeByGroupId(
         if (range.group_id == group_id) return range;
     }
     return null;
+}
+
+fn identityNamespaceFromRange(range: antfly.metadata.table_manager.RangeRecord) antfly.db.DocIdentityNamespace {
+    return .{
+        .table_id = range.table_id,
+        .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+        .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+    };
 }
 
 fn findTableById(
@@ -7629,6 +7766,291 @@ test "data runtime local group status provider collects and caches group statuse
     const empty_cached = (try server.cloneCachedLocalGroupStatuses(alloc, 3, 99)) orelse return error.TestUnexpectedResult;
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, empty_cached);
     try std.testing.expectEqual(@as(usize, 0), empty_cached.len);
+}
+
+test "data runtime local split fallback preserves source identity namespace" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-split-identity", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const source_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 180);
+    defer alloc.free(source_db_path);
+    const destination_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 181);
+    defer alloc.free(destination_db_path);
+
+    const source_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 180,
+        .range_id = 9000,
+    };
+
+    {
+        var db = try antfly.db.DB.open(alloc, source_db_path, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right\"}" }},
+        });
+    }
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 180,
+                    .table_id = 7,
+                    .range_id = 9000,
+                    .start_key = "doc:a",
+                    .end_key = "doc:z",
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{.{
+                    .transition_id = 9001,
+                    .source_group_id = 180,
+                    .destination_group_id = 181,
+                    .split_key = "doc:m",
+                    .source_range_end = "doc:z",
+                }})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    var ops = server.localShardOperationAdapter();
+    try ops.execute(.{ .prepare_split_source = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    } });
+    try ops.execute(.{ .start_split_source = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+    } });
+    try ops.execute(.{ .bootstrap_split_destination = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+    } });
+    try ops.execute(.{ .catch_up_split_destination = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+    } });
+
+    var dest = try antfly.db.DB.open(alloc, destination_db_path, .{
+        .identity_namespace = source_namespace,
+        .start_index_workers = false,
+    });
+    defer dest.close();
+
+    const replayed = (try dest.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(replayed);
+    try std.testing.expectEqualStrings("{\"v\":\"right\"}", replayed);
+
+    const stats = try dest.runtimeStatusStatsConsistent(alloc);
+    try std.testing.expectEqual(source_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(source_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
+    try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
+test "data runtime local merge fallback derives receiver identity namespace from catalog" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-merge-identity", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const donor_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 190);
+    defer alloc.free(donor_db_path);
+    const receiver_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 191);
+    defer alloc.free(receiver_db_path);
+
+    const donor_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 190,
+        .range_id = 9000,
+    };
+    const old_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 191,
+        .range_id = 9001,
+    };
+    const target_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 191,
+        .range_id = 9002,
+    };
+
+    {
+        var db = try antfly.db.DB.open(alloc, donor_db_path, .{
+            .identity_namespace = donor_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:m", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"donor\"}" }},
+        });
+    }
+
+    {
+        var db = try antfly.db.DB.open(alloc, receiver_db_path, .{
+            .identity_namespace = old_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:m" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"v\":\"receiver\"}" }},
+        });
+    }
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{
+                    .{
+                        .group_id = 190,
+                        .table_id = 7,
+                        .range_id = 9000,
+                        .start_key = "",
+                        .end_key = "doc:m",
+                    },
+                    .{
+                        .group_id = 191,
+                        .table_id = 7,
+                        .range_id = 9002,
+                        .start_key = "doc:m",
+                        .end_key = null,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    var ops = server.localShardOperationAdapter();
+    try ops.execute(.{ .accept_merge_receiver = .{
+        .transition_id = 9002,
+        .donor_group_id = 190,
+        .receiver_group_id = 191,
+        .allow_doc_identity_reassignment = true,
+    } });
+    try ops.execute(.{ .catch_up_merge_receiver = .{
+        .transition_id = 9002,
+        .donor_group_id = 190,
+        .receiver_group_id = 191,
+        .allow_doc_identity_reassignment = true,
+    } });
+
+    var reopened = try antfly.db.DB.open(alloc, receiver_db_path, .{
+        .identity_namespace = target_namespace,
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    const replayed = (try reopened.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(replayed);
+    try std.testing.expectEqualStrings("{\"v\":\"donor\"}", replayed);
+
+    const stats = try reopened.runtimeStatusStatsConsistent(alloc);
+    try std.testing.expectEqual(target_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(target_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(target_namespace.range_id, stats.doc_identity.namespace_range_id);
+
+    var txn = try reopened.core.store.beginProbeTxn();
+    defer txn.abort();
+    const receiver_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    const receiver_state = (try doc_identity.lookupStateTxn(&txn, receiver_ordinal)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), receiver_state.canonical_doc_id);
+    const donor_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:t")) orelse return error.TestUnexpectedResult;
+    const donor_state = (try doc_identity.lookupStateTxn(&txn, donor_ordinal)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:t"), donor_state.canonical_doc_id);
+    try std.testing.expect(receiver_ordinal != donor_ordinal);
 }
 
 test "data runtime local split key cache is scoped by root and change generation" {

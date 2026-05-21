@@ -15,7 +15,7 @@
 //! Document-level TTL with query-time filtering and background cleanup.
 //!
 //! Matches Go antfly's TTL system:
-//!   - Timestamp stored as separate `:t` suffixed key (8-byte u64 LE, unix nanoseconds)
+//!   - Timestamp stored as a structured internal TTL key (8-byte u64 LE, unix nanoseconds)
 //!   - Query-time filtering: isExpired() for immediate skip
 //!   - Background cleanup: cleanupExpired() with grace period for replication safety
 //!
@@ -33,9 +33,6 @@ const internal_keys = @import("internal_keys.zig");
 const lmdb = @import("lmdb.zig");
 const platform_time = @import("../platform/time.zig");
 
-/// Timestamp key suffix. Matches Go's TransactionSuffix = ":t".
-pub const timestamp_suffix = ":t";
-
 pub const TtlConfig = struct {
     /// TTL duration in nanoseconds.
     duration_ns: u64,
@@ -48,7 +45,7 @@ pub const TtlConfig = struct {
 // Timestamp read/write
 // ============================================================================
 
-/// Write a timestamp for a document key. Writes `<key>:t` → 8-byte u64 LE.
+/// Write a timestamp for a document key using the structured internal TTL key.
 pub fn writeTimestamp(store: *DocStore, key: []const u8, timestamp_ns: u64) !void {
     const ts_key = try internal_keys.ttlKeyAlloc(store.alloc, key);
     defer store.alloc.free(ts_key);
@@ -95,7 +92,7 @@ pub fn isDocExpired(store: *DocStore, alloc: Allocator, key: []const u8, config:
 // Background cleanup
 // ============================================================================
 
-/// Scan all `:t` keys in the store, collect expired ones, delete in batches.
+/// Scan structured internal TTL keys in the store, collect expired ones, delete in batches.
 /// Returns the number of documents deleted.
 pub fn cleanupExpired(
     alloc: Allocator,
@@ -268,6 +265,35 @@ test "cleanupExpired deletes expired, preserves unexpired" {
     const doc2 = try store.get(alloc, doc2_key);
     defer alloc.free(doc2);
     try std.testing.expectEqualStrings("content2", doc2);
+}
+
+test "ttl timestamp keys support arbitrary document ids" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const sp = tmpPath(&pb, "binary-id");
+    defer cleanupTmp(sp);
+
+    var store = try DocStore.open(alloc, sp, .{});
+    defer store.close();
+
+    const raw = "doc\x00:t\xff";
+    const doc_key = try internal_keys.documentKeyAlloc(alloc, raw);
+    defer alloc.free(doc_key);
+    try store.put(doc_key, "content");
+    try writeTimestamp(&store, raw, 1_000_000_000);
+
+    try std.testing.expectEqual(@as(?u64, 1_000_000_000), try readTimestamp(&store, alloc, raw));
+    try std.testing.expect(try isDocExpired(&store, alloc, raw, .{
+        .duration_ns = 5_000_000_000,
+        .grace_period_ns = 0,
+    }, 7_000_000_000));
+
+    const deleted = try cleanupExpired(alloc, &store, .{
+        .duration_ns = 5_000_000_000,
+        .grace_period_ns = 0,
+    }, 7_000_000_000, 100);
+    try std.testing.expectEqual(@as(u32, 1), deleted);
+    try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, doc_key));
 }
 
 test "grace period prevents premature cleanup" {

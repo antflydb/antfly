@@ -140,6 +140,21 @@ const GraphResultSet = struct {
     total_hits: u32,
 };
 
+fn publicGraphSeedTotalHits(hits_len: usize, limit: u32) u32 {
+    var total: u32 = @intCast(@min(hits_len, std.math.maxInt(u32)));
+    if (limit > 0 and hits_len >= limit) {
+        total = @max(total, @as(u32, @intCast(@min(hits_len + 1, @as(usize, std.math.maxInt(u32))))));
+    }
+    return total;
+}
+
+pub fn testPublicGraphSeedTotalHits() !void {
+    try std.testing.expectEqual(@as(u32, 0), publicGraphSeedTotalHits(0, 10));
+    try std.testing.expectEqual(@as(u32, 1), publicGraphSeedTotalHits(1, 10));
+    try std.testing.expectEqual(@as(u32, 2), publicGraphSeedTotalHits(1, 1));
+    try std.testing.expectEqual(@as(u32, 11), publicGraphSeedTotalHits(10, 10));
+}
+
 pub const SupportedJoinRequest = query_execution.SupportedJoinRequest;
 const SupportedJoinFilters = query_execution.SupportedJoinFilters;
 const JoinedQueryStats = query_execution.JoinedQueryStats;
@@ -2490,6 +2505,9 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         body: []const u8,
     ) !?HttpResponse {
+        public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+        };
         var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -2561,7 +2579,7 @@ pub const HttpHandler = struct {
             req.count_only = execution.plan.request.count_only;
             req.profile = execution.profile_requested;
             search_hits = try allocDbSearchHitsAlloc(self.alloc, execution.hits);
-            search_total_hits = @intCast(@min(execution.hits.len, std.math.maxInt(u32)));
+            search_total_hits = publicGraphSeedTotalHits(execution.hits.len, req.limit);
             try initial_sets.append(self.alloc, .{
                 .name = "$fused_results",
                 .hits = search_hits,
@@ -4288,6 +4306,7 @@ pub const HttpHandler = struct {
         return self.executePublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.FileNotFound => return error.NotFound,
+            error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -4305,6 +4324,7 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryViewJsonAlloc(table_name, view) catch |err| switch (err) {
             error.FileNotFound => return error.NotFound,
+            error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             else => return error.InternalFailure,
         };
     }
@@ -9346,6 +9366,10 @@ test "http handler rejects ingest when namespace is backpressured" {
     });
     defer second_ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 429), second_ingest.status);
+}
+
+test "serverless public graph seed total marks saturated pages incomplete" {
+    try testPublicGraphSeedTotalHits();
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

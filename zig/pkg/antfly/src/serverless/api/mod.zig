@@ -162,3 +162,7 @@ test "serverless api module compiles" {
     _ = HttpHandler;
     _ = CatalogService;
 }
+
+test "serverless public graph seed totals mark saturated pages incomplete" {
+    try http_handler.testPublicGraphSeedTotalHits();
+}

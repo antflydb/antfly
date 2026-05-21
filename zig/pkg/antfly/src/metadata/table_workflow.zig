@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const control_loop = @import("control_loop.zig");
+const metadata_reconciler = @import("reconciler.zig");
 const placement_planner = @import("placement_planner.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const table_manager = @import("table_manager.zig");
@@ -79,6 +80,9 @@ pub const TableWorkflow = struct {
         intent: table_manager.SplitIntent,
     ) !control_loop.ReconcileSummary {
         try self.bootstrapDesiredFromCommitted(service);
+        var current = try self.loop.stateRef().captureCurrent(service);
+        defer current.deinit(self.loop.alloc);
+        try validateSplitIntentDocIdentity(current.current, intent);
         try self.loop.stateRef().tableManager().requestSplit(intent);
         return try reconcileForService(&self.loop, service);
     }
@@ -89,6 +93,9 @@ pub const TableWorkflow = struct {
         intent: table_manager.MergeIntent,
     ) !control_loop.ReconcileSummary {
         try self.bootstrapDesiredFromCommitted(service);
+        var current = try self.loop.stateRef().captureCurrent(service);
+        defer current.deinit(self.loop.alloc);
+        try validateMergeIntentDocIdentity(current.current, intent);
         try self.loop.stateRef().tableManager().requestMerge(intent);
         return try reconcileForService(&self.loop, service);
     }
@@ -171,6 +178,243 @@ fn reconcileForService(loop: *control_loop.MetadataControlLoop, service: anytype
         return (try service.reconcileOnceIfLeaseHeld(loop)) orelse error.ReconcileLeaseNotHeld;
     }
     return try loop.reconcileOnce(service);
+}
+
+fn validateSplitIntentDocIdentity(current: metadata_reconciler.CurrentMetadataState, intent: table_manager.SplitIntent) !void {
+    const source = findMergedGroupStatus(current.merged_group_statuses, intent.source_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+}
+
+fn validateMergeIntentDocIdentity(current: metadata_reconciler.CurrentMetadataState, intent: table_manager.MergeIntent) !void {
+    const donor = findMergedGroupStatus(current.merged_group_statuses, intent.donor_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    const receiver = findMergedGroupStatus(current.merged_group_statuses, intent.receiver_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity_reassignment_active or receiver.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity_namespace_conflict or receiver.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity.rebuild_required or receiver.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity.ordinal_capacity_exhausted or receiver.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
+    if (!runtimeDocIdentityHasOrdinalRows(donor.doc_identity) or !runtimeDocIdentityHasOrdinalRows(receiver.doc_identity)) return;
+    if (intent.allow_doc_identity_reassignment) return;
+    if (!runtimeDocIdentitySameNamespace(donor.doc_identity, receiver.doc_identity)) return error.DocIdentityNamespaceMismatch;
+}
+
+fn findMergedGroupStatus(
+    statuses: []const metadata_reconciler.MergedGroupStatus,
+    group_id: u64,
+) ?metadata_reconciler.MergedGroupStatus {
+    for (statuses) |status| {
+        if (status.group_id == group_id) return status;
+    }
+    return null;
+}
+
+fn runtimeDocIdentityHasOrdinalRows(stats: table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0;
+}
+
+fn runtimeDocIdentitySameNamespace(
+    left: table_manager.RuntimeDocIdentityStatusReport,
+    right: table_manager.RuntimeDocIdentityStatusReport,
+) bool {
+    return left.namespace_table_id == right.namespace_table_id and
+        left.namespace_shard_id == right.namespace_shard_id and
+        left.namespace_range_id == right.namespace_range_id;
+}
+
+test "table workflow doc identity guards reject active transition intents" {
+    var left = metadata_reconciler.MergedGroupStatus{
+        .group_id = 91,
+        .doc_identity_reassignment_active = true,
+        .doc_identity = .{
+            .namespace_table_id = 9,
+            .namespace_shard_id = 91,
+            .namespace_range_id = 9001,
+            .next_ordinal = 12,
+            .allocated_ordinals = 11,
+        },
+    };
+    const right = metadata_reconciler.MergedGroupStatus{
+        .group_id = 92,
+        .doc_identity = .{
+            .namespace_table_id = 9,
+            .namespace_shard_id = 92,
+            .namespace_range_id = 9002,
+            .next_ordinal = 7,
+            .allocated_ordinals = 6,
+        },
+    };
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{ left, right };
+    var current = metadata_reconciler.CurrentMetadataState{ .merged_group_statuses = &statuses };
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(current, .{
+        .transition_id = 0,
+        .table_id = 9,
+        .source_group_id = 93,
+        .destination_group_id = 94,
+        .split_key = "doc:m",
+    }));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(current, .{
+        .transition_id = 1,
+        .table_id = 9,
+        .source_group_id = 91,
+        .destination_group_id = 93,
+        .split_key = "doc:m",
+    }));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(current, .{
+        .transition_id = 2,
+        .table_id = 9,
+        .donor_group_id = 92,
+        .receiver_group_id = 91,
+        .allow_doc_identity_reassignment = true,
+    }));
+
+    left.doc_identity_reassignment_active = false;
+    statuses = [_]metadata_reconciler.MergedGroupStatus{ left, right };
+    current = .{ .merged_group_statuses = &statuses };
+    try validateMergeIntentDocIdentity(current, .{
+        .transition_id = 3,
+        .table_id = 9,
+        .donor_group_id = 92,
+        .receiver_group_id = 91,
+        .allow_doc_identity_reassignment = true,
+    });
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(current, .{
+        .transition_id = 4,
+        .table_id = 9,
+        .donor_group_id = 92,
+        .receiver_group_id = 91,
+    }));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(current, .{
+        .transition_id = 40,
+        .table_id = 9,
+        .donor_group_id = 92,
+        .receiver_group_id = 93,
+    }));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(current, .{
+        .transition_id = 41,
+        .table_id = 9,
+        .donor_group_id = 92,
+        .receiver_group_id = 93,
+        .allow_doc_identity_reassignment = true,
+    }));
+
+    statuses[0].doc_identity.ordinal_capacity_exhausted = true;
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(current, .{
+        .transition_id = 42,
+        .table_id = 9,
+        .donor_group_id = 92,
+        .receiver_group_id = 91,
+        .allow_doc_identity_reassignment = true,
+    }));
+    statuses[0].doc_identity.ordinal_capacity_exhausted = false;
+
+    statuses[0].doc_identity.rebuild_required = true;
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(current, .{
+        .transition_id = 5,
+        .table_id = 9,
+        .source_group_id = 91,
+        .destination_group_id = 93,
+        .split_key = "doc:m",
+    }));
+}
+
+test "table workflow doc identity lifecycle handles mixed-version transition status" {
+    const old_left = metadata_reconciler.MergedGroupStatus{
+        .group_id = 101,
+        .doc_identity = .{
+            .namespace_table_id = 10,
+            .namespace_shard_id = 101,
+            .namespace_range_id = 1001,
+        },
+    };
+    const old_right = metadata_reconciler.MergedGroupStatus{
+        .group_id = 102,
+        .doc_identity = .{
+            .namespace_table_id = 10,
+            .namespace_shard_id = 102,
+            .namespace_range_id = 1002,
+        },
+    };
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{ old_left, old_right };
+    var current = metadata_reconciler.CurrentMetadataState{ .merged_group_statuses = &statuses };
+
+    try validateSplitIntentDocIdentity(current, .{
+        .transition_id = 10,
+        .table_id = 10,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:m",
+    });
+    try validateMergeIntentDocIdentity(current, .{
+        .transition_id = 11,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+    });
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(.{ .merged_group_statuses = &.{} }, .{
+        .transition_id = 12,
+        .table_id = 10,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:m",
+    }));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(.{ .merged_group_statuses = &.{old_left} }, .{
+        .transition_id = 13,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+        .allow_doc_identity_reassignment = true,
+    }));
+
+    statuses = [_]metadata_reconciler.MergedGroupStatus{
+        .{
+            .group_id = 101,
+            .doc_identity = .{
+                .namespace_table_id = 10,
+                .namespace_shard_id = 101,
+                .namespace_range_id = 1001,
+                .allocated_ordinals = 1,
+            },
+        },
+        .{
+            .group_id = 102,
+            .doc_identity = .{
+                .namespace_table_id = 10,
+                .namespace_shard_id = 102,
+                .namespace_range_id = 1002,
+                .allocated_ordinals = 1,
+            },
+        },
+    };
+    current = .{ .merged_group_statuses = &statuses };
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(current, .{
+        .transition_id = 14,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+    }));
+    try validateMergeIntentDocIdentity(current, .{
+        .transition_id = 15,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+        .allow_doc_identity_reassignment = true,
+    });
+
+    statuses[1].doc_identity.rebuild_required = true;
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateMergeIntentDocIdentity(current, .{
+        .transition_id = 16,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+        .allow_doc_identity_reassignment = true,
+    }));
 }
 
 fn findPlacementIntent(

@@ -27,6 +27,8 @@ const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
+const doc_identity = @import("doc_identity.zig");
+const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const backfill_state_mod = @import("backfill_state.zig");
@@ -72,9 +74,7 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test o
 else
     @import("../../template_remote.zig");
 const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
-    struct {
-        pub const RemoteContentConfig = opaque {};
-    }
+    @import("scraping_stub.zig")
 else
     @import("antfly_scraping");
 const graph_mod = @import("../../graph/graph.zig");
@@ -141,6 +141,8 @@ pub const OpenOptions = struct {
     change_journal_storage: ?lsm_backend_mod.Storage = null,
     index_backends: db_config.IndexBackendOptions = .{},
     index_open_parallelism: ?usize = null,
+    identity_namespace: ?doc_identity.Namespace = null,
+    prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -231,6 +233,70 @@ const AsyncContext = struct {
         var maintenance_it = self.dense_maintenance_last_ns.iterator();
         while (maintenance_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
         self.dense_maintenance_last_ns.deinit(alloc);
+    }
+};
+
+const DocSetPlanningRuntimeStats = struct {
+    resolved_set_count: AtomicU64 = AtomicU64.init(0),
+    all_set_count: AtomicU64 = AtomicU64.init(0),
+    none_set_count: AtomicU64 = AtomicU64.init(0),
+    doc_key_list_count: AtomicU64 = AtomicU64.init(0),
+    ordinal_list_count: AtomicU64 = AtomicU64.init(0),
+    ordinal_bitmap_count: AtomicU64 = AtomicU64.init(0),
+    doc_key_list_docs: AtomicU64 = AtomicU64.init(0),
+    ordinal_list_docs: AtomicU64 = AtomicU64.init(0),
+    ordinal_bitmap_docs: AtomicU64 = AtomicU64.init(0),
+    missing_ordinal_coverage_count: AtomicU64 = AtomicU64.init(0),
+    bitmap_promotion_count: AtomicU64 = AtomicU64.init(0),
+    unsupported_filter_shape_count: AtomicU64 = AtomicU64.init(0),
+    stale_identity_generation_rejection_count: AtomicU64 = AtomicU64.init(0),
+
+    fn recordResolvedSet(self: *@This(), set: *const doc_set.ResolvedDocSet, missing_ordinal_coverage: bool) void {
+        _ = self.resolved_set_count.fetchAdd(1, .monotonic);
+        switch (set.*) {
+            .all => _ = self.all_set_count.fetchAdd(1, .monotonic),
+            .none => _ = self.none_set_count.fetchAdd(1, .monotonic),
+            .doc_keys => |keys| {
+                _ = self.doc_key_list_count.fetchAdd(1, .monotonic);
+                _ = self.doc_key_list_docs.fetchAdd(@intCast(keys.len), .monotonic);
+            },
+            .ordinals => |ordinals| {
+                _ = self.ordinal_list_count.fetchAdd(1, .monotonic);
+                _ = self.ordinal_list_docs.fetchAdd(@intCast(ordinals.len), .monotonic);
+            },
+            .ordinal_bitmap => |*bitmap| {
+                _ = self.ordinal_bitmap_count.fetchAdd(1, .monotonic);
+                _ = self.ordinal_bitmap_docs.fetchAdd(@intCast(bitmap.cardinality()), .monotonic);
+                _ = self.bitmap_promotion_count.fetchAdd(1, .monotonic);
+            },
+        }
+        if (missing_ordinal_coverage) _ = self.missing_ordinal_coverage_count.fetchAdd(1, .monotonic);
+    }
+
+    fn recordUnsupportedFilterShape(self: *@This()) void {
+        _ = self.unsupported_filter_shape_count.fetchAdd(1, .monotonic);
+    }
+
+    fn recordStaleIdentityGenerationRejection(self: *@This()) void {
+        _ = self.stale_identity_generation_rejection_count.fetchAdd(1, .monotonic);
+    }
+
+    fn snapshot(self: *@This()) types.DocSetPlanningStats {
+        return .{
+            .resolved_set_count = self.resolved_set_count.load(.monotonic),
+            .all_set_count = self.all_set_count.load(.monotonic),
+            .none_set_count = self.none_set_count.load(.monotonic),
+            .doc_key_list_count = self.doc_key_list_count.load(.monotonic),
+            .ordinal_list_count = self.ordinal_list_count.load(.monotonic),
+            .ordinal_bitmap_count = self.ordinal_bitmap_count.load(.monotonic),
+            .doc_key_list_docs = self.doc_key_list_docs.load(.monotonic),
+            .ordinal_list_docs = self.ordinal_list_docs.load(.monotonic),
+            .ordinal_bitmap_docs = self.ordinal_bitmap_docs.load(.monotonic),
+            .missing_ordinal_coverage_count = self.missing_ordinal_coverage_count.load(.monotonic),
+            .bitmap_promotion_count = self.bitmap_promotion_count.load(.monotonic),
+            .unsupported_filter_shape_count = self.unsupported_filter_shape_count.load(.monotonic),
+            .stale_identity_generation_rejection_count = self.stale_identity_generation_rejection_count.load(.monotonic),
+        };
     }
 };
 
@@ -549,6 +615,8 @@ const EnrichmentAppendContext = struct {
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
             .log_mutex = self.log_mutex,
+            .identity_namespace = doc_identity.default_namespace,
+            .artifact_cleanup_maybe = null,
             .executor = self.executor,
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
@@ -568,6 +636,8 @@ const BatchExecutionContext = struct {
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     log_mutex: *std.atomic.Mutex,
+    identity_namespace: doc_identity.Namespace,
+    artifact_cleanup_maybe: ?*std.atomic.Value(bool) = null,
     executor: *derived_executor_mod.Executor,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     async_context: ?*AsyncContext = null,
@@ -643,6 +713,9 @@ pub const BatchProfile = struct {
     extract_writes_ns: u64 = 0,
     delete_artifacts_ns: u64 = 0,
     precompute_generated_ns: u64 = 0,
+    identity_capacity_check_ns: u64 = 0,
+    identity_metadata_ns: u64 = 0,
+    identity_metadata_writes: u64 = 0,
     store_write_ns: u64 = 0,
     split_delta_ns: u64 = 0,
     build_derived_ns: u64 = 0,
@@ -772,6 +845,9 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.extract_writes_ns += delta.extract_writes_ns;
     total.delete_artifacts_ns += delta.delete_artifacts_ns;
     total.precompute_generated_ns += delta.precompute_generated_ns;
+    total.identity_capacity_check_ns += delta.identity_capacity_check_ns;
+    total.identity_metadata_ns += delta.identity_metadata_ns;
+    total.identity_metadata_writes += delta.identity_metadata_writes;
     total.store_write_ns += delta.store_write_ns;
     total.split_delta_ns += delta.split_delta_ns;
     total.build_derived_ns += delta.build_derived_ns;
@@ -1074,7 +1150,7 @@ fn logReplayCatchUpProfile(index_ref: index_manager_mod.ManagedIndexRef, applied
 
 fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
     std.log.info(
-        "antfly_bench_batch writes={d} deletes={d} graph_writes={d} graph_deletes={d} transforms={d} sync={s} total_ms={d} resolve_ms={d} merge_ms={d} predicates_ms={d} range_ms={d} extract_ms={d} delete_artifacts_ms={d} precompute_ms={d} store_ms={d} split_delta_ms={d} build_derived_ms={d} shadow_ms={d} collect_sync_ms={d} append_replay_journal_ms={d} backlog_pressure_ms={d} executor_notify_ms={d} sync_wait_ms={d} wait_sync_ms={d} notify_enrichment_ms={d}",
+        "antfly_bench_batch writes={d} deletes={d} graph_writes={d} graph_deletes={d} transforms={d} sync={s} total_ms={d} resolve_ms={d} merge_ms={d} predicates_ms={d} range_ms={d} extract_ms={d} delete_artifacts_ms={d} precompute_ms={d} identity_capacity_ms={d} identity_metadata_ms={d} identity_metadata_writes={d} store_ms={d} split_delta_ms={d} build_derived_ms={d} shadow_ms={d} collect_sync_ms={d} append_replay_journal_ms={d} backlog_pressure_ms={d} executor_notify_ms={d} sync_wait_ms={d} wait_sync_ms={d} notify_enrichment_ms={d}",
         .{
             req.writes.len,
             req.deletes.len,
@@ -1090,6 +1166,9 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             nsToMs(profile.extract_writes_ns),
             nsToMs(profile.delete_artifacts_ns),
             nsToMs(profile.precompute_generated_ns),
+            nsToMs(profile.identity_capacity_check_ns),
+            nsToMs(profile.identity_metadata_ns),
+            profile.identity_metadata_writes,
             nsToMs(profile.store_write_ns),
             nsToMs(profile.split_delta_ns),
             nsToMs(profile.build_derived_ns),
@@ -2062,11 +2141,13 @@ pub const DB = struct {
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
+    transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
+    doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -2090,6 +2171,8 @@ pub const DB = struct {
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
             .log_mutex = resources.log_mutex,
+            .identity_namespace = resources.identity_namespace,
+            .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
             .executor = self.executor,
             .io = self.backend_runtime.io(),
             .enrichment_runtime = self.enrichment_runtime,
@@ -2197,6 +2280,9 @@ pub const DB = struct {
                 opts.change_journal_storage,
                 resolved_config.index_backends,
                 opened_primary,
+                opts.identity_namespace,
+                false,
+                if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
             );
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
@@ -2230,6 +2316,7 @@ pub const DB = struct {
                 .enrichment_runtime = null,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
+                .transaction_recovery_identity_context = null,
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
                 .shadow = null,
@@ -2436,6 +2523,7 @@ pub const DB = struct {
                 .index_manager = batch_resources.index_manager,
                 .apply_mutex = batch_resources.apply_mutex,
                 .log_mutex = batch_resources.log_mutex,
+                .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
             },
@@ -2458,15 +2546,26 @@ pub const DB = struct {
     }
 
     fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+        const identity_ctx = try self.runtime_alloc.create(db_core.TransactionRecoveryIdentityContext);
+        errdefer self.runtime_alloc.destroy(identity_ctx);
+        identity_ctx.* = .{
+            .store = self.core.store,
+            .identity_namespace = self.core.identity_namespace,
+            .alloc = self.runtime_alloc,
+        };
+        var effective_cfg = cfg;
+        effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
+
         const runtime = try self.runtime_alloc.create(transaction_runtime_mod.Runtime);
         errdefer self.runtime_alloc.destroy(runtime);
         runtime.* = try transaction_runtime_mod.Runtime.init(
             self.runtime_alloc,
             self.core.batchExecutionResources().store,
             self.backend_runtime,
-            cfg,
+            effective_cfg,
         );
         errdefer runtime.deinit();
+        self.transaction_recovery_identity_context = identity_ctx;
         self.transaction_runtime = runtime;
     }
 
@@ -2523,6 +2622,7 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
+        if (self.transaction_recovery_identity_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (self.ttl_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -2973,6 +3073,16 @@ pub const DB = struct {
         @memset(overwritten_flags, false);
         var overwrite_probe_entries = std.ArrayListUnmanaged(OverwriteProbeEntry).empty;
         defer overwrite_probe_entries.deinit(self.alloc);
+        var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_upsert_keys.deinit(self.alloc);
+        var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (identity_writes.items) |item| {
+                self.alloc.free(@constCast(item.key));
+                self.alloc.free(@constCast(item.value));
+            }
+            identity_writes.deinit(self.alloc);
+        }
 
         const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else currentTimeNs();
 
@@ -3042,6 +3152,7 @@ pub const DB = struct {
                     .key = store_key,
                     .value = cleaned,
                 });
+                try identity_upsert_keys.append(self.alloc, write.key);
                 if (shouldWriteTimestamp(write.key)) {
                     const write_timestamp_ns = try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value);
                     const timestamp_key = try makeTimestampKey(self.alloc, write.key);
@@ -3053,6 +3164,9 @@ pub const DB = struct {
                 }
             }
         }
+        const identity_capacity_start_ns = monotonicTimeNs();
+        try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
         if (overwrite_probe_entries.items.len > 0) {
             std.sort.pdq(OverwriteProbeEntry, overwrite_probe_entries.items, {}, overwriteProbeLessThan);
@@ -3162,12 +3276,33 @@ pub const DB = struct {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
         }
+        if (explicit_embedding_artifact_writes.items.len > 0 or
+            explicit_graph_artifact_writes.items.len > 0 or
+            precomputed_generated.artifact_writes.len > 0)
+        {
+            try self.core.appendArtifactPresenceMarker(&store_writes);
+        }
 
         var sync_targets: ManagedSyncTargets = .{};
         defer sync_targets.deinit(self.alloc);
         var materialized_derived_batch: ?derived_types.DerivedBatch = null;
         defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
         const sequence = self.core.reserveDerivedAppendSequence();
+        const identity_metadata_start_ns = monotonicTimeNs();
+        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+            self.alloc,
+            self.core.store,
+            self.core.identity_namespace,
+            sequence,
+            &identity_writes,
+            identity_upsert_keys.items,
+            effective_req.deletes,
+        );
+        if (profile) |active_profile| {
+            recordProfileNs(profile, &active_profile.identity_metadata_ns, identity_metadata_start_ns);
+            active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
+        }
+        try store_writes.appendSlice(self.alloc, identity_writes.items);
         const build_derived_start_ns = monotonicTimeNs();
         const replay_payload = if (use_thin_replay_fast_path)
             try encodeThinReplayRecordPayload(
@@ -3269,6 +3404,30 @@ pub const DB = struct {
             const notify_enrichment_start_ns = monotonicTimeNs();
             runtime.notifySequence(sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
+        }
+    }
+
+    fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {
+        if (doc_ids.len == 0) return;
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+
+        const raw_next = txn.get(internal_keys.identity_next_ordinal_key[0..]) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        if (raw_next.len != @sizeOf(doc_identity.DocOrdinal)) return error.InvalidDocIdentity;
+        const next_ordinal = std.mem.readInt(doc_identity.DocOrdinal, raw_next[0..4], .big);
+        if (next_ordinal != 0 and next_ordinal < std.math.maxInt(doc_identity.DocOrdinal)) return;
+
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        for (doc_ids) |doc_id| {
+            if (seen.contains(doc_id)) continue;
+            try seen.put(self.alloc, doc_id, {});
+            if (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, doc_id) != null) continue;
+            return error.DocOrdinalExhausted;
         }
     }
 
@@ -4029,6 +4188,8 @@ pub const DB = struct {
 
         try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
         try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
+        try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
+        try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         if (restore_identity) |identity| try markRestorePrimaryRestored(
             alloc,
@@ -4038,6 +4199,12 @@ pub const DB = struct {
             identity.snapshot_path,
             identity.group_id,
         );
+    }
+
+    fn validateRestoredIdentityNamespace(store: *docstore_mod.DocStore, opts: OpenOptions) !void {
+        if (opts.identity_namespace == null or opts.prefer_existing_identity_namespace) return;
+        const stored = (try doc_identity.loadNamespaceFromStore(store)) orelse return;
+        if (!stored.eql(opts.identity_namespace.?)) return error.IdentityNamespaceMismatch;
     }
 
     pub fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
@@ -4062,7 +4229,7 @@ pub const DB = struct {
         try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity);
     }
 
-    pub fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
+    fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
         try ensureDirPath(path);
         const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
         defer alloc.free(repair_marker_path);
@@ -4122,7 +4289,7 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
-    pub fn markRestorePrimaryRestored(
+    fn markRestorePrimaryRestored(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
@@ -4150,7 +4317,7 @@ pub const DB = struct {
         return state.primary_restored and !state.runtime_repair_complete;
     }
 
-    pub fn markRestoreRuntimeRepairNeeded(alloc: Allocator, path: []const u8) !void {
+    fn markRestoreRuntimeRepairNeeded(alloc: Allocator, path: []const u8) !void {
         const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
         defer alloc.free(repair_marker_path);
         const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
@@ -4171,7 +4338,7 @@ pub const DB = struct {
         try deleteFileIfExists(io, import_marker_path);
     }
 
-    pub fn markRestoreRuntimeRepairComplete(alloc: Allocator, path: []const u8) !void {
+    fn markRestoreRuntimeRepairComplete(alloc: Allocator, path: []const u8) !void {
         var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return error.InvalidRestoreState;
         defer state.deinit(alloc);
         const new_phase = try alloc.dupe(u8, "complete");
@@ -4259,7 +4426,7 @@ pub const DB = struct {
         return error.InvalidRestoreState;
     }
 
-    pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
+    fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
         var repaired = false;
         while (try self.restoreRuntimeRepairNeeded()) {
             _ = try self.repairRestoreRuntimeStateStepIfNeeded(alloc);
@@ -4268,7 +4435,7 @@ pub const DB = struct {
         return repaired;
     }
 
-    pub fn rebuildGraphDerivedState(self: *DB) !usize {
+    fn rebuildGraphDerivedState(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.index_manager.rebuildGraphSplitDestination(
@@ -4311,8 +4478,16 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_upsert_keys.deinit(self.alloc);
+        for (intents) |intent| {
+            if (intent.value == null or isMetadataKey(intent.key)) continue;
+            try identity_upsert_keys.append(self.alloc, intent.key);
+        }
+
         lockApply(self);
         defer self.core.unlockApply();
+        try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         try self.core.writeIntents(txn_id, intents, predicates);
     }
 
@@ -4357,7 +4532,52 @@ pub const DB = struct {
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
         lockApply(self);
         defer self.core.unlockApply();
-        try self.core.resolveTransactionIntents(txn_id, status, commit_version);
+
+        var raw_identity_upserts = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_identity_upserts.items) |key| self.alloc.free(@constCast(key));
+            raw_identity_upserts.deinit(self.alloc);
+        }
+        var raw_identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_identity_deletes.items) |key| self.alloc.free(@constCast(key));
+            raw_identity_deletes.deinit(self.alloc);
+        }
+        var identity_upserts = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_upserts.deinit(self.alloc);
+        var identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_deletes.deinit(self.alloc);
+        var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (identity_writes.items) |item| {
+                self.alloc.free(@constCast(item.key));
+                self.alloc.free(@constCast(item.value));
+            }
+            identity_writes.deinit(self.alloc);
+        }
+
+        if (status == .committed) {
+            try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
+            for (raw_identity_upserts.items) |key| {
+                if (!isMetadataKey(key)) try identity_upserts.append(self.alloc, key);
+            }
+            for (raw_identity_deletes.items) |key| {
+                if (!isMetadataKey(key)) try identity_deletes.append(self.alloc, key);
+            }
+            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+                self.alloc,
+                self.core.store,
+                self.core.identity_namespace,
+                self.core.nextDerivedSequence(),
+                &identity_writes,
+                identity_upserts.items,
+                identity_deletes.items,
+            );
+        }
+
+        try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+            .writes = identity_writes.items,
+        });
     }
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
@@ -4609,6 +4829,31 @@ pub const DB = struct {
         });
     }
 
+    fn graphInputSetHitsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        hit_ids: []const []const u8,
+        generation: ?u64,
+    ) ![]types.SearchHit {
+        const hits = try alloc.alloc(types.SearchHit, hit_ids.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+            if (hits.len > 0) alloc.free(hits);
+        }
+        for (hit_ids, 0..) |hit_id, j| {
+            hits[j] = .{
+                .id = try alloc.dupe(u8, hit_id),
+                .doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, hit_id, generation),
+                .score = null,
+                .stored_data = null,
+                .chunk_hits = &.{},
+            };
+            initialized += 1;
+        }
+        return hits;
+    }
+
     pub fn executeNamedGraphQueries(
         self: *DB,
         alloc: Allocator,
@@ -4618,39 +4863,37 @@ pub const DB = struct {
     ) ![]types.GraphSearchResult {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
+        if (req.identity_read_generation == null) {
+            for (input_sets) |input_set| {
+                if (input_set.hit_ids.len > 0) return error.UnsupportedQueryRequest;
+            }
+        }
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
 
         var named_sets = try alloc.alloc(NamedResultSet, input_sets.len);
         defer alloc.free(named_sets);
         var temp_hits = try alloc.alloc([]types.SearchHit, input_sets.len);
         defer alloc.free(temp_hits);
-        var initialized_sets: usize = 0;
-        errdefer {
-            for (temp_hits[0..initialized_sets]) |hits| {
-                for (hits) |*hit| hit.deinit(alloc);
-                if (hits.len > 0) alloc.free(hits);
+        var resolved_sets = try alloc.alloc(?doc_set.ResolvedDocSet, input_sets.len);
+        defer {
+            for (resolved_sets) |*maybe_set| {
+                if (maybe_set.*) |*set| set.deinit(alloc);
             }
+            if (resolved_sets.len > 0) alloc.free(resolved_sets);
         }
+        @memset(resolved_sets, null);
+        var initialized_sets: usize = 0;
 
         for (input_sets, 0..) |input_set, i| {
-            temp_hits[i] = try alloc.alloc(types.SearchHit, input_set.hit_ids.len);
-            var initialized: usize = 0;
-            errdefer {
-                for (temp_hits[i][0..initialized]) |*hit| hit.deinit(alloc);
-                if (temp_hits[i].len > 0) alloc.free(temp_hits[i]);
-            }
-            for (input_set.hit_ids, 0..) |hit_id, j| {
-                temp_hits[i][j] = .{
-                    .id = try alloc.dupe(u8, hit_id),
-                    .score = null,
-                    .stored_data = null,
-                    .chunk_hits = &.{},
-                };
-                initialized += 1;
-            }
+            resolved_sets[i] = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, input_set.hit_ids, snapshot_req.identity_read_generation);
+            temp_hits[i] = try self.graphInputSetHitsAlloc(alloc, input_set.hit_ids, snapshot_req.identity_read_generation);
+            const resolved_doc_set = if (resolved_sets[i]) |*set| set else null;
             named_sets[i] = .{
                 .name = input_set.name,
                 .hits = temp_hits[i],
                 .total_hits = if (input_set.total_hits > 0) input_set.total_hits else @intCast(input_set.hit_ids.len),
+                .resolved_doc_set = resolved_doc_set,
+                .resolved_doc_set_complete = input_set.total_hits == 0 or @as(u64, input_set.total_hits) <= input_set.hit_ids.len,
             };
             initialized_sets += 1;
         }
@@ -4661,7 +4904,7 @@ pub const DB = struct {
             }
         }
 
-        return try self.executeGraphQueriesWithSets(alloc, req, graph_queries, named_sets);
+        return try self.executeGraphQueriesWithSets(alloc, snapshot_req, graph_queries, named_sets);
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
@@ -5003,6 +5246,87 @@ pub const DB = struct {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.core.listEnrichments(alloc);
+    }
+
+    fn resolveDocSetForIdsAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.resolveDocSetForIdsNoLockAlloc(alloc, doc_ids);
+    }
+
+    fn resolveDocSetForIdsNoLockAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, null);
+    }
+
+    fn resolveDocSetForIdsNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const resolved = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(alloc, &txn, doc_ids, generation);
+        self.recordResolvedDocSet(&resolved, doc_ids.len > 0 and switch (resolved) {
+            .doc_keys => true,
+            else => false,
+        });
+        return resolved;
+    }
+
+    fn resolvedDocFilterForIdsAlloc(
+        self: *DB,
+        include_positive: bool,
+        include_doc_ids: []const []const u8,
+        exclude_doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocFilter {
+        var filter = doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(self.alloc);
+        if (include_positive) {
+            filter.include = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(self.alloc, include_doc_ids, generation);
+        }
+        if (exclude_doc_ids.len > 0) {
+            filter.exclude = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(self.alloc, exclude_doc_ids, generation);
+        }
+        return filter;
+    }
+
+    fn docIdsForResolvedDocSetAlloc(self: *DB, alloc: Allocator, set: *const doc_set.ResolvedDocSet) !?[]const []const u8 {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.docIdsForResolvedDocSetNoLockAlloc(alloc, set);
+    }
+
+    fn docIdsForResolvedDocSetNoLockAlloc(self: *DB, alloc: Allocator, set: *const doc_set.ResolvedDocSet) !?[]const []const u8 {
+        return try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, null);
+    }
+
+    fn docIdsForResolvedDocSetNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !?[]const []const u8 {
+        switch (set.*) {
+            .all => return null,
+            .none => return try alloc.alloc([]const u8, 0),
+            .doc_keys => |keys| return try dupeConstDocIdsAlloc(alloc, keys),
+            .ordinals => |ordinals| {
+                var txn = try self.core.store.beginProbeTxn();
+                defer txn.abort();
+                return try docIdsForOrdinalsAtGenerationTxnAlloc(alloc, &txn, ordinals, generation);
+            },
+            .ordinal_bitmap => |*bitmap| {
+                var txn = try self.core.store.beginProbeTxn();
+                defer txn.abort();
+                var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+                defer ordinals.deinit(alloc);
+                var iter = bitmap.iterator();
+                while (iter.next()) |ordinal| try ordinals.append(alloc, ordinal);
+                return try docIdsForOrdinalsAtGenerationTxnAlloc(alloc, &txn, ordinals.items, generation);
+            },
+        }
     }
 
     pub fn extractEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ExtractEnrichmentsResult {
@@ -5476,6 +5800,7 @@ pub const DB = struct {
         for (writes.items) |write| {
             alloc.free(write.index_name);
             alloc.free(write.doc_key);
+            if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
             if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
             if (write.vector.len > 0) alloc.free(write.vector);
         }
@@ -5820,7 +6145,7 @@ pub const DB = struct {
         return repaired;
     }
 
-    pub fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
+    fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
         return try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(alloc, null, null);
     }
 
@@ -6068,7 +6393,7 @@ pub const DB = struct {
         return state.rebuilt;
     }
 
-    pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(
+    fn rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(
         self: *DB,
         alloc: Allocator,
         progress_ctx: ?*anyopaque,
@@ -6827,6 +7152,7 @@ pub const DB = struct {
         if (!self.core.tryLockApplyShared()) {
             return .{
                 .async_indexing = self.snapshotAsyncIndexingStats(),
+                .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
                 .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
@@ -6848,11 +7174,97 @@ pub const DB = struct {
         return try self.statsLocked(alloc);
     }
 
+    pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
+        if (self.open_mode == .status_only) return error.UnsupportedOperation;
+        lockApply(self);
+        defer self.core.unlockApply();
+        try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
+        self.core.identity_namespace = namespace;
+        if (self.transaction_recovery_identity_context) |ctx| ctx.identity_namespace = namespace;
+    }
+
+    fn dbDocIdentityStats(raw: doc_identity.Stats, namespace: doc_identity.Namespace) types.DocIdentityStats {
+        const max_doc_ordinal = std.math.maxInt(doc_identity.DocOrdinal);
+        const remaining = if (raw.next_ordinal >= max_doc_ordinal)
+            0
+        else
+            @as(u64, max_doc_ordinal) - raw.next_ordinal;
+        return .{
+            .namespace_table_id = namespace.table_id,
+            .namespace_shard_id = namespace.shard_id,
+            .namespace_range_id = namespace.range_id,
+            .next_ordinal = raw.next_ordinal,
+            .allocated_ordinals = raw.allocated_ordinals,
+            .ordinal_capacity_remaining = remaining,
+            .ordinal_capacity_exhausted = raw.next_ordinal >= max_doc_ordinal,
+            .rebuild_required = raw.next_ordinal >= max_doc_ordinal,
+            .state_rows = raw.state_rows,
+            .live_ordinals = raw.live_ordinals,
+            .tombstone_ordinals = raw.tombstone_ordinals,
+            .min_created_generation = raw.min_created_generation,
+            .max_created_generation = raw.max_created_generation,
+            .min_deleted_generation = raw.min_deleted_generation,
+            .max_deleted_generation = raw.max_deleted_generation,
+            .complete = raw.complete,
+        };
+    }
+
+    fn recordResolvedDocSet(self: *DB, set: *const doc_set.ResolvedDocSet, missing_ordinal_coverage: bool) void {
+        self.doc_set_planning_stats.recordResolvedSet(set, missing_ordinal_coverage);
+    }
+
+    fn recordUnsupportedDocSetFilterShape(self: *DB) void {
+        self.doc_set_planning_stats.recordUnsupportedFilterShape();
+    }
+
+    pub fn currentIdentityReadGenerationForRequest(self: *DB, requested: ?u64) !u64 {
+        const current_generation = self.core.nextDerivedSequence();
+        if (requested) |generation| {
+            if (generation != current_generation) {
+                self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
+                return error.UnsupportedQueryRequest;
+            }
+            return generation;
+        }
+        return current_generation;
+    }
+
+    fn snapshotDocSetPlanningStats(self: *DB) types.DocSetPlanningStats {
+        return self.doc_set_planning_stats.snapshot();
+    }
+
+    const DocIdentityCoverage = struct {
+        scanned_primary_docs: u64 = 0,
+        primary_docs_missing_ordinals: u64 = 0,
+        primary_docs_missing_identity_state: u64 = 0,
+        primary_docs_with_tombstone_ordinals: u64 = 0,
+    };
+
+    fn finalizeDocIdentityRebuildRequired(identity_stats: *types.DocIdentityStats) void {
+        identity_stats.rebuild_required = identity_stats.rebuild_required or
+            identity_stats.ordinal_capacity_exhausted or
+            identity_stats.primary_docs_missing_ordinals != 0 or
+            identity_stats.primary_docs_missing_identity_state != 0 or
+            identity_stats.primary_docs_with_tombstone_ordinals != 0;
+    }
+
+    fn diagnosticDocIdentityStats(self: *DB, byte_range: types.ByteRange) !types.DocIdentityStats {
+        var identity_stats = dbDocIdentityStats(try doc_identity.fullStatsFromStore(self.core.store), self.core.identity_namespace);
+        const coverage = try self.scanPrimaryDocIdentityCoverage(byte_range);
+        identity_stats.scanned_primary_docs = coverage.scanned_primary_docs;
+        identity_stats.primary_docs_missing_ordinals = coverage.primary_docs_missing_ordinals;
+        identity_stats.primary_docs_missing_identity_state = coverage.primary_docs_missing_identity_state;
+        identity_stats.primary_docs_with_tombstone_ordinals = coverage.primary_docs_with_tombstone_ordinals;
+        finalizeDocIdentityRebuildRequired(&identity_stats);
+        return identity_stats;
+    }
+
     fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
         const target_sequence = self.core.nextDerivedSequence();
         const async_indexing = self.snapshotAsyncIndexingStats();
+        const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -6941,6 +7353,8 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .doc_identity = identity_stats,
+            .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
@@ -6976,6 +7390,7 @@ pub const DB = struct {
         }
         const visible_doc_count = indexed_doc_count orelse try self.scanPrimaryDocCount(byte_range);
         const async_indexing = self.async_context.stats.snapshot();
+        const identity_stats = try self.diagnosticDocIdentityStats(byte_range);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -7094,6 +7509,8 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .doc_identity = identity_stats,
+            .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
@@ -7132,6 +7549,7 @@ pub const DB = struct {
         defer types.freeIndexConfigs(alloc, configs);
         const target_sequence = self.core.nextDerivedSequence();
         var visible_doc_count: u64 = 0;
+        const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -7175,6 +7593,8 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .doc_identity = identity_stats,
+            .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .async_indexing = self.async_context.stats.snapshot(),
         };
     }
@@ -7471,6 +7891,59 @@ pub const DB = struct {
         return doc_count;
     }
 
+    fn scanPrimaryDocIdentityCoverage(self: *DB, byte_range: types.ByteRange) !DocIdentityCoverage {
+        const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
+        defer self.core.alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
+        defer if (upper) |buf| self.core.alloc.free(buf);
+
+        var doc_ids = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (doc_ids.items) |doc_id| self.core.alloc.free(doc_id);
+            doc_ids.deinit(self.core.alloc);
+        }
+
+        var coverage = DocIdentityCoverage{};
+        const ScanState = struct {
+            alloc: Allocator,
+            doc_ids: *std.ArrayListUnmanaged([]u8),
+            coverage: *DocIdentityCoverage,
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                _ = value;
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
+                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                errdefer state.alloc.free(raw_key);
+                try state.doc_ids.append(state.alloc, raw_key);
+                state.coverage.scanned_primary_docs += 1;
+                return .@"continue";
+            }
+        };
+
+        var scan_state = ScanState{
+            .alloc = self.core.alloc,
+            .doc_ids = &doc_ids,
+            .coverage = &coverage,
+        };
+        try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (doc_ids.items) |doc_id| {
+            const ordinal = (try doc_identity.lookupOrdinalTxn(self.core.alloc, &txn, doc_id)) orelse {
+                coverage.primary_docs_missing_ordinals += 1;
+                continue;
+            };
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                coverage.primary_docs_missing_identity_state += 1;
+                continue;
+            };
+            if (!state.isLive()) coverage.primary_docs_with_tombstone_ordinals += 1;
+        }
+        return coverage;
+    }
+
     pub fn primaryDocCount(self: *DB, alloc: Allocator) !u64 {
         _ = alloc;
         lockApplyShared(self);
@@ -7563,15 +8036,32 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
         if (self.canUsePublishedDenseSearch(req)) {
-            return try self.searchLockedWithExecutionContext(alloc, req, exec_ctx);
+            return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), exec_ctx);
         }
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return try self.searchLockedWithExecutionContext(alloc, req, exec_ctx);
+        return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), exec_ctx);
     }
 
     fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        return try self.searchLockedWithExecutionContext(alloc, req, .{});
+        return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{});
+    }
+
+    pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
+        var snapshot_req = req;
+        snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
+        try self.validateResolvedDocFilterWireContext(snapshot_req);
+        return snapshot_req;
+    }
+
+    fn validateResolvedDocFilterWireContext(self: *DB, req: types.SearchRequest) !void {
+        const ctx = req.resolved_doc_filter_wire_context orelse return;
+        if (req.resolved_doc_filter == null) return error.InvalidQueryRequest;
+        if (!ctx.namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+        if (req.identity_read_generation == null or req.identity_read_generation.? != ctx.identity_read_generation) {
+            self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
+            return error.UnsupportedQueryRequest;
+        }
     }
 
     fn searchLockedWithExecutionContext(
@@ -7630,7 +8120,7 @@ pub const DB = struct {
             return base;
         }
 
-        base.graph_results = try self.executeGraphQueries(alloc, req, req.graph_queries, base.hits);
+        base.graph_results = try self.executeGraphQueries(alloc, req, req.graph_queries, base.hits, base.total_hits);
         try self.applyGraphExpandStrategy(alloc, &base, req.expand_strategy);
         try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
@@ -7651,6 +8141,7 @@ pub const DB = struct {
             .search_sparse = searchSparseComposedCallback,
             .clone_named_set = cloneNamedSetCallback,
             .fuse_named_sets = fuseNamedSetsCallback,
+            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
         });
     }
@@ -7663,16 +8154,25 @@ pub const DB = struct {
     }
 
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
-        try self.proveTextQueryAccessPaths(req.index_name, text_query);
-        const metric_name = self.textQueryMetricIndexName(req);
+        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
+        var algebraic_filter = if (needs_algebraic_doc_filter)
+            try self.searchRequestWithAlgebraicDocFilterAlloc(req)
+        else
+            AlgebraicDocFilterRequest{ .req = req };
+        defer algebraic_filter.deinit();
+        try self.proveTextQueryAccessPaths(algebraic_filter.req.index_name, text_query);
+        const metric_name = self.textQueryMetricIndexName(algebraic_filter.req);
         const start_ns = platform_time.monotonicNs();
         defer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
-        return try db_query_search.searchTextQuery(alloc, req, text_query, .{
+        return try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
     }
@@ -7707,7 +8207,7 @@ pub const DB = struct {
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return try db_query_search.collectSearchRequestTextStats(alloc, req, .{
+        return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
         });
@@ -7745,7 +8245,7 @@ pub const DB = struct {
     ) !planning_stats_mod.PlanningStatsSummary {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return try self.collectPlanningStatsLocked(alloc, req, max_work, exec_ctx);
+        return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
     }
 
     fn collectPlanningStatsLocked(
@@ -7864,6 +8364,8 @@ pub const DB = struct {
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .load_many_parent_stored = loadParentStoredForSearchManyCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
@@ -7958,6 +8460,51 @@ pub const DB = struct {
         return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
     }
 
+    fn resolveDocSetDocIdsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation);
+    }
+
+    fn resolveDocIdsToDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
+    }
+
+    fn liveFilterDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+    }
+
+    fn denseVectorIdsForOrdinalsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) anyerror![]u64 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(
+            alloc,
+            self.core.store,
+            index_name,
+            ordinals,
+        );
+    }
+
     fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.denseQueryMetricIndexName(req);
@@ -7972,6 +8519,11 @@ pub const DB = struct {
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -7981,10 +8533,17 @@ pub const DB = struct {
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (!self.canUsePublishedDenseSearch(req)) {
+        if (self.canUsePublishedDenseSearch(req)) {
+            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
+        }
+        {
             lockApplyShared(self);
             defer self.core.unlockApplyShared();
+            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
         }
+    }
+
+    fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
@@ -7994,6 +8553,11 @@ pub const DB = struct {
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8036,6 +8600,11 @@ pub const DB = struct {
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .sparse_index = sparseIndexCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
@@ -8061,7 +8630,11 @@ pub const DB = struct {
     }
 
     fn hasNativeDocIdConstraints(req: types.SearchRequest) bool {
-        return req.filter_doc_ids_positive or req.filter_doc_ids.len > 0 or req.exclude_doc_ids.len > 0;
+        return req.filter_doc_ids_positive or
+            req.filter_doc_ids.len > 0 or
+            req.exclude_doc_ids.len > 0 or
+            req.resolved_doc_filter != null or
+            req.doc_filter_bindings.len > 0;
     }
 
     const AlgebraicDocFilterRequest = struct {
@@ -8069,11 +8642,18 @@ pub const DB = struct {
         index: ?*@import("algebraic/index.zig").Index = null,
         filter_doc_ids: [][]u8 = &.{},
         exclude_doc_ids: [][]u8 = &.{},
+        resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
+        resolved_doc_filter_alloc: ?Allocator = null,
 
         fn deinit(self: *@This()) void {
             if (self.index) |index| {
                 index.freeDocIds(self.filter_doc_ids);
                 index.freeDocIds(self.exclude_doc_ids);
+            }
+            if (self.resolved_doc_filter) |filter| {
+                const alloc = self.resolved_doc_filter_alloc.?;
+                filter.deinit(alloc);
+                alloc.destroy(filter);
             }
             self.* = undefined;
         }
@@ -8082,15 +8662,18 @@ pub const DB = struct {
     fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
         if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return .{ .req = req };
         const entry = self.core.index_manager.algebraicIndex(null) orelse {
+            self.recordUnsupportedDocSetFilterShape();
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         };
         entry.index.recordVectorFilterAttempt();
         if (entry.index.hasErrors() or !entry.index.plannerLifecycleReady()) {
             entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+            self.recordUnsupportedDocSetFilterShape();
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
+        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, &entry.index)) |direct| return direct;
         var filter_doc_ids: [][]u8 = &.{};
         errdefer entry.index.freeDocIds(filter_doc_ids);
         var exclude_doc_ids: [][]u8 = &.{};
@@ -8099,12 +8682,40 @@ pub const DB = struct {
         var filter_json_resolved = false;
         var exclusion_json_resolved = false;
         var filter_supported = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
+        var filter_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.FilterBinding).empty;
+        defer {
+            for (filter_bindings.items) |*binding| binding.set.deinit(&entry.index);
+            filter_bindings.deinit(entry.index.alloc);
+        }
 
         if (filter_supported) filter_doc_ids = try dupeAlgebraicDocIds(entry.index.alloc, req.filter_doc_ids);
         if (req.exclude_doc_ids.len > 0) exclude_doc_ids = try dupeAlgebraicDocIds(entry.index.alloc, req.exclude_doc_ids);
 
+        for (req.doc_filter_bindings) |binding| {
+            if (binding.name.len == 0 or binding.filter_query_json.len == 0) return error.InvalidArgument;
+            for (filter_bindings.items) |existing| {
+                if (std.mem.eql(u8, existing.name, binding.name)) return error.InvalidArgument;
+            }
+            var set = (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(
+                self.core.store,
+                binding.filter_query_json,
+                filter_bindings.items,
+            )) orelse {
+                entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+                self.recordUnsupportedDocSetFilterShape();
+                if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                return .{ .req = req };
+            };
+            errdefer set.deinit(&entry.index);
+            try filter_bindings.append(entry.index.alloc, .{
+                .name = binding.name,
+                .set = set,
+            });
+            set = .{};
+        }
+
         if (req.filter_query_json.len > 0) {
-            if (try entry.index.docIdSetForFilterJsonAlloc(self.core.store, req.filter_query_json)) |set| {
+            if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.filter_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
                 defer owned_set.deinit(&entry.index);
                 if (owned_set.include) |ids| {
@@ -8128,17 +8739,27 @@ pub const DB = struct {
             }
         }
         if (req.exclusion_query_json.len > 0) {
-            if (try entry.index.docIdsForFilterJsonAlloc(self.core.store, req.exclusion_query_json)) |ids| {
-                defer entry.index.freeDocIds(ids);
-                const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
-                entry.index.freeDocIds(exclude_doc_ids);
-                exclude_doc_ids = merged;
-                changed = true;
+            if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
+                var owned_set = set;
+                defer owned_set.deinit(&entry.index);
+                if (owned_set.include) |ids| {
+                    const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
+                    entry.index.freeDocIds(exclude_doc_ids);
+                    exclude_doc_ids = merged;
+                    changed = true;
+                }
+                if (owned_set.exclude.len > 0) {
+                    const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, owned_set.exclude);
+                    entry.index.freeDocIds(exclude_doc_ids);
+                    exclude_doc_ids = merged;
+                    changed = true;
+                }
                 exclusion_json_resolved = true;
             }
         }
         if (!changed) {
             entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+            self.recordUnsupportedDocSetFilterShape();
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
@@ -8151,17 +8772,299 @@ pub const DB = struct {
         if (exclude_doc_ids.len > 0) next.exclude_doc_ids = exclude_doc_ids;
         if (filter_json_resolved) next.filter_query_json = "";
         if (exclusion_json_resolved) next.exclusion_query_json = "";
+        if (filter_bindings.items.len > 0) next.doc_filter_bindings = &.{};
         if (next.require_algebraic_filter_resolution and (next.filter_query_json.len > 0 or next.exclusion_query_json.len > 0)) {
             entry.index.recordVectorFilterUnsupported(true);
+            self.recordUnsupportedDocSetFilterShape();
             return error.UnsupportedQueryRequest;
         }
+        const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+        errdefer self.alloc.destroy(resolved_filter);
+        resolved_filter.* = try self.resolvedDocFilterForIdsAlloc(filter_supported, filter_doc_ids, exclude_doc_ids, req.identity_read_generation);
+        errdefer resolved_filter.deinit(self.alloc);
+        next.resolved_doc_filter = resolved_filter;
         entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
         return .{
             .req = next,
             .index = &entry.index,
             .filter_doc_ids = filter_doc_ids,
             .exclude_doc_ids = exclude_doc_ids,
+            .resolved_doc_filter = resolved_filter,
+            .resolved_doc_filter_alloc = self.alloc,
         };
+    }
+
+    fn searchRequestWithDirectAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest, index: *@import("algebraic/index.zig").Index) !?AlgebraicDocFilterRequest {
+        var resolved_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.ResolvedFilterBinding).empty;
+        defer {
+            for (resolved_bindings.items) |*binding| binding.filter.deinit(index.alloc);
+            resolved_bindings.deinit(index.alloc);
+        }
+        for (req.doc_filter_bindings) |binding| {
+            if (binding.name.len == 0 or binding.filter_query_json.len == 0) return error.InvalidArgument;
+            for (resolved_bindings.items) |existing| {
+                if (std.mem.eql(u8, existing.name, binding.name)) return error.InvalidArgument;
+            }
+            var binding_filter = (try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                self.core.store,
+                binding.filter_query_json,
+                req.identity_read_generation,
+                resolved_bindings.items,
+            )) orelse return null;
+            errdefer binding_filter.deinit(index.alloc);
+            try resolved_bindings.append(index.alloc, .{
+                .name = binding.name,
+                .filter = binding_filter,
+            });
+            binding_filter = .{};
+        }
+
+        var filter = doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(index.alloc);
+        var changed = false;
+        var request_constraints_resolved = false;
+        var filter_json_resolved = false;
+        var exclusion_json_resolved = false;
+
+        if (try self.resolvedDocFilterForRequestNativeConstraintsAlloc(index.alloc, req)) |initial| {
+            filter = initial;
+            changed = true;
+            request_constraints_resolved = true;
+        }
+
+        if (req.filter_query_json.len > 0) {
+            var query_filter = if (resolved_bindings.items.len > 0) blk: {
+                break :blk (try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                    self.core.store,
+                    req.filter_query_json,
+                    req.identity_read_generation,
+                    resolved_bindings.items,
+                )) orelse {
+                    filter.deinit(index.alloc);
+                    return null;
+                };
+            } else blk: {
+                break :blk (try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.filter_query_json, req.identity_read_generation)) orelse {
+                    filter.deinit(index.alloc);
+                    return null;
+                };
+            };
+            defer query_filter.deinit(index.alloc);
+            if (!(try applyResolvedFilterIncludeAlloc(index.alloc, &filter, &query_filter))) {
+                filter.deinit(index.alloc);
+                return null;
+            }
+            changed = true;
+            filter_json_resolved = true;
+        }
+        if (req.exclusion_query_json.len > 0) {
+            var exclusion = if (resolved_bindings.items.len > 0) blk: {
+                break :blk (try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                    self.core.store,
+                    req.exclusion_query_json,
+                    req.identity_read_generation,
+                    resolved_bindings.items,
+                )) orelse {
+                    filter.deinit(index.alloc);
+                    return null;
+                };
+            } else blk: {
+                break :blk (try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.exclusion_query_json, req.identity_read_generation)) orelse {
+                    filter.deinit(index.alloc);
+                    return null;
+                };
+            };
+            defer exclusion.deinit(index.alloc);
+
+            if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.include))) {
+                filter.deinit(index.alloc);
+                return null;
+            }
+            if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.exclude))) {
+                filter.deinit(index.alloc);
+                return null;
+            }
+            changed = true;
+            exclusion_json_resolved = true;
+        }
+        if (!changed) return null;
+
+        const resolved_filter = try index.alloc.create(doc_set.ResolvedDocFilter);
+        errdefer index.alloc.destroy(resolved_filter);
+        resolved_filter.* = filter;
+        filter = .{};
+
+        var next = req;
+        if (request_constraints_resolved) {
+            next.filter_doc_ids = &.{};
+            next.filter_doc_ids_positive = false;
+            next.exclude_doc_ids = &.{};
+        }
+        if (filter_json_resolved) next.filter_query_json = "";
+        if (exclusion_json_resolved) next.exclusion_query_json = "";
+        if (resolved_bindings.items.len > 0) next.doc_filter_bindings = &.{};
+        next.resolved_doc_filter = resolved_filter;
+
+        index.recordVectorFilterResolved(
+            resolvedDocSetStatCount(&resolved_filter.include),
+            resolvedDocSetStatCount(&resolved_filter.exclude),
+        );
+        return .{
+            .req = next,
+            .resolved_doc_filter = resolved_filter,
+            .resolved_doc_filter_alloc = index.alloc,
+        };
+    }
+
+    fn resolvedDocFilterForRequestNativeConstraintsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) !?doc_set.ResolvedDocFilter {
+        var filter = doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(alloc);
+        var changed = false;
+
+        if (req.resolved_doc_filter) |ptr| {
+            const existing: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(ptr));
+            filter = try self.normalizeResolvedDocFilterDocKeysNoLockAtGenerationAlloc(alloc, existing, req.identity_read_generation);
+            changed = true;
+        }
+
+        if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) {
+            var include = if (req.filter_doc_ids.len == 0)
+                doc_set.ResolvedDocSet.none
+            else
+                try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, req.filter_doc_ids, req.identity_read_generation);
+            defer include.deinit(alloc);
+            if (!(try intersectResolvedFilterIncludeAlloc(alloc, &filter, &include))) {
+                filter.deinit(alloc);
+                return null;
+            }
+            changed = true;
+        }
+
+        if (req.exclude_doc_ids.len != 0) {
+            var exclude = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, req.exclude_doc_ids, req.identity_read_generation);
+            defer exclude.deinit(alloc);
+            if (!(try unionResolvedFilterExcludeAlloc(alloc, &filter, &exclude))) {
+                filter.deinit(alloc);
+                return null;
+            }
+            changed = true;
+        }
+
+        if (!changed) return null;
+        return filter;
+    }
+
+    fn normalizeResolvedDocFilterDocKeysNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        filter: *const doc_set.ResolvedDocFilter,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocFilter {
+        var out = doc_set.ResolvedDocFilter{
+            .include = try self.normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(alloc, &filter.include, generation),
+        };
+        errdefer out.deinit(alloc);
+        out.exclude = try self.normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(alloc, &filter.exclude, generation);
+        return out;
+    }
+
+    fn normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        return switch (set.*) {
+            .doc_keys => |keys| try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, keys, generation),
+            else => try doc_set.cloneAlloc(alloc, set),
+        };
+    }
+
+    fn applyResolvedFilterIncludeAlloc(
+        alloc: Allocator,
+        target: *doc_set.ResolvedDocFilter,
+        include_filter: *const doc_set.ResolvedDocFilter,
+    ) !bool {
+        var merged_include = (try doc_set.intersectAlloc(alloc, &target.include, &include_filter.include)) orelse return false;
+        errdefer merged_include.deinit(alloc);
+        var merged_exclude = (try doc_set.unionAlloc(alloc, &target.exclude, &include_filter.exclude)) orelse return false;
+        errdefer merged_exclude.deinit(alloc);
+
+        target.include.deinit(alloc);
+        target.exclude.deinit(alloc);
+        target.include = merged_include;
+        target.exclude = merged_exclude;
+        return true;
+    }
+
+    fn intersectResolvedFilterIncludeAlloc(
+        alloc: Allocator,
+        target: *doc_set.ResolvedDocFilter,
+        include: *const doc_set.ResolvedDocSet,
+    ) !bool {
+        var merged = (try doc_set.intersectAlloc(alloc, &target.include, include)) orelse return false;
+        errdefer merged.deinit(alloc);
+        target.include.deinit(alloc);
+        target.include = merged;
+        return true;
+    }
+
+    fn unionResolvedFilterExcludeAlloc(
+        alloc: Allocator,
+        target: *doc_set.ResolvedDocFilter,
+        exclude: *const doc_set.ResolvedDocSet,
+    ) !bool {
+        var merged = (try doc_set.unionAlloc(alloc, &target.exclude, exclude)) orelse return false;
+        errdefer merged.deinit(alloc);
+        target.exclude.deinit(alloc);
+        target.exclude = merged;
+        return true;
+    }
+
+    fn resolvedDocSetStatCount(set: *const doc_set.ResolvedDocSet) usize {
+        return set.estimatedCardinality() orelse 0;
+    }
+
+    fn unionResolvedDocSetsAlloc(alloc: Allocator, left: *const doc_set.ResolvedDocSet, right: *const doc_set.ResolvedDocSet) !?doc_set.ResolvedDocSet {
+        return switch (left.*) {
+            .all => .all,
+            .none => try doc_set.cloneAlloc(alloc, right),
+            .doc_keys => |left_keys| switch (right.*) {
+                .all => .all,
+                .none => try doc_set.cloneAlloc(alloc, left),
+                .doc_keys => |right_keys| .{ .doc_keys = try unionAlgebraicDocIds(alloc, left_keys, right_keys) },
+                .ordinals, .ordinal_bitmap => null,
+            },
+            .ordinals, .ordinal_bitmap => switch (right.*) {
+                .all => .all,
+                .none => try doc_set.cloneAlloc(alloc, left),
+                .doc_keys => null,
+                .ordinals, .ordinal_bitmap => try unionOrdinalDocSetsAlloc(alloc, left, right),
+            },
+        };
+    }
+
+    fn unionOrdinalDocSetsAlloc(alloc: Allocator, left: *const doc_set.ResolvedDocSet, right: *const doc_set.ResolvedDocSet) !doc_set.ResolvedDocSet {
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(alloc);
+        try appendResolvedDocSetOrdinalsAlloc(alloc, &ordinals, left);
+        try appendResolvedDocSetOrdinalsAlloc(alloc, &ordinals, right);
+        return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+    }
+
+    fn appendResolvedDocSetOrdinalsAlloc(alloc: Allocator, out: *std.ArrayListUnmanaged(doc_set.DocOrdinal), set: *const doc_set.ResolvedDocSet) !void {
+        switch (set.*) {
+            .ordinals => |ordinals| try out.appendSlice(alloc, ordinals),
+            .ordinal_bitmap => |*bitmap| {
+                var iter = bitmap.iterator();
+                while (iter.next()) |ordinal| try out.append(alloc, ordinal);
+            },
+            .all, .none, .doc_keys => {},
+        }
     }
 
     fn dupeAlgebraicDocIds(alloc: Allocator, doc_ids: []const []const u8) ![][]u8 {
@@ -8237,7 +9140,9 @@ pub const DB = struct {
         if (req.full_text != null or req.sparse != null) return false;
         if (req.full_text_queries.len != 0 or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
         if (req.merge_config != null) return false;
+        if (req.doc_filter_bindings.len != 0) return false;
         if (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) return false;
+        if (req.resolved_doc_filter != null) return false;
         if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0 or req.exclude_doc_ids.len != 0) return false;
         if (!(req.dense != null or req.query == .dense_knn)) return false;
         const entry = self.core.denseIndex(req.index_name) orelse return false;
@@ -8268,6 +9173,16 @@ pub const DB = struct {
     ) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return self.core.sparseIndex(index_name);
+    }
+
+    fn sparseDocNumsForOrdinalsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) anyerror![]const u32 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, self.core.store, index_name, ordinals);
     }
 
     fn loadRequiredProjectedSearchDocumentCallback(
@@ -8301,6 +9216,8 @@ pub const DB = struct {
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .load_many_parent_stored = loadParentStoredForSearchManyCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
@@ -8310,6 +9227,10 @@ pub const DB = struct {
         return try db_query_search.searchMatchAll(alloc, req, .{
             .ctx = self,
             .collect_candidates = collectSearchMatchAllCandidatesCallback,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
         });
     }
@@ -8324,7 +9245,54 @@ pub const DB = struct {
             .ctx = self,
             .scan_store_range = scanStoreRangeCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
         });
+    }
+
+    fn lookupLiveDocOrdinalCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) anyerror!?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+    }
+
+    fn lookupLiveDocOrdinalNoLockCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) anyerror!?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+    }
+
+    fn lookupLiveDocOrdinalNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !?doc_set.DocOrdinal {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, doc_id)) orelse return null;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return null;
+        const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+        if (!visible) return null;
+        return ordinal;
+    }
+
+    pub fn lookupLiveDocOrdinalForInternalRead(
+        self: *DB,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !?doc_set.DocOrdinal {
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
 
     fn scanStoreRangeCallback(
@@ -8339,11 +9307,14 @@ pub const DB = struct {
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         _ = req.index_name;
-        const raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
+        var raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
             .ctx = self,
             .execute_graph_query = executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         });
+        errdefer raw.deinit();
+        try self.annotateSearchHitOrdinalsNoLock(alloc, req, raw.hits);
         return try filterExpiredSearchResult(self, alloc, raw);
     }
 
@@ -8353,10 +9324,13 @@ pub const DB = struct {
         req: types.SearchRequest,
         graph_queries: []const types.NamedGraphQuery,
         base_hits: []const types.SearchHit,
+        base_total_hits: u32,
     ) ![]types.GraphSearchResult {
-        return try db_query_graph.executeGraphQueries(alloc, req, graph_queries, base_hits, .{
+        return try db_query_graph.executeGraphQueries(alloc, req, graph_queries, base_hits, base_total_hits, .{
             .ctx = self,
             .func = executeSingleGraphQueryWithSetsCallback,
+            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
+            .resolve_nodes_to_doc_set = resolveGraphNodesToDocSetCallback,
         });
     }
 
@@ -8370,6 +9344,8 @@ pub const DB = struct {
         return try db_query_graph.executeGraphQueriesWithSets(alloc, req, graph_queries, named_sets, .{
             .ctx = self,
             .func = executeSingleGraphQueryWithSetsCallback,
+            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
+            .resolve_nodes_to_doc_set = resolveGraphNodesToDocSetCallback,
         });
     }
 
@@ -8380,17 +9356,79 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        switch (named.query.query_type) {
-            .pattern => return try self.executeSinglePatternQueryWithSets(alloc, named, named_sets),
-            else => {},
+        var result = switch (named.query.query_type) {
+            .pattern => try self.executeSinglePatternQueryWithSets(alloc, req, named, named_sets),
+            else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
+                .ctx = self,
+                .find_shortest_path = executeShortestPathCallback,
+                .find_k_shortest_paths = executeKShortestPathsCallback,
+                .execute_graph_query = executeGraphQueryCallback,
+                .load_projected_document = loadProjectedSearchDocumentCallback,
+                .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
+                .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            }),
+        };
+        errdefer result.deinit(alloc);
+        try self.annotateSearchHitOrdinalsNoLock(alloc, req, result.hits);
+        return result;
+    }
+
+    fn annotateSearchHitOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        hits: []types.SearchHit,
+    ) !void {
+        for (hits) |*hit| {
+            if (hit.doc_ordinal != null) continue;
+            hit.doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, hit.id, req.identity_read_generation);
         }
-        return try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
-            .ctx = self,
-            .find_shortest_path = executeShortestPathCallback,
-            .find_k_shortest_paths = executeKShortestPathsCallback,
-            .execute_graph_query = executeGraphQueryCallback,
-            .load_projected_document = loadProjectedSearchDocumentCallback,
-        });
+    }
+
+    fn resolveSearchHitsToDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        hits: []const types.SearchHit,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, hits)) |resolved| {
+            self.recordResolvedDocSet(&resolved, false);
+            return resolved;
+        }
+        var doc_ids = try alloc.alloc([]const u8, hits.len);
+        defer alloc.free(doc_ids);
+        for (hits, 0..) |hit, i| doc_ids[i] = hit.id;
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
+    }
+
+    fn resolveGraphNodesToDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        nodes: []const graph_query_mod.GraphResultNode,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var doc_ids = try alloc.alloc([]const u8, nodes.len);
+        defer alloc.free(doc_ids);
+        for (nodes, 0..) |node, i| doc_ids[i] = node.key;
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
+    }
+
+    fn resolveDocSetDocIdsForGraphCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[][]u8 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation)) orelse return null;
+        defer alloc.free(@constCast(ids));
+        errdefer for (ids) |id| alloc.free(@constCast(id));
+
+        const out = try alloc.alloc([]u8, ids.len);
+        for (ids, 0..) |id, i| out[i] = @constCast(id);
+        return out;
     }
 
     fn executeSingleGraphQueryWithSetsCallback(
@@ -8407,13 +9445,16 @@ pub const DB = struct {
     fn executeSinglePatternQueryWithSets(
         self: *DB,
         alloc: Allocator,
+        req: types.SearchRequest,
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        return try db_query_graph.executeSinglePatternQueryWithSets(alloc, named, named_sets, .{
+        return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
             .ctx = self,
             .match_pattern = executePatternMatchCallback,
             .load_projected_document = loadPatternProjectedDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         });
     }
 
@@ -8557,7 +9598,7 @@ pub const DB = struct {
             };
             const graph_results = try alloc.alloc(types.GraphSearchResult, 1);
             errdefer alloc.free(graph_results);
-            graph_results[0] = try self.executeSinglePatternQueryWithSets(alloc, &named_query, named_sets);
+            graph_results[0] = try self.executeSinglePatternQueryWithSets(alloc, req, &named_query, named_sets);
             return .{
                 .alloc = alloc,
                 .hits = &.{},
@@ -8569,6 +9610,8 @@ pub const DB = struct {
             .ctx = self,
             .execute_graph_query = executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         });
         return try filterExpiredSearchResult(self, alloc, raw);
     }
@@ -8850,6 +9893,85 @@ fn loadEmbeddingFieldValueCallback(
 ) anyerror!?std.json.Value {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadEmbeddingFieldValue(self, alloc, doc_key);
+}
+
+fn dupeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, doc_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(out);
+    }
+    for (doc_ids, 0..) |doc_id, i| {
+        out[i] = try alloc.dupe(u8, doc_id);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn docIdsForOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_set.DocOrdinal) ![]const []const u8 {
+    return (try docIdsForOrdinalsAtGenerationTxnAlloc(alloc, txn, ordinals, null)) orelse error.InvalidDocIdentity;
+}
+
+fn docIdsForOrdinalsAtGenerationTxnAlloc(
+    alloc: Allocator,
+    txn: anytype,
+    ordinals: []const doc_set.DocOrdinal,
+    generation: ?u64,
+) !?[]const []const u8 {
+    const out = try alloc.alloc([]const u8, ordinals.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(out);
+    }
+    for (ordinals, 0..) |ordinal, i| {
+        if (try doc_identity.lookupStateTxn(txn, ordinal)) |state| {
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            if (!visible) {
+                for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+                alloc.free(out);
+                return null;
+            }
+        } else {
+            for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+            alloc.free(out);
+            return null;
+        }
+        out[i] = (try doc_identity.lookupDocIdTxn(alloc, txn, ordinal)) orelse return error.InvalidDocIdentity;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn resolvedDocSetFromSearchHitOrdinalsAlloc(alloc: Allocator, hits: []const types.SearchHit) !?doc_set.ResolvedDocSet {
+    const ordinals = try alloc.alloc(doc_set.DocOrdinal, hits.len);
+    defer if (ordinals.len > 0) alloc.free(ordinals);
+
+    for (hits, 0..) |hit, i| {
+        ordinals[i] = hit.doc_ordinal orelse return null;
+    }
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+}
+
+test "resolved doc set from search hits uses complete hit ordinals" {
+    const alloc = std.testing.allocator;
+
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .doc_ordinal = 3 },
+        .{ .id = @constCast("doc:b"), .doc_ordinal = 1 },
+    };
+    var resolved = (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &hits)) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(alloc);
+    try std.testing.expect(resolved.containsOrdinal(1));
+    try std.testing.expect(resolved.containsOrdinal(3));
+    try std.testing.expect(!resolved.containsOrdinal(2));
+
+    const mixed = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .doc_ordinal = 1 },
+        .{ .id = @constCast("doc:b") },
+    };
+    try std.testing.expect((try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &mixed)) == null);
 }
 
 fn isMetadataKey(key: []const u8) bool {
@@ -9247,14 +10369,63 @@ fn renderSourceTemplateParts(
 }
 
 fn makeChunkCacheKey(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{d}\x1f{d}\x1f{s}", .{
+    var chunk_size: [@sizeOf(u32)]u8 = undefined;
+    var chunk_overlap: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &chunk_size, request.chunk_size, .big);
+    std.mem.writeInt(u32, &chunk_overlap, request.chunk_overlap, .big);
+    return try chunkCacheTupleKeyAlloc(alloc, &.{
         request.doc_key,
         requestArtifactName(request),
         request.source_field,
-        request.chunk_size,
-        request.chunk_overlap,
+        &chunk_size,
+        &chunk_overlap,
         request.chunker_json,
     });
+}
+
+fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    for (components) |component| {
+        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
+        var len_buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, component);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "db chunk cache keys preserve embedded separators" {
+    const alloc = std.testing.allocator;
+
+    const left = try makeChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact",
+        .doc_key = "doc\x1fartifact",
+        .source_field = "body",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(left);
+
+    const right = try makeChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact\x1fartifact",
+        .doc_key = "doc",
+        .source_field = "body",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(right);
+
+    try std.testing.expect(!std.mem.eql(u8, left, right));
 }
 
 fn getOrCreateChunks(
@@ -10786,6 +11957,8 @@ fn appendGeneratedEnrichments(
 
 fn deleteEnrichmentArtifactsForBatch(self: *DB, req: types.BatchRequest, extracted: []const mapper.ExtractedWrite) ![][]u8 {
     _ = extracted;
+    if (!self.core.hasArtifactCleanupMaybe()) return try self.alloc.alloc([]u8, 0);
+
     var deleted = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeOwnedKeySlice(self.alloc, deleted.items);
 
@@ -10833,6 +12006,14 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer store_writes.deinit(ctx.alloc);
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            ctx.alloc.free(@constCast(item.key));
+            ctx.alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(ctx.alloc);
+    }
     var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer delete_keys.deinit(ctx.alloc);
     var timestamp_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -10858,8 +12039,14 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
 
     var deleted_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
     defer freeOwnedKeySlice(ctx.alloc, deleted_artifact_keys.items);
-    for (keys) |key| {
-        try collectAndDeleteEnrichmentArtifactsForDocContext(ctx.alloc, ctx.store, key, &deleted_artifact_keys);
+    const should_scan_artifacts = if (ctx.artifact_cleanup_maybe) |artifact_cleanup_maybe|
+        artifact_cleanup_maybe.load(.acquire) or ctx.index_manager.hasGeneratedEnrichmentTargets()
+    else
+        true;
+    if (should_scan_artifacts) {
+        for (keys) |key| {
+            try collectAndDeleteEnrichmentArtifactsForDocContext(ctx.alloc, ctx.store, key, &deleted_artifact_keys);
+        }
     }
 
     const req = types.BatchRequest{
@@ -10870,6 +12057,16 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
+    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+        ctx.alloc,
+        ctx.store,
+        ctx.identity_namespace,
+        sequence,
+        &identity_writes,
+        &.{},
+        keys,
+    );
+    try store_writes.appendSlice(ctx.alloc, identity_writes.items);
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -12095,7 +13292,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             var index_writes = try collectDocumentWrites(ctx.alloc, ctx.store, batch.documents, ctx.index_manager.byte_range);
             defer index_writes.deinit();
             if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-            try ctx.index_manager.indexSparseBatchByName(index_ref.name, index_writes.items);
+            try ctx.index_manager.indexSparseBatchByName(ctx.store, index_ref.name, index_writes.items);
 
             var sparse_embeddings = try collectSparseEmbeddingWritesForBatch(
                 ctx.alloc,
@@ -12267,7 +13464,10 @@ const OwnedDenseEmbeddingWrites = struct {
 
     fn deinit(self: *@This()) void {
         if (self.owns_doc_keys) {
-            for (self.writes) |write| self.alloc.free(@constCast(write.doc_key));
+            for (self.writes) |write| {
+                self.alloc.free(@constCast(write.doc_key));
+                if (write.parent_doc_key) |parent_doc_key| self.alloc.free(@constCast(parent_doc_key));
+            }
         }
         if (self.writes.len > 0) self.alloc.free(self.writes);
         self.* = undefined;
@@ -12528,6 +13728,7 @@ fn collectDenseEmbeddingWrites(alloc: Allocator, embeddings: []const derived_typ
         try filtered.append(alloc, .{
             .index_name = @constCast(embedding.index_name),
             .doc_key = @constCast(embedding.doc_key),
+            .parent_doc_key = embedding.parent_doc_key,
             .artifact_key = if (embedding.artifact_key) |artifact_key| @constCast(artifact_key) else null,
             .vector = if (embedding.artifact_key != null) &.{} else @constCast(embedding.vector),
         });
@@ -12544,7 +13745,10 @@ fn collectDenseEmbeddingWritesForArtifacts(
 ) !OwnedDenseEmbeddingWrites {
     var filtered = std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite).empty;
     errdefer {
-        for (filtered.items) |write| alloc.free(@constCast(write.doc_key));
+        for (filtered.items) |write| {
+            alloc.free(@constCast(write.doc_key));
+            if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
+        }
         filtered.deinit(alloc);
     }
 
@@ -12556,12 +13760,18 @@ fn collectDenseEmbeddingWritesForArtifacts(
         } orelse continue;
         defer identity.deinit(alloc);
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
+        const doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer alloc.free(doc_key);
+        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
         try filtered.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = try alloc.dupe(u8, identity.doc_key),
+            .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
+        parent_doc_key = null;
     }
 
     return .{
@@ -12588,12 +13798,16 @@ fn appendDenseEmbeddingWritesForArtifacts(
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
         const doc_key = try alloc.dupe(u8, identity.doc_key);
         errdefer alloc.free(doc_key);
+        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
         try out.append(alloc, .{
             .index_name = @constCast(index_name),
             .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
+        parent_doc_key = null;
     }
 }
 
@@ -12606,7 +13820,10 @@ fn collectDenseEmbeddingWritesForBatch(
 ) !OwnedDenseEmbeddingWrites {
     var filtered = std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite).empty;
     errdefer {
-        for (filtered.items) |write| alloc.free(@constCast(write.doc_key));
+        for (filtered.items) |write| {
+            alloc.free(@constCast(write.doc_key));
+            if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
+        }
         filtered.deinit(alloc);
     }
 
@@ -12614,12 +13831,16 @@ fn collectDenseEmbeddingWritesForBatch(
         if (!std.mem.eql(u8, embedding.index_name, index_name)) continue;
         const doc_key = try alloc.dupe(u8, embedding.doc_key);
         errdefer alloc.free(doc_key);
+        var parent_doc_key = if (embedding.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
         try filtered.append(alloc, .{
             .index_name = @constCast(embedding.index_name),
             .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
             .artifact_key = if (embedding.artifact_key) |artifact_key| @constCast(artifact_key) else null,
             .vector = if (embedding.artifact_key != null) &.{} else @constCast(embedding.vector),
         });
+        parent_doc_key = null;
     }
     try appendDenseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, artifact_keys, index_name);
 
@@ -13152,6 +14373,51 @@ fn tryFinalizePrimarySplitFast(self: *DB, split_lower: []const u8) !bool {
     return try self.core.rewriteLeftStoreInPlace(split_lower);
 }
 
+fn identityMetadataRange() struct { lower: [1]u8, upper: [1]u8 } {
+    return .{
+        .lower = .{internal_keys.identity_namespace},
+        .upper = .{internal_keys.identity_namespace + 1},
+    };
+}
+
+fn putIdentityMetadataRows(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    rows: []const docstore_mod.OwnedKVPair,
+) !void {
+    if (rows.len == 0) return;
+
+    var writes = try alloc.alloc(docstore_mod.KVPair, rows.len);
+    defer alloc.free(writes);
+    for (rows, 0..) |row, i| {
+        writes[i] = .{
+            .key = row.key,
+            .value = row.value,
+        };
+    }
+    try store.putBatch(writes, &.{});
+}
+
+fn copyIdentityMetadataToStore(
+    alloc: Allocator,
+    src_store: *docstore_mod.DocStore,
+    dest_store: *docstore_mod.DocStore,
+) !void {
+    const range = identityMetadataRange();
+    const rows = try src_store.scanRange(alloc, range.lower[0..], range.upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, rows);
+    try putIdentityMetadataRows(alloc, dest_store, rows);
+}
+
+fn finalizePrimarySplitPreservingIdentity(self: *DB, split_lower: []const u8) !void {
+    const range = identityMetadataRange();
+    const identity_rows = try self.core.store.scanRange(self.alloc, range.lower[0..], range.upper[0..]);
+    defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
+
+    _ = try tryFinalizePrimarySplitFast(self, split_lower);
+    try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
+}
+
 fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []const u8) !void {
     try ensureDirPath(dest_dir);
     const split_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
@@ -13175,6 +14441,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
 
     try clearSplitMetadataFromStore(self.alloc, dest_store);
     try clearSystemMetadataFromSplitDestination(self.alloc, dest_store);
+    try copyIdentityMetadataToStore(self.alloc, self.core.store, dest_store);
     const replay_floor = self.core.nextDerivedAppendSequence();
     try ensureReplayFloor(dest_store, replay_floor);
 
@@ -13431,7 +14698,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
 
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
-    _ = try tryFinalizePrimarySplitFast(self, split_lower);
+    try finalizePrimarySplitPreservingIdentity(self, split_lower);
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -14188,6 +15455,11 @@ fn tempPath(buf: []u8) [*:0]const u8 {
     return @ptrCast(path.ptr);
 }
 
+fn denseTestVectorId(doc_key: []const u8) u64 {
+    const id = std.hash.XxHash64.hash(0, doc_key);
+    return if (id == 0) 1 else id;
+}
+
 fn cleanupTempDir(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -14352,6 +15624,12 @@ fn putDenseEmbeddingArtifactForTest(db: *DB, alloc: Allocator, artifact_key: []c
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
     defer alloc.free(payload);
     try db.core.store.put(artifact_key, payload);
+    try markArtifactPresenceForTest(db);
+}
+
+fn markArtifactPresenceForTest(db: *DB) !void {
+    db.core.artifact_cleanup_maybe.store(true, .release);
+    try db.core.store.put(internal_keys.artifact_presence_key[0..], "1");
 }
 
 fn putSparseEmbeddingArtifactForTest(
@@ -14365,6 +15643,7 @@ fn putSparseEmbeddingArtifactForTest(
     const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, source_hash, indices, values);
     defer alloc.free(payload);
     try db.core.store.put(artifact_key, payload);
+    try markArtifactPresenceForTest(db);
 }
 
 fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {
@@ -15367,6 +16646,54 @@ test "db batch get match_all search and index registry" {
     try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
 }
 
+test "db match_all consumes resolved ordinal filter" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\"}" },
+        },
+    });
+
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    errdefer include.deinit(alloc);
+    switch (include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    var result = try db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .resolved_doc_filter = &filter,
+        .limit = 10,
+        .include_stored = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");
@@ -15776,6 +17103,1381 @@ test "db basic batch/get works with memory primary backend" {
     try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"alpha\"") != null);
 }
 
+test "db batch treats reserved namespace bytes as user document ids" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const raw_id = "\x03raw\x00doc";
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = raw_id, .value = "{\"name\":\"binary\"}" },
+        },
+    });
+
+    const raw = try db.get(alloc, raw_id);
+    defer if (raw) |value| alloc.free(value);
+    try std.testing.expect(raw != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"binary\"") != null);
+
+    var resolved = try db.resolveDocSetForIdsAlloc(alloc, &.{raw_id});
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    const resolved_doc_ids = (try db.docIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    defer {
+        for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(resolved_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolved_doc_ids.len);
+    try std.testing.expectEqualSlices(u8, raw_id, resolved_doc_ids[0]);
+}
+
+test "db batch and scan round trip adversarial document ids" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const raw_ids = [_][]const u8{
+        "",
+        "\x00",
+        "\x00\x00",
+        "\x00a",
+        ":",
+        ":e:",
+        ":i:",
+        ":t",
+        "abc\x00def",
+        "abc:",
+        "abc\xffdef",
+        "\xff",
+    };
+
+    var writes: [raw_ids.len]types.BatchWrite = undefined;
+    for (raw_ids, 0..) |raw_id, i| {
+        writes[i] = .{
+            .key = raw_id,
+            .value = try std.fmt.allocPrint(alloc, "{{\"ordinal\":{d}}}", .{i}),
+        };
+    }
+    defer for (writes) |write| alloc.free(@constCast(write.value));
+
+    try db.batch(.{ .writes = writes[0..] });
+
+    for (raw_ids, 0..) |raw_id, i| {
+        const raw = (try db.get(alloc, raw_id)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        const expected = try std.fmt.allocPrint(alloc, "{{\"ordinal\":{d}}}", .{i});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, raw);
+    }
+
+    var resolved = try db.resolveDocSetForIdsAlloc(alloc, raw_ids[0..]);
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(raw_ids.len, ordinals.len);
+            for (ordinals, 0..) |ordinal, i| {
+                try std.testing.expectEqual(@as(doc_set.DocOrdinal, @intCast(i + 1)), ordinal);
+            }
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    const resolved_doc_ids = (try db.docIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    defer {
+        for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(resolved_doc_ids);
+    }
+    try std.testing.expectEqual(raw_ids.len, resolved_doc_ids.len);
+    for (raw_ids, 0..) |raw_id, i| {
+        try std.testing.expectEqualSlices(u8, raw_id, resolved_doc_ids[i]);
+    }
+
+    var scanned = try db.scan(alloc, "", "", .{ .include_documents = true });
+    defer scanned.deinit(alloc);
+    try std.testing.expectEqual(raw_ids.len, scanned.hashes.len);
+    try std.testing.expectEqual(raw_ids.len, scanned.documents.len);
+    for (raw_ids, 0..) |raw_id, i| {
+        try std.testing.expectEqualSlices(u8, raw_id, scanned.hashes[i].id);
+        try std.testing.expectEqualSlices(u8, raw_id, scanned.documents[i].id);
+    }
+}
+
+test "db resolved doc-set projection honors identity read generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var create_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (create_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        create_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        1,
+        &create_identity,
+        &.{"doc:a"},
+        &.{},
+    );
+    try db.core.store.putBatchWithReplay(null, create_identity.items, &.{}, null);
+
+    var delete_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (delete_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        delete_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        2,
+        &delete_identity,
+        &.{},
+        &.{"doc:a"},
+    );
+    try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+
+    var future_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (future_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        future_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        3,
+        &future_identity,
+        &.{"doc:b"},
+        &.{},
+    );
+    try db.core.store.putBatchWithReplay(null, future_identity.items, &.{}, null);
+
+    var resolved = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 });
+    defer resolved.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 3));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, null));
+
+    var created = try doc_set.fromOrdinalsAlloc(alloc, &.{1});
+    defer created.deinit(alloc);
+    const visible_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 1)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (visible_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(visible_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), visible_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:a", visible_doc_ids[0]);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, null));
+
+    var future = try doc_set.fromOrdinalsAlloc(alloc, &.{2});
+    defer future.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 2));
+    const future_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 3)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (future_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(future_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), future_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", future_doc_ids[0]);
+
+    const current_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, null)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (current_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(current_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), current_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", current_doc_ids[0]);
+}
+
+test "db persists configured doc identity namespace for batch writes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 11, .range_id = 13 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            },
+        });
+
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(namespace, "doc:a"), state.canonical_doc_id);
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(namespace.range_id, stats.doc_identity.namespace_range_id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(namespace));
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 14 },
+    }));
+}
+
+test "db preferred identity namespace seeds new stores but preserves existing namespace" {
+    const alloc = std.testing.allocator;
+
+    var managed_path_buf: [256]u8 = undefined;
+    const managed_path = tempPath(&managed_path_buf);
+    defer cleanupTempDir(managed_path);
+
+    const managed_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    {
+        var db = try DB.open(alloc, std.mem.span(managed_path), .{
+            .start_index_workers = false,
+            .identity_namespace = managed_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+        try std.testing.expect(db.core.identity_namespace.eql(managed_namespace));
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(managed_path), .{
+            .start_index_workers = false,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+            .prefer_existing_identity_namespace = true,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(managed_namespace));
+    }
+
+    var legacy_path_buf: [256]u8 = undefined;
+    const legacy_path = tempPath(&legacy_path_buf);
+    defer cleanupTempDir(legacy_path);
+
+    {
+        var legacy = try DB.open(alloc, std.mem.span(legacy_path), .{
+            .start_index_workers = false,
+        });
+        defer legacy.close();
+        try legacy.batch(.{
+            .writes = &.{.{ .key = "doc:legacy", .value = "{\"name\":\"legacy\"}" }},
+        });
+    }
+
+    {
+        var opened = try DB.open(alloc, std.mem.span(legacy_path), .{
+            .start_index_workers = false,
+            .identity_namespace = managed_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer opened.close();
+        try std.testing.expect(opened.core.identity_namespace.eql(doc_identity.default_namespace));
+    }
+}
+
+test "db can reassign identity namespace for rebuild" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 801, .range_id = 8001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 802, .range_id = 8002 };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = old_namespace,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(old_namespace, "doc:a"), state.canonical_doc_id);
+    }
+
+    try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+        try std.testing.expectEqual(@as(u32, 1), ordinal);
+        try std.testing.expectEqual(@as(u64, 1), state.created_generation);
+    }
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(new_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(new_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(new_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
+test "db strict namespace reopen recovers after identity reassignment repair" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3801, .range_id = 38001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3802, .range_id = 38002 };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = new_namespace,
+    }));
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+        try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    }
+
+    {
+        var repaired = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = new_namespace,
+        });
+        defer repaired.close();
+
+        var filtered = try repaired.search(alloc, .{
+            .query = .{ .match_all = {} },
+            .filter_doc_ids = &.{"doc:a"},
+            .filter_doc_ids_positive = true,
+            .limit = 10,
+        });
+        defer filtered.deinit();
+        try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+        try std.testing.expectEqualStrings("doc:a", filtered.hits[0].id);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), filtered.hits[0].doc_ordinal);
+
+        var txn = try repaired.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, null), try doc_identity.lookupCanonicalOrdinalTxn(&txn, doc_identity.canonicalDocIdForNamespace(old_namespace, "doc:a")));
+    }
+}
+
+test "db identity namespace reassignment refreshes transaction recovery hook context" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2801, .range_id = 28001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2802, .range_id = 28002 };
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = old_namespace,
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 60_000,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    try std.testing.expect(identity_ctx.identity_namespace.eql(old_namespace));
+    try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
+    try std.testing.expectEqual(
+        @intFromPtr(identity_ctx),
+        @intFromPtr(db.transaction_runtime.?.config.resolution_extra_hooks.ctx.?),
+    );
+
+    try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
+    try std.testing.expect(identity_ctx.identity_namespace.eql(new_namespace));
+
+    var txn = try db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+}
+
+test "db identity namespace reassignment is unavailable on status-only handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1801, .range_id = 18001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1802, .range_id = 18002 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+    }
+
+    {
+        var status_db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer status_db.close();
+        try std.testing.expectError(error.UnsupportedOperation, status_db.reassignIdentityNamespaceForInternalTransition(new_namespace));
+        const stats = try status_db.runtimeStatusStatsConsistent(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(old_namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(old_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(old_namespace.range_id, stats.doc_identity.namespace_range_id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(old_namespace));
+    }
+}
+
+test "db stats expose document identity coverage and tombstones" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+        },
+    });
+
+    var resolved_existing = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    defer resolved_existing.deinit(alloc);
+    var resolved_missing = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:missing"});
+    defer resolved_missing.deinit(alloc);
+
+    const fast = try db.stats(alloc);
+    defer types.freeDBStats(alloc, fast);
+    try std.testing.expectEqual(@as(u32, 3), fast.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), fast.doc_identity.allocated_ordinals);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(doc_identity.DocOrdinal) - 3), fast.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(!fast.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(!fast.doc_identity.rebuild_required);
+    try std.testing.expect(!fast.doc_identity.complete);
+    try std.testing.expectEqual(@as(u64, 2), fast.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.ordinal_list_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.ordinal_list_docs);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.doc_key_list_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.doc_key_list_docs);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.missing_ordinal_coverage_count);
+
+    try db.batch(.{
+        .deletes = &.{"doc:b"},
+    });
+
+    const diagnostic = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, diagnostic);
+    try std.testing.expect(diagnostic.doc_identity.complete);
+    try std.testing.expectEqual(@as(u32, 3), diagnostic.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), diagnostic.doc_identity.allocated_ordinals);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(doc_identity.DocOrdinal) - 3), diagnostic.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(!diagnostic.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(!diagnostic.doc_identity.rebuild_required);
+    try std.testing.expectEqual(@as(u64, 2), diagnostic.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.tombstone_ordinals);
+    try std.testing.expect(diagnostic.doc_identity.min_created_generation > 0);
+    try std.testing.expectEqual(diagnostic.doc_identity.min_created_generation, diagnostic.doc_identity.max_created_generation);
+    try std.testing.expect(diagnostic.doc_identity.min_deleted_generation > diagnostic.doc_identity.min_created_generation);
+    try std.testing.expectEqual(diagnostic.doc_identity.min_deleted_generation, diagnostic.doc_identity.max_deleted_generation);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.scanned_primary_docs);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_missing_identity_state);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_with_tombstone_ordinals);
+
+    const legacy_key = try internal_keys.documentKeyAlloc(alloc, "doc:legacy");
+    defer alloc.free(legacy_key);
+    try db.core.store.put(legacy_key, "{\"name\":\"legacy\"}");
+
+    const resurrected_key = try internal_keys.documentKeyAlloc(alloc, "doc:b");
+    defer alloc.free(resurrected_key);
+    try db.core.store.put(resurrected_key, "{\"name\":\"resurrected\"}");
+
+    const repaired_diagnostic = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, repaired_diagnostic);
+    try std.testing.expectEqual(@as(u64, 3), repaired_diagnostic.doc_identity.scanned_primary_docs);
+    try std.testing.expectEqual(@as(u64, 1), repaired_diagnostic.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), repaired_diagnostic.doc_identity.primary_docs_missing_identity_state);
+    try std.testing.expectEqual(@as(u64, 1), repaired_diagnostic.doc_identity.primary_docs_with_tombstone_ordinals);
+    try std.testing.expect(repaired_diagnostic.doc_identity.rebuild_required);
+}
+
+test "db stats flag document identity ordinal capacity exhaustion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), stats.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(stats.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(stats.doc_identity.rebuild_required);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
+    }));
+}
+
+test "db allocates final document ordinal then rejects new documents" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const last_allocatable = std.math.maxInt(doc_identity.DocOrdinal) - 1;
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, last_allocatable, .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:last", .value = "{\"name\":\"last\"}" }},
+        .sync_level = .write,
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, last_allocatable), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:last"));
+    }
+
+    const exhausted = try db.stats(alloc);
+    defer types.freeDBStats(alloc, exhausted);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), exhausted.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), exhausted.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(exhausted.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(exhausted.doc_identity.rebuild_required);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:last", .value = "{\"name\":\"updated-last\"}" }},
+        .sync_level = .full_index,
+    });
+    const updated = (try db.get(alloc, "doc:last")) orelse return error.TestExpectedEqual;
+    defer alloc.free(updated);
+    try std.testing.expectEqualStrings("{\"name\":\"updated-last\"}", updated);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
+        .sync_level = .write,
+    }));
+}
+
+test "db rejects new document writes at ordinal exhaustion for every sync level" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"name\":\"existing\"}" }},
+        .sync_level = .write,
+    });
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"name\":\"updated\"}" }},
+        .sync_level = .full_index,
+    });
+    const existing = (try db.get(alloc, "doc:existing")) orelse return error.TestExpectedEqual;
+    defer alloc.free(existing);
+    try std.testing.expectEqualStrings("{\"name\":\"updated\"}", existing);
+
+    const levels = [_]types.SyncLevel{
+        .propose,
+        .write,
+        .full_text,
+        .enrichments,
+        .aknn,
+        .full_index,
+    };
+    for (levels, 0..) |level, i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:new:{d}", .{i});
+        try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+            .writes = &.{.{ .key = key, .value = "{\"name\":\"new\"}" }},
+            .sync_level = level,
+        }));
+        try std.testing.expect((try db.get(alloc, key)) == null);
+    }
+}
+
+test "db search requests default to current identity generation snapshot" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    const current_generation = db.core.nextDerivedSequence();
+    const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
+    try std.testing.expectEqual(@as(?u64, db.core.nextDerivedSequence()), current.identity_read_generation);
+
+    const explicit = try db.searchRequestAtCurrentIdentityGeneration(.{ .identity_read_generation = current_generation });
+    try std.testing.expectEqual(@as(?u64, current_generation), explicit.identity_read_generation);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.searchRequestAtCurrentIdentityGeneration(.{
+        .identity_read_generation = current_generation -| 1,
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .identity_read_generation = current_generation + 1,
+    }));
+
+    var preflight = try db.preflightSearchRequest(alloc, .{ .identity_read_generation = current_generation }, 0);
+    defer preflight.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.preflightSearchRequest(alloc, .{
+        .identity_read_generation = current_generation -| 1,
+    }, 0));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectPlanningStats(alloc, .{
+        .identity_read_generation = current_generation + 1,
+    }, 0));
+    const text_stats = try db.collectSearchRequestTextStats(alloc, .{ .identity_read_generation = current_generation });
+    defer alloc.free(text_stats);
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectSearchRequestTextStats(alloc, .{
+        .identity_read_generation = current_generation + 1,
+    }));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 5), stats.doc_set_planning.stale_identity_generation_rejection_count);
+}
+
+test "db validates internal resolved doc filter wire namespace and generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const namespace = doc_identity.Namespace{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = namespace,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    });
+
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    var ok = try db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = namespace,
+            .identity_read_generation = generation,
+        },
+    });
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ok.total_hits);
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = .{ .table_id = 1, .shard_id = 99, .range_id = 3 },
+            .identity_read_generation = generation,
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = namespace,
+            .identity_read_generation = generation + 1,
+        },
+    }));
+}
+
+test "db explicit doc-id filter resolution honors identity generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var create_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (create_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        create_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        1,
+        &create_identity,
+        &.{"doc:a"},
+        &.{},
+    );
+    try db.core.store.putBatchWithReplay(null, create_identity.items, &.{}, null);
+
+    var delete_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (delete_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        delete_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        2,
+        &delete_identity,
+        &.{},
+        &.{"doc:a"},
+    );
+    try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+
+    var visible_at_create = try db.resolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 1);
+    defer visible_at_create.deinit(alloc);
+    switch (visible_at_create.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var hidden_at_delete = try db.resolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 2);
+    defer hidden_at_delete.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 0), hidden_at_delete.include.estimatedCardinality());
+}
+
+test "db doc set planning stats record ordinal bitmap promotion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer writes.deinit(alloc);
+    var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer doc_ids.deinit(alloc);
+    var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_doc_ids.items) |doc_id| alloc.free(doc_id);
+        owned_doc_ids.deinit(alloc);
+    }
+
+    for (0..doc_set.bitmap_min_cardinality) |i| {
+        const doc_id = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        errdefer alloc.free(doc_id);
+        try owned_doc_ids.append(alloc, doc_id);
+        try doc_ids.append(alloc, doc_id);
+        try writes.append(alloc, .{ .key = doc_id, .value = "{\"ok\":true}" });
+    }
+
+    try db.batch(.{ .writes = writes.items });
+
+    var resolved = try db.resolveDocSetForIdsAlloc(alloc, doc_ids.items);
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
+        else => return error.ExpectedOrdinalBitmapDocSet,
+    }
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.ordinal_bitmap_count);
+    try std.testing.expectEqual(@as(u64, doc_set.bitmap_min_cardinality), stats.doc_set_planning.ordinal_bitmap_docs);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.bitmap_promotion_count);
+}
+
+test "db sparse index keeps physical doc nums distinct from doc identity ordinals" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"sparse\":{\"indices\":[1],\"values\":[0.5]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const sparse_entry = db.core.index_manager.sparseIndex("sp_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 0), try sparse_entry.index.debugDocNumForDocId("doc:a"));
+    try std.testing.expectEqual(@as(?u32, 1), try sparse_entry.index.debugDocNumForDocId("doc:b"));
+
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    errdefer include.deinit(alloc);
+    const ordinal = switch (include) {
+        .ordinals => |ordinals| blk: {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+            break :blk ordinals[0];
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    };
+
+    const sparse_doc_nums = try db.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, db.core.store, "sp_v1", &.{ordinal});
+    defer alloc.free(sparse_doc_nums);
+    try std.testing.expectEqual(@as(usize, 1), sparse_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 1), sparse_doc_nums[0]);
+    try std.testing.expect(sparse_doc_nums[0] != ordinal);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 2,
+        .resolved_doc_filter = &filter,
+    });
+    defer filtered.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), filtered.hits.len);
+    try std.testing.expectEqualStrings("doc:b", filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), filtered.hits[0].doc_ordinal);
+}
+
+test "db sparse hits resolve doc ordinals through identity not sparse doc nums" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    const sparse_entry = db.core.index_manager.sparseIndex("sp_v1") orelse return error.TestUnexpectedResult;
+    try sparse_entry.index.batch(&.{.{ .doc_id = "doc:a", .doc_num = 42, .vec = .{ .indices = &.{1}, .values = &.{1.0} } }}, &.{});
+    try std.testing.expectEqual(@as(?u32, 42), try sparse_entry.index.debugDocNumForDocId("doc:a"));
+
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "doc:a")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 1), ordinal);
+
+    var result = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
+}
+
+test "db dense index stores stable vector ids with ordinal filter mappings" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[10,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    errdefer include.deinit(alloc);
+    const ordinal = switch (include) {
+        .ordinals => |ordinals| blk: {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            break :blk ordinals[0];
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    };
+    try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinal);
+    const expected_vector_id = denseTestVectorId("doc:b");
+    try std.testing.expect(expected_vector_id != @as(u64, ordinal));
+    try std.testing.expectEqual(@as(?u64, expected_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    try std.testing.expect(!db.canUsePublishedDenseSearch(.{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .resolved_doc_filter = &filter,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+    }));
+
+    var dense_filtered = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .resolved_doc_filter = &filter,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_filtered.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_filtered.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_filtered.result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), dense_filtered.result.hits[0].doc_ordinal);
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.profile.raw_hit_count);
+
+    const reassigned_namespace = doc_identity.Namespace{ .table_id = 19, .shard_id = 1902, .range_id = 19002 };
+    try db.reassignIdentityNamespaceForInternalTransition(reassigned_namespace);
+    try std.testing.expectEqual(@as(?u64, expected_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(reassigned_namespace, "doc:b"), state.canonical_doc_id);
+    }
+
+    var dense_after_reassign = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .resolved_doc_filter = &filter,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_after_reassign.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_after_reassign.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_after_reassign.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_after_reassign.result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), dense_after_reassign.result.hits[0].doc_ordinal);
+    try std.testing.expectEqual(@as(u32, 1), dense_after_reassign.profile.raw_hit_count);
+}
+
+test "db resolved doc filter normalizes doc keys before composing native ids" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"category\":\"keep\"}" },
+            .{ .key = "doc:b", .value = "{\"category\":\"keep\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var doc_key_filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneDocKeysAlloc(alloc, &.{ "doc:a", "doc:b" }),
+    };
+    defer doc_key_filter.deinit(alloc);
+
+    var composed = (try db.resolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &doc_key_filter,
+        .filter_doc_ids_positive = true,
+        .filter_doc_ids = &.{"doc:b"},
+    })) orelse return error.TestUnexpectedResult;
+    defer composed.deinit(alloc);
+
+    switch (composed.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var partial_doc_key_filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneDocKeysAlloc(alloc, &.{ "doc:a", "missing" }),
+    };
+    defer partial_doc_key_filter.deinit(alloc);
+    try std.testing.expect((try db.resolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &partial_doc_key_filter,
+        .filter_doc_ids_positive = true,
+        .filter_doc_ids = &.{"doc:a"},
+    })) == null);
+}
+
+test "db vector full text filters project through doc identity ordinals" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"reject winner\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"keep winner\",\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectEqual(@as(?u64, denseTestVectorId("doc:b")), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
+
+    var dense_filtered = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_filtered.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_filtered.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_filtered.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.profile.raw_hit_count);
+
+    var sparse_filtered = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+    });
+    defer sparse_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_filtered.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_filtered.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_filtered.hits[0].id);
+
+    var dense_empty_text_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"absent\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_empty_text_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), dense_empty_text_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), dense_empty_text_filter.result.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), dense_empty_text_filter.profile.raw_hit_count);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_set_planning.missing_ordinal_coverage_count);
+}
+
+test "db non chunked search paths apply broad live doc filter" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha only\",\"embedding\":[0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta only\",\"embedding\":[10,0],\"sparse\":{\"indices\":[8],\"values\":[1.0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_store_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(doc_a_store_key);
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
+        try txn.commit();
+    }
+
+    var dense_live = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_live.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_live.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_live.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_live.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_live.profile.raw_hit_count);
+
+    var sparse_live = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{7},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .include_stored = false,
+    });
+    defer sparse_live.deinit();
+    try std.testing.expectEqual(@as(u32, 0), sparse_live.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), sparse_live.hits.len);
+
+    var text_live = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .include_stored = false,
+    });
+    defer text_live.deinit();
+    try std.testing.expectEqual(@as(u32, 0), text_live.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), text_live.hits.len);
+}
+
 test "db status_only open reads index catalog without loading index state" {
     const alloc = std.testing.allocator;
 
@@ -15879,6 +18581,11 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
     try std.testing.expectEqual(@as(u32, 1), dense_result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), dense_result.hits.len);
     try std.testing.expectEqualStrings("doc:b", dense_result.hits[0].id);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"), dense_result.hits[0].doc_ordinal);
+    }
 
     var sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -15918,6 +18625,11 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
         .config_json = "{\"field\":\"sparse\"}",
     });
     try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
         .name = "alg",
         .kind = .algebraic,
         .config_json =
@@ -15940,8 +18652,8 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"category\":\"reject\",\"published\":false,\"ip\":\"192.168.1.10\",\"score\":1.0,\"code\":\"drop\",\"meta\":{\"tier\":\"bronze\"},\"location\":{\"lat\":40.7128,\"lon\":-74.0060},\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
-            .{ .key = "doc:b", .value = "{\"category\":\"keep\",\"published\":true,\"ip\":\"10.1.2.3\",\"score\":5.0,\"code\":\"keep-code\",\"meta\":{\"tier\":\"gold\"},\"location\":{\"lat\":37.7749,\"lon\":-122.4194},\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
+            .{ .key = "doc:a", .value = "{\"body\":\"shared token\",\"category\":\"reject\",\"published\":false,\"ip\":\"192.168.1.10\",\"score\":1.0,\"code\":\"drop\",\"meta\":{\"tier\":\"bronze\"},\"location\":{\"lat\":40.7128,\"lon\":-74.0060},\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"shared token\",\"category\":\"keep\",\"published\":true,\"ip\":\"10.1.2.3\",\"score\":5.0,\"code\":\"keep-code\",\"meta\":{\"tier\":\"gold\"},\"location\":{\"lat\":37.7749,\"lon\":-122.4194},\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
         },
         .sync_level = .full_index,
     });
@@ -16001,6 +18713,71 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
         try std.testing.expectEqual(@as(u64, 2), status_value.vector_filter_attempt_count);
         try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
         try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_fail_closed_count);
+    }
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.doc_set_planning.unsupported_filter_shape_count >= 1);
+    }
+
+    const binding_defs = [_]types.NamedDocFilterBinding{
+        .{ .name = "kept", .filter_query_json = "{\"term\":{\"category\":\"keep\"}}" },
+        .{ .name = "published", .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}" },
+    };
+    var sparse_with_binding = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 2,
+        .include_stored = false,
+        .doc_filter_bindings = binding_defs[0..],
+        .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"kept\"},{\"ref\":\"published\"}]}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer sparse_with_binding.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_with_binding.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_with_binding.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_with_binding.hits[0].id);
+
+    var full_text_with_binding = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "shared" } },
+        .limit = 2,
+        .include_stored = false,
+        .doc_filter_bindings = binding_defs[0..],
+        .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"kept\"},{\"ref\":\"published\"}]}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer full_text_with_binding.deinit();
+    try std.testing.expectEqual(@as(u32, 1), full_text_with_binding.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), full_text_with_binding.hits.len);
+    try std.testing.expectEqualStrings("doc:b", full_text_with_binding.hits[0].id);
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 4), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 3), status_value.vector_filter_resolved_count);
+    }
+
+    var full_text_direct_algebraic = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "shared" } },
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer full_text_direct_algebraic.deinit();
+    try std.testing.expectEqual(@as(u32, 1), full_text_direct_algebraic.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), full_text_direct_algebraic.hits.len);
+    try std.testing.expectEqualStrings("doc:b", full_text_direct_algebraic.hits[0].id);
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 5), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 4), status_value.vector_filter_resolved_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
     }
 
     var dense_terms = try db.searchDenseProfiled(alloc, .{
@@ -18378,6 +21155,37 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     try std.testing.expectEqual(@as(u32, 1), sparse_result.total_hits);
     try std.testing.expectEqualStrings("doc:a", sparse_result.hits[0].id);
     try std.testing.expect(sparse_result.hits[0].stored_data != null);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, ordinal), sparse_result.hits[0].doc_ordinal);
+    }
+
+    const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_store_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(doc_a_store_key);
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
+        try txn.commit();
+    }
+
+    var stale_sparse_result = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = sparse_query.indices,
+            .values = sparse_query.values,
+            .k = 3,
+        } },
+        .return_mode = .chunk,
+        .limit = 3,
+        .include_stored = false,
+    });
+    defer stale_sparse_result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_sparse_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), stale_sparse_result.hits.len);
 }
 
 test "db sparse enrichment skips unchanged source hash" {
@@ -20530,6 +23338,38 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     defer alloc.free(chunk_zero);
     try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
 
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    errdefer include.deinit(alloc);
+    const ordinal = switch (include) {
+        .ordinals => |ordinals| blk: {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            break :blk ordinals[0];
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    };
+    const vector_ids = try db.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, db.core.store, "dv_v1", &.{ordinal});
+    defer alloc.free(vector_ids);
+    try std.testing.expect(vector_ids.len >= 2);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    var filtered_chunk_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 3,
+        .include_stored = false,
+        .return_mode = .parent,
+        .resolved_doc_filter = &filter,
+    }, .{ .vector = query_vec, .k = 3 });
+    defer filtered_chunk_result.result.deinit();
+    try std.testing.expect(filtered_chunk_result.profile.raw_hit_count >= 2);
+    try std.testing.expectEqual(@as(u32, 1), filtered_chunk_result.result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", filtered_chunk_result.result.hits[0].id);
+
     var parent_result = try db.search(alloc, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 3 },
@@ -20550,6 +23390,34 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
     try std.testing.expectEqualStrings(chunk_zero, parent_with_chunks.hits[0].chunk_hits[0].id);
+
+    const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_store_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(doc_a_store_key);
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
+        try txn.commit();
+    }
+
+    var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 3,
+        .include_stored = false,
+        .return_mode = .chunk,
+    }, .{ .vector = query_vec, .k = 3 });
+    defer stale_chunk_result.result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_chunk_result.result.total_hits);
+    try std.testing.expectEqual(@as(u32, 0), stale_chunk_result.profile.raw_hit_count);
+
+    var stale_parent_result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent,
+    });
+    defer stale_parent_result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_parent_result.total_hits);
 }
 
 test "db dense chunk consumer supports parent and parent_with_chunks modes with durable lsm primary backend" {
@@ -22786,6 +25654,10 @@ test "db sparse vector index routes knn search" {
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "doc:a")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
 }
 
 test "db sparse vector index routes knn search with durable lsm primary backend" {
@@ -22946,6 +25818,50 @@ test "db direct graph writes persist graph artifacts and deletes remove them" {
     const after_delete = try db.core.scanStorePrefix(alloc, prefix);
     defer docstore_mod.DocStore.freeResults(alloc, after_delete);
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "db delete artifact cleanup isolates binary document id prefixes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const first_doc = "doc\x00a";
+    const second_doc = "doc\x00a:child";
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = first_doc, .value = "{\"title\":\"first\"}" },
+            .{ .key = second_doc, .value = "{\"title\":\"second\"}" },
+        },
+    });
+
+    const first_artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, first_doc, "dense\x00idx");
+    defer alloc.free(first_artifact);
+    const second_artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, second_doc, "dense\x00idx");
+    defer alloc.free(second_artifact);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, first_artifact, null, &.{ 1.0, 0.0 });
+    try putDenseEmbeddingArtifactForTest(&db, alloc, second_artifact, null, &.{ 0.0, 1.0 });
+
+    try db.batch(.{ .deletes = &.{first_doc} });
+
+    try std.testing.expect((try db.get(alloc, first_doc)) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, first_artifact));
+
+    const remaining_doc = (try db.get(alloc, second_doc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(remaining_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"second\"}", remaining_doc);
+
+    const remaining_artifact = try db.core.store.get(alloc, second_artifact);
+    defer alloc.free(remaining_artifact);
+    try expectDenseEmbeddingArtifactValue(alloc, remaining_artifact, null, 2);
 }
 
 test "db graph index routes neighbor queries and doc deletes clean edges with durable lsm primary backend" {
@@ -23450,6 +26366,75 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
     try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
+test "db dense artifact rebuild preserves stable vector ids distinct from ordinals" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 2), ordinal);
+        const stable_vector_id = denseTestVectorId("doc:b");
+        try std.testing.expect(stable_vector_id != @as(u64, ordinal));
+        try std.testing.expectEqual(@as(?u64, stable_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dense_idx", "doc:b"));
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expectEqual(@as(usize, 2), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+
+    var txn = try reopened.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    const stable_vector_id = denseTestVectorId("doc:b");
+    try std.testing.expect(stable_vector_id != @as(u64, ordinal));
+    try std.testing.expectEqual(@as(?u64, stable_vector_id), try reopened.core.index_manager.lookupDenseVectorId(reopened.core.store, "dense_idx", "doc:b"));
+
+    const vector_ids = try reopened.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, reopened.core.store, "dense_idx", &.{ordinal});
+    defer alloc.free(vector_ids);
+    try std.testing.expectEqual(@as(usize, 1), vector_ids.len);
+    try std.testing.expectEqual(stable_vector_id, vector_ids[0]);
+
+    const dense_entry = reopened.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    const stable_metadata = (try dense_entry.index.getMetadata(stable_vector_id)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(stable_metadata);
+    try std.testing.expectEqualStrings("doc:b", stable_metadata);
+    try std.testing.expectEqual(@as(?[]u8, null), try dense_entry.index.getMetadata(@as(u64, ordinal)));
 }
 
 test "db dense artifact rebuild force-resets corrupt external dense structure" {
@@ -24230,7 +27215,7 @@ test "db search supports graph result_ref from full-text hits" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 5 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
                     .params = .{ .direction = .out, .edge_types = &.{"cites"} },
                 },
             },
@@ -24245,6 +27230,117 @@ test "db search supports graph result_ref from full-text hits" {
     try std.testing.expectEqualStrings("citations", result.graph_results[0].name);
     try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
     try std.testing.expectEqualStrings("paper:2", result.graph_results[0].hits[0].id);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_count >= 1);
+}
+
+test "db search supports graph result_ref from dense hits without public id handoff" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\"}",
+    });
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "paper:1", .value = "{\"embedding\":[1,0],\"_edges\":{\"gr_v1\":{\"cites\":[{\"target\":\"paper:2\",\"weight\":1.0}]}}}" },
+            .{ .key = "paper:2", .value = "{\"embedding\":[0,1]}" },
+            .{ .key = "paper:3", .value = "{\"embedding\":[-1,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 },
+        .graph_queries = &.{
+            .{
+                .name = "citations",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 0 } },
+                    .params = .{ .direction = .out, .edge_types = &.{"cites"} },
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(result.total_hits >= 1);
+    try std.testing.expect(result.hits.len >= 1);
+    try std.testing.expectEqualStrings("paper:1", result.hits[0].id);
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    try std.testing.expectEqual(try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "paper:1"), result.hits[0].doc_ordinal);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqualStrings("citations", result.graph_results[0].name);
+    try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("paper:2", result.graph_results[0].hits[0].id);
+}
+
+test "db search rejects unbounded graph result_ref when base result is paged" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "paper:1", .value = "{\"title\":\"intro\",\"body\":\"machine learning systems\",\"_edges\":{\"gr_v1\":{\"cites\":[{\"target\":\"paper:3\",\"weight\":1.0}]}}}" },
+            .{ .key = "paper:2", .value = "{\"title\":\"followup\",\"body\":\"machine learning ranking\",\"_edges\":{\"gr_v1\":{\"cites\":[{\"target\":\"paper:3\",\"weight\":1.0}]}}}" },
+            .{ .key = "paper:3", .value = "{\"title\":\"target\",\"body\":\"graph traversal\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "machine" } },
+        .index_name = "ft_v1",
+        .graph_queries = &.{
+            .{
+                .name = "citations",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
+                    .params = .{ .direction = .out, .edge_types = &.{"cites"} },
+                },
+            },
+        },
+        .limit = 1,
+    }));
 }
 
 test "db search supports graph-only named queries" {
@@ -24292,6 +27388,92 @@ test "db search supports graph-only named queries" {
     try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
     try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
     try std.testing.expectEqualStrings("n:b", result.graph_results[0].hits[0].id);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_count >= 1);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_docs >= 1);
+}
+
+test "db named graph input sets carry resolved doc sets" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "n:a", .value = "{\"title\":\"A\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"}]}}}" },
+            .{ .key = "n:b", .value = "{\"title\":\"B\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const graph_queries = [_]types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "gr_v1",
+            .start_nodes = .{ .result_ref = .{ .ref = "seed", .limit = 0 } },
+            .params = .{ .direction = .out, .edge_types = &.{"links"} },
+        },
+    }};
+    const input_sets = [_]types.NamedGraphInputSet{.{
+        .name = "seed",
+        .hit_ids = &.{"n:a"},
+    }};
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{}, &graph_queries, &input_sets));
+
+    const current_generation = db.core.nextDerivedSequence();
+    const seed_hits = try db.graphInputSetHitsAlloc(alloc, &.{"n:a"}, current_generation);
+    defer {
+        for (seed_hits) |*hit| hit.deinit(alloc);
+        if (seed_hits.len > 0) alloc.free(seed_hits);
+    }
+    const seed_ordinal = seed_hits[0].doc_ordinal orelse return error.TestUnexpectedResult;
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, seed_ordinal), try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "n:a"));
+
+    const results = try db.executeNamedGraphQueries(alloc, .{
+        .identity_read_generation = current_generation,
+    }, &graph_queries, &input_sets);
+    defer {
+        for (results) |*result| result.deinit(alloc);
+        if (results.len > 0) alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(u32, 1), results[0].total_hits);
+    try std.testing.expectEqualStrings("n:b", results[0].hits[0].id);
+    try std.testing.expectEqual(try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "n:b"), results[0].hits[0].doc_ordinal);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_count >= 1);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_docs >= 1);
+
+    const paged_input_sets = [_]types.NamedGraphInputSet{.{
+        .name = "seed",
+        .hit_ids = &.{"n:a"},
+        .total_hits = 2,
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{
+        .identity_read_generation = current_generation,
+    }, &graph_queries, &paged_input_sets));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{
+        .identity_read_generation = current_generation -| 1,
+    }, &graph_queries, &input_sets));
 }
 
 test "db search supports fused graph selectors for single-lane full-text searches" {
@@ -25710,6 +28892,113 @@ test "db force compacts text index to one searchable segment" {
     try std.testing.expectEqual(@as(u32, 11), result.total_hits);
     for (result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:3"));
+    }
+}
+
+test "db text compaction preserves ordinal filters across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const expected_ordinal: doc_set.DocOrdinal = 9;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        for (0..12) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
+            defer alloc.free(value);
+
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .full_index,
+            });
+        }
+
+        var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
+        errdefer include.deinit(alloc);
+        const resolved_ordinal = switch (include) {
+            .ordinals => |ordinals| blk: {
+                try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+                break :blk ordinals[0];
+            },
+            else => return error.ExpectedOrdinalDocSet,
+        };
+        try std.testing.expectEqual(expected_ordinal, resolved_ordinal);
+
+        var filter = doc_set.ResolvedDocFilter{
+            .include = include,
+            .exclude = .none,
+        };
+        include = .all;
+        defer filter.deinit(alloc);
+
+        try db.forceCompactTextIndexes();
+
+        const text_index = db.core.index_manager.textIndex("ft_v1").?;
+        try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+
+        var result = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "common" } },
+            .limit = 20,
+            .resolved_doc_filter = &filter,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("doc:8", result.hits[0].id);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, expected_ordinal), result.hits[0].doc_ordinal);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        var include = try reopened.resolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
+        errdefer include.deinit(alloc);
+        const resolved_ordinal = switch (include) {
+            .ordinals => |ordinals| blk: {
+                try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+                break :blk ordinals[0];
+            },
+            else => return error.ExpectedOrdinalDocSet,
+        };
+        try std.testing.expectEqual(expected_ordinal, resolved_ordinal);
+
+        var filter = doc_set.ResolvedDocFilter{
+            .include = include,
+            .exclude = .none,
+        };
+        include = .all;
+        defer filter.deinit(alloc);
+
+        const text_index = reopened.core.index_manager.textIndex("ft_v1").?;
+        try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "common" } },
+            .limit = 20,
+            .resolved_doc_filter = &filter,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("doc:8", result.hits[0].id);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, expected_ordinal), result.hits[0].doc_ordinal);
     }
 }
 
@@ -27756,6 +31045,24 @@ test "db writes and reads timestamp metadata" {
 
     const ts = try db.getTimestamp(alloc, "doc:a");
     try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_000), ts);
+
+    const first_doc = "doc\x00ttl";
+    const second_doc = "doc\x00ttl:child";
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = first_doc, .value = "{\"title\":\"first\"}" },
+            .{ .key = second_doc, .value = "{\"title\":\"second\"}" },
+        },
+        .timestamp_ns = 1_700_000_000_000_000_101,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, first_doc));
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, second_doc));
+
+    try db.batch(.{ .deletes = &.{first_doc} });
+
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, first_doc));
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, second_doc));
 }
 
 test "db lookup hides expired documents when ttl schema is configured" {
@@ -27935,6 +31242,16 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     try waitForRawDelete(alloc, &db, "doc:expired", 200);
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.tombstone_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+        try std.testing.expect(!stats.doc_identity.rebuild_required);
+    }
 
     try db.setSchema(.{
         .version = 1,
@@ -28198,6 +31515,118 @@ test "db exposes local transaction lifecycle" {
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", raw);
     try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "doc:txn"));
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
+
+    const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try db.writeIntents(delete_txn, &.{
+        .{ .key = "doc:txn", .value = null },
+    }, &.{});
+    try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect((try db.get(alloc, "doc:txn")) == null);
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.tombstone_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
+}
+
+test "db transaction intent writes reject new documents at ordinal exhaustion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing_txn", .value = "{\"name\":\"existing\"}" }},
+        .sync_level = .write,
+    });
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    const existing_txn = try db.beginTransaction(11_000);
+    try db.writeIntents(existing_txn, &.{
+        .{ .key = "doc:existing_txn", .value = "{\"name\":\"updated\"}" },
+    }, &.{});
+    try db.commitTransaction(existing_txn, 11_001);
+
+    const existing = (try db.get(alloc, "doc:existing_txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(existing);
+    try std.testing.expectEqualStrings("{\"name\":\"updated\"}", existing);
+
+    const direct_txn = try db.beginTransaction(12_000);
+    try std.testing.expectError(error.DocOrdinalExhausted, db.writeIntents(direct_txn, &.{
+        .{ .key = "doc:new_direct_txn", .value = "{\"name\":\"new\"}" },
+    }, &.{}));
+    try db.abortTransaction(direct_txn, 12_001);
+    try std.testing.expect((try db.get(alloc, "doc:new_direct_txn")) == null);
+
+    const request_txn = try db.beginTransaction(13_000);
+    try std.testing.expectError(error.DocOrdinalExhausted, db.writeTransaction(request_txn, .{
+        .writes = &.{.{ .key = "doc:new_request_txn", .value = "{\"name\":\"new\"}" }},
+    }));
+    try db.abortTransaction(request_txn, 13_001);
+    try std.testing.expect((try db.get(alloc, "doc:new_request_txn")) == null);
+}
+
+test "db transaction-created identity rows remain visible after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const txn_id = try db.beginTransaction(21_000);
+        try db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:txn_reopen", .value = "{\"title\":\"txn\"}" }},
+        });
+        try db.commitTransaction(txn_id, 21_001);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const raw = (try db.get(alloc, "doc:txn_reopen")) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("{\"title\":\"txn\"}", raw);
+
+        const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
+        var resolved = try db.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, &.{"doc:txn_reopen"}, current.identity_read_generation);
+        defer resolved.deinit(alloc);
+        try std.testing.expect(resolved.containsOrdinal(1));
+
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
 }
 
 test "db batch resolves transforms against pending same-batch writes" {
@@ -29207,6 +32636,8 @@ test "db transaction recovery runtime resolves participants and unblocks cleanup
         },
     });
     defer db.close();
+    try std.testing.expect(db.transaction_recovery_identity_context != null);
+    try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
 
     var cleared = false;
     var attempts: usize = 0;
@@ -29251,6 +32682,78 @@ test "db transaction recovery runtime resolves participants and unblocks cleanup
     if (!stats_ready) return error.TransactionRecoveryStatsTimeout;
     try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
     if (!resolver_called) return error.TransactionRecoveryResolverTimeout;
+}
+
+test "db transaction recovery runtime appends identity rows for committed orphaned intents" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const txn_id = try setup_db.beginTransaction(1_000);
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:recovered_orphan", .value = "{\"title\":\"recovered\"}" }},
+        });
+
+        const record_key = blk_key: {
+            const prefix = "\x00\x00__txn_records__:";
+            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+            @memcpy(key[0..prefix.len], prefix);
+            @memcpy(key[prefix.len..], &txn_id);
+            break :blk_key key;
+        };
+        var record_value: [33]u8 = undefined;
+        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+        std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
+        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+        std.mem.writeInt(u64, record_value[25..33], 2_000, .little);
+        try setup_db.core.store.put(record_key[0..], record_value[0..]);
+        break :blk txn_id;
+    };
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    var cleaned = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        }
+        sleepPollInterval();
+    }
+    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
+
+    const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
 }
 
 test "db batch enforces optimistic version predicates" {
@@ -29441,7 +32944,10 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     const dest = tempPath(&dest_buf);
     defer cleanupTempDir(dest);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    const identity_namespace = doc_identity.Namespace{ .table_id = 71, .shard_id = 101, .range_id = 1001 };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = identity_namespace,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -29476,6 +32982,18 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
     try std.testing.expect((try split_db.getSplitState(alloc)) == null);
+    {
+        const split_stats = try split_db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, split_stats);
+        try std.testing.expectEqual(identity_namespace.table_id, split_stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(identity_namespace.shard_id, split_stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(identity_namespace.range_id, split_stats.doc_identity.namespace_range_id);
+        try std.testing.expectEqual(@as(u32, 3), split_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), split_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), split_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), split_stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), split_stats.doc_identity.primary_docs_missing_identity_state);
+    }
 
     const split_doc = (try split_db.get(alloc, "doc:z")) orelse return error.TestExpectedEqual;
     defer alloc.free(split_doc);
@@ -29500,6 +33018,27 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     defer split_sparse.deinit();
     try std.testing.expectEqual(@as(u32, 1), split_sparse.total_hits);
     try std.testing.expectEqualStrings("doc:z", split_sparse.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), split_sparse.hits[0].doc_ordinal);
+
+    var split_filtered = try split_db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:z"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer split_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), split_filtered.total_hits);
+    try std.testing.expectEqualStrings("doc:z", split_filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), split_filtered.hits[0].doc_ordinal);
+
+    var split_filtered_left_doc = try split_db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:a"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer split_filtered_left_doc.deinit();
+    try std.testing.expectEqual(@as(u32, 0), split_filtered_left_doc.total_hits);
 
     const split_incoming = try split_db.getEdges(alloc, "graph_v1", "doc:y", "cites", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, split_incoming);
@@ -29509,6 +33048,18 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
     try std.testing.expectEqualStrings("doc:m", db.getRange().end);
     try std.testing.expect((try db.get(alloc, "doc:z")) == null);
+    {
+        const parent_stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, parent_stats);
+        try std.testing.expectEqual(identity_namespace.table_id, parent_stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(identity_namespace.shard_id, parent_stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(identity_namespace.range_id, parent_stats.doc_identity.namespace_range_id);
+        try std.testing.expectEqual(@as(u32, 3), parent_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), parent_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), parent_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), parent_stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), parent_stats.doc_identity.primary_docs_missing_identity_state);
+    }
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -29529,6 +33080,18 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     defer parent_sparse.deinit();
     try std.testing.expectEqual(@as(u32, 1), parent_sparse.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_sparse.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), parent_sparse.hits[0].doc_ordinal);
+
+    var parent_filtered = try db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:a"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer parent_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_filtered.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), parent_filtered.hits[0].doc_ordinal);
 
     var removed = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -29592,6 +33155,14 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     });
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
+    {
+        const split_stats = try split_db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, split_stats);
+        try std.testing.expectEqual(@as(u32, 3), split_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), split_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), split_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), split_stats.doc_identity.primary_docs_missing_ordinals);
+    }
 
     const split_doc = (try split_db.get(alloc, "doc:z")) orelse return error.TestExpectedEqual;
     defer alloc.free(split_doc);
@@ -29607,6 +33178,14 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
     try std.testing.expectEqualStrings("doc:m", db.getRange().end);
     try std.testing.expect((try db.get(alloc, "doc:z")) == null);
+    {
+        const parent_stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, parent_stats);
+        try std.testing.expectEqual(@as(u32, 3), parent_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), parent_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), parent_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), parent_stats.doc_identity.primary_docs_missing_ordinals);
+    }
 
     var removed = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -31684,6 +35263,120 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
+test "db restore snapshot rejects invalid doc identity metadata" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:bad-identity", .value = "{\"title\":\"bad\"}" }},
+        });
+
+        const state_key = internal_keys.identityOrdinalStateKey(1);
+        var corrupt_state: [25]u8 = undefined;
+        std.mem.writeInt(u64, corrupt_state[0..8], 0xdead_beef, .big);
+        std.mem.writeInt(u64, corrupt_state[8..16], 1, .big);
+        corrupt_state[16] = 0;
+        @memset(corrupt_state[17..25], 0);
+        try db.core.store.putBatch(&.{.{ .key = state_key[0..], .value = corrupt_state[0..] }}, &.{});
+
+        _ = try db.snapshot("snap1");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    try std.testing.expectError(error.InvalidDocIdentity, DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+    }));
+}
+
+test "db deferred restore rejects strict doc identity namespace mismatch" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const source_namespace = doc_identity.Namespace{
+        .table_id = 10,
+        .shard_id = 11,
+        .range_id = 12,
+    };
+    const target_namespace = doc_identity.Namespace{
+        .table_id = 10,
+        .shard_id = 99,
+        .range_id = 100,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .identity_namespace = source_namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:restore", .value = "{\"title\":\"restore\"}" }},
+        });
+        _ = try db.snapshot("snap1");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepair(
+        alloc,
+        snapshot_root,
+        std.mem.span(restore_path),
+        .{
+            .primary_backend = primary_backend,
+            .identity_namespace = target_namespace,
+        },
+        .{
+            .backup_id = "backup-a",
+            .location = "local",
+            .snapshot_path = "snap1",
+            .group_id = 99,
+        },
+    ));
+}
+
 test "db restore snapshot recreates text sparse and graph indexes for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -32246,6 +35939,8 @@ fn applyStoredSearchPatternFilters(self: *DB, alloc: Allocator, req: types.Searc
     return try db_query_result_shape.applyStoredSearchPatternFilters(alloc, req, result, .{
         .ctx = self,
         .load_stored = loadStoredSearchDocumentCallback,
+        .resolve_doc_set_doc_ids = DB.resolveDocSetDocIdsCallback,
+        .resolve_doc_ids_to_doc_set = DB.resolveDocIdsToDocSetCallback,
     });
 }
 

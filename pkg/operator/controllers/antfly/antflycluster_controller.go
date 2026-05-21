@@ -1979,15 +1979,6 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 	if swarm == nil {
 		return fmt.Errorf("spec.swarm is required when spec.mode=Swarm")
 	}
-	termiteEnabled := swarm.Termite == nil || swarm.Termite.Enabled
-	termiteArgs := "--termite=false"
-	if termiteEnabled {
-		termiteArgs = "--termite"
-		if swarm.Termite != nil && swarm.Termite.APIURL != "" {
-			termiteArgs = fmt.Sprintf("%s --termite-api-url %s", termiteArgs, swarm.Termite.APIURL)
-		}
-	}
-
 	replicas := swarm.Replicas
 	if replicas == 0 {
 		replicas = 1
@@ -2100,23 +2091,13 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 						Args: []string{
 							fmt.Sprintf(`
 exec /antfly swarm --id %d --config /config/config.json \
-  --metadata-api http://0.0.0.0:%d \
-  --metadata-raft http://0.0.0.0:%d \
-  --metadata-cluster '{ "%s": "http://0.0.0.0:%d" }' \
-  --store-api http://0.0.0.0:%d \
-  --store-raft http://0.0.0.0:%d \
-  --health-port %d \
-  %s
+  --host 0.0.0.0 \
+  --port %d \
+  --health-port %d
 							`,
 								swarm.NodeID,
 								swarm.MetadataAPI.Port,
-								swarm.MetadataRaft.Port,
-								strconv.FormatInt(int64(swarm.NodeID), 16),
-								swarm.MetadataRaft.Port,
-								swarm.StoreAPI.Port,
-								swarm.StoreRaft.Port,
 								swarm.Health.Port,
-								termiteArgs,
 							),
 						},
 						Resources: r.buildResourceRequirements(swarm.Resources),
@@ -2330,8 +2311,10 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 ORDINAL=${HOSTNAME##*-}
 ID=$((ORDINAL + 1))
 exec /antfly metadata --id $ID --config /config/config.json \
-  --api http://0.0.0.0:%d \
-  --raft http://0.0.0.0:%d \
+  --api-host 0.0.0.0 \
+  --api-port %d \
+  --raft-host 0.0.0.0 \
+  --raft-port %d \
   --health-port %d \
   --cluster '%s'
 							`,
@@ -2535,22 +2518,31 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								MountPath: "/config",
 							},
 						},
+						Env: []corev1.EnvVar{
+							{
+								Name: "POD_IP",
+								ValueFrom: &corev1.EnvVarSource{
+									FieldRef: &corev1.ObjectFieldSelector{
+										FieldPath: "status.podIP",
+									},
+								},
+							},
+						},
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
 ORDINAL=${HOSTNAME##*-}
 ID=$((ORDINAL + 1))
-exec /antfly store --id $ID --config /config/config.json \
-  --api http://0.0.0.0:%d \
-  --raft http://0.0.0.0:%d \
-  --health-port %d \
-  --service ${HOSTNAME}.%s-data.%s.svc.cluster.local
+exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
+  --api-host ${POD_IP} \
+  --api-port %d \
+  --raft-host ${POD_IP} \
+  --raft-port %d \
+  --health-port %d
 							`,
 								cluster.Spec.DataNodes.API.Port,
 								cluster.Spec.DataNodes.Raft.Port,
 								cluster.Spec.DataNodes.Health.Port,
-								cluster.Name,
-								cluster.Namespace,
 							),
 						},
 						Resources: r.buildResourceRequirements(cluster.Spec.DataNodes.Resources),

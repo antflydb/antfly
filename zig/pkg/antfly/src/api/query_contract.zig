@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
 const db_mod = @import("../storage/db/mod.zig");
 const document_query = @import("../storage/db/document_query.zig");
@@ -40,6 +41,20 @@ pub const QueryResponse = struct {
         self.* = undefined;
     }
 };
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn bodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+        return queryBodyHasInternalShardFields(alloc, body);
+    }
+
+    pub fn bodyHasForbiddenPublicDocIdentityControls(alloc: std.mem.Allocator, body: []const u8) !bool {
+        return queryBodyHasForbiddenPublicDocIdentityControlFields(alloc, body);
+    }
+
+    pub fn bodyHasPublicDocFilterBindings(alloc: std.mem.Allocator, body: []const u8) !bool {
+        return queryBodyHasPublicDocFilterBindings(alloc, body);
+    }
+} else struct {};
 
 pub const QueryResponseMeta = struct {
     pub const RerankerProfile = struct {
@@ -189,6 +204,19 @@ fn appendJsonFieldUsize(
     try out.appendSlice(alloc, rendered);
 }
 
+fn appendJsonFieldU64(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    name: []const u8,
+    value: u64,
+) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
@@ -244,6 +272,7 @@ pub const AlgebraicVectorWorkerRequestOptions = struct {
     distance_under: ?f32 = null,
     return_mode: db_mod.types.ReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
+    identity_read_generation: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.fields) |field| alloc.free(field);
@@ -263,6 +292,8 @@ pub const OwnedAlgebraicVectorWorkerRequestEnvelope = struct {
     query: OwnedAlgebraicVectorWorkerQuery,
     options: AlgebraicVectorWorkerRequestOptions = .{},
     native_doc_id_constraints: OwnedNativeDocIdConstraintEnvelope,
+    resolved_doc_filter: ?*const anyopaque = null,
+    resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
     tensor_access_paths: []OwnedAlgebraicTensorAccessPathEnvelope,
     tensor_program: OwnedAlgebraicTensorProgramEnvelope,
 
@@ -271,6 +302,7 @@ pub const OwnedAlgebraicVectorWorkerRequestEnvelope = struct {
         self.query.deinit(alloc);
         self.options.deinit(alloc);
         self.native_doc_id_constraints.deinit(alloc);
+        if (self.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
         for (self.tensor_access_paths) |*path| path.deinit(alloc);
         if (self.tensor_access_paths.len > 0) alloc.free(self.tensor_access_paths);
         self.tensor_program.deinit(alloc);
@@ -861,6 +893,8 @@ pub fn encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
     query: AlgebraicVectorWorkerQuery,
     options: AlgebraicVectorWorkerRequestOptions,
     native_doc_id_constraints: NativeDocIdConstraintEnvelope,
+    resolved_doc_filter: ?*const anyopaque,
+    resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext,
     tensor_access_paths: []const algebraic_ir.PhysicalAccessPath,
     tensor_program: algebraic_ir.TensorProgram,
 ) ![]u8 {
@@ -896,6 +930,12 @@ pub fn encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
     const encoded_constraints = try encodeNativeDocIdConstraintEnvelopeAlloc(alloc, native_doc_id_constraints);
     defer alloc.free(encoded_constraints);
     try out.appendSlice(alloc, encoded_constraints);
+    if (resolved_doc_filter) |ptr| {
+        try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &first, .{
+            .resolved_doc_filter = ptr,
+            .resolved_doc_filter_wire_context = resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest,
+        });
+    }
     try appendJsonFieldName(alloc, &out, &first, "tensor_access_paths");
     try out.append(alloc, '[');
     for (tensor_access_paths, 0..) |access_path, i| {
@@ -945,6 +985,19 @@ pub fn parseAlgebraicVectorWorkerRequestEnvelopeAlloc(
         OwnedNativeDocIdConstraintEnvelope{ .constraints = .{} };
     errdefer native_doc_id_constraints.deinit(alloc);
 
+    var resolved_req = db_mod.types.SearchRequest{};
+    if (root.object.get(db_mod.doc_filter_wire.field_name)) |value| {
+        try db_mod.doc_filter_wire.parseIntoSearchRequestAlloc(alloc, value, &resolved_req);
+    }
+    errdefer if (resolved_req.resolved_doc_filter_owned) db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, resolved_req.resolved_doc_filter.?);
+    if (resolved_req.identity_read_generation) |generation| {
+        if (options.identity_read_generation) |existing| {
+            if (existing != generation) return error.InvalidQueryRequest;
+        } else {
+            options.identity_read_generation = generation;
+        }
+    }
+
     const access_path_value = root.object.get("tensor_access_paths") orelse return error.InvalidQueryRequest;
     if (access_path_value != .array) return error.InvalidQueryRequest;
     const tensor_access_paths = try alloc.alloc(OwnedAlgebraicTensorAccessPathEnvelope, access_path_value.array.items.len);
@@ -972,10 +1025,14 @@ pub fn parseAlgebraicVectorWorkerRequestEnvelopeAlloc(
         .query = query,
         .options = options,
         .native_doc_id_constraints = native_doc_id_constraints,
+        .resolved_doc_filter = resolved_req.resolved_doc_filter,
+        .resolved_doc_filter_wire_context = resolved_req.resolved_doc_filter_wire_context,
         .tensor_access_paths = tensor_access_paths,
         .tensor_program = tensor_program,
     };
     if (!(try envelope.proveTensorProgramAlloc(alloc)).safe()) return error.InvalidQueryRequest;
+    resolved_req.resolved_doc_filter = null;
+    resolved_req.resolved_doc_filter_owned = false;
     return envelope;
 }
 
@@ -1037,6 +1094,7 @@ fn appendAlgebraicVectorWorkerRequestOptions(
     if (options.distance_under) |value| try appendJsonFieldF32(alloc, out, &first, "distance_under", value);
     if (options.return_mode != .parent) try appendJsonFieldString(alloc, out, &first, "return_mode", @tagName(options.return_mode));
     if (options.max_chunks_per_parent != 0) try appendJsonFieldUsize(alloc, out, &first, "max_chunks_per_parent", options.max_chunks_per_parent);
+    if (options.identity_read_generation) |generation| try appendJsonFieldU64(alloc, out, &first, "identity_read_generation", generation);
     try out.append(alloc, '}');
 }
 
@@ -1105,6 +1163,7 @@ fn parseAlgebraicVectorWorkerRequestOptions(alloc: std.mem.Allocator, value: std
         .distance_under = try parseOptionalF32Json(value.object.get("distance_under")),
         .return_mode = try parseOptionalReturnModeJson(value.object.get("return_mode")),
         .max_chunks_per_parent = try parseOptionalU32Json(value.object.get("max_chunks_per_parent"), 0),
+        .identity_read_generation = try parseOptionalU64Json(value.object.get("identity_read_generation")),
     };
 }
 
@@ -1204,6 +1263,12 @@ fn parseOptionalU32Json(value_opt: ?std.json.Value, default_value: u32) !u32 {
     const value = value_opt orelse return default_value;
     if (value != .integer or value.integer < 0) return error.InvalidQueryRequest;
     return std.math.cast(u32, value.integer) orelse return error.InvalidQueryRequest;
+}
+
+fn parseOptionalU64Json(value_opt: ?std.json.Value) !?u64 {
+    const value = value_opt orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidQueryRequest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidQueryRequest;
 }
 
 fn parseOptionalBoolJson(value_opt: ?std.json.Value, default_value: bool) !bool {
@@ -1708,6 +1773,7 @@ pub fn parseQueryRequest(
     body: []const u8,
 ) !OwnedQueryRequest {
     if (body.len == 0) return error.InvalidQueryRequest;
+    if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
 
     // Packed dense requests are benchmark-oriented and unusual in production.
     // Skip the extra JSON parse unless the request even mentions embeddings.
@@ -1718,10 +1784,13 @@ pub fn parseQueryRequest(
     }
 
     var parse_options: std.json.ParseOptions = .{};
-    if (queryBodyHasInternalShardFields(body)) {
+    const has_internal_shard_fields = try queryBodyHasInternalShardFields(alloc, body);
+    const has_public_doc_filter_bindings = try queryBodyHasPublicDocFilterBindings(alloc, body);
+    if (has_internal_shard_fields or has_public_doc_filter_bindings) {
         // Internal shard fanout forwards precomputed execution hints outside the
         // public OpenAPI contract; ignore just enough schema strictness to accept
-        // those fields.
+        // those fields. Public document-set bindings are parsed from the raw
+        // body below because `with` is not in the generated OpenAPI struct yet.
         parse_options.ignore_unknown_fields = true;
     }
 
@@ -1766,6 +1835,7 @@ pub fn parseQueryRequest(
     req.exclusion_query_json = normalized_query.exclusion_query_json;
     normalized_query.exclusion_query_json = "";
     try parseInternalFilterQueryJsonAlloc(alloc, body, &req);
+    req.doc_filter_bindings = try parsePublicDocFilterBindingsAlloc(alloc, body, req.limit);
 
     const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
     errdefer vector_queries.deinit(alloc);
@@ -1780,6 +1850,16 @@ pub fn parseQueryRequest(
         .fields = fields,
         .req = req,
     };
+}
+
+pub fn parsePublicQueryRequest(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?SemanticResolver,
+    table_name: []const u8,
+    body: []const u8,
+) !OwnedQueryRequest {
+    if (try queryBodyHasForbiddenPublicDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
+    return try parseQueryRequest(alloc, semantic_resolver, table_name, body);
 }
 
 pub fn preflightGraphSearchesAlloc(
@@ -3081,7 +3161,7 @@ fn appendCanonicalPublicQueryAlloc(
         if (query.object.get("bool")) |bool_value| {
             if (bool_value != .object) return error.InvalidQueryRequest;
             if (bool_value.object.get("must")) |must_value| {
-                try appendScoringQueryClausesAlloc(alloc, scoring_must, must_value, limit);
+                try appendBoolMustClausesAlloc(alloc, must_value, limit, scoring_must, filter_clauses);
             }
             if (bool_value.object.get("should")) |should_value| {
                 try appendScoringQueryClausesAlloc(alloc, scoring_should, should_value, limit);
@@ -3196,6 +3276,7 @@ fn isStructuredFilterValue(value: std.json.Value) bool {
         "doc_id",
         "doc_ids",
         "docids",
+        "ref",
         "conjuncts",
         "disjuncts",
         "bool",
@@ -3279,6 +3360,30 @@ fn buildStructuredFilterClausesJsonAlloc(
         .any => try out.appendSlice(alloc, "],\"minimum_should_match\":1}}"),
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendBoolMustClausesAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    limit: u32,
+    scoring_must: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    filter_clauses: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (value == .array) {
+        if (value.array.items.len == 0) return error.InvalidQueryRequest;
+        for (value.array.items) |item| {
+            try appendBoolMustClausesAlloc(alloc, item, limit, scoring_must, filter_clauses);
+        }
+        return;
+    }
+
+    appendScoringQueryClausesAlloc(alloc, scoring_must, value, limit) catch |err| switch (err) {
+        error.UnsupportedQueryRequest, error.InvalidQueryRequest => {
+            if (!isStructuredFilterValue(value)) return err;
+            try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, value);
+        },
+        else => return err,
+    };
 }
 
 fn deinitOwnedStringArrayList(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]u8)) void {
@@ -4087,10 +4192,18 @@ fn buildGraphQueries(
 
     var it = graph_searches.map.iterator();
     while (it.next()) |entry| {
+        const name = try alloc.dupe(u8, entry.key_ptr.*);
+        var name_owned = true;
+        errdefer if (name_owned) alloc.free(name);
+        const query = try parseGraphQuery(alloc, entry.value_ptr.*);
+        var query_owned = true;
+        errdefer if (query_owned) freeGraphQuery(alloc, query);
         try items.append(alloc, .{
-            .name = try alloc.dupe(u8, entry.key_ptr.*),
-            .query = try parseGraphQuery(alloc, entry.value_ptr.*),
+            .name = name,
+            .query = query,
         });
+        name_owned = false;
+        query_owned = false;
     }
     return try items.toOwnedSlice(alloc);
 }
@@ -4359,6 +4472,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeNamedDenseQueries(alloc, req.dense_queries);
     freeNamedSparseQueries(alloc, req.sparse_queries);
     freeNamedGraphQueries(alloc, req.graph_queries);
+    freeNamedDocFilterBindings(alloc, req.doc_filter_bindings);
     if (req.sparse) |sparse| {
         alloc.free(sparse.indices);
         alloc.free(sparse.values);
@@ -4373,18 +4487,115 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
         freeOwnedStringItems(alloc, req.exclude_doc_ids);
         alloc.free(@constCast(req.exclude_doc_ids));
     }
+    if (req.resolved_doc_filter_owned) {
+        if (req.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
+    }
     if (req.distributed_text_stats.len > 0) @import("../search/distributed_stats.zig").deinitTextFieldStats(alloc, req.distributed_text_stats);
     req.* = undefined;
 }
 
-fn queryBodyHasInternalShardFields(body: []const u8) bool {
-    return std.mem.indexOf(u8, body, "\"_distributed_text_stats\"") != null or
-        std.mem.indexOf(u8, body, "\"native_doc_id_constraints\"") != null or
-        std.mem.indexOf(u8, body, "\"_filter_query_json\"") != null or
-        std.mem.indexOf(u8, body, "\"_exclusion_query_json\"") != null or
-        std.mem.indexOf(u8, body, "\"_filter_doc_ids\"") != null or
-        std.mem.indexOf(u8, body, "\"_filter_doc_ids_positive\"") != null or
-        std.mem.indexOf(u8, body, "\"_exclude_doc_ids\"") != null;
+fn freeNamedDocFilterBindings(alloc: std.mem.Allocator, bindings: []const db_mod.types.NamedDocFilterBinding) void {
+    for (bindings) |binding| {
+        alloc.free(@constCast(binding.name));
+        alloc.free(@constCast(binding.filter_query_json));
+    }
+    if (bindings.len > 0) alloc.free(@constCast(bindings));
+}
+
+fn queryBodyHasPublicDocFilterBindings(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return parsed.value.object.get("with") != null;
+}
+
+fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return parsed.value.object.get("identity_read_generation") != null or
+        parsed.value.object.get("allow_doc_identity_reassignment") != null;
+}
+
+fn queryBodyHasForbiddenPublicDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return parsed.value.object.get("identity_read_generation") != null or
+        parsed.value.object.get("allow_doc_identity_reassignment") != null or
+        objectHasInternalShardField(parsed.value.object);
+}
+
+fn queryBodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return objectHasInternalShardField(parsed.value.object);
+}
+
+fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
+    const internal_fields = [_][]const u8{
+        "_distributed_text_stats",
+        "native_doc_id_constraints",
+        "_filter_query_json",
+        "_exclusion_query_json",
+        "_identity_read_generation",
+        db_mod.doc_filter_wire.field_name,
+        "_filter_doc_ids",
+        "_filter_doc_ids_positive",
+        "_exclude_doc_ids",
+    };
+    inline for (internal_fields) |field| {
+        if (object.get(field) != null) return true;
+    }
+    return false;
+}
+
+fn parsePublicDocFilterBindingsAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    limit: u32,
+) ![]const db_mod.types.NamedDocFilterBinding {
+    if (!(try queryBodyHasPublicDocFilterBindings(alloc, body))) return &.{};
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const with_value = parsed.value.object.get("with") orelse return &.{};
+    if (with_value != .object) return error.InvalidQueryRequest;
+
+    var out = std.ArrayListUnmanaged(db_mod.types.NamedDocFilterBinding).empty;
+    errdefer {
+        for (out.items) |binding| {
+            alloc.free(@constCast(binding.name));
+            alloc.free(@constCast(binding.filter_query_json));
+        }
+        out.deinit(alloc);
+    }
+    var it = with_value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.*.len == 0) return error.InvalidQueryRequest;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing.name, entry.key_ptr.*)) return error.InvalidQueryRequest;
+        }
+
+        var clauses = std.ArrayListUnmanaged([]u8).empty;
+        defer deinitOwnedStringArrayList(alloc, &clauses);
+        try appendPublicFilterClausesAlloc(alloc, &clauses, entry.value_ptr.*, limit);
+        var filter_query_json = try buildStructuredFilterClausesJsonAlloc(alloc, clauses.items, .all);
+        errdefer if (filter_query_json.len > 0) alloc.free(filter_query_json);
+        if (filter_query_json.len == 0) return error.InvalidQueryRequest;
+        var name = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer if (name.len > 0) alloc.free(name);
+        try out.append(alloc, .{
+            .name = name,
+            .filter_query_json = filter_query_json,
+        });
+        name = &.{};
+        filter_query_json = "";
+    }
+
+    return try out.toOwnedSlice(alloc);
 }
 
 fn parseInternalFilterQueryJsonAlloc(
@@ -4392,12 +4603,11 @@ fn parseInternalFilterQueryJsonAlloc(
     body: []const u8,
     req: *db_mod.types.SearchRequest,
 ) !void {
-    if (std.mem.indexOf(u8, body, "\"_filter_query_json\"") == null and
-        std.mem.indexOf(u8, body, "\"_exclusion_query_json\"") == null) return;
-
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
+    if (parsed.value.object.get("_filter_query_json") == null and
+        parsed.value.object.get("_exclusion_query_json") == null) return;
 
     if (parsed.value.object.get("_filter_query_json")) |value| {
         const query_json = try parseInternalFilterJsonStringAlloc(alloc, value);
@@ -4423,7 +4633,7 @@ fn parseInternalDocIdConstraintsAlloc(
     body: []const u8,
     req: *db_mod.types.SearchRequest,
 ) !void {
-    if (!queryBodyHasInternalShardFields(body)) return;
+    if (!(try queryBodyHasInternalShardFields(alloc, body))) return;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return;
     defer parsed.deinit();
@@ -4441,6 +4651,16 @@ fn parseInternalDocIdConstraintsAlloc(
         envelope.constraints.include_doc_ids = &.{};
         envelope.constraints.exclude_doc_ids = &.{};
         envelope.deinit(alloc);
+    }
+    if (parsed.value.object.get(db_mod.doc_filter_wire.field_name)) |value| {
+        try db_mod.doc_filter_wire.parseIntoSearchRequestAlloc(alloc, value, req);
+    }
+    if (parsed.value.object.get("_identity_read_generation")) |value| {
+        const generation = try parseOptionalU64Json(value);
+        if (req.resolved_doc_filter_wire_context) |ctx| {
+            if (generation == null or generation.? != ctx.identity_read_generation) return error.InvalidQueryRequest;
+        }
+        req.identity_read_generation = generation;
     }
 }
 
@@ -4862,6 +5082,110 @@ test "api query contract normalizes canonical query with legacy shorthands" {
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"exists\":{\"path\":\"/deleted_at\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"/archived\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"status\":\"deleted\"") != null);
+}
+
+test "api query contract parses public with document filter bindings" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "with": {
+        \\    "visible": {"term":{"path":"/tenant","value":"acme"}},
+        \\    "published": {"bool_field":{"field":"published","value":true}}
+        \\  },
+        \\  "query": {
+        \\    "bool": {
+        \\      "must": [
+        \\        {"match":{"field":"body","text":"raft"}},
+        \\        {"ref":"visible"}
+        \\      ],
+        \\      "filter": [{"ref":"published"}]
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.req.doc_filter_bindings.len);
+    try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[0].name);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}", parsed.req.doc_filter_bindings[0].filter_query_json);
+    try std.testing.expectEqualStrings("published", parsed.req.doc_filter_bindings[1].name);
+    try std.testing.expectEqualStrings("{\"bool_field\":{\"field\":\"published\",\"value\":true}}", parsed.req.doc_filter_bindings[1].filter_query_json);
+
+    try std.testing.expect(parsed.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"visible\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
+}
+
+test "api query contract rejects doc identity control fields when with relaxes schema" {
+    const alloc = std.testing.allocator;
+    const generation_body =
+        \\{
+        \\  "with": {"visible": {"match_all": {}}},
+        \\  "identity_read_generation": 7,
+        \\  "query": {"match_all": {}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", generation_body));
+
+    const reassignment_body =
+        \\{
+        \\  "with": {"visible": {"match_all": {}}},
+        \\  "allow_doc_identity_reassignment": true,
+        \\  "query": {"match_all": {}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", reassignment_body));
+}
+
+test "api query contract public parser rejects internal shard doc identity controls" {
+    const alloc = std.testing.allocator;
+    const internal_body =
+        \\{
+        \\  "query": {"match_all": {}},
+        \\  "native_doc_id_constraints": {
+        \\    "positive_filter": true,
+        \\    "include_doc_ids": ["doc:a"],
+        \\    "exclude_doc_ids": []
+        \\  },
+        \\  "_identity_read_generation": 7
+        \\}
+    ;
+
+    try std.testing.expect(try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, internal_body));
+    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", internal_body));
+
+    var internal = try parseQueryRequest(alloc, null, "docs", internal_body);
+    defer internal.deinit(alloc);
+    try std.testing.expect(internal.req.filter_doc_ids_positive);
+    try std.testing.expectEqual(@as(usize, 1), internal.req.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:a", internal.req.filter_doc_ids[0]);
+    try std.testing.expectEqual(@as(?u64, 7), internal.req.identity_read_generation);
+
+    const resolved_filter_body =
+        \\{
+        \\  "query": {"match_all": {}},
+        \\  "_resolved_doc_filter": {
+        \\    "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+        \\    "identity_read_generation": 9,
+        \\    "include": {"kind": "ordinals", "values": [1, 3]},
+        \\    "exclude": {"kind": "none"}
+        \\  }
+        \\}
+    ;
+    try std.testing.expect(try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, resolved_filter_body));
+    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", resolved_filter_body));
+    var resolved_internal = try parseQueryRequest(alloc, null, "docs", resolved_filter_body);
+    defer resolved_internal.deinit(alloc);
+    try std.testing.expect(resolved_internal.req.resolved_doc_filter != null);
+    try std.testing.expectEqual(@as(?u64, 9), resolved_internal.req.identity_read_generation);
+
+    const literal_body =
+        \\{"full_text_search":{"query":"mentions native_doc_id_constraints and _identity_read_generation"}}
+    ;
+    try std.testing.expect(!try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, literal_body));
 }
 
 test "api query contract treats canonical typed scalar term as structured filter" {
@@ -5410,8 +5734,11 @@ test "api query contract carries vector worker tensor program and native constra
             .distance_under = 0.9,
             .return_mode = .parent_with_chunks,
             .max_chunks_per_parent = 2,
+            .identity_read_generation = 12345,
         },
         constraints,
+        null,
+        null,
         &.{access_path},
         program,
     );
@@ -5462,6 +5789,7 @@ test "api query contract carries vector worker tensor program and native constra
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), parsed.options.distance_under.?, 0.0001);
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, parsed.options.return_mode);
     try std.testing.expectEqual(@as(u32, 2), parsed.options.max_chunks_per_parent);
+    try std.testing.expectEqual(@as(?u64, 12345), parsed.options.identity_read_generation);
     try std.testing.expectEqual(@as(usize, 3), parsed.query.dense.vector.len);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), parsed.query.dense.vector[0], 0.0001);
     try std.testing.expect(parsed.native_doc_id_constraints.constraints.positive_filter);
@@ -5499,6 +5827,8 @@ test "api query contract carries sparse vector worker payload and proof" {
         .{ .sparse = .{ .indices = &.{ 3, 9, 27 }, .values = &.{ 1.0, 0.5, 0.25 }, .k = 5 } },
         .{},
         .{},
+        null,
+        null,
         &.{access_path},
         program,
     );
@@ -5537,6 +5867,8 @@ test "api query contract rejects sparse vector worker payload with mismatched in
         .{ .sparse = .{ .indices = &.{ 3, 9 }, .values = &.{1.0}, .k = 5 } },
         .{},
         .{},
+        null,
+        null,
         &.{access_path},
         program,
     ));
@@ -5572,6 +5904,8 @@ test "api query contract rejects vector worker non-finite numeric payloads" {
         .{ .dense = .{ .vector = &.{std.math.inf(f32)}, .k = 1 } },
         .{},
         .{},
+        null,
+        null,
         &.{dense_access_path},
         dense_program,
     ));
@@ -5594,6 +5928,8 @@ test "api query contract rejects vector worker non-finite numeric payloads" {
         .{ .sparse = .{ .indices = &.{1}, .values = &.{std.math.nan(f32)}, .k = 1 } },
         .{},
         .{},
+        null,
+        null,
         &.{sparse_access_path},
         sparse_program,
     ));
@@ -5640,6 +5976,8 @@ test "api query contract rejects vector worker envelope without matching tensor 
         .{ .sparse = .{ .indices = &.{ 1, 5 }, .values = &.{ 1.0, 0.5 }, .k = 3 } },
         .{},
         .{},
+        null,
+        null,
         &.{access_path},
         program,
     ));
@@ -5666,6 +6004,8 @@ test "api query contract rejects vector worker envelope when target does not mat
         .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
         .{},
         .{},
+        null,
+        null,
         &.{access_path},
         program,
     ));
@@ -5700,6 +6040,8 @@ test "api query contract rejects vector worker envelope when primary output is n
         .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
         .{},
         .{},
+        null,
+        null,
         &.{access_path},
         program,
     ));
@@ -5726,6 +6068,8 @@ test "api query contract rejects vector worker envelope when native constraints 
         .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
         .{},
         .{ .positive_filter = true, .include_doc_ids = &.{"doc:a"} },
+        null,
+        null,
         &.{access_path},
         program,
     ));
@@ -5740,7 +6084,8 @@ test "api query contract accepts native doc id constraint envelope on internal q
         \\    "positive_filter": true,
         \\    "include_doc_ids": [],
         \\    "exclude_doc_ids": ["doc:c"]
-        \\  }
+        \\  },
+        \\  "_identity_read_generation": 42
         \\}
     ;
 
@@ -5751,6 +6096,7 @@ test "api query contract accepts native doc id constraint envelope on internal q
     try std.testing.expectEqual(@as(usize, 0), parsed.req.filter_doc_ids.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.req.exclude_doc_ids.len);
     try std.testing.expectEqualStrings("doc:c", parsed.req.exclude_doc_ids[0]);
+    try std.testing.expectEqual(@as(?u64, 42), parsed.req.identity_read_generation);
 }
 
 test "api query contract rejects legacy native doc id constraint fields" {

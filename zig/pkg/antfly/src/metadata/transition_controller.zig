@@ -141,13 +141,14 @@ pub const TransitionController = struct {
                             .source_range_end = record.source_range_end,
                         },
                     } else .none
-                else .{
-                    .start_split_source = .{
-                        .transition_id = record.transition_id,
-                        .source_group_id = record.source_group_id,
-                        .destination_group_id = record.destination_group_id,
+                else
+                    .{
+                        .start_split_source = .{
+                            .transition_id = record.transition_id,
+                            .source_group_id = record.source_group_id,
+                            .destination_group_id = record.destination_group_id,
+                        },
                     },
-                },
             },
             .bootstrapping_destination => .{
                 .next_phase = .bootstrap_peer,
@@ -230,6 +231,7 @@ pub const TransitionController = struct {
                         .transition_id = record.transition_id,
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
+                        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
                     },
                 },
             },
@@ -240,6 +242,7 @@ pub const TransitionController = struct {
                         .transition_id = record.transition_id,
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
+                        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
                     },
                 },
             },
@@ -250,6 +253,7 @@ pub const TransitionController = struct {
                         .transition_id = record.transition_id,
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
+                        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
                     },
                 },
             },
@@ -336,6 +340,7 @@ test "transition controller plans merge accept catch-up and rollback actions" {
         .transition_id = 11,
         .donor_group_id = 51,
         .receiver_group_id = 52,
+        .allow_doc_identity_reassignment = true,
     };
 
     const accept = TransitionController.planMerge(merge_record, .{
@@ -368,6 +373,7 @@ test "transition controller plans merge accept catch-up and rollback actions" {
     });
     try std.testing.expectEqual(transition_state.TransitionPhase.bootstrap_peer, accept.next_phase);
     try std.testing.expect(accept.action == .accept_merge_receiver);
+    try std.testing.expect(accept.action.accept_merge_receiver.allow_doc_identity_reassignment);
 
     const catch_up = TransitionController.planMerge(merge_record, .{
         .donor = .{
@@ -399,12 +405,14 @@ test "transition controller plans merge accept catch-up and rollback actions" {
     });
     try std.testing.expectEqual(transition_state.TransitionPhase.replay_deltas, catch_up.next_phase);
     try std.testing.expect(catch_up.action == .catch_up_merge_receiver);
+    try std.testing.expect(catch_up.action.catch_up_merge_receiver.allow_doc_identity_reassignment);
 
     const rollback_record = transition_state.MergeTransitionRecord{
         .transition_id = 11,
         .donor_group_id = 51,
         .receiver_group_id = 52,
         .rollback_reason = "operator abort",
+        .allow_doc_identity_reassignment = true,
     };
     const rollback = TransitionController.planMerge(rollback_record, .{
         .donor = .{
@@ -436,6 +444,47 @@ test "transition controller plans merge accept catch-up and rollback actions" {
     });
     try std.testing.expectEqual(transition_state.TransitionPhase.rolling_back, rollback.next_phase);
     try std.testing.expect(rollback.action == .rollback_merge);
+}
+
+test "transition controller preserves merge doc identity reassignment flag on finalize" {
+    const merge_record = transition_state.MergeTransitionRecord{
+        .transition_id = 12,
+        .donor_group_id = 61,
+        .receiver_group_id = 62,
+        .allow_doc_identity_reassignment = true,
+    };
+
+    const finalize = TransitionController.planMerge(merge_record, .{
+        .donor = .{
+            .phase = .cutover_ready,
+            .donor_group_id = 61,
+            .receiver_group_id = 62,
+            .receiver_accepts_donor_range = true,
+            .bootstrapped = true,
+            .replay_required = true,
+            .replay_caught_up = true,
+            .cutover_ready = true,
+            .receiver_ready_for_reads = true,
+            .donor_delta_sequence = 4,
+            .receiver_delta_sequence = 4,
+        },
+        .receiver = .{
+            .phase = .cutover_ready,
+            .donor_group_id = 61,
+            .receiver_group_id = 62,
+            .receiver_accepts_donor_range = true,
+            .bootstrapped = true,
+            .replay_required = true,
+            .replay_caught_up = true,
+            .cutover_ready = true,
+            .receiver_ready_for_reads = true,
+            .donor_delta_sequence = 4,
+            .receiver_delta_sequence = 4,
+        },
+    });
+    try std.testing.expectEqual(transition_state.TransitionPhase.finalizing, finalize.next_phase);
+    try std.testing.expect(finalize.action == .finalize_merge);
+    try std.testing.expect(finalize.action.finalize_merge.allow_doc_identity_reassignment);
 }
 
 test "transition controller describes split and merge execution states" {

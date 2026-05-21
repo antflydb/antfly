@@ -20,8 +20,11 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const doc_set = @import("../doc_set.zig");
 const graph_exec = @import("graph_exec.zig");
 const search_mod = @import("../../../search/search.zig");
+const index_mod = @import("../../../index.zig");
+const segment_mod = @import("../../../segment.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
@@ -77,6 +80,24 @@ pub const SearchTextQueryExecutor = struct {
         doc_key: []const u8,
         raw: []const u8,
     ) anyerror![]u8,
+    resolve_doc_set_doc_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 = null,
+    resolve_doc_ids_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
+    live_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -98,6 +119,7 @@ pub const ExplicitTextStatRequest = struct {
     index_name: ?[]const u8 = null,
     field: []const u8,
     terms: []const []const u8 = &.{},
+    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
 };
 
 pub const ExplicitBackgroundTextStatRequest = struct {
@@ -106,6 +128,7 @@ pub const ExplicitBackgroundTextStatRequest = struct {
     field: []const u8,
     terms: []const []const u8 = &.{},
     background_query: aggregations_mod.BackgroundQuery,
+    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
 };
 
 const SearchRequestTextStatEntry = struct {
@@ -239,6 +262,36 @@ pub const DenseSearchExecutor = struct {
         index_name: []const u8,
         doc_key: []const u8,
     ) anyerror!?u64,
+    lookup_vector_ids_for_ordinals: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) anyerror![]u64 = null,
+    lookup_doc_ordinal: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) anyerror!?doc_set.DocOrdinal = null,
+    resolve_doc_set_doc_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 = null,
+    resolve_doc_ids_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
+    live_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -352,6 +405,36 @@ pub const SparseSearchExecutor = struct {
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.SparseIndex,
+    resolve_doc_set_doc_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 = null,
+    resolve_doc_ids_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
+    live_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
+    lookup_doc_nums_for_ordinals: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) anyerror![]const u32 = null,
+    lookup_doc_ordinal: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) anyerror!?doc_set.DocOrdinal = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -369,6 +452,7 @@ pub const SparseSearchExecutor = struct {
 
 pub const MatchAllCandidate = struct {
     id: []u8,
+    ordinal: ?doc_set.DocOrdinal = null,
 
     pub fn deinit(self: *MatchAllCandidate, alloc: Allocator) void {
         if (self.id.len > 0) alloc.free(self.id);
@@ -393,6 +477,28 @@ pub const MatchAllExecutor = struct {
         alloc: Allocator,
         req: types.SearchRequest,
     ) anyerror!MatchAllCandidates,
+    text_index_entry: *const fn (
+        ctx: ?*anyopaque,
+        index_name: ?[]const u8,
+    ) anyerror!?*index_manager_mod.IndexManager.TextIndex,
+    resolve_doc_set_doc_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 = null,
+    resolve_doc_ids_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
+    live_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -414,6 +520,12 @@ pub const MatchAllCandidateCollector = struct {
         alloc: Allocator,
         key: []const u8,
     ) anyerror!bool,
+    lookup_doc_ordinal: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        key: []const u8,
+        generation: ?u64,
+    ) anyerror!?doc_set.DocOrdinal = null,
 };
 
 pub const ComposedSearchExecutor = struct {
@@ -453,6 +565,12 @@ pub const ComposedSearchExecutor = struct {
         req: types.SearchRequest,
         named_sets: []const graph_exec.NamedResultSet,
     ) anyerror!types.SearchResult,
+    resolve_hits_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        hits: []const types.SearchHit,
+    ) anyerror!doc_set.ResolvedDocSet = null,
     attach_graph_results: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -707,22 +825,34 @@ pub fn searchComposed(
         for (owned_results.items) |*item| item.deinit();
         owned_results.deinit(alloc);
     }
+    var owned_resolved_sets = std.ArrayListUnmanaged(*doc_set.ResolvedDocSet).empty;
+    defer {
+        for (owned_resolved_sets.items) |set| {
+            set.deinit(alloc);
+            alloc.destroy(set);
+        }
+        owned_resolved_sets.deinit(alloc);
+    }
 
     if (req.full_text_queries.len == 0) {
         if (req.full_text) |text| {
             const text_result = try executor.search_text_query(executor.ctx, alloc, req, text);
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
         } else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) {
             const text_result = try executor.search_text(executor.ctx, alloc, req);
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
         }
@@ -731,10 +861,12 @@ pub fn searchComposed(
             var text_req = req;
             text_req.index_name = full_text_query.index_name;
             const text_result = try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = full_text_query.name,
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
         }
@@ -742,10 +874,12 @@ pub fn searchComposed(
 
     if (req.dense_queries.len == 0 and req.dense != null) {
         const dense_result = try executor.search_dense(executor.ctx, alloc, req, req.dense.?);
+        const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, dense_result.hits);
         try named_sets.append(alloc, .{
             .name = if (req.sparse == null) "$embeddings_results" else "dense",
             .hits = dense_result.hits,
             .total_hits = dense_result.total_hits,
+            .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, dense_result);
     } else {
@@ -753,10 +887,12 @@ pub fn searchComposed(
             var dense_req = req;
             dense_req.index_name = dense_query.index_name;
             const dense_result = try executor.search_dense(executor.ctx, alloc, dense_req, dense_query.query);
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, dense_result.hits);
             try named_sets.append(alloc, .{
                 .name = dense_query.name,
                 .hits = dense_result.hits,
                 .total_hits = dense_result.total_hits,
+                .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, dense_result);
         }
@@ -764,10 +900,12 @@ pub fn searchComposed(
 
     if (req.sparse_queries.len == 0 and req.sparse != null) {
         const sparse_result = try executor.search_sparse(executor.ctx, alloc, req, req.sparse.?);
+        const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, sparse_result.hits);
         try named_sets.append(alloc, .{
             .name = if (req.dense == null) "$embeddings_results" else "sparse",
             .hits = sparse_result.hits,
             .total_hits = sparse_result.total_hits,
+            .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, sparse_result);
     } else {
@@ -775,10 +913,12 @@ pub fn searchComposed(
             var sparse_req = req;
             sparse_req.index_name = sparse_query.index_name;
             const sparse_result = try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, sparse_result.hits);
             try named_sets.append(alloc, .{
                 .name = sparse_query.name,
                 .hits = sparse_result.hits,
                 .total_hits = sparse_result.total_hits,
+                .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, sparse_result);
         }
@@ -792,18 +932,37 @@ pub fn searchComposed(
         try executor.fuse_named_sets(executor.ctx, alloc, req, named_sets.items);
     errdefer base.deinit();
 
+    const fused_resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, base.hits);
     try named_sets.append(alloc, .{
         .name = "$fused_results",
         .hits = base.hits,
         .total_hits = base.total_hits,
+        .resolved_doc_set = fused_resolved_doc_set,
     });
 
-    try appendEmbeddingsResultAlias(alloc, req, executor, &named_sets, &owned_results);
+    try appendEmbeddingsResultAlias(alloc, req, executor, &named_sets, &owned_results, &owned_resolved_sets);
 
     if (req.graph_queries.len > 0) {
         try executor.attach_graph_results(executor.ctx, alloc, req, &base, named_sets.items);
     }
     return base;
+}
+
+fn resolveComposedHitsToDocSet(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: ComposedSearchExecutor,
+    owned_resolved_sets: *std.ArrayListUnmanaged(*doc_set.ResolvedDocSet),
+    hits: []const types.SearchHit,
+) !?*const doc_set.ResolvedDocSet {
+    if (req.graph_queries.len == 0) return null;
+    const resolve = executor.resolve_hits_to_doc_set orelse return null;
+    const set = try alloc.create(doc_set.ResolvedDocSet);
+    errdefer alloc.destroy(set);
+    set.* = try resolve(executor.ctx, alloc, req, hits);
+    errdefer set.deinit(alloc);
+    try owned_resolved_sets.append(alloc, set);
+    return set;
 }
 
 fn appendEmbeddingsResultAlias(
@@ -812,6 +971,7 @@ fn appendEmbeddingsResultAlias(
     executor: ComposedSearchExecutor,
     named_sets: *std.ArrayListUnmanaged(graph_exec.NamedResultSet),
     owned_results: *std.ArrayListUnmanaged(types.SearchResult),
+    owned_resolved_sets: *std.ArrayListUnmanaged(*doc_set.ResolvedDocSet),
 ) !void {
     if (findComposedNamedSet(named_sets.items, "$embeddings_results") != null) return;
 
@@ -828,16 +988,19 @@ fn appendEmbeddingsResultAlias(
             .name = "$embeddings_results",
             .hits = embedding_sets.items[0].hits,
             .total_hits = embedding_sets.items[0].total_hits,
+            .resolved_doc_set = embedding_sets.items[0].resolved_doc_set,
         });
         return;
     }
 
     var embeddings_result = try executor.fuse_named_sets(executor.ctx, alloc, req, embedding_sets.items);
     errdefer embeddings_result.deinit();
+    const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, owned_resolved_sets, embeddings_result.hits);
     try named_sets.append(alloc, .{
         .name = "$embeddings_results",
         .hits = embeddings_result.hits,
         .total_hits = embeddings_result.total_hits,
+        .resolved_doc_set = resolved_doc_set,
     });
     try owned_results.append(alloc, embeddings_result);
 }
@@ -929,13 +1092,19 @@ const NativeDocIdConstraints = struct {
     positive_filter: bool = false,
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    exclude_doc_nums: []const u32 = &.{},
     filter_doc_ids_owned: bool = false,
     exclude_doc_ids_owned: bool = false,
+    filter_doc_nums_owned: bool = false,
+    exclude_doc_nums_owned: bool = false,
     resolved_stored_filters: bool = false,
 
     fn deinit(self: *NativeDocIdConstraints, alloc: Allocator) void {
         if (self.filter_doc_ids_owned) freeDocIdSlice(alloc, self.filter_doc_ids);
         if (self.exclude_doc_ids_owned) freeDocIdSlice(alloc, self.exclude_doc_ids);
+        if (self.filter_doc_nums_owned and self.filter_doc_nums.len > 0) alloc.free(@constCast(self.filter_doc_nums));
+        if (self.exclude_doc_nums_owned and self.exclude_doc_nums.len > 0) alloc.free(@constCast(self.exclude_doc_nums));
         self.* = undefined;
     }
 };
@@ -946,6 +1115,132 @@ const StructuredFilterResolverExecutor = struct {
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.TextIndex,
+    resolve_doc_set_doc_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 = null,
+    resolve_doc_ids_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
+    live_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
+    lookup_doc_nums_for_ordinals: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) anyerror![]const u32 = null,
+    doc_num_index_name: ?[]const u8 = null,
+    require_doc_num_projection_mapper: bool = false,
+    project_ordinals_to_doc_ids: bool = true,
+    text_snapshot_for_doc_num_projection: ?*const index_mod.IndexSnapshot = null,
+    apply_live_all_docs: bool = false,
+    identity_read_generation: ?u64 = null,
+};
+
+const StructuredFilterDocSetCache = struct {
+    const Entry = struct {
+        filter_query_json: []u8,
+        identity_namespace_tag: ?u64,
+        identity_read_generation: ?u64,
+        set: doc_set.ResolvedDocSet,
+    };
+
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    fn deinit(self: *StructuredFilterDocSetCache, alloc: Allocator) void {
+        for (self.entries.items) |*entry| {
+            alloc.free(entry.filter_query_json);
+            entry.set.deinit(alloc);
+        }
+        self.entries.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn get(
+        self: *const StructuredFilterDocSetCache,
+        filter_query_json: []const u8,
+        identity_read_generation: ?u64,
+    ) ?*const doc_set.ResolvedDocSet {
+        return self.getWithNamespace(filter_query_json, null, identity_read_generation);
+    }
+
+    fn getShared(
+        self: *const StructuredFilterDocSetCache,
+        filter_query_json: []const u8,
+        identity_namespace_tag: u64,
+        identity_read_generation: u64,
+    ) ?*const doc_set.ResolvedDocSet {
+        return self.getWithNamespace(filter_query_json, identity_namespace_tag, identity_read_generation);
+    }
+
+    fn getWithNamespace(
+        self: *const StructuredFilterDocSetCache,
+        filter_query_json: []const u8,
+        identity_namespace_tag: ?u64,
+        identity_read_generation: ?u64,
+    ) ?*const doc_set.ResolvedDocSet {
+        for (self.entries.items) |*entry| {
+            if (entry.identity_namespace_tag == identity_namespace_tag and
+                entry.identity_read_generation == identity_read_generation and
+                std.mem.eql(u8, entry.filter_query_json, filter_query_json))
+            {
+                return &entry.set;
+            }
+        }
+        return null;
+    }
+
+    fn putCloneAlloc(
+        self: *StructuredFilterDocSetCache,
+        alloc: Allocator,
+        filter_query_json: []const u8,
+        identity_read_generation: ?u64,
+        set: *const doc_set.ResolvedDocSet,
+    ) !void {
+        return try self.putCloneWithNamespaceAlloc(alloc, filter_query_json, null, identity_read_generation, set);
+    }
+
+    fn putSharedCloneAlloc(
+        self: *StructuredFilterDocSetCache,
+        alloc: Allocator,
+        filter_query_json: []const u8,
+        identity_namespace_tag: u64,
+        identity_read_generation: u64,
+        set: *const doc_set.ResolvedDocSet,
+    ) !void {
+        return try self.putCloneWithNamespaceAlloc(alloc, filter_query_json, identity_namespace_tag, identity_read_generation, set);
+    }
+
+    fn putCloneWithNamespaceAlloc(
+        self: *StructuredFilterDocSetCache,
+        alloc: Allocator,
+        filter_query_json: []const u8,
+        identity_namespace_tag: ?u64,
+        identity_read_generation: ?u64,
+        set: *const doc_set.ResolvedDocSet,
+    ) !void {
+        const owned_query = try alloc.dupe(u8, filter_query_json);
+        errdefer alloc.free(owned_query);
+        var owned_set = try doc_set.cloneAlloc(alloc, set);
+        errdefer owned_set.deinit(alloc);
+        try self.entries.append(alloc, .{
+            .filter_query_json = owned_query,
+            .identity_namespace_tag = identity_namespace_tag,
+            .identity_read_generation = identity_read_generation,
+            .set = owned_set,
+        });
+        owned_set = .none;
+    }
 };
 
 fn deriveNativeDocIdConstraintsArena(
@@ -1009,21 +1304,86 @@ fn deriveNativeDocIdConstraintsAlloc(
     req: types.SearchRequest,
     executor: StructuredFilterResolverExecutor,
 ) !NativeDocIdConstraints {
+    var active_executor = executor;
+    if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
     var out = NativeDocIdConstraints{};
     errdefer out.deinit(alloc);
+    var structured_filter_doc_sets = StructuredFilterDocSetCache{};
+    defer structured_filter_doc_sets.deinit(alloc);
 
+    if (active_executor.apply_live_all_docs) {
+        try applyLiveAllDocFilterToNativeConstraintsAlloc(alloc, &out, active_executor);
+    }
+
+    if (resolvedDocFilterFromRequest(req)) |filter| {
+        try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, filter, active_executor);
+    }
+
+    const resolved_request_doc_ids = !active_executor.project_ordinals_to_doc_ids and active_executor.resolve_doc_ids_to_doc_set != null;
     if (req.filter_doc_ids_positive or req.filter_doc_ids.len > 0) {
-        out.filter_doc_ids = req.filter_doc_ids;
-        out.positive_filter = true;
+        if (resolved_request_doc_ids) {
+            var resolved = try active_executor.resolve_doc_ids_to_doc_set.?(
+                active_executor.ctx,
+                alloc,
+                req.filter_doc_ids,
+                active_executor.identity_read_generation,
+            );
+            defer resolved.deinit(alloc);
+            const filter = doc_set.ResolvedDocFilter{
+                .include = resolved,
+                .exclude = .none,
+            };
+            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+        } else {
+            if (out.positive_filter) {
+                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, req.filter_doc_ids);
+                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
+                out.filter_doc_ids = intersected;
+                out.filter_doc_ids_owned = true;
+            } else {
+                out.filter_doc_ids = req.filter_doc_ids;
+            }
+            out.positive_filter = true;
+        }
         out.resolved_stored_filters = true;
     }
     if (req.exclude_doc_ids.len > 0) {
-        out.exclude_doc_ids = req.exclude_doc_ids;
+        if (resolved_request_doc_ids) {
+            var resolved = try active_executor.resolve_doc_ids_to_doc_set.?(
+                active_executor.ctx,
+                alloc,
+                req.exclude_doc_ids,
+                active_executor.identity_read_generation,
+            );
+            defer resolved.deinit(alloc);
+            const filter = doc_set.ResolvedDocFilter{
+                .include = .all,
+                .exclude = resolved,
+            };
+            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+        } else {
+            if (out.exclude_doc_ids.len > 0) {
+                const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, req.exclude_doc_ids);
+                if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
+                out.exclude_doc_ids = merged;
+                out.exclude_doc_ids_owned = true;
+            } else {
+                out.exclude_doc_ids = req.exclude_doc_ids;
+            }
+        }
         out.resolved_stored_filters = true;
     }
 
     if (req.filter_query_json.len > 0) {
-        if (try collectStructuredFilterDocIdsAlloc(alloc, req, executor, req.filter_query_json)) |doc_ids| {
+        if (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &structured_filter_doc_sets, req.filter_query_json)) |resolved| {
+            var owned_resolved = resolved;
+            defer owned_resolved.deinit(alloc);
+            const filter = doc_set.ResolvedDocFilter{
+                .include = owned_resolved,
+                .exclude = .none,
+            };
+            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+        } else if (try collectStructuredFilterDocIdsAlloc(alloc, req, active_executor, req.filter_query_json)) |doc_ids| {
             if (out.positive_filter) {
                 const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, doc_ids);
                 if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
@@ -1083,7 +1443,15 @@ fn deriveNativeDocIdConstraintsAlloc(
     }
 
     if (req.exclusion_query_json.len > 0) {
-        if (try collectStructuredFilterDocIdsAlloc(alloc, req, executor, req.exclusion_query_json)) |doc_ids| {
+        if (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &structured_filter_doc_sets, req.exclusion_query_json)) |resolved| {
+            var owned_resolved = resolved;
+            defer owned_resolved.deinit(alloc);
+            const filter = doc_set.ResolvedDocFilter{
+                .include = .all,
+                .exclude = owned_resolved,
+            };
+            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+        } else if (try collectStructuredFilterDocIdsAlloc(alloc, req, active_executor, req.exclusion_query_json)) |doc_ids| {
             if (out.exclude_doc_ids.len > 0) {
                 const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, doc_ids);
                 if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
@@ -1121,6 +1489,418 @@ fn deriveNativeDocIdConstraintsAlloc(
     return out;
 }
 
+fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
+    const ptr = req.resolved_doc_filter orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn applyResolvedDocFilterAlloc(
+    alloc: Allocator,
+    out: *NativeDocIdConstraints,
+    filter: *const doc_set.ResolvedDocFilter,
+    executor: StructuredFilterResolverExecutor,
+) !void {
+    var live_include: ?doc_set.ResolvedDocSet = null;
+    defer if (live_include) |*set| set.deinit(alloc);
+    const include_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &filter.include, executor, &live_include);
+
+    var live_exclude: ?doc_set.ResolvedDocSet = null;
+    defer if (live_exclude) |*set| set.deinit(alloc);
+    const exclude_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &filter.exclude, executor, &live_exclude);
+
+    if (exclude_set.* == .all) {
+        markNativeDocIdConstraintsEmpty(out, alloc);
+        return;
+    }
+
+    var include_represented = include_set.* == .all;
+    if (executor.project_ordinals_to_doc_ids or resolvedSetHasDocKeys(include_set)) {
+        if (try docIdsForResolvedDocSetAlloc(alloc, include_set, executor)) |ids| {
+            if (out.positive_filter) {
+                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, ids);
+                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
+                freeDocIdSlice(alloc, ids);
+                out.filter_doc_ids = intersected;
+            } else {
+                out.filter_doc_ids = ids;
+            }
+            out.filter_doc_ids_owned = true;
+            out.positive_filter = true;
+            out.resolved_stored_filters = true;
+            include_represented = true;
+        }
+    }
+    if (!executor.project_ordinals_to_doc_ids) {
+        if (try docNumsForResolvedDocSetWithExecutorAlloc(alloc, include_set, executor)) |doc_nums| {
+            if (out.positive_filter and out.filter_doc_nums.len > 0) {
+                const intersected = try intersectDocNumsAlloc(alloc, out.filter_doc_nums, doc_nums);
+                if (out.filter_doc_nums_owned and out.filter_doc_nums.len > 0) alloc.free(@constCast(out.filter_doc_nums));
+                alloc.free(doc_nums);
+                out.filter_doc_nums = intersected;
+            } else {
+                out.filter_doc_nums = doc_nums;
+            }
+            out.filter_doc_nums_owned = true;
+            out.positive_filter = true;
+            out.resolved_stored_filters = true;
+            include_represented = true;
+        }
+    }
+    if (!include_represented) return error.UnsupportedQueryRequest;
+
+    var exclude_represented = exclude_set.* == .none;
+    if (!executor.project_ordinals_to_doc_ids) {
+        if (try docNumsForResolvedDocSetWithExecutorAlloc(alloc, exclude_set, executor)) |doc_nums| {
+            if (out.exclude_doc_nums.len > 0) {
+                const merged = try unionDocNumsAlloc(alloc, out.exclude_doc_nums, doc_nums);
+                if (out.exclude_doc_nums_owned and out.exclude_doc_nums.len > 0) alloc.free(@constCast(out.exclude_doc_nums));
+                alloc.free(doc_nums);
+                out.exclude_doc_nums = merged;
+            } else {
+                out.exclude_doc_nums = doc_nums;
+            }
+            out.exclude_doc_nums_owned = true;
+            out.resolved_stored_filters = true;
+            exclude_represented = true;
+        }
+    }
+    if (executor.project_ordinals_to_doc_ids or resolvedSetHasDocKeys(exclude_set)) {
+        if (try docIdsForResolvedDocSetAlloc(alloc, exclude_set, executor)) |ids| {
+            if (out.exclude_doc_ids.len > 0) {
+                const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, ids);
+                if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
+                freeDocIdSlice(alloc, ids);
+                out.exclude_doc_ids = merged;
+            } else {
+                out.exclude_doc_ids = ids;
+            }
+            out.exclude_doc_ids_owned = true;
+            out.resolved_stored_filters = true;
+            exclude_represented = true;
+        }
+    }
+    if (!exclude_represented) return error.UnsupportedQueryRequest;
+}
+
+fn applyLiveAllDocFilterToNativeConstraintsAlloc(
+    alloc: Allocator,
+    out: *NativeDocIdConstraints,
+    executor: StructuredFilterResolverExecutor,
+) !void {
+    const live_filter = executor.live_filter_doc_set orelse return;
+    const all: doc_set.ResolvedDocSet = .all;
+    var live = try live_filter(executor.ctx, alloc, &all, executor.identity_read_generation);
+    defer live.deinit(alloc);
+    switch (live) {
+        .all => return,
+        else => {},
+    }
+    const filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneAlloc(alloc, &live),
+        .exclude = .none,
+    };
+    var owned_filter = filter;
+    defer owned_filter.deinit(alloc);
+
+    const resolved_stored_filters_before_live_filter = out.resolved_stored_filters;
+    try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, executor);
+    out.resolved_stored_filters = resolved_stored_filters_before_live_filter;
+}
+
+fn applyResolvedDocFilterToNativeConstraintsAlloc(
+    alloc: Allocator,
+    out: *NativeDocIdConstraints,
+    filter: *const doc_set.ResolvedDocFilter,
+    executor: StructuredFilterResolverExecutor,
+) !void {
+    if (executor.text_snapshot_for_doc_num_projection) |snapshot| {
+        return try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, out, filter, executor);
+    }
+    return try applyResolvedDocFilterAlloc(alloc, out, filter, executor);
+}
+
+fn markNativeDocIdConstraintsEmpty(out: *NativeDocIdConstraints, alloc: Allocator) void {
+    if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
+    if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
+    if (out.filter_doc_nums_owned and out.filter_doc_nums.len > 0) alloc.free(@constCast(out.filter_doc_nums));
+    if (out.exclude_doc_nums_owned and out.exclude_doc_nums.len > 0) alloc.free(@constCast(out.exclude_doc_nums));
+    out.filter_doc_ids = &.{};
+    out.exclude_doc_ids = &.{};
+    out.filter_doc_nums = &.{};
+    out.exclude_doc_nums = &.{};
+    out.filter_doc_ids_owned = false;
+    out.exclude_doc_ids_owned = false;
+    out.filter_doc_nums_owned = false;
+    out.exclude_doc_nums_owned = false;
+    out.positive_filter = true;
+    out.resolved_stored_filters = true;
+}
+
+fn applyResolvedDocFilterToTextDocNumsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    out: *NativeDocIdConstraints,
+    filter: *const doc_set.ResolvedDocFilter,
+    executor: StructuredFilterResolverExecutor,
+) !void {
+    var live_include: ?doc_set.ResolvedDocSet = null;
+    defer if (live_include) |*set| set.deinit(alloc);
+    const include_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &filter.include, executor, &live_include);
+
+    var live_exclude: ?doc_set.ResolvedDocSet = null;
+    defer if (live_exclude) |*set| set.deinit(alloc);
+    const exclude_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &filter.exclude, executor, &live_exclude);
+
+    if (exclude_set.* == .all) {
+        markNativeDocIdConstraintsEmpty(out, alloc);
+        return;
+    }
+
+    const can_project_ordinals = snapshot.hasDocOrdinalCoverage();
+    var include_represented = include_set.* == .all;
+    if (can_project_ordinals) {
+        if (try textDocNumsForResolvedDocSetAlloc(alloc, snapshot, include_set)) |doc_nums| {
+            if (out.positive_filter and out.filter_doc_nums.len > 0) {
+                const intersected = try intersectDocNumsAlloc(alloc, out.filter_doc_nums, doc_nums);
+                if (out.filter_doc_nums_owned and out.filter_doc_nums.len > 0) alloc.free(@constCast(out.filter_doc_nums));
+                alloc.free(doc_nums);
+                out.filter_doc_nums = intersected;
+            } else {
+                out.filter_doc_nums = doc_nums;
+            }
+            out.filter_doc_nums_owned = true;
+            out.positive_filter = true;
+            out.resolved_stored_filters = true;
+            include_represented = true;
+        }
+    }
+
+    if (!include_represented) {
+        if (try docIdsForResolvedDocSetAlloc(alloc, include_set, executor)) |ids| {
+            if (out.positive_filter) {
+                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, ids);
+                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
+                freeDocIdSlice(alloc, ids);
+                out.filter_doc_ids = intersected;
+            } else {
+                out.filter_doc_ids = ids;
+            }
+            out.filter_doc_ids_owned = true;
+            out.positive_filter = true;
+            out.resolved_stored_filters = true;
+            include_represented = true;
+        }
+    }
+    if (!include_represented) return error.UnsupportedQueryRequest;
+
+    var exclude_represented = exclude_set.* == .none;
+    if (can_project_ordinals) {
+        if (try textDocNumsForResolvedDocSetAlloc(alloc, snapshot, exclude_set)) |doc_nums| {
+            if (out.exclude_doc_nums.len > 0) {
+                const merged = try unionDocNumsAlloc(alloc, out.exclude_doc_nums, doc_nums);
+                if (out.exclude_doc_nums_owned and out.exclude_doc_nums.len > 0) alloc.free(@constCast(out.exclude_doc_nums));
+                alloc.free(doc_nums);
+                out.exclude_doc_nums = merged;
+            } else {
+                out.exclude_doc_nums = doc_nums;
+            }
+            out.exclude_doc_nums_owned = true;
+            out.resolved_stored_filters = true;
+            exclude_represented = true;
+        }
+    }
+
+    if (!exclude_represented) {
+        if (try docIdsForResolvedDocSetAlloc(alloc, exclude_set, executor)) |ids| {
+            if (out.exclude_doc_ids.len > 0) {
+                const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, ids);
+                if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
+                freeDocIdSlice(alloc, ids);
+                out.exclude_doc_ids = merged;
+            } else {
+                out.exclude_doc_ids = ids;
+            }
+            out.exclude_doc_ids_owned = true;
+            out.resolved_stored_filters = true;
+            exclude_represented = true;
+        }
+    }
+    if (!exclude_represented) return error.UnsupportedQueryRequest;
+}
+
+fn textDocNumsForResolvedDocSetAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    set: *const doc_set.ResolvedDocSet,
+) !?[]const u32 {
+    const ordinals = (try docNumsForResolvedDocSetAlloc(alloc, set)) orelse return null;
+    defer alloc.free(ordinals);
+    return try snapshot.docNumsForOrdinalsAlloc(alloc, ordinals);
+}
+
+fn maybeLiveFilterResolvedDocSetAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    executor: StructuredFilterResolverExecutor,
+    owned: *?doc_set.ResolvedDocSet,
+) !*const doc_set.ResolvedDocSet {
+    switch (set.*) {
+        .doc_keys, .ordinals, .ordinal_bitmap => {},
+        .all, .none => return set,
+    }
+    const live_filter = executor.live_filter_doc_set orelse return set;
+    owned.* = try live_filter(executor.ctx, alloc, set, executor.identity_read_generation);
+    return &owned.*.?;
+}
+
+fn resolvedSetHasDocKeys(set: *const doc_set.ResolvedDocSet) bool {
+    return switch (set.*) {
+        .doc_keys => true,
+        else => false,
+    };
+}
+
+fn docIdsForResolvedDocSetAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    executor: StructuredFilterResolverExecutor,
+) !?[]const []const u8 {
+    return switch (set.*) {
+        .all => null,
+        .none => try alloc.alloc([]const u8, 0),
+        .doc_keys => |keys| try dupeDocIdSliceAlloc(alloc, keys),
+        .ordinals, .ordinal_bitmap => if (executor.resolve_doc_set_doc_ids) |resolve|
+            try resolve(executor.ctx, alloc, set, executor.identity_read_generation)
+        else
+            null,
+    };
+}
+
+fn docNumsForResolvedDocSetWithExecutorAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    executor: StructuredFilterResolverExecutor,
+) !?[]const u32 {
+    switch (set.*) {
+        .ordinals, .ordinal_bitmap => {
+            const lookup = executor.lookup_doc_nums_for_ordinals orelse {
+                if (executor.require_doc_num_projection_mapper) return error.UnsupportedQueryRequest;
+                return try docNumsForResolvedDocSetAlloc(alloc, set);
+            };
+            const index_name = executor.doc_num_index_name orelse {
+                if (executor.require_doc_num_projection_mapper) return error.UnsupportedQueryRequest;
+                return try docNumsForResolvedDocSetAlloc(alloc, set);
+            };
+            const ordinals = (try docNumsForResolvedDocSetAlloc(alloc, set)) orelse return null;
+            defer alloc.free(ordinals);
+            return try lookup(executor.ctx, alloc, index_name, ordinals);
+        },
+        else => return try docNumsForResolvedDocSetAlloc(alloc, set),
+    }
+}
+
+fn docNumsForResolvedDocSetAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+) !?[]const u32 {
+    return switch (set.*) {
+        .all, .doc_keys => null,
+        .none => try alloc.alloc(u32, 0),
+        .ordinals => |ordinals| try alloc.dupe(u32, ordinals),
+        .ordinal_bitmap => |*bitmap| blk: {
+            var out = std.ArrayListUnmanaged(u32).empty;
+            errdefer out.deinit(alloc);
+            var iter = bitmap.iterator();
+            while (iter.next()) |ordinal| try out.append(alloc, ordinal);
+            break :blk try out.toOwnedSlice(alloc);
+        },
+    };
+}
+
+fn collectStructuredFilterResolvedDocSetAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    filter_query_json: []const u8,
+) !?doc_set.ResolvedDocSet {
+    const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
+
+    const snapshot = text_entry.persistent.snapshot();
+    const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
+    var result = try search_mod.execute(alloc, snapshot, .{
+        .query = search_query,
+        .k = k,
+        .offset = 0,
+        .include_stored = false,
+        .distributed_text_stats = req.distributed_text_stats,
+    });
+    defer result.deinit();
+    if (result.hits.len == 0) return .none;
+
+    if (snapshot.hasDocOrdinalCoverage()) {
+        if (try resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(alloc, snapshot, result.hits, executor)) |resolved| {
+            return resolved;
+        }
+    }
+
+    const resolve = executor.resolve_doc_ids_to_doc_set orelse return null;
+    var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer freeDocIdArrayList(alloc, &doc_ids);
+    for (result.hits) |hit| {
+        const id = hit.id orelse blk: {
+            const stored = snapshot.storedDoc(hit.doc_id) orelse continue;
+            break :blk stored.id;
+        };
+        try appendOwnedDocId(alloc, &doc_ids, id);
+    }
+    return try resolve(executor.ctx, alloc, doc_ids.items, executor.identity_read_generation);
+}
+
+fn resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    hits: []const search_mod.ScoredHit,
+    executor: StructuredFilterResolverExecutor,
+) !?doc_set.ResolvedDocSet {
+    var doc_nums = std.ArrayListUnmanaged(u32).empty;
+    defer doc_nums.deinit(alloc);
+    for (hits) |hit| try appendDocNum(alloc, &doc_nums, hit.doc_id);
+
+    const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums.items)) orelse return null;
+    defer alloc.free(ordinals);
+    if (ordinals.len == 0) return null;
+
+    var resolved = try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+    errdefer resolved.deinit(alloc);
+    if (executor.live_filter_doc_set) |live_filter| {
+        defer resolved.deinit(alloc);
+        return try live_filter(executor.ctx, alloc, &resolved, executor.identity_read_generation);
+    }
+    return resolved;
+}
+
+fn collectStructuredFilterResolvedDocSetCachedAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    cache: *StructuredFilterDocSetCache,
+    filter_query_json: []const u8,
+) !?doc_set.ResolvedDocSet {
+    if (cache.get(filter_query_json, executor.identity_read_generation)) |cached| {
+        return try doc_set.cloneAlloc(alloc, cached);
+    }
+    var resolved = (try collectStructuredFilterResolvedDocSetAlloc(alloc, req, executor, filter_query_json)) orelse return null;
+    errdefer resolved.deinit(alloc);
+    try cache.putCloneAlloc(alloc, filter_query_json, executor.identity_read_generation, &resolved);
+    return resolved;
+}
+
 fn collectStructuredFilterDocIdsAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -1145,6 +1925,7 @@ fn collectStructuredFilterDocIdsAlloc(
         .distributed_text_stats = req.distributed_text_stats,
     });
     defer result.deinit();
+    if (result.hits.len == 0) return try alloc.alloc([]const u8, 0);
 
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
@@ -1197,6 +1978,29 @@ fn intersectDocIdsAlloc(alloc: Allocator, left: []const []const u8, right: []con
     return try out.toOwnedSlice(alloc);
 }
 
+fn unionDocNumsAlloc(alloc: Allocator, left: []const u32, right: []const u32) ![]const u32 {
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    for (left) |doc_num| try appendDocNum(alloc, &out, doc_num);
+    for (right) |doc_num| try appendDocNum(alloc, &out, doc_num);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn intersectDocNumsAlloc(alloc: Allocator, left: []const u32, right: []const u32) ![]const u32 {
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    for (left) |doc_num| {
+        if (!containsDocNum(right, doc_num)) continue;
+        try appendDocNum(alloc, &out, doc_num);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendDocNum(alloc: Allocator, out: *std.ArrayListUnmanaged(u32), doc_num: u32) !void {
+    if (containsDocNum(out.items, doc_num)) return;
+    try out.append(alloc, doc_num);
+}
+
 fn appendOwnedDocId(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), id: []const u8) !void {
     for (out.items) |existing| {
         if (std.mem.eql(u8, existing, id)) return;
@@ -1217,6 +2021,13 @@ fn freeDocIdSlice(alloc: Allocator, doc_ids: []const []const u8) void {
 fn containsDocId(doc_ids: []const []const u8, expected: []const u8) bool {
     for (doc_ids) |doc_id| {
         if (std.mem.eql(u8, doc_id, expected)) return true;
+    }
+    return false;
+}
+
+fn containsDocNum(doc_nums: []const u32, expected: u32) bool {
+    for (doc_nums) |doc_num| {
+        if (doc_num == expected) return true;
     }
     return false;
 }
@@ -1592,6 +2403,7 @@ fn deriveNativeDenseConstraintsAlloc(
     req: types.SearchRequest,
     executor: DenseSearchExecutor,
     index_name: []const u8,
+    apply_live_all_docs: bool,
 ) !NativeDenseConstraints {
     var out = NativeDenseConstraints{};
     errdefer out.deinit(alloc);
@@ -1604,24 +2416,50 @@ fn deriveNativeDenseConstraintsAlloc(
     var doc_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
+        .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+        .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .live_filter_doc_set = executor.live_filter_doc_set,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = apply_live_all_docs,
     });
     defer doc_constraints.deinit(alloc);
 
     if (doc_constraints.positive_filter) {
-        const mapped = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
+        var mapped: []u64 = &.{};
+        var mapped_owned = false;
+        if (doc_constraints.filter_doc_nums.len > 0) {
+            mapped = try denseVectorIdsForDocNumsAlloc(alloc, doc_constraints.filter_doc_nums, executor, index_name);
+            mapped_owned = true;
+        }
+        if (doc_constraints.filter_doc_ids.len > 0) {
+            const mapped_doc_ids = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
+            if (mapped_owned) {
+                const intersected = try intersectVectorIdsAlloc(alloc, mapped, mapped_doc_ids);
+                alloc.free(mapped);
+                alloc.free(mapped_doc_ids);
+                mapped = intersected;
+            } else {
+                mapped = mapped_doc_ids;
+            }
+            mapped_owned = true;
+        }
         if (out.positive_filter) {
             const intersected = try intersectVectorIdsAlloc(alloc, out.filter_ids, mapped);
-            alloc.free(mapped);
+            if (mapped_owned) alloc.free(mapped);
             if (out.filter_ids_owned and out.filter_ids.len > 0) alloc.free(@constCast(out.filter_ids));
             out.filter_ids = intersected;
             out.filter_ids_owned = true;
         } else {
             out.filter_ids = mapped;
-            out.filter_ids_owned = true;
+            out.filter_ids_owned = mapped_owned;
             out.positive_filter = true;
         }
     }
 
+    if (doc_constraints.exclude_doc_nums.len > 0) {
+        const mapped_excludes = try denseVectorIdsForDocNumsAlloc(alloc, doc_constraints.exclude_doc_nums, executor, index_name);
+        try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
+    }
     if (doc_constraints.exclude_doc_ids.len > 0) {
         const mapped_excludes = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
@@ -1756,6 +2594,18 @@ fn denseVectorIdsForDocIdsAlloc(
         if (!containsVectorId(out.items, vector_id)) try out.append(alloc, vector_id);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn denseVectorIdsForDocNumsAlloc(
+    alloc: Allocator,
+    doc_nums: []const u32,
+    executor: DenseSearchExecutor,
+    index_name: []const u8,
+) ![]u64 {
+    if (executor.lookup_vector_ids_for_ordinals) |lookup| {
+        return try lookup(executor.ctx, alloc, index_name, doc_nums);
+    }
+    return error.UnsupportedQueryRequest;
 }
 
 fn intersectVectorIdsAlloc(alloc: Allocator, left: []const u64, right: []const u64) ![]u64 {
@@ -1928,10 +2778,46 @@ pub fn searchTextQuery(
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const search_query = try textQueryToSearchQuery(arena.allocator(), text_query, text_entry.text_analysis, text_entry.runtime_schema);
+    const arena_alloc = arena.allocator();
+    const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+    const snapshot = text_index.snapshot();
+    var constraint_req = req;
+    constraint_req.resolved_doc_filter = null;
+    var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
+        .ctx = executor.ctx,
+        .text_index_entry = executor.text_index_entry,
+        .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+        .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .live_filter_doc_set = executor.live_filter_doc_set,
+        .project_ordinals_to_doc_ids = false,
+        .text_snapshot_for_doc_num_projection = snapshot,
+        .apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage(),
+    });
+    defer native_constraints.deinit(alloc);
 
     const collect_all_hits = group_chunk_parents;
-    const snapshot = text_index.snapshot();
+    if (resolvedDocFilterFromRequest(req)) |filter| {
+        try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, filter, .{
+            .ctx = executor.ctx,
+            .text_index_entry = executor.text_index_entry,
+            .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+            .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+            .live_filter_doc_set = executor.live_filter_doc_set,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = req.identity_read_generation,
+        });
+    }
+    try convertNativeDocIdsToTextDocNumsAlloc(alloc, snapshot, &native_constraints);
+
+    if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
+        return executor.postprocess(executor.ctx, alloc, req, .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = 0,
+            .graph_results = &.{},
+        }, chunk_backed);
+    }
+    const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints);
 
     var result = if (req.count_only)
         try search_mod.executeCountCandidates(alloc, snapshot, search_query)
@@ -1956,10 +2842,12 @@ pub fn searchTextQuery(
     }
 
     for (result.hits, 0..) |hit, i| {
+        const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
         const id = hit.id orelse {
-            const stored = text_index.snapshot().storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
+            const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
             hits[i] = .{
                 .id = try alloc.dupe(u8, stored.id),
+                .doc_ordinal = doc_ordinal,
                 .score = hit.score,
                 .stored_data = null,
             };
@@ -1969,6 +2857,7 @@ pub fn searchTextQuery(
 
         hits[i] = .{
             .id = try alloc.dupe(u8, id),
+            .doc_ordinal = doc_ordinal,
             .score = hit.score,
             .stored_data = if (req.include_stored and hit.stored_data != null)
                 try executor.project_stored_search(executor.ctx, alloc, req, id, hit.stored_data.?)
@@ -1989,6 +2878,119 @@ pub fn searchTextQuery(
         },
         .graph_results = &.{},
     }, chunk_backed);
+}
+
+fn textSearchQueryWithNativeDocIdsAlloc(
+    alloc: Allocator,
+    base: search_mod.SearchQuery,
+    constraints: NativeDocIdConstraints,
+) !search_mod.SearchQuery {
+    const has_include_doc_ids = constraints.positive_filter and constraints.filter_doc_ids.len > 0;
+    const has_include_doc_nums = constraints.positive_filter and constraints.filter_doc_nums.len > 0;
+    const has_exclude_doc_ids = constraints.exclude_doc_ids.len > 0;
+    const has_exclude_doc_nums = constraints.exclude_doc_nums.len > 0;
+    const has_include = has_include_doc_ids or has_include_doc_nums;
+    const has_exclude = has_exclude_doc_ids or has_exclude_doc_nums;
+    if (!has_include and !has_exclude) return base;
+
+    const must_len: usize = 1 +
+        @as(usize, if (has_include_doc_ids) 1 else 0) +
+        @as(usize, if (has_include_doc_nums) 1 else 0);
+    const must = try alloc.alloc(search_mod.SearchQuery, must_len);
+    must[0] = base;
+    var must_i: usize = 1;
+    if (has_include_doc_ids) {
+        must[must_i] = .{ .doc_id = .{ .ids = constraints.filter_doc_ids } };
+        must_i += 1;
+    }
+    if (has_include_doc_nums) {
+        must[must_i] = .{ .doc_num = .{ .ids = constraints.filter_doc_nums } };
+        must_i += 1;
+    }
+
+    const must_not = if (has_exclude) blk: {
+        const items_len: usize =
+            @as(usize, if (has_exclude_doc_ids) 1 else 0) +
+            @as(usize, if (has_exclude_doc_nums) 1 else 0);
+        const items = try alloc.alloc(search_mod.SearchQuery, items_len);
+        var i: usize = 0;
+        if (has_exclude_doc_ids) {
+            items[i] = .{ .doc_id = .{ .ids = constraints.exclude_doc_ids } };
+            i += 1;
+        }
+        if (has_exclude_doc_nums) {
+            items[i] = .{ .doc_num = .{ .ids = constraints.exclude_doc_nums } };
+            i += 1;
+        }
+        break :blk items;
+    } else &.{};
+
+    return .{ .bool_query = .{
+        .must = must,
+        .must_not = must_not,
+        .min_should = 0,
+    } };
+}
+
+fn convertNativeDocIdsToTextDocNumsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *NativeDocIdConstraints,
+) !void {
+    if (constraints.filter_doc_ids.len > 0) {
+        const mapped = try textDocNumsForDocIdsAlloc(alloc, snapshot, constraints.filter_doc_ids);
+        if (constraints.filter_doc_nums.len > 0) {
+            const intersected = try intersectDocNumsAlloc(alloc, constraints.filter_doc_nums, mapped);
+            if (constraints.filter_doc_nums_owned and constraints.filter_doc_nums.len > 0) alloc.free(@constCast(constraints.filter_doc_nums));
+            alloc.free(mapped);
+            constraints.filter_doc_nums = intersected;
+        } else {
+            constraints.filter_doc_nums = mapped;
+        }
+        constraints.filter_doc_nums_owned = true;
+        if (constraints.filter_doc_ids_owned) freeDocIdSlice(alloc, constraints.filter_doc_ids);
+        constraints.filter_doc_ids = &.{};
+        constraints.filter_doc_ids_owned = false;
+    }
+
+    if (constraints.exclude_doc_ids.len > 0) {
+        const mapped = try textDocNumsForDocIdsAlloc(alloc, snapshot, constraints.exclude_doc_ids);
+        if (constraints.exclude_doc_nums.len > 0) {
+            const merged = try unionDocNumsAlloc(alloc, constraints.exclude_doc_nums, mapped);
+            if (constraints.exclude_doc_nums_owned and constraints.exclude_doc_nums.len > 0) alloc.free(@constCast(constraints.exclude_doc_nums));
+            alloc.free(mapped);
+            constraints.exclude_doc_nums = merged;
+        } else {
+            constraints.exclude_doc_nums = mapped;
+        }
+        constraints.exclude_doc_nums_owned = true;
+        if (constraints.exclude_doc_ids_owned) freeDocIdSlice(alloc, constraints.exclude_doc_ids);
+        constraints.exclude_doc_ids = &.{};
+        constraints.exclude_doc_ids_owned = false;
+    }
+}
+
+fn textDocNumsForDocIdsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_ids: []const []const u8,
+) ![]const u32 {
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    var doc_offset: u32 = 0;
+    for (snapshot.segments) |*seg| {
+        for (0..seg.reader.doc_count) |local_doc_usize| {
+            const local_doc: u32 = @intCast(local_doc_usize);
+            if (seg.deleted) |deleted| {
+                if (deleted.contains(local_doc)) continue;
+            }
+            const stored = seg.reader.storedDoc(local_doc) orelse continue;
+            if (!containsDocId(doc_ids, stored.id)) continue;
+            try appendDocNum(alloc, &out, doc_offset + local_doc);
+        }
+        doc_offset += seg.reader.doc_count;
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 pub fn collectSearchRequestTextStats(
@@ -2083,6 +3085,11 @@ pub fn collectExplicitTextStats(
     for (requests, 0..) |request, i| {
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
         const snapshot = text_entry.persistent.snapshot();
+        if (request.resolved_doc_filter) |filter| {
+            out[i] = try collectFilteredExplicitTextStats(alloc, snapshot, request, filter);
+            initialized += 1;
+            continue;
+        }
         const term_doc_freqs = try alloc.alloc(distributed_stats_mod.TermDocFreq, request.terms.len);
         var initialized_terms: usize = 0;
         errdefer {
@@ -2105,6 +3112,98 @@ pub fn collectExplicitTextStats(
         initialized += 1;
     }
     return out;
+}
+
+fn collectFilteredExplicitTextStats(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    request: ExplicitTextStatRequest,
+    filter: *const doc_set.ResolvedDocFilter,
+) !distributed_stats_mod.TextFieldStats {
+    const term_doc_freqs = try alloc.alloc(distributed_stats_mod.TermDocFreq, request.terms.len);
+    var initialized_terms: usize = 0;
+    errdefer {
+        for (term_doc_freqs[0..initialized_terms]) |*item| item.deinit(alloc);
+        if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
+    }
+    for (request.terms, 0..) |term, term_index| {
+        term_doc_freqs[term_index] = .{
+            .term = try alloc.dupe(u8, term),
+            .doc_freq = 0,
+        };
+        initialized_terms += 1;
+    }
+
+    var global_doc_count: u32 = 0;
+    var global_total_field_len: u64 = 0;
+    var doc_offset: u32 = 0;
+    for (snapshot.segments) |*seg| {
+        for (0..seg.reader.doc_count) |local_doc_usize| {
+            const local_doc: u32 = @intCast(local_doc_usize);
+            if (seg.deleted) |deleted| {
+                if (deleted.contains(local_doc)) continue;
+            }
+            const doc_id = doc_offset + local_doc;
+            if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
+            global_doc_count += 1;
+            const stored = (try snapshot.storedDocDecompressed(doc_id)) orelse continue;
+            defer alloc.free(stored.data);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored.data, .{}) catch continue;
+            defer parsed.deinit();
+            const value = extractJsonValueAtPath(parsed.value, request.field) orelse continue;
+            global_total_field_len += try countAnalyzedTokensInJsonValue(alloc, value);
+
+            var seen_terms = std.StringHashMap(void).init(alloc);
+            defer {
+                var it = seen_terms.keyIterator();
+                while (it.next()) |key| alloc.free(key.*);
+                seen_terms.deinit();
+            }
+            try collectSignificantTermsFromJsonValue(alloc, value, &seen_terms);
+            for (term_doc_freqs) |*item| {
+                if (seen_terms.contains(item.term)) item.doc_freq +|= 1;
+            }
+        }
+        doc_offset += seg.reader.doc_count;
+    }
+
+    return .{
+        .field = try alloc.dupe(u8, request.field),
+        .global_doc_count = global_doc_count,
+        .global_total_field_len = global_total_field_len,
+        .term_doc_freqs = term_doc_freqs,
+    };
+}
+
+fn docAllowedByResolvedFilter(
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_id: u32,
+    filter: *const doc_set.ResolvedDocFilter,
+) !bool {
+    return (try docSetContainsSnapshotDoc(snapshot, &filter.include, doc_id)) and
+        !(try docSetContainsSnapshotDoc(snapshot, &filter.exclude, doc_id));
+}
+
+fn docSetContainsSnapshotDoc(
+    snapshot: *const index_mod.IndexSnapshot,
+    set: *const doc_set.ResolvedDocSet,
+    doc_id: u32,
+) !bool {
+    return switch (set.*) {
+        .all => true,
+        .none => false,
+        .ordinals, .ordinal_bitmap => blk: {
+            const ordinal = (try snapshot.docOrdinal(doc_id)) orelse break :blk false;
+            break :blk set.containsOrdinal(ordinal);
+        },
+        .doc_keys => |keys| blk: {
+            const stored = snapshot.storedDoc(doc_id) orelse break :blk false;
+            for (keys) |key| {
+                if (std.mem.eql(u8, key, stored.id)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
 }
 
 pub fn collectExplicitBackgroundTextStats(
@@ -2140,7 +3239,12 @@ pub fn collectExplicitBackgroundTextStats(
             initialized_terms += 1;
         }
 
+        var background_doc_count: u32 = 0;
         for (background_result.hits) |hit| {
+            if (request.resolved_doc_filter) |filter| {
+                if (!(try docAllowedByResolvedFilter(snapshot, hit.doc_id, filter))) continue;
+            }
+            background_doc_count += 1;
             const stored = hit.stored_data orelse continue;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
             defer parsed.deinit();
@@ -2162,7 +3266,7 @@ pub fn collectExplicitBackgroundTextStats(
         out[i] = .{
             .aggregation_name = try alloc.dupe(u8, request.aggregation_name),
             .field = try alloc.dupe(u8, request.field),
-            .background_doc_count = background_result.total_hits,
+            .background_doc_count = if (request.resolved_doc_filter != null) background_doc_count else background_result.total_hits,
             .term_doc_freqs = term_doc_freqs,
         };
         initialized += 1;
@@ -2253,10 +3357,7 @@ fn appendFieldTerm(
     field: []const u8,
     term: []const u8,
 ) !void {
-    const map_key = if (index_name) |bound_index_name|
-        try std.fmt.allocPrint(alloc, "{s}\x1f{s}", .{ bound_index_name, field })
-    else
-        try alloc.dupe(u8, field);
+    const map_key = try textStatsMapKeyAlloc(alloc, index_name, field);
     errdefer alloc.free(map_key);
 
     const gop = try stats_map.getOrPut(alloc, map_key);
@@ -2273,6 +3374,50 @@ fn appendFieldTerm(
     if (!term_gop.found_existing) {
         term_gop.key_ptr.* = try alloc.dupe(u8, term);
     }
+}
+
+fn textStatsMapKeyAlloc(alloc: Allocator, index_name: ?[]const u8, field: []const u8) ![]u8 {
+    if (index_name) |bound_index_name| {
+        return try textStatsTupleKeyAlloc(alloc, &.{ "index", bound_index_name, field });
+    }
+    return try textStatsTupleKeyAlloc(alloc, &.{ "field", field });
+}
+
+fn textStatsTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    for (components) |component| {
+        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
+        var len_buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, component);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "search request text stats keys preserve embedded separators" {
+    const alloc = std.testing.allocator;
+
+    var stats_map = std.StringHashMapUnmanaged(SearchRequestTextStatEntry){};
+    defer {
+        var it = stats_map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.field);
+            var term_it = entry.value_ptr.terms.keyIterator();
+            while (term_it.next()) |term| alloc.free(term.*);
+            entry.value_ptr.terms.deinit(alloc);
+        }
+        stats_map.deinit(alloc);
+    }
+
+    try appendFieldTerm(alloc, &stats_map, "idx\x1ffield", "name", "alpha");
+    try appendFieldTerm(alloc, &stats_map, "idx", "field\x1fname", "beta");
+
+    try std.testing.expectEqual(@as(u32, 2), stats_map.count());
 }
 
 fn collectPatternFilterQueryTerms(
@@ -2385,6 +3530,22 @@ fn collectSignificantTermsFromJsonValue(
     }
 }
 
+fn countAnalyzedTokensInJsonValue(alloc: Allocator, value: std.json.Value) !u64 {
+    return switch (value) {
+        .array => |arr| blk: {
+            var total: u64 = 0;
+            for (arr.items) |item| total += try countAnalyzedTokensInJsonValue(alloc, item);
+            break :blk total;
+        },
+        .string => blk: {
+            const tokens = try analysis_mod.default_analyzer.analyze(alloc, value.string);
+            defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+            break :blk @as(u64, @intCast(tokens.len));
+        },
+        else => 0,
+    };
+}
+
 pub fn searchDense(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -2426,7 +3587,7 @@ fn searchDenseInternal(
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
     const paging = componentPaging(req);
     const index_stats = entry.index.stats();
-    var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, req, executor, req.index_name orelse entry.config.name);
+    var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, req, executor, req.index_name orelse entry.config.name, true);
     defer native_constraints.deinit(alloc);
     const unresolved_stored_filters = hasStoredPatternFilters(req) and !native_constraints.resolved_stored_filters;
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
@@ -2598,6 +3759,7 @@ fn searchDenseInternal(
         }
         try hits.append(alloc, .{
             .id = doc_key,
+            .doc_ordinal = try lookupDenseHitDocOrdinal(alloc, req, executor, doc_key),
             .score = hit.distance,
             .stored_data = stored_data,
         });
@@ -2661,6 +3823,26 @@ fn benchQueryProfileEveryUncached() ?u64 {
     const raw = raw_z;
     if (raw.len == 0) return null;
     return std.fmt.parseUnsigned(u64, raw, 10) catch null;
+}
+
+fn lookupDenseHitDocOrdinal(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: DenseSearchExecutor,
+    doc_key: []const u8,
+) !?doc_set.DocOrdinal {
+    if (!denseHitPageNeedsDocOrdinals(req)) return null;
+    const lookup = executor.lookup_doc_ordinal orelse return null;
+    return try lookup(executor.ctx, alloc, doc_key, req.identity_read_generation);
+}
+
+fn denseHitPageNeedsDocOrdinals(req: types.SearchRequest) bool {
+    return req.resolved_doc_filter != null or
+        req.graph_queries.len != 0 or
+        req.filter_doc_ids_positive or
+        req.filter_doc_ids.len != 0 or
+        req.exclude_doc_ids.len != 0 or
+        hasStoredPatternFilters(req);
 }
 
 fn nsToUs(ns: u64) u64 {
@@ -2807,6 +3989,29 @@ pub fn resolveSearchEpsilon(effort: f32) f32 {
     return 7.0 + ((effort - default_balanced_search_effort) * 186.0);
 }
 
+fn sparseHitParentOrdinal(
+    alloc: Allocator,
+    executor: SparseSearchExecutor,
+    hit_doc_id: []const u8,
+    generation: ?u64,
+) !?doc_set.DocOrdinal {
+    const lookup = executor.lookup_doc_ordinal orelse return null;
+    if (!internal_keys.isChunkArtifactRecordKey(hit_doc_id)) return null;
+    const parent_doc_id = (try internal_keys.decodeDocumentComponentAlloc(alloc, hit_doc_id)) orelse return null;
+    defer alloc.free(parent_doc_id);
+    return try lookup(executor.ctx, alloc, parent_doc_id, generation);
+}
+
+fn sparseHitOrdinal(
+    alloc: Allocator,
+    executor: SparseSearchExecutor,
+    hit_doc_id: []const u8,
+    generation: ?u64,
+) !?doc_set.DocOrdinal {
+    const lookup = executor.lookup_doc_ordinal orelse return null;
+    return try lookup(executor.ctx, alloc, hit_doc_id, generation);
+}
+
 pub fn searchSparse(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -2820,6 +4025,14 @@ pub fn searchSparse(
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
+        .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+        .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .live_filter_doc_set = executor.live_filter_doc_set,
+        .lookup_doc_nums_for_ordinals = executor.lookup_doc_nums_for_ordinals,
+        .doc_num_index_name = req.index_name orelse entry.config.name,
+        .require_doc_num_projection_mapper = true,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
     });
     defer native_constraints.deinit(alloc);
     const unresolved_stored_filters = hasStoredPatternFilters(req) and !native_constraints.resolved_stored_filters;
@@ -2832,7 +4045,7 @@ pub fn searchSparse(
         .indices = sparse.indices,
         .values = sparse.values,
     };
-    if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0) {
+    if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
         return .{
             .alloc = alloc,
             .hits = &.{},
@@ -2843,6 +4056,8 @@ pub fn searchSparse(
     const raw_hits = try entry.index.searchConstrained(alloc, &query, effective_k, .{
         .filter_doc_ids = native_constraints.filter_doc_ids,
         .exclude_doc_ids = native_constraints.exclude_doc_ids,
+        .filter_doc_nums = native_constraints.filter_doc_nums,
+        .exclude_doc_nums = native_constraints.exclude_doc_nums,
     });
     defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
 
@@ -2862,6 +4077,10 @@ pub fn searchSparse(
     for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
         hits[i] = .{
             .id = try alloc.dupe(u8, hit.doc_id),
+            .doc_ordinal = if (chunk_backed)
+                try sparseHitParentOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation)
+            else
+                try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
             .score = hit.score,
             .stored_data = if (req.include_stored and !(chunk_backed and group_chunk_parents))
                 try executor.load_projected_document(executor.ctx, alloc, req, hit.doc_id)
@@ -2931,6 +4150,19 @@ pub fn searchMatchAll(
 ) !types.SearchResult {
     var candidates = try executor.collect_candidates(executor.ctx, alloc, req);
     defer candidates.deinit(alloc);
+
+    var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
+        .ctx = executor.ctx,
+        .text_index_entry = executor.text_index_entry,
+        .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+        .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .live_filter_doc_set = executor.live_filter_doc_set,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer native_constraints.deinit(alloc);
+    try applyMatchAllDocIdConstraintsAlloc(alloc, &candidates, &native_constraints);
+
     const paging = componentPaging(req);
 
     const total_hits: u32 = @intCast(candidates.items.len);
@@ -2946,6 +4178,7 @@ pub fn searchMatchAll(
         if (i < start_usize or i >= end_usize) continue;
         hits[i - start_usize] = .{
             .id = candidate.id,
+            .doc_ordinal = candidate.ordinal,
             .score = 1.0,
             .stored_data = if (req.include_stored)
                 try executor.load_projected_document(executor.ctx, alloc, req, candidate.id)
@@ -2961,6 +4194,59 @@ pub fn searchMatchAll(
         .total_hits = total_hits,
         .graph_results = &.{},
     };
+}
+
+fn applyMatchAllDocIdConstraintsAlloc(
+    alloc: Allocator,
+    candidates: *MatchAllCandidates,
+    constraints: *const NativeDocIdConstraints,
+) !void {
+    if (!constraints.positive_filter and constraints.exclude_doc_ids.len == 0 and constraints.exclude_doc_nums.len == 0) return;
+
+    var keep_count: usize = 0;
+    for (candidates.items) |candidate| {
+        if (matchAllCandidateAllowed(candidate, constraints)) keep_count += 1;
+    }
+    if (keep_count == candidates.items.len) return;
+
+    const filtered = try alloc.alloc(MatchAllCandidate, keep_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (filtered[0..initialized]) |*candidate| candidate.deinit(alloc);
+        if (filtered.len > 0) alloc.free(filtered);
+    }
+
+    for (candidates.items) |*candidate| {
+        if (matchAllCandidateAllowed(candidate.*, constraints)) {
+            filtered[initialized] = candidate.*;
+            candidate.id = @constCast(&[_]u8{});
+            initialized += 1;
+        } else {
+            candidate.deinit(alloc);
+        }
+    }
+
+    alloc.free(candidates.items);
+    candidates.items = filtered;
+}
+
+fn matchAllCandidateAllowed(
+    candidate: MatchAllCandidate,
+    constraints: *const NativeDocIdConstraints,
+) bool {
+    if (constraints.positive_filter) {
+        if (constraints.filter_doc_ids.len == 0 and constraints.filter_doc_nums.len == 0) return false;
+        if (constraints.filter_doc_ids.len > 0 and !containsDocId(constraints.filter_doc_ids, candidate.id)) return false;
+        if (constraints.filter_doc_nums.len > 0) {
+            const ordinal = candidate.ordinal orelse return false;
+            if (!containsDocNum(constraints.filter_doc_nums, ordinal)) return false;
+        }
+    }
+    if (containsDocId(constraints.exclude_doc_ids, candidate.id)) return false;
+    if (candidate.ordinal) |ordinal| {
+        if (containsDocNum(constraints.exclude_doc_nums, ordinal)) return false;
+    }
+    return true;
 }
 
 pub fn collectMatchAllCandidates(
@@ -2996,9 +4282,14 @@ pub fn collectMatchAllCandidates(
             alloc.free(raw_key);
             continue;
         }
+        const ordinal = if (collector.lookup_doc_ordinal) |lookup|
+            try lookup(collector.ctx, alloc, raw_key, req.identity_read_generation)
+        else
+            null;
         try seen.put(alloc, raw_key, {});
         try candidates.append(alloc, .{
             .id = raw_key,
+            .ordinal = ordinal,
         });
     }
 
@@ -3482,7 +4773,7 @@ test "native dense constraints derive safe doc-id filter and exclusion ids" {
         .filter_query_json =
         \\{"bool":{"must":[{"doc_id":["doc:a","doc:b"]},{"term":{"category":"keep"}}],"must_not":[{"doc_id":["doc:c"]}]}}
         ,
-    }, testDenseConstraintExecutor(), "dv_v1");
+    }, testDenseConstraintExecutor(), "dv_v1", false);
     defer constraints.deinit(alloc);
 
     try std.testing.expect(constraints.positive_filter);
@@ -3498,7 +4789,7 @@ test "native dense constraints preserve empty positive algebraic candidate sets"
     var constraints = try deriveNativeDenseConstraintsAlloc(alloc, .{
         .filter_doc_ids = &.{},
         .filter_doc_ids_positive = true,
-    }, testDenseConstraintExecutor(), "dv_v1");
+    }, testDenseConstraintExecutor(), "dv_v1", false);
     defer constraints.deinit(alloc);
 
     try std.testing.expect(constraints.positive_filter);
@@ -3508,11 +4799,23 @@ test "native dense constraints preserve empty positive algebraic candidate sets"
         .filter_doc_ids = &.{},
         .filter_doc_ids_positive = true,
         .filter_ids = &.{ 11, 22 },
-    }, testDenseConstraintExecutor(), "dv_v1");
+    }, testDenseConstraintExecutor(), "dv_v1", false);
     defer intersected.deinit(alloc);
 
     try std.testing.expect(intersected.positive_filter);
     try std.testing.expectEqual(@as(usize, 0), intersected.filter_ids.len);
+}
+
+test "native dense constraints fail closed without ordinal vector mapping" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{2}),
+    };
+    defer filter.deinit(alloc);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, deriveNativeDenseConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, testDenseConstraintExecutor(), "dv_v1", false));
 }
 
 test "native sparse constraints accept algebraic doc id candidate sets" {
@@ -3553,6 +4856,1268 @@ test "native sparse constraints preserve empty positive algebraic candidate sets
 
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+}
+
+const TestMatchAllCtx = struct {
+    ids: []const []const u8,
+    ordinals: []const ?doc_set.DocOrdinal = &.{},
+};
+
+fn testCollectMatchAllCandidatesCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    _: types.SearchRequest,
+) anyerror!MatchAllCandidates {
+    const test_ctx: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    var out = try alloc.alloc(MatchAllCandidate, test_ctx.ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*candidate| candidate.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (test_ctx.ids, 0..) |id, i| {
+        const ordinal = if (i < test_ctx.ordinals.len) test_ctx.ordinals[i] else null;
+        out[i] = .{ .id = try alloc.dupe(u8, id), .ordinal = ordinal };
+        initialized += 1;
+    }
+    return .{ .items = out };
+}
+
+fn testMatchAllLoadProjectedCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: types.SearchRequest,
+    _: []const u8,
+) anyerror![]u8 {
+    return error.UnexpectedTestCall;
+}
+
+fn testMatchAllExecutor(ctx: *const TestMatchAllCtx) MatchAllExecutor {
+    return .{
+        .ctx = @constCast(ctx),
+        .collect_candidates = testCollectMatchAllCandidatesCallback,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+        .resolve_doc_ids_to_doc_set = testResolveDocIdsToDocSetCallback,
+        .live_filter_doc_set = testLiveFilterDocSetCallback,
+        .load_projected_document = testMatchAllLoadProjectedCallback,
+    };
+}
+
+test "match_all applies explicit doc id constraints before paging" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .filter_doc_ids = &.{ "doc:a", "doc:c" },
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &.{"doc:c"},
+        .include_stored = false,
+        .limit = 10,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "match_all candidate ordinal lookup uses identity read generation" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        seen_generation: ?u64 = null,
+
+        fn scanStoreRange(
+            _: ?*anyopaque,
+            scan_alloc: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            const out = try scan_alloc.alloc(docstore_mod.OwnedKVPair, 1);
+            errdefer scan_alloc.free(out);
+            out[0] = .{
+                .key = try internal_keys.documentKeyAlloc(scan_alloc, "doc:a"),
+                .value = try scan_alloc.dupe(u8, "{}"),
+            };
+            return out;
+        }
+
+        fn isExpiredKey(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn lookupDocOrdinal(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            doc_id: []const u8,
+            generation: ?u64,
+        ) anyerror!?doc_set.DocOrdinal {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            try std.testing.expectEqualStrings("doc:a", doc_id);
+            self.seen_generation = generation;
+            return 9;
+        }
+    };
+
+    var harness = Harness{};
+    var candidates = try collectMatchAllCandidates(alloc, .{
+        .identity_read_generation = 77,
+    }, .{
+        .ctx = &harness,
+        .scan_store_range = Harness.scanStoreRange,
+        .is_expired_key = Harness.isExpiredKey,
+        .lookup_doc_ordinal = Harness.lookupDocOrdinal,
+    });
+    defer candidates.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?u64, 77), harness.seen_generation);
+    try std.testing.expectEqual(@as(usize, 1), candidates.items.len);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 9), candidates.items[0].ordinal);
+}
+
+test "match_all consumes resolved ordinal filters without doc id projection" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2, 3 }),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{3}),
+    };
+    defer filter.deinit(alloc);
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.resolve_doc_set_doc_ids = null;
+    var result = try searchMatchAll(alloc, .{
+        .resolved_doc_filter = &filter,
+        .include_stored = false,
+        .limit = 10,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+fn testResolveDocSetDocIdsCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    _: ?u64,
+) anyerror!?[]const []const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeDocIdArrayList(alloc, &out);
+    switch (set.*) {
+        .ordinals => |ordinals| {
+            for (ordinals) |ordinal| {
+                const id: []const u8 = switch (ordinal) {
+                    1 => "doc:a",
+                    2 => "doc:b",
+                    3 => "doc:c",
+                    else => return error.NotFound,
+                };
+                try appendOwnedDocId(alloc, &out, id);
+            }
+            return try out.toOwnedSlice(alloc);
+        },
+        .ordinal_bitmap => |*bitmap| {
+            var iter = bitmap.iterator();
+            while (iter.next()) |ordinal| {
+                const id: []const u8 = switch (ordinal) {
+                    1 => "doc:a",
+                    2 => "doc:b",
+                    3 => "doc:c",
+                    else => return error.NotFound,
+                };
+                try appendOwnedDocId(alloc, &out, id);
+            }
+            return try out.toOwnedSlice(alloc);
+        },
+        else => return null,
+    }
+}
+
+fn testResolveDocIdsToDocSetCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    doc_ids: []const []const u8,
+    _: ?u64,
+) anyerror!doc_set.ResolvedDocSet {
+    var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+    defer ordinals.deinit(alloc);
+    for (doc_ids) |doc_id| {
+        const ordinal: doc_set.DocOrdinal = if (std.mem.eql(u8, doc_id, "doc:a"))
+            1
+        else if (std.mem.eql(u8, doc_id, "doc:b"))
+            2
+        else if (std.mem.eql(u8, doc_id, "doc:c"))
+            3
+        else
+            return try doc_set.cloneDocKeysAlloc(alloc, doc_ids);
+        try ordinals.append(alloc, ordinal);
+    }
+    if (ordinals.items.len == 0) return .none;
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+}
+
+fn testLookupDocNumsForOrdinalsCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    index_name: []const u8,
+    ordinals: []const u32,
+) anyerror![]const u32 {
+    try std.testing.expectEqualStrings("sp_v1", index_name);
+    const out = try alloc.alloc(u32, ordinals.len);
+    errdefer alloc.free(out);
+    for (ordinals, 0..) |ordinal, i| {
+        out[i] = switch (ordinal) {
+            1 => 101,
+            2 => 102,
+            3 => 103,
+            else => return error.NotFound,
+        };
+    }
+    return out;
+}
+
+fn testLiveFilterDocSetCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    _: ?u64,
+) anyerror!doc_set.ResolvedDocSet {
+    switch (set.*) {
+        .all => return .all,
+        .none => return .none,
+        .doc_keys => |keys| {
+            var out = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer freeDocIdArrayList(alloc, &out);
+            for (keys) |key| {
+                if (std.mem.eql(u8, key, "doc:a")) continue;
+                try appendOwnedDocId(alloc, &out, key);
+            }
+            return .{ .doc_keys = try out.toOwnedSlice(alloc) };
+        },
+        .ordinals => |ordinals| {
+            var out = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+            defer out.deinit(alloc);
+            for (ordinals) |ordinal| {
+                if (ordinal == 1) continue;
+                try out.append(alloc, ordinal);
+            }
+            return try doc_set.fromOrdinalsAlloc(alloc, out.items);
+        },
+        .ordinal_bitmap => |*bitmap| {
+            var out = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+            defer out.deinit(alloc);
+            var iter = bitmap.iterator();
+            while (iter.next()) |ordinal| {
+                if (ordinal == 1) continue;
+                try out.append(alloc, ordinal);
+            }
+            return try doc_set.fromOrdinalsAlloc(alloc, out.items);
+        },
+    }
+}
+
+fn testLiveAllDocSetCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    _: ?u64,
+) anyerror!doc_set.ResolvedDocSet {
+    return switch (set.*) {
+        .all => try doc_set.fromOrdinalsAlloc(alloc, &.{ 2, 3 }),
+        else => try doc_set.cloneAlloc(alloc, set),
+    };
+}
+
+const TestGenerationLiveFilterProbe = struct {
+    seen_generation: ?u64 = null,
+};
+
+fn testGenerationLiveFilterDocSetCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    generation: ?u64,
+) anyerror!doc_set.ResolvedDocSet {
+    const probe: *TestGenerationLiveFilterProbe = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    probe.seen_generation = generation;
+    switch (set.*) {
+        .ordinals => |ordinals| {
+            var out = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+            defer out.deinit(alloc);
+            for (ordinals) |ordinal| {
+                if (generation == null and ordinal == 1) continue;
+                try out.append(alloc, ordinal);
+            }
+            return try doc_set.fromOrdinalsAlloc(alloc, out.items);
+        },
+        else => return try doc_set.cloneAlloc(alloc, set),
+    }
+}
+
+test "native sparse constraints consume resolved doc sets before vector filtering" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 2, 1 }),
+        .exclude = try doc_set.cloneDocKeysAlloc(alloc, &.{"doc:c"}),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+        .filter_doc_ids = &.{"doc:b"},
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &.{"doc:d"},
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 1), constraints.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", constraints.filter_doc_ids[0]);
+    try std.testing.expect(containsDocId(constraints.exclude_doc_ids, "doc:c"));
+    try std.testing.expect(containsDocId(constraints.exclude_doc_ids, "doc:d"));
+}
+
+test "native constraints pass identity generation to doc-set id projection" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    const Harness = struct {
+        seen_generation: ?u64 = null,
+
+        fn resolveDocSetDocIds(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) anyerror!?[]const []const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.seen_generation = generation;
+            try std.testing.expect(set.containsOrdinal(1));
+            return try dupeDocIdSliceAlloc(alloc_inner, &.{"doc:a"});
+        }
+    };
+
+    var harness = Harness{};
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+        .identity_read_generation = 7,
+    }, .{
+        .ctx = &harness,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = Harness.resolveDocSetDocIds,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?u64, 7), harness.seen_generation);
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 1), constraints.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:a", constraints.filter_doc_ids[0]);
+}
+
+test "native constraints fail closed when resolved ordinals cannot be represented" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+    }));
+
+    var exclude_filter = doc_set.ResolvedDocFilter{
+        .include = .all,
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{2}),
+    };
+    defer exclude_filter.deinit(alloc);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &exclude_filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+    }));
+}
+
+test "native sparse constraints fail closed without ordinal doc num mapper" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 3, 1 }),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{2}),
+    };
+    defer filter.deinit(alloc);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+        .project_ordinals_to_doc_ids = false,
+        .require_doc_num_projection_mapper = true,
+    }));
+}
+
+test "native sparse constraints map resolved ordinals to physical doc nums" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 3, 1 }),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{2}),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+        .lookup_doc_nums_for_ordinals = testLookupDocNumsForOrdinalsCallback,
+        .doc_num_index_name = "sp_v1",
+        .project_ordinals_to_doc_ids = false,
+        .require_doc_num_projection_mapper = true,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 101));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 103));
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 102), constraints.exclude_doc_nums[0]);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+}
+
+test "native constraints treat resolved all-doc exclusion as empty candidates" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 }),
+        .exclude = .all,
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+    try std.testing.expect(constraints.resolved_stored_filters);
+}
+
+test "native sparse constraints resolve explicit request doc ids to doc nums" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .filter_doc_ids = &.{ "doc:b", "doc:c" },
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &.{"doc:a"},
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_ids_to_doc_set = testResolveDocIdsToDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 1), constraints.exclude_doc_nums[0]);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+}
+
+test "native sparse constraints keep explicit doc ids when identity coverage is incomplete" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .filter_doc_ids = &.{"doc:z"},
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &.{"doc:missing"},
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_ids_to_doc_set = testResolveDocIdsToDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 1), constraints.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:z", constraints.filter_doc_ids[0]);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:missing", constraints.exclude_doc_ids[0]);
+}
+
+test "native sparse constraints can apply broad live doc filter" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveAllDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(!containsDocNum(constraints.filter_doc_nums, 1));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
+}
+
+test "native sparse constraints live-filter resolved ordinal sets" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 3, 1, 2 }),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 3 }),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+        .live_filter_doc_set = testLiveFilterDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(!containsDocNum(constraints.filter_doc_nums, 1));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 3), constraints.exclude_doc_nums[0]);
+}
+
+test "native constraints pass identity read generation to live doc filtering" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 }),
+    };
+    defer filter.deinit(alloc);
+
+    var current_probe = TestGenerationLiveFilterProbe{};
+    var current_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = &current_probe,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testGenerationLiveFilterDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer current_constraints.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, null), current_probe.seen_generation);
+    try std.testing.expectEqual(@as(usize, 1), current_constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 2), current_constraints.filter_doc_nums[0]);
+
+    var snapshot_probe = TestGenerationLiveFilterProbe{};
+    var snapshot_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+        .identity_read_generation = 7,
+    }, .{
+        .ctx = &snapshot_probe,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testGenerationLiveFilterDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer snapshot_constraints.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 7), snapshot_probe.seen_generation);
+    try std.testing.expectEqual(@as(usize, 2), snapshot_constraints.filter_doc_nums.len);
+    try std.testing.expect(containsDocNum(snapshot_constraints.filter_doc_nums, 1));
+    try std.testing.expect(containsDocNum(snapshot_constraints.filter_doc_nums, 2));
+}
+
+test "text search query pushes native doc id constraints into bool query" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const query = try textSearchQueryWithNativeDocIdsAlloc(arena.allocator(), .{
+        .match = .{ .field = "body", .text = "alpha" },
+    }, .{
+        .positive_filter = true,
+        .filter_doc_ids = &.{ "doc:b", "doc:c" },
+        .exclude_doc_ids = &.{"doc:c"},
+    });
+
+    switch (query) {
+        .bool_query => |bool_query| {
+            try std.testing.expectEqual(@as(usize, 2), bool_query.must.len);
+            try std.testing.expectEqual(@as(usize, 1), bool_query.must_not.len);
+            try std.testing.expect(std.meta.activeTag(bool_query.must[0]) == .match);
+            try std.testing.expect(std.meta.activeTag(bool_query.must[1]) == .doc_id);
+            try std.testing.expectEqualStrings("doc:b", bool_query.must[1].doc_id.ids[0]);
+            try std.testing.expect(std.meta.activeTag(bool_query.must_not[0]) == .doc_id);
+            try std.testing.expectEqualStrings("doc:c", bool_query.must_not[0].doc_id.ids[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "text search query pushes native doc num constraints into bool query" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const query = try textSearchQueryWithNativeDocIdsAlloc(arena.allocator(), .{
+        .match = .{ .field = "body", .text = "alpha" },
+    }, .{
+        .positive_filter = true,
+        .filter_doc_nums = &.{ 1, 3 },
+        .exclude_doc_nums = &.{2},
+    });
+
+    switch (query) {
+        .bool_query => |bool_query| {
+            try std.testing.expectEqual(@as(usize, 2), bool_query.must.len);
+            try std.testing.expectEqual(@as(usize, 1), bool_query.must_not.len);
+            try std.testing.expect(std.meta.activeTag(bool_query.must[0]) == .match);
+            try std.testing.expect(std.meta.activeTag(bool_query.must[1]) == .doc_num);
+            try std.testing.expectEqual(@as(u32, 1), bool_query.must[1].doc_num.ids[0]);
+            try std.testing.expect(std.meta.activeTag(bool_query.must_not[0]) == .doc_num);
+            try std.testing.expectEqual(@as(u32, 2), bool_query.must_not[0].doc_num.ids[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "text native constraints project resolved ordinals through segment sidecar" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{}");
+    try seg_writer.addStoredDoc("doc:b", "{}");
+    try seg_writer.addDocOrdinals(&.{ 42, 7 });
+    const segment_bytes = try seg_writer.build();
+    defer alloc.free(segment_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{7}),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{42}),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .text_snapshot_for_doc_num_projection = writer.snapshot(),
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 1), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 1), constraints.filter_doc_nums[0]);
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 0), constraints.exclude_doc_nums[0]);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+}
+
+test "text resolved doc filter projection passes identity generation to live filtering" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{}");
+    try seg_writer.addStoredDoc("doc:b", "{}");
+    try seg_writer.addDocOrdinals(&.{ 1, 2 });
+    const segment_bytes = try seg_writer.build();
+    defer alloc.free(segment_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 }),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = NativeDocIdConstraints{};
+    defer constraints.deinit(alloc);
+    var probe = TestGenerationLiveFilterProbe{};
+    try applyResolvedDocFilterToTextDocNumsAlloc(alloc, writer.snapshot(), &constraints, &filter, .{
+        .ctx = &probe,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testGenerationLiveFilterDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+        .identity_read_generation = 7,
+    });
+
+    try std.testing.expectEqual(@as(?u64, 7), probe.seen_generation);
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 0));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 1));
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+}
+
+test "text native constraints resolve explicit request doc ids through ordinal sidecar" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{}");
+    try seg_writer.addStoredDoc("doc:b", "{}");
+    try seg_writer.addStoredDoc("doc:c", "{}");
+    try seg_writer.addDocOrdinals(&.{ 1, 2, 3 });
+    const segment_bytes = try seg_writer.build();
+    defer alloc.free(segment_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+
+    const Harness = struct {
+        fn resolveDocSetDocIds(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: *const doc_set.ResolvedDocSet,
+            _: ?u64,
+        ) anyerror!?[]const []const u8 {
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .filter_doc_ids = &.{ "doc:b", "doc:c" },
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &.{"doc:a"},
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_ids_to_doc_set = testResolveDocIdsToDocSetCallback,
+        .resolve_doc_set_doc_ids = Harness.resolveDocSetDocIds,
+        .text_snapshot_for_doc_num_projection = writer.snapshot(),
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 1));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, 0), constraints.exclude_doc_nums[0]);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+}
+
+test "text native constraints fall back for mixed ordinal sidecar coverage" {
+    const alloc = std.testing.allocator;
+
+    var seg_with_ordinals = segment_mod.SegmentWriter.init(alloc);
+    defer seg_with_ordinals.deinit();
+    try seg_with_ordinals.addStoredDoc("doc:a", "{}");
+    try seg_with_ordinals.addDocOrdinals(&.{1});
+    const covered_segment = try seg_with_ordinals.build();
+    defer alloc.free(covered_segment);
+
+    var legacy_seg = segment_mod.SegmentWriter.init(alloc);
+    defer legacy_seg.deinit();
+    try legacy_seg.addStoredDoc("doc:b", "{}");
+    const legacy_segment = try legacy_seg.build();
+    defer alloc.free(legacy_segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(covered_segment);
+    try writer.addSegment(legacy_segment);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{2}),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+        .text_snapshot_for_doc_num_projection = writer.snapshot(),
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(!writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 1), constraints.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:a", constraints.filter_doc_ids[0]);
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", constraints.exclude_doc_ids[0]);
+}
+
+test "text native constraints fail closed when resolved ordinals cannot be projected" {
+    const alloc = std.testing.allocator;
+
+    var legacy_seg = segment_mod.SegmentWriter.init(alloc);
+    defer legacy_seg.deinit();
+    try legacy_seg.addStoredDoc("doc:a", "{}");
+    const legacy_segment = try legacy_seg.build();
+    defer alloc.free(legacy_segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(legacy_segment);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    try std.testing.expect(!writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expectError(error.UnsupportedQueryRequest, deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .text_snapshot_for_doc_num_projection = writer.snapshot(),
+    }));
+}
+
+test "text native constraints treat resolved all-doc exclusion as empty candidates" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{}");
+    try seg_writer.addDocOrdinals(&.{1});
+    const segment_bytes = try seg_writer.build();
+    defer alloc.free(segment_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+        .exclude = .all,
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
+        .text_snapshot_for_doc_num_projection = writer.snapshot(),
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+    try std.testing.expect(constraints.resolved_stored_filters);
+}
+
+test "structured text filter hit resolution uses ordinal sidecar" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{}");
+    try seg_writer.addStoredDoc("doc:b", "{}");
+    try seg_writer.addDocOrdinals(&.{ 1, 2 });
+    const segment_bytes = try seg_writer.build();
+    defer alloc.free(segment_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+
+    const hits = [_]search_mod.ScoredHit{
+        .{ .doc_id = 0, .score = 1.0, .id = null, .stored_data = null },
+        .{ .doc_id = 1, .score = 1.0, .id = null, .stored_data = null },
+    };
+    var resolved = (try resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(alloc, writer.snapshot(), hits[0..], .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveFilterDocSetCallback,
+    })) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(alloc);
+
+    switch (resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "structured filter doc set cache returns owned clones" {
+    const alloc = std.testing.allocator;
+    var cache = StructuredFilterDocSetCache{};
+    defer cache.deinit(alloc);
+
+    var source = try doc_set.fromOrdinalsAlloc(alloc, &.{ 4, 2, 4 });
+    defer source.deinit(alloc);
+    try cache.putCloneAlloc(alloc, "{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 7, &source);
+
+    try std.testing.expect(cache.get("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", null) == null);
+    try std.testing.expect(cache.get("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 8) == null);
+    const cached = cache.get("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 7) orelse return error.TestUnexpectedResult;
+    var clone = try doc_set.cloneAlloc(alloc, cached);
+    defer clone.deinit(alloc);
+
+    try std.testing.expect(clone.containsOrdinal(2));
+    try std.testing.expect(clone.containsOrdinal(4));
+    try std.testing.expect(!clone.containsOrdinal(3));
+
+    var current_source = try doc_set.fromOrdinalsAlloc(alloc, &.{3});
+    defer current_source.deinit(alloc);
+    try cache.putCloneAlloc(alloc, "{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", null, &current_source);
+    const current_cached = cache.get("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(current_cached.containsOrdinal(3));
+    try std.testing.expect(!current_cached.containsOrdinal(2));
+}
+
+test "structured filter doc set cache separates shared namespace generation keys" {
+    const alloc = std.testing.allocator;
+    var cache = StructuredFilterDocSetCache{};
+    defer cache.deinit(alloc);
+
+    var source = try doc_set.fromOrdinalsAlloc(alloc, &.{ 9, 10 });
+    defer source.deinit(alloc);
+    try cache.putSharedCloneAlloc(alloc, "{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 111, 7, &source);
+
+    try std.testing.expect(cache.get("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 7) == null);
+    try std.testing.expect(cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 112, 7) == null);
+    try std.testing.expect(cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 111, 8) == null);
+    const cached = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 111, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cached.containsOrdinal(9));
+    try std.testing.expect(cached.containsOrdinal(10));
+}
+
+test "composed search carries resolved doc sets for graph attachment" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        saw_attach: bool = false,
+
+        fn makeResult(alloc_inner: Allocator, doc_id: []const u8) !types.SearchResult {
+            const hits = try alloc_inner.alloc(types.SearchHit, 1);
+            hits[0] = .{ .id = try alloc_inner.dupe(u8, doc_id) };
+            return .{
+                .alloc = alloc_inner,
+                .hits = hits,
+                .total_hits = 1,
+            };
+        }
+
+        fn searchTextQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            _: types.TextQuery,
+        ) anyerror!types.SearchResult {
+            try std.testing.expectEqual(@as(?u64, 77), req.identity_read_generation);
+            return try makeResult(alloc_inner, "doc:a");
+        }
+
+        fn searchText(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchDense(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            _: types.DenseKnnQuery,
+        ) anyerror!types.SearchResult {
+            try std.testing.expectEqual(@as(?u64, 77), req.identity_read_generation);
+            return try makeResult(alloc_inner, "doc:b");
+        }
+
+        fn searchSparse(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            _: types.SparseKnnQuery,
+        ) anyerror!types.SearchResult {
+            try std.testing.expectEqual(@as(?u64, 77), req.identity_read_generation);
+            return try makeResult(alloc_inner, "doc:c");
+        }
+
+        fn cloneNamedSet(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: graph_exec.NamedResultSet,
+            include_stored: bool,
+        ) anyerror!types.SearchResult {
+            return try graph_exec.cloneNamedSetAsResult(alloc_inner, set, include_stored);
+        }
+
+        fn fuseNamedSets(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            named_sets: []const graph_exec.NamedResultSet,
+        ) anyerror!types.SearchResult {
+            try std.testing.expectEqual(@as(?u64, 77), req.identity_read_generation);
+            const doc_id = if (named_sets.len == 2 and
+                findComposedNamedSet(named_sets, "dense") != null and
+                findComposedNamedSet(named_sets, "sparse") != null)
+                "doc:embeddings"
+            else
+                "doc:fused";
+            return try makeResult(alloc_inner, doc_id);
+        }
+
+        fn resolveHits(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            hits: []const types.SearchHit,
+        ) anyerror!doc_set.ResolvedDocSet {
+            try std.testing.expectEqual(@as(?u64, 77), req.identity_read_generation);
+            var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+            defer ordinals.deinit(alloc_inner);
+            for (hits) |hit| {
+                const ordinal: doc_set.DocOrdinal = if (std.mem.eql(u8, hit.id, "doc:a"))
+                    1
+                else if (std.mem.eql(u8, hit.id, "doc:b"))
+                    2
+                else if (std.mem.eql(u8, hit.id, "doc:c"))
+                    3
+                else if (std.mem.eql(u8, hit.id, "doc:embeddings"))
+                    8
+                else if (std.mem.eql(u8, hit.id, "doc:fused"))
+                    9
+                else
+                    return error.TestUnexpectedResult;
+                try ordinals.append(alloc_inner, ordinal);
+            }
+            return try doc_set.fromOrdinalsAlloc(alloc_inner, ordinals.items);
+        }
+
+        fn expectNamedSetOrdinal(named_sets: []const graph_exec.NamedResultSet, name: []const u8, ordinal: doc_set.DocOrdinal) !void {
+            const set = findComposedNamedSet(named_sets, name) orelse return error.TestUnexpectedResult;
+            const resolved = set.resolved_doc_set orelse return error.TestUnexpectedResult;
+            try std.testing.expect(resolved.containsOrdinal(ordinal));
+        }
+
+        fn attachGraphResults(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            req: types.SearchRequest,
+            _: *types.SearchResult,
+            named_sets: []const graph_exec.NamedResultSet,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            try std.testing.expectEqual(@as(?u64, 77), req.identity_read_generation);
+            try expectNamedSetOrdinal(named_sets, "$full_text_results", 1);
+            try expectNamedSetOrdinal(named_sets, "dense", 2);
+            try expectNamedSetOrdinal(named_sets, "sparse", 3);
+            try expectNamedSetOrdinal(named_sets, "$embeddings_results", 8);
+            try expectNamedSetOrdinal(named_sets, "$fused_results", 9);
+            self.saw_attach = true;
+        }
+    };
+
+    const dense_vector = [_]f32{1.0};
+    const sparse_indices = [_]u32{1};
+    const sparse_values = [_]f32{1.0};
+    const graph_queries = [_]types.NamedGraphQuery{.{
+        .name = "g",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{},
+        },
+    }};
+
+    var harness = Harness{};
+    var result = try searchComposed(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .dense = .{ .vector = &dense_vector, .k = 1 },
+        .sparse = .{ .indices = &sparse_indices, .values = &sparse_values, .k = 1 },
+        .graph_queries = &graph_queries,
+        .include_stored = false,
+        .identity_read_generation = 77,
+    }, .{
+        .ctx = &harness,
+        .search_text_query = Harness.searchTextQuery,
+        .search_text = Harness.searchText,
+        .search_dense = Harness.searchDense,
+        .search_sparse = Harness.searchSparse,
+        .clone_named_set = Harness.cloneNamedSet,
+        .fuse_named_sets = Harness.fuseNamedSets,
+        .resolve_hits_to_doc_set = Harness.resolveHits,
+        .attach_graph_results = Harness.attachGraphResults,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(harness.saw_attach);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:fused", result.hits[0].id);
+}
+
+test "composed search skips resolved doc-set materialization without graph queries" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn makeResult(alloc_inner: Allocator, doc_id: []const u8) !types.SearchResult {
+            const hits = try alloc_inner.alloc(types.SearchHit, 1);
+            hits[0] = .{ .id = try alloc_inner.dupe(u8, doc_id) };
+            return .{
+                .alloc = alloc_inner,
+                .hits = hits,
+                .total_hits = 1,
+            };
+        }
+
+        fn searchTextQuery(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.TextQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchText(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchDense(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: types.SearchRequest,
+            _: types.DenseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return try makeResult(alloc_inner, "doc:a");
+        }
+
+        fn searchSparse(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.SparseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn cloneNamedSet(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: graph_exec.NamedResultSet,
+            include_stored: bool,
+        ) anyerror!types.SearchResult {
+            return try graph_exec.cloneNamedSetAsResult(alloc_inner, set, include_stored);
+        }
+
+        fn fuseNamedSets(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn resolveHits(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const types.SearchHit,
+        ) anyerror!doc_set.ResolvedDocSet {
+            return error.TestUnexpectedResult;
+        }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: *types.SearchResult,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const dense_vector = [_]f32{1.0};
+    var result = try searchComposed(alloc, .{
+        .dense = .{ .vector = &dense_vector, .k = 1 },
+        .include_stored = false,
+    }, .{
+        .ctx = null,
+        .search_text_query = Harness.searchTextQuery,
+        .search_text = Harness.searchText,
+        .search_dense = Harness.searchDense,
+        .search_sparse = Harness.searchSparse,
+        .clone_named_set = Harness.cloneNamedSet,
+        .fuse_named_sets = Harness.fuseNamedSets,
+        .resolve_hits_to_doc_set = Harness.resolveHits,
+        .attach_graph_results = Harness.attachGraphResults,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
 test "preflightSearchRequestAlloc summarizes search request result refs" {

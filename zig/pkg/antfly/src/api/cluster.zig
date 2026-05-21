@@ -49,6 +49,12 @@ pub fn fromMetadataStatus(alloc: std.mem.Allocator, status: metadata_api.Metadat
             .message = try std.fmt.allocPrint(alloc, "{d} placement groups require repair", .{status.repair_placement_groups}),
         };
     }
+    if (status.projected_doc_identity_lifecycle_rebuild_required > 0) {
+        return .{
+            .health = .degraded,
+            .message = try std.fmt.allocPrint(alloc, "{d} ranges require document identity rebuild", .{status.projected_doc_identity_lifecycle_rebuild_required}),
+        };
+    }
     if (status.excluded_stores > 0) {
         return .{
             .health = .degraded,
@@ -63,7 +69,9 @@ pub fn fromMetadataStatus(alloc: std.mem.Allocator, status: metadata_api.Metadat
     }
     return .{
         .health = .healthy,
-        .message = if (status.rebalance_placement_groups > 0)
+        .message = if (status.projected_doc_identity_lifecycle_reassigning > 0)
+            try std.fmt.allocPrint(alloc, "{d} ranges are reassigning document identity", .{status.projected_doc_identity_lifecycle_reassigning})
+        else if (status.rebalance_placement_groups > 0)
             try std.fmt.allocPrint(alloc, "{d} placement groups are rebalancing", .{status.rebalance_placement_groups})
         else
             null,
@@ -90,6 +98,24 @@ test "cluster status derives degraded and error states from metadata status" {
     });
     defer degraded.deinit(std.testing.allocator);
     try std.testing.expectEqual(ClusterHealth.degraded, degraded.health);
+
+    var rebuild_required = try fromMetadataStatus(std.testing.allocator, .{
+        .metadata_group_id = 1,
+        .metrics = .{},
+        .projected_stores = 3,
+        .projected_doc_identity_lifecycle_rebuild_required = 1,
+    });
+    defer rebuild_required.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ClusterHealth.degraded, rebuild_required.health);
+
+    var reassigning = try fromMetadataStatus(std.testing.allocator, .{
+        .metadata_group_id = 1,
+        .metrics = .{},
+        .projected_stores = 3,
+        .projected_doc_identity_lifecycle_reassigning = 1,
+    });
+    defer reassigning.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ClusterHealth.healthy, reassigning.health);
 
     var healthy = try fromMetadataStatus(std.testing.allocator, .{
         .metadata_group_id = 1,

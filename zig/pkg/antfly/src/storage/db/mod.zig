@@ -19,6 +19,9 @@ const planning_adapter = @import("planning_adapter.zig");
 const planning_bindings = @import("planning_bindings.zig");
 const planning_collectors = @import("planning_collectors.zig");
 const planning_stats = @import("planning_stats.zig");
+const doc_identity_mod = @import("doc_identity.zig");
+const query_graph = @import("query/graph_exec.zig");
+const query_result_shape = @import("query/result_shape.zig");
 
 pub const types = @import("types.zig");
 pub const docstore = @import("../docstore.zig");
@@ -48,6 +51,8 @@ pub const ttl_runtime = @import("maintenance/ttl_runtime.zig");
 pub const transaction_runtime = @import("maintenance/transaction_runtime.zig");
 pub const document_query = @import("document_query.zig");
 pub const document_mapper = @import("document_mapper.zig");
+pub const DocIdentityNamespace = doc_identity_mod.Namespace;
+pub const doc_filter_wire = @import("doc_filter_wire.zig");
 pub const artifact_ids = @import("artifact_ids.zig");
 pub const internal_keys = @import("../internal_keys.zig");
 pub const transform = @import("transform.zig");
@@ -125,6 +130,8 @@ test {
     _ = transaction_runtime;
     _ = document_query;
     _ = document_mapper;
+    _ = DocIdentityNamespace;
+    _ = doc_filter_wire;
     _ = artifact_ids;
     _ = internal_keys;
     _ = transform;
@@ -153,6 +160,8 @@ test {
     _ = validatePlanningBindings;
     _ = planningCollectors;
     _ = query_metrics;
+    _ = query_graph;
+    _ = query_result_shape;
     _ = TextIndexEstimate;
     _ = EmbeddingIndexEstimate;
     _ = GraphIndexEstimate;

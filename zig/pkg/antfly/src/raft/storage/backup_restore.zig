@@ -16,12 +16,18 @@ const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
 const backups_api = @import("../../api/backups.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const doc_identity = @import("../../storage/db/doc_identity.zig");
 const lsm_table_file = @import("../../storage/lsm/table_file.zig");
 
 pub const RestoreSource = struct {
     backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8,
+};
+
+pub const RestoreOptions = struct {
+    expected_table_name: ?[]const u8 = null,
+    expected_identity_namespace: ?doc_identity.Namespace = null,
 };
 
 pub fn groupDbPathFromReplicaRoot(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) ![]u8 {
@@ -47,18 +53,33 @@ pub fn applyRestoreSnapshotToPath(
     restore: RestoreSource,
     expected_table_name: ?[]const u8,
 ) !void {
-    try applyRestoreSnapshotIfNeeded(alloc, path, group_id, restore, expected_table_name);
+    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, restore, .{
+        .expected_table_name = expected_table_name,
+    });
+}
+
+pub fn applyRestoreSnapshotToPathWithOptions(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !void {
+    try applyRestoreSnapshotIfNeeded(alloc, path, group_id, restore, options);
 }
 
 pub fn restoreSnapshotMatchesPath(
     alloc: std.mem.Allocator,
     path: []const u8,
     restore: RestoreSource,
+    options: RestoreOptions,
 ) !bool {
     const snapshot_doc_count = try restoreSnapshotDocCount(alloc, restore);
 
-    var db = db_mod.DB.open(alloc, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
+    var db = db_mod.DB.open(alloc, path, .{
+        .identity_namespace = options.expected_identity_namespace,
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.IdentityNamespaceMismatch => return false,
         else => return err,
     };
     defer db.close();
@@ -98,7 +119,7 @@ pub fn forceApplyBackupRestoreFromRecord(
             .location = restore.location,
             .snapshot_path = restore.snapshot_path,
         },
-        null,
+        .{},
     );
 }
 
@@ -107,7 +128,7 @@ fn applyRestoreSnapshotIfNeeded(
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
-    expected_table_name: ?[]const u8,
+    options: RestoreOptions,
 ) !void {
     if (try db_mod.DB.readRestoreStateForPath(alloc, path)) |state_value| {
         var state = state_value;
@@ -117,13 +138,13 @@ fn applyRestoreSnapshotIfNeeded(
             std.mem.eql(u8, state.location, restore.location) and
             std.mem.eql(u8, state.snapshot_path, restore.snapshot_path) and
             state.group_id == group_id and
-            try restoreSnapshotMatchesPath(alloc, path, restore))
+            try restoreSnapshotMatchesPath(alloc, path, restore, options))
         {
             return;
         }
     }
 
-    try applyRestoreSnapshot(alloc, path, group_id, restore, expected_table_name);
+    try applyRestoreSnapshot(alloc, path, group_id, restore, options);
 }
 
 fn applyRestoreSnapshot(
@@ -131,13 +152,13 @@ fn applyRestoreSnapshot(
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
-    expected_table_name: ?[]const u8,
+    options: RestoreOptions,
 ) !void {
     var location = try backups_api.openBackupLocation(alloc, restore.location);
     defer location.deinit(alloc);
     var manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
     defer manifest.deinit(alloc);
-    if (expected_table_name) |table_name| {
+    if (options.expected_table_name) |table_name| {
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
     }
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
@@ -158,7 +179,9 @@ fn applyRestoreSnapshot(
     };
 
     try resetLocalTablePath(path);
-    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, .{}, .{
+    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, .{
+        .identity_namespace = options.expected_identity_namespace,
+    }, .{
         .backup_id = restore.backup_id,
         .location = restore.location,
         .snapshot_path = snapshot_path,

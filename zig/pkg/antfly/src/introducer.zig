@@ -35,6 +35,7 @@ pub const Batch = struct {
         id: []const u8,
         stored_data: []const u8,
         fields: []const FieldTerms,
+        doc_ordinal: ?u32 = null,
     };
 
     pub const FieldTerms = struct {
@@ -95,6 +96,16 @@ fn buildSegmentWithExtraSections(
         }
     }
 
+    var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
+    defer doc_ordinals.deinit(alloc);
+    var has_doc_ordinal = false;
+    for (batch.docs) |doc| {
+        const ordinal = doc.doc_ordinal orelse 0;
+        has_doc_ordinal = has_doc_ordinal or ordinal != 0;
+        try doc_ordinals.append(alloc, ordinal);
+    }
+    if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+
     // Build inverted indexes and attach to segment
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
@@ -152,6 +163,7 @@ pub const TextDocument = struct {
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
+    doc_ordinal: ?u32 = null,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     typed_fields: ?[]const TypedFieldValue = null,
@@ -341,6 +353,7 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
             .id = text_doc.id,
             .stored_data = text_doc.stored_data,
             .fields = fields_owned,
+            .doc_ordinal = text_doc.doc_ordinal,
         });
     }
 

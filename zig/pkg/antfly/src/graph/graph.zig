@@ -26,6 +26,7 @@ const platform_time = @import("../platform/time.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
 const supports_native_reverse_lmdb = builtin.os.tag != .freestanding;
 const lmdb_backend = if (supports_native_reverse_lmdb) @import("../storage/lmdb_backend.zig") else struct {
@@ -92,6 +93,152 @@ pub fn decodeEdgeValue(data: []const u8) struct { weight: f64, created_at: u64, 
     const updated_at = std.mem.readInt(u64, data[16..24], .little);
     const metadata = if (data.len > 24) data[24..] else &[0]u8{};
     return .{ .weight = weight, .created_at = created_at, .updated_at = updated_at, .metadata = metadata };
+}
+
+const ParsedGraphEdgeKey = struct {
+    source: []u8,
+    index_name: []u8,
+    edge_type: []u8,
+    target: []u8,
+
+    fn deinit(self: *ParsedGraphEdgeKey, alloc: Allocator) void {
+        alloc.free(self.source);
+        alloc.free(self.index_name);
+        alloc.free(self.edge_type);
+        alloc.free(self.target);
+        self.* = undefined;
+    }
+};
+
+const graph_index_edge_artifact_type = "graph_index";
+
+fn edgeKeyAlloc(alloc: Allocator, source: []const u8, index_name: []const u8, edge_type: []const u8, target: []const u8) ![]u8 {
+    return try graphIndexEdgeKeyAlloc(alloc, source, index_name, edge_type, target);
+}
+
+fn reverseEdgeKeyAlloc(alloc: Allocator, target: []const u8, index_name: []const u8, edge_type: []const u8, source: []const u8) ![]u8 {
+    return try graphIndexEdgeKeyAlloc(alloc, target, index_name, edge_type, source);
+}
+
+fn edgePrefixAlloc(alloc: Allocator, source: []const u8, index_name: []const u8, edge_type: []const u8) ![]u8 {
+    return try graphIndexEdgePrefixAlloc(alloc, source, index_name, edge_type);
+}
+
+fn reverseEdgePrefixAlloc(alloc: Allocator, target: []const u8, index_name: []const u8, edge_type: []const u8) ![]u8 {
+    return try graphIndexEdgePrefixAlloc(alloc, target, index_name, edge_type);
+}
+
+fn graphIndexEdgePrefixAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, edge_type: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.artifact_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, graph_index_edge_artifact_type);
+    try internal_keys.appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, internal_keys.graph_edge_record_kind);
+    if (edge_type.len > 0) try internal_keys.appendEncodedComponent(&list, alloc, edge_type);
+
+    return try list.toOwnedSlice(alloc);
+}
+
+fn graphIndexEdgeKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, edge_type: []const u8, target_doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.artifact_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, graph_index_edge_artifact_type);
+    try internal_keys.appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, internal_keys.graph_edge_record_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, edge_type);
+    try internal_keys.appendEncodedComponent(&list, alloc, target_doc_key);
+
+    return try list.toOwnedSlice(alloc);
+}
+
+fn parseGraphIndexEdgeKeyAlloc(alloc: Allocator, key: []const u8) !?ParsedGraphEdgeKey {
+    if (!internal_keys.isInternalUserKey(key)) return null;
+    const doc_term = internal_keys.findComponentTerminator(key, 1) orelse return null;
+    const doc_key = try internal_keys.decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != internal_keys.artifact_kind) {
+        alloc.free(doc_key);
+        return null;
+    }
+    pos += 1;
+
+    if (!internal_keys.componentEquals(key, pos, graph_index_edge_artifact_type)) {
+        alloc.free(doc_key);
+        return null;
+    }
+    pos = (internal_keys.findComponentTerminator(key, pos) orelse {
+        alloc.free(doc_key);
+        return null;
+    }) + 2;
+
+    const index_term = internal_keys.findComponentTerminator(key, pos) orelse {
+        alloc.free(doc_key);
+        return null;
+    };
+    const index_name = try internal_keys.decodeBodyAlloc(alloc, key[pos..index_term]);
+    errdefer alloc.free(index_name);
+    pos = index_term + 2;
+
+    if (pos >= key.len or key[pos] != internal_keys.graph_edge_record_kind) {
+        alloc.free(doc_key);
+        alloc.free(index_name);
+        return null;
+    }
+    pos += 1;
+
+    const edge_type_term = internal_keys.findComponentTerminator(key, pos) orelse {
+        alloc.free(doc_key);
+        alloc.free(index_name);
+        return null;
+    };
+    const edge_type = try internal_keys.decodeBodyAlloc(alloc, key[pos..edge_type_term]);
+    errdefer alloc.free(edge_type);
+    pos = edge_type_term + 2;
+
+    const target_term = internal_keys.findComponentTerminator(key, pos) orelse {
+        alloc.free(doc_key);
+        alloc.free(index_name);
+        alloc.free(edge_type);
+        return null;
+    };
+    if (target_term + 2 != key.len) {
+        alloc.free(doc_key);
+        alloc.free(index_name);
+        alloc.free(edge_type);
+        return null;
+    }
+    const target_doc_key = try internal_keys.decodeBodyAlloc(alloc, key[pos..target_term]);
+    errdefer alloc.free(target_doc_key);
+
+    return .{
+        .source = doc_key,
+        .index_name = index_name,
+        .edge_type = edge_type,
+        .target = target_doc_key,
+    };
+}
+
+fn parseOutgoingEdgeKeyAlloc(alloc: Allocator, key: []const u8) !?ParsedGraphEdgeKey {
+    return try parseGraphIndexEdgeKeyAlloc(alloc, key);
+}
+
+fn parseReverseEdgeKeyAlloc(alloc: Allocator, key: []const u8) !?ParsedGraphEdgeKey {
+    var parsed = (try parseGraphIndexEdgeKeyAlloc(alloc, key)) orelse return null;
+    errdefer parsed.deinit(alloc);
+    return .{
+        .source = parsed.target,
+        .index_name = parsed.index_name,
+        .edge_type = parsed.edge_type,
+        .target = parsed.source,
+    };
 }
 
 // ============================================================================
@@ -365,7 +512,9 @@ pub const GraphIndex = struct {
                 try meta_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
             } else {
                 edge_count += 1;
-                if (docstore.KeyEncoder.parseEdgeKey(entry.key)) |parsed| {
+                if (try parseReverseEdgeKeyAlloc(self.alloc, entry.key)) |parsed_owned| {
+                    var parsed = parsed_owned;
+                    defer parsed.deinit(self.alloc);
                     try self.rememberNodeRefCount(&node_refs, parsed.source);
                     try self.rememberNodeRefCount(&node_refs, parsed.target);
                 }
@@ -606,7 +755,8 @@ pub const GraphIndex = struct {
         seen_nodes: *std.StringHashMapUnmanaged(void),
         key: []const u8,
     ) !void {
-        const parsed = docstore.KeyEncoder.parseEdgeKey(key) orelse return;
+        var parsed = (try parseReverseEdgeKeyAlloc(alloc, key)) orelse return;
+        defer parsed.deinit(alloc);
         try rememberStatsNodeValue(alloc, seen_nodes, parsed.source);
         try rememberStatsNodeValue(alloc, seen_nodes, parsed.target);
     }
@@ -682,15 +832,15 @@ pub const GraphIndex = struct {
         }
 
         for (deletes) |delete| {
-            var out_buf: [1024]u8 = undefined;
-            const out_key = docstore.KeyEncoder.makeEdgeKey(&out_buf, delete.source, self.index_name, delete.edge_type, delete.target);
+            const out_key = try edgeKeyAlloc(self.alloc, delete.source, self.index_name, delete.edge_type, delete.target);
+            defer self.alloc.free(out_key);
             main_batch.delete(out_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
 
-            var rev_buf: [1024]u8 = undefined;
-            const rev_key = docstore.KeyEncoder.makeReverseEdgeKey(&rev_buf, delete.target, self.index_name, delete.edge_type, delete.source);
+            const rev_key = try reverseEdgeKeyAlloc(self.alloc, delete.target, self.index_name, delete.edge_type, delete.source);
+            defer self.alloc.free(rev_key);
             try self.accountReverseDelete(&reverse_batch, delete.source, delete.target, rev_key);
             reverse_batch.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -702,12 +852,12 @@ pub const GraphIndex = struct {
             var val_buf: [4096]u8 = undefined;
             const edge_val = encodeEdgeValue(&val_buf, write.weight, write.created_at, write.updated_at, write.metadata_json);
 
-            var out_buf: [1024]u8 = undefined;
-            const out_key = docstore.KeyEncoder.makeEdgeKey(&out_buf, write.source, self.index_name, write.edge_type, write.target);
+            const out_key = try edgeKeyAlloc(self.alloc, write.source, self.index_name, write.edge_type, write.target);
+            defer self.alloc.free(out_key);
             try main_batch.put(out_key, edge_val);
 
-            var rev_buf: [1024]u8 = undefined;
-            const rev_key = docstore.KeyEncoder.makeReverseEdgeKey(&rev_buf, write.target, self.index_name, write.edge_type, write.source);
+            const rev_key = try reverseEdgeKeyAlloc(self.alloc, write.target, self.index_name, write.edge_type, write.source);
+            defer self.alloc.free(rev_key);
             try self.accountReverseInsert(&reverse_batch, write.source, write.target, rev_key);
             try reverse_batch.put(rev_key, edge_val);
         }
@@ -747,14 +897,15 @@ pub const GraphIndex = struct {
     }
 
     fn scanOutgoingEdges(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
-        var prefix_buf: [1024]u8 = undefined;
-        const prefix = docstore.KeyEncoder.makeEdgePrefix(&prefix_buf, key, self.index_name, edge_type);
+        const prefix = try edgePrefixAlloc(alloc, key, self.index_name, edge_type);
+        defer alloc.free(prefix);
 
         const pairs = try self.mainStoreScanPrefix(alloc, prefix);
         defer backend_scan.freeResults(alloc, pairs);
 
         for (pairs) |pair| {
-            const parsed = docstore.KeyEncoder.parseEdgeKey(pair.key) orelse continue;
+            var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
+            defer parsed.deinit(alloc);
             const decoded = decodeEdgeValue(pair.value);
             try results.append(alloc, .{
                 .source = try alloc.dupe(u8, parsed.source),
@@ -769,8 +920,8 @@ pub const GraphIndex = struct {
     }
 
     fn scanIncomingEdges(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
-        var prefix_buf: [1024]u8 = undefined;
-        const prefix = docstore.KeyEncoder.makeReverseEdgePrefix(&prefix_buf, key, self.index_name, edge_type);
+        const prefix = try reverseEdgePrefixAlloc(alloc, key, self.index_name, edge_type);
+        defer alloc.free(prefix);
 
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();
@@ -781,19 +932,30 @@ pub const GraphIndex = struct {
         const first = (try cur.seekAtOrAfter(prefix)) orelse return;
 
         if (std.mem.startsWith(u8, first.key, prefix)) {
-            try appendEdgeFromKV(alloc, results, first.key, first.value);
+            try appendReverseEdgeFromKV(alloc, results, first.key, first.value);
         } else {
             return;
         }
 
         while (try cur.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-            try appendEdgeFromKV(alloc, results, entry.key, entry.value);
+            try appendReverseEdgeFromKV(alloc, results, entry.key, entry.value);
         }
     }
 
     fn appendEdgeFromKV(alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, value: []const u8) !void {
-        const parsed = docstore.KeyEncoder.parseEdgeKey(key) orelse return;
+        var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, key)) orelse return;
+        defer parsed.deinit(alloc);
+        try appendParsedEdge(alloc, results, parsed, value);
+    }
+
+    fn appendReverseEdgeFromKV(alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, value: []const u8) !void {
+        var parsed = (try parseReverseEdgeKeyAlloc(alloc, key)) orelse return;
+        defer parsed.deinit(alloc);
+        try appendParsedEdge(alloc, results, parsed, value);
+    }
+
+    fn appendParsedEdge(alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), parsed: ParsedGraphEdgeKey, value: []const u8) !void {
         const decoded = decodeEdgeValue(value);
         try results.append(alloc, .{
             .source = try alloc.dupe(u8, parsed.source),
@@ -859,14 +1021,16 @@ pub const GraphIndex = struct {
         upper: []const u8,
         resume_from: ?[]const u8,
     ) !usize {
-        var lower_buf: [1024]u8 = undefined;
-        var upper_buf: [1024]u8 = undefined;
-        const base_lower = if (lower.len > 0) docstore.KeyEncoder.keyRangeStart(&lower_buf, lower) else "";
+        const base_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
+        defer if (base_lower_owned) |key| alloc.free(key);
+        const range_upper_owned = if (upper.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper) else null;
+        defer if (range_upper_owned) |key| alloc.free(key);
+        const base_lower = base_lower_owned orelse "";
         const range_lower = if (resume_from) |key|
             if (key.len > 0 and std.mem.order(u8, key, base_lower) == .gt) key else base_lower
         else
             base_lower;
-        const range_upper = if (upper.len > 0) docstore.KeyEncoder.keyRangeStart(&upper_buf, upper) else "";
+        const range_upper = range_upper_owned orelse "";
 
         const pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
         defer backend_scan.freeResults(alloc, pairs);
@@ -884,13 +1048,13 @@ pub const GraphIndex = struct {
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, pair.key, resume_key) != .gt) continue;
             }
-            if (!docstore.KeyEncoder.isEdgeKey(pair.key)) continue;
-            const parsed = docstore.KeyEncoder.parseEdgeKey(pair.key) orelse continue;
+            var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
+            defer parsed.deinit(alloc);
             if (!std.mem.eql(u8, parsed.index_name, self.index_name)) continue;
             matching_edges += 1;
 
-            var rev_buf: [1024]u8 = undefined;
-            const rev_key = docstore.KeyEncoder.makeReverseEdgeKey(&rev_buf, parsed.target, self.index_name, parsed.edge_type, parsed.source);
+            const rev_key = try reverseEdgeKeyAlloc(alloc, parsed.target, self.index_name, parsed.edge_type, parsed.source);
+            defer alloc.free(rev_key);
             try txn.put(rev_key, pair.value);
             rebuilt += 1;
             batch_count += 1;
@@ -921,10 +1085,12 @@ pub const GraphIndex = struct {
     pub fn pruneOwnedRange(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
         var removed: usize = 0;
 
-        var lower_buf: [1024]u8 = undefined;
-        var upper_buf: [1024]u8 = undefined;
-        const range_lower = if (lower.len > 0) docstore.KeyEncoder.keyRangeStart(&lower_buf, lower) else "";
-        const range_upper = if (upper.len > 0) docstore.KeyEncoder.keyRangeStart(&upper_buf, upper) else "";
+        const range_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
+        defer if (range_lower_owned) |key| alloc.free(key);
+        const range_upper_owned = if (upper.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper) else null;
+        defer if (range_upper_owned) |key| alloc.free(key);
+        const range_lower = range_lower_owned orelse "";
+        const range_upper = range_upper_owned orelse "";
 
         const owned_pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
         defer backend_scan.freeResults(alloc, owned_pairs);
@@ -933,12 +1099,12 @@ pub const GraphIndex = struct {
         errdefer reverse_txn.abort();
 
         for (owned_pairs) |pair| {
-            if (!docstore.KeyEncoder.isEdgeKey(pair.key)) continue;
-            const parsed = docstore.KeyEncoder.parseEdgeKey(pair.key) orelse continue;
+            var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
+            defer parsed.deinit(alloc);
             if (!std.mem.eql(u8, parsed.index_name, self.index_name)) continue;
 
-            var rev_buf: [1024]u8 = undefined;
-            const rev_key = docstore.KeyEncoder.makeReverseEdgeKey(&rev_buf, parsed.target, self.index_name, parsed.edge_type, parsed.source);
+            const rev_key = try reverseEdgeKeyAlloc(alloc, parsed.target, self.index_name, parsed.edge_type, parsed.source);
+            defer alloc.free(rev_key);
             reverse_txn.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -960,7 +1126,9 @@ pub const GraphIndex = struct {
                 var entry = initial_entry;
                 while (true) {
                     if (range_upper.len > 0 and std.mem.order(u8, entry.key, range_upper) != .lt) break;
-                    if (docstore.KeyEncoder.parseEdgeKey(entry.key)) |parsed| {
+                    if (try parseReverseEdgeKeyAlloc(alloc, entry.key)) |parsed_owned| {
+                        var parsed = parsed_owned;
+                        defer parsed.deinit(alloc);
                         if (std.mem.eql(u8, parsed.index_name, self.index_name)) {
                             try keys_to_delete.append(alloc, try alloc.dupe(u8, entry.key));
                         }
@@ -1129,6 +1297,55 @@ test "graph addEdge and getEdges in (reverse index)" {
     }
 }
 
+test "graph edge keys support arbitrary document ids and edge types" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-binary-ids");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-binary-ids");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "g\x00:i:", .{});
+    defer graph.close();
+
+    const source = "doc\x00:i:\xff";
+    const target = "\x00target:out:\xff";
+    const edge_type = "rel:with\x00byte";
+    try graph.addEdge(source, target, edge_type, 1.5, 10, 11, "{\"ok\":true}");
+
+    const out_edges = try graph.getEdges(alloc, source, edge_type, .out);
+    defer GraphIndex.freeEdges(alloc, out_edges);
+    try std.testing.expectEqual(@as(usize, 1), out_edges.len);
+    try std.testing.expectEqualStrings(source, out_edges[0].source);
+    try std.testing.expectEqualStrings(target, out_edges[0].target);
+    try std.testing.expectEqualStrings(edge_type, out_edges[0].edge_type);
+
+    const in_edges = try graph.getEdges(alloc, target, edge_type, .in);
+    defer GraphIndex.freeEdges(alloc, in_edges);
+    try std.testing.expectEqual(@as(usize, 1), in_edges.len);
+    try std.testing.expectEqualStrings(source, in_edges[0].source);
+    try std.testing.expectEqualStrings(target, in_edges[0].target);
+
+    const prefix = try edgePrefixAlloc(alloc, source, graph.index_name, edge_type);
+    defer alloc.free(prefix);
+    const pairs = try graph.mainStoreScanPrefix(alloc, prefix);
+    defer backend_scan.freeResults(alloc, pairs);
+    try std.testing.expectEqual(@as(usize, 1), pairs.len);
+    var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pairs[0].key)).?;
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings(source, parsed.source);
+    try std.testing.expectEqualStrings(target, parsed.target);
+    try std.testing.expectEqualStrings(edge_type, parsed.edge_type);
+
+    try graph.deleteEdge(source, target, edge_type);
+    const deleted_edges = try graph.getEdges(alloc, source, edge_type, .out);
+    defer GraphIndex.freeEdges(alloc, deleted_edges);
+    try std.testing.expectEqual(@as(usize, 0), deleted_edges.len);
+}
+
 test "graph deleteEdge removes both directions" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
@@ -1274,10 +1491,11 @@ test "graph rebuildReverseFromOwnedOutgoingEdges reconstructs incoming index" {
     var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
-    var out_buf: [1024]u8 = undefined;
     var val_buf: [128]u8 = undefined;
     const edge_val = encodeEdgeValue(&val_buf, 1.0, 10, 11, "");
-    try store.put(docstore.KeyEncoder.makeEdgeKey(&out_buf, "doc:m", "g", "ref", "doc:z"), edge_val);
+    const edge_key = try edgeKeyAlloc(alloc, "doc:m", "g", "ref", "doc:z");
+    defer alloc.free(edge_key);
+    try store.put(edge_key, edge_val);
 
     try std.testing.expectEqual(@as(usize, 1), try graph.rebuildReverseFromOwnedOutgoingEdges(alloc, "doc:m", ""));
 
@@ -1301,13 +1519,18 @@ test "graph rebuildReverseFromOwnedOutgoingEdges respects split ownership bounds
     var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
-    var edge_key_buf: [1024]u8 = undefined;
     var val_buf: [128]u8 = undefined;
     const edge_val = encodeEdgeValue(&val_buf, 1.0, 10, 11, "");
 
-    try store.put(docstore.KeyEncoder.makeEdgeKey(&edge_key_buf, "doc:a", "g", "ref", "doc:z"), edge_val);
-    try store.put(docstore.KeyEncoder.makeEdgeKey(&edge_key_buf, "doc:m", "g", "ref", "doc:z"), edge_val);
-    try store.put(docstore.KeyEncoder.makeEdgeKey(&edge_key_buf, "doc:t", "g", "ref", "doc:y"), edge_val);
+    const edge_a = try edgeKeyAlloc(alloc, "doc:a", "g", "ref", "doc:z");
+    defer alloc.free(edge_a);
+    const edge_m = try edgeKeyAlloc(alloc, "doc:m", "g", "ref", "doc:z");
+    defer alloc.free(edge_m);
+    const edge_t = try edgeKeyAlloc(alloc, "doc:t", "g", "ref", "doc:y");
+    defer alloc.free(edge_t);
+    try store.put(edge_a, edge_val);
+    try store.put(edge_m, edge_val);
+    try store.put(edge_t, edge_val);
 
     try std.testing.expectEqual(@as(usize, 1), try graph.rebuildReverseFromOwnedOutgoingEdges(alloc, "doc:m", "doc:t"));
 

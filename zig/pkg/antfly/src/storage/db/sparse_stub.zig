@@ -24,16 +24,20 @@ pub const SparseVector = struct {
 pub const SparseWrite = struct {
     doc_id: []const u8,
     vec: SparseVector,
+    doc_num: ?u32 = null,
 };
 
 pub const SearchResult = struct {
     doc_id: []u8,
+    doc_num: ?u32 = null,
     score: f32,
 };
 
 pub const SearchConstraints = struct {
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    exclude_doc_nums: []const u32 = &.{},
 };
 
 pub const SplitRebuildResult = struct {
@@ -109,6 +113,10 @@ pub const SparseIndex = struct {
     }
 
     pub fn searchConstrained(_: *SparseIndex, _: Allocator, _: *const SparseVector, _: u32, _: SearchConstraints) ![]SearchResult {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn debugDocNumForDocId(_: *SparseIndex, _: []const u8) !?u32 {
         return error.UnsupportedPlatform;
     }
 
