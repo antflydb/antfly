@@ -1030,20 +1030,12 @@ pub fn build(b: *std.Build) void {
     const termite_mlx_root = termite_mlx_root_opt orelse detected_termite_mlx_root;
     const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded Termite");
     const termite_onnx_root = termite_onnx_root_opt orelse defaultTermiteOnnxRoot(b, target);
-    const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
-        pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
-    const termite_mlx_available = if (termite_mlx_root) |root|
-        target.result.os.tag == .macos and
-            pathExists(b, b.fmt("{s}/include/mlx/c/mlx.h", .{root})) and
-            pathExists(b, b.fmt("{s}/lib/libmlxc.dylib", .{root}))
-    else
-        false;
     const termite_mlx_requested = if (link_libc)
-        b.option(bool, "mlx", "Enable MLX termite support when available") orelse termite_mlx_available
+        b.option(bool, "mlx", "Enable MLX termite support (default: false)") orelse false
     else
         false;
     const termite_enable_onnx = if (link_libc)
-        b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite") orelse termite_onnx_available
+        b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite (default: false)") orelse false
     else
         false;
     const termite_enable_metal = if (link_libc)
