@@ -58,6 +58,7 @@ func RunAsMetadataServer(
 		zl.Fatal("Failed to create metadata runtime", zap.Error(err))
 	}
 	runtime.StartRaft()
+	runtime.StartDefaultAdminSeed(ctx)
 	defer func() {
 		if err := runtime.Close(); err != nil {
 			zl.Error("failed to close metadata runtime", zap.Error(err))

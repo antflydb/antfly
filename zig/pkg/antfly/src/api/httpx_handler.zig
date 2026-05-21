@@ -57,6 +57,24 @@ const db_mod = @import("../storage/db/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 
+const ParsedGlobalQueryTable = struct {
+    parsed: std.json.Parsed(metadata_openapi.QueryRequest),
+    table_name: []const u8,
+
+    fn deinit(self: *@This()) void {
+        self.parsed.deinit();
+    }
+};
+
+fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
+    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+    errdefer parsed.deinit();
+    return .{
+        .parsed = parsed,
+        .table_name = parsed.value.table orelse "",
+    };
+}
+
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
 
@@ -66,6 +84,19 @@ pub const AntflyApiHandler = struct {
 
     pub fn respond(ctx: *httpx.Context, resp: *http_common.HttpResponse) !httpx.Response {
         defer resp.deinit(ctx.allocator);
+        _ = ctx.status(resp.status);
+        if (resp.content_type) |ct| {
+            try ctx.setHeader("content-type", ct);
+        }
+        for (resp.headers) |hdr| {
+            try ctx.setHeader(hdr.name, hdr.value);
+        }
+        _ = ctx.response.body(resp.body);
+        return ctx.response.build();
+    }
+
+    fn respondWithAllocator(ctx: *httpx.Context, resp: *http_common.HttpResponse, alloc: std.mem.Allocator) !httpx.Response {
+        defer resp.deinit(alloc);
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
             try ctx.setHeader("content-type", ct);
@@ -266,6 +297,12 @@ pub const AntflyApiHandler = struct {
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
         public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        if (self.api_server.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+        }
         return ctx.json(public_status);
     }
 
@@ -1058,16 +1095,17 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(ctx.allocator, authenticated_identity, "");
-        defer if (row_filter_json) |value| ctx.allocator.free(value);
-        var resp = try public_table_http.handleTableQueryRequest(
-            ctx.allocator,
-            "",
+        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid query request");
+        };
+        defer parsed_table.deinit();
+        var resp = try self.api_server.handlePublicTableQuery(
+            parsed_table.table_name,
             body_data,
-            row_filter_json,
-            self.api_server.tableApi(),
+            authenticated_identity,
         );
-        return respondOwnedApiResponse(ctx, &resp);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn evaluate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -1545,16 +1583,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(ctx.allocator, authenticated_identity, table_name);
-        defer if (row_filter_json) |value| ctx.allocator.free(value);
-        var resp = try public_table_http.handleTableQueryRequest(
-            ctx.allocator,
+        var resp = try self.api_server.handlePublicTableQuery(
             table_name,
             body_data,
-            row_filter_json,
-            self.api_server.tableApi(),
+            authenticated_identity,
         );
-        return respondOwnedApiResponse(ctx, &resp);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn batchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -3015,6 +3049,15 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqualStrings("docs", parsed.value.name);
     try std.testing.expect(parsed.value.schema != null);
     try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+}
+
+test "httpx global query table name comes from request body" {
+    var parsed_table = try parseGlobalQueryTable(std.testing.allocator,
+        \\{"table":"files","limit":5}
+    );
+    defer parsed_table.deinit();
+
+    try std.testing.expectEqualStrings("files", parsed_table.table_name);
 }
 
 test "httpx antfly cluster restore preserves backup location validation" {

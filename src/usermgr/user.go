@@ -49,15 +49,15 @@ const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345
 
 // ApiKeyRecord stores an API key's metadata and hashed secret.
 type ApiKeyRecord struct {
-	KeyID       string                       `json:"key_id"`
-	SecretHash  []byte                       `json:"secret_hash"` // SHA-256(salt + secret)
-	SecretSalt  []byte                       `json:"secret_salt"` // 16-byte random salt
-	Username    string                       `json:"username"`    // owner
-	Name        string                       `json:"name"`
-	Permissions []Permission                 `json:"permissions,omitempty"`  // optional scoping
-	RowFilter   map[string]json.RawMessage   `json:"row_filter,omitempty"`  // per-table bleve query filter
-	CreatedAt   time.Time                    `json:"created_at"`
-	ExpiresAt   time.Time                    `json:"expires_at"` // zero = never
+	KeyID       string                     `json:"key_id"`
+	SecretHash  []byte                     `json:"secret_hash"` // SHA-256(salt + secret)
+	SecretSalt  []byte                     `json:"secret_salt"` // 16-byte random salt
+	Username    string                     `json:"username"`    // owner
+	Name        string                     `json:"name"`
+	Permissions []Permission               `json:"permissions,omitempty"` // optional scoping
+	RowFilter   map[string]json.RawMessage `json:"row_filter,omitempty"`  // per-table bleve query filter
+	CreatedAt   time.Time                  `json:"created_at"`
+	ExpiresAt   time.Time                  `json:"expires_at"` // zero = never
 }
 
 const rbacModelConf = `
@@ -177,8 +177,23 @@ func (um *UserManager) CreateUser(
 	password string,
 	initialPolicies []Permission,
 ) (*User, error) {
+	return um.CreateUserWithContext(context.Background(), username, password, initialPolicies)
+}
+
+// CreateUserWithContext creates a new user, using ctx for the Raft-backed user
+// record write. This is important for bootstrap paths where Raft may not be
+// available yet and callers need a bounded attempt.
+func (um *UserManager) CreateUserWithContext(
+	ctx context.Context,
+	username string,
+	password string,
+	initialPolicies []Permission,
+) (*User, error) {
 	um.mu.Lock()
 	defer um.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	if _, exists := um.passwordHashes[username]; exists {
 		return nil, ErrUserExists
@@ -194,7 +209,7 @@ func (um *UserManager) CreateUser(
 		PasswordHash: hashedPassword,
 	}
 
-	if err := um.saveUserPasswordInfo(userInfo); err != nil {
+	if err := um.saveUserPasswordInfo(ctx, userInfo); err != nil {
 		return nil, fmt.Errorf("failed to save user password info: %w", err)
 	}
 
@@ -365,13 +380,16 @@ func (um *UserManager) GetPermissionsForUser(username string) ([]Permission, err
 	return roles, nil
 }
 
-func (um *UserManager) saveUserPasswordInfo(userInfo *UserPasswordInfo) error {
+func (um *UserManager) saveUserPasswordInfo(ctx context.Context, userInfo *UserPasswordInfo) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := []byte(userPasswordPrefix + userInfo.Username)
 	data, err := json.Marshal(userInfo)
 	if err != nil {
 		return fmt.Errorf("failed to marshal user password info: %w", err)
 	}
-	if err := um.db.Batch(context.Background(), [][2][]byte{{key, data}}, nil); err != nil {
+	if err := um.db.Batch(ctx, [][2][]byte{{key, data}}, nil); err != nil {
 		return fmt.Errorf("failed to save user password info to database: %w", err)
 	}
 	return nil
@@ -470,7 +488,7 @@ func (um *UserManager) UpdatePassword(username string, newPassword string) error
 		Username:     username,
 		PasswordHash: newPasswordHash,
 	}
-	if err := um.saveUserPasswordInfo(userInfo); err != nil {
+	if err := um.saveUserPasswordInfo(context.Background(), userInfo); err != nil {
 		// If save fails, revert in-memory change
 		um.passwordHashes[username] = currentHash // Revert
 		return fmt.Errorf("failed to save updated password for user %s: %w", username, err)

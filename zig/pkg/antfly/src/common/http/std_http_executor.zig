@@ -135,21 +135,30 @@ pub const StdHttpExecutor = struct {
             .DELETE => std.http.Method.DELETE,
         };
 
-        var extra_headers_buf: [1]std.http.Header = undefined;
-        const extra_headers: []const std.http.Header = if (req.content_type != null)
-            extra_headers_buf[0..1]
-        else
-            &.{};
+        var extra_headers = std.ArrayListUnmanaged(std.http.Header).empty;
+        defer extra_headers.deinit(alloc);
         if (req.content_type) |content_type| {
-            extra_headers_buf[0] = .{
+            try extra_headers.append(alloc, .{
                 .name = "content-type",
                 .value = content_type,
-            };
+            });
+        }
+        if (req.authorization) |authorization| {
+            try extra_headers.append(alloc, .{
+                .name = "authorization",
+                .value = authorization,
+            });
+        }
+        for (req.headers) |header| {
+            try extra_headers.append(alloc, .{
+                .name = header.name,
+                .value = header.value,
+            });
         }
 
         const request_keep_alive = self.reserveRequestKeepAlive();
         var request = try std.http.Client.request(&self.client, method, uri, .{
-            .extra_headers = extra_headers,
+            .extra_headers = extra_headers.items,
             .keep_alive = request_keep_alive,
         });
         defer request.deinit();

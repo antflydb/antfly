@@ -2133,6 +2133,35 @@ fn cloneWithoutSpecialFields(alloc: Allocator, root: std.json.Value) !std.json.V
     return value;
 }
 
+pub fn stripTopLevelFieldsAlloc(alloc: Allocator, data: []const u8, fields: []const []const u8) !?[]u8 {
+    if (fields.len == 0) return try alloc.dupe(u8, data);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.dupe(u8, data);
+
+    var value = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer freeJsonValue(alloc, &value);
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (containsTopLevelField(fields, entry.key_ptr.*)) continue;
+        try value.object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValue(alloc, entry.value_ptr.*));
+    }
+
+    if (value.object.count() == 0) return null;
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+fn containsTopLevelField(fields: []const []const u8, field: []const u8) bool {
+    for (fields) |item| {
+        if (std.mem.eql(u8, item, field)) return true;
+    }
+    return false;
+}
+
 fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
     return switch (value) {
         .null => .null,

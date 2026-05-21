@@ -456,6 +456,11 @@ fn computeAlgebraicAggregation(
 
     if (std.mem.eql(u8, request.type, "terms")) {
         const maybe_result = computeAlgebraicTermsAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
+            error.UnsupportedAggregation => {
+                try recordAlgebraicBucketObservation(alloc, index, store, request, ctx.algebraic_constraints, "terms_unsupported");
+                index.recordPlannerFallback("terms_unsupported", null, null);
+                return null;
+            },
             error.AlgebraicPlannerScanTooLarge => {
                 try recordAlgebraicBucketObservation(alloc, index, store, request, ctx.algebraic_constraints, "terms_too_many_rows");
                 index.recordPlannerFallback("terms_too_many_rows", null, null);
@@ -6499,7 +6504,7 @@ fn computeTermsAggregation(
             }, ctx, false);
         };
         buckets[idx] = .{
-            .key_json = try std.fmt.allocPrint(alloc, "\"{s}\"", .{entry.key}),
+            .key_json = try std.json.Stringify.valueAlloc(alloc, entry.key, .{}),
             .count = entry.count,
             .aggregations = nested,
         };
@@ -10544,6 +10549,45 @@ test "terms aggregation computes multi field composite fallback" {
     try std.testing.expectEqualStrings("[\"bob\",\"pen\"]", aggregations[0].buckets[2].key_json);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[2].count);
     try std.testing.expectEqualStrings("7", aggregations[0].buckets[2].aggregations[0].value_json.?);
+}
+
+test "terms aggregation escapes string bucket keys in fallback" {
+    const alloc = std.testing.allocator;
+
+    const docs = [_][]const u8{
+        "{\"extension\":\".go\",\"file_type\":\"source\\\"code\"}",
+        "{\"extension\":\".go\",\"file_type\":\"source\\\"code\"}",
+    };
+    var hits = try alloc.alloc(types.SearchHit, docs.len);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    for (docs, 0..) |doc, i| {
+        hits[i] = .{
+            .id = try std.fmt.allocPrint(alloc, "doc:{d}", .{i}),
+            .stored_data = try alloc.dupe(u8, doc),
+        };
+    }
+
+    const requests = [_]SearchAggregationRequest{.{
+        .name = "file_types",
+        .type = "terms",
+        .field = "file_type",
+        .size = 10,
+    }};
+    const result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = @intCast(hits.len),
+    };
+    const aggregations = try computeSearchAggregations(alloc, &requests, result, .{});
+    defer deinitResults(alloc, aggregations);
+
+    try std.testing.expectEqual(@as(usize, 1), aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), aggregations[0].buckets.len);
+    try std.testing.expectEqualStrings("\"source\\\"code\"", aggregations[0].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].count);
 }
 
 test "algebraic aggregation planner answers schemaless structural path terms" {

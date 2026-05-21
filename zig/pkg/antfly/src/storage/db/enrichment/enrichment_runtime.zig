@@ -70,7 +70,7 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
-pub const RuntimeError = error{EnrichmentWorkerFailed};
+pub const RuntimeError = error{ EnrichmentWorkerFailed, EnrichmentRetryInProgress };
 
 pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types.DerivedBatch) anyerror!u64;
 pub const NotifyFn = *const fn (ptr: *anyopaque, sequence: u64) void;
@@ -318,11 +318,14 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
         error.ConnectionTimedOut,
+        error.Timeout,
         error.NetworkUnreachable,
         error.HostLacksNetworkAddresses,
         error.TemporaryNameServerFailure,
         error.NameServerFailure,
         error.UnexpectedReadFailure,
+        error.SendFailed,
+        error.RecvFailed,
         => true,
         else => false,
     };
@@ -1088,10 +1091,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
-        while (self.applied_sequence < sequence and self.last_error_name == null) {
+        while (self.applied_sequence < sequence and self.last_error_name == null and !self.retrying) {
             self.cond.waitUncancelable(io, &self.mutex);
         }
         if (self.last_error_name != null) return RuntimeError.EnrichmentWorkerFailed;
+        if (self.applied_sequence < sequence and self.retrying) return RuntimeError.EnrichmentRetryInProgress;
     }
 
     pub fn markAppliedThrough(self: *EnrichmentRuntime, sequence: u64) !void {

@@ -1314,6 +1314,7 @@ pub const DataServer = struct {
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
+    store_registration_confirmed: bool = false,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
@@ -1663,16 +1664,20 @@ pub const DataServer = struct {
         }
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
-        self.registerNodeIfConfigured() catch |err| switch (err) {
-            error.HttpConnectionClosing,
-            error.ConnectionResetByPeer,
-            error.ConnectionRefused,
-            error.BrokenPipe,
-            error.EndOfStream,
-            error.UnexpectedHttpStatus,
-            => {},
-            else => return err,
-        };
+        if (self.store_registration != null) {
+            self.store_status_dirty = true;
+            self.registerNodeIfConfigured() catch |err| switch (err) {
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.ConnectionRefused,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.UnexpectedHttpStatus,
+                error.NotListening,
+                => std.log.warn("data node registration deferred err={}", .{err}),
+                else => return err,
+            };
+        }
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
             error.SystemResources,
@@ -1709,6 +1714,19 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata != null and self.store_registration != null) {
+            if (!self.store_registration_confirmed) {
+                self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
+                    error.HttpConnectionClosing,
+                    error.ConnectionResetByPeer,
+                    error.ConnectionRefused,
+                    error.BrokenPipe,
+                    error.EndOfStream,
+                    error.UnexpectedHttpStatus,
+                    error.NotListening,
+                    => {},
+                    else => return register_err,
+                };
+            }
             self.store_status_ticks += 1;
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
             const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
@@ -1735,8 +1753,10 @@ pub const DataServer = struct {
                     error.ConnectionRefused,
                     error.BrokenPipe,
                     error.EndOfStream,
+                    error.UnexpectedHttpStatus,
                     => {},
                     error.UnknownStore => {
+                        self.store_registration_confirmed = false;
                         self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
                             error.HttpConnectionClosing,
                             error.ConnectionResetByPeer,
@@ -2904,6 +2924,7 @@ pub const DataServer = struct {
             .failure_domain = registration.failure_domain,
             .live = true,
         });
+        self.store_registration_confirmed = true;
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
@@ -6878,7 +6899,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try ensureDefaultAdminUser(&user_manager.?);
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -7145,21 +7169,6 @@ fn parseBoolFlag(value: []const u8) ?bool {
     return null;
 }
 
-fn ensureDefaultAdminUser(manager: *antfly.usermgr.UserManager) !void {
-    _ = manager.getUser("admin") catch |err| switch (err) {
-        error.UserNotFound => {
-            var admin_permission = [_]antfly.usermgr.Permission{
-                try antfly.usermgr.Permission.initOwned(manager.alloc, .@"*", "*", .admin),
-            };
-            defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
-            user.deinit(manager.alloc);
-            return;
-        },
-        else => return err,
-    };
-}
-
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
         \\Usage: {s} [options]
@@ -7341,6 +7350,18 @@ test "data runtime parses auth flag" {
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, parsed.auth_enabled.?);
+}
+
+test "data runtime leaves auth disabled unless config or cli enables it" {
+    var cli = CliConfig{};
+    defer cli.deinit(std.testing.allocator);
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = true;
+    try std.testing.expect(resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = false;
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
 }
 
 test "data runtime local group status uses injected leadership source" {

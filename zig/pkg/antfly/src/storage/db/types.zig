@@ -530,6 +530,98 @@ pub const TextQuery = union(enum) {
         boost: f32 = 1.0,
     },
     bool_query: TextBoolQuery,
+
+    pub fn deinit(self: *TextQuery, alloc: Allocator) void {
+        switch (self.*) {
+            .match_none, .match_all => {},
+            .phrase => |phrase| {
+                alloc.free(phrase.field);
+                for (phrase.terms) |term| alloc.free(term);
+                if (phrase.terms.len > 0) alloc.free(phrase.terms);
+            },
+            .multi_phrase => |multi| {
+                alloc.free(multi.field);
+                for (multi.terms) |group| {
+                    for (group) |term| alloc.free(term);
+                    if (group.len > 0) alloc.free(group);
+                }
+                if (multi.terms.len > 0) alloc.free(multi.terms);
+            },
+            .term => |term| {
+                alloc.free(term.field);
+                alloc.free(term.term);
+            },
+            .match => |match| {
+                alloc.free(match.field);
+                alloc.free(match.text);
+                if (match.analyzer) |analyzer| alloc.free(analyzer);
+            },
+            .match_phrase => |phrase| {
+                alloc.free(phrase.field);
+                alloc.free(phrase.text);
+                if (phrase.analyzer) |analyzer| alloc.free(analyzer);
+            },
+            .fuzzy => |fuzzy| {
+                alloc.free(fuzzy.field);
+                alloc.free(fuzzy.term);
+            },
+            .numeric_range => |range| alloc.free(range.field),
+            .date_range => |range| alloc.free(range.field),
+            .geo_distance => |range| alloc.free(range.field),
+            .geo_bbox => |range| alloc.free(range.field),
+            .doc_id => |doc_id| {
+                for (doc_id.ids) |id| alloc.free(id);
+                if (doc_id.ids.len > 0) alloc.free(doc_id.ids);
+            },
+            .bool_field => |field| alloc.free(field.field),
+            .prefix => |prefix| {
+                alloc.free(prefix.field);
+                alloc.free(prefix.prefix);
+            },
+            .wildcard => |wildcard| {
+                alloc.free(wildcard.field);
+                alloc.free(wildcard.pattern);
+            },
+            .regexp => |regexp| {
+                alloc.free(regexp.field);
+                alloc.free(regexp.pattern);
+            },
+            .term_range => |range| {
+                alloc.free(range.field);
+                if (range.min) |min| alloc.free(min);
+                if (range.max) |max| alloc.free(max);
+            },
+            .ip_range => |range| {
+                alloc.free(range.field);
+                alloc.free(range.cidr);
+            },
+            .geo_shape => |shape| {
+                alloc.free(shape.field);
+                for (shape.polygons) |polygon| {
+                    if (polygon.len > 0) alloc.free(polygon);
+                }
+                if (shape.polygons.len > 0) alloc.free(shape.polygons);
+            },
+            .bool_query => |bool_query| {
+                for (bool_query.must) |*query| {
+                    var owned = query.*;
+                    owned.deinit(alloc);
+                }
+                if (bool_query.must.len > 0) alloc.free(bool_query.must);
+                for (bool_query.should) |*query| {
+                    var owned = query.*;
+                    owned.deinit(alloc);
+                }
+                if (bool_query.should.len > 0) alloc.free(bool_query.should);
+                for (bool_query.must_not) |*query| {
+                    var owned = query.*;
+                    owned.deinit(alloc);
+                }
+                if (bool_query.must_not.len > 0) alloc.free(bool_query.must_not);
+            },
+        }
+        self.* = undefined;
+    }
 };
 
 pub const DenseKnnQuery = struct {

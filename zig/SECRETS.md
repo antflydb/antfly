@@ -51,15 +51,17 @@ Implemented:
 - Metadata-service restore planning uses `openBackupLocationWithSecrets()` when
   the concrete service owns a `FileStore`, so S3 restore metadata reads can use
   live secret-backed AWS credentials.
+- `GET /status` reports compact, non-secret local secret-store health when a
+  store is available: whether Antfly is serving a stale last-known-good snapshot.
+- API server tests cover external `secrets.json` additions and deletions being
+  reflected by `GET /secrets`.
 
 Still needed:
 
-- API/runtime integration coverage for managed embedder key rotation with a fake
-  OpenAI-compatible endpoint.
-- Logs and metrics for reload generation, failed reloads, and stale snapshot
-  state.
 - Runtime tests for generator/reranker, foreign DSN, CDC DSN, S3 backup, and
   remote-content credential rotation.
+- Optional Prometheus metrics for reload state if operators need scrape-based
+  alerting in addition to `GET /status`.
 - A future encrypted-at-rest codec, if non-Kubernetes deployments need local
   secret-file encryption.
 
@@ -215,7 +217,7 @@ Expected behavior:
 6. If parsing succeeds, swap the temporary map into `entries`, update observed
    metadata, increment generation, and return `true`.
 7. If parsing fails, keep the old in-memory snapshot and record the reload
-   failure for logs and metrics.
+   failure for warning logs and compact cluster status.
 
 Do not mutate the active map until the new file has been fully parsed. A bad
 external edit must not destroy the last known good secrets.
@@ -314,7 +316,7 @@ the mounted-file behavior robust:
 
 - valid replacement files are authoritative, including key deletion
 - missing or malformed files keep last known good values
-- reload status is visible through logs and metrics
+- reload status is visible through compact cluster status and warning logs
 - secret values are never returned by APIs or written to logs
 - runtime consumers can observe changed values without process restart where
   live rotation is supported
@@ -397,7 +399,7 @@ workers.
 
 | Subsystem | Current Status | Needed Semantics |
 | --- | --- | --- |
-| Managed OpenAI embedders | Implemented with generation-cached bearer auth headers. | Add fake-provider runtime test. |
+| Managed OpenAI embedders | Implemented with generation-cached bearer auth headers and a fake OpenAI-compatible rotation test. | Continue using the same generation contract for future managed provider clients. |
 | Generator providers | Implemented for OpenAI-compatible providers with generation-cached bearer auth headers. | Add fake-provider runtime test; extend the same pattern when additional provider clients are implemented. |
 | Reranker providers | Runtime options now carry and resolve `api_key` references before rerank calls. | Add provider-specific tests once non-local reranker clients are implemented. |
 | Foreign DSNs | Implemented for API query paths that have the API server `FileStore`. | Add runtime tests and define pool invalidation behavior for any long-lived foreign clients. |
@@ -480,8 +482,8 @@ The public API should continue to avoid returning secret values.
 - include externally added keys
 - stop listing externally removed keys after a valid replacement file is loaded
 - report environment overlay status using current environment variables
-- expose stale reload status through logs and metrics when a malformed or
-  missing file forced the store to keep last known good values
+- expose stale reload status through compact `GET /status` fields when a
+  malformed or missing file forced the store to keep last known good values
 
 `PUT /secrets/{key}` should:
 
@@ -549,11 +551,11 @@ Additional runtime tests:
    `FileStore`.
 2. [done] Call refresh from `list()`, `getOwned()`, and write paths.
 3. [done] Add unit coverage for external file edits and malformed edits.
-4. [todo] Wire API tests around external edits.
+4. [done] Wire API tests around external edits.
 5. [done] Add reference-preserving `SecretValue`.
 6. [done] Migrate managed embedder API keys to resolve at request time or by generation
    cache.
-7. [todo] Add managed embedder runtime test with a fake OpenAI-compatible
+7. [done] Add managed embedder runtime test with a fake OpenAI-compatible
    endpoint.
 8. [done] Migrate generator and reranker provider credential plumbing.
 9. [partial] Preserve and resolve remote-content HTTP header references at
@@ -561,7 +563,7 @@ Additional runtime tests:
 10. [partial] Preserve and resolve remote-content S3 references at fetch time;
    rotation tests remain.
 11. [partial] Migrate foreign DSNs and CDC DSNs; reconnect tests remain.
-12. [todo] Add logs and metrics for stale reload state.
+12. [done] Add warning logs and compact cluster status for stale reload state.
 13. [done] Document operational behavior for malformed files, file deletion, Kubernetes
    projection, and rotation of long-lived clients.
 
@@ -572,7 +574,7 @@ Additional runtime tests:
 2. A missing file after a previous successful load keeps the last known good
    snapshot.
 3. A malformed file keeps the last known good snapshot and records reload
-   failure through logs and metrics.
+   failure through warning logs and compact cluster status.
 4. File entries have priority over environment fallback. If a file key is
    deleted and a matching environment variable exists, the environment value is
    used.
@@ -591,11 +593,9 @@ Additional runtime tests:
 
 ## Deferred Questions
 
-1. What exact logs and metrics should expose last reload success, last reload
-   failure, generation, and stale snapshot state?
-2. Should there be an API field for non-secret reload health, or are logs and
-   metrics sufficient?
-3. What encrypted envelope format and key-source contract should the future
+1. Should Prometheus metrics mirror the compact `GET /status` secret-store
+   state for scrape-based alerting?
+2. What encrypted envelope format and key-source contract should the future
    encrypted codec use?
-4. Should S3/backup and remote-content clients share a generation-keyed
+3. Should S3/backup and remote-content clients share a generation-keyed
    credential cache, or should each subsystem own its own cache?

@@ -172,16 +172,11 @@ pub fn build(b: *std.Build) void {
     const onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root (default: ./onnxruntime/<platform>)");
     const default_onnx_root = defaultOnnxRuntimeRoot(b, target);
     const effective_onnx_root = onnx_root_opt orelse default_onnx_root;
-    const onnx_runtime_available = !enable_wasm and link_libc and
-        pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{effective_onnx_root})) and
-        pathExists(b, b.fmt("{s}/lib", .{effective_onnx_root}));
-    const enable_onnx = if (enable_wasm or !link_libc) false else (b.option(bool, "onnx", "Enable ONNX Runtime backend") orelse onnx_runtime_available);
+    const enable_onnx = if (enable_wasm or !link_libc) false else (b.option(bool, "onnx", "Enable ONNX Runtime backend (default: false)") orelse false);
     const mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with lib/libmlxc.dylib");
     const default_mlx_root = defaultMlxRoot(b);
     const effective_mlx_root = mlx_root_opt orelse default_mlx_root;
-    const mlx_runtime_available = !enable_wasm and link_libc and target.result.os.tag == .macos and
-        if (effective_mlx_root) |root| pathExists(b, b.fmt("{s}/lib/libmlxc.dylib", .{root})) else false;
-    const mlx_requested = if (enable_wasm or !link_libc) false else (b.option(bool, "mlx", "Enable MLX backend (macOS only)") orelse mlx_runtime_available);
+    const mlx_requested = if (enable_wasm or !link_libc) false else (b.option(bool, "mlx", "Enable MLX backend (macOS only, default: false)") orelse false);
     // Metal kernels are independent of MLX, but MLX decoder paths currently
     // dispatch through Metal kernels. Disabling Metal therefore disables MLX.
     const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (mlx_requested or target.result.os.tag == .macos));

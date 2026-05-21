@@ -43,8 +43,8 @@ pub fn chunkText(
         try chunks.append(alloc, .{
             .chunk_id = chunk_id,
             .text = try alloc.dupe(u8, text[start..end]),
-            .start_offset = @intCast(start),
-            .end_offset = @intCast(end),
+            .start_offset = std.math.cast(u32, start),
+            .end_offset = std.math.cast(u32, end),
         });
         chunk_id += 1;
         if (end == text.len) break;

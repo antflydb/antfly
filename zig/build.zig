@@ -1030,20 +1030,12 @@ pub fn build(b: *std.Build) void {
     const termite_mlx_root = termite_mlx_root_opt orelse detected_termite_mlx_root;
     const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded Termite");
     const termite_onnx_root = termite_onnx_root_opt orelse defaultTermiteOnnxRoot(b, target);
-    const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
-        pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
-    const termite_mlx_available = if (termite_mlx_root) |root|
-        target.result.os.tag == .macos and
-            pathExists(b, b.fmt("{s}/include/mlx/c/mlx.h", .{root})) and
-            pathExists(b, b.fmt("{s}/lib/libmlxc.dylib", .{root}))
-    else
-        false;
     const termite_mlx_requested = if (link_libc)
-        b.option(bool, "mlx", "Enable MLX termite support when available") orelse termite_mlx_available
+        b.option(bool, "mlx", "Enable MLX termite support (default: false)") orelse false
     else
         false;
     const termite_enable_onnx = if (link_libc)
-        b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite") orelse termite_onnx_available
+        b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite (default: false)") orelse false
     else
         false;
     const termite_enable_metal = if (link_libc)
@@ -3015,6 +3007,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "metadata http cluster simulation serves public lifecycle from a non-host node after public create",
+            "metadata http cluster simulation seeds default admin for auth-enabled public api",
             "metadata http cluster simulation forwards public split flow from a non-host node after public create",
             "metadata http cluster simulation forwards public merge flow from a non-host node after public create",
         },
@@ -3649,7 +3642,7 @@ pub fn build(b: *std.Build) void {
     });
     var swarm_runtime_imports = antfly_imports;
     swarm_runtime_imports.build_options = swarm_runtime_build_options;
-    swarm_runtime_imports.configure(b, swarm_runtime_test_mod, false, true);
+    swarm_runtime_imports.configure(b, swarm_runtime_test_mod, true, true);
     const usermgr_storage_swarm_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
@@ -3660,9 +3653,21 @@ pub fn build(b: *std.Build) void {
     swarm_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_swarm_runtime_test_mod);
     const lib_swarm_runtime_tests = b.addTest(.{
         .root_module = swarm_runtime_test_mod,
+        .filters = &.{
+            "swarm runtime module compiles",
+            "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
+            "swarm runtime registers internal group routes explicitly",
+            "parse cli accepts config path",
+            "parse cli accepts canonical host port and models dir flags",
+            "termite config uses cli override before common config",
+            "swarm public api caps keep alive request reuse",
+            "parse cli accepts termite budget overrides",
+            "termite config falls back to common config",
+            "swarm runtime resolves paths from common storage base dir",
+        },
     });
-    const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
     const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
+    const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
     lib_swarm_runtime_test_step.dependOn(&run_lib_swarm_runtime_tests.step);
 
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
@@ -3703,6 +3708,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(lib_swarm_runtime_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
 

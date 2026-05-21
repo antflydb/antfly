@@ -26,6 +26,7 @@ const metadata_storage = @import("storage/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
+const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
@@ -54,6 +55,8 @@ const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_time = @import("../platform/time.zig");
+const usermgr = @import("../usermgr/mod.zig");
+const casbin = @import("antfly_casbin");
 
 const LeanSimAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 // Public API simulations can open DBs and hosted indexes from the listener
@@ -4302,6 +4305,55 @@ fn PublicApiRouter(comptime N: usize) type {
     };
 }
 
+const SimAuthManager = struct {
+    store: usermgr.MemoryStore,
+    policy_store: casbin.MemoryAdapter,
+    manager: usermgr.UserManager,
+
+    fn init(alloc: std.mem.Allocator) !SimAuthManager {
+        var self = SimAuthManager{
+            .store = usermgr.MemoryStore.init(alloc),
+            .policy_store = casbin.MemoryAdapter.init(alloc),
+            .manager = undefined,
+        };
+        errdefer self.store.deinit();
+        errdefer self.policy_store.deinit();
+
+        self.manager = try usermgr.UserManager.init(
+            alloc,
+            self.store.iface(),
+            try usermgr.initDefaultEnforcer(alloc, self.policy_store.iface()),
+        );
+        errdefer self.manager.deinit();
+
+        try usermgr.ensureDefaultAdminUser(&self.manager);
+        return self;
+    }
+
+    fn deinit(self: *SimAuthManager) void {
+        self.manager.deinit();
+        self.policy_store.deinit();
+        self.store.deinit();
+        self.* = undefined;
+    }
+};
+
+fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
+    const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
+    defer alloc.free(raw);
+    const size = std.base64.standard.Encoder.calcSize(raw.len);
+    const encoded = try alloc.alloc(u8, size);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, raw);
+    return try std.fmt.allocPrint(alloc, "Basic {s}", .{encoded});
+}
+
+fn PublicApiServerOptions(comptime N: usize) type {
+    return struct {
+        auth_managers: ?*[N]SimAuthManager = null,
+    };
+}
+
 fn startPublicApiServers(
     comptime N: usize,
     alloc: std.mem.Allocator,
@@ -4317,6 +4369,7 @@ fn startPublicApiServers(
     routers: *[N]PublicApiRouter(N),
     read_sources: *[N]api_table_reads.HostedProvisionedTableReadSource,
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
+    options: PublicApiServerOptions(N),
     api_base_uris: *[N][]const u8,
 ) !void {
     var started: usize = 0;
@@ -4344,9 +4397,13 @@ fn startPublicApiServers(
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
+        const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
+            .auth_enabled = true,
+            .user_manager = &auth_managers[i].manager,
+        } else .{};
         servers[i] = api_http_server.ApiHttpServer.init(
             alloc,
-            .{},
+            server_config,
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
@@ -4430,12 +4487,33 @@ fn PublicApiTestRig(comptime N: usize) type {
             try self.initWithMetadataMode(alloc, cluster, roots, .leader_backed);
         }
 
+        fn initLeaderBackedWithAuthInPlace(
+            self: *@This(),
+            alloc: std.mem.Allocator,
+            cluster: *MetadataHttpClusterSimulation,
+            roots: [N][]const u8,
+            auth_managers: *[N]SimAuthManager,
+        ) !void {
+            try self.initWithMetadataModeAndOptions(alloc, cluster, roots, .leader_backed, .{ .auth_managers = auth_managers });
+        }
+
         fn initWithMetadataMode(
             self: *@This(),
             alloc: std.mem.Allocator,
             cluster: *MetadataHttpClusterSimulation,
             roots: [N][]const u8,
             metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
+        ) !void {
+            try self.initWithMetadataModeAndOptions(alloc, cluster, roots, metadata_snapshot_mode, .{});
+        }
+
+        fn initWithMetadataModeAndOptions(
+            self: *@This(),
+            alloc: std.mem.Allocator,
+            cluster: *MetadataHttpClusterSimulation,
+            roots: [N][]const u8,
+            metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
+            options: PublicApiServerOptions(N),
         ) !void {
             self.* = .{
                 .alloc = alloc,
@@ -4459,6 +4537,7 @@ fn PublicApiTestRig(comptime N: usize) type {
                 &self.routers,
                 &self.read_sources,
                 &self.write_sources,
+                options,
                 &self.api_base_uris,
             );
             errdefer {
@@ -5391,6 +5470,92 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     try std.testing.expectEqual(@as(usize, 0), parsed_tables_after_drop.value.len);
 }
 
+test "metadata http cluster simulation seeds default admin for auth-enabled public api" {
+    var sim_alloc_state: LeanSimAllocator = .init;
+    defer _ = sim_alloc_state.deinit();
+    const sim_alloc = sim_alloc_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(sim_alloc);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(sim_alloc);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(sim_alloc);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-a", .{tmp.sub_path});
+    defer sim_alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-b", .{tmp.sub_path});
+    defer sim_alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-c", .{tmp.sub_path});
+    defer sim_alloc.free(root_c);
+    const cat_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-a.txt", .{tmp.sub_path});
+    defer sim_alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-b.txt", .{tmp.sub_path});
+    defer sim_alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-c.txt", .{tmp.sub_path});
+    defer sim_alloc.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4868, root_a, cat_a),
+        makeHostSimConfig(2, 4868, root_b, cat_b),
+        makeHostSimConfig(3, 4868, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(sim_alloc, 4868, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    defer cluster.stopAll();
+    _ = try startBootstrappedMetadataCluster(&cluster, 24, true);
+
+    var auth_managers: [3]SimAuthManager = undefined;
+    var auth_count: usize = 0;
+    errdefer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    for (&auth_managers) |*auth| {
+        auth.* = try SimAuthManager.init(sim_alloc);
+        auth_count += 1;
+    }
+    defer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+
+    const roots = [_][]const u8{ root_a, root_b, root_c };
+    var public_api: PublicApiTestRig(3) = undefined;
+    try public_api.initLeaderBackedWithAuthInPlace(sim_alloc, &cluster, roots, &auth_managers);
+    defer public_api.deinit();
+
+    const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "admin");
+    defer std.heap.page_allocator.free(admin_auth);
+
+    for (public_api.api_base_uris) |base_uri| {
+        const status_uri = try raft_transport.Routes.join(std.heap.page_allocator, base_uri, api_http_routes.Routes.status);
+        defer std.heap.page_allocator.free(status_uri);
+
+        var unauthorized = try public_api.client_executor.executor().execute(std.heap.page_allocator, .{
+            .method = .GET,
+            .uri = status_uri,
+        });
+        defer unauthorized.deinit(std.heap.page_allocator);
+        try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+
+        var authorized = try public_api.client_executor.executor().execute(std.heap.page_allocator, .{
+            .method = .GET,
+            .uri = status_uri,
+            .authorization = admin_auth,
+        });
+        defer authorized.deinit(std.heap.page_allocator);
+        try std.testing.expectEqual(@as(u16, 200), authorized.status);
+    }
+}
+
 test "metadata http cluster simulation forwards public split flow from a non-host node after public create" {
     var sim_alloc_state: LeanSimAllocator = .init;
     defer _ = sim_alloc_state.deinit();
@@ -5503,6 +5668,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
         &routers,
         &read_sources,
         &write_sources,
+        .{},
         &api_base_uris,
     );
     defer for (api_base_uris) |uri| sim_alloc.free(uri);
@@ -5703,6 +5869,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
         &routers,
         &read_sources,
         &write_sources,
+        .{},
         &api_base_uris,
     );
     defer for (api_base_uris) |uri| sim_alloc.free(uri);

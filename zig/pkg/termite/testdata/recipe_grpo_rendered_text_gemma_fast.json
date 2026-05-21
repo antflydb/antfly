@@ -14,7 +14,7 @@
   },
   "adapter": {
     "rank": 8,
-    "alpha": 16
+    "alpha": 32
   },
   "grpo": {
     "group_size": 2,

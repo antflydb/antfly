@@ -3150,6 +3150,7 @@ pub const DB = struct {
             }
             extracted[i] = try mapper.extractWrite(self.alloc, write.key, write.value);
             try augmentExtractedWriteWithGraphFieldEdges(self, self.alloc, write.key, write.value, &extracted[i]);
+            try extractConfiguredVectorFields(self, write.key, &extracted[i]);
             extracted_initialized += 1;
             for (extracted[i].dense_embeddings) |*embedding| {
                 if (embedding.artifact_key != null) continue;
@@ -11738,6 +11739,130 @@ fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.
 
 fn parsePatternRfc3339ToNs(text: []const u8) !?u64 {
     return try db_query_graph.parsePatternRfc3339ToNs(text);
+}
+
+fn extractConfiguredVectorFields(self: *DB, doc_key: []const u8, extracted: *mapper.ExtractedWrite) !void {
+    const doc_value = extracted.cleaned_value orelse return;
+
+    var stripped_fields = std.ArrayListUnmanaged([]const u8).empty;
+    defer stripped_fields.deinit(self.alloc);
+
+    for (self.core.index_manager.dense_indexes.items) |entry| {
+        if (hasDenseEmbeddingForIndex(extracted.dense_embeddings, entry.config.name)) continue;
+        if (try mapper.extractDenseVectorField(self.alloc, doc_value, entry.field_name, entry.dims)) |vector| {
+            var vector_owned = true;
+            errdefer if (vector_owned) self.alloc.free(vector);
+            const index_name = try self.alloc.dupe(u8, entry.config.name);
+            var index_name_owned = true;
+            errdefer if (index_name_owned) self.alloc.free(index_name);
+            const owned_doc_key = try self.alloc.dupe(u8, doc_key);
+            var doc_key_owned = true;
+            errdefer if (doc_key_owned) self.alloc.free(owned_doc_key);
+            var embedding = mapper.DenseEmbeddingWrite{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            };
+            vector_owned = false;
+            index_name_owned = false;
+            doc_key_owned = false;
+            var embedding_owned = true;
+            errdefer if (embedding_owned) freeDenseEmbeddingWrite(self.alloc, &embedding);
+            try appendDenseEmbeddingToExtracted(self.alloc, extracted, embedding);
+            embedding_owned = false;
+            try appendUniqueBorrowedField(self.alloc, &stripped_fields, entry.field_name);
+        }
+    }
+
+    for (self.core.index_manager.sparse_indexes.items) |entry| {
+        if (hasSparseEmbeddingForIndex(extracted.sparse_embeddings, entry.config.name)) continue;
+        if (try mapper.extractSparseVectorField(self.alloc, doc_value, entry.field_name)) |raw_sparse_vec| {
+            var sparse_vec = raw_sparse_vec;
+            var sparse_vec_owned = true;
+            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
+            const index_name = try self.alloc.dupe(u8, entry.config.name);
+            var index_name_owned = true;
+            errdefer if (index_name_owned) self.alloc.free(index_name);
+            const owned_doc_key = try self.alloc.dupe(u8, doc_key);
+            var doc_key_owned = true;
+            errdefer if (doc_key_owned) self.alloc.free(owned_doc_key);
+            var embedding = mapper.SparseEmbeddingWrite{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            };
+            sparse_vec_owned = false;
+            index_name_owned = false;
+            doc_key_owned = false;
+            var embedding_owned = true;
+            errdefer if (embedding_owned) freeSparseEmbeddingWrite(self.alloc, &embedding);
+            try appendSparseEmbeddingToExtracted(self.alloc, extracted, embedding);
+            embedding_owned = false;
+            try appendUniqueBorrowedField(self.alloc, &stripped_fields, entry.field_name);
+        }
+    }
+
+    if (stripped_fields.items.len == 0) return;
+    const stripped = try mapper.stripTopLevelFieldsAlloc(self.alloc, doc_value, stripped_fields.items);
+    self.alloc.free(doc_value);
+    extracted.cleaned_value = stripped;
+}
+
+fn hasDenseEmbeddingForIndex(embeddings: []const mapper.DenseEmbeddingWrite, index_name: []const u8) bool {
+    for (embeddings) |embedding| {
+        if (std.mem.eql(u8, embedding.index_name, index_name)) return true;
+    }
+    return false;
+}
+
+fn hasSparseEmbeddingForIndex(embeddings: []const mapper.SparseEmbeddingWrite, index_name: []const u8) bool {
+    for (embeddings) |embedding| {
+        if (std.mem.eql(u8, embedding.index_name, index_name)) return true;
+    }
+    return false;
+}
+
+fn appendUniqueBorrowedField(alloc: Allocator, fields: *std.ArrayListUnmanaged([]const u8), field_name: []const u8) !void {
+    for (fields.items) |existing| {
+        if (std.mem.eql(u8, existing, field_name)) return;
+    }
+    try fields.append(alloc, field_name);
+}
+
+fn appendDenseEmbeddingToExtracted(alloc: Allocator, extracted: *mapper.ExtractedWrite, embedding: mapper.DenseEmbeddingWrite) !void {
+    const old = extracted.dense_embeddings;
+    const next = try alloc.alloc(mapper.DenseEmbeddingWrite, old.len + 1);
+    @memcpy(next[0..old.len], old);
+    next[old.len] = embedding;
+    if (old.len > 0) alloc.free(old);
+    extracted.dense_embeddings = next;
+}
+
+fn appendSparseEmbeddingToExtracted(alloc: Allocator, extracted: *mapper.ExtractedWrite, embedding: mapper.SparseEmbeddingWrite) !void {
+    const old = extracted.sparse_embeddings;
+    const next = try alloc.alloc(mapper.SparseEmbeddingWrite, old.len + 1);
+    @memcpy(next[0..old.len], old);
+    next[old.len] = embedding;
+    if (old.len > 0) alloc.free(old);
+    extracted.sparse_embeddings = next;
+}
+
+fn freeDenseEmbeddingWrite(alloc: Allocator, embedding: *mapper.DenseEmbeddingWrite) void {
+    alloc.free(embedding.index_name);
+    alloc.free(embedding.doc_key);
+    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+    if (embedding.vector.len > 0) alloc.free(embedding.vector);
+    embedding.* = undefined;
+}
+
+fn freeSparseEmbeddingWrite(alloc: Allocator, embedding: *mapper.SparseEmbeddingWrite) void {
+    alloc.free(embedding.index_name);
+    alloc.free(embedding.doc_key);
+    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+    if (embedding.indices.len > 0) alloc.free(embedding.indices);
+    if (embedding.values.len > 0) alloc.free(embedding.values);
+    embedding.* = undefined;
 }
 
 fn buildDerivedBatch(
@@ -26532,6 +26657,65 @@ test "db document _embeddings update vector index and strip stored special field
     defer after.deinit();
 
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+}
+
+test "db field-backed vector indexes store artifacts and strip vector fields" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[0,1,0],\"sparse\":{\"indices\":[3],\"values\":[1.0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const stored = (try db.get(alloc, "doc:a")).?;
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"title\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"embedding\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"sparse\"") == null);
+
+    var dense = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 2,
+        } },
+        .limit = 2,
+    });
+    defer dense.deinit();
+    try std.testing.expectEqualStrings("doc:a", dense.hits[0].id);
+
+    var sparse = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{7},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 2,
+    });
+    defer sparse.deinit();
+    try std.testing.expectEqualStrings("doc:a", sparse.hits[0].id);
 }
 
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {

@@ -248,6 +248,63 @@ pub const SupportedJoinFilters = struct {
     }
 };
 
+pub fn combineFilterQueryWithRowFilterJson(
+    alloc: std.mem.Allocator,
+    existing_filter_query: ?std.json.Value,
+    row_filter_json: []const u8,
+) !std.json.Value {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_filter_json, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    return try combineFilterQueryValues(alloc, existing_filter_query, parsed.value);
+}
+
+pub fn applyRightTableRowFilterJson(
+    alloc: std.mem.Allocator,
+    join: *SupportedJoinRequest,
+    row_filter_json: []const u8,
+) !void {
+    if (join.right_filters == null) join.right_filters = .{};
+    var filters = &join.right_filters.?;
+    var combined = try combineFilterQueryWithRowFilterJson(alloc, filters.filter_query, row_filter_json);
+    errdefer deinitJsonValue(alloc, &combined);
+    if (filters.filter_query) |*existing| deinitJsonValue(alloc, existing);
+    filters.filter_query = combined;
+}
+
+fn combineFilterQueryValues(
+    alloc: std.mem.Allocator,
+    existing_filter_query: ?std.json.Value,
+    row_filter: std.json.Value,
+) !std.json.Value {
+    const existing = existing_filter_query orelse return try cloneJsonValue(alloc, row_filter);
+
+    var conjuncts = std.json.Array.init(alloc);
+    var conjuncts_owned = true;
+    errdefer if (conjuncts_owned) {
+        for (conjuncts.items) |*item| deinitJsonValue(alloc, item);
+        conjuncts.deinit();
+    };
+    var existing_clone = try cloneJsonValue(alloc, existing);
+    var existing_clone_owned = true;
+    errdefer if (existing_clone_owned) deinitJsonValue(alloc, &existing_clone);
+    try conjuncts.append(existing_clone);
+    existing_clone_owned = false;
+
+    var row_filter_clone = try cloneJsonValue(alloc, row_filter);
+    var row_filter_clone_owned = true;
+    errdefer if (row_filter_clone_owned) deinitJsonValue(alloc, &row_filter_clone);
+    try conjuncts.append(row_filter_clone);
+    row_filter_clone_owned = false;
+
+    var root = std.json.Value{ .object = std.json.ObjectMap.empty };
+    errdefer deinitJsonValue(alloc, &root);
+    const key = try alloc.dupe(u8, "conjuncts");
+    errdefer alloc.free(key);
+    try root.object.put(alloc, key, .{ .array = conjuncts });
+    conjuncts_owned = false;
+    return root;
+}
+
 pub const JoinedQueryStats = struct {
     left_rows_scanned: i64 = 0,
     right_rows_scanned: i64 = 0,
@@ -1293,7 +1350,6 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     join: SupportedJoinRequest,
     foreign_sources: foreign_mod.PostgresSourceMap,
 ) (public_table_http.TableApi.ExecuteQueryError || error{OutOfMemory})![]u8 {
-    if (row_filter_json != null) return error.InvalidQueryRequest;
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
     var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer contract_request.deinit();
@@ -1311,7 +1367,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     const primary_body = rewrite.body;
     defer alloc.free(primary_body);
 
-    var primary_result = ctx.executePlainQuery(alloc, source, table_name, primary_body, null) catch |err| switch (err) {
+    var primary_result = ctx.executePlainQuery(alloc, source, table_name, primary_body, row_filter_json) catch |err| switch (err) {
         error.InvalidQueryRequest => return error.InvalidQueryRequest,
         error.TableNotFound => return error.NotFound,
         else => return error.InternalFailure,
@@ -5404,6 +5460,30 @@ pub fn deinitJsonValue(alloc: std.mem.Allocator, value: *std.json.Value) void {
 
 pub fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
     return json_helpers.jsonValuesEqual(lhs, rhs);
+}
+
+test "distributed join applies auth row filter to right table filter query" {
+    const alloc = std.testing.allocator;
+    var existing = std.json.parseFromSlice(std.json.Value, alloc, "{\"term\":{\"tier\":\"premium\"}}", .{}) catch unreachable;
+    defer existing.deinit();
+    var join = SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .left_field = try alloc.dupe(u8, "customer_id"),
+        .right_field = try alloc.dupe(u8, "id"),
+        .right_filters = .{
+            .filter_query = try cloneJsonValue(alloc, existing.value),
+        },
+    };
+    defer join.deinit(alloc);
+
+    try applyRightTableRowFilterJson(alloc, &join, "{\"term\":{\"tenant_id\":\"acme\"}}");
+    const filter_query = join.right_filters.?.filter_query orelse return error.TestExpectedEqual;
+    const json = try stringifyJsonValueAlloc(alloc, filter_query);
+    defer alloc.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"conjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tier\":\"premium\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tenant_id\":\"acme\"") != null);
 }
 
 /// Ordered comparison of two JSON values. Returns -1 (less), 0 (equal), or

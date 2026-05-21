@@ -50,8 +50,17 @@ const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
 const command_registry = @import("command_registry.zig");
 const ml = @import("ml");
+const peft = @import("peft.zig");
 
 const print = std.debug.print;
+
+const default_lora_rank: usize = 16;
+const default_policy_lora_rank: usize = 8;
+const default_lora_alpha: f32 = 32.0;
+const default_lora_target_preset = "all-linear";
+
+const qwen_attention_lora_target_modules = [_][]const u8{ "q_proj", "k_proj", "v_proj", "o_proj" };
+const qwen_mlp_lora_target_modules = [_][]const u8{ "gate_proj", "up_proj", "down_proj" };
 
 pub const RecipeKind = enum {
     sft,
@@ -95,6 +104,11 @@ pub const AdapterConfig = struct {
     layer_name: ?[]const u8 = null,
     base_model_name_or_path: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
+    target_preset: ?[]const u8 = null,
+    target_modules: ?[]const []const u8 = null,
+    init_lora_weights: ?[]const u8 = null,
+    use_dora: ?bool = null,
+    scaling: ?[]const u8 = null,
 };
 
 pub const OptimizerConfig = struct {
@@ -1245,11 +1259,8 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         "bootstrap-gemma4-lora",
         model_path,
         bootstrap_dir,
-        try fmtInt(allocator, adapter.rank orelse 8),
-        try fmtFloat(allocator, adapter.alpha orelse 16),
     });
-    if (adapter.base_model_name_or_path) |base_name| try bootstrap_argv.append(allocator, base_name);
-    if (adapter.layer_name) |layer| try appendMany(allocator, &bootstrap_argv, &.{ "--layer-name", layer });
+    try appendGemmaBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .lora_sft);
     try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
 
     var train_argv: std.ArrayList([]const u8) = .empty;
@@ -1292,9 +1303,10 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 
     var steps: std.ArrayList(Step) = .empty;
     errdefer freeSteps(allocator, steps.items);
-    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try argv(allocator, &.{
-        "bootstrap-gliner2-lora", model_path, bootstrap_dir, try fmtInt(allocator, adapter.rank orelse 8), try fmtFloat(allocator, adapter.alpha orelse 16),
-    }) });
+    var bootstrap_argv: std.ArrayList([]const u8) = .empty;
+    try appendMany(allocator, &bootstrap_argv, &.{ "bootstrap-gliner2-lora", model_path, bootstrap_dir });
+    try appendGenericBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .lora_sft);
+    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
     const entity_types = recipe.dataset.labels orelse recipe.dataset.format orelse return error.MissingEntityTypes;
     try steps.append(allocator, .{ .name = "prepare", .argv = try argv(allocator, &.{
         "prepare-gliner2-top-layer-boundary-cache",
@@ -1349,9 +1361,10 @@ fn buildLayoutLmv3LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 
     var steps: std.ArrayList(Step) = .empty;
     errdefer freeSteps(allocator, steps.items);
-    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try argv(allocator, &.{
-        "bootstrap-layoutlmv3-lora", model_path, bootstrap_dir, try fmtInt(allocator, adapter.rank orelse 8), try fmtFloat(allocator, adapter.alpha orelse 16),
-    }) });
+    var bootstrap_argv: std.ArrayList([]const u8) = .empty;
+    try appendMany(allocator, &bootstrap_argv, &.{ "bootstrap-layoutlmv3-lora", model_path, bootstrap_dir });
+    try appendGenericBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .lora_sft);
+    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
     try steps.append(allocator, .{ .name = "train-eval", .argv = try argv(allocator, &.{
         train_cmd,                                                    model_path,                                                           bootstrap_dir,                                            train_path,                                              eval_path, trained_dir,
         try fmtInt(allocator, recipe.dataset.max_examples orelse 32), try fmtFloat(allocator, recipe.optimizer.learning_rate orelse 0.001), try fmtInt(allocator, evalMaxExamples(recipe) orelse 32), try fmtInt(allocator, recipe.optimizer.epochs orelse 1),
@@ -1408,9 +1421,10 @@ fn buildRerankerLoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const adapter = recipe.adapter orelse AdapterConfig{};
     var steps: std.ArrayList(Step) = .empty;
     errdefer freeSteps(allocator, steps.items);
-    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try argv(allocator, &.{
-        "bootstrap-reranker-lora", model_path, bootstrap_dir, try fmtInt(allocator, adapter.rank orelse 8), try fmtFloat(allocator, adapter.alpha orelse 16),
-    }) });
+    var bootstrap_argv: std.ArrayList([]const u8) = .empty;
+    try appendMany(allocator, &bootstrap_argv, &.{ "bootstrap-reranker-lora", model_path, bootstrap_dir });
+    try appendGenericBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .lora_sft);
+    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
     try steps.append(allocator, .{ .name = "prepare", .argv = try argv(allocator, &.{
         "prepare-reranker-top-layer-cache", model_path, train_path, train_cache_path, recipe.dataset.train_split orelse "train", "--backend", recipe.backend orelse "auto", "--max-examples", try fmtInt(allocator, recipe.dataset.max_examples orelse 128),
     }) });
@@ -1448,9 +1462,10 @@ fn buildVlmRetrievalPlan(allocator: std.mem.Allocator, recipe: Recipe, family: [
     try steps.append(allocator, .{ .name = "prepare", .argv = try argv(allocator, &.{
         "prepare-colqwen2-inputs", model_path, dataset_path, examples_jsonl, prepared_path, try fmtInt(allocator, recipe.dataset.max_examples orelse 32),
     }) });
-    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try argv(allocator, &.{
-        "bootstrap-colqwen2-lora", model_path, bootstrap_dir, try fmtInt(allocator, adapter.rank orelse 8), try fmtFloat(allocator, adapter.alpha orelse 16),
-    }) });
+    var bootstrap_argv: std.ArrayList([]const u8) = .empty;
+    try appendMany(allocator, &bootstrap_argv, &.{ "bootstrap-colqwen2-lora", model_path, bootstrap_dir });
+    try appendGenericBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .vlm_retrieval);
+    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
     try steps.append(allocator, .{ .name = "train-eval", .argv = try argv(allocator, &.{
         "train-eval-colqwen2-lora-bundle",                       model_path,                                                           bootstrap_dir,    prepared_path,                                                trained_dir,
         "--lr",                                                  try fmtFloat(allocator, recipe.optimizer.learning_rate orelse 0.001), "--max-examples", try fmtInt(allocator, recipe.dataset.max_examples orelse 32), "--epochs",
@@ -1975,6 +1990,118 @@ fn qwenLoraTargetModulesForFamily(family: []const u8) []const []const u8 {
     return qwen2_real_autodiff.default_lora_target_modules[0..];
 }
 
+fn defaultLoraRankForKind(kind: RecipeKind) usize {
+    return switch (kind) {
+        .grpo => default_policy_lora_rank,
+        else => default_lora_rank,
+    };
+}
+
+fn adapterRank(adapter: AdapterConfig, kind: RecipeKind) usize {
+    return adapter.rank orelse defaultLoraRankForKind(kind);
+}
+
+fn adapterAlpha(adapter: AdapterConfig) f32 {
+    return adapter.alpha orelse default_lora_alpha;
+}
+
+fn validateAdapterScaling(adapter: AdapterConfig) !void {
+    const scaling = adapter.scaling orelse return;
+    if (eqlName(scaling, "standard") or
+        eqlName(scaling, "alpha/r") or
+        eqlName(scaling, "alpha-over-r"))
+    {
+        return;
+    }
+    return error.UnsupportedLoRAScaling;
+}
+
+fn validateAdapterTargetSelection(adapter: AdapterConfig) !void {
+    if (adapter.target_modules != null and adapter.target_preset != null) return error.ConflictingLoRATargetSelection;
+}
+
+fn validateGemmaAdapterOptions(adapter: AdapterConfig) !void {
+    try validateAdapterScaling(adapter);
+    try validateAdapterTargetSelection(adapter);
+    if (adapter.target_modules == null) _ = try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+}
+
+fn validateNonGemmaAdapterOptions(adapter: AdapterConfig) !void {
+    try validateAdapterScaling(adapter);
+    try validateAdapterTargetSelection(adapter);
+    if (adapter.use_dora orelse false) return error.UnsupportedLoRAOption;
+    if (adapter.init_lora_weights != null) return error.UnsupportedLoRAOption;
+}
+
+fn validateGenericBootstrapAdapterOptions(adapter: AdapterConfig) !void {
+    try validateNonGemmaAdapterOptions(adapter);
+    if (adapter.target_preset != null) return error.UnsupportedLoRATargetPreset;
+}
+
+fn parseAdapterTargetPreset(name: []const u8) !peft.TargetPreset {
+    return peft.parseTargetPreset(name) orelse error.UnsupportedLoRATargetPreset;
+}
+
+fn gemmaTargetPreset(adapter: AdapterConfig) !?peft.TargetPreset {
+    if (adapter.target_modules != null) return null;
+    return try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+}
+
+fn adapterTargetModulesForQwen(adapter: AdapterConfig, default_target_modules: []const []const u8) ![]const []const u8 {
+    try validateAdapterTargetSelection(adapter);
+    if (adapter.target_modules) |modules| return modules;
+    const preset_name = adapter.target_preset orelse return default_target_modules;
+    const preset = try parseAdapterTargetPreset(preset_name);
+    return switch (preset) {
+        .all_linear => default_target_modules,
+        .attention_only => qwen_attention_lora_target_modules[0..],
+        .mlp_only => qwen_mlp_lora_target_modules[0..],
+        .moe_experts => error.UnsupportedLoRATargetPreset,
+    };
+}
+
+fn appendTargetModulesCsv(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), modules: []const []const u8) !void {
+    try appendMany(allocator, list, &.{ "--target-modules", try joinCsv(allocator, modules) });
+}
+
+fn appendGemmaBootstrapAdapterArgs(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    adapter: AdapterConfig,
+    kind: RecipeKind,
+) !void {
+    try validateGemmaAdapterOptions(adapter);
+    try appendMany(allocator, list, &.{
+        try fmtInt(allocator, adapterRank(adapter, kind)),
+        try fmtFloat(allocator, adapterAlpha(adapter)),
+    });
+    if (adapter.base_model_name_or_path) |base_name| try list.append(allocator, base_name);
+    if (adapter.target_modules) |modules| {
+        try appendTargetModulesCsv(allocator, list, modules);
+    } else {
+        _ = try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+        try appendMany(allocator, list, &.{ "--target-preset", adapter.target_preset orelse default_lora_target_preset });
+    }
+    if (adapter.layer_name) |layer| try appendMany(allocator, list, &.{ "--layer-name", layer });
+    if (adapter.use_dora orelse false) try list.append(allocator, "--use-dora");
+    if (adapter.init_lora_weights) |init| try appendMany(allocator, list, &.{ "--init-lora-weights", init });
+}
+
+fn appendGenericBootstrapAdapterArgs(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    adapter: AdapterConfig,
+    kind: RecipeKind,
+) !void {
+    try validateGenericBootstrapAdapterOptions(adapter);
+    try appendMany(allocator, list, &.{
+        try fmtInt(allocator, adapterRank(adapter, kind)),
+        try fmtFloat(allocator, adapterAlpha(adapter)),
+    });
+    if (adapter.base_model_name_or_path) |base_name| try list.append(allocator, base_name);
+    if (adapter.target_modules) |modules| try appendTargetModulesCsv(allocator, list, modules);
+}
+
 fn adapterBootstrapDir(recipe: Recipe) ?[]const u8 {
     if (recipe.adapter) |adapter| if (adapter.path) |path| return path;
     return recipe.artifacts.adapter_dir;
@@ -2457,32 +2584,79 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
     if (argv_in.len < 3) return error.InvalidArguments;
     const model_dir = argv_in[1];
     const out_dir = argv_in[2];
-    const rank = if (argv_in.len >= 4 and !std.mem.startsWith(u8, argv_in[3], "--")) try std.fmt.parseUnsigned(usize, argv_in[3], 10) else 8;
-    const alpha = if (argv_in.len >= 5 and !std.mem.startsWith(u8, argv_in[4], "--")) try std.fmt.parseFloat(f32, argv_in[4]) else 16;
+    var rank = default_lora_rank;
+    var alpha = default_lora_alpha;
+    var rank_set = false;
+    var alpha_set = false;
+    var rank_alpha_flag_seen = false;
 
     var base_model_name_or_path: ?[]const u8 = null;
     var layer_name: ?[]const u8 = null;
+    var target_preset: ?peft.TargetPreset = null;
+    var target_modules: ?[]const []const u8 = null;
+    defer if (target_modules) |modules| allocator.free(modules);
+    var use_dora = false;
+    var init_lora_weights: ?[]const u8 = null;
     var i: usize = 3;
-    if (argv_in.len >= 4 and !std.mem.startsWith(u8, argv_in[3], "--")) i = 4;
-    if (argv_in.len >= 5 and !std.mem.startsWith(u8, argv_in[4], "--")) i = 5;
     while (i < argv_in.len) : (i += 1) {
         const arg = argv_in[i];
-        if (std.mem.eql(u8, arg, "--layer-name") or std.mem.eql(u8, arg, "--layer")) {
+        if (std.mem.eql(u8, arg, "--rank")) {
+            if (rank_set) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            rank = try std.fmt.parseUnsigned(usize, argv_in[i], 10);
+            rank_set = true;
+            rank_alpha_flag_seen = true;
+        } else if (std.mem.eql(u8, arg, "--alpha")) {
+            if (alpha_set) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            alpha = try std.fmt.parseFloat(f32, argv_in[i]);
+            alpha_set = true;
+            rank_alpha_flag_seen = true;
+        } else if (std.mem.eql(u8, arg, "--layer-name") or std.mem.eql(u8, arg, "--layer")) {
             i += 1;
             if (i >= argv_in.len) return error.InvalidArguments;
             layer_name = argv_in[i];
+        } else if (std.mem.eql(u8, arg, "--target-preset")) {
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            target_preset = peft.parseTargetPreset(argv_in[i]) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--target-modules")) {
+            if (target_modules != null) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            target_modules = try parseCsvBorrowed(allocator, argv_in[i]);
+        } else if (std.mem.eql(u8, arg, "--use-dora")) {
+            use_dora = true;
+        } else if (std.mem.eql(u8, arg, "--init-lora-weights")) {
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            init_lora_weights = argv_in[i];
+        } else if (!rank_alpha_flag_seen and !rank_set) {
+            rank = try std.fmt.parseUnsigned(usize, arg, 10);
+            rank_set = true;
+        } else if (!rank_alpha_flag_seen and !alpha_set) {
+            alpha = try std.fmt.parseFloat(f32, arg);
+            alpha_set = true;
         } else if (base_model_name_or_path == null) {
             base_model_name_or_path = arg;
         } else {
             return error.InvalidArguments;
         }
     }
+    if (target_modules != null and target_preset != null) return error.InvalidArguments;
+    const effective_target_preset = if (target_modules == null) target_preset orelse .all_linear else null;
 
     var summary = try gemma4.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .base_model_name_or_path = base_model_name_or_path,
         .layer_name = layer_name,
+        .target_modules = target_modules,
+        .target_preset = effective_target_preset,
+        .use_dora = use_dora,
+        .init_lora_weights = init_lora_weights,
     });
     defer gemma4.freeBootstrapSummary(allocator, &summary);
     print("direct adapter: {s}\n", .{argv_in[0]});
@@ -2506,14 +2680,39 @@ fn runDirectBootstrapGliner2Lora(allocator: std.mem.Allocator, io: std.Io, argv_
     if (argv_in.len < 3) return error.InvalidArguments;
     const model_dir = argv_in[1];
     const out_dir = argv_in[2];
-    const rank = if (argv_in.len >= 4) try std.fmt.parseUnsigned(usize, argv_in[3], 10) else 16;
-    const alpha = if (argv_in.len >= 5) try std.fmt.parseFloat(f32, argv_in[4]) else 32;
-    const base_model_name_or_path = if (argv_in.len >= 6) argv_in[5] else null;
+    var rank = default_lora_rank;
+    var alpha = default_lora_alpha;
+    var base_model_name_or_path: ?[]const u8 = null;
+    var target_modules: ?[]const []const u8 = null;
+    defer if (target_modules) |modules| allocator.free(modules);
+    var i: usize = 3;
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        rank = try std.fmt.parseUnsigned(usize, argv_in[i], 10);
+        i += 1;
+    }
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        alpha = try std.fmt.parseFloat(f32, argv_in[i]);
+        i += 1;
+    }
+    while (i < argv_in.len) : (i += 1) {
+        const arg = argv_in[i];
+        if (std.mem.eql(u8, arg, "--target-modules")) {
+            if (target_modules != null) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            target_modules = try parseCsvBorrowed(allocator, argv_in[i]);
+        } else if (base_model_name_or_path == null) {
+            base_model_name_or_path = arg;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
 
     var summary = try gliner2.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .base_model_name_or_path = base_model_name_or_path,
+        .target_modules = target_modules,
     });
     defer gliner2.freeBootstrapSummary(allocator, &summary);
     print("direct adapter: {s}\n", .{argv_in[0]});
@@ -2606,19 +2805,57 @@ fn parseCsvOwned(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 
     return try out.toOwnedSlice(allocator);
 }
 
+fn parseCsvBorrowed(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        try out.append(allocator, item);
+    }
+    if (out.items.len == 0) return error.InvalidArguments;
+    return try out.toOwnedSlice(allocator);
+}
+
 fn runDirectBootstrapLayoutlmv3Lora(allocator: std.mem.Allocator, io: std.Io, argv_in: []const []const u8) !void {
     _ = io;
     if (argv_in.len < 3) return error.InvalidArguments;
     const model_dir = argv_in[1];
     const out_dir = argv_in[2];
-    const rank = if (argv_in.len >= 4) try std.fmt.parseUnsigned(usize, argv_in[3], 10) else 16;
-    const alpha = if (argv_in.len >= 5) try std.fmt.parseFloat(f32, argv_in[4]) else 32;
-    const base_model_name_or_path = if (argv_in.len >= 6) argv_in[5] else null;
+    var rank = default_lora_rank;
+    var alpha = default_lora_alpha;
+    var base_model_name_or_path: ?[]const u8 = null;
+    var target_modules: ?[]const []const u8 = null;
+    defer if (target_modules) |modules| allocator.free(modules);
+    var i: usize = 3;
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        rank = try std.fmt.parseUnsigned(usize, argv_in[i], 10);
+        i += 1;
+    }
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        alpha = try std.fmt.parseFloat(f32, argv_in[i]);
+        i += 1;
+    }
+    while (i < argv_in.len) : (i += 1) {
+        const arg = argv_in[i];
+        if (std.mem.eql(u8, arg, "--target-modules")) {
+            if (target_modules != null) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            target_modules = try parseCsvBorrowed(allocator, argv_in[i]);
+        } else if (base_model_name_or_path == null) {
+            base_model_name_or_path = arg;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
 
     var summary = try layoutlmv3.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .base_model_name_or_path = base_model_name_or_path,
+        .target_modules = target_modules,
     });
     defer layoutlmv3.freeBootstrapSummary(allocator, &summary);
     print("direct adapter: {s}\n", .{argv_in[0]});
@@ -2651,14 +2888,54 @@ fn runDirectBootstrapRerankerLora(allocator: std.mem.Allocator, io: std.Io, argv
     if (argv_in.len < 3) return error.InvalidArguments;
     const model_dir = argv_in[1];
     const out_dir = argv_in[2];
-    const rank = if (argv_in.len >= 4) try std.fmt.parseUnsigned(usize, argv_in[3], 10) else 16;
-    const alpha = if (argv_in.len >= 5) try std.fmt.parseFloat(f32, argv_in[4]) else 32.0;
-    const top_layer_count = if (argv_in.len >= 6) try std.fmt.parseUnsigned(usize, argv_in[5], 10) else 1;
+    var rank = default_lora_rank;
+    var alpha = default_lora_alpha;
+    var top_layer_count: usize = 1;
+    var base_model_name_or_path: ?[]const u8 = null;
+    var target_modules: ?[]const []const u8 = null;
+    defer if (target_modules) |modules| allocator.free(modules);
+    var i: usize = 3;
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        rank = try std.fmt.parseUnsigned(usize, argv_in[i], 10);
+        i += 1;
+    }
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        alpha = try std.fmt.parseFloat(f32, argv_in[i]);
+        i += 1;
+    }
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        top_layer_count = std.fmt.parseUnsigned(usize, argv_in[i], 10) catch |err| switch (err) {
+            error.InvalidCharacter => blk: {
+                base_model_name_or_path = argv_in[i];
+                break :blk top_layer_count;
+            },
+            else => return err,
+        };
+        i += 1;
+    }
+    while (i < argv_in.len) : (i += 1) {
+        const arg = argv_in[i];
+        if (std.mem.eql(u8, arg, "--target-modules")) {
+            if (target_modules != null) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            target_modules = try parseCsvBorrowed(allocator, argv_in[i]);
+        } else if (std.mem.eql(u8, arg, "--base-model-name-or-path") or std.mem.eql(u8, arg, "--base-model")) {
+            if (base_model_name_or_path != null) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            base_model_name_or_path = argv_in[i];
+        } else {
+            return error.InvalidArguments;
+        }
+    }
 
     var summary = try reranker_lora.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .top_layer_count = top_layer_count,
+        .base_model_name_or_path = base_model_name_or_path,
+        .target_modules = target_modules,
     });
     defer reranker_lora.freeBootstrapSummary(allocator, &summary);
     print("direct adapter: {s}\n", .{argv_in[0]});
@@ -2748,14 +3025,39 @@ fn runDirectBootstrapColqwen2Lora(allocator: std.mem.Allocator, io: std.Io, argv
     if (argv_in.len < 3) return error.InvalidArguments;
     const model_dir = argv_in[1];
     const out_dir = argv_in[2];
-    const rank = if (argv_in.len >= 4) try std.fmt.parseUnsigned(usize, argv_in[3], 10) else 16;
-    const alpha = if (argv_in.len >= 5) try std.fmt.parseFloat(f32, argv_in[4]) else 32;
-    const base_model_name_or_path = if (argv_in.len >= 6) argv_in[5] else null;
+    var rank = default_lora_rank;
+    var alpha = default_lora_alpha;
+    var base_model_name_or_path: ?[]const u8 = null;
+    var target_modules: ?[]const []const u8 = null;
+    defer if (target_modules) |modules| allocator.free(modules);
+    var i: usize = 3;
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        rank = try std.fmt.parseUnsigned(usize, argv_in[i], 10);
+        i += 1;
+    }
+    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
+        alpha = try std.fmt.parseFloat(f32, argv_in[i]);
+        i += 1;
+    }
+    while (i < argv_in.len) : (i += 1) {
+        const arg = argv_in[i];
+        if (std.mem.eql(u8, arg, "--target-modules")) {
+            if (target_modules != null) return error.InvalidArguments;
+            i += 1;
+            if (i >= argv_in.len) return error.InvalidArguments;
+            target_modules = try parseCsvBorrowed(allocator, argv_in[i]);
+        } else if (base_model_name_or_path == null) {
+            base_model_name_or_path = arg;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
 
     var summary = try colqwen2.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .base_model_name_or_path = base_model_name_or_path,
+        .target_modules = target_modules,
     });
     defer colqwen2.freeBootstrapSummary(allocator, &summary);
     print("direct adapter: {s}\n", .{argv_in[0]});
@@ -3306,13 +3608,15 @@ fn runOptimizerBackedQwen2Sft(
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     const family = recipe.model.family orelse try inferFamily(recipe);
     const default_target_modules = qwenLoraTargetModulesForFamily(family);
+    try validateNonGemmaAdapterOptions(adapter);
+    const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
-            .rank = adapter.rank orelse 8,
-            .alpha = adapter.alpha orelse 16,
+            .rank = adapterRank(adapter, .lora_sft),
+            .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
-            .target_modules = default_target_modules,
+            .target_modules = bootstrap_target_modules,
         });
         defer colqwen2.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -3334,7 +3638,7 @@ fn runOptimizerBackedQwen2Sft(
     defer colqwen2.freeInspectionSummary(allocator, &adapter_inspect);
     const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
-    const target_modules = adapter_inspect.target_modules orelse default_target_modules;
+    const target_modules = adapter_inspect.target_modules orelse bootstrap_target_modules;
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
@@ -3524,13 +3828,17 @@ fn runOptimizerBackedGemmaDpo(
     const backend_kind: gemma4_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
+    try validateGemmaAdapterOptions(adapter);
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
-            .rank = adapter.rank orelse 8,
-            .alpha = adapter.alpha orelse 16,
+            .rank = adapterRank(adapter, .dpo),
+            .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
-            .target_modules = null,
+            .target_modules = adapter.target_modules,
+            .target_preset = try gemmaTargetPreset(adapter),
+            .use_dora = adapter.use_dora orelse false,
+            .init_lora_weights = adapter.init_lora_weights,
         });
         defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -3560,7 +3868,7 @@ fn runOptimizerBackedGemmaDpo(
     defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
     const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
-    const target_modules = adapter_inspect.target_modules orelse gemma4.default_lora_target_modules[0..];
+    const target_modules = adapter_inspect.target_modules orelse (adapter.target_modules orelse gemma4.default_lora_target_modules[0..]);
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
@@ -3704,13 +4012,15 @@ fn runOptimizerBackedQwen2Dpo(
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     const family = recipe.model.family orelse try inferFamily(recipe);
     const default_target_modules = qwenLoraTargetModulesForFamily(family);
+    try validateNonGemmaAdapterOptions(adapter);
+    const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
-            .rank = adapter.rank orelse 8,
-            .alpha = adapter.alpha orelse 16,
+            .rank = adapterRank(adapter, .dpo),
+            .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
-            .target_modules = default_target_modules,
+            .target_modules = bootstrap_target_modules,
         });
         defer colqwen2.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -3740,7 +4050,7 @@ fn runOptimizerBackedQwen2Dpo(
     defer colqwen2.freeInspectionSummary(allocator, &adapter_inspect);
     const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
-    const target_modules = adapter_inspect.target_modules orelse default_target_modules;
+    const target_modules = adapter_inspect.target_modules orelse bootstrap_target_modules;
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
@@ -3939,6 +4249,21 @@ fn runOptimizerBackedGemmaGrpo(
     const group_size = recipe.grpo.group_size orelse 2;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
+    try validateGemmaAdapterOptions(adapter);
+
+    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+        var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
+            .rank = adapterRank(adapter, .grpo),
+            .alpha = adapterAlpha(adapter),
+            .base_model_name_or_path = adapter.base_model_name_or_path,
+            .target_modules = adapter.target_modules,
+            .target_preset = try gemmaTargetPreset(adapter),
+            .use_dora = adapter.use_dora orelse false,
+            .init_lora_weights = adapter.init_lora_weights,
+        });
+        defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
+    };
+
     if (recipe.model.projector_path != null) {
         try runOptimizerBackedGemmaMultimodalGrpo(
             allocator,
@@ -3958,16 +4283,6 @@ fn runOptimizerBackedGemmaGrpo(
         );
         return;
     }
-
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
-        var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
-            .rank = adapter.rank orelse 8,
-            .alpha = adapter.alpha orelse 16,
-            .base_model_name_or_path = adapter.base_model_name_or_path,
-            .target_modules = null,
-        });
-        defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
-    };
 
     var session_manager = backends.SessionManager.init(allocator);
     native_backend_choice.configureSessionPreference(&session_manager, try parseRecipeBackendChoice(recipe.backend));
@@ -3991,7 +4306,7 @@ fn runOptimizerBackedGemmaGrpo(
     defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
     const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
-    const target_modules = adapter_inspect.target_modules orelse gemma4.default_lora_target_modules[0..];
+    const target_modules = adapter_inspect.target_modules orelse (adapter.target_modules orelse gemma4.default_lora_target_modules[0..]);
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
@@ -4186,13 +4501,15 @@ fn runOptimizerBackedQwen2Grpo(
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
     const family = recipe.model.family orelse try inferFamily(recipe);
     const default_target_modules = qwenLoraTargetModulesForFamily(family);
+    try validateNonGemmaAdapterOptions(adapter);
+    const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
-            .rank = adapter.rank orelse 8,
-            .alpha = adapter.alpha orelse 16,
+            .rank = adapterRank(adapter, .grpo),
+            .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
-            .target_modules = default_target_modules,
+            .target_modules = bootstrap_target_modules,
         });
         defer colqwen2.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -4219,7 +4536,7 @@ fn runOptimizerBackedQwen2Grpo(
     defer colqwen2.freeInspectionSummary(allocator, &adapter_inspect);
     const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
-    const target_modules = adapter_inspect.target_modules orelse default_target_modules;
+    const target_modules = adapter_inspect.target_modules orelse bootstrap_target_modules;
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
@@ -5308,6 +5625,16 @@ fn fmtFloat(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{value});
 }
 
+fn joinCsv(allocator: std.mem.Allocator, values: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (values, 0..) |value, idx| {
+        if (idx != 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, value);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn eqlName(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
@@ -5456,6 +5783,80 @@ test "gemma4 lora recipe builds prepare bootstrap train plan" {
     try std.testing.expectEqualStrings("train-eval-gemma4-lora-bundle", plan.steps[2].argv[0]);
 }
 
+test "gemma4 lora recipe defaults to all-linear rank16 alpha32" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("16", plan.steps[1].argv[3]);
+    try std.testing.expectEqualStrings("32", plan.steps[1].argv[4]);
+    try std.testing.expectEqualStrings("--target-preset", plan.steps[1].argv[5]);
+    try std.testing.expectEqualStrings("all-linear", plan.steps[1].argv[6]);
+}
+
+test "gemma4 lora recipe passes explicit adapter knobs" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl" },
+        .adapter = .{
+            .target_modules = &.{ "q_proj", "v_proj" },
+            .init_lora_weights = "default",
+            .use_dora = true,
+        },
+        .artifacts = .{ .root = "/tmp/out" },
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("--target-modules", plan.steps[1].argv[5]);
+    try std.testing.expectEqualStrings("q_proj,v_proj", plan.steps[1].argv[6]);
+    try std.testing.expectEqualStrings("--use-dora", plan.steps[1].argv[7]);
+    try std.testing.expectEqualStrings("--init-lora-weights", plan.steps[1].argv[8]);
+    try std.testing.expectEqualStrings("default", plan.steps[1].argv[9]);
+}
+
+test "gemma4 lora recipe rejects conflicting target selectors" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl" },
+        .adapter = .{
+            .target_preset = "all-linear",
+            .target_modules = &.{"q_proj"},
+        },
+        .artifacts = .{ .root = "/tmp/out" },
+    };
+    try std.testing.expectError(error.ConflictingLoRATargetSelection, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "qwen adapter target presets map to supported module sets" {
+    const all_linear = try adapterTargetModulesForQwen(.{ .target_preset = "all-linear" }, qwen2_real_autodiff.default_lora_target_modules[0..]);
+    try std.testing.expectEqual(qwen2_real_autodiff.default_lora_target_modules.len, all_linear.len);
+    const attention = try adapterTargetModulesForQwen(.{ .target_preset = "attention-only" }, qwen2_real_autodiff.default_lora_target_modules[0..]);
+    try std.testing.expectEqualStrings("q_proj", attention[0]);
+    try std.testing.expectEqualStrings("o_proj", attention[3]);
+    try std.testing.expectError(error.ConflictingLoRATargetSelection, adapterTargetModulesForQwen(.{ .target_preset = "all-linear", .target_modules = &.{"q_proj"} }, qwen2_real_autodiff.default_lora_target_modules[0..]));
+    try std.testing.expectError(error.UnsupportedLoRATargetPreset, adapterTargetModulesForQwen(.{ .target_preset = "moe-experts" }, qwen2_real_autodiff.default_lora_target_modules[0..]));
+}
+
+test "generic bootstrap families reject unsupported target preset" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gliner2", .family = "gliner2" },
+        .dataset = .{
+            .train_path = "/data/gliner-train.jsonl",
+            .labels = "person,organization",
+        },
+        .adapter = .{ .target_preset = "all-linear" },
+        .artifacts = .{ .root = "/tmp/gliner-run" },
+    };
+    try std.testing.expectError(error.UnsupportedLoRATargetPreset, buildPlan(std.heap.page_allocator, recipe));
+}
+
 test "gliner2 lora recipe keeps distinct train and eval caches" {
     const recipe = Recipe{
         .recipe = "lora-sft",
@@ -5554,6 +5955,30 @@ test "reranker lora recipe requires and routes head input" {
         "materialize-reranker-lora",
     });
     try std.testing.expectEqualStrings("/tmp/rerank-head", plan.steps[3].argv[3]);
+}
+
+test "reranker lora recipe routes base model override before module flags" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/reranker", .family = "reranker" },
+        .dataset = .{ .train_path = "/data/rerank-train.jsonl" },
+        .adapter = .{
+            .base_model_name_or_path = "BAAI/bge-reranker-base",
+            .target_modules = &.{"query"},
+        },
+        .artifacts = .{
+            .root = "/tmp/rerank-lora-run",
+            .report_path = "/tmp/rerank-head",
+        },
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("bootstrap-reranker-lora", plan.steps[0].argv[0]);
+    try std.testing.expectEqualStrings("16", plan.steps[0].argv[3]);
+    try std.testing.expectEqualStrings("32", plan.steps[0].argv[4]);
+    try std.testing.expectEqualStrings("BAAI/bge-reranker-base", plan.steps[0].argv[5]);
+    try std.testing.expectEqualStrings("--target-modules", plan.steps[0].argv[6]);
+    try std.testing.expectEqualStrings("query", plan.steps[0].argv[7]);
 }
 
 test "vlm retrieval routes colqwen2 prepared inputs" {

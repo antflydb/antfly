@@ -12,8 +12,8 @@
     "eval_max_examples": 4
   },
   "adapter": {
-    "rank": 8,
-    "alpha": 16
+    "rank": 16,
+    "alpha": 32
   },
   "optimizer": {
     "learning_rate": 0.001,

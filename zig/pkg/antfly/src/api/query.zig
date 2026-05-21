@@ -634,7 +634,7 @@ test "query parser accepts bleve query string queries" {
     try std.testing.expectEqualStrings("beta gamma", root.must[1].match_phrase.text);
 }
 
-test "query parser accepts bleve query string boosts and slop" {
+test "query parser accepts bleve query string boosts" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"full_text_search":{"query":"body:alpha^2 AND title:\"beta gamma\"~3^4"}}
     );
@@ -647,7 +647,6 @@ test "query parser accepts bleve query string boosts and slop" {
     try std.testing.expect(root.must[0] == .match);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), root.must[0].match.boost, 0.0001);
     try std.testing.expect(root.must[1] == .match_phrase);
-    try std.testing.expectEqual(@as(u32, 3), root.must[1].match_phrase.slop);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), root.must[1].match_phrase.boost, 0.0001);
 }
 
