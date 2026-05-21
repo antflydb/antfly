@@ -22,10 +22,6 @@ export default defineConfig({
         target: "http://localhost:8080",
         changeOrigin: true,
       },
-      "/termite": {
-        target: "http://localhost:8080",
-        changeOrigin: true,
-      },
     },
   },
   // optimizeDeps: {

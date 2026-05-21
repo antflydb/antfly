@@ -1071,13 +1071,20 @@ pub fn build(b: *std.Build) void {
         false;
     const termite_mlx_option = b.option(bool, "mlx", "Enable MLX termite support when available");
     const termite_mlx_requested = if (link_libc)
-        termite_mlx_option orelse termite_mlx_available
+        termite_mlx_option orelse false
     else
         false;
+    if ((termite_mlx_option orelse false) and !termite_mlx_available) {
+        @panic("-Dmlx=true requires an MLX C install with Termite's distributed runtime symbols; update mlx-c or pass -Dmlx-root=<path>");
+    }
+    const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite");
     const termite_enable_onnx = if (link_libc)
-        b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite") orelse termite_onnx_available
+        termite_onnx_option orelse false
     else
         false;
+    if ((termite_onnx_option orelse false) and !termite_onnx_available) {
+        @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
+    }
     const termite_enable_metal = if (link_libc)
         b.option(bool, "metal", "Enable Apple Metal kernels for embedded Termite") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
     else

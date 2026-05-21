@@ -36,7 +36,6 @@ help:
 	@echo "  build              Build the Zig antfly binary"
 	@echo "  build-go           Build the legacy Go antfly binary"
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
-	@echo "  build-termite-dashboard  Build the legacy Go termite dashboard (termite-only antfarm)"
 	@echo "  build-docs         Join and lint OpenAPI specifications"
 	@echo "  generate           Generate code, client SDKs, and all website documentation (API, config, changelog)"
 	@echo "  lint               Run golangci-lint with auto-fix"
@@ -88,7 +87,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-go build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-termite-dashboard sim-validate sim-validate-repo sim-soak
+.PHONY: build build-go build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
@@ -99,13 +98,6 @@ build-antfarm-main:
 	@echo "Copying dist files to src/metadata/antfarm..."
 	rm -rf src/metadata/antfarm/*
 	cp -r ts/apps/antfarm/dist/* src/metadata/antfarm/
-
-build-termite-dashboard:
-	@echo "Building termite dashboard (antfarm with VITE_PRODUCTS=termite)..."
-	cd ts && pnpm install && VITE_PRODUCTS=termite pnpm --filter antfarm... build
-	@echo "Copying dist files to pkg/termite/dashboard..."
-	rm -rf pkg/termite/dashboard/*
-	cp -r ts/apps/antfarm/dist/* pkg/termite/dashboard/
 
 build: build-antfarm
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
@@ -118,7 +110,7 @@ build-docs:
 	npx @redocly/cli@latest join src/metadata/api.yaml src/usermgr/api.yaml
 	npx @redocly/cli@latest lint openapi.yaml
 
-generate: build-docs build-termite-dashboard tidy
+generate: build-docs tidy
 	$(GO) generate ./...
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Generating in $$mod"; \

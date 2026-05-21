@@ -1,7 +1,6 @@
 import { AntflyClient } from "@antfly/sdk";
 import type { ReactNode } from "react";
 import { useState } from "react";
-import { isProductEnabled } from "@/config/products";
 import { ApiConfigContext } from "@/contexts/api-config-context";
 
 const getDefaultApiUrl = () => {
@@ -9,11 +8,7 @@ const getDefaultApiUrl = () => {
 };
 
 const getDefaultTermiteApiUrl = () => {
-  // In the antfly build, Termite is on a different server — proxy via /termite.
-  // In the Termite-only build, the API is same-origin at /api/*.
-  if (isProductEnabled("antfly")) {
-    return "/termite";
-  }
+  // Termite is served same-origin at /ml/v1 in both the Antfly and Termite views.
   return "";
 };
 

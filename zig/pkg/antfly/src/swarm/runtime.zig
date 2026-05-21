@@ -843,9 +843,6 @@ fn serveUnifiedInner(
     // Register termite routes under /ml/v1
     if (termite_node) |node| {
         try node.registerRoutesOn(termite.server.public_api_prefix, &server);
-        try node.registerRoutesOn("/termite" ++ termite.server.public_api_prefix, &server);
-        try server.get("/termite/healthz", healthzHandler);
-        try server.get("/termite/readyz", readyzHandler);
     }
 
     // Register antfly public API routes under /api/v1
@@ -1031,7 +1028,6 @@ fn isAntfarmReservedPath(path: []const u8) bool {
         "/termite",
         "/metadata",
         "/internal",
-        "/_internal",
         "/mcp",
         "/healthz",
         "/readyz",
