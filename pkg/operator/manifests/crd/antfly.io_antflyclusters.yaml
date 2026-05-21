@@ -2893,6 +2893,28 @@ spec:
                     - LoadBalancer
                     type: string
                 type: object
+              secretStore:
+                description: |-
+                  SecretStore mounts a Kubernetes Secret containing an Antfly secrets.json
+                  file for runtime secret resolution.
+                properties:
+                  key:
+                    description: |-
+                      Key is the Secret data key containing the Antfly secrets file.
+                      Defaults to secrets.json.
+                    type: string
+                  path:
+                    description: |-
+                      Path is the absolute file path where the secret file should be mounted.
+                      Defaults to /run/antfly/secrets/secrets.json.
+                    type: string
+                  secretName:
+                    description: SecretName is the Kubernetes Secret name in the AntflyCluster
+                      namespace.
+                    type: string
+                required:
+                - secretName
+                type: object
               serviceAccountName:
                 description: |-
                   ServiceAccountName is the name of the Kubernetes ServiceAccount to use for pods

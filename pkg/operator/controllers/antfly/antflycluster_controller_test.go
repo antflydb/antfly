@@ -2232,6 +2232,58 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
+func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseSwarmControllerCluster()
+	cluster.Spec.SecretStore = &antflyv1.SecretStoreSpec{
+		SecretName: "cloud-secrets-config",
+		Key:        "secrets.json",
+		Path:       "/run/antfly/secrets/secrets.json",
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	err := reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	sts := &appsv1.StatefulSet{}
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	container := sts.Spec.Template.Spec.Containers[0]
+	g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
+		Name:  antflySecretStoreEnvVar,
+		Value: "/run/antfly/secrets/secrets.json",
+	}))
+	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+		Name:      antflySecretStoreVolumeName,
+		MountPath: "/run/antfly/secrets",
+		ReadOnly:  true,
+	}))
+	g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+		Name: antflySecretStoreVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: "cloud-secrets-config",
+				Items: []corev1.KeyToPath{{
+					Key:  "secrets.json",
+					Path: "secrets.json",
+				}},
+			},
+		},
+	}))
+}
+
 func TestUpdateStatus_Swarm(t *testing.T) {
 	g := NewWithT(t)
 

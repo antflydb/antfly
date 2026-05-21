@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,11 @@ var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
+
+	antflySecretStoreVolumeName  = "secret-store"
+	antflySecretStoreDefaultKey  = "secrets.json"
+	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json"
+	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -88,6 +94,66 @@ var reservedPodLabelPrefixes = []string{"app.kubernetes.io/"}
 
 func int64Ptr(v int64) *int64 {
 	return &v
+}
+
+func secretStoreKey(store *antflyv1.SecretStoreSpec) string {
+	if store == nil || store.Key == "" {
+		return antflySecretStoreDefaultKey
+	}
+	return store.Key
+}
+
+func secretStorePath(store *antflyv1.SecretStoreSpec) string {
+	if store == nil || store.Path == "" {
+		return antflySecretStoreDefaultPath
+	}
+	return store.Path
+}
+
+func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
+	if store == nil {
+		return nil
+	}
+	return []corev1.EnvVar{{
+		Name:  antflySecretStoreEnvVar,
+		Value: secretStorePath(store),
+	}}
+}
+
+func secretStoreSwarmArg(store *antflyv1.SecretStoreSpec) string {
+	if store == nil {
+		return ""
+	}
+	return fmt.Sprintf(" \\\n  --secret-store-path %s", secretStorePath(store))
+}
+
+func secretStoreVolumeMounts(store *antflyv1.SecretStoreSpec) []corev1.VolumeMount {
+	if store == nil {
+		return nil
+	}
+	return []corev1.VolumeMount{{
+		Name:      antflySecretStoreVolumeName,
+		MountPath: path.Dir(secretStorePath(store)),
+		ReadOnly:  true,
+	}}
+}
+
+func secretStoreVolumes(store *antflyv1.SecretStoreSpec) []corev1.Volume {
+	if store == nil {
+		return nil
+	}
+	return []corev1.Volume{{
+		Name: antflySecretStoreVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: store.SecretName,
+				Items: []corev1.KeyToPath{{
+					Key:  secretStoreKey(store),
+					Path: path.Base(secretStorePath(store)),
+				}},
+			},
+		},
+	}}
 }
 
 func podFSGroupChangePolicyPtr(v corev1.PodFSGroupChangePolicy) *corev1.PodFSGroupChangePolicy {
@@ -2046,6 +2112,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
+						Env:             secretStoreEnv(cluster.Spec.SecretStore),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -2073,7 +2140,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: []corev1.VolumeMount{
+						VolumeMounts: append([]corev1.VolumeMount{
 							{
 								Name:      "swarm-storage",
 								MountPath: "/antflydb",
@@ -2082,18 +2149,19 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 								Name:      "config",
 								MountPath: "/config",
 							},
-						},
+						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
 exec /antfly swarm --id %d --config /config/config.json \
   --host 0.0.0.0 \
   --port %d \
-  --health-port %d
+  --health-port %d%s
 							`,
 								swarm.NodeID,
 								swarm.MetadataAPI.Port,
 								swarm.Health.Port,
+								secretStoreSwarmArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources: r.buildResourceRequirements(swarm.Resources),
@@ -2130,7 +2198,7 @@ exec /antfly swarm --id %d --config /config/config.json \
 						},
 					},
 				},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
@@ -2141,7 +2209,7 @@ exec /antfly swarm --id %d --config /config/config.json \
 							},
 						},
 					},
-				},
+				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
@@ -2274,6 +2342,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         cluster.Spec.MetadataNodes.EnvFrom,
+						Env:             secretStoreEnv(cluster.Spec.SecretStore),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -2291,7 +2360,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: []corev1.VolumeMount{
+						VolumeMounts: append([]corev1.VolumeMount{
 							{
 								Name:      "metadata-storage",
 								MountPath: "/antflydb",
@@ -2300,7 +2369,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 								Name:      "config",
 								MountPath: "/config",
 							},
-						},
+						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -2354,7 +2423,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 						},
 					},
 				},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
@@ -2365,7 +2434,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 							},
 						},
 					},
-				},
+				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
@@ -2504,7 +2573,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: []corev1.VolumeMount{
+						VolumeMounts: append([]corev1.VolumeMount{
 							{
 								Name:      "data-storage",
 								MountPath: "/antflydb",
@@ -2513,8 +2582,8 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								Name:      "config",
 								MountPath: "/config",
 							},
-						},
-						Env: []corev1.EnvVar{
+						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
+						Env: append([]corev1.EnvVar{
 							{
 								Name: "POD_IP",
 								ValueFrom: &corev1.EnvVarSource{
@@ -2523,7 +2592,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 									},
 								},
 							},
-						},
+						}, secretStoreEnv(cluster.Spec.SecretStore)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -2575,7 +2644,7 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 						},
 					},
 				},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
@@ -2586,7 +2655,7 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 							},
 						},
 					},
-				},
+				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
