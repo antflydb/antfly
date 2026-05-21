@@ -1685,13 +1685,14 @@ fn applySearchRequestFields(
     generated_fields: ?[]const []const u8,
     req: *db_mod.types.SearchRequest,
 ) ![][]const u8 {
+    const include_all_fields = generated_fields == null;
     const fields: [][]const u8 = if (generated_fields) |items|
         try cloneFields(alloc, items)
     else
         &.{};
     req.fields = fields;
-    req.include_all_fields = false;
-    req.include_stored = fields.len > 0 or req.reranker != null;
+    req.include_all_fields = include_all_fields;
+    req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null;
     req.defer_stored_projection = canDeferStoredProjection(fields);
     return fields;
 }
@@ -4876,6 +4877,41 @@ test "api query contract treats canonical typed scalar term as structured filter
     try std.testing.expect(parsed.req.full_text.? == .match_all);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/published\",\"value\":true}}", parsed.req.filter_query_json);
     try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
+}
+
+test "api query contract includes stored source when fields are omitted" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"full_text_search":{"match":"needle","field":"content"}}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.include_all_fields);
+    try std.testing.expect(parsed.req.include_stored);
+    try std.testing.expect(!parsed.req.defer_stored_projection);
+    try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
+}
+
+test "api query contract projects stored source when explicit fields are supplied" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "full_text_search": {"match": "needle", "field": "content"},
+        \\  "fields": ["path", "filename"]
+        \\}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(!parsed.req.include_all_fields);
+    try std.testing.expect(parsed.req.include_stored);
+    try std.testing.expect(parsed.req.defer_stored_projection);
+    try std.testing.expectEqual(@as(usize, 2), parsed.req.fields.len);
+    try std.testing.expectEqualStrings("path", parsed.req.fields[0]);
+    try std.testing.expectEqualStrings("filename", parsed.req.fields[1]);
 }
 
 test "api query contract accepts internal normalized filter json on internal query route" {
