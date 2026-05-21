@@ -73,7 +73,7 @@ const (
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 //+kubebuilder:rbac:groups="",resources=nodes/proxy,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
@@ -1364,6 +1364,12 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Create Data StatefulSet
 	if err := r.reconcileDataStatefulSet(ctx, efCache, workingCluster); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if repaired, err := r.repairBlockedStatefulSetRollouts(ctx, workingCluster); err != nil {
+		return ctrl.Result{}, err
+	} else if repaired {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Reconcile PVC expansion (metadata and data)
@@ -3160,6 +3166,122 @@ func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.Antfl
 	}
 
 	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
+}
+
+func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollouts(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	metadataSts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}, metadataSts); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, err
+		}
+	} else if repaired, err := r.repairBlockedStatefulSetRollout(ctx, cluster, metadataSts, "metadata"); err != nil || repaired {
+		return repaired, err
+	}
+
+	dataSts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-data", Namespace: cluster.Namespace}, dataSts); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, err
+		}
+	} else if repaired, err := r.repairBlockedStatefulSetRollout(ctx, cluster, dataSts, "data"); err != nil || repaired {
+		return repaired, err
+	}
+
+	return false, nil
+}
+
+func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Context, cluster *antflyv1.AntflyCluster, sts *appsv1.StatefulSet, component string) (bool, error) {
+	if sts == nil || sts.Name == "" || sts.Status.UpdateRevision == "" {
+		return false, nil
+	}
+
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	if replicas <= 0 || sts.Status.UpdatedReplicas >= replicas {
+		return false, nil
+	}
+
+	pods, err := r.listComponentPods(ctx, cluster, component)
+	if err != nil {
+		return false, err
+	}
+	sort.Slice(pods, func(i, j int) bool {
+		return pods[i].Name < pods[j].Name
+	})
+
+	desiredImage := ""
+	if len(sts.Spec.Template.Spec.Containers) > 0 {
+		desiredImage = sts.Spec.Template.Spec.Containers[0].Image
+	}
+	for i := range pods {
+		pod := &pods[i]
+		if !isPodControlledByStatefulSet(pod, sts.Name) ||
+			!isStaleStatefulSetPod(pod, sts.Status.UpdateRevision, desiredImage) ||
+			!isUnhealthyPod(pod) {
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		log.FromContext(ctx).Info(
+			"Deleting stale unhealthy pod to unblock StatefulSet rollout",
+			"statefulset", sts.Name,
+			"pod", pod.Name,
+			"component", component,
+			"currentRevision", pod.Labels["controller-revision-hash"],
+			"updateRevision", sts.Status.UpdateRevision,
+			"desiredImage", desiredImage,
+		)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "RepairingBlockedRollout", "DeleteStalePod", "Deleting stale unhealthy %s pod %s to unblock rollout to revision %s", component, pod.Name, sts.Status.UpdateRevision)
+		}
+		return true, r.Delete(ctx, pod)
+	}
+
+	return false, nil
+}
+
+func isPodControlledByStatefulSet(pod *corev1.Pod, statefulSetName string) bool {
+	if pod == nil {
+		return false
+	}
+	controller := metav1.GetControllerOf(pod)
+	return controller != nil && controller.Kind == "StatefulSet" && controller.Name == statefulSetName
+}
+
+func isStaleStatefulSetPod(pod *corev1.Pod, updateRevision, desiredImage string) bool {
+	if pod == nil {
+		return false
+	}
+	if pod.Labels["controller-revision-hash"] != "" && pod.Labels["controller-revision-hash"] != updateRevision {
+		return true
+	}
+	if desiredImage == "" || len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	for _, container := range pod.Spec.Containers {
+		if container.Name == "antfly" {
+			return container.Image != desiredImage
+		}
+	}
+	return pod.Spec.Containers[0].Image != desiredImage
+}
+
+func isUnhealthyPod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown {
+		return true
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *AntflyClusterReconciler) listComponentPods(ctx context.Context, cluster *antflyv1.AntflyCluster, component string) ([]corev1.Pod, error) {

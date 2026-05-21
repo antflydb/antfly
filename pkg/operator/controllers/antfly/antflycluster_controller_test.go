@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -31,6 +32,22 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func mergeStringMaps(base map[string]string, overlay map[string]string) map[string]string {
+	merged := maps.Clone(base)
+	maps.Copy(merged, overlay)
+	return merged
+}
+
+func statefulSetOwnerRef(name string) metav1.OwnerReference {
+	controller := true
+	return metav1.OwnerReference{
+		APIVersion: "apps/v1",
+		Kind:       "StatefulSet",
+		Name:       name,
+		Controller: &controller,
+	}
 }
 
 // T004: Unit test for applyDefaults() setting ServiceMesh.Enabled=false
@@ -721,6 +738,132 @@ func TestUpdateRolloutConditionReportsMissingStatefulSet(t *testing.T) {
 	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
 	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
 	g.Expect(cond.Message).To(ContainSubstring("not observed"))
+}
+
+func TestRepairBlockedStatefulSetRolloutDeletesStaleUnhealthyPod(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-metadata", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "antfly", Image: "antfly:new"}},
+				},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			UpdateRevision:  "metadata-new",
+			UpdatedReplicas: 0,
+		},
+	}
+	staleUnreadyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-cluster-metadata-0",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{statefulSetOwnerRef(sts.Name)},
+			Labels: mergeStringMaps(
+				serviceSelectorLabels("test-cluster", "metadata"),
+				map[string]string{"controller-revision-hash": "metadata-old"},
+			),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "antfly", Image: "antfly:old"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionFalse,
+				Reason: "ContainersNotReady",
+			}},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(staleUnreadyPod).Build(),
+		Scheme: s,
+	}
+
+	repaired, err := reconciler.repairBlockedStatefulSetRollout(ctx, cluster, sts, "metadata")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(repaired).To(BeTrue())
+
+	deleted := &corev1.Pod{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: staleUnreadyPod.Name, Namespace: staleUnreadyPod.Namespace}, deleted)
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
+func TestRepairBlockedStatefulSetRolloutKeepsHealthyStalePod(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-data", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "antfly", Image: "antfly:new"}},
+				},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			UpdateRevision:  "data-new",
+			UpdatedReplicas: 1,
+		},
+	}
+	healthyStalePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-cluster-data-0",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{statefulSetOwnerRef(sts.Name)},
+			Labels: mergeStringMaps(
+				serviceSelectorLabels("test-cluster", "data"),
+				map[string]string{"controller-revision-hash": "data-old"},
+			),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "antfly", Image: "antfly:old"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(healthyStalePod).Build(),
+		Scheme: s,
+	}
+
+	repaired, err := reconciler.repairBlockedStatefulSetRollout(ctx, cluster, sts, "data")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(repaired).To(BeFalse())
+
+	existing := &corev1.Pod{}
+	g.Expect(reconciler.Get(ctx, types.NamespacedName{Name: healthyStalePod.Name, Namespace: healthyStalePod.Namespace}, existing)).To(Succeed())
 }
 
 func TestEffectiveDataReplicaTargetPrefersStatefulSetSpec(t *testing.T) {
