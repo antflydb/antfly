@@ -101,9 +101,8 @@ pub const HealthServer = struct {
             .bind_host = cfg.bind_host,
             .bind_port = cfg.bind_port,
             .reuse_address = true,
-            .thread_stack_size = 256 * 1024,
             .serve_in_connection_threads = true,
-            .connection_thread_stack_size = 256 * 1024,
+            .connection_thread_stack_size = 1 * 1024 * 1024,
             .max_connection_threads = 16,
         }, self.executor());
         if (metrics != null) {
