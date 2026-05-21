@@ -170,7 +170,7 @@ pub const Config = struct {
             .object => |*object| object,
             else => return error.InvalidConfig,
         };
-        try applyCommonConfigDefaults(alloc, root);
+        try applyCommonConfigDefaults(parsed_tree.arena.allocator(), root);
 
         var validated = try std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
             .allocate = .alloc_always,
@@ -397,7 +397,9 @@ fn putIntegerDefault(
     value: i64,
 ) !void {
     if (root.get(field_name) != null) return;
-    try root.put(alloc, field_name, .{ .integer = value });
+    const owned_field_name = try alloc.dupe(u8, field_name);
+    errdefer alloc.free(owned_field_name);
+    try root.put(alloc, owned_field_name, .{ .integer = value });
 }
 
 fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
