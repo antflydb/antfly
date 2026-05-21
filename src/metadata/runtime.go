@@ -16,11 +16,13 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antflydb/antfly/lib/clock"
@@ -45,6 +47,11 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	defaultAdminSeedAttemptTimeout = 10 * time.Second
+	defaultAdminSeedRetryInterval  = 2 * time.Second
+)
+
 // Runtime owns the metadata server's long-lived state without opening any
 // listeners. Bootstrap layers can start Raft and serve the returned handler.
 type Runtime struct {
@@ -65,8 +72,9 @@ type Runtime struct {
 	httpHandler      http.Handler
 	termiteMLHandler http.Handler
 
-	closeOnce sync.Once
-	closeErr  error
+	closeOnce   sync.Once
+	closeErr    error
+	raftStarted atomic.Bool
 }
 
 type RuntimeOptions struct {
@@ -126,13 +134,6 @@ func NewRuntime(
 			_ = httpCloser.Close()
 		}
 		return nil, fmt.Errorf("creating user manager: %w", err)
-	}
-	if adminUser, _ := um.GetUser("admin"); adminUser == nil {
-		if _, err := um.CreateUser("admin", "admin", []usermgr.Permission{{
-			Resource: "*", ResourceType: "*", Type: "*",
-		}}); err != nil {
-			zl.Warn("Error creating admin user", zap.Error(err))
-		}
 	}
 
 	embeddingCache := ttlcache.New(
@@ -220,7 +221,68 @@ func NewRuntime(
 }
 
 func (r *Runtime) StartRaft() {
+	if !r.raftStarted.CompareAndSwap(false, true) {
+		return
+	}
 	go r.raft.Start()
+}
+
+func (r *Runtime) StartDefaultAdminSeed(ctx context.Context) {
+	if r == nil || r.config == nil || !r.config.EnableAuth || r.userManager == nil {
+		return
+	}
+	go r.seedDefaultAdminLoop(ctx)
+}
+
+func (r *Runtime) seedDefaultAdminLoop(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		err := r.ensureDefaultAdmin(ctx)
+		if err == nil {
+			r.logger.Info("Default admin user is available")
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		r.logger.Warn("Default admin user seed failed; retrying", zap.Error(err))
+
+		timer := time.NewTimer(defaultAdminSeedRetryInterval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
+}
+
+func (r *Runtime) ensureDefaultAdmin(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := r.userManager.GetUser("admin"); err == nil {
+		return nil
+	} else if !errors.Is(err, usermgr.ErrUserNotFound) {
+		return err
+	}
+
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultAdminSeedAttemptTimeout)
+	defer cancel()
+	_, err := r.userManager.CreateUserWithContext(attemptCtx, "admin", "admin", []usermgr.Permission{{
+		Resource: "*", ResourceType: "*", Type: "*",
+	}})
+	if errors.Is(err, usermgr.ErrUserExists) {
+		return nil
+	}
+	return err
 }
 
 func (r *Runtime) HTTPHandler() http.Handler {
@@ -236,7 +298,7 @@ func (r *Runtime) Close() error {
 		if r.metadataStore != nil {
 			r.metadataStore.Close()
 		}
-		if r.raft != nil {
+		if r.raft != nil && r.raftStarted.Load() {
 			if err := r.raft.Stop(); err != nil {
 				if r.closeErr == nil {
 					r.closeErr = err
@@ -462,6 +524,8 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	mcpAdapter := newMCPAdapter(NewTableApi(r.logger, r.node, r.tableManager))
 	mcpServer := antflymcp.NewMCPServer(mcpAdapter)
 	mcpHandler := antflymcp.NewMCPHandler(mcpServer)
+	// Ensure MCP routes receive the same authentication gate as other public APIs.
+	mcpHandler = r.node.authnMiddleware(mcpHandler)
 	apiRoutes.Handle("/mcp/v1/", http.StripPrefix("/mcp/v1", mcpHandler))
 	r.logger.Info("MCP server mounted", zap.String("path", "/mcp/v1/"))
 

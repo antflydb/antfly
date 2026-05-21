@@ -150,6 +150,17 @@ pub const ResolvedSecret = struct {
     }
 };
 
+pub const ReloadHealth = struct {
+    generation: u64,
+    entry_count: usize,
+    last_reload_failed: bool,
+    stale_snapshot: bool,
+    reload_successes: u64,
+    reload_failures: u64,
+    last_success_ns: u64,
+    last_failure_ns: u64,
+};
+
 pub const BearerAuthHeaderCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     generation: u64 = 0,
@@ -221,6 +232,10 @@ pub const FileStore = struct {
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
     last_reload_failed: bool = false,
+    reload_success_count: u64 = 0,
+    reload_failure_count: u64 = 0,
+    last_success_ns: u64 = 0,
+    last_failure_ns: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
         var store = FileStore{
@@ -249,6 +264,12 @@ pub const FileStore = struct {
         self.lock();
         defer self.unlock();
         return self.last_reload_failed;
+    }
+
+    pub fn healthSnapshot(self: *FileStore) ReloadHealth {
+        self.lock();
+        defer self.unlock();
+        return self.healthSnapshotLocked();
     }
 
     pub fn refreshIfChanged(self: *FileStore) !bool {
@@ -399,14 +420,14 @@ pub const FileStore = struct {
         const metadata = statFileMetadata(self.path) catch |err| switch (err) {
             error.FileNotFound => {
                 self.observed_metadata = null;
-                self.last_reload_failed = false;
+                self.markReloadHealthyLocked(false);
                 return;
             },
             else => return err,
         };
         if (metadata == null) {
             self.observed_metadata = null;
-            self.last_reload_failed = false;
+            self.markReloadHealthyLocked(false);
             return;
         }
 
@@ -421,17 +442,18 @@ pub const FileStore = struct {
         self.entries = next;
         next = .{};
         self.observed_metadata = metadata;
-        self.last_reload_failed = false;
+        self.markReloadHealthyLocked(true);
     }
 
     fn refreshIfChangedLocked(self: *FileStore) !bool {
         const metadata = statFileMetadata(self.path) catch |err| switch (err) {
             error.FileNotFound => {
                 if (self.observed_metadata != null) {
-                    self.last_reload_failed = true;
-                    std.log.warn("secret store file missing; keeping last known good snapshot path={s}", .{self.path});
+                    const first_failure = !self.last_reload_failed;
+                    self.markReloadFailedLocked();
+                    if (first_failure) std.log.warn("secret store file missing; keeping last known good snapshot path={s}", .{self.path});
                 } else {
-                    self.last_reload_failed = false;
+                    self.markReloadHealthyLocked(false);
                 }
                 return false;
             },
@@ -439,23 +461,24 @@ pub const FileStore = struct {
         };
         if (metadata == null) {
             if (self.observed_metadata != null) {
-                self.last_reload_failed = true;
-                std.log.warn("secret store file missing; keeping last known good snapshot path={s}", .{self.path});
+                const first_failure = !self.last_reload_failed;
+                self.markReloadFailedLocked();
+                if (first_failure) std.log.warn("secret store file missing; keeping last known good snapshot path={s}", .{self.path});
             } else {
-                self.last_reload_failed = false;
+                self.markReloadHealthyLocked(false);
             }
             return false;
         }
         if (self.observed_metadata) |observed| {
             if (observed.eql(metadata.?)) {
-                self.last_reload_failed = false;
                 return false;
             }
         }
 
         var next = loadEntriesFromFile(self.alloc, self.path) catch |err| {
-            self.last_reload_failed = true;
-            std.log.warn("secret store reload failed; keeping last known good snapshot path={s} err={}", .{ self.path, err });
+            const first_failure = !self.last_reload_failed;
+            self.markReloadFailedLocked();
+            if (first_failure) std.log.warn("secret store reload failed; keeping last known good snapshot path={s} err={}", .{ self.path, err });
             return false;
         };
         errdefer {
@@ -465,7 +488,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(&next);
         self.observed_metadata = metadata;
         self.generation_value +%= 1;
-        self.last_reload_failed = false;
+        self.markReloadHealthyLocked(true);
         return true;
     }
 
@@ -500,7 +523,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(next);
         self.observed_metadata = try statFileMetadata(self.path);
         self.generation_value +%= 1;
-        self.last_reload_failed = false;
+        self.markReloadHealthyLocked(true);
     }
 
     fn replaceEntriesLocked(self: *FileStore, next: *std.StringArrayHashMapUnmanaged(StoredSecret)) void {
@@ -516,6 +539,33 @@ pub const FileStore = struct {
 
     fn unlock(self: *FileStore) void {
         self.mutex.unlock();
+    }
+
+    fn healthSnapshotLocked(self: *FileStore) ReloadHealth {
+        return .{
+            .generation = self.generation_value,
+            .entry_count = self.entries.count(),
+            .last_reload_failed = self.last_reload_failed,
+            .stale_snapshot = self.last_reload_failed and self.observed_metadata != null,
+            .reload_successes = self.reload_success_count,
+            .reload_failures = self.reload_failure_count,
+            .last_success_ns = self.last_success_ns,
+            .last_failure_ns = self.last_failure_ns,
+        };
+    }
+
+    fn markReloadHealthyLocked(self: *FileStore, count_success: bool) void {
+        self.last_reload_failed = false;
+        if (count_success) {
+            self.reload_success_count +%= 1;
+            self.last_success_ns = nowNs();
+        }
+    }
+
+    fn markReloadFailedLocked(self: *FileStore) void {
+        if (!self.last_reload_failed) self.reload_failure_count +%= 1;
+        self.last_reload_failed = true;
+        self.last_failure_ns = nowNs();
     }
 };
 
@@ -922,6 +972,11 @@ test "file secret store keeps last known good snapshot for malformed and missing
     try std.testing.expectEqualStrings("stable", after_malformed.?);
     try std.testing.expect(store.reloadFailed());
     try std.testing.expectEqual(malformed_generation, store.generation());
+    const malformed_health = store.healthSnapshot();
+    try std.testing.expect(malformed_health.last_reload_failed);
+    try std.testing.expect(malformed_health.stale_snapshot);
+    try std.testing.expectEqual(@as(u64, 1), malformed_health.reload_failures);
+    try std.testing.expect(malformed_health.last_failure_ns != 0);
 
     try deleteFile(path);
     const missing_generation = store.generation();
@@ -930,6 +985,10 @@ test "file secret store keeps last known good snapshot for malformed and missing
     try std.testing.expectEqualStrings("stable", after_missing.?);
     try std.testing.expect(store.reloadFailed());
     try std.testing.expectEqual(missing_generation, store.generation());
+    const missing_health = store.healthSnapshot();
+    try std.testing.expect(missing_health.last_reload_failed);
+    try std.testing.expect(missing_health.stale_snapshot);
+    try std.testing.expectEqual(@as(u64, 1), missing_health.reload_failures);
 }
 
 test "file secret store write refreshes first and preserves external keys" {

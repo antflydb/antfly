@@ -22,6 +22,7 @@ pub const ApiKey = user_manager.ApiKey;
 pub const ApiKeyRecord = user_manager.ApiKeyRecord;
 pub const CreatedApiKey = user_manager.CreatedApiKey;
 pub const default_rbac_model_text = user_manager.default_rbac_model_text;
+pub const ensureDefaultAdminUser = user_manager.ensureDefaultAdminUser;
 pub const initDefaultEnforcer = user_manager.initDefaultEnforcer;
 pub const Permission = user_manager.Permission;
 pub const PermissionType = user_manager.PermissionType;

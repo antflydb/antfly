@@ -1488,6 +1488,12 @@ pub const ApiHttpServer = struct {
             defer public_status.deinit(self.alloc);
             public_status.auth_enabled = self.cfg.auth_enabled;
             public_status.swarm_mode = self.cfg.swarm_mode;
+            if (self.cfg.secret_store) |secret_store| {
+                _ = secret_store.refreshIfChanged() catch |err| {
+                    std.log.warn("secret store status refresh skipped err={}", .{err});
+                };
+                cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            }
             return try jsonResponse(self.alloc, public_status);
         }
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
@@ -4213,6 +4219,7 @@ pub const ApiHttpServer = struct {
         _ = (source.batch(alloc, table_name, req) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
+            error.EnrichmentRetryInProgress => return error.Backpressured,
             else => {
                 std.log.err("public table batch failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5290,6 +5297,64 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
+fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataService) StatusSource {
+    const V = struct {
+        fn status(ptr: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try service.status();
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try service.adminSnapshot();
+        }
+
+        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            service.freeAdminSnapshot(snapshot);
+        }
+
+        fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try createTableOnService(service, alloc, table_name, req);
+        }
+
+        fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try dropTableOnService(service, alloc, table_name);
+        }
+
+        fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try updateSchemaOnService(service, alloc, table_name, schema_json);
+        }
+
+        fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try createIndexOnService(service, alloc, table_name, index_name, index_json);
+        }
+
+        fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try dropIndexOnService(service, alloc, table_name, index_name);
+        }
+    };
+
+    return .{
+        .ptr = svc,
+        .vtable = &.{
+            .status = V.status,
+            .admin_snapshot = V.adminSnapshot,
+            .free_admin_snapshot = V.freeAdminSnapshot,
+            .create_table = V.createTable,
+            .drop_table = V.dropTable,
+            .update_schema = V.updateSchema,
+            .create_index = V.createIndex,
+            .drop_index = V.dropIndex,
+        },
+    };
+}
+
 pub fn freeOwnedStrings(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(@constCast(value));
     if (values.len > 0) alloc.free(@constCast(values));
@@ -5465,6 +5530,7 @@ fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
 pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
@@ -7038,12 +7104,95 @@ test "api http server serves secrets crud when backed by a local store" {
     }
     try std.testing.expect(found_openai);
 
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{\"secrets\":[{\"key\":\"gemini.api_key\",\"value\":\"externally-managed\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
+    });
+
+    var external_list_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/secrets",
+    });
+    defer external_list_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), external_list_resp.status);
+    var external_list = try std.json.parseFromSlice(metadata_openapi.SecretList, alloc, external_list_resp.body, .{});
+    defer external_list.deinit();
+    var found_external_gemini = false;
+    var found_deleted_openai = false;
+    for (external_list.value.secrets) |secret| {
+        if (std.mem.eql(u8, secret.key, "gemini.api_key")) found_external_gemini = true;
+        if (std.mem.eql(u8, secret.key, "openai.api_key")) found_deleted_openai = true;
+    }
+    try std.testing.expect(found_external_gemini);
+    try std.testing.expect(!found_deleted_openai);
+
+    var restored = try store.put(alloc, "openai.api_key", "sk-test");
+    defer restored.deinit(alloc);
+
     var delete_resp = try server.handle(.{
         .method = .DELETE,
         .uri = "/secrets/openai.api_key",
     });
     defer delete_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_resp.status);
+}
+
+test "api http server status includes secret store reload health" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-status-{d}.json", .{platform_time.monotonicNs()});
+    defer alloc.free(store_path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"stable\",\"created_at_ns\":1,\"updated_at_ns\":1}]}",
+    });
+
+    var source = FakeSource{};
+    var store = try common_secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+
+    var server = ApiHttpServer.init(alloc, .{
+        .swarm_mode = true,
+        .secret_store = &store,
+    }, source.iface(), null, null);
+
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{not-json",
+    });
+
+    var status_resp = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.status,
+    });
+    defer status_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), status_resp.status);
+    var parsed = try std.json.parseFromSlice(cluster.ClusterStatus, alloc, status_resp.body, .{});
+    defer parsed.deinit();
+    const secret_store = parsed.value.secret_store orelse return error.TestUnexpectedResult;
+    try std.testing.expect(secret_store.stale);
 }
 
 test "api http server lists secrets status without a local secret store" {
@@ -12493,8 +12642,36 @@ test "api http server create table with local writes waits for projected presenc
                     }})[0..])
                 else
                     @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .stores = if (self.created)
+                    @constCast((&[_]metadata_table_manager.StoreRecord{.{
+                        .store_id = 20,
+                        .node_id = 30,
+                        .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                            .group_id = 10,
+                            .local_voter = true,
+                        }})[0..]),
+                    }})[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = if (self.created)
+                    @constCast((&[_]raft_reconciler.PlacementIntent{.{
+                        .record = .{
+                            .group_id = 10,
+                            .replica_id = 1,
+                            .local_node_id = 30,
+                        },
+                        .store_id = 20,
+                    }})[0..])
+                else
+                    @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .merged_group_statuses = if (self.created)
+                    @constCast((&[_]metadata_reconciler.MergedGroupStatus{.{
+                        .group_id = 10,
+                        .leader_known = true,
+                        .leader_store_id = 20,
+                    }})[0..])
+                else
+                    @constCast((&[_]metadata_reconciler.MergedGroupStatus{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
@@ -13714,7 +13891,7 @@ test "api http server serves table metadata routes against real metadata service
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, StatusSource.fromMetadataService(&svc), null, null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, testMetadataServiceSourceWithoutLifecycle(&svc), null, null);
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
     defer std.testing.allocator.free(create_body);
@@ -13919,7 +14096,7 @@ test "api http server create table with replication sources returns encoded tabl
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, StatusSource.fromMetadataService(&svc), null, null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, testMetadataServiceSourceWithoutLifecycle(&svc), null, null);
 
     const create_body =
         \\{
@@ -17654,7 +17831,7 @@ test "api http server executes direct foreign table query through registry" {
         \\{"fields":["name"],"limit":1,"offset":2,"order_by":[{"field":"name"}],"filter_query":{"term":"active","field":"status"},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"${secret:pg_dsn}","postgres_table":"customers","columns":[{"name":"status","type":"text"}]}}}
     ;
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -17743,7 +17920,7 @@ test "api http server executes direct foreign table aggregations through registr
         \\{"fields":["name"],"aggregations":{"version_stats":{"type":"stats","field":"version"},"name_terms":{"type":"terms","field":"name","size":5}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers","columns":[{"name":"version","type":"bigint"},{"name":"name","type":"text"}]}}}
     ;
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});

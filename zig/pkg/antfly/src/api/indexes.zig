@@ -1624,13 +1624,13 @@ test "single index config encoder infers shorthand embeddings type" {
 
 test "single index helpers use default index metadata when indexes_json is empty" {
     const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 0, .metrics = .{} },
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
             .indexes_json = "",
             .placement_role = "data",
         }})[0..]),
-        .shards = @constCast((&[_]metadata_table_manager.ShardRecord{})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
         .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
         .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),

@@ -609,7 +609,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try ensureDefaultAdminUser(&user_manager.?);
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -1367,14 +1370,13 @@ fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 
             else => return err,
         };
         if (resolved_z) |resolved| {
+            defer alloc.free(resolved);
             const resolved_prefix = resolved[0..resolved.len];
-            if (probe.len == path.len) return resolved_prefix;
+            if (probe.len == path.len) return try alloc.dupe(u8, resolved_prefix);
 
             const suffix_start: usize = if (probe.len == 1) 1 else probe.len + 1;
             const suffix = path[suffix_start..];
-            const joined = try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
-            alloc.free(resolved_prefix);
-            return joined;
+            return try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
         }
 
         const parent = std.fs.path.dirname(probe) orelse return try alloc.dupe(u8, path);
@@ -1445,21 +1447,6 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     if (cli.auth_enabled) |value| return value;
     if (cfg) |loaded| return loaded.auth_enabled;
     return false;
-}
-
-fn ensureDefaultAdminUser(manager: *antfly.usermgr.UserManager) !void {
-    _ = manager.getUser("admin") catch |err| switch (err) {
-        error.UserNotFound => {
-            var admin_permission = [_]antfly.usermgr.Permission{
-                try antfly.usermgr.Permission.initOwned(manager.alloc, .@"*", "*", .admin),
-            };
-            defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
-            user.deinit(manager.alloc);
-            return;
-        },
-        else => return err,
-    };
 }
 
 fn resolveTermiteModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
@@ -1558,6 +1545,12 @@ const RecordingServer = struct {
 test "swarm runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "swarm runtime leaves auth disabled unless config or cli enables it" {
+    try std.testing.expect(!resolveAuthEnabled(.{}, null));
+    try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
+    try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
@@ -1759,8 +1752,18 @@ test "swarm runtime resolves paths from common storage base dir" {
 
     const resolved = try resolvePaths(alloc, .{}, &cfg);
     defer resolved.deinit(alloc);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/replicas", resolved.replica_root_dir);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/catalog.txt", resolved.replica_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/local-metadata.json", resolved.local_metadata_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm/snapshots", resolved.snapshot_root_dir);
+    const expected_base = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/swarm");
+    defer alloc.free(expected_base);
+    const expected_replica_root = try std.fs.path.join(alloc, &.{ expected_base, "replicas" });
+    defer alloc.free(expected_replica_root);
+    const expected_replica_catalog = try std.fs.path.join(alloc, &.{ expected_base, "catalog.txt" });
+    defer alloc.free(expected_replica_catalog);
+    const expected_local_metadata = try std.fs.path.join(alloc, &.{ expected_base, "local-metadata.json" });
+    defer alloc.free(expected_local_metadata);
+    const expected_snapshot_root = try std.fs.path.join(alloc, &.{ expected_base, "snapshots" });
+    defer alloc.free(expected_snapshot_root);
+    try std.testing.expectEqualStrings(expected_replica_root, resolved.replica_root_dir);
+    try std.testing.expectEqualStrings(expected_replica_catalog, resolved.replica_catalog_path);
+    try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
+    try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
 }

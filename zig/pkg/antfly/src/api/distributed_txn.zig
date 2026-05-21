@@ -2006,7 +2006,7 @@ test "db one-shot transaction recovery does not auto-abort fresh pending transac
 
     const stats = try db.runTransactionRecoveryOnce(resolver.config());
     try std.testing.expectEqual(@as(u64, 0), stats.notification_attempts);
-    try std.testing.expectEqual(@as(u64, 0), stats.recovery.auto_aborted);
+    try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
     try std.testing.expectEqual(@as(usize, 0), recorder.calls);
     try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(txn_id));
 }

@@ -1795,6 +1795,104 @@ test "managed embedder calls openai compatible embeddings endpoint" {
     try std.testing.expectEqual(@as(f32, 0.5), vector[2]);
 }
 
+pub fn testFileBackedApiKeyRotation() !void {
+    const alloc = std.testing.allocator;
+    const AuthCaptureApp = struct {
+        alloc: std.mem.Allocator,
+        mutex: std.atomic.Mutex = .unlocked,
+        headers: [2]?[]u8 = .{ null, null },
+        count: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            for (&self.headers) |*header| {
+                if (header.*) |value| self.alloc.free(value);
+                header.* = null;
+            }
+        }
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const auth = req.authorization orelse req.header("authorization") orelse "";
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.mutex.unlock();
+            const index = self.count;
+            if (index < self.headers.len) {
+                if (self.headers[index]) |value| self.alloc.free(value);
+                self.headers[index] = try self.alloc.dupe(u8, auth);
+            }
+            self.count += 1;
+
+            return .{
+                .status = 200,
+                .content_type = try response_alloc.dupe(u8, "application/json"),
+                .body = try response_alloc.dupe(u8,
+                    \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.125,0.25,0.5]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":1,"total_tokens":1}}
+                ),
+            };
+        }
+
+        fn expectHeader(self: *@This(), index: usize, expected: []const u8) !void {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.mutex.unlock();
+            try std.testing.expect(index < self.count);
+            try std.testing.expectEqualStrings(expected, self.headers[index] orelse return error.TestUnexpectedResult);
+        }
+    };
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-managed-embedder-secret-rotation-{d}.json", .{monotonicNowNs()});
+    defer alloc.free(store_path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"first-key\",\"created_at_ns\":1,\"updated_at_ns\":1}]}",
+    });
+
+    var secret_store = try common_secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+
+    var app = AuthCaptureApp{ .alloc = alloc };
+    defer app.deinit();
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, app.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    const indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}","api_key":"${{secret:openai.api_key}}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(indexes_json);
+
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{ .secret_store = &secret_store });
+    defer managed.deinit();
+
+    const first = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
+    defer alloc.free(first);
+    try app.expectHeader(0, "Bearer first-key");
+
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = store_path,
+        .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"second-key-longer\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
+    });
+
+    const second = try managed.embedQuery(alloc, "semantic_idx", "beta concept");
+    defer alloc.free(second);
+    try app.expectHeader(1, "Bearer second-key-longer");
+}
+
 test "managed embedder surfaces rate-limited openai compatible responses as retryable" {
     const FakeApp = struct {
         fn executor() http_common.RequestExecutor {
