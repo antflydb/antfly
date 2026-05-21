@@ -5,7 +5,8 @@
   "type": "module",
   "main": "main.mjs",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node --test file_server.test.mjs"
   },
   "devDependencies": {
     "electron": "^41.2.2"

@@ -46,6 +46,7 @@ func init() {
 	metadataCmd.Flags().
 		String("cluster", `{ "1": "http://0.0.0.0:9017" }`, "metadata cluster peer URLs (json object)")
 	metadataCmd.Flags().Bool("join", false, "join an existing cluster")
+	metadataCmd.Flags().Bool("health", true, "enable health/metrics server")
 	metadataCmd.Flags().Int("health-port", 4200, "health/metrics server port")
 
 	mustBindPFlag("metadata.id", metadataCmd.Flags().Lookup("id"))
@@ -53,6 +54,7 @@ func init() {
 	mustBindPFlag("metadata.api", metadataCmd.Flags().Lookup("api"))
 	mustBindPFlag("metadata.cluster", metadataCmd.Flags().Lookup("cluster"))
 	mustBindPFlag("metadata.join", metadataCmd.Flags().Lookup("join"))
+	mustBindPFlag("health_enabled", metadataCmd.Flags().Lookup("health"))
 	mustBindPFlag("health_port", metadataCmd.Flags().Lookup("health-port"))
 }
 
@@ -76,7 +78,9 @@ func runMetadata(cmd *cobra.Command, args []string) error {
 	defer cache.Close()
 
 	readyC := make(chan struct{})
-	startHealthServer(logger, config.HealthPort, readyC, "Metadata server")
+	if config.HealthEnabled {
+		startHealthServer(logger, config.HealthPort, readyC, "Metadata server")
+	}
 
 	metadata.RunAsMetadataServer(ctx, logger, config,
 		&store.StoreInfo{

@@ -155,12 +155,20 @@ type ModelConfig struct {
 
 // ModelSpec defines a single model to load
 type ModelSpec struct {
-	// Name is the model name (e.g., "bge-small-en-v1.5")
+	// Name is the model reference, including an optional tag/variant suffix
+	// (e.g., "BAAI/bge-small-en-v1.5:i8" or "hf:antflydb/clipclap:gguf:Q4_K").
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Variant specifies a model variant (e.g., "quantized")
+	// Tasks declares the model tasks to write into the pulled model manifest.
+	// For example: ["embed"].
 	// +optional
-	Variant string `json:"variant,omitempty"`
+	Tasks []string `json:"tasks,omitempty"`
+
+	// Capabilities declares modality/runtime capabilities to write into the
+	// pulled model manifest. For example: ["text", "image", "audio"].
+	// +optional
+	Capabilities []string `json:"capabilities,omitempty"`
 
 	// Priority determines loading order and eviction priority
 	// +kubebuilder:validation:Enum=high;medium;low

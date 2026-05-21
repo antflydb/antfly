@@ -26,7 +26,7 @@ pub const NamedChainLink = struct {
 
 pub const MetadataInfo = struct {
     /// Mapping from Metadata Node ID (hex string) to its URL used by store nodes for enrolling into the cluster
-    orchestration_urls: std.json.ArrayHashMap([]const u8),
+    orchestration_urls: ?std.json.ArrayHashMap([]const u8) = null,
 };
 
 pub const TLSInfo = struct {
@@ -38,7 +38,7 @@ pub const TLSInfo = struct {
 
 pub const LocalStorageConfig = struct {
     /// Root directory for all antfly data storage. Defaults to 'antflydb'.
-    base_dir: []const u8,
+    base_dir: ?[]const u8 = null,
 };
 
 pub const S3Info = struct {
@@ -75,7 +75,7 @@ pub const StorageBackend = enum {
 };
 
 pub const StorageConfig = struct {
-    local: LocalStorageConfig,
+    local: ?LocalStorageConfig = null,
     data: ?StorageBackend = null,
     metadata: ?StorageBackend = null,
     s3: ?S3Info = null,
@@ -85,10 +85,12 @@ pub const Config = struct {
     /// Internal version of antfly
     version: ?[]const u8 = null,
     log: ?antfly_logging_openapi.Config = null,
+    /// Enables the health/metrics server. Defaults to true.
+    health_enabled: ?bool = null,
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
-    storage: StorageConfig,
-    metadata: MetadataInfo,
+    storage: ?StorageConfig = null,
+    metadata: ?MetadataInfo = null,
     termite: ?antfly_termite_config_openapi.Config = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
@@ -96,7 +98,7 @@ pub const Config = struct {
     speech_to_text: ?std.json.ArrayHashMap(antfly_audio_openapi.STTConfig) = null,
     cors: ?antfly_middleware_openapi.CORSConfig = null,
     /// How many replicas of each shard should be maintained.
-    replication_factor: i64,
+    replication_factor: ?i64 = null,
     /// Enables authentication and authorization (RBAC) for the API.
     enable_auth: ?bool = null,
     /// Disables automatic shard reallocation (splitting/merging).
@@ -108,15 +110,15 @@ pub const Config = struct {
     /// Minimum continuous readiness duration required before finalizing a split. Format: duration string like '15s', '1m'. Default: '15s'.
     split_finalize_grace_period: ?[]const u8 = null,
     /// Maximum size of a shard in bytes. Used to determine when to split shards.
-    max_shard_size_bytes: i64,
+    max_shard_size_bytes: ?i64 = null,
     /// Minimum size of a shard in bytes before it becomes eligible for automatic merge consideration. If unset, defaults to one quarter of max_shard_size_bytes.
     min_shard_size_bytes: ?i64 = null,
     /// Minimum number of shards to keep for a table. Automatic merges will not reduce a table below this count.
     min_shards_per_table: ?i64 = null,
     /// Maximum number of shards that can be created for a single table.
-    max_shards_per_table: i64,
+    max_shards_per_table: ?i64 = null,
     /// Default number of shards to create for a new table.
-    default_shards_per_table: i64,
+    default_shards_per_table: ?i64 = null,
     /// Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node.
     swarm_mode: ?bool = null,
     /// URL of the model registry for the Antfarm dashboard. Defaults to https://registry.antfly.io/v1

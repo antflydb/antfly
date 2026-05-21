@@ -52,6 +52,7 @@ const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
+    health_enabled: ?bool = null,
     health_port: ?u16 = null,
     raft_bind_host: ?[]const u8 = null,
     raft_bind_port: ?u16 = null,
@@ -1313,6 +1314,7 @@ pub const DataServer = struct {
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
+    store_registration_confirmed: bool = false,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
@@ -1660,16 +1662,20 @@ pub const DataServer = struct {
         }
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
-        self.registerNodeIfConfigured() catch |err| switch (err) {
-            error.HttpConnectionClosing,
-            error.ConnectionResetByPeer,
-            error.ConnectionRefused,
-            error.BrokenPipe,
-            error.EndOfStream,
-            error.UnexpectedHttpStatus,
-            => {},
-            else => return err,
-        };
+        if (self.store_registration != null) {
+            self.store_status_dirty = true;
+            self.registerNodeIfConfigured() catch |err| switch (err) {
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.ConnectionRefused,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.UnexpectedHttpStatus,
+                error.NotListening,
+                => std.log.warn("data node registration deferred err={}", .{err}),
+                else => return err,
+            };
+        }
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
             error.SystemResources,
@@ -1706,6 +1712,19 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata != null and self.store_registration != null) {
+            if (!self.store_registration_confirmed) {
+                self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
+                    error.HttpConnectionClosing,
+                    error.ConnectionResetByPeer,
+                    error.ConnectionRefused,
+                    error.BrokenPipe,
+                    error.EndOfStream,
+                    error.UnexpectedHttpStatus,
+                    error.NotListening,
+                    => {},
+                    else => return register_err,
+                };
+            }
             self.store_status_ticks += 1;
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
             const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
@@ -1732,8 +1751,10 @@ pub const DataServer = struct {
                     error.ConnectionRefused,
                     error.BrokenPipe,
                     error.EndOfStream,
+                    error.UnexpectedHttpStatus,
                     => {},
                     error.UnknownStore => {
+                        self.store_registration_confirmed = false;
                         self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
                             error.HttpConnectionClosing,
                             error.ConnectionResetByPeer,
@@ -2824,6 +2845,7 @@ pub const DataServer = struct {
             .failure_domain = registration.failure_domain,
             .live = true,
         });
+        self.store_registration_confirmed = true;
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
@@ -6778,7 +6800,11 @@ pub fn runFromIterator(
     std.debug.print("\n", .{});
 
     var data_health = HealthSource{ .data_server = &data_server };
-    const health_port = cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else null;
+    const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
+    const health_port = if (health_enabled)
+        cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
+    else
+        null;
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
         "data",
@@ -6834,6 +6860,15 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--health-port")) {
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--health")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.health_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--health=")) {
+            cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--auth")) {
@@ -7021,7 +7056,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-port <port>              Data API bind port (default: 0)
         \\  --raft-host <host>             Data raft bind host (default: 127.0.0.1)
         \\  --raft-port <port>             Data raft bind port (default: 0 when registered)
-        \\  --health-port <port>           Dedicated health/metrics bind port (default: unset)
+        \\  --health <true|false>          Enable health/metrics server (default: true)
+        \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --auth <true|false>            Enable auth middleware and local user store
         \\  --metadata-api <uri>           Metadata orchestration/API URL (repeat for multiple endpoints)
         \\  --node-id <id>                 Register this split data process as metadata node <id>

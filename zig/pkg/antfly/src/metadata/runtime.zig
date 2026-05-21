@@ -31,6 +31,7 @@ const CliConfig = struct {
     api_port: ?u16 = null,
     cluster_json: ?[]const u8 = null,
     join: bool = false,
+    health_enabled: ?bool = null,
     health_port: ?u16 = null,
     tick_ms: ?u64 = null,
     local_node_id: ?u64 = null,
@@ -526,7 +527,11 @@ pub fn runFromIterator(
     std.debug.print("metadata admin api listening on {s}\n", .{admin_uri});
 
     var metadata_health = HealthSource{ .server = &server };
-    const health_port = cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else null;
+    const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
+    const health_port = if (health_enabled)
+        cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
+    else
+        null;
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
         "metadata",
@@ -594,6 +599,15 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--health-port")) {
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--health")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.health_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--health=")) {
+            cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--tick-ms")) {
@@ -898,7 +912,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
         \\  --join                         Join an existing metadata cluster (not yet supported)
-        \\  --health-port <port>           Dedicated health/metrics bind port (default: unset)
+        \\  --health <true|false>          Enable health/metrics server (default: true)
+        \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -906,6 +921,12 @@ fn printUsage(argv0: []const u8) void {
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
+}
+
+fn parseBoolFlag(raw: []const u8) ?bool {
+    if (std.mem.eql(u8, raw, "true")) return true;
+    if (std.mem.eql(u8, raw, "false")) return false;
+    return null;
 }
 
 test "metadata runtime module compiles" {
