@@ -31,6 +31,7 @@ const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
+    health_enabled: ?bool = null,
     health_port: ?u16 = null,
     tick_ms: ?u64 = null,
     local_node_id: ?u64 = null,
@@ -698,7 +699,11 @@ pub fn runFromIterator(
     var swarm_health = SwarmHealthSource{
         .data_server = &data_server,
     };
-    const health_port = cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else null;
+    const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
+    const health_port = if (health_enabled)
+        cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
+    else
+        null;
     const health_server = antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
         alloc,
         "swarm",
@@ -1073,6 +1078,15 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--health")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.health_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--health=")) {
+            cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--tick-ms")) {
             cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -1309,7 +1323,8 @@ fn printUsage() void {
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 0)
         \\  --id <node-id>                        Local node id (default: 1)
-        \\  --health-port <port>                  Dedicated health/metrics port on --host (default: unset)
+        \\  --health <true|false>                 Enable health/metrics server (default: true)
+        \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
         \\  --models-dir <path>                   Embedded termite models directory (default: ~/.termite/models)
         \\  --termite-host-budget-mb <n>          Embedded termite native generation host budget override

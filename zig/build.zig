@@ -2439,6 +2439,8 @@ pub fn build(b: *std.Build) void {
     const lib_unit_default_filters = [_][]const u8{
         ".test_0",
         "module compiles",
+        "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,

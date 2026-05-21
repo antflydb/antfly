@@ -484,6 +484,11 @@ fn computeAlgebraicAggregation(
 
     if (std.mem.eql(u8, request.type, "date_histogram")) {
         const maybe_result = computeAlgebraicDateHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
+            error.UnsupportedAggregation => {
+                try recordAlgebraicBucketObservation(alloc, index, store, request, ctx.algebraic_constraints, "date_histogram_unsupported");
+                index.recordPlannerFallback("date_histogram_unsupported", null, null);
+                return null;
+            },
             error.AlgebraicPlannerScanTooLarge => {
                 try recordAlgebraicBucketObservation(alloc, index, store, request, ctx.algebraic_constraints, "date_histogram_too_many_rows");
                 index.recordPlannerFallback("date_histogram_too_many_rows", null, null);
@@ -507,6 +512,14 @@ fn computeAlgebraicAggregation(
 
     if (std.mem.eql(u8, request.type, "histogram")) {
         const maybe_result = computeAlgebraicHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
+            error.UnsupportedAggregation => {
+                index.recordPlannerFallback("histogram_unsupported", null, null);
+                return null;
+            },
+            error.AlgebraicPlannerScanTooLarge => {
+                index.recordPlannerFallback("histogram_too_many_rows", null, null);
+                return null;
+            },
             error.AlgebraicResultBucketLimit => {
                 index.recordPlannerFallback("histogram_too_many_buckets", null, null);
                 return null;
@@ -522,7 +535,22 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "range") or std.mem.eql(u8, request.type, "date_range")) {
-        if (try computeAlgebraicRangeAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation)) |result| {
+        const maybe_result = computeAlgebraicRangeAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
+            error.UnsupportedAggregation => {
+                index.recordPlannerFallback("range_unsupported", null, null);
+                return null;
+            },
+            error.AlgebraicPlannerScanTooLarge => {
+                index.recordPlannerFallback("range_too_many_rows", null, null);
+                return null;
+            },
+            error.AlgebraicResultBucketLimit => {
+                index.recordPlannerFallback("range_too_many_buckets", null, null);
+                return null;
+            },
+            else => return err,
+        };
+        if (maybe_result) |result| {
             index.recordPlannerSelected(null, result.buckets.len);
             return result;
         }
@@ -5403,10 +5431,15 @@ fn computeAlgebraicRangeAggregation(
             const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, doc_ids, constraints, generation);
             defer if (constrained_ids) |ids| index.freeDocIds(ids);
             const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else doc_ids;
+            const nested = try algebraicDocIdMetricResultsAlloc(alloc, index, store, child_aggs.primary, effective_ids);
+            errdefer {
+                for (nested) |*agg| agg.deinit(alloc);
+                if (nested.len > 0) alloc.free(nested);
+            }
             buckets[idx] = .{
                 .key_json = try std.fmt.allocPrint(alloc, "\"{s}\"", .{range_spec.name}),
                 .count = @intCast(effective_ids.len),
-                .aggregations = try algebraicDocIdMetricResultsAlloc(alloc, index, store, child_aggs.primary, effective_ids),
+                .aggregations = nested,
             };
             filled = idx + 1;
         }
@@ -5423,10 +5456,15 @@ fn computeAlgebraicRangeAggregation(
             const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, doc_ids, constraints, generation);
             defer if (constrained_ids) |ids| index.freeDocIds(ids);
             const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else doc_ids;
+            const nested = try algebraicDocIdMetricResultsAlloc(alloc, index, store, child_aggs.primary, effective_ids);
+            errdefer {
+                for (nested) |*agg| agg.deinit(alloc);
+                if (nested.len > 0) alloc.free(nested);
+            }
             buckets[idx] = .{
                 .key_json = try std.fmt.allocPrint(alloc, "\"{s}\"", .{range_spec.name}),
                 .count = @intCast(effective_ids.len),
-                .aggregations = try algebraicDocIdMetricResultsAlloc(alloc, index, store, child_aggs.primary, effective_ids),
+                .aggregations = nested,
             };
             filled = idx + 1;
         }
@@ -13740,6 +13778,139 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
 
     const status_value = manager.algebraic_indexes.items[0].index.status();
     try std.testing.expect(status_value.planner_algebraic_selected >= 3);
+}
+
+test "algebraic bucket aggregations fall back when nested metrics are unsupported" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [{"name":"amount","path":"amount","type":"integer"}],
+        \\  "time_fields": [{"name":"created","path":"created_at","type":"timestamp"}],
+        \\  "materializations": [
+        \\    {"name":"orders_by_day","op":"count","time":"created","bucket":"day"}
+        \\  ]
+        \\}
+    ;
+
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = cfg,
+    });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    try manager.algebraic_indexes.append(alloc, .{
+        .apply_mutex = mutex,
+        .config = config,
+        .index = alg_index,
+    });
+
+    const docs = [_][]const u8{
+        "{\"amount\":10,\"created_at\":\"2026-01-02T00:00:00Z\"}",
+        "{\"amount\":20,\"created_at\":\"2026-01-03T00:00:00Z\"}",
+    };
+    const derived_docs = [_]@import("derived/derived_types.zig").DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = docs[0] },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = docs[1] },
+    };
+    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = derived_docs[0..] });
+
+    var hits = try alloc.alloc(types.SearchHit, docs.len);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    for (docs, 0..) |doc, i| {
+        hits[i] = .{
+            .id = try std.fmt.allocPrint(alloc, "o{d}", .{i + 1}),
+            .stored_data = try alloc.dupe(u8, doc),
+        };
+    }
+    const result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = @intCast(hits.len),
+    };
+
+    const histogram_requests = [_]SearchAggregationRequest{.{
+        .name = "amount_histogram",
+        .type = "histogram",
+        .field = "amount",
+        .interval = 10,
+        .aggregations = &.{.{ .name = "amount_sum", .type = "sum", .field = "amount" }},
+    }};
+    const histogram_aggs = try computeSearchAggregations(alloc, &histogram_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    });
+    defer deinitResults(alloc, histogram_aggs);
+    try std.testing.expectEqual(@as(usize, 2), histogram_aggs[0].buckets.len);
+    try std.testing.expectEqualStrings("10", histogram_aggs[0].buckets[0].key_json);
+    try std.testing.expectEqualStrings("10", histogram_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("20", histogram_aggs[0].buckets[1].key_json);
+    try std.testing.expectEqualStrings("20", histogram_aggs[0].buckets[1].aggregations[0].value_json.?);
+
+    const range_requests = [_]SearchAggregationRequest{.{
+        .name = "amount_ranges",
+        .type = "range",
+        .field = "amount",
+        .ranges = &.{
+            .{ .name = "low", .start = 0, .end = 15 },
+            .{ .name = "high", .start = 15, .end = 25 },
+        },
+        .aggregations = &.{.{ .name = "amount_sum", .type = "sum", .field = "amount" }},
+    }};
+    const range_aggs = try computeSearchAggregations(alloc, &range_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    });
+    defer deinitResults(alloc, range_aggs);
+    try std.testing.expectEqual(@as(usize, 2), range_aggs[0].buckets.len);
+    try std.testing.expectEqualStrings("\"low\"", range_aggs[0].buckets[0].key_json);
+    try std.testing.expectEqualStrings("10", range_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("\"high\"", range_aggs[0].buckets[1].key_json);
+    try std.testing.expectEqualStrings("20", range_aggs[0].buckets[1].aggregations[0].value_json.?);
+
+    const date_histogram_requests = [_]SearchAggregationRequest{.{
+        .name = "orders_by_day",
+        .type = "date_histogram",
+        .field = "created_at",
+        .calendar_interval = "day",
+        .aggregations = &.{.{ .name = "amount_sum", .type = "sum", .field = "amount" }},
+    }};
+    const date_histogram_aggs = try computeSearchAggregations(alloc, &date_histogram_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    });
+    defer deinitResults(alloc, date_histogram_aggs);
+    try std.testing.expectEqual(@as(usize, 2), date_histogram_aggs[0].buckets.len);
+    try std.testing.expectEqualStrings("\"2026-01-02T00:00:00Z\"", date_histogram_aggs[0].buckets[0].key_json);
+    try std.testing.expectEqualStrings("10", date_histogram_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("\"2026-01-03T00:00:00Z\"", date_histogram_aggs[0].buckets[1].key_json);
+    try std.testing.expectEqualStrings("20", date_histogram_aggs[0].buckets[1].aggregations[0].value_json.?);
+
+    const status_value = manager.algebraic_indexes.items[0].index.status();
+    try std.testing.expectEqual(@as(u64, 0), status_value.planner_algebraic_selected);
+    try std.testing.expectEqual(@as(u64, 3), status_value.planner_fallback_count);
+    try std.testing.expectEqualStrings("fallback", status_value.planner_last_decision.?);
+    try std.testing.expectEqualStrings("date_histogram_unsupported", status_value.planner_last_fallback_reason.?);
 }
 
 test "algebraic aggregation planner rolls up date cylinders across extra dimensions" {

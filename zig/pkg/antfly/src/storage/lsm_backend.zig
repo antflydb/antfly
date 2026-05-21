@@ -920,10 +920,12 @@ pub const Backend = struct {
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.mutable.clone(self.allocator);
+        errdefer snapshot.deinit(self.allocator);
         const snapshot_bytes = estimateStateBytes(snapshot);
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
+        try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         self.mutable_read_snapshot = snapshot;
         return snapshot;
     }
@@ -8439,4 +8441,37 @@ test "lsm backend ignores orphaned committed run files not referenced by manifes
         try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
         try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
     }
+}
+test "lsm backend mutable read snapshot retirement allocation failure keeps snapshot cleanup reachable" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var backend = Backend.init(alloc, .{});
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+    }
+
+    var read_a = try backend.beginRead();
+    var read_a_active = true;
+    defer if (read_a_active) read_a.abort();
+    try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
+    const first_snapshot = backend.mutable_read_snapshot orelse return error.TestUnexpectedResult;
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    backend.invalidateMutableReadSnapshot();
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expect(backend.retired_mutable_snapshots.items[0] == first_snapshot);
+
+    read_a.abort();
+    read_a_active = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
+    backend.close();
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }

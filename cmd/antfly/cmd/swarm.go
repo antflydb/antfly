@@ -59,6 +59,7 @@ func init() {
 	swarmCmd.Flags().String("store-api", "http://0.0.0.0:12380", "store api server URL")
 	swarmCmd.Flags().Bool("termite", true, "also run as a termite node")
 	swarmCmd.Flags().String("termite-api-url", "", "Termite API URL (http://host:port)")
+	swarmCmd.Flags().Bool("health", true, "enable health/metrics server")
 	swarmCmd.Flags().Int("health-port", 4200, "health/metrics server port")
 
 	mustBindPFlag("swarm.id", swarmCmd.Flags().Lookup("id"))
@@ -69,6 +70,7 @@ func init() {
 	mustBindPFlag("swarm.store-api", swarmCmd.Flags().Lookup("store-api"))
 	mustBindPFlag("swarm.termite", swarmCmd.Flags().Lookup("termite"))
 	mustBindPFlag("termite.api_url", swarmCmd.Flags().Lookup("termite-api-url"))
+	mustBindPFlag("health_enabled", swarmCmd.Flags().Lookup("health"))
 	mustBindPFlag("health_port", swarmCmd.Flags().Lookup("health-port"))
 }
 
@@ -138,7 +140,9 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		ready.Store(true)
 		logger.Info("Swarm mode: all servers are ready")
 	}()
-	healthserver.Start(logger, config.HealthPort, ready.Load)
+	if config.HealthEnabled {
+		healthserver.Start(logger, config.HealthPort, ready.Load)
+	}
 
 	metaConf := &store.StoreInfo{
 		ID:      tid,
