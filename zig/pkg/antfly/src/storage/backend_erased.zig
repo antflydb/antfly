@@ -351,6 +351,7 @@ pub const Batch = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+        append_put: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque) anyerror!Cursor = null,
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
@@ -385,6 +386,11 @@ pub const Batch = struct {
 
     pub fn put(self: *Batch, key: []const u8, value: []const u8) !void {
         try self.vtable.put(self.ptr, key, value);
+    }
+
+    pub fn appendPut(self: *Batch, key: []const u8, value: []const u8) !void {
+        const append_put = self.vtable.append_put orelse return error.Unsupported;
+        try append_put(self.ptr, key, value);
     }
 
     pub fn delete(self: *Batch, key: []const u8) !void {
@@ -1080,6 +1086,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             try unbox(ptr).handle.put(key, value);
         }
 
+        fn appendPut(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            try unbox(ptr).handle.appendPut(key, value);
+        }
+
         fn delete(ptr: *anyopaque, key: []const u8) anyerror!void {
             try unbox(ptr).handle.delete(key);
         }
@@ -1105,6 +1115,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .put = vt.put,
+            .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,

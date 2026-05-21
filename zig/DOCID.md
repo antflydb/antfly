@@ -1461,6 +1461,62 @@ Status as of 2026-05-19:
   setup measurable, but 100k real full-text+sparse query evidence should use
   deferred indexing with bounded batches or a dedicated bulk-load path rather
   than repeated per-batch full-index barriers.
+  Sparse-vector replay now has an internal bulk append path wired through
+  backend batch options and resource-manager accounting. The path preserves the
+  existing sparse on-disk layout but groups postings by term, writes complete
+  chunks once, uses larger bulk replay batches, and lets replay/backfill callers
+  skip per-doc existence probes when they have already applied deletes or are
+  building a fresh index. A bounded 10k-doc DOCID query profile after the change
+  still shows primary store load around 13-15s and full-text apply around
+  4-4.5s; sparse apply improved from the original ~89.6s profile to roughly
+  28-32s locally. That is a meaningful reduction, but not enough to call sparse
+  loading solved. The remaining sparse load cost appears to be backend
+  write/flush dominated rather than DOCID identity work, so future large-scale
+  evidence should profile sparse backend batch commit/flush directly before
+  using 100k full DB runs as a pass/fail signal.
+  Follow-up sparse write profiling now emits `antfly_bench_sparse_write` rows.
+  On the same 10k deferred-index run, sparse apply remained about `28-30s`.
+  The profile attributed roughly `12-14s` to forward/reverse sparse row writes,
+  about `5.2s` to commit, and only a few hundred milliseconds to grouped
+  posting/chunk/meta writes. Sorted sparse artifact reads and a non-namespaced
+  erased-batch `appendPut` hook did not materially improve this shape because
+  the current LSM batch path still pays per-entry active-memtable mutation cost.
+  A direct bulk-state append path now keeps append-only sparse rows in a
+  transaction-local sorted-state buffer instead of mutating the active memtable
+  per row, with arena-backed entry allocation and safe fallback copying when
+  arena-owned entries must move into the normal mutable table. Sparse
+  `fwd:`/`rev:`/`inv:` rows now use that append path during bulk replay. On the
+  same 10k deferred-index profile, this removed most forward/reverse row-append
+  time (`fwd_rev_put_ms` dropped to about `1.6s`) and fixed the earlier
+  arena-fallback lifetime crash; however, sparse apply still measured about
+  `26.4s` because commit-time WAL/table materialization grew to about `14.2s`.
+  Sparse layout v2 now makes that breaking change while the feature is still
+  undeployed: sparse keys use typed binary prefixes, bulk replay stores inverted
+  postings in a compact segment blob, and bulk doc maps are stored in a compact
+  doc-map segment instead of per-document `fwd:`/`rev:` rows. The old chunk-row
+  shape remains only as the small incremental delta path, and search reads both
+  segment blobs and delta chunks. On the same 10k deferred-index profile,
+  sparse commit dropped from about `13-14s` to about `16ms`, sparse apply
+  dropped to about `11.5s`, filter preparation dropped from about `13-14s` to
+  about `68ms`, and the sparse query shape dropped from about `10.1s` to about
+  `3.1s`. The remaining sparse apply time is no longer generic LSM commit; it is
+  now dominated by replay artifact decode/grouping and doc-map/postings segment
+  encoding. The next lever is to avoid materializing the whole sparse replay
+  batch before segment encode, or to stream segment construction directly from
+  replay artifacts under backend-runtime/resource-manager budgets.
+  Sparse deferred replay now also has a prepared `SparseWrite` path for
+  field-backed sparse indexes: replay reads borrowed document bytes with a
+  sorted batched store read, extracts sparse vectors directly, and hands the
+  prepared writes to the bulk sparse loader instead of first materializing
+  `BatchWrite` document-value copies and then reparsing them inside
+  `IndexManager`. On the same 10k deferred-index profile, sparse indexing
+  itself dropped from roughly `1.4s` to about `67ms`, and total sparse apply
+  dropped from roughly `2.7-2.8s` to about `2.1s`. The remaining measured cost
+  is now mostly sparse extraction from JSON (`~1.34s`) plus replay document-key
+  scan/key construction (`~0.67s`). That points to the next breaking-change
+  lever if we need more: persist field-backed sparse vectors, or a compact
+  sparse replay artifact, at write time so catch-up does not have to reread and
+  reparse full JSON documents.
   The first
   optimization from that evidence specialized
   `ResolvedDocSet` ordinal set algebra: list/list operators now use direct

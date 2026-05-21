@@ -78,6 +78,7 @@ var hbc_bulk_rebuild_leaf_min_members_cache: std.atomic.Value(usize) = .init(0);
 var hbc_defer_bulk_leaf_splits_cache: std.atomic.Value(u8) = .init(0);
 var hbc_defer_bulk_quantized_rebuild_cache: std.atomic.Value(u8) = .init(0);
 var bench_hbc_metrics_cache: std.atomic.Value(u8) = .init(0);
+var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 const default_merge_policy = merger_mod.MergePolicy{
     .max_segments_per_tier = 10,
     .max_segment_size = 256 * 1024 * 1024,
@@ -3215,6 +3216,11 @@ pub const IndexManager = struct {
         return entry.index.getWriteProfile();
     }
 
+    pub fn sparseWriteProfileByName(self: *IndexManager, name: []const u8) ?sparse_mod.WriteProfile {
+        const entry = self.sparseIndex(name) orelse return null;
+        return entry.index.getWriteProfile();
+    }
+
     pub fn beginDenseBulkIngestSessions(self: *IndexManager) !void {
         var opened: usize = 0;
         errdefer {
@@ -3260,6 +3266,54 @@ pub const IndexManager = struct {
 
     pub fn abortDenseBulkIngestSessionByName(self: *IndexManager, name: []const u8) void {
         const entry = self.denseIndex(name) orelse return;
+        entry.index.abortBulkIngestSession();
+    }
+
+    pub fn beginSparseBulkIngestSessions(self: *IndexManager) !void {
+        var opened: usize = 0;
+        errdefer {
+            for (self.sparse_indexes.items[0..opened]) |*entry| {
+                entry.index.abortBulkIngestSession();
+            }
+        }
+        for (self.sparse_indexes.items) |*entry| {
+            try entry.index.beginBulkIngestSession();
+            opened += 1;
+        }
+    }
+
+    pub fn finishSparseBulkIngestSessionsWithOptions(self: *IndexManager, options: backend_types.BulkIngestFinishOptions) !void {
+        var first_err: ?anyerror = null;
+        for (self.sparse_indexes.items) |*entry| {
+            entry.index.finishBulkIngestSessionWithOptions(options) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
+    }
+
+    pub fn abortSparseBulkIngestSessions(self: *IndexManager) void {
+        for (self.sparse_indexes.items) |*entry| {
+            entry.index.abortBulkIngestSession();
+        }
+    }
+
+    pub fn beginSparseBulkIngestSessionByName(self: *IndexManager, name: []const u8) !void {
+        const entry = self.sparseIndex(name) orelse return error.IndexNotFound;
+        try entry.index.beginBulkIngestSession();
+    }
+
+    pub fn finishSparseBulkIngestSessionByNameWithOptions(
+        self: *IndexManager,
+        name: []const u8,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !void {
+        const entry = self.sparseIndex(name) orelse return error.IndexNotFound;
+        try entry.index.finishBulkIngestSessionWithOptions(options);
+    }
+
+    pub fn abortSparseBulkIngestSessionByName(self: *IndexManager, name: []const u8) void {
+        const entry = self.sparseIndex(name) orelse return;
         entry.index.abortBulkIngestSession();
     }
 
@@ -3600,7 +3654,7 @@ pub const IndexManager = struct {
         }
 
         for (self.sparse_indexes.items) |*entry| {
-            try self.indexSparseBatchEntry(store, entry, writes);
+            try self.indexSparseBatchEntryWithOptions(store, entry, writes, .{});
         }
     }
 
@@ -4034,7 +4088,7 @@ pub const IndexManager = struct {
         if (writes.len == 0) return;
 
         for (self.sparse_indexes.items) |*entry| {
-            try self.applySparseEmbeddingWritesEntry(store, entry, writes);
+            try self.applySparseEmbeddingWritesEntry(store, entry, writes, .{});
         }
     }
 
@@ -4129,15 +4183,34 @@ pub const IndexManager = struct {
     }
 
     pub fn indexSparseBatchByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite) !void {
+        return try self.indexSparseBatchByNameWithOptions(store, index_name, writes, .{});
+    }
+
+    pub fn indexSparseBatchByNameWithOptions(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite, batch_options: StoreBatchOptions) !void {
         if (writes.len == 0) return;
         const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
-        try self.indexSparseBatchEntry(store, entry, writes);
+        try self.indexSparseBatchEntryWithOptions(store, entry, writes, batch_options);
+    }
+
+    pub fn sparseFieldNameByName(self: *IndexManager, index_name: []const u8) ?[]const u8 {
+        const entry = self.sparseIndex(index_name) orelse return null;
+        return entry.field_name;
+    }
+
+    pub fn indexSparsePreparedWritesByNameWithOptions(self: *IndexManager, index_name: []const u8, writes: []const sparse_mod.SparseWrite, batch_options: StoreBatchOptions) !void {
+        if (writes.len == 0) return;
+        const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
+        try self.indexSparsePreparedWritesEntryWithOptions(entry, writes, batch_options);
     }
 
     pub fn deleteSparseBatchByName(self: *IndexManager, index_name: []const u8, keys: []const []const u8) !void {
+        return try self.deleteSparseBatchByNameWithOptions(index_name, keys, .{});
+    }
+
+    pub fn deleteSparseBatchByNameWithOptions(self: *IndexManager, index_name: []const u8, keys: []const []const u8, batch_options: StoreBatchOptions) !void {
         if (keys.len == 0) return;
         const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
-        try self.deleteSparseBatchEntry(entry, keys);
+        try self.deleteSparseBatchEntryWithOptions(entry, keys, batch_options);
     }
 
     pub fn deleteGraphDocsByName(self: *IndexManager, index_name: []const u8, keys: []const []const u8) !void {
@@ -4206,9 +4279,19 @@ pub const IndexManager = struct {
     }
 
     pub fn applySparseEmbeddingWritesByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const mapper.SparseEmbeddingWrite) !void {
+        return try self.applySparseEmbeddingWritesByNameWithOptions(store, index_name, writes, .{});
+    }
+
+    pub fn applySparseEmbeddingWritesByNameWithOptions(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        writes: []const mapper.SparseEmbeddingWrite,
+        batch_options: StoreBatchOptions,
+    ) !void {
         if (writes.len == 0) return;
         const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
-        try self.applySparseEmbeddingWritesEntry(store, entry, writes);
+        try self.applySparseEmbeddingWritesEntry(store, entry, writes, batch_options);
     }
 
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
@@ -5399,6 +5482,7 @@ pub const IndexManager = struct {
         }
 
         var flushed_batches: usize = 0;
+        var backfilled_doc_count: u64 = 0;
         var saw_visible_doc = false;
         var last_key: ?[]const u8 = null;
 
@@ -5410,11 +5494,14 @@ pub const IndexManager = struct {
                 writes_buf: *std.ArrayListUnmanaged(sparse_mod.SparseWrite),
                 last_doc_key: []const u8,
                 flush_count: *usize,
+                doc_count: *u64,
             ) !void {
                 if (writes_buf.items.len == 0) return;
                 try sparse_entry.index.batchWithOptions(writes_buf.items, &.{}, .{
                     .defer_term_range_updates = true,
                 });
+                doc_count.* += writes_buf.items.len;
+                try sparse_entry.index.persistBackfillDocCount(doc_count.*);
                 for (writes_buf.items) |item| {
                     manager.alloc.free(@constCast(item.doc_id));
                     manager.alloc.free(@constCast(item.vec.indices));
@@ -5451,12 +5538,12 @@ pub const IndexManager = struct {
                 },
             });
             if (writes.items.len >= sparse_backfill_batch_size) {
-                try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches);
+                try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches, &backfilled_doc_count);
             }
         }
 
         if (writes.items.len > 0) {
-            try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches);
+            try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches, &backfilled_doc_count);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -6097,7 +6184,11 @@ pub const IndexManager = struct {
     }
 
     fn indexSparseBatchEntry(self: *IndexManager, store: ?*docstore_mod.DocStore, entry: *SparseIndex, writes: []const types.BatchWrite) !void {
-        return self.indexSparseBatchEntryWithSkip(store, entry, writes, null);
+        return self.indexSparseBatchEntryWithOptions(store, entry, writes, .{});
+    }
+
+    fn indexSparseBatchEntryWithOptions(self: *IndexManager, store: ?*docstore_mod.DocStore, entry: *SparseIndex, writes: []const types.BatchWrite, batch_options: StoreBatchOptions) !void {
+        return self.indexSparseBatchEntryWithSkipAndOptions(store, entry, writes, null, batch_options);
     }
 
     fn indexSparseBatchEntryWithSkip(
@@ -6107,7 +6198,31 @@ pub const IndexManager = struct {
         writes: []const types.BatchWrite,
         skip: ?*const SparseSplitHandoff,
     ) !void {
+        return self.indexSparseBatchEntryWithSkipAndOptions(store, entry, writes, skip, .{});
+    }
+
+    fn indexSparseBatchEntryWithSkipAndOptions(
+        self: *IndexManager,
+        store: ?*docstore_mod.DocStore,
+        entry: *SparseIndex,
+        writes: []const types.BatchWrite,
+        skip: ?*const SparseSplitHandoff,
+        batch_options: StoreBatchOptions,
+    ) !void {
         _ = store;
+        const ReplayProfile = struct {
+            scan_ns: u64 = 0,
+            extract_ns: u64 = 0,
+            append_ns: u64 = 0,
+            batch_ns: u64 = 0,
+            in_range: usize = 0,
+            primary_candidates: usize = 0,
+            skipped_by_handoff: usize = 0,
+            extracted: usize = 0,
+        };
+        const profile_enabled = sparseReplayProfileEnabled();
+        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var profile: ReplayProfile = .{};
         var sparse_writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         defer {
             for (sparse_writes.items) |item| {
@@ -6117,15 +6232,27 @@ pub const IndexManager = struct {
             sparse_writes.deinit(self.alloc);
         }
 
+        const scan_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         for (writes) |write| {
             if (!self.keyInRange(write.key)) continue;
+            if (profile_enabled) profile.in_range += 1;
             if (!isPrimaryDocumentCandidate(write.key)) continue;
+            if (profile_enabled) profile.primary_candidates += 1;
             if (skip) |handoff| {
-                if (handoff.shouldSkip(write.key)) continue;
+                if (handoff.shouldSkip(write.key)) {
+                    if (profile_enabled) profile.skipped_by_handoff += 1;
+                    continue;
+                }
             }
+            const extract_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, write.value, entry.field_name)) orelse continue;
             errdefer sparse_vec.deinit(self.alloc);
+            if (profile_enabled) {
+                profile.extract_ns += platform_time.monotonicNs() - extract_start_ns;
+                profile.extracted += 1;
+            }
 
+            const append_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             try sparse_writes.append(self.alloc, .{
                 .doc_id = write.key,
                 .vec = .{
@@ -6133,24 +6260,100 @@ pub const IndexManager = struct {
                     .values = sparse_vec.values,
                 },
             });
+            if (profile_enabled) profile.append_ns += platform_time.monotonicNs() - append_start_ns;
         }
+        if (profile_enabled) profile.scan_ns = platform_time.monotonicNs() - scan_start_ns -| profile.extract_ns -| profile.append_ns;
 
-        const max_sparse_writes_per_txn = 16;
+        const sparse_batch_options: sparse_mod.BatchOptions = .{
+            .defer_term_range_updates = true,
+            .backend_batch_options = batch_options,
+            .prefer_bulk_build = batch_options.mode == .bulk_ingest,
+            .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
+        };
+        const max_sparse_writes_per_txn: usize = if (batch_options.mode == .bulk_ingest) 16 * 1024 else 256;
         var start: usize = 0;
         while (start < sparse_writes.items.len) {
             const end = @min(start + max_sparse_writes_per_txn, sparse_writes.items.len);
-            try entry.index.batch(sparse_writes.items[start..end], &.{});
+            const batch_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try entry.index.batchWithOptions(sparse_writes.items[start..end], &.{}, sparse_batch_options);
+            if (profile_enabled) profile.batch_ns += platform_time.monotonicNs() - batch_start_ns;
             start = end;
+        }
+        if (profile_enabled and (writes.len > 0 or sparse_writes.items.len > 0)) {
+            std.log.info(
+                "antfly_bench_sparse_doc_index index={s} mode={s} input_writes={d} in_range={d} primary_candidates={d} skipped_by_handoff={d} extracted={d} sparse_writes={d} total_ms={d} scan_filter_ms={d} extract_ms={d} append_ms={d} sparse_batch_ms={d}",
+                .{
+                    entry.config.name,
+                    @tagName(batch_options.mode),
+                    writes.len,
+                    profile.in_range,
+                    profile.primary_candidates,
+                    profile.skipped_by_handoff,
+                    profile.extracted,
+                    sparse_writes.items.len,
+                    nsToMs(platform_time.monotonicNs() - total_start_ns),
+                    nsToMs(profile.scan_ns),
+                    nsToMs(profile.extract_ns),
+                    nsToMs(profile.append_ns),
+                    nsToMs(profile.batch_ns),
+                },
+            );
+        }
+    }
+
+    fn indexSparsePreparedWritesEntryWithOptions(
+        self: *IndexManager,
+        entry: *SparseIndex,
+        writes: []const sparse_mod.SparseWrite,
+        batch_options: StoreBatchOptions,
+    ) !void {
+        _ = self;
+        const profile_enabled = sparseReplayProfileEnabled();
+        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var batch_ns: u64 = 0;
+        const sparse_batch_options: sparse_mod.BatchOptions = .{
+            .defer_term_range_updates = true,
+            .backend_batch_options = batch_options,
+            .prefer_bulk_build = batch_options.mode == .bulk_ingest,
+            .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
+        };
+        const max_sparse_writes_per_txn: usize = if (batch_options.mode == .bulk_ingest) 16 * 1024 else 256;
+        var start: usize = 0;
+        while (start < writes.len) {
+            const end = @min(start + max_sparse_writes_per_txn, writes.len);
+            const batch_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try entry.index.batchWithOptions(writes[start..end], &.{}, sparse_batch_options);
+            if (profile_enabled) batch_ns += platform_time.monotonicNs() - batch_start_ns;
+            start = end;
+        }
+        if (profile_enabled) {
+            std.log.info(
+                "antfly_bench_sparse_prepared_index index={s} mode={s} sparse_writes={d} total_ms={d} sparse_batch_ms={d}",
+                .{
+                    entry.config.name,
+                    @tagName(batch_options.mode),
+                    writes.len,
+                    nsToMs(platform_time.monotonicNs() - total_start_ns),
+                    nsToMs(batch_ns),
+                },
+            );
         }
     }
 
     fn deleteSparseBatchEntry(self: *IndexManager, entry: *SparseIndex, keys: []const []const u8) !void {
+        return self.deleteSparseBatchEntryWithOptions(entry, keys, .{});
+    }
+
+    fn deleteSparseBatchEntryWithOptions(self: *IndexManager, entry: *SparseIndex, keys: []const []const u8, batch_options: StoreBatchOptions) !void {
         var filtered = std.ArrayListUnmanaged([]const u8).empty;
         defer filtered.deinit(self.alloc);
         for (keys) |key| {
             try filtered.append(self.alloc, key);
         }
-        try entry.index.batch(&.{}, filtered.items);
+        try entry.index.batchWithOptions(&.{}, filtered.items, .{
+            .defer_term_range_updates = true,
+            .backend_batch_options = batch_options,
+        });
     }
 
     pub fn lookupSparseDocNumsForOrdinalsAlloc(
@@ -7003,6 +7206,26 @@ pub const IndexManager = struct {
         return enabled;
     }
 
+    fn sparseReplayProfileEnabled() bool {
+        const cached = sparse_replay_profile_enabled_cache.load(.monotonic);
+        if (cached != 0) return cached == 2;
+        if (comptime builtin.os.tag == .freestanding) {
+            sparse_replay_profile_enabled_cache.store(1, .monotonic);
+            return false;
+        }
+        const raw_z = getenv("ANTFLY_BENCH_SPARSE_REPLAY_PROFILE") orelse
+            getenv("ANTFLY_BENCH_METRICS") orelse {
+            sparse_replay_profile_enabled_cache.store(1, .monotonic);
+            return false;
+        };
+        const raw = std.mem.span(raw_z);
+        const enabled = !(std.mem.eql(u8, raw, "0") or
+            std.ascii.eqlIgnoreCase(raw, "false") or
+            std.ascii.eqlIgnoreCase(raw, "no"));
+        sparse_replay_profile_enabled_cache.store(if (enabled) 2 else 1, .monotonic);
+        return enabled;
+    }
+
     fn openProfileEnabled() bool {
         const cached = open_profile_enabled_cache.load(.monotonic);
         if (cached != 0) return cached == 2;
@@ -7843,53 +8066,51 @@ pub const IndexManager = struct {
         return try enrichment_artifact_codec.decodeDenseEmbeddingInto(raw, scratch);
     }
 
-    fn applySparseEmbeddingWritesEntry(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, writes: []const mapper.SparseEmbeddingWrite) !void {
+    fn applySparseEmbeddingWritesEntry(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, writes: []const mapper.SparseEmbeddingWrite, batch_options: StoreBatchOptions) !void {
+        const PendingSparseArtifactLoad = struct {
+            doc_key: []const u8,
+            artifact_key: []const u8,
+        };
+        const ReplayProfile = struct {
+            scan_ns: u64 = 0,
+            sort_ns: u64 = 0,
+            artifact_read_ns: u64 = 0,
+            artifact_decode_ns: u64 = 0,
+            delete_batch_ns: u64 = 0,
+            sparse_batch_ns: u64 = 0,
+            corrupt_delete_ns: u64 = 0,
+        };
+        const profile_enabled = sparseReplayProfileEnabled();
+        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var profile: ReplayProfile = .{};
         var sparse_writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         var owned_indices = std.ArrayListUnmanaged([]u32).empty;
         var owned_values = std.ArrayListUnmanaged([]f32).empty;
+        var pending_artifact_loads = std.ArrayListUnmanaged(PendingSparseArtifactLoad).empty;
         defer {
             for (owned_indices.items) |indices| self.alloc.free(indices);
             for (owned_values.items) |values| self.alloc.free(values);
             owned_indices.deinit(self.alloc);
             owned_values.deinit(self.alloc);
             sparse_writes.deinit(self.alloc);
+            pending_artifact_loads.deinit(self.alloc);
         }
         var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer delete_keys.deinit(self.alloc);
         var corrupt_artifact_deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer corrupt_artifact_deletes.deinit(self.alloc);
-        var artifact_read_txn: ?docstore_mod.DocStore.Txn = null;
-        defer if (artifact_read_txn) |*txn| txn.abort();
 
+        const scan_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         for (writes) |write| {
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
-            var indices = write.indices;
-            var values = write.values;
-            var loaded_sparse: ?enrichment_artifact_codec.SparseEmbedding = null;
-            defer if (loaded_sparse) |*sparse| sparse.deinit(self.alloc);
+            const indices = write.indices;
+            const values = write.values;
             if (write.artifact_key != null and indices.len == 0) {
-                const artifact_key = write.artifact_key.?;
-                if (artifact_read_txn == null) artifact_read_txn = try store.beginProbeTxn();
-                loaded_sparse = self.loadSparseEmbeddingArtifactTxn(&artifact_read_txn.?, artifact_key) catch |err| {
-                    if (err == error.NotFound) continue;
-                    if (isRecoverableEmbeddingArtifactError(err)) {
-                        try corrupt_artifact_deletes.append(self.alloc, artifact_key);
-                        continue;
-                    }
-                    return err;
-                };
-                const owned_indices_slice = try self.alloc.dupe(u32, loaded_sparse.?.indices);
-                errdefer self.alloc.free(owned_indices_slice);
-                try owned_indices.append(self.alloc, owned_indices_slice);
-                errdefer _ = owned_indices.pop();
-
-                const owned_values_slice = try self.alloc.dupe(f32, loaded_sparse.?.values);
-                errdefer self.alloc.free(owned_values_slice);
-                try owned_values.append(self.alloc, owned_values_slice);
-                errdefer _ = owned_values.pop();
-
-                indices = owned_indices_slice;
-                values = owned_values_slice;
+                try pending_artifact_loads.append(self.alloc, .{
+                    .doc_key = write.doc_key,
+                    .artifact_key = write.artifact_key.?,
+                });
+                continue;
             }
             try delete_keys.append(self.alloc, write.doc_key);
             try sparse_writes.append(self.alloc, .{
@@ -7900,14 +8121,106 @@ pub const IndexManager = struct {
                 },
             });
         }
+        if (profile_enabled) profile.scan_ns = platform_time.monotonicNs() - scan_start_ns;
+
+        if (pending_artifact_loads.items.len > 0) {
+            const sort_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            std.mem.sort(PendingSparseArtifactLoad, pending_artifact_loads.items, {}, struct {
+                fn lessThan(_: void, a: PendingSparseArtifactLoad, b: PendingSparseArtifactLoad) bool {
+                    return std.mem.order(u8, a.artifact_key, b.artifact_key) == .lt;
+                }
+            }.lessThan);
+            if (profile_enabled) profile.sort_ns = platform_time.monotonicNs() - sort_start_ns;
+
+            const read_keys = try self.alloc.alloc([]const u8, pending_artifact_loads.items.len);
+            defer self.alloc.free(read_keys);
+            const read_values = try self.alloc.alloc(?[]const u8, pending_artifact_loads.items.len);
+            defer self.alloc.free(read_values);
+            for (pending_artifact_loads.items, 0..) |item, i| read_keys[i] = item.artifact_key;
+
+            const read_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            var artifact_read_txn = try store.beginProbeTxn();
+            defer artifact_read_txn.abort();
+            try artifact_read_txn.getManySorted(read_keys, read_values);
+            if (profile_enabled) profile.artifact_read_ns = platform_time.monotonicNs() - read_start_ns;
+
+            const decode_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            for (pending_artifact_loads.items, 0..) |item, i| {
+                const raw = read_values[i] orelse continue;
+                var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(self.alloc, raw) catch |err| {
+                    if (isRecoverableEmbeddingArtifactError(err)) {
+                        try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                        continue;
+                    }
+                    return err;
+                };
+                errdefer decoded.deinit(self.alloc);
+
+                const owned_indices_slice = decoded.indices;
+                try owned_indices.append(self.alloc, owned_indices_slice);
+                decoded.indices = &.{};
+
+                const owned_values_slice = decoded.values;
+                try owned_values.append(self.alloc, owned_values_slice);
+                decoded.values = &.{};
+
+                try delete_keys.append(self.alloc, item.doc_key);
+                try sparse_writes.append(self.alloc, .{
+                    .doc_id = item.doc_key,
+                    .vec = .{
+                        .indices = owned_indices_slice,
+                        .values = owned_values_slice,
+                    },
+                });
+            }
+            if (profile_enabled) profile.artifact_decode_ns = platform_time.monotonicNs() - decode_start_ns;
+        }
 
         if (delete_keys.items.len > 0) {
-            try entry.index.batch(&.{}, delete_keys.items);
+            const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
+                .defer_term_range_updates = true,
+                .backend_batch_options = batch_options,
+            });
+            if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
         }
         if (sparse_writes.items.len > 0) {
-            try entry.index.batch(sparse_writes.items, &.{});
+            const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+                .defer_term_range_updates = true,
+                .backend_batch_options = batch_options,
+                .prefer_bulk_build = batch_options.mode == .bulk_ingest,
+                .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
+            });
+            if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
         }
-        if (corrupt_artifact_deletes.items.len > 0) try store.putBatch(&.{}, corrupt_artifact_deletes.items);
+        if (corrupt_artifact_deletes.items.len > 0) {
+            const corrupt_delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try store.putBatch(&.{}, corrupt_artifact_deletes.items);
+            if (profile_enabled) profile.corrupt_delete_ns = platform_time.monotonicNs() - corrupt_delete_start_ns;
+        }
+        if (profile_enabled and (pending_artifact_loads.items.len > 0 or sparse_writes.items.len > 0 or delete_keys.items.len > 0)) {
+            std.log.info(
+                "antfly_bench_sparse_replay index={s} mode={s} input_writes={d} pending_artifacts={d} sparse_writes={d} delete_keys={d} corrupt_artifacts={d} total_ms={d} scan_ms={d} sort_ms={d} artifact_read_ms={d} artifact_decode_ms={d} delete_batch_ms={d} sparse_batch_ms={d} corrupt_delete_ms={d}",
+                .{
+                    entry.config.name,
+                    @tagName(batch_options.mode),
+                    writes.len,
+                    pending_artifact_loads.items.len,
+                    sparse_writes.items.len,
+                    delete_keys.items.len,
+                    corrupt_artifact_deletes.items.len,
+                    nsToMs(platform_time.monotonicNs() - total_start_ns),
+                    nsToMs(profile.scan_ns),
+                    nsToMs(profile.sort_ns),
+                    nsToMs(profile.artifact_read_ns),
+                    nsToMs(profile.artifact_decode_ns),
+                    nsToMs(profile.delete_batch_ns),
+                    nsToMs(profile.sparse_batch_ns),
+                    nsToMs(profile.corrupt_delete_ns),
+                },
+            );
+        }
     }
 
     fn writeDenseVectorMapping(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, doc_key: []const u8, vector_id: u64) !void {

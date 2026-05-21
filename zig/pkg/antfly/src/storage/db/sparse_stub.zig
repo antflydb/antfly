@@ -14,7 +14,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const backend_types = @import("../backend_types.zig");
 const lsm_backend = @import("../lsm_backend/mod.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 pub const SparseVector = struct {
     indices: []const u32,
@@ -74,6 +76,45 @@ pub const SparseBackend = enum {
 
 pub const BatchOptions = struct {
     defer_term_range_updates: bool = false,
+    backend_batch_options: backend_types.BatchOptions = .{},
+    prefer_bulk_build: bool = false,
+    assume_new_doc_ids: bool = false,
+};
+
+pub const WriteProfile = struct {
+    batch_calls: u64 = 0,
+    incremental_calls: u64 = 0,
+    bulk_append_calls: u64 = 0,
+    bulk_append_fallbacks: u64 = 0,
+    writes: u64 = 0,
+    deletes: u64 = 0,
+    postings: u64 = 0,
+    terms: u64 = 0,
+    reserve_ns: u64 = 0,
+    dedupe_ns: u64 = 0,
+    existence_check_ns: u64 = 0,
+    doc_num_ns: u64 = 0,
+    fwd_rev_put_ns: u64 = 0,
+    posting_collect_ns: u64 = 0,
+    posting_sort_ns: u64 = 0,
+    posting_write_ns: u64 = 0,
+    chunk_read_ns: u64 = 0,
+    chunk_encode_ns: u64 = 0,
+    chunk_put_ns: u64 = 0,
+    range_meta_encode_ns: u64 = 0,
+    range_meta_put_ns: u64 = 0,
+    term_meta_ns: u64 = 0,
+    commit_ns: u64 = 0,
+    incremental_delete_ns: u64 = 0,
+    incremental_insert_ns: u64 = 0,
+    incremental_refresh_ns: u64 = 0,
+    incremental_commit_ns: u64 = 0,
+
+    pub fn delta(after: WriteProfile, before: WriteProfile) WriteProfile {
+        _ = after;
+        _ = before;
+        return .{};
+    }
 };
 
 pub const SparseIndex = struct {
@@ -96,8 +137,32 @@ pub const SparseIndex = struct {
         return error.UnsupportedPlatform;
     }
 
+    pub fn attachResourceManager(_: *SparseIndex, _: *resource_manager_mod.ResourceManager) void {}
+
+    pub fn getWriteProfile(_: *SparseIndex) WriteProfile {
+        return .{};
+    }
+
+    pub fn beginBulkIngestSession(_: *SparseIndex) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn finishBulkIngestSessionWithOptions(_: *SparseIndex, _: backend_types.BulkIngestFinishOptions) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn abortBulkIngestSession(_: *SparseIndex) void {}
+
     pub fn stats(_: *SparseIndex) Stats {
         return .{};
+    }
+
+    pub fn refreshPersistedStatsFromScan(_: *SparseIndex) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn persistBackfillDocCount(_: *SparseIndex, _: u64) !void {
+        return error.UnsupportedPlatform;
     }
 
     pub fn batch(_: *SparseIndex, _: []const SparseWrite, _: []const []const u8) !void {
