@@ -36,6 +36,7 @@ const HttpRequest = http_common.HttpRequest;
 const HttpResponse = http_common.HttpResponse;
 const RequestExecutor = http_common.RequestExecutor;
 const metrics_cache_ttl_ms: u64 = 5 * std.time.ms_per_s;
+const health_thread_stack_size: usize = 1 * 1024 * 1024;
 
 pub const ReadinessChecker = struct {
     ptr: *anyopaque,
@@ -101,9 +102,8 @@ pub const HealthServer = struct {
             .bind_host = cfg.bind_host,
             .bind_port = cfg.bind_port,
             .reuse_address = true,
-            .thread_stack_size = 256 * 1024,
             .serve_in_connection_threads = true,
-            .connection_thread_stack_size = 256 * 1024,
+            .connection_thread_stack_size = health_thread_stack_size,
             .max_connection_threads = 16,
         }, self.executor());
         if (metrics != null) {
@@ -167,7 +167,11 @@ pub const HealthServer = struct {
             .bind_port = p,
         }, ready, metrics);
         errdefer hs.deinit();
-        try hs.start();
+        hs.start() catch |err| {
+            hs.deinit();
+            std.log.warn("{s} health api disabled port={d} err={}", .{ label, p, err });
+            return null;
+        };
         const uri = try hs.baseUri(alloc);
         defer alloc.free(uri);
         std.debug.print("{s} health api listening on {s}\n", .{ label, uri });
@@ -233,7 +237,7 @@ pub const HealthServer = struct {
         if (self.metrics == null or self.metrics_refresh_future != null) return;
         self.metrics_refresh_stop.store(false, .release);
         if (self.metrics_refresh_io == null) {
-            self.metrics_refresh_io = Io.Threaded.init(self.alloc, .{ .stack_size = 256 * 1024 });
+            self.metrics_refresh_io = Io.Threaded.init(self.alloc, .{ .stack_size = health_thread_stack_size });
         }
         const io = self.metrics_refresh_io.?.io();
         self.metrics_refresh_future = try io.concurrent(metricsRefreshTask, .{self});

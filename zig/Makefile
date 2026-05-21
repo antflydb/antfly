@@ -52,7 +52,7 @@ termite-e2e-models: ## Prefetch the curated termite E2E model set with `termite 
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
 generate: openapi-generate snowball-generate ## Regenerate checked-in generated sources.
 
@@ -82,7 +82,7 @@ license-check: ## Check first-party source files have license headers.
 tla-tools:
 	@bash scripts/tla-tools.sh
 
-tla-check: tla-check-txn tla-check-split tla-check-snap
+tla-check: tla-check-txn tla-check-split tla-check-snap tla-check-lsm
 
 tla-check-txn: tla-tools
 	@echo "==> Model checking transaction spec..."
@@ -103,6 +103,13 @@ tla-check-snap: tla-tools
 	source scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \
+	  -workers auto -deadlock
+
+tla-check-lsm: tla-tools
+	@echo "==> Model checking LSM lifecycle OOM safety..."
+	source scripts/tla-tools.sh && \
+	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
+	  -config specs/tla/AntflyLsmLifecycle.cfg specs/tla/AntflyLsmLifecycle.tla \
 	  -workers auto -deadlock
 
 tla-trace-raft: tla-tools

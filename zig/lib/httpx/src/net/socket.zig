@@ -946,13 +946,14 @@ test "Socket.writer writeAll and print over TCP" {
 
     var buf2: [512]u8 = undefined;
     var total2: usize = 0;
-    while (total2 < 4) { // read at least request line
+    const expected_prefix = "GET /test";
+    while (total2 < expected_prefix.len) {
         const n = try result2.socket.recv(buf2[total2..]);
         if (n == 0) break;
         total2 += n;
     }
     // Verify the request line was serialized correctly.
-    try std.testing.expect(std.mem.startsWith(u8, buf2[0..total2], "GET /test"));
+    try std.testing.expect(std.mem.startsWith(u8, buf2[0..total2], expected_prefix));
 }
 
 test "UdpSocket send/recv localhost" {

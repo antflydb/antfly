@@ -8,13 +8,6 @@ components:
   schemas:
     Config:
       type: object
-      required:
-        - metadata
-        - storage
-        - replication_factor
-        - max_shard_size_bytes
-        - max_shards_per_table
-        - default_shards_per_table
       properties:
         version:
           type: string
@@ -22,6 +15,10 @@ components:
           example: "0.0.1"
         log:
           $ref: "../../pkg/libaf/logging/openapi.yaml#/components/schemas/Config"
+        health_enabled:
+          type: boolean
+          description: "Enables the health/metrics server. Defaults to true."
+          default: true
         health_port:
           type: integer
           description: "Port for the health/metrics server. Defaults to 4200."
@@ -75,6 +72,7 @@ components:
           description: "How many replicas of each shard should be maintained."
           minimum: 1
           maximum: 5
+          default: 3
           example: 3
           x-go-type: uint64
         enable_auth:
@@ -84,7 +82,7 @@ components:
         disable_shard_alloc:
           type: boolean
           description: "Disables automatic shard reallocation (splitting/merging)."
-          default: false
+          default: true
         shard_cooldown_period:
           type: string
           description: "Cooldown period after shard operations (start/stop/split). Format: duration string like '1m', '30s'. Default: '1m' (one minute)."
@@ -105,6 +103,7 @@ components:
           description: "Maximum size of a shard in bytes. Used to determine when to split shards."
           minimum: 1048576
           maximum: 46170898227200
+          default: 67108864
           example: 1073741824
           x-go-type: uint64
         min_shard_size_bytes:
@@ -123,12 +122,14 @@ components:
           type: integer
           description: "Maximum number of shards that can be created for a single table."
           minimum: 1
+          default: 20
           example: 100
           x-go-type: uint64
         default_shards_per_table:
           type: integer
           description: "Default number of shards to create for a new table."
           minimum: 1
+          default: 3
           example: 4
           x-go-type: uint64
         swarm_mode:
@@ -371,8 +372,6 @@ components:
 
     MetadataInfo:
       type: object
-      required:
-        - orchestration_urls
       properties:
         orchestration_urls:
           type: object
@@ -399,8 +398,6 @@ components:
 
     LocalStorageConfig:
       type: object
-      required:
-        - base_dir
       properties:
         base_dir:
           type: string
@@ -440,8 +437,6 @@ components:
 
     StorageConfig:
       type: object
-      required:
-        - local
       properties:
         local:
           $ref: "#/components/schemas/LocalStorageConfig"

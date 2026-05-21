@@ -43,12 +43,14 @@ func init() {
 	storeCmd.Flags().String("raft", "http://0.0.0.0:9021", "raft server URL")
 	storeCmd.Flags().String("api", "http://0.0.0.0:12380", "api server URL")
 	storeCmd.Flags().String("service", "", "service name (for multi-tenant mode) with kubernetes")
+	storeCmd.Flags().Bool("health", true, "enable health/metrics server")
 	storeCmd.Flags().Int("health-port", 4200, "health/metrics server port")
 
 	mustBindPFlag("store.id", storeCmd.Flags().Lookup("id"))
 	mustBindPFlag("store.raft", storeCmd.Flags().Lookup("raft"))
 	mustBindPFlag("store.api", storeCmd.Flags().Lookup("api"))
 	mustBindPFlag("store.service", storeCmd.Flags().Lookup("service"))
+	mustBindPFlag("health_enabled", storeCmd.Flags().Lookup("health"))
 	mustBindPFlag("health_port", storeCmd.Flags().Lookup("health-port"))
 }
 
@@ -69,7 +71,9 @@ func runStore(cmd *cobra.Command, args []string) error {
 	defer cache.Close()
 
 	readyC := make(chan struct{})
-	startHealthServer(logger, config.HealthPort, readyC, "Store")
+	if config.HealthEnabled {
+		startHealthServer(logger, config.HealthPort, readyC, "Store")
+	}
 
 	storeConf := &store.StoreInfo{
 		ID:      types.ID(viper.GetUint64("store.id")),

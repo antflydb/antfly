@@ -105,8 +105,18 @@ spec:
                 items:
                   description: ModelSpec defines a single model to load
                   properties:
+                    capabilities:
+                      description: |-
+                        Capabilities declares modality/runtime capabilities to write into the
+                        pulled model manifest. For example: ["text", "image", "audio"].
+                      items:
+                        type: string
+                      type: array
                     name:
-                      description: Name is the model name (e.g., "bge-small-en-v1.5")
+                      description: |-
+                        Name is the model reference, including an optional tag/variant suffix
+                        (e.g., "BAAI/bge-small-en-v1.5:i8" or "hf:antflydb/clipclap:gguf:Q4_K").
+                      minLength: 1
                       type: string
                     priority:
                       default: medium
@@ -126,9 +136,13 @@ spec:
                       - lazy
                       - bounded
                       type: string
-                    variant:
-                      description: Variant specifies a model variant (e.g., "quantized")
-                      type: string
+                    tasks:
+                      description: |-
+                        Tasks declares the model tasks to write into the pulled model manifest.
+                        For example: ["embed"].
+                      items:
+                        type: string
+                      type: array
                   required:
                   - name
                   type: object

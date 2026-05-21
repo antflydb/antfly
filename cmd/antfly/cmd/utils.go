@@ -111,6 +111,7 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 		// If the default wasn't set by swarm mode set it here
 		v.SetDefault("default_shards_per_table", 3)
 	}
+	v.SetDefault("health_enabled", true)
 	v.SetDefault("health_port", 4200)
 	// Storage defaults
 	v.SetDefault("storage.local.base_dir", common.DefaultDataDir())
