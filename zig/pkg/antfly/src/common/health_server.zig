@@ -153,7 +153,11 @@ pub const HealthServer = struct {
         const p = port orelse return null;
         const hs = try HealthServer.init(alloc, .{ .bind_port = p }, ready, metrics);
         errdefer hs.deinit();
-        try hs.start();
+        hs.start() catch |err| {
+            hs.deinit();
+            std.log.warn("{s} health api disabled port={d} err={}", .{ label, p, err });
+            return null;
+        };
         const uri = try hs.baseUri(alloc);
         defer alloc.free(uri);
         std.debug.print("{s} health api listening on {s}\n", .{ label, uri });

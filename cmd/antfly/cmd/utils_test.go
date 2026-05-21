@@ -166,6 +166,7 @@ func TestParseConfigDefaults(t *testing.T) {
 	require.Equal(t, uint64(20), config.MaxShardsPerTable)
 	require.Equal(t, uint64(3), config.ReplicationFactor)
 	require.Equal(t, uint64(3), config.DefaultShardsPerTable)
+	require.True(t, config.HealthEnabled)
 	require.Equal(t, 4200, config.HealthPort)
 	require.Equal(t, common.DefaultDataDir(), config.Storage.Local.BaseDir)
 	require.True(t, config.DisableShardAlloc)
@@ -205,6 +206,7 @@ max_shard_size_bytes: 134217728
 max_shards_per_table: 50
 replication_factor: 2
 default_shards_per_table: 5
+health_enabled: false
 health_port: 9090
 storage:
   local:
@@ -222,6 +224,7 @@ storage:
 	require.Equal(t, uint64(50), config.MaxShardsPerTable)
 	require.Equal(t, uint64(2), config.ReplicationFactor)
 	require.Equal(t, uint64(5), config.DefaultShardsPerTable)
+	require.False(t, config.HealthEnabled)
 	require.Equal(t, 9090, config.HealthPort)
 	require.Equal(t, "/tmp/antfly-test", config.Storage.Local.BaseDir)
 }
