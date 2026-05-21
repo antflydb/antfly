@@ -51,9 +51,7 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test o
 else
     @import("../../../template_remote.zig");
 const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
-    struct {
-        pub const RemoteContentConfig = opaque {};
-    }
+    @import("../scraping_stub.zig")
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");

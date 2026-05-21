@@ -794,6 +794,28 @@ test "common config extracts termite settings" {
     try std.testing.expectEqualStrings("termite-secret", cfg.termite.s3_credentials.?.secret_access_key.?);
 }
 
+test "common config defaults shard scalar fields" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:7001"
+        \\    }
+        \\  },
+        \\  "storage": {
+        \\    "local": { "base_dir": "antflydb" }
+        \\  }
+        \\}
+    ;
+    var cfg = try Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
+    try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
+    try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
+}
+
 test "common config treats go orchestration urls as metadata api discovery urls" {
     const alloc = std.testing.allocator;
     const raw =

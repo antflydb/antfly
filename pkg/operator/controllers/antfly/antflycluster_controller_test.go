@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -31,6 +32,22 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func mergeStringMaps(base map[string]string, overlay map[string]string) map[string]string {
+	merged := maps.Clone(base)
+	maps.Copy(merged, overlay)
+	return merged
+}
+
+func statefulSetOwnerRef(name string) metav1.OwnerReference {
+	controller := true
+	return metav1.OwnerReference{
+		APIVersion: "apps/v1",
+		Kind:       "StatefulSet",
+		Name:       name,
+		Controller: &controller,
+	}
 }
 
 // T004: Unit test for applyDefaults() setting ServiceMesh.Enabled=false
@@ -255,7 +272,7 @@ func TestReconcileTermitePoolPreservesCustomImage(t *testing.T) {
 		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
 	cluster := baseClusterWithTermiteSpec()
-	cluster.Spec.Termite.Image = "registry.example.com/antfly:custom-termite"
+	cluster.Spec.Termite.ManagedPools[0].Spec.Image = "registry.example.com/antfly:custom-termite"
 
 	err := reconciler.reconcileTermitePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -392,6 +409,65 @@ func TestReconcileTermitePoolManagementDisabledLeavesOwnedPool(t *testing.T) {
 	})))
 }
 
+func TestReconcileTermitePoolSharedRefDoesNotCreatePool(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	cluster := baseClusterWithTermiteSpec()
+	cluster.Spec.Termite = &antflyv1.AntflyTermiteSpec{
+		Mode: antflyv1.AntflyTermiteModeSharedRef,
+		SharedPools: []antflyv1.TermitePoolReference{{
+			Name:      "customer-shared-embeddings",
+			Namespace: "inference",
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:             s,
+		ManageTermitePools: true,
+	}
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+	g.Expect(cluster.Status.Conditions).To(ContainElement(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+		"Type":   Equal(antflyv1.TypeTermitePoolReady),
+		"Status": Equal(metav1.ConditionTrue),
+		"Reason": Equal(antflyv1.ReasonTermitePoolReady),
+	})))
+}
+
+func TestReconcileTermitePoolPlatformSharedDeletesOwnedPool(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newOperatorTestScheme(g)
+	cluster := baseClusterWithTermiteSpec()
+	managedPool := &termitev1alpha1.TermitePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-termite",
+			Namespace: "default",
+		},
+	}
+	g.Expect(controllerutil.SetControllerReference(cluster, managedPool, s)).To(Succeed())
+	cluster.Spec.Termite = &antflyv1.AntflyTermiteSpec{
+		Mode: antflyv1.AntflyTermiteModePlatformShared,
+		PlatformPools: []antflyv1.TermitePoolReference{{
+			Name: "default-embeddings",
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool).Build(),
+		Scheme:             s,
+		ManageTermitePools: true,
+	}
+
+	err := reconciler.reconcileTermitePool(ctx, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
 func newOperatorTestScheme(g *WithT) *runtime.Scheme {
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
@@ -411,10 +487,15 @@ func baseClusterWithTermiteSpec() *antflyv1.AntflyCluster {
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			Image: "antfly:test",
-			Termite: &termitev1alpha1.TermitePoolSpec{
-				Models:   termitev1alpha1.ModelConfig{},
-				Replicas: termitev1alpha1.ReplicaConfig{Min: 1, Max: 2},
-				Hardware: termitev1alpha1.HardwareConfig{},
+			Termite: &antflyv1.AntflyTermiteSpec{
+				Mode: antflyv1.AntflyTermiteModeManaged,
+				ManagedPools: []antflyv1.ManagedTermitePoolSpec{{
+					Spec: termitev1alpha1.TermitePoolSpec{
+						Models:   termitev1alpha1.ModelConfig{},
+						Replicas: termitev1alpha1.ReplicaConfig{Min: 1, Max: 2},
+						Hardware: termitev1alpha1.HardwareConfig{},
+					},
+				}},
 			},
 		},
 	}
@@ -657,6 +738,132 @@ func TestUpdateRolloutConditionReportsMissingStatefulSet(t *testing.T) {
 	g.Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
 	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutInProgress))
 	g.Expect(cond.Message).To(ContainSubstring("not observed"))
+}
+
+func TestRepairBlockedStatefulSetRolloutDeletesStaleUnhealthyPod(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-metadata", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "antfly", Image: "antfly:new"}},
+				},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			UpdateRevision:  "metadata-new",
+			UpdatedReplicas: 0,
+		},
+	}
+	staleUnreadyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-cluster-metadata-0",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{statefulSetOwnerRef(sts.Name)},
+			Labels: mergeStringMaps(
+				serviceSelectorLabels("test-cluster", "metadata"),
+				map[string]string{"controller-revision-hash": "metadata-old"},
+			),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "antfly", Image: "antfly:old"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionFalse,
+				Reason: "ContainersNotReady",
+			}},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(staleUnreadyPod).Build(),
+		Scheme: s,
+	}
+
+	repaired, err := reconciler.repairBlockedStatefulSetRollout(ctx, cluster, sts, "metadata")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(repaired).To(BeTrue())
+
+	deleted := &corev1.Pod{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: staleUnreadyPod.Name, Namespace: staleUnreadyPod.Namespace}, deleted)
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
+func TestRepairBlockedStatefulSetRolloutKeepsHealthyStalePod(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-data", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "antfly", Image: "antfly:new"}},
+				},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			UpdateRevision:  "data-new",
+			UpdatedReplicas: 1,
+		},
+	}
+	healthyStalePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-cluster-data-0",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{statefulSetOwnerRef(sts.Name)},
+			Labels: mergeStringMaps(
+				serviceSelectorLabels("test-cluster", "data"),
+				map[string]string{"controller-revision-hash": "data-old"},
+			),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "antfly", Image: "antfly:old"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(healthyStalePod).Build(),
+		Scheme: s,
+	}
+
+	repaired, err := reconciler.repairBlockedStatefulSetRollout(ctx, cluster, sts, "data")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(repaired).To(BeFalse())
+
+	existing := &corev1.Pod{}
+	g.Expect(reconciler.Get(ctx, types.NamespacedName{Name: healthyStalePod.Name, Namespace: healthyStalePod.Namespace}, existing)).To(Succeed())
 }
 
 func TestEffectiveDataReplicaTargetPrefersStatefulSetSpec(t *testing.T) {
@@ -1933,6 +2140,8 @@ func TestGenerateCompleteConfig(t *testing.T) {
 	// Verify the full URL format
 	expectedURL := "http://test-cluster-metadata-0.test-cluster-metadata.default.svc.cluster.local:12377"
 	g.Expect(url1).To(Equal(expectedURL))
+	g.Expect(config["default_shards_per_table"]).To(Equal(float64(1)))
+	g.Expect(config["max_shards_per_table"]).To(Equal(float64(0)))
 }
 
 func TestGenerateCompleteConfig_Swarm(t *testing.T) {
