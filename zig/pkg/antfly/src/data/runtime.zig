@@ -1313,6 +1313,7 @@ pub const DataServer = struct {
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
+    store_registration_confirmed: bool = false,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
@@ -1660,7 +1661,20 @@ pub const DataServer = struct {
         }
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
-        if (self.store_registration != null) self.store_status_dirty = true;
+        if (self.store_registration != null) {
+            self.store_status_dirty = true;
+            self.registerNodeIfConfigured() catch |err| switch (err) {
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.ConnectionRefused,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.UnexpectedHttpStatus,
+                error.NotListening,
+                => std.log.warn("data node registration deferred err={}", .{err}),
+                else => return err,
+            };
+        }
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
             error.SystemResources,
@@ -1697,6 +1711,19 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata != null and self.store_registration != null) {
+            if (!self.store_registration_confirmed) {
+                self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
+                    error.HttpConnectionClosing,
+                    error.ConnectionResetByPeer,
+                    error.ConnectionRefused,
+                    error.BrokenPipe,
+                    error.EndOfStream,
+                    error.UnexpectedHttpStatus,
+                    error.NotListening,
+                    => {},
+                    else => return register_err,
+                };
+            }
             self.store_status_ticks += 1;
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
             const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
@@ -1726,6 +1753,7 @@ pub const DataServer = struct {
                     error.UnexpectedHttpStatus,
                     => {},
                     error.UnknownStore => {
+                        self.store_registration_confirmed = false;
                         self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
                             error.HttpConnectionClosing,
                             error.ConnectionResetByPeer,
@@ -2816,6 +2844,7 @@ pub const DataServer = struct {
             .failure_domain = registration.failure_domain,
             .live = true,
         });
+        self.store_registration_confirmed = true;
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
