@@ -141,11 +141,15 @@ func init() {
 	termiteCmd.AddCommand(termiteListCmd)
 
 	// Run command flags
+	termiteRunCmd.Flags().Bool("health", true, "enable health/metrics server")
 	termiteRunCmd.Flags().Int("health-port", 4200, "health/metrics server port")
+	mustBindPFlag("health_enabled", termiteRunCmd.Flags().Lookup("health"))
 	mustBindPFlag("health_port", termiteRunCmd.Flags().Lookup("health-port"))
 
 	// Also bind to parent for backward compatibility (antfly termite --health-port)
+	termiteCmd.Flags().Bool("health", true, "enable health/metrics server")
 	termiteCmd.Flags().Int("health-port", 4200, "health/metrics server port")
+	mustBindPFlag("health_enabled", termiteCmd.Flags().Lookup("health"))
 	mustBindPFlag("health_port", termiteCmd.Flags().Lookup("health-port"))
 
 	// Persistent flags for model management (shared across pull/list)
@@ -186,7 +190,9 @@ func runTermite(cmd *cobra.Command, args []string) error {
 	logger.Info("Running as termite")
 
 	readyC := make(chan struct{})
-	startHealthServer(logger, config.HealthPort, readyC, "Termite")
+	if config.HealthEnabled {
+		startHealthServer(logger, config.HealthPort, readyC, "Termite")
+	}
 
 	termite.RunAsTermite(ctx, logger, termiteConfigWithSecurity(config), readyC)
 	return nil

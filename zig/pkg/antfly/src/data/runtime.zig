@@ -52,6 +52,7 @@ const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
+    health_enabled: ?bool = null,
     health_port: ?u16 = null,
     raft_bind_host: ?[]const u8 = null,
     raft_bind_port: ?u16 = null,
@@ -6799,7 +6800,11 @@ pub fn runFromIterator(
     std.debug.print("\n", .{});
 
     var data_health = HealthSource{ .data_server = &data_server };
-    const health_port = cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else null;
+    const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
+    const health_port = if (health_enabled)
+        cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
+    else
+        null;
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
         "data",
@@ -6855,6 +6860,15 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--health-port")) {
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--health")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.health_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--health=")) {
+            cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--auth")) {
@@ -7042,7 +7056,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-port <port>              Data API bind port (default: 0)
         \\  --raft-host <host>             Data raft bind host (default: 127.0.0.1)
         \\  --raft-port <port>             Data raft bind port (default: 0 when registered)
-        \\  --health-port <port>           Dedicated health/metrics bind port (default: unset)
+        \\  --health <true|false>          Enable health/metrics server (default: true)
+        \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --auth <true|false>            Enable auth middleware and local user store
         \\  --metadata-api <uri>           Metadata orchestration/API URL (repeat for multiple endpoints)
         \\  --node-id <id>                 Register this split data process as metadata node <id>
