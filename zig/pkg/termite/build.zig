@@ -212,10 +212,7 @@ pub fn build(b: *std.Build) void {
     const onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root (default: ./onnxruntime/<platform>)");
     const default_onnx_root = defaultOnnxRuntimeRoot(b, target);
     const effective_onnx_root = onnx_root_opt orelse default_onnx_root;
-    const onnx_runtime_available = !enable_wasm and link_libc and
-        pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{effective_onnx_root})) and
-        pathExists(b, b.fmt("{s}/lib", .{effective_onnx_root}));
-    const enable_onnx = if (enable_wasm or !link_libc) false else (b.option(bool, "onnx", "Enable ONNX Runtime backend") orelse onnx_runtime_available);
+    const enable_onnx = if (enable_wasm or !link_libc) false else (b.option(bool, "onnx", "Enable ONNX Runtime backend (default: false)") orelse false);
     const mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with lib/libmlxc.dylib");
     const default_mlx_root = defaultMlxRoot(b, target);
     const effective_mlx_root = mlx_root_opt orelse default_mlx_root;

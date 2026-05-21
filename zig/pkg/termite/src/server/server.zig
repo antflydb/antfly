@@ -4071,8 +4071,9 @@ pub const Node = struct {
         try buf.appendSlice(a, body.items);
         try buf.append(a, '}');
 
-        try ctx.setHeader("Content-Type", "application/json");
-        return ctx.text(buf.items);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(buf.items);
+        return ctx.response.build();
     }
 
     pub fn getVersion(_: *Node, ctx: *httpx.Context) !httpx.Response {

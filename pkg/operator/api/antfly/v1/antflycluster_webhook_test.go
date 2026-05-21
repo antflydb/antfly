@@ -1748,17 +1748,22 @@ func TestValidateCreate_SwarmRejectsInvalidTermiteURL(t *testing.T) {
 
 func TestValidateCreate_RejectsInvalidManagedTermiteSpec(t *testing.T) {
 	cluster := baseCluster()
-	cluster.Spec.Termite = &termitev1alpha1.TermitePoolSpec{
-		Models:   termitev1alpha1.ModelConfig{},
-		Replicas: termitev1alpha1.ReplicaConfig{Min: 3, Max: 1},
-		Hardware: termitev1alpha1.HardwareConfig{},
+	cluster.Spec.Termite = &AntflyTermiteSpec{
+		Mode: AntflyTermiteModeManaged,
+		ManagedPools: []ManagedTermitePoolSpec{{
+			Spec: termitev1alpha1.TermitePoolSpec{
+				Models:   termitev1alpha1.ModelConfig{},
+				Replicas: termitev1alpha1.ReplicaConfig{Min: 3, Max: 1},
+				Hardware: termitev1alpha1.HardwareConfig{},
+			},
+		}},
 	}
 
 	err := cluster.ValidateCreate()
 	if err == nil {
 		t.Fatal("expected error for invalid managed termite spec")
 	}
-	if !strings.Contains(err.Error(), "spec.termite is invalid") {
+	if !strings.Contains(err.Error(), "spec.termite.managedPools[0].spec is invalid") {
 		t.Fatalf("expected managed termite validation error, got: %v", err)
 	}
 }

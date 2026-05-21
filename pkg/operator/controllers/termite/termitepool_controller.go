@@ -238,11 +238,7 @@ func (r *TermitePoolReconciler) reconcileConfigMap(ctx context.Context, pool *an
 	// Build model list for environment variables (backward compatibility)
 	models := make([]string, 0, len(pool.Spec.Models.Preload))
 	for _, m := range pool.Spec.Models.Preload {
-		name := m.Name
-		if m.Variant != "" {
-			name = name + ":" + m.Variant
-		}
-		models = append(models, name)
+		models = append(models, m.Name)
 	}
 
 	cm := &corev1.ConfigMap{
@@ -302,11 +298,7 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 	// Build preload model list
 	preload := make([]string, 0, len(pool.Spec.Models.Preload))
 	for _, m := range pool.Spec.Models.Preload {
-		name := m.Name
-		if m.Variant != "" {
-			name = name + ":" + m.Variant
-		}
-		preload = append(preload, name)
+		preload = append(preload, m.Name)
 	}
 
 	// Set auto-generated config (don't override if user specified)
@@ -316,16 +308,12 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 
 	// Build per-model loading strategies map
 	// Only include models that have an explicit strategy override
-	// Key format: "name" or "name-variant" (matches lazy registry naming)
+	// Key format is the canonical model ref from spec.models.preload[].name.
 	if _, exists := config["model_strategies"]; !exists {
 		modelStrategies := make(map[string]string)
 		for _, m := range pool.Spec.Models.Preload {
 			if m.Strategy != "" {
-				key := m.Name
-				if m.Variant != "" {
-					key = m.Name + "-" + m.Variant
-				}
-				modelStrategies[key] = string(m.Strategy)
+				modelStrategies[m.Name] = string(m.Strategy)
 			}
 		}
 		if len(modelStrategies) > 0 {
@@ -407,40 +395,26 @@ func (r *TermitePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.Te
 func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.TermitePool) error {
 	replicas := initialTermiteReplicas(pool)
 
-	// Build model list for init container pull command.
-	// Group models by variant to use --variants flag.
-	// Example:
-	//   /antfly termite pull --models-dir /models --variants i8 bge-small-en-v1.5 mxbai-rerank-base-v1
-	variantGroups := make(map[string][]string) // variant -> []model names
-	for _, m := range pool.Spec.Models.Preload {
-		variant := m.Variant
-		if variant == "" {
-			variant = "f32" // default variant
-		}
-		variantGroups[variant] = append(variantGroups[variant], m.Name)
-	}
-
-	// Build preload init containers - one per variant group, sorted for deterministic ordering.
-	variants := make([]string, 0, len(variantGroups))
-	for v := range variantGroups {
-		variants = append(variants, v)
-	}
-	slices.Sort(variants)
-
 	// Determine image
 	image := r.AntflyImage
 	if pool.Spec.Image != "" {
 		image = pool.Spec.Image
 	}
 
-	initContainers := make([]corev1.Container, 0, len(variants))
-	for i, variant := range variants {
-		names := variantGroups[variant]
-		slices.Sort(names) // Sort model names too for consistency
+	preloadModels := slices.Clone(pool.Spec.Models.Preload)
+	slices.SortFunc(preloadModels, func(a, b antflyaiv1alpha1.ModelSpec) int {
+		return strings.Compare(a.Name, b.Name)
+	})
 
-		args := []string{"termite", "pull", "--models-dir", "/models", "--variants", variant}
-		args = append(args, names...)
-
+	initContainers := make([]corev1.Container, 0, len(preloadModels))
+	for i, model := range preloadModels {
+		args := []string{"termite", "pull", model.Name, "--models-dir", "/models"}
+		if len(model.Tasks) > 0 {
+			args = append(args, "--tasks", strings.Join(model.Tasks, ","))
+		}
+		if len(model.Capabilities) > 0 {
+			args = append(args, "--capabilities", strings.Join(model.Capabilities, ","))
+		}
 		initContainers = append(initContainers, corev1.Container{
 			Name:    fmt.Sprintf("model-puller-%d", i),
 			Image:   image,
@@ -480,7 +454,7 @@ func (r *TermitePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *
 							Name:    "termite",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    []string{"termite", "run", "--config", "/config/config.json"},
+							Args:    []string{"termite", "run", "--host", "0.0.0.0", "--port", strconv.Itoa(TermiteAPIPort), "--models-dir", "/models"},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: TermiteAPIPort, Protocol: corev1.ProtocolTCP},
 							},
@@ -1503,32 +1477,35 @@ func (r *TermitePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antflya
 	container.StartupProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/ml/v1/models",
+				Path: "/readyz",
 				Port: intstr.FromString("http"),
 			},
 		},
 		FailureThreshold: failureThreshold,
 		PeriodSeconds:    periodSeconds,
+		TimeoutSeconds:   5,
 	}
 
 	container.ReadinessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/ml/v1/models",
+				Path: "/readyz",
 				Port: intstr.FromString("http"),
 			},
 		},
-		PeriodSeconds: 5,
+		PeriodSeconds:  5,
+		TimeoutSeconds: 5,
 	}
 
 	container.LivenessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/ml/v1/models",
+				Path: "/healthz",
 				Port: intstr.FromString("http"),
 			},
 		},
-		PeriodSeconds: 30,
+		PeriodSeconds:  30,
+		TimeoutSeconds: 5,
 	}
 }
 
