@@ -34,7 +34,6 @@ type AntflyBackupReconciler struct {
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile handles AntflyBackup reconciliation
 func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

@@ -2232,6 +2232,141 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
+func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseSwarmControllerCluster()
+	cluster.Spec.SecretStore = &antflyv1.SecretStoreSpec{
+		SecretName: "cloud-secrets-config",
+		Key:        "secrets.json",
+		Path:       "/run/antfly/secrets/secrets.json",
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	err := reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	sts := &appsv1.StatefulSet{}
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	container := sts.Spec.Template.Spec.Containers[0]
+	g.Expect(container.Args).To(HaveLen(1))
+	g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path /run/antfly/secrets/secrets.json"))
+	g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
+		Name:  antflySecretStoreEnvVar,
+		Value: "/run/antfly/secrets/secrets.json",
+	}))
+	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+		Name:      antflySecretStoreVolumeName,
+		MountPath: "/run/antfly/secrets",
+		ReadOnly:  true,
+	}))
+	g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+		Name: antflySecretStoreVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: "cloud-secrets-config",
+				Items: []corev1.KeyToPath{{
+					Key:  "secrets.json",
+					Path: "secrets.json",
+				}},
+			},
+		},
+	}))
+}
+
+func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-split",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:latest",
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:     1,
+				MetadataAPI:  antflyv1.APISpec{Port: 12377},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+				Health:       antflyv1.APISpec{Port: 4200},
+			},
+			DataNodes: antflyv1.DataNodesSpec{
+				Replicas: 1,
+				API:      antflyv1.APISpec{Port: 12380},
+				Raft:     antflyv1.APISpec{Port: 9021},
+				Health:   antflyv1.APISpec{Port: 4201},
+			},
+			Storage: antflyv1.StorageSpec{
+				StorageClass:    "standard",
+				MetadataStorage: "1Gi",
+				DataStorage:     "1Gi",
+			},
+			SecretStore: &antflyv1.SecretStoreSpec{
+				SecretName: "cloud-secrets-config",
+				Key:        "secrets.json",
+				Path:       "/run/antfly/secrets/secrets.json",
+			},
+			Config: "{}",
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	for _, component := range []string{"metadata", "data"} {
+		sts := &appsv1.StatefulSet{}
+		key := types.NamespacedName{Name: cluster.Name + "-" + component, Namespace: cluster.Namespace}
+		g.Expect(client.Get(context.Background(), key, sts)).To(Succeed())
+
+		container := sts.Spec.Template.Spec.Containers[0]
+		g.Expect(container.Args).To(HaveLen(1))
+		g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path /run/antfly/secrets/secrets.json"))
+		g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
+			Name:  antflySecretStoreEnvVar,
+			Value: "/run/antfly/secrets/secrets.json",
+		}))
+		g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name:      antflySecretStoreVolumeName,
+			MountPath: "/run/antfly/secrets",
+			ReadOnly:  true,
+		}))
+		g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+			Name: antflySecretStoreVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "cloud-secrets-config",
+					Items: []corev1.KeyToPath{{
+						Key:  "secrets.json",
+						Path: "secrets.json",
+					}},
+				},
+			},
+		}))
+	}
+}
+
 func TestUpdateStatus_Swarm(t *testing.T) {
 	g := NewWithT(t)
 

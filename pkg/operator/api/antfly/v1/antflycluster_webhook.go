@@ -151,6 +151,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateSecretStore(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if err := r.validateProductTierMapping(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
@@ -160,6 +164,35 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 			strings.Join(allErrors, "\n  - "))
 	}
 
+	return nil
+}
+
+func (r *AntflyCluster) validateSecretStore() error {
+	store := r.Spec.SecretStore
+	if store == nil {
+		return nil
+	}
+	var errors []string
+	if strings.TrimSpace(store.SecretName) == "" {
+		errors = append(errors, "spec.secretStore.secretName is required")
+	}
+	if strings.Contains(store.SecretName, "/") {
+		errors = append(errors, "spec.secretStore.secretName must be a name in the AntflyCluster namespace, not a path")
+	}
+	if store.Key != "" && strings.Contains(store.Key, "/") {
+		errors = append(errors, "spec.secretStore.key must be a single Secret data key")
+	}
+	if store.Path != "" {
+		if !strings.HasPrefix(store.Path, "/") {
+			errors = append(errors, "spec.secretStore.path must be an absolute file path")
+		}
+		if strings.HasSuffix(store.Path, "/") {
+			errors = append(errors, "spec.secretStore.path must include a file name")
+		}
+	}
+	if len(errors) > 0 {
+		return fmt.Errorf("SecretStore validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
 	return nil
 }
 

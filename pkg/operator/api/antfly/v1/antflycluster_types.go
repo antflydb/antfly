@@ -241,6 +241,11 @@ type AntflyClusterSpec struct {
 	// Config is the configuration file content for Antfly
 	Config string `json:"config"`
 
+	// SecretStore mounts a Kubernetes Secret containing an Antfly secrets.json
+	// file for runtime secret resolution.
+	// +optional
+	SecretStore *SecretStoreSpec `json:"secretStore,omitempty"`
+
 	// Storage defines the storage configuration
 	Storage StorageSpec `json:"storage"`
 
@@ -264,6 +269,22 @@ type AntflyClusterSpec struct {
 	// If not specified, the default ServiceAccount for the namespace is used
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
+// SecretStoreSpec configures a mounted Antfly secrets.json file.
+type SecretStoreSpec struct {
+	// SecretName is the Kubernetes Secret name in the AntflyCluster namespace.
+	SecretName string `json:"secretName"`
+
+	// Key is the Secret data key containing the Antfly secrets file.
+	// Defaults to secrets.json.
+	// +optional
+	Key string `json:"key,omitempty"`
+
+	// Path is the absolute file path where the secret file should be mounted.
+	// Defaults to /run/antfly/secrets/secrets.json.
+	// +optional
+	Path string `json:"path,omitempty"`
 }
 
 // ProductTierSpec records product-tier provenance for a CR whose concrete

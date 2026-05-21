@@ -45,6 +45,7 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
+    secret_store_path: ?[]const u8 = null,
     help: bool = false,
 };
 
@@ -536,8 +537,23 @@ pub fn runFromIterator(
         return;
     }
 
+    var secret_store: antfly.common.secrets.FileStore = undefined;
+    var secret_store_initialized = false;
+    defer if (secret_store_initialized) secret_store.deinit();
+
+    if (cli.secret_store_path) |raw_secret_store_path| {
+        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
+        defer alloc.free(normalized_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+        secret_store_initialized = true;
+    }
+
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPath(alloc, config_path)
+        try antfly.common.config.loadFromPathWithSecrets(
+            alloc,
+            config_path,
+            if (secret_store_initialized) &secret_store else null,
+        )
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
@@ -579,8 +595,10 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
-    var secret_store = try antfly.common.secrets.FileStore.init(alloc, resolved.secret_store_path);
-    defer secret_store.deinit();
+    if (!secret_store_initialized) {
+        secret_store = try antfly.common.secrets.FileStore.init(alloc, resolved.secret_store_path);
+        secret_store_initialized = true;
+    }
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
     var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
@@ -1136,6 +1154,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--secret-store-path")) {
+            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         return error.InvalidArguments;
     }
     return cfg;
@@ -1179,7 +1201,9 @@ fn resolvePaths(
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
-    const secret_store_path = blk: {
+    const secret_store_path = if (cli.secret_store_path) |path|
+        try normalizeResolvedPathAlloc(alloc, path)
+    else blk: {
         const raw = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
@@ -1335,6 +1359,7 @@ fn printUsage() void {
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
         \\  --snapshot-root-dir <path>            Snapshot root directory
+        \\  --secret-store-path <path>            Antfly secrets.json file path
         \\  -h, --help                            Show this help
         \\
     , .{});
@@ -1474,6 +1499,13 @@ test "parse cli accepts config path" {
     try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
 }
 
+test "parse cli accepts secret store path" {
+    var argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const cfg = try parseCli(&iter);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+}
+
 test "parse cli accepts canonical host port and models dir flags" {
     var argv = [_][*:0]const u8{
         "--host",
@@ -1584,4 +1616,14 @@ test "swarm runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings(expected_replica_catalog, resolved.replica_catalog_path);
     try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
     try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
+    const expected_secret_store = try std.fs.path.join(alloc, &.{ expected_base, "secrets.json" });
+    defer alloc.free(expected_secret_store);
+    try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
+}
+
+test "swarm runtime resolves explicit secret store path" {
+    const alloc = std.testing.allocator;
+    const resolved = try resolvePaths(alloc, .{ .secret_store_path = "/run/antfly/secrets/secrets.json" }, null);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", resolved.secret_store_path);
 }

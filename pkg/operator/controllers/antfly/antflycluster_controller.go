@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,11 @@ var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
+
+	antflySecretStoreVolumeName  = "secret-store"
+	antflySecretStoreDefaultKey  = "secrets.json"
+	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
+	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -74,7 +80,6 @@ const (
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
-//+kubebuilder:rbac:groups="",resources=nodes/proxy,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -89,6 +94,66 @@ var reservedPodLabelPrefixes = []string{"app.kubernetes.io/"}
 
 func int64Ptr(v int64) *int64 {
 	return &v
+}
+
+func secretStoreKey(store *antflyv1.SecretStoreSpec) string {
+	if store == nil || store.Key == "" {
+		return antflySecretStoreDefaultKey
+	}
+	return store.Key
+}
+
+func secretStorePath(store *antflyv1.SecretStoreSpec) string {
+	if store == nil || store.Path == "" {
+		return antflySecretStoreDefaultPath
+	}
+	return store.Path
+}
+
+func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
+	if store == nil {
+		return nil
+	}
+	return []corev1.EnvVar{{
+		Name:  antflySecretStoreEnvVar,
+		Value: secretStorePath(store),
+	}}
+}
+
+func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
+	if store == nil {
+		return ""
+	}
+	return fmt.Sprintf(" \\\n  --secret-store-path %s", secretStorePath(store))
+}
+
+func secretStoreVolumeMounts(store *antflyv1.SecretStoreSpec) []corev1.VolumeMount {
+	if store == nil {
+		return nil
+	}
+	return []corev1.VolumeMount{{
+		Name:      antflySecretStoreVolumeName,
+		MountPath: path.Dir(secretStorePath(store)),
+		ReadOnly:  true,
+	}}
+}
+
+func secretStoreVolumes(store *antflyv1.SecretStoreSpec) []corev1.Volume {
+	if store == nil {
+		return nil
+	}
+	return []corev1.Volume{{
+		Name: antflySecretStoreVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: store.SecretName,
+				Items: []corev1.KeyToPath{{
+					Key:  secretStoreKey(store),
+					Path: path.Base(secretStorePath(store)),
+				}},
+			},
+		},
+	}}
 }
 
 func podFSGroupChangePolicyPtr(v corev1.PodFSGroupChangePolicy) *corev1.PodFSGroupChangePolicy {
@@ -792,12 +857,10 @@ func (r *AntflyClusterReconciler) detectSidecarInjectionStatus(ctx context.Conte
 	return podsWithSidecars, totalPods, nil
 }
 
-// envFromCache caches secret and configmap fetches for a single reconcile cycle,
-// avoiding duplicate API calls when checkEnvFromSecrets and computeEnvFromHash
-// reference the same resources.
+// envFromCache caches configmap fetches for a single reconcile cycle,
+// avoiding duplicate API calls when envFrom hashing references the same resources.
 type envFromCache struct {
 	client     client.Reader
-	secrets    map[types.NamespacedName]*corev1.Secret
 	configMaps map[types.NamespacedName]*corev1.ConfigMap
 	// notFound tracks keys that returned NotFound so we don't retry them.
 	notFound map[types.NamespacedName]bool
@@ -806,28 +869,9 @@ type envFromCache struct {
 func newEnvFromCache(c client.Reader) *envFromCache {
 	return &envFromCache{
 		client:     c,
-		secrets:    make(map[types.NamespacedName]*corev1.Secret),
 		configMaps: make(map[types.NamespacedName]*corev1.ConfigMap),
 		notFound:   make(map[types.NamespacedName]bool),
 	}
-}
-
-func (c *envFromCache) getSecret(ctx context.Context, key types.NamespacedName) (*corev1.Secret, error) {
-	if s, ok := c.secrets[key]; ok {
-		return s, nil
-	}
-	if c.notFound[key] {
-		return nil, errors.NewNotFound(corev1.Resource("secrets"), key.Name)
-	}
-	s := &corev1.Secret{}
-	if err := c.client.Get(ctx, key, s); err != nil {
-		if errors.IsNotFound(err) {
-			c.notFound[key] = true
-		}
-		return nil, err
-	}
-	c.secrets[key] = s
-	return s, nil
 }
 
 func (c *envFromCache) getConfigMap(ctx context.Context, key types.NamespacedName) (*corev1.ConfigMap, error) {
@@ -848,8 +892,11 @@ func (c *envFromCache) getConfigMap(ctx context.Context, key types.NamespacedNam
 	return cm, nil
 }
 
-// computeEnvFromHash computes a hash of the data in referenced secrets and configmaps.
-// This hash is used as a pod annotation to trigger rolling updates when secret/configmap data changes.
+// computeEnvFromHash computes a hash of envFrom references plus referenced ConfigMap data.
+// Secret data is intentionally not read by the operator, so this ClusterRole does not need
+// the dangerous secrets permission flagged by Snyk. Secret reference names are still hashed
+// so changing which Secret is referenced rolls pods; rotating Secret contents should be
+// handled by the workload or by updating an annotation/spec field.
 func (r *AntflyClusterReconciler) computeEnvFromHash(ctx context.Context, cache *envFromCache, namespace string, envFrom []corev1.EnvFromSource) string {
 	if len(envFrom) == 0 {
 		return ""
@@ -859,20 +906,10 @@ func (r *AntflyClusterReconciler) computeEnvFromHash(ctx context.Context, cache 
 
 	for _, source := range envFrom {
 		if source.SecretRef != nil {
-			key := types.NamespacedName{Name: source.SecretRef.Name, Namespace: namespace}
-			secret, err := cache.getSecret(ctx, key)
-			if err == nil {
-				// Sort keys for deterministic hash
-				keys := make([]string, 0, len(secret.Data))
-				for k := range secret.Data {
-					keys = append(keys, k)
-				}
-				sort.Strings(keys)
-				for _, k := range keys {
-					h.Write([]byte(k))
-					h.Write(secret.Data[k])
-				}
-			}
+			h.Write([]byte("secret:"))
+			h.Write([]byte(namespace))
+			h.Write([]byte("/"))
+			h.Write([]byte(source.SecretRef.Name))
 		}
 		if source.ConfigMapRef != nil {
 			key := types.NamespacedName{Name: source.ConfigMapRef.Name, Namespace: namespace}
@@ -895,69 +932,12 @@ func (r *AntflyClusterReconciler) computeEnvFromHash(ctx context.Context, cache 
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }
 
-// checkEnvFromSecrets checks if all secrets referenced in EnvFrom exist and updates the cluster status.
-// Returns an error if any referenced secret is not found.
-func (r *AntflyClusterReconciler) checkEnvFromSecrets(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
-	log := log.FromContext(ctx)
-
-	// Collect envFrom sources for the active topology.
-	var allEnvFrom []corev1.EnvFromSource
-	if isSwarmMode(cluster) {
-		if cluster.Spec.Swarm != nil {
-			allEnvFrom = append(allEnvFrom, cluster.Spec.Swarm.EnvFrom...)
-		}
-	} else {
-		allEnvFrom = append(allEnvFrom, cluster.Spec.MetadataNodes.EnvFrom...)
-		allEnvFrom = append(allEnvFrom, cluster.Spec.DataNodes.EnvFrom...)
-	}
-
-	// If no envFrom sources, set status to True and return
-	if len(allEnvFrom) == 0 {
-		r.setSecretsReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonAllSecretsFound, "No secrets referenced")
-		return nil
-	}
-
-	// Check each secret reference
-	var missingSecrets []string
-	for _, source := range allEnvFrom {
-		if source.SecretRef != nil {
-			key := types.NamespacedName{Name: source.SecretRef.Name, Namespace: cluster.Namespace}
-			_, err := cache.getSecret(ctx, key)
-			if err != nil {
-				if errors.IsNotFound(err) {
-					missingSecrets = append(missingSecrets, source.SecretRef.Name)
-					log.Info("Referenced secret not found", "secret", source.SecretRef.Name, "namespace", cluster.Namespace)
-				} else {
-					return fmt.Errorf("failed to check secret %s: %w", source.SecretRef.Name, err)
-				}
-			}
-		}
-		// ConfigMaps are also checked but are less critical for backup credentials
-		if source.ConfigMapRef != nil {
-			key := types.NamespacedName{Name: source.ConfigMapRef.Name, Namespace: cluster.Namespace}
-			_, err := cache.getConfigMap(ctx, key)
-			if err != nil {
-				if errors.IsNotFound(err) {
-					log.Info("Referenced configmap not found", "configmap", source.ConfigMapRef.Name, "namespace", cluster.Namespace)
-					// ConfigMaps are optional, don't block on missing configmaps
-				} else {
-					return fmt.Errorf("failed to check configmap %s: %w", source.ConfigMapRef.Name, err)
-				}
-			}
-		}
-	}
-
-	if len(missingSecrets) > 0 {
-		message := fmt.Sprintf("Secret(s) not found: %v", missingSecrets)
-		r.setSecretsReadyCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonSecretNotFound, message)
-		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, antflyv1.ReasonSecretNotFound, antflyv1.ReasonSecretNotFound, "%s", message)
-		// Don't return error - allow reconciliation to continue so pods can be created
-		// Pods will be stuck in CreateContainerConfigError if secrets don't exist
-		return nil
-	}
-
-	r.setSecretsReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonAllSecretsFound, "All referenced secrets exist")
-	return nil
+// markEnvFromSecretsUnchecked records that Secret references are intentionally not
+// read by the operator. Kubernetes will validate envFrom Secret existence when it
+// creates pods, and avoiding direct Secret reads keeps the operator ClusterRole from
+// carrying dangerous Secret permissions.
+func (r *AntflyClusterReconciler) markEnvFromSecretsUnchecked(cluster *antflyv1.AntflyCluster) {
+	r.setSecretsReadyCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonAllSecretsFound, "Secret references are delegated to Kubernetes and are not read by the operator")
 }
 
 // setSecretsReadyCondition updates the SecretsReady condition on the cluster status
@@ -1055,8 +1035,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Apply default values for ports
 	r.applyDefaults(workingCluster) // Use workingCluster for all processing, keep original cluster for status updates
 
-	// Per-reconcile cache for secret/configmap lookups — shared by checkEnvFromSecrets,
-	// buildPodAnnotations (metadata + data), avoiding 2-3x duplicate API calls.
+	// Per-reconcile cache for ConfigMap lookups used by buildPodAnnotations.
 	efCache := newEnvFromCache(r.Client)
 
 	// Validate cluster configuration (T026)
@@ -1093,11 +1072,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// Check if referenced secrets exist and update SecretsReady condition
-	if err := r.checkEnvFromSecrets(ctx, efCache, workingCluster); err != nil {
-		log.Error(err, "Failed to check envFrom secrets")
-		// Don't block reconciliation - pods will fail with CreateContainerConfigError if secrets don't exist
-	}
+	// Do not read Secrets from the operator. Kubernetes validates referenced Secrets
+	// during pod admission/startup, which avoids granting dangerous Secret RBAC here.
+	r.markEnvFromSecretsUnchecked(workingCluster)
 
 	if err := r.reconcileTermitePool(ctx, workingCluster); err != nil {
 		return ctrl.Result{}, err
@@ -2135,6 +2112,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
+						Env:             secretStoreEnv(cluster.Spec.SecretStore),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -2162,7 +2140,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: []corev1.VolumeMount{
+						VolumeMounts: append([]corev1.VolumeMount{
 							{
 								Name:      "swarm-storage",
 								MountPath: "/antflydb",
@@ -2171,18 +2149,19 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 								Name:      "config",
 								MountPath: "/config",
 							},
-						},
+						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
 exec /antfly swarm --id %d --config /config/config.json \
   --host 0.0.0.0 \
   --port %d \
-  --health-port %d
+  --health-port %d%s
 							`,
 								swarm.NodeID,
 								swarm.MetadataAPI.Port,
 								swarm.Health.Port,
+								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources: r.buildResourceRequirements(swarm.Resources),
@@ -2219,7 +2198,7 @@ exec /antfly swarm --id %d --config /config/config.json \
 						},
 					},
 				},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
@@ -2230,7 +2209,7 @@ exec /antfly swarm --id %d --config /config/config.json \
 							},
 						},
 					},
-				},
+				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
@@ -2363,6 +2342,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         cluster.Spec.MetadataNodes.EnvFrom,
+						Env:             secretStoreEnv(cluster.Spec.SecretStore),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -2380,7 +2360,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: []corev1.VolumeMount{
+						VolumeMounts: append([]corev1.VolumeMount{
 							{
 								Name:      "metadata-storage",
 								MountPath: "/antflydb",
@@ -2389,7 +2369,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 								Name:      "config",
 								MountPath: "/config",
 							},
-						},
+						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -2401,12 +2381,13 @@ exec /antfly metadata --id $ID --config /config/config.json \
   --raft-host 0.0.0.0 \
   --raft-port %d \
   --health-port %d \
-  --cluster '%s'
-							`,
+  --cluster '%s'%s
+								`,
 								cluster.Spec.MetadataNodes.MetadataAPI.Port,
 								cluster.Spec.MetadataNodes.MetadataRaft.Port,
 								cluster.Spec.MetadataNodes.Health.Port,
 								metadataCluster,
+								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources: r.buildResourceRequirements(cluster.Spec.MetadataNodes.Resources),
@@ -2443,7 +2424,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 						},
 					},
 				},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
@@ -2454,7 +2435,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 							},
 						},
 					},
-				},
+				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
@@ -2593,7 +2574,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: []corev1.VolumeMount{
+						VolumeMounts: append([]corev1.VolumeMount{
 							{
 								Name:      "data-storage",
 								MountPath: "/antflydb",
@@ -2602,8 +2583,8 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								Name:      "config",
 								MountPath: "/config",
 							},
-						},
-						Env: []corev1.EnvVar{
+						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
+						Env: append([]corev1.EnvVar{
 							{
 								Name: "POD_IP",
 								ValueFrom: &corev1.EnvVarSource{
@@ -2612,7 +2593,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 									},
 								},
 							},
-						},
+						}, secretStoreEnv(cluster.Spec.SecretStore)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -2623,11 +2604,12 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
   --api-port %d \
   --raft-host ${POD_IP} \
   --raft-port %d \
-  --health-port %d
-							`,
+  --health-port %d%s
+								`,
 								cluster.Spec.DataNodes.API.Port,
 								cluster.Spec.DataNodes.Raft.Port,
 								cluster.Spec.DataNodes.Health.Port,
+								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources: r.buildResourceRequirements(cluster.Spec.DataNodes.Resources),
@@ -2664,7 +2646,7 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 						},
 					},
 				},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
@@ -2675,7 +2657,7 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 							},
 						},
 					},
-				},
+				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
