@@ -1543,7 +1543,14 @@ Status as of 2026-05-19:
   (`artifact_decode_ms ~= 3`, `artifact_views=10000`,
   `artifact_copies=0`); total sparse replay is now dominated by artifact-key
   collection/read orchestration rather than sparse vector decode or sparse
-  index apply.
+  index apply. The next replay-profile pass added a non-allocating direct
+  embedding-artifact key parser and lets direct sparse artifact replay borrow
+  doc-key slices from replay artifact keys, while retaining the allocating
+  fallback for derived chunk embeddings or escaped internal-key components. On
+  the same 10k deferred profile, sparse artifact collection dropped from about
+  `9.6s` to about `4ms`, and total sparse replay dropped to about `112ms`
+  (`embedding_apply_ms ~= 104`). The remaining multi-second deferred index wait
+  in that benchmark is now outside sparse vector artifact collection/decode/apply.
   The first
   optimization from that evidence specialized
   `ResolvedDocSet` ordinal set algebra: list/list operators now use direct

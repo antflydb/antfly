@@ -126,6 +126,16 @@ pub fn decodeBodyAlloc(alloc: Allocator, body: []const u8) ![]u8 {
     return try alloc.realloc(out, out_pos);
 }
 
+pub fn decodeBodyView(body: []const u8) !?[]const u8 {
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        if (body[i] != 0) continue;
+        if (i + 1 >= body.len or body[i + 1] != 0xff) return error.InvalidInternalUserKey;
+        return null;
+    }
+    return body;
+}
+
 fn maxDecodedLen(body: []const u8) usize {
     return body.len;
 }
@@ -555,6 +565,26 @@ pub fn parseEmbeddingArtifactKeyAlloc(alloc: Allocator, key: []const u8) !?struc
     return .{ .doc_key = doc_key, .artifact_name = artifact_name };
 }
 
+pub fn parseEmbeddingArtifactKeyView(key: []const u8) !?struct { doc_key: []const u8, artifact_name: []const u8 } {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    const doc_key = (try decodeBodyView(key[1..doc_term])) orelse return null;
+
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return null;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "embedding")) return null;
+    const type_term = findComponentTerminator(key, pos) orelse return null;
+    pos = type_term + 2;
+
+    const name_term = findComponentTerminator(key, pos) orelse return null;
+    if (name_term + 2 != key.len) return null;
+    const artifact_name = (try decodeBodyView(key[pos..name_term])) orelse return null;
+
+    return .{ .doc_key = doc_key, .artifact_name = artifact_name };
+}
+
 pub fn parseGraphEdgeArtifactKeyAlloc(
     alloc: Allocator,
     key: []const u8,
@@ -857,6 +887,10 @@ test "isEmbeddingArtifactKey round trip" {
     defer alloc.free(parsed.artifact_name);
     try std.testing.expectEqualStrings("my-doc", parsed.doc_key);
     try std.testing.expectEqualStrings("my-index", parsed.artifact_name);
+
+    const view = (try parseEmbeddingArtifactKeyView(key)).?;
+    try std.testing.expectEqualStrings("my-doc", view.doc_key);
+    try std.testing.expectEqualStrings("my-index", view.artifact_name);
 }
 
 test "embedding artifact key round trip with zero bytes in doc key" {
@@ -870,6 +904,7 @@ test "embedding artifact key round trip with zero bytes in doc key" {
     defer alloc.free(parsed.artifact_name);
     try std.testing.expectEqualStrings(raw, parsed.doc_key);
     try std.testing.expectEqualStrings("dense", parsed.artifact_name);
+    try std.testing.expectEqual(null, try parseEmbeddingArtifactKeyView(key));
 }
 
 test "embedding artifact key round trip with arbitrary doc and artifact bytes" {
@@ -884,6 +919,7 @@ test "embedding artifact key round trip with arbitrary doc and artifact bytes" {
     defer alloc.free(parsed.artifact_name);
     try std.testing.expectEqualSlices(u8, raw_doc, parsed.doc_key);
     try std.testing.expectEqualSlices(u8, raw_name, parsed.artifact_name);
+    try std.testing.expectEqual(null, try parseEmbeddingArtifactKeyView(key));
 }
 
 test "matchesEmbeddingArtifactName matches exact embedding artifact name" {
