@@ -18,7 +18,12 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"path"
+	"strings"
+	"time"
 )
 
 //go:embed antfarm

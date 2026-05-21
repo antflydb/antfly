@@ -15,9 +15,11 @@
 package template
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"testing"
@@ -145,4 +147,39 @@ func TestErrorToDirective(t *testing.T) {
 		assert.Equal(t, 0, directives[0].Status)
 		assert.Equal(t, "connection refused", directives[0].Message)
 	})
+}
+
+func TestResolveCredentialsDoesNotResolveS3ForHTTPURL(t *testing.T) {
+	scraping.SetDefaultS3Credentials(nil)
+	scraping.SetDefaultSecurityConfig(nil)
+	scraping.InitRemoteContentConfig(&scraping.RemoteContentConfig{
+		S3: map[string]scraping.S3CredentialConfig{
+			"github": {
+				Endpoint:        "s3.amazonaws.com",
+				AccessKeyId:     "github-key",
+				SecretAccessKey: "github-secret",
+				Buckets:         []string{"antflydb"},
+			},
+		},
+		DefaultS3: "github",
+	})
+	defer scraping.InitRemoteContentConfig(nil)
+
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	oldPrefix := log.Prefix()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	defer func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	}()
+
+	s3Creds, securityConfig := resolveCredentials("https://raw.githubusercontent.com/antflydb/antfly/HEAD/README.md", "")
+	require.Nil(t, s3Creds)
+	require.NotNil(t, securityConfig)
+	require.NotContains(t, logs.String(), "credential resolution failed")
 }

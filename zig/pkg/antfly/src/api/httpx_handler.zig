@@ -57,6 +57,24 @@ const db_mod = @import("../storage/db/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 
+const ParsedGlobalQueryTable = struct {
+    parsed: std.json.Parsed(metadata_openapi.QueryRequest),
+    table_name: []const u8,
+
+    fn deinit(self: *@This()) void {
+        self.parsed.deinit();
+    }
+};
+
+fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
+    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+    errdefer parsed.deinit();
+    return .{
+        .parsed = parsed,
+        .table_name = parsed.value.table orelse "",
+    };
+}
+
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
 
@@ -279,6 +297,12 @@ pub const AntflyApiHandler = struct {
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
         public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        if (self.api_server.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+        }
         return ctx.json(public_status);
     }
 
@@ -1046,8 +1070,13 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
+        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid query request");
+        };
+        defer parsed_table.deinit();
         var resp = try self.api_server.handlePublicTableQuery(
-            "",
+            parsed_table.table_name,
             body_data,
             authenticated_identity,
         );
@@ -2986,6 +3015,15 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqualStrings("docs", parsed.value.name);
     try std.testing.expect(parsed.value.schema != null);
     try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+}
+
+test "httpx global query table name comes from request body" {
+    var parsed_table = try parseGlobalQueryTable(std.testing.allocator,
+        \\{"table":"files","limit":5}
+    );
+    defer parsed_table.deinit();
+
+    try std.testing.expectEqualStrings("files", parsed_table.table_name);
 }
 
 test "httpx antfly cluster restore preserves backup location validation" {

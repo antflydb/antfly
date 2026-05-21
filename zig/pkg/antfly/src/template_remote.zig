@@ -312,7 +312,7 @@ fn resolveRemoteContentFetchOptions(
 ) !ResolvedRemoteContentFetchOptions {
     const cfg = remote_content orelse return .{};
     const parsed = std.Uri.parse(url) catch return .{ .security = if (cfg.security) |*security| security else null };
-    if (std.mem.eql(u8, parsed.scheme, "s3")) {
+    if (isUriScheme(parsed, "s3")) {
         const credential = selectS3Credential(cfg, parsed, credential_name);
         return .{
             .security = if (credential) |creds|
@@ -321,7 +321,7 @@ fn resolveRemoteContentFetchOptions(
             .s3_credentials = if (credential) |creds| try resolveS3Credential(alloc, secret_store, creds) else null,
         };
     }
-    if (std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https")) {
+    if (isUriScheme(parsed, "http") or isUriScheme(parsed, "https")) {
         const credential = selectHttpCredential(cfg, url, credential_name);
         return .{
             .security = if (credential) |creds|
@@ -331,6 +331,10 @@ fn resolveRemoteContentFetchOptions(
         };
     }
     return .{ .security = if (cfg.security) |*security| security else null };
+}
+
+fn isUriScheme(parsed: std.Uri, scheme: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(parsed.scheme, scheme);
 }
 
 fn selectS3Credential(
@@ -416,6 +420,42 @@ fn bucketPatternMatches(pattern: []const u8, bucket: []const u8) bool {
     const prefix = pattern[0..star];
     const suffix = pattern[star + 1 ..];
     return std.mem.startsWith(u8, bucket, prefix) and std.mem.endsWith(u8, bucket, suffix);
+}
+
+test "template remote does not apply s3 credentials to http urls" {
+    const alloc = std.testing.allocator;
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    cfg.default_s3 = try alloc.dupe(u8, "primary");
+
+    {
+        const key = try alloc.dupe(u8, "primary");
+        errdefer alloc.free(key);
+        const endpoint = try alloc.dupe(u8, "s3.amazonaws.com");
+        errdefer alloc.free(endpoint);
+        const access_key_id = try alloc.dupe(u8, "primary-key");
+        errdefer alloc.free(access_key_id);
+        const secret_access_key = try alloc.dupe(u8, "primary-secret");
+        errdefer alloc.free(secret_access_key);
+
+        try cfg.s3.put(alloc, key, .{
+            .endpoint = endpoint,
+            .access_key_id = access_key_id,
+            .secret_access_key = secret_access_key,
+        });
+    }
+
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "https://raw.githubusercontent.com/antflydb/antfly/HEAD/README.md",
+        null,
+    );
+    defer resolved.deinit(alloc);
+
+    try std.testing.expect(resolved.s3_credentials == null);
 }
 
 test "template remote renders remotePDF extract with injected pdf backend" {
