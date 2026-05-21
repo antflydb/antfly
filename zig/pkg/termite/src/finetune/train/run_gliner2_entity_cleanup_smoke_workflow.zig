@@ -310,10 +310,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackend(value: []const u8) ?text_encoder_boundary.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    return null;
+    return text_encoder_boundary.parseBackendChoice(value);
 }
 
 fn freeMaterializeSummary(allocator: std.mem.Allocator, summary: *gliner2.MaterializeSummary) void {

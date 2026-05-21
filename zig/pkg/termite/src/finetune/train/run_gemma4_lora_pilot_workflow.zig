@@ -53,7 +53,7 @@ const Options = struct {
     recursive_init: []const u8 = "average_residual_svd",
     teacher_top_k: ?[]const u8 = null,
     teacher_temperature: []const u8 = "1.0",
-    backend: []const u8 = "mlx",
+    backend: []const u8 = "auto",
     split: []const u8 = "train",
     dry_run: bool = false,
 };
@@ -180,7 +180,7 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
     const train_prepared_path = if (opts.teacher_top_k) |teacher_top_k| blk: {
         var teacher_cmd = std.ArrayListUnmanaged([]const u8).empty;
         defer teacher_cmd.deinit(allocator);
-        try teacher_cmd.appendSlice(allocator, &.{ opts.base_model_dir, prepared_path, teacher_prepared_path, "--top-k", teacher_top_k, "--temperature", opts.teacher_temperature, "--max-examples", max_examples_arg, "--backend", "native" });
+        try teacher_cmd.appendSlice(allocator, &.{ opts.base_model_dir, prepared_path, teacher_prepared_path, "--top-k", teacher_top_k, "--temperature", opts.teacher_temperature, "--max-examples", max_examples_arg, "--backend", opts.backend });
         if (opts.mode == .multimodal) try teacher_cmd.appendSlice(allocator, &.{ "--gguf-projector", opts.projector_path.? });
         try runCommand(init, allocator, "materialize-gemma4-teacher-targets", materialize_gemma4_teacher_targets.main, teacher_cmd.items, opts.dry_run);
         break :blk teacher_prepared_path;
@@ -405,7 +405,7 @@ fn usageError() error{InvalidArguments} {
         \\  --recursive-init NAME
         \\  --teacher-top-k N
         \\  --teacher-temperature F
-        \\  --backend auto|mlx|blas
+        \\  --backend auto|cuda|mlx|blas|native
         \\  --split NAME
         \\  --dry-run
         \\

@@ -376,6 +376,26 @@ pub fn build(b: *std.Build) void {
     const finetune_step = b.step("finetune", "Run termite finetune");
     finetune_step.dependOn(&run_finetune.step);
 
+    const cuda_artifact_check = b.addSystemCommand(&.{
+        "bash",
+        "scripts/check_cuda_artifacts.sh",
+    });
+    const cuda_artifact_check_step = b.step(
+        "check-cuda-artifacts",
+        "Verify embedded CUDA source/PTX artifacts against runtime-loaded kernel symbols",
+    );
+    cuda_artifact_check_step.dependOn(&cuda_artifact_check.step);
+
+    const cuda_finetune_smoke = b.addSystemCommand(&.{
+        "bash",
+        "scripts/verify_cuda_finetune_smoke.sh",
+    });
+    const cuda_finetune_smoke_step = b.step(
+        "verify-cuda-finetune-smoke",
+        "Build CUDA artifacts and run the strict NVIDIA finetune smoke gate",
+    );
+    cuda_finetune_smoke_step.dependOn(&cuda_finetune_smoke.step);
+
     const bench_exe = b.addExecutable(.{
         .name = "termite-paged-attention-bench",
         .root_module = b.createModule(.{
@@ -654,6 +674,7 @@ pub fn build(b: *std.Build) void {
         .termite_internal_mod = termite_internal_mod,
         .termite_tokenizer_mod = termite_tokenizer_mod,
         .termite_hf_tokenizer_mod = termite_hf_tokenizer_mod,
+        .antfly_platform_mod = platform_mod,
         .antfly_image_mod = antfly_image_mod,
         .pjrt_mod = pjrt_mod,
         .protobuf_mod = protobuf_mod,

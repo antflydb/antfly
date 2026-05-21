@@ -1,6 +1,6 @@
 # Fine-Tuning in termite-zig
 
-termite-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in pure Zig and run on CPU (BLAS) or Apple Silicon (MLX) — no CUDA dependencies.
+termite-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in pure Zig and run on CPU (BLAS), Apple Silicon (MLX), or CUDA when the binary is built with `-Dcuda=true` and a usable NVIDIA driver is present.
 
 ---
 
@@ -91,6 +91,8 @@ Recipe-level LoRA defaults are intentionally PEFT-like:
 
 For learning-rate selection, do not copy full-finetune LRs directly. Start LoRA sweeps around `1e-4`, `3e-4`, and `1e-3` with the real target metric, then keep the smallest rank/target set that passes. Smaller micro-batches plus gradient accumulation are usually a better first move than shrinking rank below the defaults.
 
+`backend` accepts `auto`, `cuda`, `mlx`, `blas`, or `native` on the real-autodiff LoRA paths. `auto` prefers CUDA first when `-Dcuda=true` was used and the runtime probe reports an available CUDA device, then MLX when compiled in, then native BLAS/CPU. Explicit `cuda` fails fast if CUDA was not built in or the driver/runtime probe is unavailable.
+
 Use `--dry-run` to print the routed tool plan without launching training:
 
 ```sh
@@ -103,7 +105,47 @@ For a no-download recipe-layer verifier, use:
 termite finetune smoke-fast
 ```
 
-`smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/termite-finetune-smoke-fast/fast_smoke_summary.json` by default.
+`smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen3.5/Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/termite-finetune-smoke-fast/fast_smoke_summary.json` by default.
+
+### CUDA Hardware Validation
+
+CUDA fine-tuning has two gates: the binary must be built with CUDA enabled, and the runtime probe must find a usable NVIDIA driver/device. On a CUDA host, use:
+
+```sh
+./scripts/verify_cuda_finetune_smoke.sh
+```
+
+The script builds a CUDA-enabled binary, runs `termite cuda-info --json --smoke`, runs `smoke-fast --require-cuda`, runs strict `smoke-fast --require-cuda --strict-cuda` with host-side CUDA training fallbacks disabled, and asserts that the optimizer-backed Qwen3.5 SFT, Gemma4 LoRA SFT, and Qwen/Gemma preference smoke cases record `backend_resolved: "cuda"`.
+
+Equivalent manual commands:
+
+```sh
+zig build finetune -Dcuda=true -Dcuda-artifacts=portable -Dsystem-blas=true
+./zig-out/bin/termite cuda-info --json --smoke
+./zig-out/bin/termite finetune smoke-fast --require-cuda --out-root /tmp/termite-cuda-finetune-smoke
+```
+
+The CUDA probe should report `runtime_available: true` and `smoke.ok: true`. `--require-cuda` fails fast if the binary was not built with CUDA, the driver/runtime is unavailable, or any optimizer-backed Qwen3.5/Qwen/Gemma smoke case resolves to a non-CUDA backend. The smoke summary should report `status: "succeeded"` and include `backend_resolved: "cuda"` for those model-backed cases.
+
+For production validation, also run the smoke with host-side CUDA training fallbacks disabled:
+
+```sh
+TERMITE_CUDA_ALLOW_HOST_TRAINING_FALLBACKS=0 ./zig-out/bin/termite finetune smoke-fast --require-cuda --strict-cuda --out-root /tmp/termite-cuda-finetune-strict-smoke
+```
+
+This gate verifies that the selected CUDA training path is not depending on CPU-mediated primitive fallbacks.
+
+Use explicit CUDA in a recipe when fallback would hide a deployment issue:
+
+```json
+{
+  "backend": "cuda"
+}
+```
+
+Explicit CUDA fails before model loading if the binary was not built with CUDA, the driver/runtime probe is unavailable, or the selected recipe family has not been promoted to the CUDA finetune route.
+
+`auto` currently selects CUDA for optimizer-backed Qwen/Gemma adapter training and for reranker/GLiNER encoder cache or head-eval paths that can use the CUDA session factory. Direct GLiNER2, LayoutLMv3, and ColQwen2 gradient-math trainers still use the existing `auto|mlx|blas` backend policy until their graph-primitive coverage is promoted to the strict CUDA gate; explicit `backend: "cuda"` is rejected during recipe planning for those routes.
 
 ### Adapter Matrix
 
@@ -223,13 +265,24 @@ Completed:
 35. Added Qwen3.5/Chandra fine-tune readiness gating so unified recipes no longer infer those models as Qwen2 or route adapter training through the Qwen2 autodiff graph.
 36. Added the first Qwen3.5 training graph slice: full-attention text layers now build with gated `q_proj`, Qwen3.5 `1 + weight` RMSNorm, and partial-RoPE metadata, while linear-attention layers fail explicitly.
 37. Added Qwen3.5 linear-attention graph IR and routed text SFT/DPO/GRPO adapter recipes through the Qwen autodiff trainer.
+38. Added CUDA-aware backend selection for optimizer-backed Qwen/Gemma LoRA fine-tuning, explicit CUDA failure checks, CUDA runtime metadata in recipe artifacts, and CUDA primitive coverage for gradient execution.
+39. Added a one-command NVIDIA-host validation script for CUDA finetuning that builds the CUDA binary, verifies the CUDA probe, runs require/strict smoke gates, and asserts per-case CUDA backend resolution.
+40. Added synthetic execute-path verification for the optimizer-backed Qwen3.5 SFT route in `smoke-fast`, and included it in the required CUDA backend assertions.
+41. Broadened CUDA strict-mode primitive coverage for same-shape elementwise training math by keeping `divide`, `exp`, and `log` on device instead of routing through host fallback.
+42. Added CUDA last-dimension and all-axes `reduce_sum`, `reduce_max`, and `reduce_mean` coverage for the kept-dimension loss and normalization shapes used by the training graph.
+43. Added device-resident CUDA `broadcast_in_dim` coverage, including scalar expansion used by loss constants and reduced-shape gradients in strict CUDA training smoke.
+44. Added CUDA `where_select` broadcast materialization for scalar and suffix-broadcast operands so masking and safe-normalization paths can remain device-resident under strict CUDA validation.
+45. Broadened CUDA binary elementwise promotion from scalar-only to strict suffix-broadcast materialization for `add`, `multiply`, `divide`, `less_than`, and `subtract`.
+46. Added CUDA unary `sqrt`, `rsqrt`, and `abs` coverage for graph normalization and simple unary paths that cannot cross the host fallback boundary in strict CUDA mode.
+47. Added CUDA unary `sin`, `cos`, and `erf` coverage for RoPE/trig and exact-GELU-style graph paths so these simple ops stay device-resident in strict CUDA mode.
 
 Remaining:
 
 1. Add real-weight one-step smoke coverage for Qwen3.5 text SFT/DPO/GRPO on CPU and MLX/Metal.
-2. Add execute-path verification for the broader Qwen-family text-decoder routes, including ColQwen2 if we keep that path.
+2. Add execute-path verification for the broader Qwen-family text-decoder preference routes, including ColQwen2 if we keep that path.
 3. Add Chandra multimodal training data preparation with dynamic image-token expansion before enabling multimodal fine-tune recipes.
 4. Add more GRPO reward modes if we need tasks beyond exact, exact-match-ci, and prefix matching.
+5. Run the CUDA hardware validation gate above on an NVIDIA host before declaring CUDA fine-tuning production-ready for deployment.
 
 ---
 
@@ -850,7 +903,7 @@ usage: train-eval-reranker-lora-surrogate <model-dir> <adapter-dir>
     [train-split] [eval-split]
 
 Flags:
-  --backend auto|blas|mlx   Compute backend (default: auto)
+  --backend auto|cuda|blas|mlx   Compute backend (default: auto)
   --max-examples <n>        Max training examples (default: 128)
   --epochs <n>              Number of epochs (default: 1)
   --learning-rate <f>       Learning rate (default: 0.001)
@@ -1069,7 +1122,7 @@ Flags:
   --grad-accum <n>              Gradient accumulation steps (default: 1)
   --llrd-decay <f>              Surrogate-only layer-wise LR decay (default: 1.0=disabled)
   --schedule-free               Surrogate-only Schedule-Free AdamW (default: false)
-  --backend auto|mlx|blas       Compute backend (default: auto)
+  --backend auto|cuda|mlx|blas|native  Compute backend (default: auto)
 ```
 
 Trainer mode behavior:

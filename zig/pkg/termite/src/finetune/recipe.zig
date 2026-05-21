@@ -50,6 +50,7 @@ const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
 const command_registry = @import("command_registry.zig");
 const ml = @import("ml");
+const platform = @import("antfly_platform");
 const peft = @import("peft.zig");
 
 const print = std.debug.print;
@@ -241,13 +242,32 @@ const BackendBuildInfo = struct {
     enable_native: bool,
     enable_onnx: bool,
     enable_mlx: bool,
+    enable_cuda: bool,
+    cuda_artifacts: []const u8,
     enable_pjrt: bool,
     skip_openapi: bool,
 };
 
+const CudaRuntimeMetadata = struct {
+    built: bool,
+    runtime_available: bool,
+    reason: []const u8,
+    driver_version: i32,
+    device_count: i32,
+    selected_device: i32,
+    device_name: ?[]const u8,
+    compute_major: i32,
+    compute_minor: i32,
+    total_memory_bytes: u64,
+};
+
+const CudaMetadata = CudaRuntimeMetadata;
+
 const BackendMetadata = struct {
     requested: ?[]const u8,
+    resolved: []const u8,
     build: BackendBuildInfo,
+    cuda: CudaRuntimeMetadata,
 };
 
 const OptimizerSummary = struct {
@@ -328,8 +348,10 @@ const FastSmokeMode = enum {
 const FastSmokeSetup = enum {
     none,
     synthetic_gliner2_execute,
+    synthetic_qwen35_sft_execute,
     synthetic_qwen2_dpo_execute,
     synthetic_qwen2_grpo_execute,
+    synthetic_gemma_sft_execute,
     synthetic_gemma_dpo_execute,
     synthetic_gemma_grpo_execute,
 };
@@ -339,6 +361,7 @@ const FastSmokeCase = struct {
     recipe_path: []const u8,
     mode: FastSmokeMode,
     setup: FastSmokeSetup = .none,
+    requires_cuda_backend: bool = false,
 };
 
 const FastSmokeCaseResult = struct {
@@ -347,13 +370,19 @@ const FastSmokeCaseResult = struct {
     mode: FastSmokeMode,
     status: RunStatus,
     manifest_path: ?[]const u8 = null,
+    training_config_path: ?[]const u8 = null,
     training_report_path: ?[]const u8 = null,
+    backend_resolved: ?[]const u8 = null,
+    cuda_runtime_available: ?bool = null,
 };
 
 const FastSmokeSummary = struct {
     schema_version: []const u8 = "termite_finetune_fast_smoke/v1",
     status: RunStatus,
     output_root: []const u8,
+    require_cuda: bool = false,
+    strict_cuda: bool = false,
+    cuda: CudaMetadata,
     cases: []const FastSmokeCaseResult,
 };
 
@@ -371,6 +400,40 @@ const FastSmokeRecipeOverrides = struct {
     max_seq_len: ?usize = null,
 };
 
+const FastSmokeOptions = struct {
+    out_root: []const u8 = "/tmp/termite-finetune-smoke-fast",
+    require_cuda: bool = false,
+    strict_cuda: bool = false,
+};
+
+const FastSmokeBackendCheck = struct {
+    resolved: []const u8,
+    cuda_runtime_available: bool,
+};
+
+const FastSmokeBackendBuildView = struct {
+    enable_cuda: bool = false,
+};
+
+const FastSmokeBackendCudaView = struct {
+    runtime_available: bool = false,
+    reason: []const u8 = "",
+};
+
+const FastSmokeBackendMetadataView = struct {
+    resolved: []const u8 = "",
+    build: FastSmokeBackendBuildView = .{},
+    cuda: FastSmokeBackendCudaView = .{},
+};
+
+const FastSmokeTrainingMetadataView = struct {
+    backend: FastSmokeBackendMetadataView = .{},
+};
+
+const FastSmokeTrainingConfigView = struct {
+    metadata: FastSmokeTrainingMetadataView = .{},
+};
+
 const SyntheticGlinerAssets = struct {
     model_dir: []const u8,
     train_path: []const u8,
@@ -380,12 +443,14 @@ const SyntheticGlinerAssets = struct {
 
 const SyntheticQwen2Assets = struct {
     model_dir: []const u8,
+    sft_path: []const u8,
     dpo_path: []const u8,
     grpo_path: []const u8,
 };
 
 const SyntheticGemmaAssets = struct {
     model_dir: []const u8,
+    sft_path: []const u8,
     dpo_path: []const u8,
     grpo_path: []const u8,
 };
@@ -451,20 +516,11 @@ pub fn loadRecipe(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !s
 }
 
 fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    var out_root: []const u8 = "/tmp/termite-finetune-smoke-fast";
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--out-root")) {
-            i += 1;
-            if (i >= args.len) return usageError();
-            out_root = args[i];
-        } else {
-            return usageError();
-        }
-    }
+    const options = parseFastSmokeOptions(args) catch return usageError();
+    if (options.require_cuda) try requireFastSmokeCudaReady(options.strict_cuda);
 
-    try std.Io.Dir.cwd().createDirPath(io, out_root);
-    const summary_path = try std.fs.path.join(allocator, &.{ out_root, "fast_smoke_summary.json" });
+    try std.Io.Dir.cwd().createDirPath(io, options.out_root);
+    const summary_path = try std.fs.path.join(allocator, &.{ options.out_root, "fast_smoke_summary.json" });
     defer allocator.free(summary_path);
 
     const cases = [_]FastSmokeCase{
@@ -486,47 +542,127 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
         .{ .name = "grpo_text_colqwen2_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_colqwen2_fast.json", .mode = .dry_run },
         .{ .name = "grpo_ci_text_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_ci_native_fast.json", .mode = .dry_run },
         .{ .name = "grpo_prefix_text_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_prefix_native_fast.json", .mode = .dry_run },
+        .{ .name = "qwen35_sft_dry_run", .recipe_path = "pkg/termite/testdata/recipe_sft_qwen35_fast.json", .mode = .dry_run },
         .{ .name = "gliner2_direct_execute", .recipe_path = "pkg/termite/testdata/recipe_gliner2_lora.json", .mode = .execute, .setup = .synthetic_gliner2_execute },
-        .{ .name = "qwen2_dpo_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_qwen2_fast.json", .mode = .subprocess_execute, .setup = .synthetic_qwen2_dpo_execute },
-        .{ .name = "qwen2_grpo_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .execute, .setup = .synthetic_qwen2_grpo_execute },
-        .{ .name = "gemma4_dpo_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_dpo_execute },
-        .{ .name = "gemma4_grpo_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_grpo_execute },
+        .{ .name = "qwen35_sft_execute", .recipe_path = "pkg/termite/testdata/recipe_sft_qwen35_fast.json", .mode = .execute, .setup = .synthetic_qwen35_sft_execute, .requires_cuda_backend = true },
+        .{ .name = "gemma4_lora_sft_execute", .recipe_path = "pkg/termite/testdata/recipe_gemma4_lora.json", .mode = .execute, .setup = .synthetic_gemma_sft_execute, .requires_cuda_backend = true },
+        .{ .name = "qwen2_dpo_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_qwen2_fast.json", .mode = .subprocess_execute, .setup = .synthetic_qwen2_dpo_execute, .requires_cuda_backend = true },
+        .{ .name = "qwen2_grpo_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .execute, .setup = .synthetic_qwen2_grpo_execute, .requires_cuda_backend = true },
+        .{ .name = "gemma4_dpo_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_dpo_execute, .requires_cuda_backend = true },
+        .{ .name = "gemma4_grpo_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_grpo_execute, .requires_cuda_backend = true },
         .{ .name = "dpo_scalar_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_scalar.json", .mode = .execute },
         .{ .name = "grpo_scalar_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_scalar.json", .mode = .execute },
     };
 
     var results = try allocator.alloc(FastSmokeCaseResult, cases.len);
-    defer freeFastSmokeResults(allocator, results);
+    var results_len: usize = 0;
+    defer freeFastSmokeResults(allocator, results, results_len);
     for (cases, 0..) |case, idx| {
-        results[idx] = try runFastSmokeCase(allocator, io, out_root, case);
+        results[idx] = try runFastSmokeCase(allocator, io, options, case);
+        results_len = idx + 1;
     }
 
     const overall = blk: {
-        for (results) |result| {
+        for (results[0..results_len]) |result| {
             if (result.status != .succeeded) break :blk RunStatus.failed;
         }
         break :blk RunStatus.succeeded;
     };
     try writeJsonFile(allocator, io, summary_path, FastSmokeSummary{
         .status = overall,
-        .output_root = out_root,
-        .cases = results,
+        .output_root = options.out_root,
+        .require_cuda = options.require_cuda,
+        .strict_cuda = options.strict_cuda,
+        .cuda = collectCudaMetadata(),
+        .cases = results[0..results_len],
     });
     print("fast smoke summary: {s}\n", .{summary_path});
     if (overall != .succeeded) return error.FinetuneStepFailed;
 }
 
+fn parseFastSmokeOptions(args: []const []const u8) !FastSmokeOptions {
+    var options = FastSmokeOptions{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out-root")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            options.out_root = args[i];
+        } else if (std.mem.eql(u8, args[i], "--require-cuda")) {
+            options.require_cuda = true;
+        } else if (std.mem.eql(u8, args[i], "--strict-cuda")) {
+            options.require_cuda = true;
+            options.strict_cuda = true;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+    return options;
+}
+
+fn requireFastSmokeCudaReady(strict_cuda: bool) !void {
+    if (!build_options.enable_cuda) return error.CudaNotAvailable;
+    const cuda = backends.gpu_inventory.cudaStatus();
+    if (!cuda.runtime_available) {
+        print("error: CUDA runtime unavailable for required CUDA smoke: {s}\n", .{cuda.reasonText()});
+        return error.CudaRuntimeUnavailable;
+    }
+    if (strict_cuda and platform.env.getenvBoolDefault("TERMITE_CUDA_ALLOW_HOST_TRAINING_FALLBACKS", true)) {
+        print("error: --strict-cuda requires TERMITE_CUDA_ALLOW_HOST_TRAINING_FALLBACKS=0\n", .{});
+        return error.CudaStrictSmokeRequiresHostFallbacksDisabled;
+    }
+}
+
+fn fastSmokeBackendCheck(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: FastSmokeOptions,
+    case: FastSmokeCase,
+    training_config_path: []const u8,
+) !?FastSmokeBackendCheck {
+    if (!case.requires_cuda_backend) return null;
+
+    const raw = try readFileMax(allocator, io, training_config_path, 32 * 1024 * 1024);
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(FastSmokeTrainingConfigView, allocator, raw, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const backend = parsed.value.metadata.backend;
+    if (options.require_cuda) {
+        if (!backend.build.enable_cuda) {
+            print("error: required CUDA smoke case {s} was not built with CUDA enabled\n", .{case.name});
+            return error.CudaNotAvailable;
+        }
+        if (!backend.cuda.runtime_available) {
+            print("error: required CUDA smoke case {s} recorded unavailable runtime: {s}\n", .{ case.name, backend.cuda.reason });
+            return error.CudaRuntimeUnavailable;
+        }
+        if (!backendNameEquals(backend.resolved, "cuda")) {
+            print("error: required CUDA smoke case {s} resolved backend {s}, expected cuda\n", .{ case.name, backend.resolved });
+            return error.CudaRequiredSmokeDidNotResolveCuda;
+        }
+    }
+
+    return FastSmokeBackendCheck{
+        .resolved = try allocator.dupe(u8, backend.resolved),
+        .cuda_runtime_available = backend.cuda.runtime_available,
+    };
+}
+
 fn runFastSmokeCase(
     allocator: std.mem.Allocator,
     io: std.Io,
-    out_root: []const u8,
+    options: FastSmokeOptions,
     case: FastSmokeCase,
 ) !FastSmokeCaseResult {
     print("fast-smoke {s}: {s}\n", .{ case.name, case.recipe_path });
     var path_arena = std.heap.ArenaAllocator.init(allocator);
     defer path_arena.deinit();
     const path_allocator = path_arena.allocator();
-    const case_root = try std.fs.path.join(allocator, &.{ out_root, case.name });
+    const case_root = try std.fs.path.join(allocator, &.{ options.out_root, case.name });
     defer allocator.free(case_root);
     const overrides = try setupFastSmokeCase(allocator, io, case_root, case.setup);
     defer freeFastSmokeRecipeOverrides(allocator, overrides);
@@ -596,32 +732,44 @@ fn runFastSmokeCase(
         try expectPathExists(io, trained_dir);
         try expectRunStatusFile(allocator, io, manifest_path, "succeeded");
         try expectRunStatusFile(allocator, io, training_report_path, "succeeded");
+        const backend_check = try fastSmokeBackendCheck(allocator, io, options, case, training_config_path);
+        errdefer if (backend_check) |check| allocator.free(check.resolved);
         return .{
             .name = case.name,
             .recipe_path = case.recipe_path,
             .mode = case.mode,
             .status = .succeeded,
             .manifest_path = try allocator.dupe(u8, manifest_path),
+            .training_config_path = try allocator.dupe(u8, training_config_path),
             .training_report_path = try allocator.dupe(u8, training_report_path),
+            .backend_resolved = if (backend_check) |check| check.resolved else null,
+            .cuda_runtime_available = if (backend_check) |check| check.cuda_runtime_available else null,
         };
     }
     try runPlan(allocator, io, exe_dir, recipe, plan, manifest_path, training_config_path, training_report_path);
     try expectRunStatusFile(allocator, io, manifest_path, "succeeded");
     try expectRunStatusFile(allocator, io, training_report_path, "succeeded");
+    const backend_check = try fastSmokeBackendCheck(allocator, io, options, case, training_config_path);
+    errdefer if (backend_check) |check| allocator.free(check.resolved);
     return .{
         .name = case.name,
         .recipe_path = case.recipe_path,
         .mode = case.mode,
         .status = .succeeded,
         .manifest_path = try allocator.dupe(u8, manifest_path),
+        .training_config_path = try allocator.dupe(u8, training_config_path),
         .training_report_path = try allocator.dupe(u8, training_report_path),
+        .backend_resolved = if (backend_check) |check| check.resolved else null,
+        .cuda_runtime_available = if (backend_check) |check| check.cuda_runtime_available else null,
     };
 }
 
-fn freeFastSmokeResults(allocator: std.mem.Allocator, results: []FastSmokeCaseResult) void {
-    for (results) |result| {
+fn freeFastSmokeResults(allocator: std.mem.Allocator, results: []FastSmokeCaseResult, initialized_len: usize) void {
+    for (results[0..initialized_len]) |result| {
         if (result.manifest_path) |path| allocator.free(path);
+        if (result.training_config_path) |path| allocator.free(path);
         if (result.training_report_path) |path| allocator.free(path);
+        if (result.backend_resolved) |value| allocator.free(value);
     }
     allocator.free(results);
 }
@@ -708,8 +856,22 @@ fn setupFastSmokeCase(
                 .max_seq_len = 16,
             };
         },
+        .synthetic_qwen35_sft_execute => blk: {
+            const assets = try writeSyntheticQwen2SmokeAssets(allocator, io, case_root);
+            allocator.free(assets.dpo_path);
+            allocator.free(assets.grpo_path);
+            break :blk .{
+                .model_path = assets.model_dir,
+                .dataset_path = assets.sft_path,
+                .dataset_format = "rendered-text-sft",
+                .backend = "auto",
+                .max_examples = 1,
+                .max_seq_len = 32,
+            };
+        },
         .synthetic_qwen2_dpo_execute => blk: {
             const assets = try writeSyntheticQwen2SmokeAssets(allocator, io, case_root);
+            allocator.free(assets.sft_path);
             allocator.free(assets.grpo_path);
             break :blk .{
                 .model_path = assets.model_dir,
@@ -723,6 +885,7 @@ fn setupFastSmokeCase(
         },
         .synthetic_qwen2_grpo_execute => blk: {
             const assets = try writeSyntheticQwen2SmokeAssets(allocator, io, case_root);
+            allocator.free(assets.sft_path);
             allocator.free(assets.dpo_path);
             break :blk .{
                 .model_path = assets.model_dir,
@@ -734,8 +897,22 @@ fn setupFastSmokeCase(
                 .max_seq_len = 32,
             };
         },
+        .synthetic_gemma_sft_execute => blk: {
+            const assets = try writeSyntheticGemmaSmokeAssets(allocator, io, case_root);
+            allocator.free(assets.dpo_path);
+            allocator.free(assets.grpo_path);
+            break :blk .{
+                .model_path = assets.model_dir,
+                .dataset_path = assets.sft_path,
+                .backend = "auto",
+                .max_examples = 1,
+                .eval_max_examples = 1,
+                .max_seq_len = 32,
+            };
+        },
         .synthetic_gemma_dpo_execute => blk: {
             const assets = try writeSyntheticGemmaSmokeAssets(allocator, io, case_root);
+            allocator.free(assets.sft_path);
             allocator.free(assets.grpo_path);
             break :blk .{
                 .model_path = assets.model_dir,
@@ -749,6 +926,7 @@ fn setupFastSmokeCase(
         },
         .synthetic_gemma_grpo_execute => blk: {
             const assets = try writeSyntheticGemmaSmokeAssets(allocator, io, case_root);
+            allocator.free(assets.sft_path);
             allocator.free(assets.dpo_path);
             break :blk .{
                 .model_path = assets.model_dir,
@@ -877,6 +1055,11 @@ fn writeSyntheticQwen2SmokeAssets(allocator: std.mem.Allocator, io: std.Io, case
     errdefer allocator.free(dpo_path);
     const grpo_path = try std.fs.path.join(allocator, &.{ assets_root, "grpo.jsonl" });
     errdefer allocator.free(grpo_path);
+    const sft_path = try std.fs.path.join(allocator, &.{ assets_root, "sft.jsonl" });
+    errdefer allocator.free(sft_path);
+    try writeTextFile(io, sft_path,
+        \\{"prompt":"Answer with one word: yes\nAnswer:","completion":" yes"}
+    );
     try writeTextFile(io, dpo_path,
         \\{"prompt":"Answer with one word: yes or no?\nAnswer:","chosen":" yes","rejected":" no"}
     );
@@ -886,6 +1069,7 @@ fn writeSyntheticQwen2SmokeAssets(allocator: std.mem.Allocator, io: std.Io, case
 
     return .{
         .model_dir = model_dir,
+        .sft_path = sft_path,
         .dpo_path = dpo_path,
         .grpo_path = grpo_path,
     };
@@ -914,10 +1098,15 @@ fn writeSyntheticGemmaSmokeAssets(allocator: std.mem.Allocator, io: std.Io, case
     defer allocator.free(checkpoint_path);
     try writeSyntheticGemmaCheckpoint(allocator, checkpoint_path);
 
+    const sft_path = try std.fs.path.join(allocator, &.{ assets_root, "sft.jsonl" });
+    errdefer allocator.free(sft_path);
     const dpo_path = try std.fs.path.join(allocator, &.{ assets_root, "dpo.jsonl" });
     errdefer allocator.free(dpo_path);
     const grpo_path = try std.fs.path.join(allocator, &.{ assets_root, "grpo.jsonl" });
     errdefer allocator.free(grpo_path);
+    try writeTextFile(io, sft_path,
+        \\{"prompt":"Answer with one word: yes","response":"yes"}
+    );
     try writeTextFile(io, dpo_path,
         \\{"prompt":"Answer with one word: yes or no?\nAnswer:","chosen":" yes","rejected":" no"}
     );
@@ -927,6 +1116,7 @@ fn writeSyntheticGemmaSmokeAssets(allocator: std.mem.Allocator, io: std.Io, case
 
     return .{
         .model_dir = model_dir,
+        .sft_path = sft_path,
         .dpo_path = dpo_path,
         .grpo_path = grpo_path,
     };
@@ -1188,6 +1378,7 @@ fn makeRampF32(allocator: std.mem.Allocator, len: usize, scale: f32) ![]f32 {
 fn buildPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const kind = try parseKind(recipe.recipe orelse recipe.kind orelse return error.MissingRecipeKind);
     const family = recipe.model.family orelse try inferFamily(recipe);
+    try rejectUnsupportedExplicitCudaRecipe(recipe, kind, family);
 
     return switch (kind) {
         .sft, .lora_sft, .qlora_sft => try buildLoraSftPlan(allocator, recipe, family),
@@ -1472,6 +1663,16 @@ fn buildVlmRetrievalPlan(allocator: std.mem.Allocator, recipe: Recipe, family: [
         try fmtInt(allocator, recipe.optimizer.epochs orelse 1),
     }) });
     return .{ .steps = try steps.toOwnedSlice(allocator) };
+}
+
+fn rejectUnsupportedExplicitCudaRecipe(recipe: Recipe, kind: RecipeKind, family: []const u8) !void {
+    if (!isExplicitCudaBackend(recipe.backend)) return;
+    const unsupported = switch (kind) {
+        .sft, .lora_sft, .qlora_sft => eqlAny(family, &.{ "gliner2", "layoutlmv3" }),
+        .vlm_retrieval => true,
+        .dpo, .grpo, .reranker => false,
+    };
+    if (unsupported) return error.UnsupportedCudaFinetuneRoute;
 }
 
 fn buildDpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
@@ -2162,20 +2363,57 @@ fn writeTrainingReport(allocator: std.mem.Allocator, io: std.Io, path: []const u
     try writeJsonFile(allocator, io, path, report);
 }
 
+fn collectBackendMetadata(allocator: std.mem.Allocator, recipe: Recipe) !BackendMetadata {
+    const cuda = backends.gpu_inventory.cudaStatus();
+    const device_name = if (cuda.name_len > 0) try allocator.dupe(u8, cuda.nameSlice()) else null;
+    return .{
+        .requested = recipe.backend,
+        .resolved = resolvedRecipeBackendName(recipe),
+        .build = .{
+            .termite_version = build_options.termite_version,
+            .enable_native = build_options.enable_native,
+            .enable_onnx = build_options.enable_onnx,
+            .enable_mlx = build_options.enable_mlx,
+            .enable_cuda = build_options.enable_cuda,
+            .cuda_artifacts = build_options.cuda_artifacts,
+            .enable_pjrt = build_options.enable_pjrt,
+            .skip_openapi = build_options.skip_openapi,
+        },
+        .cuda = .{
+            .built = cuda.built,
+            .runtime_available = cuda.runtime_available,
+            .reason = cuda.reasonText(),
+            .driver_version = cuda.driver_version,
+            .device_count = cuda.device_count,
+            .selected_device = cuda.selected_device,
+            .device_name = device_name,
+            .compute_major = cuda.compute_major,
+            .compute_minor = cuda.compute_minor,
+            .total_memory_bytes = cuda.total_memory_bytes,
+        },
+    };
+}
+
+fn collectCudaMetadata() CudaMetadata {
+    const cuda = backends.gpu_inventory.cudaStatus();
+    return .{
+        .built = cuda.built,
+        .runtime_available = cuda.runtime_available,
+        .reason = cuda.reasonText(),
+        .driver_version = cuda.driver_version,
+        .device_count = cuda.device_count,
+        .selected_device = cuda.selected_device,
+        .device_name = if (cuda.name_len > 0) cuda.nameSlice() else null,
+        .compute_major = cuda.compute_major,
+        .compute_minor = cuda.compute_minor,
+        .total_memory_bytes = cuda.total_memory_bytes,
+    };
+}
+
 fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe) !StaticMetadata {
     return .{
         .dataset_fingerprints = try collectDatasetFingerprints(allocator, io, recipe),
-        .backend = .{
-            .requested = recipe.backend,
-            .build = .{
-                .termite_version = build_options.termite_version,
-                .enable_native = build_options.enable_native,
-                .enable_onnx = build_options.enable_onnx,
-                .enable_mlx = build_options.enable_mlx,
-                .enable_pjrt = build_options.enable_pjrt,
-                .skip_openapi = build_options.skip_openapi,
-            },
-        },
+        .backend = try collectBackendMetadata(allocator, recipe),
         .optimizer = .{
             .learning_rate = recipe.optimizer.learning_rate,
             .epochs = recipe.optimizer.epochs,
@@ -2783,10 +3021,7 @@ fn runDirectMaterializeGliner2Lora(allocator: std.mem.Allocator, io: std.Io, arg
 }
 
 fn parseGlinerBackend(value: []const u8) !reranker.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    return error.InvalidBackend;
+    return reranker.parseBackendChoice(value) orelse error.InvalidBackend;
 }
 
 fn parseCsvOwned(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 {
@@ -3176,10 +3411,7 @@ fn runDirectMaterializeRerankerHead(allocator: std.mem.Allocator, io: std.Io, ar
 }
 
 fn parseRerankerBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    return null;
+    return reranker_head.parseBackendChoice(value);
 }
 
 const DpoScalarRow = struct {
@@ -3603,7 +3835,7 @@ fn runOptimizerBackedQwen2Sft(
     const trained_dir_config = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir;
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
-    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind = try resolveQwenAutodiffBackend(recipe.backend);
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     const family = recipe.model.family orelse try inferFamily(recipe);
@@ -3825,7 +4057,7 @@ fn runOptimizerBackedGemmaDpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: gemma4_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind = try resolveGemmaAutodiffBackend(recipe.backend);
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     try validateGemmaAdapterOptions(adapter);
@@ -4007,7 +4239,7 @@ fn runOptimizerBackedQwen2Dpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind = try resolveQwenAutodiffBackend(recipe.backend);
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     const family = recipe.model.family orelse try inferFamily(recipe);
@@ -4244,7 +4476,7 @@ fn runOptimizerBackedGemmaGrpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: gemma4_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind = try resolveGemmaAutodiffBackend(recipe.backend);
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
@@ -4494,7 +4726,7 @@ fn runOptimizerBackedQwen2Grpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind = try resolveQwenAutodiffBackend(recipe.backend);
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
@@ -5240,7 +5472,116 @@ fn logProbAtToken(logits: []const f32, token_id: i32) f32 {
 
 fn parseRecipeBackendChoice(value: ?[]const u8) !native_backend_choice.Choice {
     const raw = value orelse return .auto;
+    if (backendNameEquals(raw, "blas")) return .native;
     return native_backend_choice.parse(raw) orelse error.InvalidBackend;
+}
+
+fn backendNameEquals(value: []const u8, expected: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, expected);
+}
+
+fn isExplicitCudaBackend(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    return backendNameEquals(raw, "cuda");
+}
+
+fn cudaAvailableForFinetune() bool {
+    return build_options.enable_cuda and backends.gpu_inventory.cudaRuntimeAvailable();
+}
+
+fn recipeFamilyOrNull(recipe: Recipe) ?[]const u8 {
+    if (recipe.model.family) |family| return family;
+    if (recipe.model.path) |path| return inferFamilyFromModelPath(path);
+    return null;
+}
+
+fn recipeHasCudaFinetuneRoute(recipe: Recipe) bool {
+    const kind = parseKind(recipe.recipe orelse recipe.kind orelse return false) catch return false;
+    const family = recipeFamilyOrNull(recipe) orelse return false;
+    return switch (kind) {
+        .sft, .lora_sft, .qlora_sft => blk: {
+            if (isQwen35Family(family)) break :blk true;
+            if (eqlAny(family, &.{ "gemma4", "gemma" })) break :blk true;
+            if (eqlAny(family, &.{ "reranker", "text-reranker", "deberta", "modernbert" })) break :blk true;
+            break :blk false;
+        },
+        .dpo, .grpo => blk: {
+            if (!requestsAdapterTraining(recipe)) break :blk false;
+            if (isQwen35Family(family)) break :blk true;
+            if (eqlAny(family, &.{ "qwen2", "qwen", "colqwen2", "colqwen", "qwen2vl", "gemma4", "gemma" })) break :blk true;
+            break :blk false;
+        },
+        .reranker => eqlAny(family, &.{ "reranker", "text-reranker", "deberta", "modernbert" }),
+        .vlm_retrieval => false,
+    };
+}
+
+fn resolvedRecipeBackendName(recipe: Recipe) []const u8 {
+    const raw = recipe.backend orelse "auto";
+    if (backendNameEquals(raw, "auto")) {
+        if (recipeHasCudaFinetuneRoute(recipe) and cudaAvailableForFinetune()) return "cuda";
+        if (build_options.enable_mlx) return "mlx";
+        return "blas";
+    }
+    return raw;
+}
+
+fn requireCudaFinetuneAvailable() !void {
+    if (!build_options.enable_cuda) return error.CudaNotAvailable;
+    const status = backends.gpu_inventory.cudaStatus();
+    if (!status.runtime_available) return error.CudaRuntimeUnavailable;
+}
+
+fn resolveQwenAutodiffBackend(value: ?[]const u8) !qwen2_real_autodiff.BackendKind {
+    const raw = value orelse "auto";
+    if (backendNameEquals(raw, "auto")) {
+        if (cudaAvailableForFinetune()) return .cuda;
+        if (build_options.enable_mlx) return .mlx;
+        return .native;
+    }
+    if (backendNameEquals(raw, "cuda")) {
+        try requireCudaFinetuneAvailable();
+        return .cuda;
+    }
+    if (backendNameEquals(raw, "mlx")) {
+        if (!build_options.enable_mlx) return error.MlxNotAvailable;
+        return .mlx;
+    }
+    if (backendNameEquals(raw, "blas") or backendNameEquals(raw, "native")) return .native;
+    return error.InvalidBackend;
+}
+
+fn resolveQwenBackendKind(value: ?[]const u8) !qwen2_real_autodiff.BackendKind {
+    return resolveQwenAutodiffBackend(value) catch |err| switch (err) {
+        error.CudaNotAvailable => error.CudaBackendUnavailable,
+        else => err,
+    };
+}
+
+fn resolveGemmaAutodiffBackend(value: ?[]const u8) !gemma4_real_autodiff.BackendKind {
+    const raw = value orelse "auto";
+    if (backendNameEquals(raw, "auto")) {
+        if (cudaAvailableForFinetune()) return .cuda;
+        if (build_options.enable_mlx) return .mlx;
+        return .native;
+    }
+    if (backendNameEquals(raw, "cuda")) {
+        try requireCudaFinetuneAvailable();
+        return .cuda;
+    }
+    if (backendNameEquals(raw, "mlx")) {
+        if (!build_options.enable_mlx) return error.MlxNotAvailable;
+        return .mlx;
+    }
+    if (backendNameEquals(raw, "blas") or backendNameEquals(raw, "native")) return .native;
+    return error.InvalidBackend;
+}
+
+fn resolveGemmaBackendKind(value: ?[]const u8) !gemma4_real_autodiff.BackendKind {
+    return resolveGemmaAutodiffBackend(value) catch |err| switch (err) {
+        error.CudaNotAvailable => error.CudaBackendUnavailable,
+        else => err,
+    };
 }
 
 const GrpoScalarRow = struct {
@@ -5694,7 +6035,7 @@ fn readFileMax(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_b
 fn usage() void {
     print(
         \\usage: termite finetune run <recipe.json> [--dry-run]
-        \\       termite finetune smoke-fast [--out-root <path>]
+        \\       termite finetune smoke-fast [--out-root <path>] [--require-cuda] [--strict-cuda]
         \\
         \\recipe kinds: sft, lora-sft, qlora-sft, dpo, grpo, reranker, vlm-retrieval
         \\common fields: model, dataset, adapter, optimizer, eval, artifacts
@@ -5766,6 +6107,29 @@ test "qwen3_5 text preference recipes route to qwen autodiff planner" {
     try std.testing.expect(try shouldRunOptimizerBackedQwen2Grpo(grpo_recipe, "text-grpo"));
 }
 
+test "recipe backends resolve legacy blas and cuda requests" {
+    try std.testing.expectEqual(native_backend_choice.Choice.native, try parseRecipeBackendChoice("blas"));
+    try std.testing.expectEqual(native_backend_choice.Choice.cuda, try parseRecipeBackendChoice("cuda"));
+    try std.testing.expectEqual(qwen2_real_autodiff.BackendKind.native, try resolveQwenBackendKind("blas"));
+    try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.native, try resolveGemmaBackendKind("native"));
+
+    const auto_qwen = try resolveQwenBackendKind("auto");
+    const auto_gemma = try resolveGemmaBackendKind(null);
+    if (build_options.enable_cuda and backends.gpu_inventory.cudaRuntimeAvailable()) {
+        try std.testing.expectEqual(qwen2_real_autodiff.BackendKind.cuda, auto_qwen);
+        try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.cuda, auto_gemma);
+        try std.testing.expectEqual(qwen2_real_autodiff.BackendKind.cuda, try resolveQwenBackendKind("cuda"));
+    } else {
+        try std.testing.expectEqual(qwen2_real_autodiff.BackendKind.native, auto_qwen);
+        try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.native, auto_gemma);
+        if (build_options.enable_cuda) {
+            try std.testing.expectError(error.CudaRuntimeUnavailable, resolveQwenBackendKind("cuda"));
+        } else {
+            try std.testing.expectError(error.CudaBackendUnavailable, resolveQwenBackendKind("cuda"));
+        }
+    }
+}
+
 test "gemma4 lora recipe builds prepare bootstrap train plan" {
     const recipe = Recipe{
         .recipe = "lora-sft",
@@ -5774,6 +6138,7 @@ test "gemma4 lora recipe builds prepare bootstrap train plan" {
         .adapter = .{ .rank = 4, .alpha = 8 },
         .optimizer = .{ .learning_rate = 0.0002, .epochs = 2 },
         .artifacts = .{ .root = "/tmp/out" },
+        .backend = "cuda",
     };
     const plan = try buildPlan(std.heap.page_allocator, recipe);
     defer freePlan(std.heap.page_allocator, plan);
@@ -5781,6 +6146,7 @@ test "gemma4 lora recipe builds prepare bootstrap train plan" {
     try std.testing.expectEqualStrings("prepare-gemma4-lora-inputs", plan.steps[0].argv[0]);
     try std.testing.expectEqualStrings("bootstrap-gemma4-lora", plan.steps[1].argv[0]);
     try std.testing.expectEqualStrings("train-eval-gemma4-lora-bundle", plan.steps[2].argv[0]);
+    try expectArgPair(plan.steps[2].argv, "--backend", "cuda");
 }
 
 test "gemma4 lora recipe defaults to all-linear rank16 alpha32" {
@@ -6058,6 +6424,19 @@ test "fast smoke resolves checked-in testdata from current package cwd" {
     try std.testing.expect(cwdPathExists(std.testing.io, path));
 }
 
+test "fast smoke options parse cuda gates" {
+    const required = try parseFastSmokeOptions(&.{ "--out-root", "/tmp/cuda-smoke", "--require-cuda" });
+    try std.testing.expectEqualStrings("/tmp/cuda-smoke", required.out_root);
+    try std.testing.expect(required.require_cuda);
+    try std.testing.expect(!required.strict_cuda);
+
+    const strict = try parseFastSmokeOptions(&.{"--strict-cuda"});
+    try std.testing.expect(strict.require_cuda);
+    try std.testing.expect(strict.strict_cuda);
+
+    try std.testing.expectError(error.InvalidArguments, parseFastSmokeOptions(&.{"--out-root"}));
+}
+
 test "direct command adapter registry covers reranker family steps" {
     try std.testing.expect(isDirectCommandAdapter("prepare-gemma4-lora-inputs"));
     try std.testing.expect(isDirectCommandAdapter("bootstrap-gemma4-lora"));
@@ -6080,6 +6459,116 @@ test "direct command adapter registry covers reranker family steps" {
     try std.testing.expect(isDirectCommandAdapter("prepare-reranker-pooled-cache"));
     try std.testing.expect(isDirectCommandAdapter("train-eval-reranker-head-cached"));
     try std.testing.expect(isDirectCommandAdapter("materialize-reranker-head"));
+}
+
+test "finetune backend parser accepts blas alias for native sessions" {
+    try std.testing.expectEqual(native_backend_choice.Choice.native, try parseRecipeBackendChoice("blas"));
+    try std.testing.expectEqual(native_backend_choice.Choice.native, try parseRecipeBackendChoice("native"));
+    try std.testing.expectEqual(native_backend_choice.Choice.cuda, try parseRecipeBackendChoice("cuda"));
+}
+
+test "autodiff backend resolvers validate explicit cuda and auto fallback" {
+    const cuda = backends.gpu_inventory.cudaStatus();
+
+    if (!build_options.enable_cuda) {
+        try std.testing.expectError(error.CudaNotAvailable, resolveQwenAutodiffBackend("cuda"));
+        try std.testing.expectError(error.CudaNotAvailable, resolveGemmaAutodiffBackend("cuda"));
+    } else if (!cuda.runtime_available) {
+        try std.testing.expectError(error.CudaRuntimeUnavailable, resolveQwenAutodiffBackend("cuda"));
+        try std.testing.expectError(error.CudaRuntimeUnavailable, resolveGemmaAutodiffBackend("cuda"));
+    } else {
+        try std.testing.expectEqual(qwen2_real_autodiff.BackendKind.cuda, try resolveQwenAutodiffBackend("cuda"));
+        try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.cuda, try resolveGemmaAutodiffBackend("cuda"));
+    }
+
+    const expected_qwen_auto: qwen2_real_autodiff.BackendKind = if (cuda.runtime_available)
+        .cuda
+    else if (build_options.enable_mlx)
+        .mlx
+    else
+        .native;
+    const expected_gemma_auto: gemma4_real_autodiff.BackendKind = if (cuda.runtime_available)
+        .cuda
+    else if (build_options.enable_mlx)
+        .mlx
+    else
+        .native;
+    try std.testing.expectEqual(expected_qwen_auto, try resolveQwenAutodiffBackend("auto"));
+    try std.testing.expectEqual(expected_gemma_auto, try resolveGemmaAutodiffBackend(null));
+}
+
+test "recipe cuda route detection matches supported finetune families" {
+    try std.testing.expect(recipeHasCudaFinetuneRoute(.{
+        .recipe = "lora-sft",
+        .model = .{ .family = "gemma4" },
+    }));
+    try std.testing.expect(recipeHasCudaFinetuneRoute(.{
+        .recipe = "dpo",
+        .model = .{ .family = "qwen2" },
+        .adapter = .{},
+    }));
+    try std.testing.expect(recipeHasCudaFinetuneRoute(.{
+        .recipe = "reranker",
+        .model = .{ .family = "reranker" },
+    }));
+    try std.testing.expect(!recipeHasCudaFinetuneRoute(.{
+        .recipe = "lora-sft",
+        .model = .{ .family = "gliner2" },
+    }));
+    try std.testing.expect(!recipeHasCudaFinetuneRoute(.{
+        .recipe = "vlm-retrieval",
+        .model = .{ .family = "colqwen2" },
+    }));
+}
+
+test "explicit cuda rejects direct-gradient recipe routes without cuda support" {
+    try std.testing.expectError(error.UnsupportedCudaFinetuneRoute, buildPlan(std.testing.allocator, .{
+        .recipe = "lora-sft",
+        .model = .{ .family = "gliner2" },
+        .backend = "cuda",
+    }));
+    try std.testing.expectError(error.UnsupportedCudaFinetuneRoute, buildPlan(std.testing.allocator, .{
+        .recipe = "lora-sft",
+        .model = .{ .family = "layoutlmv3" },
+        .backend = "cuda",
+    }));
+    try std.testing.expectError(error.UnsupportedCudaFinetuneRoute, buildPlan(std.testing.allocator, .{
+        .recipe = "vlm-retrieval",
+        .model = .{ .family = "colqwen2" },
+        .backend = "cuda",
+    }));
+
+    const dpo = try buildPlan(std.testing.allocator, .{
+        .recipe = "dpo",
+        .model = .{ .family = "custom-decoder" },
+        .dataset = .{ .path = "/data/prefs.jsonl" },
+        .backend = "cuda",
+    });
+    defer freePlan(std.testing.allocator, dpo);
+    try std.testing.expectEqual(StepKind.direct_dpo, dpo.steps[0].kind);
+}
+
+test "backend metadata records cuda build and runtime probe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const recipe = Recipe{ .backend = "auto" };
+    const metadata = try collectBackendMetadata(arena.allocator(), recipe);
+    const cuda = backends.gpu_inventory.cudaStatus();
+
+    try std.testing.expectEqual(build_options.enable_cuda, metadata.build.enable_cuda);
+    try std.testing.expectEqualStrings(build_options.cuda_artifacts, metadata.build.cuda_artifacts);
+    try std.testing.expectEqual(cuda.built, metadata.cuda.built);
+    try std.testing.expectEqual(cuda.runtime_available, metadata.cuda.runtime_available);
+    try std.testing.expectEqual(cuda.device_count, metadata.cuda.device_count);
+    try std.testing.expectEqual(cuda.total_memory_bytes, metadata.cuda.total_memory_bytes);
+    try std.testing.expectEqualStrings(cuda.reasonText(), metadata.cuda.reason);
+    try std.testing.expectEqualStrings(resolvedRecipeBackendName(recipe), metadata.resolved);
+    if (cuda.name_len > 0) {
+        try std.testing.expectEqualStrings(cuda.nameSlice(), metadata.cuda.device_name.?);
+    } else {
+        try std.testing.expect(metadata.cuda.device_name == null);
+    }
 }
 
 test "text reward modes score as expected" {
@@ -6126,4 +6615,15 @@ fn expectStepCommands(plan: Plan, expected: []const []const u8) !void {
     for (expected, 0..) |command, i| {
         try std.testing.expectEqualStrings(command, plan.steps[i].argv[0]);
     }
+}
+
+fn expectArgPair(args: []const []const u8, flag: []const u8, value: []const u8) !void {
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], flag)) {
+            try std.testing.expectEqualStrings(value, args[i + 1]);
+            return;
+        }
+    }
+    return error.ExpectedArgumentPairMissing;
 }

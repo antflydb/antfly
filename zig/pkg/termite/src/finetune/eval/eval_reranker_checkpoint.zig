@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const backends = @import("../../backends/backends.zig");
 const reranker_data = @import("../reranker_data.zig");
 const reranker = @import("../reranker.zig");
 const reranker_head = @import("../reranker_head.zig");
@@ -33,6 +34,20 @@ const Options = struct {
         _ = self;
     }
 };
+
+fn reportedBackendForHeadEval(choice: reranker.BackendChoice) backends.BackendType {
+    return switch (choice) {
+        .auto => if (build_options.enable_cuda and backends.gpu_inventory.cudaRuntimeAvailable())
+            .cuda
+        else if (build_options.enable_mlx)
+            .mlx
+        else
+            .native,
+        .native => .native,
+        .mlx => .mlx,
+        .cuda => .cuda,
+    };
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -92,11 +107,7 @@ pub fn main(init: std.process.Init) !void {
         const summary = try reranker_head.evaluateHead(allocator, opts.model_dir, &head, loaded.examples, opts.backend, opts.max_examples);
         break :blk reranker.RuntimeEvalResult{
             .summary = summary,
-            .backend_selected = switch (opts.backend) {
-                .auto => .native,
-                .native => .native,
-                .mlx => .mlx,
-            },
+            .backend_selected = reportedBackendForHeadEval(opts.backend),
             .distributed = .{},
             .uses_distributed_mlx = false,
             .uses_tensor_parallel_mlx = false,
@@ -133,15 +144,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackendChoice(value: []const u8) ?reranker.BackendChoice {
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas") or std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    return null;
+    return reranker.parseBackendChoice(value);
 }
 
 fn printUsage() void {
     print(
-        \\usage: eval-reranker-checkpoint <model-dir> <jsonl_or_dir> [split] [--head-dir DIR|--head FILE] [--backend auto|blas|mlx] [--max-examples N]
+        \\usage: eval-reranker-checkpoint <model-dir> <jsonl_or_dir> [split] [--head-dir DIR|--head FILE] [--backend auto|cuda|blas|mlx] [--max-examples N]
         \\example: eval-reranker-checkpoint /tmp/bge-reranker /tmp/rerank train --head-dir /tmp/out --backend mlx --max-examples 128
         \\
     , .{});

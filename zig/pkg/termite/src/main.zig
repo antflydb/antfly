@@ -32,6 +32,7 @@ fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
 
 const RunConfig = struct {
     models_dir: ?[]const u8 = null,
+    backend: ?[]const u8 = null,
     content_security: ?termite.scraping.ContentSecurityConfig = null,
     s3_credentials: ?termite.scraping.S3CredentialsConfig = null,
     keep_alive_ms: ?u64 = null,
@@ -48,6 +49,18 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
         .ignore_unknown_fields = true,
     });
     return parsed.value;
+}
+
+fn parseBackendChoice(value: []const u8) !termite.native_backend_choice.Choice {
+    const choice = termite.native_backend_choice.parse(value) orelse return error.InvalidBackend;
+    termite.native_backend_choice.validateRuntime(choice) catch |err| {
+        if (err == error.CudaRuntimeUnavailable) {
+            const cuda = termite.backends.gpu_inventory.cudaStatus();
+            print("cuda backend unavailable: {s}\n", .{cuda.reasonText()});
+        }
+        return err;
+    };
+    return choice;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -127,6 +140,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(allocator);
+    var backend_choice: termite.native_backend_choice.Choice = .auto;
+    var backend_overridden = false;
     var config_path: ?[]const u8 = null;
     var models_overridden = false;
 
@@ -142,6 +157,10 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             models_dir = args[i + 1];
             models_overridden = true;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
+            backend_choice = try parseBackendChoice(args[i + 1]);
+            backend_overridden = true;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
             i += 1;
@@ -153,16 +172,25 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (!models_overridden) {
             if (cfg.models_dir) |value| models_dir = value;
         }
+        if (!backend_overridden) {
+            if (cfg.backend) |value| {
+                backend_choice = try parseBackendChoice(value);
+            }
+        }
     }
 
     print("termite-zig v{s}\n", .{build_options.termite_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={}\n", .{
+    const cuda = termite.backends.gpu_inventory.cudaStatus();
+    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={} cuda_runtime={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
         build_options.enable_mlx,
+        build_options.enable_cuda,
+        cuda.runtime_available,
     });
+    print("backend preference: {s}\n", .{@tagName(backend_choice)});
     print("models: {s}\n", .{models_dir});
     print("listening on {s}:{d}\n", .{ host, port });
 
@@ -172,6 +200,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node_cfg = termite.server.NodeConfig{
         .models_dir = models_dir,
+        .backend_choice = backend_choice,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
@@ -251,14 +280,16 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 }
 
 fn printVersion() void {
+    const cuda = termite.backends.gpu_inventory.cudaStatus();
     print("termite-zig v{s}\n", .{build_options.termite_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={} cuda_runtime={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
         build_options.enable_mlx,
         build_options.enable_cuda,
+        cuda.runtime_available,
     });
 }
 
@@ -292,6 +323,7 @@ fn printUsage() void {
         \\  --host <addr>     Listen address (default: 127.0.0.1)
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    Models directory (default: ~/.termite/models)
+        \\  --backend <name>  Backend preference: auto, native, metal, mlx, cuda, onnx, xla, webgpu
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
@@ -309,6 +341,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\{
         \\  "api_url": "http://127.0.0.1:8082",
         \\  "models_dir": "/tmp/models",
+        \\  "backend": "native",
         \\  "content_security": {
         \\    "block_private_ips": true
         \\  },
@@ -326,6 +359,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("/tmp/models", parsed.value.models_dir.?);
+    try std.testing.expectEqualStrings("native", parsed.value.backend.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);

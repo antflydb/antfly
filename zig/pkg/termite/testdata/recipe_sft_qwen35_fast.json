@@ -1,0 +1,27 @@
+{
+  "recipe": "lora-sft",
+  "model": {
+    "path": "/tmp/termite-models/Qwen/Qwen3.5-VL",
+    "family": "qwen3_5",
+    "name": "qwen35-local-fast"
+  },
+  "dataset": {
+    "path": "pkg/termite/testdata/dpo_text_preference.jsonl",
+    "format": "text-sft",
+    "max_examples": 2,
+    "max_seq_len": 128
+  },
+  "adapter": {
+    "rank": 8,
+    "alpha": 16
+  },
+  "optimizer": {
+    "learning_rate": 0.0001,
+    "epochs": 1,
+    "gradient_accumulation_steps": 1
+  },
+  "artifacts": {
+    "root": "/tmp/termite-sft-qwen35-fast"
+  },
+  "backend": "auto"
+}

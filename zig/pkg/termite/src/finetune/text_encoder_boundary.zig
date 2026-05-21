@@ -27,6 +27,7 @@ const deberta_arch = @import("../architectures/deberta.zig");
 const reranker = @import("reranker.zig");
 
 pub const BackendChoice = reranker.BackendChoice;
+pub const parseBackendChoice = reranker.parseBackendChoice;
 
 pub const Boundary = struct {
     hidden_in: []f32,
@@ -138,7 +139,16 @@ fn openEncoder(allocator: std.mem.Allocator, model_dir: []const u8, backend: Bac
     const session = switch (backend) {
         .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, task_override),
         .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, task_override),
+        .cuda => try session_factory.createCudaSessionWithTaskOverride(allocator, model_dir, task_override),
         .auto => blk: {
+            if (comptime build_options.enable_cuda) {
+                if (backends.gpu_inventory.cudaRuntimeAvailable()) {
+                    if (session_factory.createCudaSessionWithTaskOverride(allocator, model_dir, task_override) catch |err| switch (err) {
+                        error.UnsupportedCudaArchitecture => null,
+                        else => return err,
+                    }) |cuda_session| break :blk cuda_session;
+                }
+            }
             if (build_options.enable_mlx) {
                 break :blk session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, task_override) catch try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, task_override);
             }

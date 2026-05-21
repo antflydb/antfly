@@ -52,9 +52,22 @@ pub fn validate(choice: Choice) !void {
     }
 }
 
+pub fn validateRuntime(choice: Choice) !void {
+    try validate(choice);
+    if (choice == .cuda and !backends.gpu_inventory.cudaRuntimeAvailable()) return error.CudaRuntimeUnavailable;
+}
+
 pub fn configureSessionPreference(session_manager: *backends.SessionManager, choice: Choice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
+        .auto => if (backends.gpu_inventory.cudaRuntimeAvailable() and build_options.enable_metal and build_options.enable_mlx)
+            &.{ backends.BackendType.cuda, backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
+        else if (backends.gpu_inventory.cudaRuntimeAvailable() and build_options.enable_metal)
+            &.{ backends.BackendType.cuda, backends.BackendType.metal, backends.BackendType.native }
+        else if (backends.gpu_inventory.cudaRuntimeAvailable() and build_options.enable_mlx)
+            &.{ backends.BackendType.cuda, backends.BackendType.mlx, backends.BackendType.native }
+        else if (backends.gpu_inventory.cudaRuntimeAvailable())
+            &.{ backends.BackendType.cuda, backends.BackendType.native }
+        else if (build_options.enable_metal and build_options.enable_mlx)
             &.{ backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
         else if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }

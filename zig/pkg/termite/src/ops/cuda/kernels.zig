@@ -20,6 +20,24 @@ const driver_mod = @import("driver.zig");
 const fill_ptx = @embedFile("artifacts/termite_cuda_kernels.ptx");
 const fill_ptx_z = fill_ptx ++ "\x00";
 
+pub fn embeddedPtxVersion() ?[]const u8 {
+    return ptxDirectiveValue(".version ");
+}
+
+pub fn embeddedPtxTarget() ?[]const u8 {
+    return ptxDirectiveValue(".target ");
+}
+
+pub fn embeddedPtxHasSymbol(symbol: []const u8) bool {
+    return std.mem.indexOf(u8, fill_ptx, symbol) != null;
+}
+
+fn ptxDirectiveValue(prefix: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, fill_ptx, prefix) orelse return null) + prefix.len;
+    const end = start + (std.mem.indexOfScalar(u8, fill_ptx[start..], '\n') orelse return null);
+    return std.mem.trim(u8, fill_ptx[start..end], " \t\r");
+}
+
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     fill_f32: driver_mod.CUfunction = null,
@@ -36,8 +54,14 @@ pub const KernelModule = struct {
     layer_norm_f32: driver_mod.CUfunction = null,
     add_layer_norm_f32: driver_mod.CUfunction = null,
     elementwise_f32: driver_mod.CUfunction = null,
+    softmax_lastdim_f32: driver_mod.CUfunction = null,
+    reduce_lastdim_f32: driver_mod.CUfunction = null,
+    broadcast_in_dim_f32: driver_mod.CUfunction = null,
     embedding_lookup_f32: driver_mod.CUfunction = null,
     take_rows_f32: driver_mod.CUfunction = null,
+    scatter_add_rows_f32: driver_mod.CUfunction = null,
+    transpose2d_f32: driver_mod.CUfunction = null,
+    argmax_lastdim_f32: driver_mod.CUfunction = null,
     gliner_word_embeddings_f32: driver_mod.CUfunction = null,
     repeat_first_row_f32: driver_mod.CUfunction = null,
     gliner_gru_combine_f32: driver_mod.CUfunction = null,
@@ -100,10 +124,22 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_layer_norm_f32, module, "termite_add_layer_norm_f32"));
         var elementwise_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&elementwise_f32, module, "termite_elementwise_f32"));
+        var softmax_lastdim_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&softmax_lastdim_f32, module, "termite_softmax_lastdim_f32"));
+        var reduce_lastdim_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&reduce_lastdim_f32, module, "termite_reduce_lastdim_f32"));
+        var broadcast_in_dim_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&broadcast_in_dim_f32, module, "termite_broadcast_in_dim_f32"));
         var embedding_lookup_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_f32, module, "termite_embedding_lookup_f32"));
         var take_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&take_rows_f32, module, "termite_take_rows_f32"));
+        var scatter_add_rows_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scatter_add_rows_f32, module, "termite_scatter_add_rows_f32"));
+        var transpose2d_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&transpose2d_f32, module, "termite_transpose2d_f32"));
+        var argmax_lastdim_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_lastdim_f32, module, "termite_argmax_lastdim_f32"));
         var gliner_word_embeddings_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&gliner_word_embeddings_f32, module, "termite_gliner_word_embeddings_f32"));
         var repeat_first_row_f32: driver_mod.CUfunction = null;
@@ -185,8 +221,14 @@ pub const KernelModule = struct {
             .layer_norm_f32 = layer_norm_f32,
             .add_layer_norm_f32 = add_layer_norm_f32,
             .elementwise_f32 = elementwise_f32,
+            .softmax_lastdim_f32 = softmax_lastdim_f32,
+            .reduce_lastdim_f32 = reduce_lastdim_f32,
+            .broadcast_in_dim_f32 = broadcast_in_dim_f32,
             .embedding_lookup_f32 = embedding_lookup_f32,
             .take_rows_f32 = take_rows_f32,
+            .scatter_add_rows_f32 = scatter_add_rows_f32,
+            .transpose2d_f32 = transpose2d_f32,
+            .argmax_lastdim_f32 = argmax_lastdim_f32,
             .gliner_word_embeddings_f32 = gliner_word_embeddings_f32,
             .repeat_first_row_f32 = repeat_first_row_f32,
             .gliner_gru_combine_f32 = gliner_gru_combine_f32,
@@ -236,8 +278,14 @@ pub const KernelModule = struct {
             self.layer_norm_f32 = null;
             self.add_layer_norm_f32 = null;
             self.elementwise_f32 = null;
+            self.softmax_lastdim_f32 = null;
+            self.reduce_lastdim_f32 = null;
+            self.broadcast_in_dim_f32 = null;
             self.embedding_lookup_f32 = null;
             self.take_rows_f32 = null;
+            self.scatter_add_rows_f32 = null;
+            self.transpose2d_f32 = null;
+            self.argmax_lastdim_f32 = null;
             self.gliner_word_embeddings_f32 = null;
             self.repeat_first_row_f32 = null;
             self.gliner_gru_combine_f32 = null;
@@ -693,6 +741,105 @@ pub const KernelModule = struct {
         try launch1d(self.elementwise_f32, ctx, count, &params);
     }
 
+    pub fn launchSoftmaxLastDimF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        rows: usize,
+        dim: usize,
+        log_mode: bool,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(rows, dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var rows_u32 = try toU32(rows);
+        var dim_u32 = try toU32(dim);
+        var log_mode_u32: u32 = if (log_mode) 1 else 0;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&log_mode_u32),
+        };
+        try launchBlocks(self.softmax_lastdim_f32, ctx, rows, 256, &params);
+    }
+
+    pub fn launchReduceLastDimF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        rows: usize,
+        dim: usize,
+        op: ReduceOp,
+    ) driver_mod.Error!void {
+        const input_count = try checkedTensorElements(rows, dim);
+        try checkBytes(dst, rows);
+        try checkBytes(input, input_count);
+        if (input_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var rows_u32 = try toU32(rows);
+        var dim_u32 = try toU32(dim);
+        var op_u32: u32 = @intFromEnum(op);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&op_u32),
+        };
+        try launchBlocks(self.reduce_lastdim_f32, ctx, rows, 256, &params);
+    }
+
+    pub fn launchBroadcastInDimF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        out_count: usize,
+        input_count: usize,
+        out_rank: usize,
+        in_rank: usize,
+        target_shape: buffer_mod.DeviceBuffer,
+        input_shape: buffer_mod.DeviceBuffer,
+        axes: buffer_mod.DeviceBuffer,
+    ) driver_mod.Error!void {
+        try checkBytes(dst, out_count);
+        try checkBytes(input, input_count);
+        try checkRawBytes(target_shape, std.math.mul(usize, out_rank, @sizeOf(u32)) catch return error.InvalidCudaState);
+        try checkRawBytes(input_shape, std.math.mul(usize, in_rank, @sizeOf(u32)) catch return error.InvalidCudaState);
+        try checkRawBytes(axes, std.math.mul(usize, in_rank, @sizeOf(u32)) catch return error.InvalidCudaState);
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var out_count_u32 = try toU32(out_count);
+        var out_rank_u32 = try toU32(out_rank);
+        var in_rank_u32 = try toU32(in_rank);
+        var target_shape_ptr = target_shape.ptr;
+        var input_shape_ptr = input_shape.ptr;
+        var axes_ptr = axes.ptr;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&out_count_u32),
+            @ptrCast(&out_rank_u32),
+            @ptrCast(&in_rank_u32),
+            @ptrCast(&target_shape_ptr),
+            @ptrCast(&input_shape_ptr),
+            @ptrCast(&axes_ptr),
+        };
+        try launch1d(self.broadcast_in_dim_f32, ctx, out_count, &params);
+    }
+
     pub fn launchLayerNormF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -832,6 +979,91 @@ pub const KernelModule = struct {
             @ptrCast(&dim_u32),
         };
         try launch1d(self.take_rows_f32, ctx, count, &params);
+    }
+
+    pub fn launchScatterAddRowsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        row_ids: buffer_mod.DeviceBuffer,
+        out_rows: usize,
+        rows: usize,
+        dim: usize,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(rows, dim);
+        try checkBytes(dst, try checkedTensorElements(out_rows, dim));
+        try checkBytes(input, count);
+        try checkRawBytes(row_ids, rows * @sizeOf(u32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var row_ids_ptr = row_ids.ptr;
+        var out_rows_u32 = try toU32(out_rows);
+        var rows_u32 = try toU32(rows);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&row_ids_ptr),
+            @ptrCast(&out_rows_u32),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+        };
+        try launch1d(self.scatter_add_rows_f32, ctx, count, &params);
+    }
+
+    pub fn launchTranspose2DF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        rows: usize,
+        cols: usize,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(rows, cols);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var rows_u32 = try toU32(rows);
+        var cols_u32 = try toU32(cols);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&cols_u32),
+        };
+        try launch1d(self.transpose2d_f32, ctx, count, &params);
+    }
+
+    pub fn launchArgMaxLastDimF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        rows: usize,
+        dim: usize,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(rows, dim);
+        try checkBytes(dst, rows);
+        try checkBytes(input, count);
+        if (rows == 0 or dim == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var rows_u32 = try toU32(rows);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+        };
+        try launch1d(self.argmax_lastdim_f32, ctx, rows, &params);
     }
 
     pub fn launchGlinerWordEmbeddingsF32(
@@ -1870,13 +2102,30 @@ pub const ElementwiseOp = enum(u32) {
     quick_gelu = 5,
     sigmoid = 6,
     tanh = 7,
+    less_than = 8,
+    divide = 9,
+    exp = 10,
+    log = 11,
+    sqrt = 12,
+    rsqrt = 13,
+    abs = 14,
+    sin = 15,
+    cos = 16,
+    erf = 17,
+    subtract = 18,
 
     fn isUnary(self: ElementwiseOp) bool {
         return switch (self) {
-            .add, .multiply => false,
-            .silu, .gelu, .relu, .quick_gelu, .sigmoid, .tanh => true,
+            .add, .multiply, .less_than, .divide, .subtract => false,
+            .silu, .gelu, .relu, .quick_gelu, .sigmoid, .tanh, .exp, .log, .sqrt, .rsqrt, .abs, .sin, .cos, .erf => true,
         };
     }
+};
+
+pub const ReduceOp = enum(u32) {
+    sum = 0,
+    max = 1,
+    mean = 2,
 };
 
 const q8_0_values_per_block: usize = 32;
@@ -1977,6 +2226,25 @@ fn launchRows(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, ro
     ));
 }
 
+fn launchRowsThreads(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, rows: usize, threads: usize, params: [*]?*anyopaque) driver_mod.Error!void {
+    const grid: c_uint = try toU32(rows);
+    const block: c_uint = try toU32(threads);
+    try ctx.makeCurrent();
+    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        function,
+        grid,
+        1,
+        1,
+        block,
+        1,
+        1,
+        0,
+        ctx.stream,
+        params,
+        null,
+    ));
+}
+
 fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmodule) driver_mod.Error!void {
     var info_log: [4096]u8 = .{0} ** 4096;
     var error_log: [4096]u8 = .{0} ** 4096;
@@ -2041,6 +2309,9 @@ pub fn smokeDenseF32(allocator: std.mem.Allocator) !void {
     try smokeLinearF32(allocator, &ctx, &module);
     try smokeRmsNormF32(allocator, &ctx, &module);
     try smokeElementwiseF32(allocator, &ctx, &module);
+    try smokeSoftmaxLastDimF32(allocator, &ctx, &module);
+    try smokeReduceLastDimF32(allocator, &ctx, &module);
+    try smokeBroadcastInDimF32(allocator, &ctx, &module);
     try smokeLayerNormF32(allocator, &ctx, &module);
     try smokeEmbeddingConcatConvF32(allocator, &ctx, &module);
     try smokeAttentionF32(allocator, &ctx, &module);
@@ -2126,8 +2397,26 @@ fn smokeElementwiseF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaConte
     const b_data = [_]f32{ 3.0, 5.0, -1.0, 0.5 };
     const expected_add = [_]f32{ 4.0, 3.0, -1.0, 4.5 };
     const expected_mul = [_]f32{ 3.0, -10.0, -0.0, 2.0 };
+    const expected_lt = [_]f32{ 1.0, 1.0, 0.0, 0.0 };
+    const expected_div = [_]f32{ 0.33333334, -0.4, -0.0, 8.0 };
     var expected_silu: [a_data.len]f32 = undefined;
     for (a_data, 0..) |x, i| expected_silu[i] = x / (1.0 + std.math.exp(-x));
+    var expected_exp: [a_data.len]f32 = undefined;
+    for (a_data, 0..) |x, i| expected_exp[i] = std.math.exp(x);
+    var expected_log: [a_data.len]f32 = undefined;
+    for (b_data, 0..) |x, i| expected_log[i] = std.math.log(f32, std.math.e, x);
+    var expected_sqrt: [b_data.len]f32 = undefined;
+    for (b_data, 0..) |x, i| expected_sqrt[i] = std.math.sqrt(x);
+    var expected_rsqrt: [b_data.len]f32 = undefined;
+    for (b_data, 0..) |x, i| expected_rsqrt[i] = 1.0 / std.math.sqrt(x);
+    var expected_abs: [a_data.len]f32 = undefined;
+    for (a_data, 0..) |x, i| expected_abs[i] = @abs(x);
+    var expected_sin: [a_data.len]f32 = undefined;
+    for (a_data, 0..) |x, i| expected_sin[i] = @sin(x);
+    var expected_cos: [a_data.len]f32 = undefined;
+    for (a_data, 0..) |x, i| expected_cos[i] = @cos(x);
+    var expected_erf: [a_data.len]f32 = undefined;
+    for (a_data, 0..) |x, i| expected_erf[i] = erfApprox(x);
 
     var a = try buffer_mod.DeviceBuffer.alloc(ctx, a_data.len * @sizeOf(f32));
     defer a.free(ctx);
@@ -2153,11 +2442,208 @@ fn smokeElementwiseF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaConte
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_mul, 0.0001);
 
+    try module.launchElementwiseF32(ctx, output, a, b, a_data.len, .less_than);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_lt, 0.0001);
+
+    try module.launchElementwiseF32(ctx, output, a, b, a_data.len, .divide);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_div, 0.0001);
+
     try module.launchElementwiseF32(ctx, output, a, .{}, a_data.len, .silu);
     try ctx.synchronize();
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_silu, 0.01);
+
+    try module.launchElementwiseF32(ctx, output, a, .{}, a_data.len, .exp);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_exp, 0.01);
+
+    try module.launchElementwiseF32(ctx, output, b, .{}, b_data.len, .log);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_log, 0.01);
+
+    try module.launchElementwiseF32(ctx, output, b, .{}, b_data.len, .sqrt);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_sqrt, 0.01);
+
+    try module.launchElementwiseF32(ctx, output, b, .{}, b_data.len, .rsqrt);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_rsqrt, 0.01);
+
+    try module.launchElementwiseF32(ctx, output, a, .{}, a_data.len, .abs);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_abs, 0.0001);
+
+    try module.launchElementwiseF32(ctx, output, a, .{}, a_data.len, .sin);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_sin, 0.01);
+
+    try module.launchElementwiseF32(ctx, output, a, .{}, a_data.len, .cos);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_cos, 0.01);
+
+    try module.launchElementwiseF32(ctx, output, a, .{}, a_data.len, .erf);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_erf, 0.02);
+}
+
+fn erfApprox(x: f32) f32 {
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const y = 1.0 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t) * @exp(-ax * ax);
+    return sign * y;
+}
+
+fn smokeSoftmaxLastDimF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const rows: usize = 2;
+    const dim: usize = 4;
+    const input_data = [_]f32{ 1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0 };
+    var expected_softmax: [input_data.len]f32 = undefined;
+    var expected_log_softmax: [input_data.len]f32 = undefined;
+    for (0..rows) |row_idx| {
+        const row = input_data[row_idx * dim ..][0..dim];
+        var max_val: f32 = -std.math.inf(f32);
+        for (row) |v| max_val = @max(max_val, v);
+        var sum: f32 = 0.0;
+        for (row) |v| sum += std.math.exp(v - max_val);
+        const log_sum = max_val + std.math.log(f32, std.math.e, sum);
+        for (row, 0..) |v, col| {
+            const idx = row_idx * dim + col;
+            expected_log_softmax[idx] = v - log_sum;
+            expected_softmax[idx] = std.math.exp(expected_log_softmax[idx]);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+
+    try module.launchSoftmaxLastDimF32(ctx, output, input, rows, dim, false);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_softmax, 0.003);
+
+    try module.launchSoftmaxLastDimF32(ctx, output, input, rows, dim, true);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_log_softmax, 0.003);
+}
+
+fn smokeReduceLastDimF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const rows: usize = 2;
+    const dim: usize = 4;
+    const input_data = [_]f32{ 1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0 };
+    const expected_sum = [_]f32{ 10.0, 2.0 };
+    const expected_max = [_]f32{ 4.0, 2.0 };
+    const expected_mean = [_]f32{ 2.5, 0.5 };
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, rows * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+
+    const out = try allocator.alloc(f32, rows);
+    defer allocator.free(out);
+
+    try module.launchReduceLastDimF32(ctx, output, input, rows, dim, .sum);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_sum, 0.0001);
+
+    try module.launchReduceLastDimF32(ctx, output, input, rows, dim, .max);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_max, 0.0001);
+
+    try module.launchReduceLastDimF32(ctx, output, input, rows, dim, .mean);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_mean, 0.0001);
+}
+
+fn smokeBroadcastInDimF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const input_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const target_shape_data = [_]u32{ 2, 2, 3 };
+    const input_shape_data = [_]u32{ 2, 3 };
+    const axes_data = [_]u32{ 0, 2 };
+    const expected = [_]f32{ 1, 2, 3, 1, 2, 3, 4, 5, 6, 4, 5, 6 };
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var target_shape = try buffer_mod.DeviceBuffer.alloc(ctx, target_shape_data.len * @sizeOf(u32));
+    defer target_shape.free(ctx);
+    var input_shape = try buffer_mod.DeviceBuffer.alloc(ctx, input_shape_data.len * @sizeOf(u32));
+    defer input_shape.free(ctx);
+    var axes = try buffer_mod.DeviceBuffer.alloc(ctx, axes_data.len * @sizeOf(u32));
+    defer axes.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, expected.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try target_shape.copyFromHost(ctx, std.mem.sliceAsBytes(&target_shape_data));
+    try input_shape.copyFromHost(ctx, std.mem.sliceAsBytes(&input_shape_data));
+    try axes.copyFromHost(ctx, std.mem.sliceAsBytes(&axes_data));
+
+    try module.launchBroadcastInDimF32(ctx, output, input, expected.len, input_data.len, target_shape_data.len, input_shape_data.len, target_shape, input_shape, axes);
+    try ctx.synchronize();
+    const out = try allocator.alloc(f32, expected.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
+
+    const scalar_data = [_]f32{7.0};
+    const scalar_target_shape = [_]u32{ 2, 3 };
+    const expected_scalar = [_]f32{ 7, 7, 7, 7, 7, 7 };
+    var scalar = try buffer_mod.DeviceBuffer.alloc(ctx, scalar_data.len * @sizeOf(f32));
+    defer scalar.free(ctx);
+    var scalar_target = try buffer_mod.DeviceBuffer.alloc(ctx, scalar_target_shape.len * @sizeOf(u32));
+    defer scalar_target.free(ctx);
+    var scalar_output = try buffer_mod.DeviceBuffer.alloc(ctx, expected_scalar.len * @sizeOf(f32));
+    defer scalar_output.free(ctx);
+    try scalar.copyFromHost(ctx, std.mem.sliceAsBytes(&scalar_data));
+    try scalar_target.copyFromHost(ctx, std.mem.sliceAsBytes(&scalar_target_shape));
+
+    try module.launchBroadcastInDimF32(ctx, scalar_output, scalar, expected_scalar.len, scalar_data.len, scalar_target_shape.len, 0, scalar_target, .{}, .{});
+    try ctx.synchronize();
+    const scalar_out = try allocator.alloc(f32, expected_scalar.len);
+    defer allocator.free(scalar_out);
+    try scalar_output.copyToHost(ctx, std.mem.sliceAsBytes(scalar_out));
+    try ctx.synchronize();
+    try expectApproxSlice(scalar_out, &expected_scalar, 0.0001);
 }
 
 fn smokeLayerNormF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -2560,6 +3046,37 @@ test "cuda kernel launch helper bounds" {
     try std.testing.expectEqual(std.math.maxInt(u32), try toU32(std.math.maxInt(u32)));
     try std.testing.expectError(error.InvalidCudaState, toU32(@as(usize, std.math.maxInt(u32)) + 1));
     try std.testing.expectEqual(@as(usize, 12), try checkedTensorElements(3, 4));
+}
+
+test "embedded cuda ptx artifact contract" {
+    try std.testing.expectEqualStrings("9.0", embeddedPtxVersion().?);
+    try std.testing.expectEqualStrings("sm_75", embeddedPtxTarget().?);
+    try std.testing.expect(embeddedPtxHasSymbol("termite_fill_f32"));
+    try std.testing.expect(embeddedPtxHasSymbol("termite_linear_q8_0_f32"));
+    try std.testing.expect(embeddedPtxHasSymbol("termite_linear_q4_k_f32"));
+    try std.testing.expect(embeddedPtxHasSymbol("termite_softmax_lastdim_f32"));
+    try std.testing.expect(embeddedPtxHasSymbol("termite_reduce_lastdim_f32"));
+    try std.testing.expect(embeddedPtxHasSymbol("termite_broadcast_in_dim_f32"));
+}
+
+test "cuda elementwise op metadata includes less-than as binary" {
+    try std.testing.expect(!ElementwiseOp.less_than.isUnary());
+    try std.testing.expectEqual(@as(u32, 8), @intFromEnum(ElementwiseOp.less_than));
+    try std.testing.expect(!ElementwiseOp.divide.isUnary());
+    try std.testing.expect(ElementwiseOp.exp.isUnary());
+    try std.testing.expect(ElementwiseOp.log.isUnary());
+    try std.testing.expect(ElementwiseOp.sqrt.isUnary());
+    try std.testing.expect(ElementwiseOp.rsqrt.isUnary());
+    try std.testing.expectEqual(@as(u32, 12), @intFromEnum(ElementwiseOp.sqrt));
+    try std.testing.expectEqual(@as(u32, 13), @intFromEnum(ElementwiseOp.rsqrt));
+    try std.testing.expect(ElementwiseOp.abs.isUnary());
+    try std.testing.expectEqual(@as(u32, 14), @intFromEnum(ElementwiseOp.abs));
+    try std.testing.expect(ElementwiseOp.sin.isUnary());
+    try std.testing.expectEqual(@as(u32, 15), @intFromEnum(ElementwiseOp.sin));
+    try std.testing.expect(ElementwiseOp.cos.isUnary());
+    try std.testing.expectEqual(@as(u32, 16), @intFromEnum(ElementwiseOp.cos));
+    try std.testing.expect(ElementwiseOp.erf.isUnary());
+    try std.testing.expectEqual(@as(u32, 17), @intFromEnum(ElementwiseOp.erf));
 }
 
 test "cuda q8_0 smoke row writer uses gguf block layout" {

@@ -1,5 +1,5 @@
 .version 7.5
-.target sm_61
+.target sm_75
 .address_size 64
 
 .visible .entry termite_fill_f32(

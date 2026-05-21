@@ -24,6 +24,7 @@ pub const TensorInfo = @import("tensor.zig").TensorInfo;
 pub const DType = @import("tensor.zig").DType;
 pub const native = @import("native.zig");
 pub const activations = @import("activations.zig");
+pub const gpu_inventory = @import("gpu_inventory.zig");
 
 pub const session_pool = @import("session_pool.zig");
 pub const SessionPool = session_pool.SessionPool;
@@ -65,6 +66,13 @@ pub const BackendType = enum {
             .cuda => build_options.enable_cuda,
             .pjrt => build_options.enable_pjrt,
             .wasm => build_options.enable_wasm,
+        };
+    }
+
+    pub fn runtimeAvailable(self: BackendType) bool {
+        return switch (self) {
+            .cuda => gpu_inventory.cudaRuntimeAvailable(),
+            else => self.available(),
         };
     }
 
@@ -130,13 +138,27 @@ pub const SessionManager = struct {
         model_path: []const u8,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
+        if (isExplicitSingleBackend(self.preferred_backends, .cuda) and !gpu_inventory.cudaRuntimeAvailable()) {
+            return error.CudaRuntimeUnavailable;
+        }
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
-        var effective_buf: [4]BackendType = undefined;
+        var effective_buf: [5]BackendType = undefined;
         const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
 
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
+            if (!backend.runtimeAvailable()) {
+                if (backend == .cuda) {
+                    const cuda = gpu_inventory.cudaStatus();
+                    std.log.info("skipping CUDA backend for {s}: {s}", .{ model_path, cuda.reasonText() });
+                }
+                continue;
+            }
+            if (backend == .cuda and !isExplicitSingleBackend(self.preferred_backends, .cuda) and !cudaSupportsManifestForAuto(if (manifest) |m| m else null, model_path)) {
+                std.log.info("skipping CUDA backend for {s}: model architecture not marked CUDA-capable", .{model_path});
+                continue;
+            }
             if (!backend.supportsDirectSessionLoad()) {
                 std.log.err(
                     "backend {s} is available but does not support direct model inference yet",
@@ -260,7 +282,7 @@ pub const SessionManager = struct {
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
         for (self.preferred_backends) |backend| {
-            if (backend.available() and backend.supportsDirectSessionLoad()) return backend;
+            if (backend.available() and backend.runtimeAvailable() and backend.supportsDirectSessionLoad()) return backend;
         }
         return null;
     }
@@ -279,6 +301,7 @@ fn configuredPreferredBackends() []const BackendType {
             .wasm => &.{ .onnx, .metal, .mlx, .native },
         };
     }
+    if (gpu_inventory.cudaRuntimeAvailable()) return &.{ .onnx, .cuda, .metal, .mlx, .native };
     return &.{ .onnx, .metal, .mlx, .native };
 }
 
@@ -346,7 +369,7 @@ fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
 
 fn effectiveBackendOrder(
     allocator: std.mem.Allocator,
-    scratch: *[4]BackendType,
+    scratch: *[5]BackendType,
     preferred: []const BackendType,
     manifest: ?manifest_mod.ModelManifest,
 ) []const BackendType {
@@ -363,7 +386,7 @@ fn effectiveBackendOrder(
 }
 
 fn effectiveBackendOrderForPreference(
-    scratch: *[4]BackendType,
+    scratch: *[5]BackendType,
     preferred: []const BackendType,
     prefer_blas_before_mlx: bool,
 ) []const BackendType {
@@ -395,7 +418,7 @@ fn effectiveBackendOrderForPreference(
 }
 
 fn reorderNativeAheadOfOnnx(
-    scratch: *[4]BackendType,
+    scratch: *[5]BackendType,
     preferred: []const BackendType,
     prefer_blas_before_mlx: bool,
 ) []const BackendType {
@@ -428,6 +451,23 @@ fn reorderNativeAheadOfOnnx(
     }
     return scratch[0..idx];
 }
+
+fn isExplicitSingleBackend(preferred: []const BackendType, backend: BackendType) bool {
+    return preferred.len == 1 and preferred[0] == backend;
+}
+
+fn cudaSupportsManifestForAuto(manifest: ?manifest_mod.ModelManifest, model_path: []const u8) bool {
+    if (isOnnxFilePath(model_path)) return false;
+    const man = manifest orelse return false;
+    if (man.onnx_path != null and man.safetensors_path == null and man.safetensors_index_path == null and man.gguf_path == null) return false;
+    if (man.gliner_model_type.len > 0) return true;
+    if (std.mem.eql(u8, man.config_model_arch, "extractor")) return true;
+    if (std.mem.indexOf(u8, man.config_model_arch, "deberta") != null) return true;
+    return switch (man.native_arch_hint) {
+        .clip, .clap => true,
+        else => false,
+    };
+}
 test {
     _ = @import("tensor.zig");
     _ = @import("session.zig");
@@ -450,21 +490,21 @@ test "shouldPreferBlasBeforeMlxForBytes prefers native only above eager dense th
 
 test "effective backend order prefers native before mlx for large gguf generators" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [5]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, true);
     try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .native, .metal, .mlx }, effective);
 }
 
 test "effective backend order preserves mlx preference for small gguf generators" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [5]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, false);
     try std.testing.expectEqualSlices(BackendType, &preferred, effective);
 }
 
 test "effective backend order preserves order for non-gguf models" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [5]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
         .model_type = .generator,
@@ -476,7 +516,7 @@ test "effective backend order preserves order for non-gguf models" {
 
 test "effective backend order prefers native layoutlmv3 before onnx" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [5]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
         .native_arch_hint = .layoutlmv3,
@@ -484,4 +524,24 @@ test "effective backend order prefers native layoutlmv3 before onnx" {
     };
     const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
     try std.testing.expectEqualSlices(BackendType, &.{ .metal, .mlx, .native, .onnx }, effective);
+}
+
+test "cuda auto eligibility is conservative by manifest" {
+    const allocator = std.testing.allocator;
+    var gliner = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer gliner.deinit();
+    gliner.gliner_model_type = try allocator.dupe(u8, "gliner2");
+    gliner.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expect(cudaSupportsManifestForAuto(gliner, "/models/gliner"));
+
+    var generator = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer generator.deinit();
+    generator.config_model_arch = try allocator.dupe(u8, "gemma4");
+    generator.gguf_path = try allocator.dupe(u8, "model.gguf");
+    try std.testing.expect(!cudaSupportsManifestForAuto(generator, "/models/gemma4"));
+
+    var onnx_only = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer onnx_only.deinit();
+    onnx_only.onnx_path = try allocator.dupe(u8, "model.onnx");
+    try std.testing.expect(!cudaSupportsManifestForAuto(onnx_only, "/models/onnx"));
 }

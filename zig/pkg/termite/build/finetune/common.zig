@@ -16,6 +16,7 @@ const std = @import("std");
 
 pub const Import = enum {
     antfly_image,
+    antfly_platform,
     build_options,
     jinja,
     ml,
@@ -49,6 +50,7 @@ pub const Context = struct {
     termite_internal_mod: *std.Build.Module,
     termite_tokenizer_mod: *std.Build.Module,
     termite_hf_tokenizer_mod: *std.Build.Module,
+    antfly_platform_mod: *std.Build.Module,
     antfly_image_mod: *std.Build.Module,
     pjrt_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
@@ -62,6 +64,7 @@ pub const Context = struct {
     pub fn moduleFor(ctx: Context, import: Import) *std.Build.Module {
         return switch (import) {
             .antfly_image => ctx.antfly_image_mod,
+            .antfly_platform => ctx.antfly_platform_mod,
             .build_options => ctx.build_options_mod,
             .jinja => ctx.jinja_mod,
             .ml => ctx.ml_mod,
@@ -130,6 +133,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) void {
             .optimize = ctx.optimize,
         }),
     });
+    exe.root_module.addImport("antfly_platform", ctx.antfly_platform_mod);
     addImports(ctx, exe.root_module, spec.imports);
     configureNative(ctx, exe, spec.native_link);
     if (spec.link_libc) exe.root_module.link_libc = true;
@@ -149,6 +153,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
             .optimize = ctx.optimize,
         }),
     });
+    test_exe.root_module.addImport("antfly_platform", ctx.antfly_platform_mod);
     addImports(ctx, test_exe.root_module, spec.imports);
     configureNative(ctx, test_exe, spec.native_link);
 

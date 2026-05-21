@@ -61,10 +61,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackend(value: []const u8) !reranker.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    return error.InvalidBackend;
+    return reranker.parseBackendChoice(value) orelse error.InvalidBackend;
 }
 
 fn usageError() error{InvalidArguments} {

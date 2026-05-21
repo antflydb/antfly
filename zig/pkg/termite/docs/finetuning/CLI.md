@@ -67,6 +67,19 @@ top-level CLI. It routes recipe execution through `termite finetune run` and
 `src/finetune/cli/root.zig`, and still accepts legacy tool names as
 compatibility wrappers:
 
+On NVIDIA machines, `termite finetune smoke-fast --require-cuda --strict-cuda`
+requires a CUDA-built binary and a live CUDA driver/device probe. Use
+`scripts/verify_cuda_finetune_smoke.sh` or `zig build verify-cuda-finetune-smoke`
+to build with portable CUDA artifacts, run finetune tests, build the installed
+CLI, and execute the strict smoke with host training fallbacks disabled. The
+strict gate also verifies the optimizer-backed Qwen SFT/DPO/GRPO and Gemma
+DPO/GRPO execute reports resolved to `backend = "cuda"`, plus the Gemma LoRA SFT
+bundle path. `zig build check-cuda-artifacts` is the no-hardware static gate for
+CUDA source/PTX coverage of every runtime-loaded kernel symbol and duplicate PTX
+labels or entries. The full verifier requires `ptxas` by default through
+`TERMITE_CUDA_REQUIRE_PTXAS=1`; set it to `0` only for a local driver-preflight
+run on a machine without the CUDA toolkit.
+
 ```sh
 termite finetune run /tmp/recipe.json
 termite finetune dataset prepare colqwen2 /models/colqwen2 /data /tmp/examples.jsonl /tmp/prepared.json

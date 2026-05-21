@@ -20,6 +20,7 @@ const gemma4_real = termite.finetune.gemma4_real_autodiff;
 const gemma4_mm_real = termite.finetune.gemma4_multimodal_real_autodiff;
 const real_autodiff = termite.finetune.real_autodiff_trainer;
 const graph_bridge = termite.finetune.graph_bridge;
+const gpu_inventory = termite.backends.gpu_inventory;
 const gemma_graph = @import("../../architectures/gemma_graph.zig");
 const build_options = @import("build_options");
 const run_contract = @import("../../run/contract.zig");
@@ -61,7 +62,7 @@ const CliOptions = struct {
     grad_accum_steps: u32 = 1,
     llrd_decay: f32 = 1.0,
     use_schedule_free: bool = false,
-    use_mlx: bool = build_options.enable_mlx,
+    backend_kind: gemma4_real.BackendKind = .native,
     trainer_mode: TrainerMode = .auto,
     gguf_projector_path: ?[]const u8 = null,
 
@@ -89,8 +90,22 @@ const ReportContext = struct {
     grad_accum_steps: u32,
     llrd_decay: f32,
     use_schedule_free: bool,
-    use_mlx: bool,
+    backend: []const u8,
 };
+
+fn defaultBackendKind() gemma4_real.BackendKind {
+    if (build_options.enable_cuda and gpu_inventory.cudaRuntimeAvailable()) return .cuda;
+    if (build_options.enable_mlx) return .mlx;
+    return .native;
+}
+
+fn backendKindName(kind: gemma4_real.BackendKind) []const u8 {
+    return switch (kind) {
+        .native => "blas",
+        .mlx => "mlx",
+        .cuda => "cuda",
+    };
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -112,7 +127,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     const prepared_inputs_path = argv[2];
     const out_dir = argv[3];
 
-    var opts = CliOptions{};
+    var opts = CliOptions{ .backend_kind = defaultBackendKind() };
     var positional_count: usize = 0;
     var i: usize = 4;
     while (i < argv.len) : (i += 1) {
@@ -155,12 +170,14 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             i += 1;
             if (i >= argv.len) return usageError();
             const val = argv[i];
-            if (std.mem.eql(u8, val, "mlx")) {
-                opts.use_mlx = true;
-            } else if (std.mem.eql(u8, val, "blas")) {
-                opts.use_mlx = false;
-            } else if (std.mem.eql(u8, val, "auto")) {
-                opts.use_mlx = build_options.enable_mlx;
+            if (std.ascii.eqlIgnoreCase(val, "mlx")) {
+                opts.backend_kind = .mlx;
+            } else if (std.ascii.eqlIgnoreCase(val, "cuda")) {
+                opts.backend_kind = .cuda;
+            } else if (std.ascii.eqlIgnoreCase(val, "blas") or std.ascii.eqlIgnoreCase(val, "native")) {
+                opts.backend_kind = .native;
+            } else if (std.ascii.eqlIgnoreCase(val, "auto")) {
+                opts.backend_kind = defaultBackendKind();
             } else return usageError();
         } else if (std.mem.eql(u8, arg, "--trainer")) {
             i += 1;
@@ -189,9 +206,23 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         }
     }
 
-    if (opts.use_mlx and !build_options.enable_mlx) {
-        std.debug.print("error: MLX support not compiled in\n", .{});
-        std.process.exit(1);
+    switch (opts.backend_kind) {
+        .native => {},
+        .mlx => if (!build_options.enable_mlx) {
+            std.debug.print("error: MLX support not compiled in\n", .{});
+            std.process.exit(1);
+        },
+        .cuda => {
+            if (!build_options.enable_cuda) {
+                std.debug.print("error: CUDA support not compiled in; rebuild with -Dcuda=true\n", .{});
+                std.process.exit(1);
+            }
+            const status = gpu_inventory.cudaStatus();
+            if (!status.runtime_available) {
+                std.debug.print("error: CUDA runtime unavailable: {s}\n", .{status.reasonText()});
+                std.process.exit(1);
+            }
+        },
     }
 
     var prepared = try finetune.loadPreparedInputsSummary(allocator, prepared_inputs_path);
@@ -269,7 +300,7 @@ fn runAutodiff(
     }
     const mm_stats = summarizeMultimodalPrepared(prepared.examples);
     const graph_config = try gemma4_real.loadGraphConfig(allocator, base_model_dir);
-    const backend_kind: gemma4_real.BackendKind = if (opts.use_mlx) .mlx else .native;
+    const backend_kind = opts.backend_kind;
     var adapter_inspect = try finetune.inspectCheckpoint(allocator, adapter_model_dir);
     defer finetune.freeInspectionSummary(allocator, &adapter_inspect);
     const recursive_shared_block_size = adapter_inspect.recursive_shared_block_size;
@@ -452,7 +483,7 @@ fn runAutodiff(
         .grad_accum_steps = opts.grad_accum_steps,
         .llrd_decay = opts.llrd_decay,
         .use_schedule_free = opts.use_schedule_free,
-        .use_mlx = opts.use_mlx,
+        .backend = backendKindName(opts.backend_kind),
     });
 }
 
@@ -562,6 +593,7 @@ fn runSurrogate(
     opts: CliOptions,
 ) !void {
     if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0) return error.MultimodalRequiresAutodiffTrainer;
+    if (opts.backend_kind == .cuda) return error.CudaSurrogateTrainerUnsupported;
 
     const MlxWeightStoreT = if (build_options.enable_mlx) mlx_compute_mod.WeightStore else void;
     const MlxComputeT = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else void;
@@ -572,7 +604,7 @@ fn runSurrogate(
     var backend_ptr: ?*const ComputeBackend = null;
 
     if (comptime build_options.enable_mlx) {
-        if (opts.use_mlx) {
+        if (opts.backend_kind == .mlx) {
             mlx_weight_store = mlx_compute_mod.WeightStore{
                 .allocator = allocator,
                 .resident_weights = mlx_mod.c.mlx_map_string_to_array_new(),
@@ -717,7 +749,7 @@ fn runSurrogate(
         .grad_accum_steps = opts.grad_accum_steps,
         .llrd_decay = opts.llrd_decay,
         .use_schedule_free = opts.use_schedule_free,
-        .use_mlx = opts.use_mlx,
+        .backend = backendKindName(opts.backend_kind),
     });
 }
 
@@ -755,12 +787,12 @@ fn writeRunOutputs(
             .use_schedule_free = ctx.use_schedule_free,
         },
         .backend_policy = .{
-            .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = ctx.backend,
+            .preferred = backendKindName(defaultBackendKind()),
         },
         .distributed = .{
             .enabled = false,
-            .backend = if (ctx.use_mlx) "mlx" else "blas",
+            .backend = ctx.backend,
             .rank = 0,
             .world_size = 1,
             .primary_rank = 0,
@@ -778,12 +810,12 @@ fn writeRunOutputs(
         .artifact_family_version = finetune.artifact_family_version,
         .task = "gemma4_lora_train_eval",
         .backend_policy = .{
-            .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = ctx.backend,
+            .preferred = backendKindName(defaultBackendKind()),
         },
         .distributed = .{
             .enabled = false,
-            .backend = if (ctx.use_mlx) "mlx" else "blas",
+            .backend = ctx.backend,
             .rank = 0,
             .world_size = 1,
             .primary_rank = 0,
@@ -821,7 +853,7 @@ fn usageError() error{InvalidArguments} {
         \\  --grad-accum <u32>                  Gradient accumulation steps (default: 1)
         \\  --llrd-decay <f32>                  Surrogate-only layer-wise LR decay (default: 1.0)
         \\  --schedule-free                     Surrogate-only schedule-free AdamW
-        \\  --backend auto|mlx|blas             Compute backend for gradient math (default: auto)
+        \\  --backend auto|cuda|mlx|blas|native Compute backend for gradient math (default: auto)
         \\  --gguf-projector <path>             Required for multimodal autodiff examples; path to Gemma4 projector GGUF
         \\
         \\example: train-eval-gemma4-lora-bundle /tmp/gemma4-base /tmp/gemma4-lora /tmp/gemma4_inputs.json /tmp/out \

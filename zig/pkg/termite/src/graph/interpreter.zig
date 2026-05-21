@@ -889,6 +889,13 @@ fn executeScatterAdd(
     if (dest_shape[0] < 0 or dest_shape[1] <= 0 or values_shape[0] < 0 or values_shape[1] != dest_shape[1]) return error.UnsupportedShape;
     if (indices_shape.len == 0) return error.UnsupportedShape;
 
+    if (cb.primScatterAddInto(dest, values, indices, dest_shape, values_shape, indices_shape, axis)) |device_result| {
+        return device_result;
+    } else |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape => {},
+        else => return err,
+    }
+
     const out_rows: usize = @intCast(dest_shape[0]);
     const value_rows: usize = @intCast(values_shape[0]);
     const dim: usize = @intCast(dest_shape[1]);

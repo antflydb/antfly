@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const compat = @import("../io/compat.zig");
+const build_options = @import("build_options");
 
 const backends = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
@@ -31,6 +32,25 @@ pub const boundary_head_file_name = "gliner2_top_layer_boundary_head.json";
 pub const boundary_head_family_version = "gliner2_top_layer_boundary_head/v1alpha1";
 pub const boundary_task_head_file_name = "gliner2_top_layer_boundary_task_head.json";
 pub const boundary_task_head_family_version = "gliner2_top_layer_boundary_task_head/v1alpha1";
+
+fn openBoundarySession(allocator: std.mem.Allocator, model_dir: []const u8, backend: text_encoder_boundary.BackendChoice) !backends.Session {
+    return switch (backend) {
+        .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
+        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
+        .cuda => try session_factory.createCudaSessionWithTaskOverride(allocator, model_dir, .generic),
+        .auto => blk: {
+            if (comptime build_options.enable_cuda) {
+                if (backends.gpu_inventory.cudaRuntimeAvailable()) {
+                    if (session_factory.createCudaSessionWithTaskOverride(allocator, model_dir, .generic) catch |err| switch (err) {
+                        error.UnsupportedCudaArchitecture => null,
+                        else => return err,
+                    }) |cuda_session| break :blk cuda_session;
+                }
+            }
+            break :blk try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic);
+        },
+    };
+}
 
 pub const CachedBoundaryExampleSummary = struct {
     text: []const u8,
@@ -358,11 +378,7 @@ pub fn trainEvalBoundaryHead(
     var optimizer_state = optimizers.OptimizerState.init(allocator);
     defer optimizer_state.deinit();
 
-    var session = switch (backend) {
-        .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
-        .auto => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-    };
+    var session = try openBoundarySession(allocator, model_dir, backend);
     defer session.close();
     var cb = try session_factory.getComputeBackend(session, allocator);
     defer cb.deinit();
@@ -470,11 +486,7 @@ pub fn trainEvalBoundaryTaskHead(
     var optimizer_state = optimizers.OptimizerState.init(allocator);
     defer optimizer_state.deinit();
 
-    var session = switch (backend) {
-        .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
-        .auto => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-    };
+    var session = try openBoundarySession(allocator, model_dir, backend);
     defer session.close();
     var cb = try session_factory.getComputeBackend(session, allocator);
     defer cb.deinit();
@@ -659,11 +671,7 @@ fn collectCalibrationBatch(
     var tokenizer = try gliner2_data.Tokenizer.initGLiNER2HF(allocator, model_dir);
     defer tokenizer.deinit(allocator);
 
-    var session = switch (backend) {
-        .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
-        .auto => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-    };
+    var session = try openBoundarySession(allocator, model_dir, backend);
     defer session.close();
     var cb = try session_factory.getComputeBackend(session, allocator);
     defer cb.deinit();

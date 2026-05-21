@@ -57,4 +57,12 @@ pub const DeviceBuffer = struct {
         try ctx.makeCurrent();
         try ctx.driver.check(ctx.driver.fns.cuMemcpyDtoDAsync(self.ptr, src.ptr, len, ctx.stream));
     }
+
+    pub fn copyFromDeviceOffset(self: DeviceBuffer, ctx: *context_mod.CudaContext, dst_offset: usize, src: DeviceBuffer, src_offset: usize, len: usize) driver_mod.Error!void {
+        if (dst_offset > self.len or src_offset > src.len) return error.InvalidCudaState;
+        if (len > self.len - dst_offset or len > src.len - src_offset) return error.InvalidCudaState;
+        if (len == 0) return;
+        try ctx.makeCurrent();
+        try ctx.driver.check(ctx.driver.fns.cuMemcpyDtoDAsync(self.ptr + dst_offset, src.ptr + src_offset, len, ctx.stream));
+    }
 };

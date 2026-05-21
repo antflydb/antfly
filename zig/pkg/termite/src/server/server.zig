@@ -92,6 +92,7 @@ pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
+    backend_choice: native_backend_choice.Choice = .auto,
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
@@ -117,7 +118,10 @@ fn parseGenerateBackendSelection(
         native_backend_choice.parse(value) orelse return error.InvalidBackend
     else
         native_backend_choice.Choice.auto;
-    try native_backend_choice.validate(choice);
+    if (backend_value != null)
+        try native_backend_choice.validateRuntime(choice)
+    else
+        try native_backend_choice.validate(choice);
 
     const compiled_mode_requested = if (mode_value) |value| blk: {
         if (std.mem.eql(u8, value, "eager")) break :blk false;
@@ -459,11 +463,17 @@ pub const Node = struct {
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
+        var session_manager = backends_mod.SessionManager.init(allocator);
+        var model_session_manager = backends_mod.SessionManager.init(allocator);
+        if (config.backend_choice != .auto) {
+            native_backend_choice.configureSessionPreference(&session_manager, config.backend_choice);
+            native_backend_choice.configureSessionPreference(&model_session_manager, config.backend_choice);
+        }
         return .{
             .config = config,
             .allocator = allocator,
-            .session_manager = backends_mod.SessionManager.init(allocator),
-            .model_manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator)),
+            .session_manager = session_manager,
+            .model_manager = model_manager_mod.ModelManager.init(allocator, model_session_manager),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
@@ -1717,11 +1727,13 @@ pub const Node = struct {
             .cache_compaction_ratio = body.cache_compaction_ratio,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
+            const cuda = if (err == error.CudaRuntimeUnavailable) backends_mod.gpu_inventory.cudaStatus() else null;
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = switch (err) {
                     error.InvalidGenerateMode => "unsupported generation mode",
                     error.InvalidCompiledTarget => "unsupported compiled_target",
+                    error.CudaRuntimeUnavailable => if (cuda) |status| status.reasonText() else "cuda backend unavailable",
                     else => "unsupported backend",
                 },
             });
@@ -4052,6 +4064,7 @@ pub const Node = struct {
     }
 
     pub fn getVersion(_: *Node, ctx: *httpx.Context) !httpx.Response {
+        const cuda = backends_mod.gpu_inventory.cudaStatus();
         return ctx.json(.{
             .version = build_options.termite_version,
             .git_commit = build_options.git_commit,
@@ -4064,7 +4077,26 @@ pub const Node = struct {
                 .onnx = !build_options.enable_wasm,
                 .onnx_runtime = build_options.enable_onnx,
                 .mlx = build_options.enable_mlx,
+                .cuda = build_options.enable_cuda,
+                .cuda_runtime = cuda.runtime_available,
                 .wasm = build_options.enable_wasm,
+            },
+            .gpu = .{
+                .cuda = .{
+                    .built = cuda.built,
+                    .runtime_available = cuda.runtime_available,
+                    .reason = cuda.reasonText(),
+                    .driver_version = cuda.driver_version,
+                    .device_count = cuda.device_count,
+                    .selected_device = cuda.selected_device,
+                    .device_name = cuda.nameSlice(),
+                    .compute_capability = .{
+                        .major = cuda.compute_major,
+                        .minor = cuda.compute_minor,
+                    },
+                    .total_memory_bytes = cuda.total_memory_bytes,
+                    .artifacts = cuda.artifacts,
+                },
             },
         });
     }
@@ -4128,6 +4160,11 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "termite_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
         try appendPromMetric(&writer.writer, "termite_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
         try appendPromMetric(&writer.writer, "termite_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
+        const cuda = backends_mod.gpu_inventory.cudaStatus();
+        try appendPromMetric(&writer.writer, "termite_cuda_built", "gauge", "Whether the native CUDA backend is built into this runtime", if (cuda.built) 1 else 0);
+        try appendPromMetric(&writer.writer, "termite_cuda_runtime_available", "gauge", "Whether the CUDA driver probe found a usable device", if (cuda.runtime_available) 1 else 0);
+        try appendPromMetric(&writer.writer, "termite_cuda_device_count", "gauge", "CUDA devices reported by the driver probe", @intCast(@max(cuda.device_count, 0)));
+        try appendPromMetric(&writer.writer, "termite_cuda_selected_device_memory_bytes", "gauge", "Total memory on the selected CUDA device", cuda.total_memory_bytes);
         try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
 
@@ -4136,12 +4173,28 @@ pub const Node = struct {
     }
 
     fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-        return ctx.json(.{ .status = "ok" });
+        const node = active_node;
+        const cuda = backends_mod.gpu_inventory.cudaStatus();
+        return ctx.json(.{
+            .status = "ok",
+            .backend = .{
+                .preference = if (node) |n| @tagName(n.config.backend_choice) else "auto",
+                .cuda_runtime = cuda.runtime_available,
+                .cuda_reason = cuda.reasonText(),
+            },
+        });
     }
 
     fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+        const node = active_node;
+        const cuda = backends_mod.gpu_inventory.cudaStatus();
         const models_dir = active_models_dir orelse return ctx.status(503).json(.{
             .status = "not_ready",
+            .backend = .{
+                .preference = if (node) |n| @tagName(n.config.backend_choice) else "auto",
+                .cuda_runtime = cuda.runtime_available,
+                .cuda_reason = cuda.reasonText(),
+            },
             .models = .{
                 .embedders = 0,
                 .rerankers = 0,
@@ -4160,6 +4213,11 @@ pub const Node = struct {
         const status_code: u16 = if (counts.total() > 0) 200 else 503;
         return ctx.status(status_code).json(.{
             .status = status_text,
+            .backend = .{
+                .preference = if (node) |n| @tagName(n.config.backend_choice) else "auto",
+                .cuda_runtime = cuda.runtime_available,
+                .cuda_reason = cuda.reasonText(),
+            },
             .models = .{
                 .embedders = counts.embedders,
                 .rerankers = counts.rerankers,

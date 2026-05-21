@@ -76,10 +76,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackend(value: []const u8) !text_encoder_boundary.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    return error.InvalidBackend;
+    return text_encoder_boundary.parseBackendChoice(value) orelse error.InvalidBackend;
 }
 
 fn usage() error{InvalidArguments}!void {

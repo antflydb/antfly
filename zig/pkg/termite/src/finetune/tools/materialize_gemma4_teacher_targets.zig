@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const termite = @import("termite_internal");
 
 const finetune = termite.finetune.gemma4;
@@ -30,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     const out_path = args.next() orelse return usageError();
 
     var opts = gemma4_real.TeacherTopKOptions{};
-    var backend: gemma4_real.BackendKind = .native;
+    var backend: gemma4_real.BackendKind = defaultBackend();
     var gguf_projector_path: ?[]const u8 = null;
 
     while (args.next()) |arg| {
@@ -52,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
             return usageError();
         }
     }
+    try validateBackendAvailable(backend);
 
     var prepared = try finetune.loadPreparedInputsSummary(allocator, prepared_inputs_path);
     defer finetune.freePreparedInputsSummary(allocator, &prepared);
@@ -101,10 +103,39 @@ pub fn main(init: std.process.Init) !void {
     try writer.interface.flush();
 }
 
+fn defaultBackend() gemma4_real.BackendKind {
+    if (build_options.enable_cuda and termite.backends.gpu_inventory.cudaRuntimeAvailable()) return .cuda;
+    if (build_options.enable_mlx) return .mlx;
+    return .native;
+}
+
 fn parseBackend(value: []const u8) ?gemma4_real.BackendKind {
-    if (std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return defaultBackend();
+    if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
+    if (std.ascii.eqlIgnoreCase(value, "native") or std.ascii.eqlIgnoreCase(value, "blas")) return .native;
+    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     return null;
+}
+
+fn validateBackendAvailable(backend: gemma4_real.BackendKind) !void {
+    switch (backend) {
+        .native => {},
+        .mlx => if (!build_options.enable_mlx) {
+            std.debug.print("error: MLX support not compiled in\n", .{});
+            return error.MlxNotAvailable;
+        },
+        .cuda => {
+            if (!build_options.enable_cuda) {
+                std.debug.print("error: CUDA support not compiled in; rebuild with -Dcuda=true\n", .{});
+                return error.CudaNotAvailable;
+            }
+            const status = termite.backends.gpu_inventory.cudaStatus();
+            if (!status.runtime_available) {
+                std.debug.print("error: CUDA runtime unavailable: {s}\n", .{status.reasonText()});
+                return error.CudaRuntimeUnavailable;
+            }
+        },
+    }
 }
 
 fn usageError() error{InvalidArguments} {
@@ -119,7 +150,7 @@ fn usageError() error{InvalidArguments} {
         \\  --top-k N              Teacher tokens per row (default: 8)
         \\  --temperature F        Temperature applied before top-k softmax (default: 1.0)
         \\  --max-examples N       Maximum examples to materialize (default: 0 = all)
-        \\  --backend native|mlx   Teacher inference backend (default: native)
+        \\  --backend auto|cuda|native|mlx|blas  Teacher inference backend (default: auto)
         \\  --gguf-projector P     Required for multimodal inputs unless recorded in the prepared summary
         \\
         \\example: materialize-gemma4-teacher-targets /tmp/gemma4-base /tmp/prepared.json /tmp/prepared.teacher.json --top-k 8 --temperature 2.0
@@ -127,4 +158,30 @@ fn usageError() error{InvalidArguments} {
         \\
     , .{});
     return error.InvalidArguments;
+}
+
+test "gemma4 teacher backend parser accepts cuda and auto" {
+    try validateBackendAvailable(defaultBackend());
+    try std.testing.expectEqual(defaultBackend(), parseBackend("auto").?);
+    try std.testing.expectEqual(gemma4_real.BackendKind.cuda, parseBackend("cuda").?);
+    try std.testing.expectEqual(gemma4_real.BackendKind.native, parseBackend("blas").?);
+    try std.testing.expectEqual(gemma4_real.BackendKind.native, parseBackend("native").?);
+    try std.testing.expectEqual(gemma4_real.BackendKind.mlx, parseBackend("mlx").?);
+    try std.testing.expect(parseBackend("bogus") == null);
+}
+
+test "gemma4 teacher backend validator rejects unavailable explicit cuda" {
+    const cuda = termite.backends.gpu_inventory.cudaStatus();
+    if (!build_options.enable_cuda) {
+        try std.testing.expectError(error.CudaNotAvailable, validateBackendAvailable(.cuda));
+    } else if (!cuda.runtime_available) {
+        try std.testing.expectError(error.CudaRuntimeUnavailable, validateBackendAvailable(.cuda));
+    } else {
+        try validateBackendAvailable(.cuda);
+    }
+
+    if (!build_options.enable_mlx) {
+        try std.testing.expectError(error.MlxNotAvailable, validateBackendAvailable(.mlx));
+    }
+    try validateBackendAvailable(.native);
 }

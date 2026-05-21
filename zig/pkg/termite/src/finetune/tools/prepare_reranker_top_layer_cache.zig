@@ -76,15 +76,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    return null;
+    return reranker_head.parseBackendChoice(value);
 }
 
 fn usage() error{InvalidArguments}!void {
     print(
-        \\usage: prepare-reranker-top-layer-cache <model-dir> <jsonl-or-dir> <out-summary-json> [split] [--backend auto|blas|mlx] [--max-examples N] [--top-layer-count N]
+        \\usage: prepare-reranker-top-layer-cache <model-dir> <jsonl-or-dir> <out-summary-json> [split] [--backend auto|cuda|blas|mlx] [--max-examples N] [--top-layer-count N]
         \\example: prepare-reranker-top-layer-cache /tmp/bge-reranker /tmp/rerank /tmp/reranker_top_layer_cache.json train --backend mlx --max-examples 128 --top-layer-count 1
         \\
     , .{});

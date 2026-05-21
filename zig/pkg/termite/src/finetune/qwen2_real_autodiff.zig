@@ -30,6 +30,7 @@ const ShardedSafetensorsSource = weight_source_mod.ShardedSafetensorsSource;
 const native_compute = @import("../ops/native_compute.zig");
 const mlx_backend = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {};
 const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
+const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const ops_mod = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -88,7 +89,7 @@ fn copyTensorFloat32(dst: []f32, tensor: *const Tensor) !void {
     }
 }
 
-pub const BackendKind = enum { native, mlx };
+pub const BackendKind = enum { native, mlx, cuda };
 
 pub const LoadedBackend = struct {
     allocator: std.mem.Allocator,
@@ -102,6 +103,8 @@ pub const LoadedBackend = struct {
         if (build_options.enable_mlx) null else {},
     mlx_engine: if (build_options.enable_mlx) ?*mlx_compute.MlxCompute else void =
         if (build_options.enable_mlx) null else {},
+    cuda_engine: if (build_options.enable_cuda) ?*cuda_compute.CudaCompute else void =
+        if (build_options.enable_cuda) null else {},
 
     pub fn backendPtr(self: *LoadedBackend) *const ComputeBackend {
         self.compute_backend = switch (self.kind) {
@@ -113,6 +116,10 @@ pub const LoadedBackend = struct {
             .mlx => if (comptime build_options.enable_mlx) blk: {
                 const engine = self.mlx_engine.?;
                 engine.data = &self.mlx_ws.?;
+                break :blk engine.computeBackend();
+            } else unreachable,
+            .cuda => if (comptime build_options.enable_cuda) blk: {
+                const engine = self.cuda_engine.?;
                 break :blk engine.computeBackend();
             } else unreachable,
         };
@@ -157,6 +164,12 @@ pub const LoadedBackend = struct {
                     engine.data = &self.mlx_ws.?;
                     var cb = engine.computeBackend();
                     cb.deinit();
+                }
+            } else {},
+            .cuda => if (comptime build_options.enable_cuda) {
+                if (self.cuda_engine) |engine| {
+                    engine.deinit();
+                    self.allocator.destroy(engine);
                 }
             } else {},
         }
@@ -429,6 +442,50 @@ pub fn loadBackendForModelDir(
                 .mlx_engine = engine,
             };
         },
+        .cuda => if (comptime build_options.enable_cuda) {
+            var single_source: ?*SafetensorsSource = null;
+            var sharded_source: ?*ShardedSafetensorsSource = null;
+            var source: weight_source_mod.WeightSource = undefined;
+            if (manifest.safetensors_path) |st_path| {
+                const src = try SafetensorsSource.initAbsolute(allocator, st_path);
+                single_source = src;
+                source = src.weightSource();
+            } else if (manifest.safetensors_index_path) |idx_path| {
+                const src = try ShardedSafetensorsSource.initAbsolute(allocator, idx_path);
+                sharded_source = src;
+                source = src.weightSource();
+            } else {
+                return error.MissingMergedCheckpoint;
+            }
+            errdefer {
+                if (single_source) |src| src.weightSource().deinit();
+                if (sharded_source) |src| src.weightSource().deinit();
+            }
+
+            const engine = try allocator.create(cuda_compute.CudaCompute);
+            errdefer allocator.destroy(engine);
+            engine.* = try cuda_compute.CudaCompute.init(allocator);
+            errdefer engine.deinit();
+
+            const names = try source.listNames(allocator);
+            defer allocator.free(names);
+            for (names) |name| {
+                var lw = try source.getTensor(name);
+                errdefer lw.deinit();
+                const owned_name = try allocator.dupe(u8, name);
+                try engine.insertWeightFromLoaded(owned_name, &lw);
+                lw.deinit();
+            }
+
+            return .{
+                .allocator = allocator,
+                .kind = .cuda,
+                .compute_backend = engine.computeBackend(),
+                .cuda_engine = engine,
+                .safetensors_source = single_source,
+                .sharded_safetensors_source = sharded_source,
+            };
+        } else return error.CudaNotAvailable,
     }
 }
 

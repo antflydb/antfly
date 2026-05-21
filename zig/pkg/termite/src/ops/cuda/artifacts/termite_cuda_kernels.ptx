@@ -7,7 +7,7 @@
 //
 
 .version 9.0
-.target sm_61
+.target sm_75
 .address_size 64
 
 	// .globl	termite_fill_f32
@@ -3639,6 +3639,39 @@ $L__BB13_12:
 	setp.eq.s32 	%p5, %r2, 5;
 	@%p5 bra 	$L__BB13_15;
 
+	setp.eq.s32 	%p6, %r2, 8;
+	@%p6 bra 	$L__BB13_22;
+
+	setp.eq.s32 	%p6, %r2, 9;
+	@%p6 bra 	$L__BB13_23;
+
+	setp.eq.s32 	%p6, %r2, 10;
+	@%p6 bra 	$L__BB13_24;
+
+	setp.eq.s32 	%p6, %r2, 11;
+	@%p6 bra 	$L__BB13_25;
+
+	setp.eq.s32 	%p6, %r2, 12;
+	@%p6 bra 	$L__BB_EW_SQRT;
+
+	setp.eq.s32 	%p6, %r2, 13;
+	@%p6 bra 	$L__BB_EW_RSQRT;
+
+	setp.eq.s32 	%p6, %r2, 14;
+	@%p6 bra 	$L__BB_EW_ABS;
+
+	setp.eq.s32 	%p6, %r2, 15;
+	@%p6 bra 	$L__BB_EW_SIN;
+
+	setp.eq.s32 	%p6, %r2, 16;
+	@%p6 bra 	$L__BB_EW_COS;
+
+	setp.eq.s32 	%p6, %r2, 17;
+	@%p6 bra 	$L__BB_EW_ERF;
+
+	setp.eq.s32 	%p6, %r2, 18;
+	@%p6 bra 	$L__BB_EW_SUB;
+
 	setp.ne.s32 	%p6, %r2, 6;
 	@%p6 bra 	$L__BB13_19;
 
@@ -3725,6 +3758,72 @@ $L__BB13_15:
 	div.rn.f32 	%f116, %f1, %f47;
 	bra.uni 	$L__BB13_20;
 
+$L__BB13_22:
+	setp.lt.f32 	%p6, %f1, %f3;
+	selp.f32 	%f116, 0f3F800000, 0f00000000, %p6;
+	bra.uni 	$L__BB13_20;
+
+$L__BB13_23:
+	div.rn.f32 	%f116, %f1, %f3;
+	bra.uni 	$L__BB13_20;
+
+$L__BB13_24:
+	mul.f32 	%f14, %f1, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%f116, %f14;
+	bra.uni 	$L__BB13_20;
+
+$L__BB13_25:
+	lg2.approx.ftz.f32 	%f14, %f1;
+	mul.f32 	%f116, %f14, 0f3F317218;
+	bra.uni 	$L__BB13_20;
+
+$L__BB_EW_SQRT:
+	sqrt.rn.f32 	%f116, %f1;
+	bra.uni 	$L__BB13_20;
+
+$L__BB_EW_RSQRT:
+	sqrt.rn.f32 	%f14, %f1;
+	rcp.rn.f32 	%f116, %f14;
+	bra.uni 	$L__BB13_20;
+
+$L__BB_EW_ABS:
+	abs.f32 	%f116, %f1;
+	bra.uni 	$L__BB13_20;
+
+$L__BB_EW_SIN:
+	sin.approx.ftz.f32 	%f116, %f1;
+	bra.uni 	$L__BB13_20;
+
+$L__BB_EW_COS:
+	cos.approx.ftz.f32 	%f116, %f1;
+	bra.uni 	$L__BB13_20;
+
+$L__BB_EW_ERF:
+	abs.f32 	%f14, %f1;
+	mul.f32 	%f15, %f14, 0f3EA7BA05;
+	add.f32 	%f16, %f15, 0f3F800000;
+	rcp.rn.f32 	%f17, %f16;
+	mov.f32 	%f18, 0f3F87DC22;
+	fma.rn.f32 	%f18, %f18, %f17, 0fBFBA00E3;
+	fma.rn.f32 	%f18, %f18, %f17, 0f3FB5F0E3;
+	fma.rn.f32 	%f18, %f18, %f17, 0fBE91A98E;
+	fma.rn.f32 	%f18, %f18, %f17, 0f3E827906;
+	mul.f32 	%f18, %f18, %f17;
+	mul.f32 	%f19, %f14, %f14;
+	neg.f32 	%f19, %f19;
+	mul.f32 	%f19, %f19, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%f20, %f19;
+	mul.f32 	%f21, %f18, %f20;
+	sub.f32 	%f22, 0f3F800000, %f21;
+	setp.lt.f32 	%p6, %f1, 0f00000000;
+	neg.f32 	%f23, %f22;
+	selp.f32 	%f116, %f23, %f22, %p6;
+	bra.uni 	$L__BB13_20;
+
+$L__BB_EW_SUB:
+	sub.f32 	%f116, %f1, %f3;
+	bra.uni 	$L__BB13_20;
+
 $L__BB13_19:
 	abs.f32 	%f94, %f1;
 	mul.f32 	%f95, %f94, 0f4038AA3B;
@@ -3765,6 +3864,559 @@ $L__BB13_21:
 	ret;
 
 }
+	// .globl	termite_softmax_lastdim_f32
+.visible .entry termite_softmax_lastdim_f32(
+	.param .u64 .ptr .align 1 termite_softmax_lastdim_f32_param_0,
+	.param .u64 .ptr .align 1 termite_softmax_lastdim_f32_param_1,
+	.param .u32 termite_softmax_lastdim_f32_param_2,
+	.param .u32 termite_softmax_lastdim_f32_param_3,
+	.param .u32 termite_softmax_lastdim_f32_param_4
+)
+{
+	.reg .pred 	%p<36>;
+	.reg .b32 	%r<100>;
+	.reg .b64 	%rd<17>;
+	.shared .align 4 .b8 _ZZ27termite_softmax_lastdim_f32E7scratch[1024];
+	ld.param.b32 	%r22, [termite_softmax_lastdim_f32_param_3];
+	ld.param.b64 	%rd5, [termite_softmax_lastdim_f32_param_0];
+	ld.param.b64 	%rd6, [termite_softmax_lastdim_f32_param_1];
+	cvta.to.global.u64 	%rd1, %rd6;
+	cvta.to.global.u64 	%rd2, %rd5;
+	ld.param.b32 	%r26, [termite_softmax_lastdim_f32_param_2];
+	mov.u32 	%r98, %tid.x;
+	mov.u32 	%r25, %ctaid.x;
+	setp.ge.u32 	%p1, %r25, %r26;
+	setp.eq.b32 	%p2, %r22, 0;
+	or.pred 	%p3, %p2, %p1;
+	@%p3 bra 	$L__BB_SOFTMAX_43;
+	mul.lo.s32 	%r3, %r25, %r22;
+	setp.ge.u32 	%p4, %r98, %r22;
+	mov.b32 	%r93, 0fFF7FFFFF;
+	@%p4 bra 	$L__BB_SOFTMAX_4;
+	mov.b32 	%r94, %r98;
+$L__BB_SOFTMAX_3:
+	add.s32 	%r29, %r3, %r94;
+	mul.wide.u32 	%rd7, %r29, 4;
+	add.s64 	%rd8, %rd1, %rd7;
+	ld.global.b32 	%r30, [%rd8];
+	setp.gt.f32 	%p5, %r30, %r93;
+	selp.f32 	%r93, %r30, %r93, %p5;
+	add.s32 	%r94, %r94, 256;
+	setp.lt.u32 	%p6, %r94, %r22;
+	@%p6 bra 	$L__BB_SOFTMAX_3;
+$L__BB_SOFTMAX_4:
+	mul.wide.u32 	%rd9, %r98, 4;
+	mov.b64 	%rd10, _ZZ27termite_softmax_lastdim_f32E7scratch;
+	add.s64 	%rd3, %rd10, %rd9;
+	st.shared.b32 	[%rd3], %r93;
+	bar.sync 	0;
+	setp.lt.u32 	%p7, %r98, 128;
+	@%p7 bra 	$L__BB_SOFTMAX_5;
+	bra.uni 	$L__BB_SOFTMAX_6;
+$L__BB_SOFTMAX_5:
+	ld.shared.b32 	%r31, [%rd3+512];
+	ld.shared.b32 	%r32, [%rd3];
+	setp.gt.f32 	%p8, %r31, %r32;
+	selp.f32 	%r33, %r31, %r32, %p8;
+	st.shared.b32 	[%rd3], %r33;
+$L__BB_SOFTMAX_6:
+	bar.sync 	0;
+	setp.gt.u32 	%p9, %r98, 63;
+	@%p9 bra 	$L__BB_SOFTMAX_8;
+	ld.shared.b32 	%r34, [%rd3+256];
+	ld.shared.b32 	%r35, [%rd3];
+	setp.gt.f32 	%p10, %r34, %r35;
+	selp.f32 	%r36, %r34, %r35, %p10;
+	st.shared.b32 	[%rd3], %r36;
+$L__BB_SOFTMAX_8:
+	bar.sync 	0;
+	setp.gt.u32 	%p11, %r98, 31;
+	@%p11 bra 	$L__BB_SOFTMAX_10;
+	ld.shared.b32 	%r37, [%rd3+128];
+	ld.shared.b32 	%r38, [%rd3];
+	setp.gt.f32 	%p12, %r37, %r38;
+	selp.f32 	%r39, %r37, %r38, %p12;
+	st.shared.b32 	[%rd3], %r39;
+$L__BB_SOFTMAX_10:
+	bar.sync 	0;
+	setp.gt.u32 	%p13, %r98, 15;
+	@%p13 bra 	$L__BB_SOFTMAX_12;
+	ld.shared.b32 	%r40, [%rd3+64];
+	ld.shared.b32 	%r41, [%rd3];
+	setp.gt.f32 	%p14, %r40, %r41;
+	selp.f32 	%r42, %r40, %r41, %p14;
+	st.shared.b32 	[%rd3], %r42;
+$L__BB_SOFTMAX_12:
+	bar.sync 	0;
+	setp.gt.u32 	%p15, %r98, 7;
+	@%p15 bra 	$L__BB_SOFTMAX_14;
+	ld.shared.b32 	%r43, [%rd3+32];
+	ld.shared.b32 	%r44, [%rd3];
+	setp.gt.f32 	%p16, %r43, %r44;
+	selp.f32 	%r45, %r43, %r44, %p16;
+	st.shared.b32 	[%rd3], %r45;
+$L__BB_SOFTMAX_14:
+	bar.sync 	0;
+	setp.gt.u32 	%p17, %r98, 3;
+	@%p17 bra 	$L__BB_SOFTMAX_16;
+	ld.shared.b32 	%r46, [%rd3+16];
+	ld.shared.b32 	%r47, [%rd3];
+	setp.gt.f32 	%p18, %r46, %r47;
+	selp.f32 	%r48, %r46, %r47, %p18;
+	st.shared.b32 	[%rd3], %r48;
+$L__BB_SOFTMAX_16:
+	bar.sync 	0;
+	setp.gt.u32 	%p19, %r98, 1;
+	@%p19 bra 	$L__BB_SOFTMAX_18;
+	ld.shared.b32 	%r49, [%rd3+8];
+	ld.shared.b32 	%r50, [%rd3];
+	setp.gt.f32 	%p20, %r49, %r50;
+	selp.f32 	%r51, %r49, %r50, %p20;
+	st.shared.b32 	[%rd3], %r51;
+$L__BB_SOFTMAX_18:
+	bar.sync 	0;
+	setp.ne.b32 	%p21, %r98, 0;
+	@%p21 bra 	$L__BB_SOFTMAX_20;
+	ld.shared.b32 	%r52, [_ZZ27termite_softmax_lastdim_f32E7scratch+4];
+	ld.shared.b32 	%r53, [%rd3];
+	setp.gt.f32 	%p22, %r52, %r53;
+	selp.f32 	%r54, %r52, %r53, %p22;
+	st.shared.b32 	[%rd3], %r54;
+$L__BB_SOFTMAX_20:
+	bar.sync 	0;
+	mov.b32 	%r97, 0f00000000;
+	ld.shared.b32 	%r9, [_ZZ27termite_softmax_lastdim_f32E7scratch];
+	@%p4 bra 	$L__BB_SOFTMAX_23;
+	mov.b32 	%r96, %r98;
+$L__BB_SOFTMAX_22:
+	add.s32 	%r59, %r3, %r96;
+	mul.wide.u32 	%rd11, %r59, 4;
+	add.s64 	%rd12, %rd1, %rd11;
+	ld.global.b32 	%r60, [%rd12];
+	sub.f32 	%r61, %r60, %r9;
+	mul.f32 	%r58, %r61, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%r57, %r58;
+	add.f32 	%r97, %r97, %r57;
+	add.s32 	%r96, %r96, 256;
+	setp.lt.u32 	%p24, %r96, %r22;
+	@%p24 bra 	$L__BB_SOFTMAX_22;
+$L__BB_SOFTMAX_23:
+	st.shared.b32 	[%rd3], %r97;
+	bar.sync 	0;
+	@%p7 bra 	$L__BB_SOFTMAX_24;
+	bra.uni 	$L__BB_SOFTMAX_25;
+$L__BB_SOFTMAX_24:
+	ld.shared.b32 	%r62, [%rd3+512];
+	ld.shared.b32 	%r63, [%rd3];
+	add.f32 	%r64, %r62, %r63;
+	st.shared.b32 	[%rd3], %r64;
+$L__BB_SOFTMAX_25:
+	bar.sync 	0;
+	@%p9 bra 	$L__BB_SOFTMAX_27;
+	ld.shared.b32 	%r65, [%rd3+256];
+	ld.shared.b32 	%r66, [%rd3];
+	add.f32 	%r67, %r65, %r66;
+	st.shared.b32 	[%rd3], %r67;
+$L__BB_SOFTMAX_27:
+	bar.sync 	0;
+	@%p11 bra 	$L__BB_SOFTMAX_29;
+	ld.shared.b32 	%r68, [%rd3+128];
+	ld.shared.b32 	%r69, [%rd3];
+	add.f32 	%r70, %r68, %r69;
+	st.shared.b32 	[%rd3], %r70;
+$L__BB_SOFTMAX_29:
+	bar.sync 	0;
+	@%p13 bra 	$L__BB_SOFTMAX_31;
+	ld.shared.b32 	%r71, [%rd3+64];
+	ld.shared.b32 	%r72, [%rd3];
+	add.f32 	%r73, %r71, %r72;
+	st.shared.b32 	[%rd3], %r73;
+$L__BB_SOFTMAX_31:
+	bar.sync 	0;
+	@%p15 bra 	$L__BB_SOFTMAX_33;
+	ld.shared.b32 	%r74, [%rd3+32];
+	ld.shared.b32 	%r75, [%rd3];
+	add.f32 	%r76, %r74, %r75;
+	st.shared.b32 	[%rd3], %r76;
+$L__BB_SOFTMAX_33:
+	bar.sync 	0;
+	@%p17 bra 	$L__BB_SOFTMAX_35;
+	ld.shared.b32 	%r77, [%rd3+16];
+	ld.shared.b32 	%r78, [%rd3];
+	add.f32 	%r79, %r77, %r78;
+	st.shared.b32 	[%rd3], %r79;
+$L__BB_SOFTMAX_35:
+	bar.sync 	0;
+	@%p19 bra 	$L__BB_SOFTMAX_37;
+	ld.shared.b32 	%r80, [%rd3+8];
+	ld.shared.b32 	%r81, [%rd3];
+	add.f32 	%r82, %r80, %r81;
+	st.shared.b32 	[%rd3], %r82;
+$L__BB_SOFTMAX_37:
+	bar.sync 	0;
+	@%p21 bra 	$L__BB_SOFTMAX_39;
+	ld.shared.b32 	%r83, [_ZZ27termite_softmax_lastdim_f32E7scratch+4];
+	ld.shared.b32 	%r84, [%rd3];
+	add.f32 	%r85, %r83, %r84;
+	st.shared.b32 	[%rd3], %r85;
+$L__BB_SOFTMAX_39:
+	ld.param.b32 	%r23, [termite_softmax_lastdim_f32_param_4];
+	setp.lt.u32 	%p33, %r98, %r22;
+	bar.sync 	0;
+	ld.shared.b32 	%r87, [_ZZ27termite_softmax_lastdim_f32E7scratch];
+	lg2.approx.ftz.f32 	%r86, %r87;
+	fma.rn.f32 	%r15, %r86, 0f3F317218, %r9;
+	@%p33 bra 	$L__BB_SOFTMAX_40;
+$L__BB_SOFTMAX_43:
+	ret;
+$L__BB_SOFTMAX_42:
+	shl.b64 	%rd15, %rd4, 2;
+	add.s64 	%rd16, %rd2, %rd15;
+	st.global.b32 	[%rd16], %r99;
+	add.s32 	%r98, %r98, 256;
+	setp.lt.u32 	%p35, %r98, %r22;
+	@%p35 bra 	$L__BB_SOFTMAX_40;
+	bra.uni 	$L__BB_SOFTMAX_43;
+$L__BB_SOFTMAX_40:
+	setp.ne.b32 	%p34, %r23, 0;
+	add.s32 	%r88, %r3, %r98;
+	cvt.u64.u32 	%rd4, %r88;
+	mul.wide.u32 	%rd13, %r88, 4;
+	add.s64 	%rd14, %rd1, %rd13;
+	ld.global.b32 	%r89, [%rd14];
+	sub.f32 	%r99, %r89, %r15;
+	@%p34 bra 	$L__BB_SOFTMAX_42;
+	mul.f32 	%r91, %r99, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%r99, %r91;
+	bra.uni 	$L__BB_SOFTMAX_42;
+}
+
+	// .globl	termite_reduce_lastdim_f32
+.visible .entry termite_reduce_lastdim_f32(
+	.param .u64 .ptr .align 1 termite_reduce_lastdim_f32_param_0,
+	.param .u64 .ptr .align 1 termite_reduce_lastdim_f32_param_1,
+	.param .u32 termite_reduce_lastdim_f32_param_2,
+	.param .u32 termite_reduce_lastdim_f32_param_3,
+	.param .u32 termite_reduce_lastdim_f32_param_4
+)
+{
+	.reg .pred 	%p<35>;
+	.reg .b32 	%r<65>;
+	.reg .b64 	%rd<12>;
+	.shared .align 4 .b8 _ZZ26termite_reduce_lastdim_f32E7scratch[1024];
+	ld.param.b32 	%r11, [termite_reduce_lastdim_f32_param_3];
+	ld.param.b64 	%rd5, [termite_reduce_lastdim_f32_param_0];
+	ld.param.b64 	%rd6, [termite_reduce_lastdim_f32_param_1];
+	cvta.to.global.u64 	%rd1, %rd6;
+	cvta.to.global.u64 	%rd2, %rd5;
+	ld.param.b32 	%r15, [termite_reduce_lastdim_f32_param_2];
+	mov.u32 	%r1, %tid.x;
+	mov.u32 	%r14, %ctaid.x;
+	setp.ge.u32 	%p1, %r14, %r15;
+	setp.eq.b32 	%p2, %r11, 0;
+	or.pred 	%p3, %p2, %p1;
+	@%p3 bra 	$L__BB_REDUCE_20;
+	ld.param.b32 	%r12, [termite_reduce_lastdim_f32_param_4];
+	mul.lo.s32 	%r3, %r14, %r11;
+	setp.eq.b32 	%p4, %r12, 1;
+	selp.f32 	%r63, 0fFF7FFFFF, 0f00000000, %p4;
+	setp.ge.u32 	%p5, %r1, %r11;
+	mov.b32 	%r64, %r1;
+	@%p5 bra 	$L__BB_REDUCE_2;
+$L__BB_REDUCE_21:
+	add.s32 	%r16, %r3, %r64;
+	mul.wide.u32 	%rd7, %r16, 4;
+	add.s64 	%rd8, %rd1, %rd7;
+	ld.global.b32 	%r17, [%rd8];
+	setp.gt.f32 	%p7, %r17, %r63;
+	selp.f32 	%r18, %r17, %r63, %p7;
+	add.f32 	%r19, %r63, %r17;
+	selp.f32 	%r63, %r18, %r19, %p4;
+	add.s32 	%r64, %r64, 256;
+	setp.lt.u32 	%p8, %r64, %r11;
+	@%p8 bra 	$L__BB_REDUCE_21;
+$L__BB_REDUCE_2:
+	mul.wide.u32 	%rd9, %r1, 4;
+	mov.b64 	%rd10, _ZZ26termite_reduce_lastdim_f32E7scratch;
+	add.s64 	%rd3, %rd10, %rd9;
+	st.shared.b32 	[%rd3], %r63;
+	bar.sync 	0;
+	setp.lt.u32 	%p9, %r1, 128;
+	@%p9 bra 	$L__BB_REDUCE_3;
+	bra.uni 	$L__BB_REDUCE_4;
+$L__BB_REDUCE_3:
+	ld.shared.b32 	%r20, [%rd3+512];
+	ld.shared.b32 	%r21, [%rd3];
+	add.f32 	%r22, %r20, %r21;
+	setp.gt.f32 	%p11, %r20, %r21;
+	selp.f32 	%r23, %r20, %r21, %p11;
+	selp.f32 	%r24, %r23, %r22, %p4;
+	st.shared.b32 	[%rd3], %r24;
+$L__BB_REDUCE_4:
+	bar.sync 	0;
+	setp.gt.u32 	%p12, %r1, 63;
+	@%p12 bra 	$L__BB_REDUCE_6;
+	ld.shared.b32 	%r25, [%rd3+256];
+	ld.shared.b32 	%r26, [%rd3];
+	add.f32 	%r27, %r25, %r26;
+	setp.gt.f32 	%p14, %r25, %r26;
+	selp.f32 	%r28, %r25, %r26, %p14;
+	selp.f32 	%r29, %r28, %r27, %p4;
+	st.shared.b32 	[%rd3], %r29;
+$L__BB_REDUCE_6:
+	bar.sync 	0;
+	setp.gt.u32 	%p15, %r1, 31;
+	@%p15 bra 	$L__BB_REDUCE_8;
+	ld.shared.b32 	%r30, [%rd3+128];
+	ld.shared.b32 	%r31, [%rd3];
+	add.f32 	%r32, %r30, %r31;
+	setp.gt.f32 	%p17, %r30, %r31;
+	selp.f32 	%r33, %r30, %r31, %p17;
+	selp.f32 	%r34, %r33, %r32, %p4;
+	st.shared.b32 	[%rd3], %r34;
+$L__BB_REDUCE_8:
+	bar.sync 	0;
+	setp.gt.u32 	%p18, %r1, 15;
+	@%p18 bra 	$L__BB_REDUCE_10;
+	ld.shared.b32 	%r35, [%rd3+64];
+	ld.shared.b32 	%r36, [%rd3];
+	add.f32 	%r37, %r35, %r36;
+	setp.gt.f32 	%p20, %r35, %r36;
+	selp.f32 	%r38, %r35, %r36, %p20;
+	selp.f32 	%r39, %r38, %r37, %p4;
+	st.shared.b32 	[%rd3], %r39;
+$L__BB_REDUCE_10:
+	bar.sync 	0;
+	setp.gt.u32 	%p21, %r1, 7;
+	@%p21 bra 	$L__BB_REDUCE_12;
+	ld.shared.b32 	%r40, [%rd3+32];
+	ld.shared.b32 	%r41, [%rd3];
+	add.f32 	%r42, %r40, %r41;
+	setp.gt.f32 	%p23, %r40, %r41;
+	selp.f32 	%r43, %r40, %r41, %p23;
+	selp.f32 	%r44, %r43, %r42, %p4;
+	st.shared.b32 	[%rd3], %r44;
+$L__BB_REDUCE_12:
+	bar.sync 	0;
+	setp.gt.u32 	%p24, %r1, 3;
+	@%p24 bra 	$L__BB_REDUCE_14;
+	ld.shared.b32 	%r45, [%rd3+16];
+	ld.shared.b32 	%r46, [%rd3];
+	add.f32 	%r47, %r45, %r46;
+	setp.gt.f32 	%p26, %r45, %r46;
+	selp.f32 	%r48, %r45, %r46, %p26;
+	selp.f32 	%r49, %r48, %r47, %p4;
+	st.shared.b32 	[%rd3], %r49;
+$L__BB_REDUCE_14:
+	bar.sync 	0;
+	setp.gt.u32 	%p27, %r1, 1;
+	@%p27 bra 	$L__BB_REDUCE_16;
+	ld.shared.b32 	%r50, [%rd3+8];
+	ld.shared.b32 	%r51, [%rd3];
+	add.f32 	%r52, %r50, %r51;
+	setp.gt.f32 	%p29, %r50, %r51;
+	selp.f32 	%r53, %r50, %r51, %p29;
+	selp.f32 	%r54, %r53, %r52, %p4;
+	st.shared.b32 	[%rd3], %r54;
+$L__BB_REDUCE_16:
+	bar.sync 	0;
+	setp.ne.b32 	%p30, %r1, 0;
+	@%p30 bra 	$L__BB_REDUCE_18;
+	ld.shared.b32 	%r55, [_ZZ26termite_reduce_lastdim_f32E7scratch+4];
+	ld.shared.b32 	%r56, [%rd3];
+	add.f32 	%r57, %r55, %r56;
+	setp.gt.f32 	%p32, %r55, %r56;
+	selp.f32 	%r58, %r55, %r56, %p32;
+	selp.f32 	%r59, %r58, %r57, %p4;
+	st.shared.b32 	[%rd3], %r59;
+$L__BB_REDUCE_18:
+	bar.sync 	0;
+	@%p30 bra 	$L__BB_REDUCE_20;
+	cvt.rn.f32.u32 	%r10, %r11;
+	mul.wide.u32 	%rd11, %r14, 4;
+	add.s64 	%rd4, %rd2, %rd11;
+	setp.eq.b32 	%p34, %r12, 2;
+	ld.shared.b32 	%r60, [_ZZ26termite_reduce_lastdim_f32E7scratch];
+	div.rn.f32 	%r61, %r60, %r10;
+	selp.f32 	%r62, %r61, %r60, %p34;
+	st.global.b32 	[%rd4], %r62;
+$L__BB_REDUCE_20:
+	ret;
+}
+	// .globl	termite_broadcast_in_dim_f32
+.visible .entry termite_broadcast_in_dim_f32(
+	.param .u64 .ptr .align 1 termite_broadcast_in_dim_f32_param_0,
+	.param .u64 .ptr .align 1 termite_broadcast_in_dim_f32_param_1,
+	.param .u32 termite_broadcast_in_dim_f32_param_2,
+	.param .u32 termite_broadcast_in_dim_f32_param_3,
+	.param .u32 termite_broadcast_in_dim_f32_param_4,
+	.param .u64 .ptr .align 1 termite_broadcast_in_dim_f32_param_5,
+	.param .u64 .ptr .align 1 termite_broadcast_in_dim_f32_param_6,
+	.param .u64 .ptr .align 1 termite_broadcast_in_dim_f32_param_7
+)
+{
+	.local .align 4 .b8 	__local_depot_broadcast[32];
+	.reg .b64 	%SPL_BCAST;
+	.reg .pred 	%p<17>;
+	.reg .b32 	%r<86>;
+	.reg .b64 	%rd<61>;
+	mov.b64 	%SPL_BCAST, __local_depot_broadcast;
+	ld.param.b64 	%rd25, [termite_broadcast_in_dim_f32_param_0];
+	ld.param.b64 	%rd26, [termite_broadcast_in_dim_f32_param_5];
+	cvta.to.global.u64 	%rd1, %rd26;
+	ld.param.b64 	%rd27, [termite_broadcast_in_dim_f32_param_1];
+	ld.param.b64 	%rd28, [termite_broadcast_in_dim_f32_param_7];
+	cvta.to.global.u64 	%rd2, %rd28;
+	ld.param.b32 	%r40, [termite_broadcast_in_dim_f32_param_2];
+	ld.param.b64 	%rd29, [termite_broadcast_in_dim_f32_param_6];
+	cvta.to.global.u64 	%rd3, %rd29;
+	cvta.to.global.u64 	%rd4, %rd27;
+	cvta.to.global.u64 	%rd5, %rd25;
+	add.u64 	%rd6, %SPL_BCAST, 0;
+	mov.u32 	%r38, %tid.x;
+	mov.u32 	%r39, %ctaid.x;
+	shl.b32 	%r41, %r39, 8;
+	add.s32 	%r1, %r41, %r38;
+	setp.ge.u32 	%p1, %r1, %r40;
+	@%p1 bra 	$L__BB_BCAST_22;
+	ld.param.b32 	%r37, [termite_broadcast_in_dim_f32_param_4];
+	ld.param.b32 	%r36, [termite_broadcast_in_dim_f32_param_3];
+	setp.lt.s32 	%p2, %r36, 1;
+	@%p2 bra 	$L__BB_BCAST_13;
+	and.b32 	%r42, %r36, 1;
+	setp.ne.b32 	%p3, %r42, 0;
+	not.pred 	%p4, %p3;
+	mov.b32 	%r73, %r36;
+	mov.b32 	%r76, %r1;
+	@%p4 bra 	$L__BB_BCAST_6;
+	add.s32 	%r73, %r36, -1;
+	cvt.u64.u32 	%rd7, %r73;
+	mul.wide.u32 	%rd31, %r73, 4;
+	add.s64 	%rd32, %rd1, %rd31;
+	ld.global.b32 	%r44, [%rd32];
+	setp.eq.b32 	%p5, %r44, 0;
+	mov.b32 	%r71, 0;
+	mov.b32 	%r76, %r71;
+	@%p5 bra 	$L__BB_BCAST_5;
+	div.u32 	%r76, %r1, %r44;
+	mul.lo.s32 	%r45, %r76, %r44;
+	sub.s32 	%r71, %r1, %r45;
+$L__BB_BCAST_5:
+	shl.b64 	%rd33, %rd7, 2;
+	add.s64 	%rd34, %rd6, %rd33;
+	st.local.b32 	[%rd34], %r71;
+$L__BB_BCAST_6:
+	setp.eq.b32 	%p6, %r36, 1;
+	@%p6 bra 	$L__BB_BCAST_13;
+	bra.uni 	$L__BB_BCAST_7;
+$L__BB_BCAST_13:
+	setp.eq.b32 	%p10, %r37, 0;
+	mov.b64 	%rd58, 0;
+	@%p10 bra 	$L__BB_BCAST_21;
+	and.b32 	%r12, %r37, 1;
+	setp.eq.b32 	%p11, %r37, 1;
+	mov.b32 	%r83, 0;
+	mov.b64 	%rd57, 0;
+	@%p11 bra 	$L__BB_BCAST_18;
+	and.b32 	%r13, %r37, -2;
+	add.s64 	%rd60, %rd2, 4;
+	add.s64 	%rd59, %rd3, 4;
+	mov.b32 	%r84, 0;
+	mov.b32 	%r83, %r84;
+$L__BB_BCAST_16:
+	ld.global.b32 	%r57, [%rd60+-4];
+	ld.global.b32 	%r58, [%rd59+-4];
+	mul.wide.u32 	%rd42, %r57, 4;
+	add.s64 	%rd43, %rd6, %rd42;
+	ld.local.b32 	%r59, [%rd43];
+	setp.eq.b32 	%p12, %r58, 1;
+	selp.b32 	%r60, 0, %r59, %p12;
+	mad.lo.s32 	%r61, %r58, %r83, %r60;
+	ld.global.b32 	%r62, [%rd60];
+	ld.global.b32 	%r63, [%rd59];
+	mul.wide.u32 	%rd44, %r62, 4;
+	add.s64 	%rd45, %rd6, %rd44;
+	ld.local.b32 	%r64, [%rd45];
+	setp.eq.b32 	%p13, %r63, 1;
+	selp.b32 	%r65, 0, %r64, %p13;
+	mad.lo.s32 	%r83, %r63, %r61, %r65;
+	add.s32 	%r84, %r84, 2;
+	add.s64 	%rd60, %rd60, 8;
+	add.s64 	%rd59, %rd59, 8;
+	setp.eq.b32 	%p14, %r13, %r84;
+	@%p14 bra 	$L__BB_BCAST_17;
+	bra.uni 	$L__BB_BCAST_16;
+$L__BB_BCAST_17:
+	cvt.u64.u32 	%rd57, %r84;
+$L__BB_BCAST_18:
+	setp.eq.b32 	%p15, %r12, 0;
+	@%p15 bra 	$L__BB_BCAST_20;
+	shl.b64 	%rd46, %rd57, 2;
+	add.s64 	%rd47, %rd2, %rd46;
+	ld.global.b32 	%r66, [%rd47];
+	add.s64 	%rd48, %rd3, %rd46;
+	ld.global.b32 	%r67, [%rd48];
+	mul.wide.u32 	%rd49, %r66, 4;
+	add.s64 	%rd50, %rd6, %rd49;
+	ld.local.b32 	%r68, [%rd50];
+	setp.eq.b32 	%p16, %r67, 1;
+	selp.b32 	%r69, 0, %r68, %p16;
+	mad.lo.s32 	%r83, %r67, %r83, %r69;
+$L__BB_BCAST_20:
+	cvt.u64.u32 	%rd58, %r83;
+$L__BB_BCAST_21:
+	shl.b64 	%rd51, %rd58, 2;
+	add.s64 	%rd52, %rd4, %rd51;
+	ld.global.b32 	%r70, [%rd52];
+	mul.wide.u32 	%rd53, %r1, 4;
+	add.s64 	%rd54, %rd5, %rd53;
+	st.global.b32 	[%rd54], %r70;
+$L__BB_BCAST_22:
+	ret;
+$L__BB_BCAST_7:
+	add.s32 	%r75, %r73, -2;
+	add.s32 	%r46, %r73, -1;
+	mul.wide.u32 	%rd35, %r46, 4;
+	add.s64 	%rd56, %rd1, %rd35;
+	add.s64 	%rd55, %rd6, %rd35;
+	bra.uni 	$L__BB_BCAST_8;
+$L__BB_BCAST_12:
+	cvt.u64.u32 	%rd14, %r75;
+	shl.b64 	%rd38, %rd14, 2;
+	add.s64 	%rd39, %rd6, %rd38;
+	st.local.b32 	[%rd39], %r79;
+	add.s32 	%r27, %r75, -2;
+	add.s32 	%r53, %r75, 1;
+	add.s64 	%rd56, %rd56, -8;
+	add.s64 	%rd55, %rd55, -8;
+	setp.gt.u32 	%p9, %r53, 1;
+	mov.b32 	%r75, %r27;
+	@%p9 bra 	$L__BB_BCAST_8;
+	bra.uni 	$L__BB_BCAST_13;
+$L__BB_BCAST_8:
+	ld.global.b32 	%r48, [%rd56];
+	setp.eq.b32 	%p7, %r48, 0;
+	mov.b32 	%r79, 0;
+	mov.b32 	%r77, %r79;
+	mov.b32 	%r78, %r79;
+	@%p7 bra 	$L__BB_BCAST_10;
+	div.u32 	%r78, %r76, %r48;
+	mul.lo.s32 	%r49, %r78, %r48;
+	sub.s32 	%r77, %r76, %r49;
+$L__BB_BCAST_10:
+	st.local.b32 	[%rd55], %r77;
+	mul.wide.u32 	%rd36, %r75, 4;
+	add.s64 	%rd37, %rd1, %rd36;
+	ld.global.b32 	%r51, [%rd37];
+	setp.eq.b32 	%p8, %r51, 0;
+	mov.b32 	%r76, %r79;
+	@%p8 bra 	$L__BB_BCAST_12;
+	div.u32 	%r76, %r78, %r51;
+	mul.lo.s32 	%r52, %r76, %r51;
+	sub.s32 	%r79, %r78, %r52;
+	bra.uni 	$L__BB_BCAST_12;
+}
+
 	// .globl	termite_embedding_lookup_f32
 .visible .entry termite_embedding_lookup_f32(
 	.param .u64 termite_embedding_lookup_f32_param_0,
@@ -3870,6 +4522,166 @@ $L__BB15_3:
 	st.global.f32 	[%rd12], %f4;
 
 $L__BB15_4:
+	ret;
+
+}
+	// .globl	termite_scatter_add_rows_f32
+.visible .entry termite_scatter_add_rows_f32(
+	.param .u64 termite_scatter_add_rows_f32_param_0,
+	.param .u64 termite_scatter_add_rows_f32_param_1,
+	.param .u64 termite_scatter_add_rows_f32_param_2,
+	.param .u32 termite_scatter_add_rows_f32_param_3,
+	.param .u32 termite_scatter_add_rows_f32_param_4,
+	.param .u32 termite_scatter_add_rows_f32_param_5
+)
+{
+	.reg .pred 	%p<3>;
+	.reg .f32 	%f<3>;
+	.reg .b32 	%r<13>;
+	.reg .b64 	%rd<13>;
+
+
+	ld.param.u64 	%rd1, [termite_scatter_add_rows_f32_param_0];
+	ld.param.u64 	%rd2, [termite_scatter_add_rows_f32_param_1];
+	ld.param.u64 	%rd3, [termite_scatter_add_rows_f32_param_2];
+	ld.param.u32 	%r4, [termite_scatter_add_rows_f32_param_3];
+	ld.param.u32 	%r6, [termite_scatter_add_rows_f32_param_4];
+	ld.param.u32 	%r5, [termite_scatter_add_rows_f32_param_5];
+	mov.u32 	%r7, %ntid.x;
+	mov.u32 	%r8, %ctaid.x;
+	mov.u32 	%r9, %tid.x;
+	mad.lo.s32 	%r1, %r8, %r7, %r9;
+	mul.lo.s32 	%r10, %r5, %r6;
+	setp.ge.u32 	%p1, %r1, %r10;
+	@%p1 bra 	$L__BB101_3;
+
+	cvta.to.global.u64 	%rd4, %rd3;
+	div.u32 	%r2, %r1, %r5;
+	mul.wide.u32 	%rd5, %r2, 4;
+	add.s64 	%rd6, %rd4, %rd5;
+	ld.global.u32 	%r3, [%rd6];
+	setp.ge.u32 	%p2, %r3, %r4;
+	@%p2 bra 	$L__BB101_3;
+
+	cvta.to.global.u64 	%rd7, %rd2;
+	mul.wide.u32 	%rd8, %r1, 4;
+	add.s64 	%rd9, %rd7, %rd8;
+	ld.global.f32 	%f1, [%rd9];
+	sub.s32 	%r11, %r3, %r2;
+	mad.lo.s32 	%r12, %r11, %r5, %r1;
+	cvta.to.global.u64 	%rd10, %rd1;
+	mul.wide.u32 	%rd11, %r12, 4;
+	add.s64 	%rd12, %rd10, %rd11;
+	atom.global.add.f32 	%f2, [%rd12], %f1;
+
+$L__BB101_3:
+	ret;
+
+}
+	// .globl	termite_transpose2d_f32
+.visible .entry termite_transpose2d_f32(
+	.param .u64 termite_transpose2d_f32_param_0,
+	.param .u64 termite_transpose2d_f32_param_1,
+	.param .u32 termite_transpose2d_f32_param_2,
+	.param .u32 termite_transpose2d_f32_param_3
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .f32 	%f<2>;
+	.reg .b32 	%r<12>;
+	.reg .b64 	%rd<10>;
+
+
+	ld.param.u64 	%rd1, [termite_transpose2d_f32_param_0];
+	ld.param.u64 	%rd2, [termite_transpose2d_f32_param_1];
+	ld.param.u32 	%r4, [termite_transpose2d_f32_param_2];
+	ld.param.u32 	%r5, [termite_transpose2d_f32_param_3];
+	mov.u32 	%r6, %ntid.x;
+	mov.u32 	%r7, %ctaid.x;
+	mov.u32 	%r8, %tid.x;
+	mad.lo.s32 	%r1, %r7, %r6, %r8;
+	mul.lo.s32 	%r9, %r4, %r5;
+	setp.ge.u32 	%p1, %r1, %r9;
+	@%p1 bra 	$L__BB102_2;
+
+	div.u32 	%r2, %r1, %r5;
+	mad.lo.s32 	%r10, %r2, %r5, 0;
+	sub.s32 	%r3, %r1, %r10;
+	mad.lo.s32 	%r11, %r3, %r4, %r2;
+	cvta.to.global.u64 	%rd3, %rd2;
+	mul.wide.u32 	%rd4, %r1, 4;
+	add.s64 	%rd5, %rd3, %rd4;
+	ld.global.f32 	%f1, [%rd5];
+	cvta.to.global.u64 	%rd6, %rd1;
+	mul.wide.u32 	%rd7, %r11, 4;
+	add.s64 	%rd8, %rd6, %rd7;
+	st.global.f32 	[%rd8], %f1;
+
+$L__BB102_2:
+	ret;
+
+}
+	// .globl	termite_argmax_lastdim_f32
+.visible .entry termite_argmax_lastdim_f32(
+	.param .u64 termite_argmax_lastdim_f32_param_0,
+	.param .u64 termite_argmax_lastdim_f32_param_1,
+	.param .u32 termite_argmax_lastdim_f32_param_2,
+	.param .u32 termite_argmax_lastdim_f32_param_3
+)
+{
+	.reg .pred 	%p<5>;
+	.reg .f32 	%f<4>;
+	.reg .b32 	%r<13>;
+	.reg .b64 	%rd<12>;
+
+
+	ld.param.u64 	%rd1, [termite_argmax_lastdim_f32_param_0];
+	ld.param.u64 	%rd2, [termite_argmax_lastdim_f32_param_1];
+	ld.param.u32 	%r4, [termite_argmax_lastdim_f32_param_2];
+	ld.param.u32 	%r5, [termite_argmax_lastdim_f32_param_3];
+	mov.u32 	%r6, %ntid.x;
+	mov.u32 	%r7, %ctaid.x;
+	mov.u32 	%r8, %tid.x;
+	mad.lo.s32 	%r1, %r7, %r6, %r8;
+	setp.ge.u32 	%p1, %r1, %r4;
+	@%p1 bra 	$L__BB103_6;
+	setp.eq.u32 	%p2, %r5, 0;
+	@%p2 bra 	$L__BB103_6;
+
+	cvta.to.global.u64 	%rd3, %rd2;
+	mul.lo.s32 	%r9, %r1, %r5;
+	mul.wide.u32 	%rd4, %r9, 4;
+	add.s64 	%rd5, %rd3, %rd4;
+	ld.global.f32 	%f1, [%rd5];
+	mov.u32 	%r2, 1;
+	mov.u32 	%r3, 0;
+
+$L__BB103_2:
+	setp.ge.u32 	%p3, %r2, %r5;
+	@%p3 bra 	$L__BB103_5;
+	mul.wide.u32 	%rd6, %r2, 4;
+	add.s64 	%rd7, %rd5, %rd6;
+	ld.global.f32 	%f2, [%rd7];
+	setp.gt.f32 	%p4, %f2, %f1;
+	@%p4 bra 	$L__BB103_4;
+	bra 	$L__BB103_3;
+
+$L__BB103_4:
+	mov.f32 	%f1, %f2;
+	mov.u32 	%r3, %r2;
+
+$L__BB103_3:
+	add.s32 	%r2, %r2, 1;
+	bra 	$L__BB103_2;
+
+$L__BB103_5:
+	cvt.rn.f32.u32 	%f3, %r3;
+	cvta.to.global.u64 	%rd8, %rd1;
+	mul.wide.u32 	%rd9, %r1, 4;
+	add.s64 	%rd10, %rd8, %rd9;
+	st.global.f32 	[%rd10], %f3;
+
+$L__BB103_6:
 	ret;
 
 }

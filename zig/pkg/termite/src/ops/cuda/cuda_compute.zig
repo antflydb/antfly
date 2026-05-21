@@ -22,6 +22,7 @@ const scratch_mod = @import("scratch.zig");
 const weight_source_mod = @import("../../models/weight_source.zig");
 const gguf_tensor_types = @import("../../gguf/tensor_types.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
+const native_compute = @import("../native_compute.zig");
 const platform = @import("antfly_platform");
 
 const CT = ops.CT;
@@ -45,6 +46,7 @@ pub const CudaCompute = struct {
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
     owned_by_backend: bool = false,
+    allow_host_training_fallbacks: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) !CudaCompute {
         var ctx = try context_mod.CudaContext.initDefault();
@@ -54,6 +56,7 @@ pub const CudaCompute = struct {
             .allocator = allocator,
             .ctx = ctx,
             .kernels = kernels,
+            .allow_host_training_fallbacks = cudaHostTrainingFallbacksAllowed(),
         };
     }
 
@@ -88,6 +91,7 @@ pub const CudaCompute = struct {
 
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
         if (loaded.quantized_storage) |storage| {
+            errdefer self.allocator.free(owned_key);
             if (cudaDequantizeQuantWeightsOnUpload()) {
                 const elem_count = try elementCountFromShape(storage.shape);
                 const data = try self.allocator.alloc(f32, elem_count);
@@ -100,7 +104,6 @@ pub const CudaCompute = struct {
                 errdefer device.free(&self.ctx);
                 try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
                 try self.ctx.synchronize();
-                errdefer self.allocator.free(owned_key);
                 try self.resident_weights.put(self.allocator, owned_key, .{
                     .buffer = device,
                     .dtype = .f32,
@@ -120,7 +123,6 @@ pub const CudaCompute = struct {
             errdefer device.free(&self.ctx);
             try device.copyFromHost(&self.ctx, storage.raw_bytes);
             try self.ctx.synchronize();
-            errdefer self.allocator.free(owned_key);
             try self.resident_weights.put(self.allocator, owned_key, .{
                 .buffer = device,
                 .dtype = .u8,
@@ -133,11 +135,15 @@ pub const CudaCompute = struct {
             });
             return;
         }
-        if (loaded.quantized or loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
+        if (loaded.quantized or loaded.tensor.dtype != .f32) {
+            self.allocator.free(owned_key);
+            return error.UnsupportedTensorType;
+        }
         try self.insertWeightFromTensor(owned_key, &loaded.tensor);
     }
 
     pub fn insertWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        errdefer self.allocator.free(owned_key);
         if (tensor.dtype != .f32) return error.UnsupportedTensorType;
         const data = tensor.asFloat32();
         const shape = try self.allocator.dupe(i64, tensor.shape);
@@ -146,7 +152,6 @@ pub const CudaCompute = struct {
         errdefer device.free(&self.ctx);
         try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
         try self.ctx.synchronize();
-        errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
             .dtype = .f32,
@@ -162,6 +167,10 @@ pub const CudaCompute = struct {
 
 fn cudaDequantizeQuantWeightsOnUpload() bool {
     return platform.env.getenvBoolDefault("TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS", false);
+}
+
+fn cudaHostTrainingFallbacksAllowed() bool {
+    return platform.env.getenvBoolDefault("TERMITE_CUDA_ALLOW_HOST_TRAINING_FALLBACKS", true);
 }
 
 fn tensorFromCt(tensor: CT) *CudaTensor {
@@ -333,6 +342,668 @@ fn downloadAlloc(self: *CudaCompute, tensor: *const CudaTensor) ![]f32 {
     return out;
 }
 
+fn broadcastShape2(allocator: std.mem.Allocator, a: []const i64, b: []const i64) !?[]i64 {
+    const rank = @max(a.len, b.len);
+    if (rank > 8) return error.InvalidShape;
+    const out = try allocator.alloc(i64, rank);
+    errdefer allocator.free(out);
+    for (0..rank) |i| {
+        const a_dim: i64 = if (i + a.len >= rank) a[i + a.len - rank] else 1;
+        const b_dim: i64 = if (i + b.len >= rank) b[i + b.len - rank] else 1;
+        if (a_dim <= 0 or b_dim <= 0) return error.InvalidShape;
+        if (a_dim != b_dim and a_dim != 1 and b_dim != 1) {
+            allocator.free(out);
+            return null;
+        }
+        out[i] = @max(a_dim, b_dim);
+    }
+    return out;
+}
+
+fn broadcastShape3(allocator: std.mem.Allocator, a: []const i64, b: []const i64, c: []const i64) !?[]i64 {
+    const ab = try broadcastShape2(allocator, a, b) orelse return null;
+    defer allocator.free(ab);
+    return broadcastShape2(allocator, ab, c);
+}
+
+fn u32FromShape(allocator: std.mem.Allocator, shape: []const i64) ![]u32 {
+    const out = try allocator.alloc(u32, shape.len);
+    errdefer allocator.free(out);
+    for (shape, 0..) |dim, i| {
+        if (dim < 0 or dim > std.math.maxInt(u32)) return error.InvalidShape;
+        out[i] = @intCast(dim);
+    }
+    return out;
+}
+
+fn u32FromAxes(allocator: std.mem.Allocator, axes: []const u8) ![]u32 {
+    const out = try allocator.alloc(u32, axes.len);
+    errdefer allocator.free(out);
+    for (axes, 0..) |axis, i| out[i] = axis;
+    return out;
+}
+
+fn broadcastAxesForSuffix(allocator: std.mem.Allocator, input_shape: []const i64, target_shape: []const i64) ![]u32 {
+    if (input_shape.len > target_shape.len) return error.InvalidShape;
+    const axes = try allocator.alloc(u32, input_shape.len);
+    errdefer allocator.free(axes);
+    const offset = target_shape.len - input_shape.len;
+    for (input_shape, 0..) |dim, i| {
+        const target_dim = target_shape[offset + i];
+        if (dim != target_dim and dim != 1) return error.InvalidShape;
+        axes[i] = @intCast(offset + i);
+    }
+    return axes;
+}
+
+fn resolveBroadcastInputShape(allocator: std.mem.Allocator, tensor_shape: []const i64, declared_shape: []const i64, elem_count: usize) ![]i64 {
+    const source_shape = if (declared_shape.len > 0) declared_shape else tensor_shape;
+    if (source_shape.len > 8) return error.InvalidShape;
+    const out = try allocator.alloc(i64, source_shape.len);
+    errdefer allocator.free(out);
+    for (source_shape, 0..) |dim, i| {
+        if (dim > 0) {
+            out[i] = dim;
+        } else if (i < tensor_shape.len and tensor_shape[i] > 0) {
+            out[i] = tensor_shape[i];
+        } else {
+            out[i] = 1;
+        }
+    }
+    if (try elementCountFromShape(out) != elem_count) return error.InvalidShape;
+    return out;
+}
+
+fn resolveBroadcastTargetShape(allocator: std.mem.Allocator, target_shape: []const i64, broadcast_axes: []const u32, input_shape: []const i64) ![]i64 {
+    if (target_shape.len > 8) return error.InvalidShape;
+    const out = try allocator.alloc(i64, target_shape.len);
+    errdefer allocator.free(out);
+    for (target_shape, 0..) |raw_dim, d| {
+        var dim = raw_dim;
+        if (dim <= 0) {
+            for (broadcast_axes, 0..) |axis, in_d| {
+                if (axis == @as(u32, @intCast(d))) {
+                    dim = input_shape[in_d];
+                    break;
+                }
+            }
+        }
+        if (dim <= 0) dim = 1;
+        out[d] = dim;
+    }
+    return out;
+}
+
+fn cudaBroadcastMappingSupported(input_shape: []const i64, target_shape: []const i64, broadcast_axes: []const u32) bool {
+    if (input_shape.len > 8 or target_shape.len > 8 or broadcast_axes.len != input_shape.len) return false;
+    var seen = [_]bool{false} ** 8;
+    for (broadcast_axes, 0..) |axis, in_d| {
+        if (axis >= target_shape.len) return false;
+        const axis_usize: usize = @intCast(axis);
+        if (seen[axis_usize]) return false;
+        seen[axis_usize] = true;
+        const input_dim = input_shape[in_d];
+        const target_dim = target_shape[axis_usize];
+        if (input_dim <= 0 or target_dim < 0) return false;
+        if (input_dim != 1 and input_dim != target_dim) return false;
+    }
+    return true;
+}
+
+fn broadcastMappingIsIdentity(input_shape: []const i64, target_shape: []const i64, broadcast_axes: []const u32) bool {
+    if (!sameShape(input_shape, target_shape) or input_shape.len != broadcast_axes.len) return false;
+    for (broadcast_axes, 0..) |axis, i| {
+        if (axis != @as(u32, @intCast(i))) return false;
+    }
+    return true;
+}
+
+fn broadcastToShapeDeviceMapped(ctx: *anyopaque, input: CT, target_shape_raw: []const i64, input_shape_raw: []const i64, broadcast_axes: []const u32) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    const input_shape = try resolveBroadcastInputShape(self.allocator, input_tensor.shape, input_shape_raw, input_tensor.elem_count);
+    defer self.allocator.free(input_shape);
+    const target_shape = try resolveBroadcastTargetShape(self.allocator, target_shape_raw, broadcast_axes, input_shape);
+    defer self.allocator.free(target_shape);
+    if (!cudaBroadcastMappingSupported(input_shape, target_shape, broadcast_axes)) return error.UnsupportedShape;
+    const out_count = try elementCountFromShape(target_shape);
+    const shape = try dupeShape(self.allocator, target_shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    if (broadcastMappingIsIdentity(input_shape, target_shape, broadcast_axes)) {
+        try device.copyFromDevice(&self.ctx, input_tensor.buffer, input_tensor.elem_count * @sizeOf(f32));
+        return createTensor(self, device, shape, out_count);
+    }
+
+    const target_u32 = try u32FromShape(self.allocator, target_shape);
+    defer self.allocator.free(target_u32);
+    const input_u32 = try u32FromShape(self.allocator, input_shape);
+    defer self.allocator.free(input_u32);
+
+    const target_device = try uploadTempU32(self, target_u32);
+    const input_device = try uploadTempU32(self, input_u32);
+    const axes_device = try uploadTempU32(self, broadcast_axes);
+    try self.kernels.launchBroadcastInDimF32(
+        &self.ctx,
+        device,
+        input_tensor.buffer,
+        out_count,
+        input_tensor.elem_count,
+        target_shape.len,
+        input_tensor.shape.len,
+        target_device,
+        input_device,
+        axes_device,
+    );
+    return createTensor(self, device, shape, out_count);
+}
+
+fn broadcastToShapeDevice(ctx: *anyopaque, input: CT, target_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const axes_u32 = try broadcastAxesForSuffix(self.allocator, input_tensor.shape, target_shape);
+    defer self.allocator.free(axes_u32);
+    return broadcastToShapeDeviceMapped(ctx, input, target_shape, input_tensor.shape, axes_u32);
+}
+
+fn nativeArgMaxFallback(ctx: *anyopaque, input: CT, axis: u8, keepdims: bool, input_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "argmax");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primArgMax(ni, axis, keepdims, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn nativeReshapeFallback(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "reshape");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primReshape(ni, new_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, new_shape);
+}
+
+fn nativeTransposeFallback(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "transpose");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primTranspose(ni, perm, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn nativeBroadcastInDimFallback(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "broadcast_in_dim");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primBroadcastInDim(ni, target_shape, broadcast_axes, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, target_shape);
+}
+
+fn nativeDotGeneralFallback(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "dot_general");
+    defer fallback.deinit();
+
+    const nl = try nativeCtFromCuda(self, &fallback, lhs);
+    defer fallback.cb.free(nl);
+    const nr = try nativeCtFromCuda(self, &fallback, rhs);
+    defer fallback.cb.free(nr);
+    const out = try fallback.cb.primDotGeneral(nl, nr, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, tensorFromCt(lhs).shape);
+}
+
+const Linear2DPlan = struct {
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+};
+
+fn planDotGeneral2DLinear(lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) !?Linear2DPlan {
+    if (lhs_batch.len != 0 or rhs_batch.len != 0) return null;
+    if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+    if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
+    if (lhs_contracting[0] != 1 or rhs_contracting[0] != 1) return null;
+    if (lhs_shape[0] < 0 or lhs_shape[1] < 0 or rhs_shape[0] < 0 or rhs_shape[1] < 0) return error.InvalidShape;
+    if (lhs_shape[1] != rhs_shape[1]) return error.InvalidShape;
+    return .{
+        .rows = @intCast(lhs_shape[0]),
+        .in_dim = @intCast(lhs_shape[1]),
+        .out_dim = @intCast(rhs_shape[0]),
+    };
+}
+
+fn dotGeneral2DDevice(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!?CT {
+    const plan = try planDotGeneral2DLinear(lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) orelse return null;
+    return try linearNoBias(ctx, lhs, rhs, plan.rows, plan.in_dim, plan.out_dim);
+}
+
+fn nativeScatterAddFallback(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "scatter_add");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const nidx = try nativeCtFromCuda(self, &fallback, indices);
+    defer fallback.cb.free(nidx);
+    const out = try fallback.cb.primScatterAdd(ni, nidx, input_shape, indices_shape, axis);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn nativeGatherFallback(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "gather");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const nidx = try nativeCtFromCuda(self, &fallback, indices);
+    defer fallback.cb.free(nidx);
+    const out = try fallback.cb.primGather(ni, nidx, axis, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn nativeSliceFallback(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "slice");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primSlice(ni, starts, limits, strides, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn nativeConcatPrimFallback(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "concat_prim");
+    defer fallback.deinit();
+
+    const na = try nativeCtFromCuda(self, &fallback, a);
+    defer fallback.cb.free(na);
+    const nb = try nativeCtFromCuda(self, &fallback, b);
+    defer fallback.cb.free(nb);
+    const out = try fallback.cb.primConcatPrim(na, nb, axis, a_shape, b_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, a_shape);
+}
+
+fn nativeSoftmaxFallback(ctx: *anyopaque, input: CT, dim: u32, comptime log_softmax: bool) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, if (log_softmax) "log_softmax" else "softmax");
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = if (log_softmax) try fallback.cb.primLogSoftmax(ni, dim) else try fallback.cb.primSoftmax(ni, dim);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, tensorFromCt(input).shape);
+}
+
+fn resolveSoftmaxLastDimCuda(tensor: *const CudaTensor, dim: u32) ?usize {
+    if (dim != 0) return @intCast(dim);
+    if (tensor.shape.len > 0) {
+        const raw_last = tensor.shape[tensor.shape.len - 1];
+        if (raw_last > 0) return @intCast(raw_last);
+        if (raw_last == -1) {
+            var known_product: usize = 1;
+            var infer_count: usize = 0;
+            for (tensor.shape) |shape_dim| {
+                if (shape_dim == -1) {
+                    infer_count += 1;
+                    continue;
+                }
+                if (shape_dim <= 0) return null;
+                known_product = std.math.mul(usize, known_product, @intCast(shape_dim)) catch return null;
+            }
+            if (infer_count == 1 and known_product > 0 and tensor.elem_count % known_product == 0) {
+                return tensor.elem_count / known_product;
+            }
+        }
+    }
+    if (tensor.elem_count > 0) return tensor.elem_count;
+    return null;
+}
+
+fn deviceCopyWithShape(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    const elem_count = try elementCountFromShape(new_shape);
+    if (elem_count != input_tensor.elem_count) return error.InvalidShape;
+
+    const shape = try dupeShape(self.allocator, new_shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try device.copyFromDevice(&self.ctx, input_tensor.buffer, input_tensor.elem_count * @sizeOf(f32));
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn reshapeDeviceCopy(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
+    return deviceCopyWithShape(ctx, input, new_shape);
+}
+
+fn isIdentityBroadcast(target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) bool {
+    if (target_shape.len != input_shape.len or broadcast_axes.len != input_shape.len) return false;
+    for (input_shape, 0..) |dim, idx| {
+        if (dim < 0 or target_shape[idx] < 0) return false;
+        if (broadcast_axes[idx] != idx or target_shape[idx] != dim) return false;
+    }
+    return true;
+}
+
+const max_cuda_broadcast_rank = 8;
+
+const BroadcastInDimPlan = struct {
+    target_rank: usize,
+    input_rank: usize,
+    out_count: usize,
+    input_count: usize,
+    target_shape: [max_cuda_broadcast_rank]u32,
+    input_shape: [max_cuda_broadcast_rank]u32,
+    axes: [max_cuda_broadcast_rank]u32,
+};
+
+fn broadcastDimToU32(dim: i64) !u32 {
+    if (dim < 0 or dim > std.math.maxInt(u32)) return error.InvalidShape;
+    return @intCast(dim);
+}
+
+fn planBroadcastInDim(
+    target_shape: []const i64,
+    broadcast_axes: []const u8,
+    input_shape: []const i64,
+    input_elem_count: usize,
+) !?BroadcastInDimPlan {
+    if (target_shape.len > max_cuda_broadcast_rank or input_shape.len > max_cuda_broadcast_rank) return null;
+    if (broadcast_axes.len != input_shape.len) return error.InvalidShape;
+
+    var plan = BroadcastInDimPlan{
+        .target_rank = target_shape.len,
+        .input_rank = input_shape.len,
+        .out_count = 1,
+        .input_count = 1,
+        .target_shape = [_]u32{0} ** max_cuda_broadcast_rank,
+        .input_shape = [_]u32{0} ** max_cuda_broadcast_rank,
+        .axes = [_]u32{0} ** max_cuda_broadcast_rank,
+    };
+
+    for (target_shape, 0..) |dim, idx| {
+        plan.target_shape[idx] = try broadcastDimToU32(dim);
+        plan.out_count = try checkedMul(plan.out_count, @intCast(plan.target_shape[idx]));
+    }
+    if (plan.out_count > std.math.maxInt(u32)) return null;
+
+    for (input_shape, 0..) |dim, idx| {
+        plan.input_shape[idx] = try broadcastDimToU32(dim);
+        plan.input_count = try checkedMul(plan.input_count, @intCast(plan.input_shape[idx]));
+    }
+    if (plan.input_count != input_elem_count) return error.InvalidShape;
+
+    var seen = [_]bool{false} ** max_cuda_broadcast_rank;
+    for (broadcast_axes, 0..) |axis_u8, idx| {
+        const axis: usize = axis_u8;
+        if (axis >= target_shape.len or seen[axis]) return error.InvalidShape;
+        seen[axis] = true;
+        plan.axes[idx] = axis_u8;
+        const input_dim = plan.input_shape[idx];
+        const target_dim = plan.target_shape[axis];
+        if (input_dim != 1 and input_dim != target_dim) return error.InvalidShape;
+    }
+
+    return plan;
+}
+
+fn metadataBufferSlice(buffer: buffer_mod.DeviceBuffer, offset_u32: usize, count_u32: usize) buffer_mod.DeviceBuffer {
+    if (count_u32 == 0) return .{};
+    return .{
+        .ptr = buffer.ptr + @as(u64, @intCast(offset_u32 * @sizeOf(u32))),
+        .len = count_u32 * @sizeOf(u32),
+    };
+}
+
+fn launchBroadcastInDimPlan(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    input_tensor: *const CudaTensor,
+    plan: *const BroadcastInDimPlan,
+) !void {
+    var metadata = [_]u32{0} ** (max_cuda_broadcast_rank * 3);
+    var metadata_len: usize = 0;
+    for (plan.target_shape[0..plan.target_rank]) |value| {
+        metadata[metadata_len] = value;
+        metadata_len += 1;
+    }
+    for (plan.input_shape[0..plan.input_rank]) |value| {
+        metadata[metadata_len] = value;
+        metadata_len += 1;
+    }
+    for (plan.axes[0..plan.input_rank]) |value| {
+        metadata[metadata_len] = value;
+        metadata_len += 1;
+    }
+    const metadata_device = try uploadTempU32(self, metadata[0..metadata_len]);
+    const target_device = metadataBufferSlice(metadata_device, 0, plan.target_rank);
+    const input_shape_device = metadataBufferSlice(metadata_device, plan.target_rank, plan.input_rank);
+    const axes_device = metadataBufferSlice(metadata_device, plan.target_rank + plan.input_rank, plan.input_rank);
+    try self.kernels.launchBroadcastInDimF32(
+        &self.ctx,
+        dst,
+        input_tensor.buffer,
+        plan.out_count,
+        plan.input_count,
+        plan.target_rank,
+        plan.input_rank,
+        target_device,
+        input_shape_device,
+        axes_device,
+    );
+}
+
+fn broadcastInDimDeviceSupported(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    const plan = try planBroadcastInDim(target_shape, broadcast_axes, input_shape, input_tensor.elem_count) orelse return null;
+
+    const shape = try dupeShape(self.allocator, target_shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, plan.out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try launchBroadcastInDimPlan(self, device, input_tensor, &plan);
+    return createTensor(self, device, shape, plan.out_count);
+}
+
+fn broadcastScalarToBuffer(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    scalar_tensor: *const CudaTensor,
+    target_shape: []const i64,
+    out_count: usize,
+) !bool {
+    if (scalar_tensor.elem_count != 1) return false;
+    const plan = try planBroadcastInDim(target_shape, &[_]u8{}, &[_]i64{}, scalar_tensor.elem_count) orelse return false;
+    if (plan.out_count != out_count) return error.InvalidShape;
+    try launchBroadcastInDimPlan(self, dst, scalar_tensor, &plan);
+    return true;
+}
+
+const BroadcastShapePlan = struct {
+    rank: usize,
+    count: usize,
+    shape: [max_cuda_broadcast_rank]i64,
+};
+
+fn planBroadcastShape3(
+    a_shape: []const i64,
+    b_shape: []const i64,
+    c_shape: []const i64,
+    a_count: usize,
+    b_count: usize,
+    c_count: usize,
+) !?BroadcastShapePlan {
+    const rank = @max(a_shape.len, @max(b_shape.len, c_shape.len));
+    if (rank > max_cuda_broadcast_rank) return null;
+    if ((try elementCountFromShape(a_shape)) != a_count) return error.InvalidShape;
+    if ((try elementCountFromShape(b_shape)) != b_count) return error.InvalidShape;
+    if ((try elementCountFromShape(c_shape)) != c_count) return error.InvalidShape;
+
+    var plan = BroadcastShapePlan{
+        .rank = rank,
+        .count = 1,
+        .shape = [_]i64{0} ** max_cuda_broadcast_rank,
+    };
+    for (0..rank) |axis| {
+        const dims = [_]i64{
+            broadcastDimFromRight(a_shape, rank, axis),
+            broadcastDimFromRight(b_shape, rank, axis),
+            broadcastDimFromRight(c_shape, rank, axis),
+        };
+        var out_dim: i64 = 1;
+        for (dims) |dim| {
+            if (dim < 0) return null;
+            if (dim == 1) continue;
+            if (out_dim == 1) {
+                out_dim = dim;
+            } else if (out_dim != dim) {
+                return null;
+            }
+        }
+        plan.shape[axis] = out_dim;
+        plan.count = try checkedMul(plan.count, @intCast(out_dim));
+    }
+    if (plan.count > std.math.maxInt(u32)) return null;
+    return plan;
+}
+
+fn broadcastDimFromRight(shape: []const i64, out_rank: usize, out_axis: usize) i64 {
+    const leading = out_rank - shape.len;
+    if (out_axis < leading) return 1;
+    return shape[out_axis - leading];
+}
+
+fn suffixBroadcastAxes(input_rank: usize, out_rank: usize, axes: *[max_cuda_broadcast_rank]u8) []const u8 {
+    const leading = out_rank - input_rank;
+    for (0..input_rank) |idx| axes[idx] = @intCast(leading + idx);
+    return axes[0..input_rank];
+}
+
+fn materializeBroadcastOperand(
+    self: *CudaCompute,
+    tensor: *const CudaTensor,
+    out_shape: []const i64,
+    out_count: usize,
+    temp: *buffer_mod.DeviceBuffer,
+) !?buffer_mod.DeviceBuffer {
+    if (tensor.elem_count == out_count and sameShape(tensor.shape, out_shape)) return tensor.buffer;
+    var axes_buf: [max_cuda_broadcast_rank]u8 = undefined;
+    const axes = suffixBroadcastAxes(tensor.shape.len, out_shape.len, &axes_buf);
+    const plan = try planBroadcastInDim(out_shape, axes, tensor.shape, tensor.elem_count) orelse return null;
+    if (plan.out_count != out_count) return error.InvalidShape;
+    temp.* = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    try launchBroadcastInDimPlan(self, temp.*, tensor, &plan);
+    return temp.*;
+}
+
+const ConcatLastDimPlan = struct {
+    rows: usize,
+    dim_a: usize,
+    dim_b: usize,
+    out_dim: usize,
+    out_count: usize,
+};
+
+fn planConcatLastDim(a_shape: []const i64, b_shape: []const i64, axis: u8) !?ConcatLastDimPlan {
+    if (a_shape.len == 0 or a_shape.len != b_shape.len) return null;
+    const axis_index: usize = @intCast(axis);
+    if (axis_index + 1 != a_shape.len) return null;
+
+    var rows: usize = 1;
+    for (a_shape[0..axis_index], 0..) |dim, idx| {
+        if (dim < 0 or b_shape[idx] < 0) return error.InvalidShape;
+        if (dim != b_shape[idx]) return error.InvalidShape;
+        rows = try checkedMul(rows, @intCast(dim));
+    }
+    if (a_shape[axis_index] < 0 or b_shape[axis_index] < 0) return error.InvalidShape;
+    const dim_a: usize = @intCast(a_shape[axis_index]);
+    const dim_b: usize = @intCast(b_shape[axis_index]);
+    const out_dim = try checkedAdd(dim_a, dim_b);
+    return .{
+        .rows = rows,
+        .dim_a = dim_a,
+        .dim_b = dim_b,
+        .out_dim = out_dim,
+        .out_count = try checkedMul(rows, out_dim),
+    };
+}
+
+fn concatLastDimDevice(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!?CT {
+    const plan = try planConcatLastDim(a_shape, b_shape, axis) orelse return null;
+    const axis_index: usize = @intCast(axis);
+
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a_tensor = tensorFromCt(a);
+    const b_tensor = tensorFromCt(b);
+    try ensureF32(a_tensor);
+    try ensureF32(b_tensor);
+    try ensureCount(a_tensor, try checkedMul(plan.rows, plan.dim_a));
+    try ensureCount(b_tensor, try checkedMul(plan.rows, plan.dim_b));
+
+    const shape = try dupeShape(self.allocator, a_shape);
+    errdefer self.allocator.free(shape);
+    shape[axis_index] = @intCast(plan.out_dim);
+    var device = try allocDeviceBuffer(self, plan.out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchConcatLastDimF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, plan.rows, plan.dim_a, plan.dim_b);
+    return try createTensor(self, device, shape, plan.out_count);
+}
+
+fn toFloat32BatchOp(ctx: *anyopaque, cts: []const CT, allocator: std.mem.Allocator) anyerror![][]f32 {
+    const out = try allocator.alloc([]f32, cts.len);
+    errdefer allocator.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |buf| allocator.free(buf);
+    }
+    for (cts, 0..) |ct, idx| {
+        out[idx] = try toFloat32Op(ctx, ct, allocator);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn allocShape2(allocator: std.mem.Allocator, rows: usize, cols: usize) ![]i64 {
     const shape = try allocator.alloc(i64, 2);
     shape[0] = @intCast(rows);
@@ -388,6 +1059,150 @@ fn elementCountFromShape(shape: []const i64) !usize {
 
 fn sameShape(a: []const i64, b: []const i64) bool {
     return std.mem.eql(i64, a, b);
+}
+
+const NativeUnaryOp = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh_prim, erf, abs };
+const NativeBinaryOp = enum { add, multiply, subtract, divide, less_than };
+
+const NativeFallback = struct {
+    compute: *CudaCompute,
+    ws: native_compute.WeightStore = undefined,
+    engine: native_compute.NativeCompute = undefined,
+    cb: ops.ComputeBackend = undefined,
+
+    fn init(self: *NativeFallback, compute: *CudaCompute, op_name: []const u8) !void {
+        if (!compute.allow_host_training_fallbacks) {
+            if (op_name.len > 0) {
+                std.debug.print("error: CUDA host training fallback disabled for {s}\n", .{op_name});
+            }
+            return error.CudaHostTrainingFallbackDisabled;
+        }
+        self.compute = compute;
+        self.ws = .{
+            .allocator = compute.allocator,
+            .resident_weights = .{},
+            .lazy_weights = .{},
+        };
+        self.engine = native_compute.NativeCompute.init(compute.allocator, &self.ws, null);
+        self.cb = self.engine.computeBackend();
+    }
+
+    fn deinit(self: *NativeFallback) void {
+        native_compute.deinitPrefetchQueue(&self.ws);
+        self.ws.resident_weights.deinit(self.compute.allocator);
+        self.ws.lazy_weights.deinit(self.compute.allocator);
+    }
+};
+
+fn shapeI32FromI64(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
+    const out = try allocator.alloc(i32, shape.len);
+    errdefer allocator.free(out);
+    for (shape, 0..) |dim, i| {
+        if (dim < 0 or dim > std.math.maxInt(i32)) return error.InvalidShape;
+        out[i] = @intCast(dim);
+    }
+    return out;
+}
+
+fn nativeCtFromCuda(self: *CudaCompute, fallback: *NativeFallback, input: CT) !CT {
+    const tensor = tensorFromCt(input);
+    const data = try downloadAlloc(self, tensor);
+    defer self.allocator.free(data);
+    const shape_i32 = try shapeI32FromI64(self.allocator, tensor.shape);
+    defer self.allocator.free(shape_i32);
+    return fallback.cb.fromFloat32Shape(data, shape_i32);
+}
+
+fn cudaCtFromNative(self: *CudaCompute, fallback: *NativeFallback, input: CT, fallback_shape: []const i64) !CT {
+    const shape = fallback.cb.tensorShape(input, self.allocator) catch try self.allocator.dupe(i64, fallback_shape);
+    defer self.allocator.free(shape);
+    const data = try fallback.cb.toFloat32(input, self.allocator);
+    return uploadOwnedHost(self, data, shape);
+}
+
+fn nativeUnaryFallback(ctx: *anyopaque, a: CT, op: NativeUnaryOp) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, @tagName(op));
+    defer fallback.deinit();
+
+    const na = try nativeCtFromCuda(self, &fallback, a);
+    defer fallback.cb.free(na);
+    const out = switch (op) {
+        .negate => try fallback.cb.primNegate(na),
+        .sqrt => try fallback.cb.primSqrt(na),
+        .rsqrt => try fallback.cb.primRsqrt(na),
+        .exp => try fallback.cb.primExp(na),
+        .log => try fallback.cb.primLog(na),
+        .sin => try fallback.cb.primSin(na),
+        .cos => try fallback.cb.primCos(na),
+        .tanh_prim => try fallback.cb.primTanh(na),
+        .erf => try fallback.cb.primErf(na),
+        .abs => try fallback.cb.primAbs(na),
+    };
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, tensorFromCt(a).shape);
+}
+
+fn nativeBinaryFallback(ctx: *anyopaque, a: CT, b: CT, op: NativeBinaryOp) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, @tagName(op));
+    defer fallback.deinit();
+
+    const na = try nativeCtFromCuda(self, &fallback, a);
+    defer fallback.cb.free(na);
+    const nb = try nativeCtFromCuda(self, &fallback, b);
+    defer fallback.cb.free(nb);
+    const out = switch (op) {
+        .add => try fallback.cb.add(na, nb),
+        .multiply => try fallback.cb.multiply(na, nb),
+        .subtract => try fallback.cb.primSubtract(na, nb),
+        .divide => try fallback.cb.primDivide(na, nb),
+        .less_than => try fallback.cb.primLessThan(na, nb),
+    };
+    defer fallback.cb.free(out);
+    const out_shape = fallback.cb.tensorShape(out, self.allocator) catch tensorFromCt(a).shape;
+    const out_shape_owned = out_shape.ptr != tensorFromCt(a).shape.ptr;
+    defer if (out_shape_owned) self.allocator.free(out_shape);
+    return cudaCtFromNative(self, &fallback, out, out_shape);
+}
+
+fn nativeWhereSelectFallback(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "where_select");
+    defer fallback.deinit();
+
+    const nc = try nativeCtFromCuda(self, &fallback, cond);
+    defer fallback.cb.free(nc);
+    const nt = try nativeCtFromCuda(self, &fallback, on_true);
+    defer fallback.cb.free(nt);
+    const nf = try nativeCtFromCuda(self, &fallback, on_false);
+    defer fallback.cb.free(nf);
+    const out = try fallback.cb.primWhereSelect(nc, nt, nf);
+    defer fallback.cb.free(out);
+    const out_shape = fallback.cb.tensorShape(out, self.allocator) catch tensorFromCt(on_true).shape;
+    const out_shape_owned = out_shape.ptr != tensorFromCt(on_true).shape.ptr;
+    defer if (out_shape_owned) self.allocator.free(out_shape);
+    return cudaCtFromNative(self, &fallback, out, out_shape);
+}
+
+fn nativeReduceFallback(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64, comptime mode: enum { sum, max, mean }) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "reduce_" ++ @tagName(mode));
+    defer fallback.deinit();
+
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = switch (mode) {
+        .sum => try fallback.cb.primReduceSum(ni, axes, input_shape),
+        .max => try fallback.cb.primReduceMax(ni, axes, input_shape),
+        .mean => try fallback.cb.primReduceMean(ni, axes, input_shape),
+    };
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
 }
 
 fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
@@ -686,8 +1501,9 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     return try createTensor(self, device, shape, out_count);
 }
 
-fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+fn linearNoBiasWithShape(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, shape: []i64) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    errdefer self.allocator.free(shape);
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
     try ensureF32(input_tensor);
@@ -696,8 +1512,6 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     try ensureCount(weight_tensor, try checkedMul(out_dim, in_dim));
 
     const out_count = try checkedMul(rows, out_dim);
-    const shape = try allocShape2(self.allocator, rows, out_dim);
-    errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     if (weight_tensor.quant_type) |quant_type| {
@@ -714,6 +1528,12 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
         try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
     }
     return createTensor(self, device, shape, out_count);
+}
+
+fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const shape = try allocShape2(self.allocator, rows, out_dim);
+    return linearNoBiasWithShape(ctx, input, weight, rows, in_dim, out_dim, shape);
 }
 
 fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, weight_c: CT, bias_c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
@@ -914,7 +1734,7 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     try self.kernels.launchRmsNormF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
-const UnaryOp = enum { gelu, relu, quick_gelu, sigmoid, tanh };
+const UnaryOp = enum { silu, gelu, relu, quick_gelu, sigmoid, tanh, exp, log, sqrt, rsqrt, abs, sin, cos, erf };
 
 fn unaryHost(ctx: *anyopaque, input: CT, op: UnaryOp) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -925,14 +1745,27 @@ fn unaryHost(ctx: *anyopaque, input: CT, op: UnaryOp) anyerror!CT {
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     const kernel_op: kernels_mod.ElementwiseOp = switch (op) {
+        .silu => .silu,
         .gelu => .gelu,
         .relu => .relu,
         .quick_gelu => .quick_gelu,
         .sigmoid => .sigmoid,
         .tanh => .tanh,
+        .exp => .exp,
+        .log => .log,
+        .sqrt => .sqrt,
+        .rsqrt => .rsqrt,
+        .abs => .abs,
+        .sin => .sin,
+        .cos => .cos,
+        .erf => .erf,
     };
     try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, .{}, input_tensor.elem_count, kernel_op);
     return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
+    return unaryHost(ctx, input, .silu);
 }
 
 fn gelu(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -970,6 +1803,89 @@ fn concat(ctx: *anyopaque, a: CT, b: CT, total: usize, dim_a: usize, dim_b: usiz
     errdefer device.free(&self.ctx);
     try self.kernels.launchConcatLastDimF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, total, dim_a, dim_b);
     return createTensor(self, device, shape, out_count);
+}
+
+fn concatRows2D(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a_tensor = tensorFromCt(a);
+    const b_tensor = tensorFromCt(b);
+    try ensureF32(a_tensor);
+    try ensureF32(b_tensor);
+    try ensureCount(a_tensor, try checkedMul(rows_a, cols));
+    try ensureCount(b_tensor, try checkedMul(rows_b, cols));
+
+    const out_rows = try checkedAdd(rows_a, rows_b);
+    const out_count = try checkedMul(out_rows, cols);
+    const shape = try allocShape2(self.allocator, out_rows, cols);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    const a_bytes = a_tensor.elem_count * @sizeOf(f32);
+    const b_bytes = b_tensor.elem_count * @sizeOf(f32);
+    try device.copyFromDeviceOffset(&self.ctx, 0, a_tensor.buffer, 0, a_bytes);
+    try device.copyFromDeviceOffset(&self.ctx, a_bytes, b_tensor.buffer, 0, b_bytes);
+    return createTensor(self, device, shape, out_count);
+}
+
+fn sliceRows2D(ctx: *anyopaque, input: CT, start_row: usize, row_count: usize, cols: usize) anyerror!CT {
+    if (cols == 0) return error.InvalidShape;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (input_tensor.elem_count % cols != 0) return error.UnexpectedOutputShape;
+    const total_rows = input_tensor.elem_count / cols;
+    if (start_row > total_rows or row_count > total_rows - start_row) return error.UnexpectedOutputShape;
+
+    const out_count = try checkedMul(row_count, cols);
+    const shape = try allocShape2(self.allocator, row_count, cols);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    const src_offset = try checkedMul(try checkedMul(start_row, cols), @sizeOf(f32));
+    const byte_count = try checkedMul(out_count, @sizeOf(f32));
+    try device.copyFromDeviceOffset(&self.ctx, 0, input_tensor.buffer, src_offset, byte_count);
+    return createTensor(self, device, shape, out_count);
+}
+
+fn copyLastDimSliceDevice(ctx: *anyopaque, input: CT, input_shape: []const i64, start: usize, stop: usize) anyerror!CT {
+    if (input_shape.len == 0 or start > stop) return error.InvalidShape;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+
+    const last_dim_i64 = input_shape[input_shape.len - 1];
+    if (last_dim_i64 <= 0) return error.InvalidShape;
+    const last_dim: usize = @intCast(last_dim_i64);
+    if (stop > last_dim) return error.OutOfBounds;
+
+    var rows: usize = 1;
+    for (input_shape[0 .. input_shape.len - 1]) |dim| {
+        if (dim <= 0) return error.InvalidShape;
+        rows = try checkedMul(rows, @intCast(dim));
+    }
+    try ensureCount(input_tensor, try checkedMul(rows, last_dim));
+
+    const out_dim = stop - start;
+    const out_count = try checkedMul(rows, out_dim);
+    const output_shape = try dupeShape(self.allocator, input_shape);
+    errdefer self.allocator.free(output_shape);
+    output_shape[output_shape.len - 1] = @intCast(out_dim);
+
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    const row_bytes = try checkedMul(out_dim, @sizeOf(f32));
+    for (0..rows) |row| {
+        const src_elem = try checkedAdd(try checkedMul(row, last_dim), start);
+        const dst_elem = try checkedMul(row, out_dim);
+        try device.copyFromDeviceOffset(
+            &self.ctx,
+            try checkedMul(dst_elem, @sizeOf(f32)),
+            input_tensor.buffer,
+            try checkedMul(src_elem, @sizeOf(f32)),
+            row_bytes,
+        );
+    }
+    return createTensor(self, device, output_shape, out_count);
 }
 
 fn splitLastDim3(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!ops.SplitLastDim3Result {
@@ -1011,13 +1927,74 @@ fn splitLastDim3(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!o
     return .{ .first = first, .second = second, .third = third };
 }
 
+fn sliceLastDim(ctx: *anyopaque, input: CT, start: usize, stop: usize) anyerror!CT {
+    if (start > stop) return error.OutOfBounds;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (input_tensor.shape.len == 2 and input_tensor.shape[0] > 0 and input_tensor.shape[1] > 0) {
+        const rows: usize = @intCast(input_tensor.shape[0]);
+        const cols: usize = @intCast(input_tensor.shape[1]);
+        if (stop <= cols) {
+            const dim = stop - start;
+            if (dim > 0 and cols == dim * 3 and (start == 0 or start == dim or start == dim * 2)) {
+                const parts = try splitLastDim3(ctx, input, rows, dim);
+                switch (start / dim) {
+                    0 => {
+                        defer freeTensor(ctx, parts.second);
+                        defer freeTensor(ctx, parts.third);
+                        return parts.first;
+                    },
+                    1 => {
+                        defer freeTensor(ctx, parts.first);
+                        defer freeTensor(ctx, parts.third);
+                        return parts.second;
+                    },
+                    2 => {
+                        defer freeTensor(ctx, parts.first);
+                        defer freeTensor(ctx, parts.second);
+                        return parts.third;
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+    }
+    if (input_tensor.shape.len >= 1) {
+        const maybe: ?CT = copyLastDimSliceDevice(ctx, input, input_tensor.shape, start, stop) catch |err| switch (err) {
+            error.InvalidShape, error.OutOfBounds => null,
+            else => return err,
+        };
+        if (maybe) |out| return out;
+    }
+
+    var fallback: NativeFallback = undefined;
+    try fallback.init(self, "slice_last_dim");
+    defer fallback.deinit();
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.sliceLastDim(ni, start, stop);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_tensor.shape);
+}
+
 fn binaryElementwise(ctx: *anyopaque, a: CT, b: CT, op: kernels_mod.ElementwiseOp) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const a_tensor = tensorFromCt(a);
     const b_tensor = tensorFromCt(b);
     try ensureF32(a_tensor);
     try ensureF32(b_tensor);
-    if (a_tensor.elem_count != b_tensor.elem_count or !sameShape(a_tensor.shape, b_tensor.shape)) return error.InvalidShape;
+    if (a_tensor.elem_count != b_tensor.elem_count or !sameShape(a_tensor.shape, b_tensor.shape)) {
+        if (try binaryElementwiseBroadcast(ctx, a_tensor, b_tensor, op)) |out| return out;
+        return nativeBinaryFallback(ctx, a, b, switch (op) {
+            .add => .add,
+            .multiply => .multiply,
+            .less_than => .less_than,
+            .divide => .divide,
+            .subtract => .subtract,
+            else => return error.InvalidShape,
+        });
+    }
 
     const shape = try dupeShape(self.allocator, a_tensor.shape);
     errdefer self.allocator.free(shape);
@@ -1025,6 +2002,211 @@ fn binaryElementwise(ctx: *anyopaque, a: CT, b: CT, op: kernels_mod.ElementwiseO
     errdefer device.free(&self.ctx);
     try self.kernels.launchElementwiseF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, a_tensor.elem_count, op);
     return createTensor(self, device, shape, a_tensor.elem_count);
+}
+
+fn binaryElementwiseBroadcast(ctx: *anyopaque, a_tensor: *const CudaTensor, b_tensor: *const CudaTensor, op: kernels_mod.ElementwiseOp) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const out_plan = try planBroadcastShape3(a_tensor.shape, b_tensor.shape, &[_]i64{}, a_tensor.elem_count, b_tensor.elem_count, 1) orelse return null;
+    const out_shape = out_plan.shape[0..out_plan.rank];
+    const shape = try dupeShape(self.allocator, out_shape);
+    errdefer self.allocator.free(shape);
+
+    var a_temp: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &a_temp);
+    var b_temp: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &b_temp);
+    const a_buffer = (try materializeBroadcastOperand(self, a_tensor, out_shape, out_plan.count, &a_temp)) orelse {
+        self.allocator.free(shape);
+        return null;
+    };
+    const b_buffer = (try materializeBroadcastOperand(self, b_tensor, out_shape, out_plan.count, &b_temp)) orelse {
+        self.allocator.free(shape);
+        return null;
+    };
+
+    var device = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchElementwiseF32(&self.ctx, device, a_buffer, b_buffer, out_plan.count, op);
+    return createTensor(self, device, shape, out_plan.count);
+}
+
+fn negateDevice(ctx: *anyopaque, input: CT) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var scale = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &scale);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchFillF32(&self.ctx, scale, input_tensor.elem_count, -1.0);
+    try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, scale, input_tensor.elem_count, .multiply);
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn subtractDeviceSameShape(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a_tensor = tensorFromCt(a);
+    const b_tensor = tensorFromCt(b);
+    try ensureF32(a_tensor);
+    try ensureF32(b_tensor);
+    if (a_tensor.elem_count != b_tensor.elem_count or !sameShape(a_tensor.shape, b_tensor.shape)) return null;
+
+    const shape = try dupeShape(self.allocator, a_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var scale = try allocDeviceBuffer(self, b_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &scale);
+    var neg_b = try allocDeviceBuffer(self, b_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &neg_b);
+    var device = try allocDeviceBuffer(self, a_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchFillF32(&self.ctx, scale, b_tensor.elem_count, -1.0);
+    try self.kernels.launchElementwiseF32(&self.ctx, neg_b, b_tensor.buffer, scale, b_tensor.elem_count, .multiply);
+    try self.kernels.launchElementwiseF32(&self.ctx, device, a_tensor.buffer, neg_b, a_tensor.elem_count, .add);
+    return createTensor(self, device, shape, a_tensor.elem_count);
+}
+
+fn subtractDeviceBroadcast(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a_tensor = tensorFromCt(a);
+    const b_tensor = tensorFromCt(b);
+    try ensureF32(a_tensor);
+    try ensureF32(b_tensor);
+    const out_plan = try planBroadcastShape3(a_tensor.shape, b_tensor.shape, &[_]i64{}, a_tensor.elem_count, b_tensor.elem_count, 1) orelse return null;
+    const out_shape = out_plan.shape[0..out_plan.rank];
+    const shape = try dupeShape(self.allocator, out_shape);
+    errdefer self.allocator.free(shape);
+
+    var a_temp: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &a_temp);
+    var b_temp: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &b_temp);
+    var neg_one: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &neg_one);
+    var neg_b: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &neg_b);
+    const a_buffer = (try materializeBroadcastOperand(self, a_tensor, out_shape, out_plan.count, &a_temp)) orelse {
+        self.allocator.free(shape);
+        return null;
+    };
+    const b_buffer = (try materializeBroadcastOperand(self, b_tensor, out_shape, out_plan.count, &b_temp)) orelse {
+        self.allocator.free(shape);
+        return null;
+    };
+
+    neg_one = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    neg_b = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    var device = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchFillF32(&self.ctx, neg_one, out_plan.count, -1.0);
+    try self.kernels.launchElementwiseF32(&self.ctx, neg_b, b_buffer, neg_one, out_plan.count, .multiply);
+    try self.kernels.launchElementwiseF32(&self.ctx, device, a_buffer, neg_b, out_plan.count, .add);
+    return createTensor(self, device, shape, out_plan.count);
+}
+
+fn whereSelectDeviceBroadcast(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const cond_tensor = tensorFromCt(cond);
+    const true_tensor = tensorFromCt(on_true);
+    const false_tensor = tensorFromCt(on_false);
+    try ensureF32(cond_tensor);
+    try ensureF32(true_tensor);
+    try ensureF32(false_tensor);
+
+    const out_plan = try planBroadcastShape3(
+        cond_tensor.shape,
+        true_tensor.shape,
+        false_tensor.shape,
+        cond_tensor.elem_count,
+        true_tensor.elem_count,
+        false_tensor.elem_count,
+    ) orelse return null;
+    const out_shape = out_plan.shape[0..out_plan.rank];
+
+    const shape = try dupeShape(self.allocator, out_shape);
+    errdefer self.allocator.free(shape);
+    var cond_temp: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &cond_temp);
+    var true_temp: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &true_temp);
+    var false_temp: buffer_mod.DeviceBuffer = .{};
+    defer releaseDeviceBuffer(self, &false_temp);
+    const cond_buffer = (try materializeBroadcastOperand(self, cond_tensor, out_shape, out_plan.count, &cond_temp)) orelse {
+        self.allocator.free(shape);
+        return null;
+    };
+    const true_buffer = (try materializeBroadcastOperand(self, true_tensor, out_shape, out_plan.count, &true_temp)) orelse {
+        self.allocator.free(shape);
+        return null;
+    };
+    const false_buffer = (try materializeBroadcastOperand(self, false_tensor, out_shape, out_plan.count, &false_temp)) orelse {
+        self.allocator.free(shape);
+        return null;
+    };
+
+    var true_part = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &true_part);
+    var neg_one = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &neg_one);
+    var neg_cond = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &neg_cond);
+    var one = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &one);
+    var inv_cond = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &inv_cond);
+    var false_part = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &false_part);
+    var device = try allocDeviceBuffer(self, out_plan.count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+
+    try self.kernels.launchElementwiseF32(&self.ctx, true_part, cond_buffer, true_buffer, out_plan.count, .multiply);
+    try self.kernels.launchFillF32(&self.ctx, neg_one, out_plan.count, -1.0);
+    try self.kernels.launchElementwiseF32(&self.ctx, neg_cond, cond_buffer, neg_one, out_plan.count, .multiply);
+    try self.kernels.launchFillF32(&self.ctx, one, out_plan.count, 1.0);
+    try self.kernels.launchElementwiseF32(&self.ctx, inv_cond, one, neg_cond, out_plan.count, .add);
+    try self.kernels.launchElementwiseF32(&self.ctx, false_part, inv_cond, false_buffer, out_plan.count, .multiply);
+    try self.kernels.launchElementwiseF32(&self.ctx, device, true_part, false_part, out_plan.count, .add);
+    return createTensor(self, device, shape, out_plan.count);
+}
+
+fn whereSelectDeviceSameShape(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const cond_tensor = tensorFromCt(cond);
+    const true_tensor = tensorFromCt(on_true);
+    const false_tensor = tensorFromCt(on_false);
+    try ensureF32(cond_tensor);
+    try ensureF32(true_tensor);
+    try ensureF32(false_tensor);
+    if (cond_tensor.elem_count != true_tensor.elem_count or cond_tensor.elem_count != false_tensor.elem_count) return null;
+    if (!sameShape(cond_tensor.shape, true_tensor.shape) or !sameShape(cond_tensor.shape, false_tensor.shape)) return null;
+
+    const shape = try dupeShape(self.allocator, true_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var true_part = try allocDeviceBuffer(self, true_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &true_part);
+    var neg_one = try allocDeviceBuffer(self, cond_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &neg_one);
+    var neg_cond = try allocDeviceBuffer(self, cond_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &neg_cond);
+    var one = try allocDeviceBuffer(self, cond_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &one);
+    var inv_cond = try allocDeviceBuffer(self, cond_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &inv_cond);
+    var false_part = try allocDeviceBuffer(self, false_tensor.elem_count * @sizeOf(f32));
+    defer releaseDeviceBuffer(self, &false_part);
+    var device = try allocDeviceBuffer(self, true_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+
+    try self.kernels.launchElementwiseF32(&self.ctx, true_part, cond_tensor.buffer, true_tensor.buffer, cond_tensor.elem_count, .multiply);
+    try self.kernels.launchFillF32(&self.ctx, neg_one, cond_tensor.elem_count, -1.0);
+    try self.kernels.launchElementwiseF32(&self.ctx, neg_cond, cond_tensor.buffer, neg_one, cond_tensor.elem_count, .multiply);
+    try self.kernels.launchFillF32(&self.ctx, one, cond_tensor.elem_count, 1.0);
+    try self.kernels.launchElementwiseF32(&self.ctx, inv_cond, one, neg_cond, cond_tensor.elem_count, .add);
+    try self.kernels.launchElementwiseF32(&self.ctx, false_part, inv_cond, false_tensor.buffer, cond_tensor.elem_count, .multiply);
+    try self.kernels.launchElementwiseF32(&self.ctx, device, true_part, false_part, cond_tensor.elem_count, .add);
+    return createTensor(self, device, shape, true_tensor.elem_count);
 }
 
 fn add(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -1035,18 +2217,854 @@ fn multiply(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     return binaryElementwise(ctx, a, b, .multiply);
 }
 
-fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
+fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+    if (try subtractDeviceSameShape(ctx, a, b)) |out| return out;
+    if (try subtractDeviceBroadcast(ctx, a, b)) |out| return out;
+    return nativeBinaryFallback(ctx, a, b, .subtract);
+}
+
+fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+    return binaryElementwise(ctx, a, b, .divide);
+}
+
+fn negateOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return negateDevice(ctx, a);
+}
+
+fn primSqrtOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .sqrt);
+}
+
+fn primRsqrtOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .rsqrt);
+}
+
+fn primExpOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .exp);
+}
+
+fn primLogOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .log);
+}
+
+fn primSinOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .sin);
+}
+
+fn primCosOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .cos);
+}
+
+fn primTanhOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .tanh);
+}
+
+fn primErfOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .erf);
+}
+
+fn primAbsOp(ctx: *anyopaque, a: CT) anyerror!CT {
+    return unaryHost(ctx, a, .abs);
+}
+
+fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+    return binaryElementwise(ctx, a, b, .less_than);
+}
+
+fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
+    if (try whereSelectDeviceSameShape(ctx, cond, on_true, on_false)) |out| return out;
+    if (try whereSelectDeviceBroadcast(ctx, cond, on_true, on_false)) |out| return out;
+    return nativeWhereSelectFallback(ctx, cond, on_true, on_false);
+}
+
+const ReduceMode = enum { sum, max, mean };
+
+fn reduceOutputShape(allocator: std.mem.Allocator, input_shape: []const i64, axes: []const u8) ![]i64 {
+    const out = try allocator.dupe(i64, input_shape);
+    errdefer allocator.free(out);
+    for (axes) |axis| {
+        if (axis >= out.len) return error.InvalidShape;
+        out[axis] = 1;
+    }
+    return out;
+}
+
+fn isAllAxesReduction(axes: []const u8, rank: usize) bool {
+    if (axes.len != rank) return false;
+    var seen = [_]bool{false} ** 8;
+    for (axes) |axis| {
+        if (axis >= rank or seen[axis]) return false;
+        seen[axis] = true;
+    }
+    return true;
+}
+
+fn reduceDeviceSupported(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64, mode: ReduceMode) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
+    if (input_shape.len == 0 or input_shape.len > 8) return null;
+    const input_count = try elementCountFromShape(input_shape);
+    try ensureCount(input_tensor, input_count);
 
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
+    var rows: usize = 0;
+    var dim: usize = 0;
+    if (axes.len == 1 and axes[0] == input_shape.len - 1) {
+        dim = @intCast(input_shape[input_shape.len - 1]);
+        if (dim == 0) return error.InvalidShape;
+        rows = input_count / dim;
+    } else if (isAllAxesReduction(axes, input_shape.len)) {
+        dim = input_count;
+        rows = 1;
+    } else {
+        return null;
+    }
+
+    const output_shape = try reduceOutputShape(self.allocator, input_shape, axes);
+    errdefer self.allocator.free(output_shape);
+    var device = try allocDeviceBuffer(self, rows * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    const kernel_mode: kernels_mod.ReduceOp = switch (mode) {
+        .sum => .sum,
+        .max => .max,
+        .mean => .mean,
+    };
+    try self.kernels.launchReduceLastDimF32(&self.ctx, device, input_tensor.buffer, rows, dim, kernel_mode);
+    return createTensor(self, device, output_shape, rows);
+}
+
+fn primReduceSumOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+    if (axes.len == 0) return deviceCopyWithShape(ctx, input, input_shape);
+    if (try reduceDeviceSupported(ctx, input, axes, input_shape, .sum)) |out| return out;
+    return nativeReduceFallback(ctx, input, axes, input_shape, .sum);
+}
+
+fn primReduceMaxOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+    if (axes.len == 0) return deviceCopyWithShape(ctx, input, input_shape);
+    if (try reduceDeviceSupported(ctx, input, axes, input_shape, .max)) |out| return out;
+    return nativeReduceFallback(ctx, input, axes, input_shape, .max);
+}
+
+fn primReduceMeanOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+    if (axes.len == 0) return deviceCopyWithShape(ctx, input, input_shape);
+    if (try reduceDeviceSupported(ctx, input, axes, input_shape, .mean)) |out| return out;
+    return nativeReduceFallback(ctx, input, axes, input_shape, .mean);
+}
+
+fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
+    return deviceCopyWithShape(ctx, input, new_shape);
+}
+
+fn isAliasableTranspose(input_shape: []const i64, perm: []const u8) bool {
+    if (perm.len != input_shape.len) return false;
+
+    var expected_non_singleton: [16]usize = undefined;
+    if (input_shape.len > expected_non_singleton.len) return false;
+    var expected_len: usize = 0;
+    for (input_shape, 0..) |dim, axis| {
+        if (dim < 0) return false;
+        if (dim != 1) {
+            expected_non_singleton[expected_len] = axis;
+            expected_len += 1;
+        }
+    }
+
+    var seen = [_]bool{false} ** 16;
+    var seen_non_singleton: usize = 0;
+    for (perm) |axis_u8| {
+        const axis: usize = axis_u8;
+        if (axis >= input_shape.len or seen[axis]) return false;
+        seen[axis] = true;
+        if (input_shape[axis] != 1) {
+            if (seen_non_singleton >= expected_len or expected_non_singleton[seen_non_singleton] != axis) return false;
+            seen_non_singleton += 1;
+        }
+    }
+    return seen_non_singleton == expected_len;
+}
+
+fn transposeAliasShape(allocator: std.mem.Allocator, input_shape: []const i64, perm: []const u8) ![]i64 {
+    const out = try allocator.alloc(i64, input_shape.len);
+    errdefer allocator.free(out);
+    for (perm, 0..) |src_axis, dst_axis| out[dst_axis] = input_shape[src_axis];
+    return out;
+}
+
+fn deviceTranspose2D(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    try ensureCount(input_tensor, try checkedMul(rows, cols));
+
+    const output_shape = try allocShape2(self.allocator, cols, rows);
+    errdefer self.allocator.free(output_shape);
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, .{}, input_tensor.elem_count, .silu);
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    try self.kernels.launchTranspose2DF32(&self.ctx, device, input_tensor.buffer, rows, cols);
+    return createTensor(self, device, output_shape, input_tensor.elem_count);
 }
+
+fn tryDeviceTranspose2D(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!?CT {
+    if (input_shape.len != 2 or perm.len != 2 or perm[0] != 1 or perm[1] != 0) return null;
+    if (input_shape[0] <= 0 or input_shape[1] <= 0) return null;
+    return try deviceTranspose2D(ctx, input, @intCast(input_shape[0]), @intCast(input_shape[1]));
+}
+
+fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
+    if (isAliasableTranspose(input_shape, perm)) {
+        const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+        const output_shape = try transposeAliasShape(self.allocator, input_shape, perm);
+        defer self.allocator.free(output_shape);
+        return deviceCopyWithShape(ctx, input, output_shape);
+    }
+    if (try tryDeviceTranspose2D(ctx, input, perm, input_shape)) |out| return out;
+    var fallback: NativeFallback = undefined;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    try fallback.init(self, "transpose");
+    defer fallback.deinit();
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primTranspose(ni, perm, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const axes_u32 = try u32FromAxes(self.allocator, broadcast_axes);
+    defer self.allocator.free(axes_u32);
+    return broadcastToShapeDeviceMapped(ctx, input, target_shape, input_shape, axes_u32) catch |err| switch (err) {
+        error.UnsupportedShape, error.InvalidShape => return nativeBroadcastInDimFallback(ctx, input, target_shape, broadcast_axes, input_shape),
+        else => return err,
+    };
+}
+
+fn axesArePrefix(axes: []const u8) bool {
+    for (axes, 0..) |axis, i| {
+        if (axis != i) return false;
+    }
+    return true;
+}
+
+fn sharedLinearDotOutputShape(
+    allocator: std.mem.Allocator,
+    lhs_shape: []const i64,
+    lhs_contract_axis: usize,
+    out_dim: i64,
+) ![]i64 {
+    const output_shape = try allocator.alloc(i64, lhs_shape.len);
+    errdefer allocator.free(output_shape);
+    if (lhs_contract_axis > 0) @memcpy(output_shape[0..lhs_contract_axis], lhs_shape[0..lhs_contract_axis]);
+    output_shape[lhs_contract_axis] = out_dim;
+    return output_shape;
+}
+
+fn tryDeviceRank2DotGeneral(
+    ctx: *anyopaque,
+    lhs: CT,
+    rhs: CT,
+    lhs_shape: []const i64,
+    rhs_shape: []const i64,
+    lhs_contracting: []const u8,
+    rhs_contracting: []const u8,
+    lhs_batch: []const u8,
+    rhs_batch: []const u8,
+) anyerror!?CT {
+    if (lhs_batch.len != 0 or rhs_batch.len != 0) return null;
+    if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+    if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
+    const lhs_contract_axis: usize = lhs_contracting[0];
+    const rhs_contract_axis: usize = rhs_contracting[0];
+    if (lhs_contract_axis > 1 or rhs_contract_axis > 1) return null;
+
+    const lhs_k = lhs_shape[lhs_contract_axis];
+    const rhs_k = rhs_shape[rhs_contract_axis];
+    const lhs_out_axis: usize = 1 - lhs_contract_axis;
+    const rhs_out_axis: usize = 1 - rhs_contract_axis;
+    const rows_i64 = lhs_shape[lhs_out_axis];
+    const out_dim_i64 = rhs_shape[rhs_out_axis];
+    if (lhs_k <= 0 or rhs_k <= 0 or lhs_k != rhs_k or rows_i64 <= 0 or out_dim_i64 <= 0) return null;
+
+    var lhs_linear = lhs;
+    var lhs_tmp: ?CT = null;
+    defer if (lhs_tmp) |tmp| freeTensor(ctx, tmp);
+    if (lhs_contract_axis == 0) {
+        lhs_tmp = try deviceTranspose2D(ctx, lhs, @intCast(lhs_shape[0]), @intCast(lhs_shape[1]));
+        lhs_linear = lhs_tmp.?;
+    }
+
+    var rhs_linear = rhs;
+    var rhs_tmp: ?CT = null;
+    defer if (rhs_tmp) |tmp| freeTensor(ctx, tmp);
+    if (rhs_contract_axis == 0) {
+        rhs_tmp = try deviceTranspose2D(ctx, rhs, @intCast(rhs_shape[0]), @intCast(rhs_shape[1]));
+        rhs_linear = rhs_tmp.?;
+    }
+
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const output_shape = try allocShape2(self.allocator, @intCast(rows_i64), @intCast(out_dim_i64));
+    var output_shape_passed_to_linear = false;
+    errdefer if (!output_shape_passed_to_linear) self.allocator.free(output_shape);
+    output_shape_passed_to_linear = true;
+    return try linearNoBiasWithShape(
+        ctx,
+        lhs_linear,
+        rhs_linear,
+        @intCast(rows_i64),
+        @intCast(lhs_k),
+        @intCast(out_dim_i64),
+        output_shape,
+    );
+}
+
+fn tryDeviceSharedLinearDotGeneral(
+    ctx: *anyopaque,
+    lhs: CT,
+    rhs: CT,
+    lhs_shape: []const i64,
+    rhs_shape: []const i64,
+    lhs_contracting: []const u8,
+    rhs_contracting: []const u8,
+    lhs_batch: []const u8,
+    rhs_batch: []const u8,
+) anyerror!?CT {
+    if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+    if (rhs_batch.len != 0) return null;
+    if (lhs_shape.len < 2 or rhs_shape.len != 2) return null;
+    if (!axesArePrefix(lhs_batch)) return null;
+
+    const lhs_contract_axis: usize = lhs_contracting[0];
+    if (lhs_contract_axis != lhs_shape.len - 1) return null;
+    if (lhs_batch.len > lhs_contract_axis) return null;
+    const in_dim_i64 = lhs_shape[lhs_contract_axis];
+    const rhs_contract_axis: usize = rhs_contracting[0];
+    if (rhs_contract_axis > 1) return null;
+    const rhs_in_dim_i64 = rhs_shape[rhs_contract_axis];
+    const rhs_out_axis: usize = 1 - rhs_contract_axis;
+    const out_dim_i64 = rhs_shape[rhs_out_axis];
+    if (in_dim_i64 <= 0 or rhs_in_dim_i64 <= 0 or out_dim_i64 <= 0) return null;
+    if (in_dim_i64 != rhs_in_dim_i64) return null;
+
+    var rows: usize = 1;
+    for (lhs_shape[0..lhs_contract_axis]) |dim| {
+        if (dim <= 0) return null;
+        rows = try checkedMul(rows, @intCast(dim));
+    }
+
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const output_shape = try sharedLinearDotOutputShape(self.allocator, lhs_shape, lhs_contract_axis, out_dim_i64);
+    var output_shape_passed_to_linear = false;
+    errdefer if (!output_shape_passed_to_linear) self.allocator.free(output_shape);
+    if (rhs_contract_axis == 0) {
+        const rhs_transposed = try deviceTranspose2D(ctx, rhs, @intCast(rhs_shape[0]), @intCast(rhs_shape[1]));
+        defer freeTensor(ctx, rhs_transposed);
+        output_shape_passed_to_linear = true;
+        return try linearNoBiasWithShape(
+            ctx,
+            lhs,
+            rhs_transposed,
+            rows,
+            @intCast(in_dim_i64),
+            @intCast(out_dim_i64),
+            output_shape,
+        );
+    }
+    output_shape_passed_to_linear = true;
+    return try linearNoBiasWithShape(
+        ctx,
+        lhs,
+        rhs,
+        rows,
+        @intCast(in_dim_i64),
+        @intCast(out_dim_i64),
+        output_shape,
+    );
+}
+
+fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
+    if (try tryDeviceRank2DotGeneral(ctx, lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |out| return out;
+    if (try tryDeviceSharedLinearDotGeneral(ctx, lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |out| return out;
+    var fallback: NativeFallback = undefined;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    try fallback.init(self, "dot_general");
+    defer fallback.deinit();
+    const nl = try nativeCtFromCuda(self, &fallback, lhs);
+    defer fallback.cb.free(nl);
+    const nr = try nativeCtFromCuda(self, &fallback, rhs);
+    defer fallback.cb.free(nr);
+    const out = try fallback.cb.primDotGeneral(nl, nr, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, tensorFromCt(lhs).shape);
+}
+
+fn isFullSlice(starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) bool {
+    if (starts.len != input_shape.len or limits.len != input_shape.len or strides.len != input_shape.len) return false;
+    for (input_shape, 0..) |dim, i| {
+        if (starts[i] != 0 or strides[i] != 1) return false;
+        if (limits[i] != dim and !(limits[i] < 0 and dim >= 0)) return false;
+    }
+    return true;
+}
+
+fn contiguousLeadingSliceDevice(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!?CT {
+    if (input_shape.len == 0 or starts.len != input_shape.len or limits.len != input_shape.len or strides.len != input_shape.len) return null;
+    if (input_shape[0] <= 0 or starts[0] < 0 or strides[0] != 1) return null;
+    const dim0 = input_shape[0];
+    const limit0 = if (limits[0] < 0) dim0 else limits[0];
+    if (limit0 < starts[0] or limit0 > dim0) return null;
+
+    var inner_count: usize = 1;
+    for (input_shape[1..], 1..) |dim, axis| {
+        if (dim <= 0) return null;
+        if (starts[axis] != 0 or strides[axis] != 1) return null;
+        if (limits[axis] != dim and !(limits[axis] < 0 and dim >= 0)) return null;
+        inner_count = try checkedMul(inner_count, @intCast(dim));
+    }
+
+    const row_count: usize = @intCast(limit0 - starts[0]);
+    const start_row: usize = @intCast(starts[0]);
+    const cols = inner_count;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    try ensureCount(input_tensor, try elementCountFromShape(input_shape));
+    const output_shape = try dupeShape(self.allocator, input_shape);
+    errdefer self.allocator.free(output_shape);
+    output_shape[0] = @intCast(row_count);
+
+    const out_count = try checkedMul(row_count, cols);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    const src_offset = try checkedMul(try checkedMul(start_row, cols), @sizeOf(f32));
+    const byte_count = try checkedMul(out_count, @sizeOf(f32));
+    try device.copyFromDeviceOffset(&self.ctx, 0, input_tensor.buffer, src_offset, byte_count);
+    return createTensor(self, device, output_shape, out_count);
+}
+
+fn contiguousLastDimSliceDevice(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!?CT {
+    if (input_shape.len == 0 or starts.len != input_shape.len or limits.len != input_shape.len or strides.len != input_shape.len) return null;
+    const last_axis = input_shape.len - 1;
+    for (input_shape[0..last_axis], 0..) |dim, axis| {
+        if (dim <= 0) return null;
+        if (starts[axis] != 0 or strides[axis] != 1) return null;
+        if (limits[axis] != dim and !(limits[axis] < 0 and dim >= 0)) return null;
+    }
+    if (starts[last_axis] < 0 or strides[last_axis] != 1) return null;
+    const last_dim = input_shape[last_axis];
+    if (last_dim <= 0) return null;
+    const limit = if (limits[last_axis] < 0) last_dim else limits[last_axis];
+    if (limit < starts[last_axis] or limit > last_dim) return null;
+    return try copyLastDimSliceDevice(ctx, input, input_shape, @intCast(starts[last_axis]), @intCast(limit));
+}
+
+fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
+    if (isFullSlice(starts, limits, strides, input_shape)) return deviceCopyWithShape(ctx, input, input_shape);
+    if (try contiguousLeadingSliceDevice(ctx, input, starts, limits, strides, input_shape)) |out| return out;
+    if (try contiguousLastDimSliceDevice(ctx, input, starts, limits, strides, input_shape)) |out| return out;
+    var fallback: NativeFallback = undefined;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    try fallback.init(self, "slice");
+    defer fallback.deinit();
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primSlice(ni, starts, limits, strides, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
+    if (a_shape.len == b_shape.len and a_shape.len > 0 and axis == a_shape.len - 1) {
+        var total: usize = 1;
+        var prefix_match = true;
+        for (a_shape[0 .. a_shape.len - 1], 0..) |dim, i| {
+            if (dim != b_shape[i]) {
+                prefix_match = false;
+                break;
+            }
+            total = try checkedMul(total, @intCast(dim));
+        }
+        if (prefix_match) {
+            return concat(ctx, a, b, total, @intCast(a_shape[a_shape.len - 1]), @intCast(b_shape[b_shape.len - 1]));
+        }
+    }
+    if (a_shape.len == 2 and b_shape.len == 2 and axis == 0 and a_shape[1] == b_shape[1]) {
+        if (a_shape[0] < 0 or b_shape[0] < 0 or a_shape[1] < 0) return error.InvalidShape;
+        return concatRows2D(ctx, a, b, @intCast(a_shape[0]), @intCast(b_shape[0]), @intCast(a_shape[1]));
+    }
+    var fallback: NativeFallback = undefined;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    try fallback.init(self, "concat_prim");
+    defer fallback.deinit();
+    const na = try nativeCtFromCuda(self, &fallback, a);
+    defer fallback.cb.free(na);
+    const nb = try nativeCtFromCuda(self, &fallback, b);
+    defer fallback.cb.free(nb);
+    const out = try fallback.cb.primConcatPrim(na, nb, axis, a_shape, b_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, a_shape);
+}
+
+fn primSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
+    return softmaxLastDimDevice(ctx, input, dim, false);
+}
+
+fn primLogSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
+    return softmaxLastDimDevice(ctx, input, dim, true);
+}
+
+fn softmaxLastDimDevice(ctx: *anyopaque, input: CT, dim: u32, log_softmax: bool) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const t = tensorFromCt(input);
+    try ensureF32(t);
+    const last_dim: usize = @intCast(dim);
+    if (last_dim == 0 or t.elem_count % last_dim != 0) return error.InvalidShape;
+    const shape = try dupeShape(self.allocator, t.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, t.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchSoftmaxLastDimF32(&self.ctx, device, t.buffer, t.elem_count / last_dim, last_dim, log_softmax);
+    return createTensor(self, device, shape, t.elem_count);
+}
+
+fn argMaxOutputShape(allocator: std.mem.Allocator, input_shape: []const i64, axis: usize, keepdims: bool) ![]i64 {
+    if (axis >= input_shape.len or input_shape.len > 8) return error.InvalidShape;
+    const out_rank = if (keepdims) input_shape.len else input_shape.len - 1;
+    const out_shape = try allocator.alloc(i64, out_rank);
+    errdefer allocator.free(out_shape);
+    if (keepdims) {
+        @memcpy(out_shape, input_shape);
+        out_shape[axis] = 1;
+    } else {
+        var out_i: usize = 0;
+        for (input_shape, 0..) |dim, i| {
+            if (i == axis) continue;
+            out_shape[out_i] = dim;
+            out_i += 1;
+        }
+    }
+    return out_shape;
+}
+
+fn argMaxLastDimDevice(ctx: *anyopaque, input: CT, axis: u8, keepdims: bool, input_shape: []const i64) anyerror!?CT {
+    if (input_shape.len == 0 or axis != input_shape.len - 1) return null;
+    const last_dim_i64 = input_shape[input_shape.len - 1];
+    if (last_dim_i64 <= 0) return null;
+    var rows: usize = 1;
+    for (input_shape[0 .. input_shape.len - 1]) |dim| {
+        if (dim <= 0) return null;
+        rows = try checkedMul(rows, @intCast(dim));
+    }
+    const dim: usize = @intCast(last_dim_i64);
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    try ensureCount(input_tensor, try checkedMul(rows, dim));
+
+    const output_shape = try argMaxOutputShape(self.allocator, input_shape, input_shape.len - 1, keepdims);
+    errdefer self.allocator.free(output_shape);
+    var device = try allocDeviceBuffer(self, rows * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchArgMaxLastDimF32(&self.ctx, device, input_tensor.buffer, rows, dim);
+    return createTensor(self, device, output_shape, rows);
+}
+
+fn primArgMaxOp(ctx: *anyopaque, input: CT, axis: u8, keepdims: bool, input_shape: []const i64) anyerror!CT {
+    if (try argMaxLastDimDevice(ctx, input, axis, keepdims, input_shape)) |out| return out;
+    var fallback: NativeFallback = undefined;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    try fallback.init(self, "argmax");
+    defer fallback.deinit();
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const out = try fallback.cb.primArgMax(ni, axis, keepdims, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn scatterAddRowsDevice(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!?CT {
+    if (axis != 0 or input_shape.len != 2) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const indices_tensor = tensorFromCt(indices);
+    try ensureF32(input_tensor);
+    try ensureF32(indices_tensor);
+    if (input_shape[0] < 0 or input_shape[1] <= 0) return null;
+
+    const rows: usize = @intCast(input_shape[0]);
+    const dim: usize = @intCast(input_shape[1]);
+    try ensureCount(input_tensor, try checkedMul(rows, dim));
+    if (indices_tensor.elem_count < rows) return error.ShapeMismatch;
+
+    const index_values = try downloadAlloc(self, indices_tensor);
+    defer self.allocator.free(index_values);
+
+    var out_rows: usize = 0;
+    if (indices_shape.len > 0) {
+        if (indices_shape[0] <= 0) return null;
+        out_rows = @intCast(indices_shape[0]);
+    } else {
+        if (index_values.len == 0) return null;
+        for (index_values) |value| {
+            if (value < 0) return error.IndexOutOfBounds;
+            const row: usize = @intFromFloat(value);
+            out_rows = @max(out_rows, try checkedAdd(row, 1));
+        }
+    }
+
+    const row_ids = try self.allocator.alloc(u32, rows);
+    defer self.allocator.free(row_ids);
+    for (row_ids, 0..) |*row_id, i| {
+        const value = index_values[i];
+        if (value < 0) return error.IndexOutOfBounds;
+        const row: usize = @intFromFloat(value);
+        if (row >= out_rows or row > std.math.maxInt(u32)) return error.IndexOutOfBounds;
+        row_id.* = @intCast(row);
+    }
+
+    const output_shape = try allocShape2(self.allocator, out_rows, dim);
+    errdefer self.allocator.free(output_shape);
+    const out_count = try checkedMul(out_rows, dim);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchFillF32(&self.ctx, device, out_count, 0.0);
+    const row_ids_device = try uploadTempU32(self, row_ids);
+    try self.kernels.launchScatterAddRowsF32(&self.ctx, device, input_tensor.buffer, row_ids_device, out_rows, rows, dim);
+    return createTensor(self, device, output_shape, out_count);
+}
+
+fn scatterAddIntoRowsDevice(ctx: *anyopaque, dest: CT, values: CT, indices: CT, dest_shape: []const i64, values_shape: []const i64, axis: u8) anyerror!?CT {
+    if (axis != 0 or dest_shape.len != 2 or values_shape.len != 2) return null;
+    if (dest_shape[0] < 0 or dest_shape[1] <= 0 or values_shape[0] < 0 or values_shape[1] != dest_shape[1]) return null;
+
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const dest_tensor = tensorFromCt(dest);
+    const values_tensor = tensorFromCt(values);
+    const indices_tensor = tensorFromCt(indices);
+    try ensureF32(dest_tensor);
+    try ensureF32(values_tensor);
+    try ensureF32(indices_tensor);
+
+    const out_rows: usize = @intCast(dest_shape[0]);
+    const rows: usize = @intCast(values_shape[0]);
+    const dim: usize = @intCast(dest_shape[1]);
+    const out_count = try checkedMul(out_rows, dim);
+    try ensureCount(dest_tensor, out_count);
+    try ensureCount(values_tensor, try checkedMul(rows, dim));
+    if (indices_tensor.elem_count < rows) return error.ShapeMismatch;
+
+    const index_values = try downloadAlloc(self, indices_tensor);
+    defer self.allocator.free(index_values);
+
+    const row_ids = try self.allocator.alloc(u32, rows);
+    defer self.allocator.free(row_ids);
+    for (row_ids, 0..) |*row_id, i| {
+        const value = index_values[i];
+        if (value < 0) return error.IndexOutOfBounds;
+        const row: usize = @intFromFloat(value);
+        if (row >= out_rows or row > std.math.maxInt(u32)) return error.IndexOutOfBounds;
+        row_id.* = @intCast(row);
+    }
+
+    const output_shape = try dupeShape(self.allocator, dest_shape);
+    errdefer self.allocator.free(output_shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try device.copyFromDevice(&self.ctx, dest_tensor.buffer, out_count * @sizeOf(f32));
+    const row_ids_device = try uploadTempU32(self, row_ids);
+    try self.kernels.launchScatterAddRowsF32(&self.ctx, device, values_tensor.buffer, row_ids_device, out_rows, rows, dim);
+    return createTensor(self, device, output_shape, out_count);
+}
+
+fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
+    if (try scatterAddRowsDevice(ctx, input, indices, input_shape, indices_shape, axis)) |out| return out;
+    var fallback: NativeFallback = undefined;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    try fallback.init(self, "scatter_add");
+    defer fallback.deinit();
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const nidx = try nativeCtFromCuda(self, &fallback, indices);
+    defer fallback.cb.free(nidx);
+    const out = try fallback.cb.primScatterAdd(ni, nidx, input_shape, indices_shape, axis);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
+fn primScatterAddIntoOp(ctx: *anyopaque, dest: CT, values: CT, indices: CT, dest_shape: []const i64, values_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
+    _ = indices_shape;
+    if (try scatterAddIntoRowsDevice(ctx, dest, values, indices, dest_shape, values_shape, axis)) |out| return out;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.allow_host_training_fallbacks) {
+        std.debug.print("error: CUDA host training fallback disabled for scatter_add_into\n", .{});
+        return error.CudaHostTrainingFallbackDisabled;
+    }
+    return error.UnsupportedPrimitiveOp;
+}
+
+fn allDimsAreOne(shape: []const i64) bool {
+    for (shape) |dim| {
+        if (dim != 1) return false;
+    }
+    return true;
+}
+
+fn gatherOutputShape(allocator: std.mem.Allocator, input_shape: []const i64, axis_index: usize, indices_shape: []const i64, index_count: usize) ![]i64 {
+    if (axis_index >= input_shape.len or input_shape.len > 8 or indices_shape.len > 8) return error.InvalidShape;
+
+    const scalar_index = indices_shape.len == 0 and index_count == 1;
+    const normalized_indices_len: usize = if (scalar_index)
+        0
+    else if (indices_shape.len == 0)
+        1
+    else if (indices_shape.len > 1 and index_count == 1 and allDimsAreOne(indices_shape))
+        1
+    else
+        indices_shape.len;
+
+    const out_rank = input_shape.len - 1 + normalized_indices_len;
+    if (out_rank > 8) return error.InvalidShape;
+
+    const out_shape = try allocator.alloc(i64, out_rank);
+    errdefer allocator.free(out_shape);
+    var out_i: usize = 0;
+    for (input_shape[0..axis_index]) |dim| {
+        out_shape[out_i] = dim;
+        out_i += 1;
+    }
+    if (!scalar_index) {
+        if (indices_shape.len == 0) {
+            out_shape[out_i] = @intCast(index_count);
+            out_i += 1;
+        } else if (normalized_indices_len == 1 and indices_shape.len != 1) {
+            out_shape[out_i] = 1;
+            out_i += 1;
+        } else {
+            @memcpy(out_shape[out_i..][0..indices_shape.len], indices_shape);
+            out_i += indices_shape.len;
+        }
+    }
+    for (input_shape[axis_index + 1 ..]) |dim| {
+        out_shape[out_i] = dim;
+        out_i += 1;
+    }
+    return out_shape;
+}
+
+fn gatherWithHostIndicesDevice(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!?CT {
+    const axis_index: usize = axis;
+    if (input_shape.len == 0 or axis_index >= input_shape.len or input_shape.len > 8) return null;
+
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const indices_tensor = tensorFromCt(indices);
+    try ensureF32(input_tensor);
+    try ensureF32(indices_tensor);
+    if (indices_tensor.shape.len > 8) return error.InvalidShape;
+
+    var prefix_count: usize = 1;
+    for (input_shape[0..axis_index]) |dim| {
+        if (dim <= 0) return null;
+        prefix_count = try checkedMul(prefix_count, @intCast(dim));
+    }
+
+    const axis_extent_i64 = input_shape[axis_index];
+    if (axis_extent_i64 <= 0) return null;
+    const axis_extent: usize = @intCast(axis_extent_i64);
+
+    var suffix_size: usize = 1;
+    for (input_shape[axis_index + 1 ..]) |dim| {
+        if (dim <= 0) return null;
+        suffix_size = try checkedMul(suffix_size, @intCast(dim));
+    }
+
+    try ensureCount(input_tensor, try checkedMul(try checkedMul(prefix_count, axis_extent), suffix_size));
+
+    const index_count = indices_tensor.elem_count;
+    try ensureCount(indices_tensor, try elementCountFromShape(indices_tensor.shape));
+    const out_count = try checkedMul(try checkedMul(prefix_count, index_count), suffix_size);
+    const output_shape = try gatherOutputShape(self.allocator, input_shape, axis_index, indices_tensor.shape, index_count);
+    errdefer self.allocator.free(output_shape);
+
+    const index_values = try downloadAlloc(self, indices_tensor);
+    defer self.allocator.free(index_values);
+
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    const slice_bytes = try checkedMul(suffix_size, @sizeOf(f32));
+    for (0..prefix_count) |prefix_idx| {
+        for (index_values, 0..) |value, idx_pos| {
+            var gather_index = @as(i64, @intFromFloat(value));
+            if (gather_index < 0) gather_index += @as(i64, @intCast(axis_extent));
+            if (gather_index < 0 or gather_index >= @as(i64, @intCast(axis_extent))) return error.IndexOutOfBounds;
+            const gather_pos: usize = @intCast(gather_index);
+            const src_elem = try checkedMul(try checkedAdd(try checkedMul(prefix_idx, axis_extent), gather_pos), suffix_size);
+            const dst_elem = try checkedMul(try checkedAdd(try checkedMul(prefix_idx, index_count), idx_pos), suffix_size);
+            try device.copyFromDeviceOffset(
+                &self.ctx,
+                try checkedMul(dst_elem, @sizeOf(f32)),
+                input_tensor.buffer,
+                try checkedMul(src_elem, @sizeOf(f32)),
+                slice_bytes,
+            );
+        }
+    }
+    return createTensor(self, device, output_shape, out_count);
+}
+
+fn gatherAxis0RowsDevice(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64) anyerror!?CT {
+    if (input_shape.len != 2) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const indices_tensor = tensorFromCt(indices);
+    try ensureF32(input_tensor);
+    try ensureF32(indices_tensor);
+    if (input_shape[0] <= 0 or input_shape[1] <= 0) return null;
+
+    const source_rows: usize = @intCast(input_shape[0]);
+    const dim: usize = @intCast(input_shape[1]);
+    try ensureCount(input_tensor, try checkedMul(source_rows, dim));
+
+    const index_count = indices_tensor.elem_count;
+    const index_values = try downloadAlloc(self, indices_tensor);
+    defer self.allocator.free(index_values);
+    const row_ids = try self.allocator.alloc(u32, index_count);
+    defer self.allocator.free(row_ids);
+    for (index_values, 0..) |value, i| {
+        var row_i64 = @as(i64, @intFromFloat(value));
+        if (row_i64 < 0) row_i64 += @as(i64, @intCast(source_rows));
+        if (row_i64 < 0 or row_i64 >= @as(i64, @intCast(source_rows))) return error.IndexOutOfBounds;
+        row_ids[i] = @intCast(row_i64);
+    }
+
+    const out_count = try checkedMul(index_count, dim);
+    const shape = try gatherOutputShape(self.allocator, input_shape, 0, indices_tensor.shape, index_count);
+    errdefer self.allocator.free(shape);
+
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    const row_ids_device = try uploadTempU32(self, row_ids);
+    try self.kernels.launchTakeRowsF32(&self.ctx, device, input_tensor.buffer, row_ids_device, source_rows, index_count, dim);
+    return createTensor(self, device, shape, out_count);
+}
+
+fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
+    if (axis == 0) {
+        if (try gatherAxis0RowsDevice(ctx, input, indices, input_shape)) |out| return out;
+    }
+    if (try gatherWithHostIndicesDevice(ctx, input, indices, axis, input_shape)) |out| return out;
+    var fallback: NativeFallback = undefined;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    try fallback.init(self, "gather");
+    defer fallback.deinit();
+    const ni = try nativeCtFromCuda(self, &fallback, input);
+    defer fallback.cb.free(ni);
+    const nidx = try nativeCtFromCuda(self, &fallback, indices);
+    defer fallback.cb.free(nidx);
+    const out = try fallback.cb.primGather(ni, nidx, axis, input_shape);
+    defer fallback.cb.free(out);
+    return cudaCtFromNative(self, &fallback, out, input_shape);
+}
+
 fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const q_tensor = tensorFromCt(q_ct);
@@ -1295,7 +3313,10 @@ const vtable = ops.ComputeBackend.VTable{
     .sigmoid = &sigmoid,
     .tanh_act = &tanhAct,
     .splitLastDim3 = &splitLastDim3,
+    .sliceLastDim = &sliceLastDim,
     .concat = &concat,
+    .concatRows2D = &concatRows2D,
+    .sliceRows2D = &sliceRows2D,
     .add = &add,
     .scaledDotProductAttention = &sdpa,
     .scaledDotProductAttentionFull = &sdpaFull,
@@ -1316,9 +3337,39 @@ const vtable = ops.ComputeBackend.VTable{
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
     .toFloat32 = &toFloat32Op,
+    .toFloat32Batch = &toFloat32BatchOp,
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,
     .evalTensor = &evalTensorOp,
+    .subtract = &subtractOp,
+    .divide = &divideOp,
+    .negate = &negateOp,
+    .sqrtOp = &primSqrtOp,
+    .rsqrtOp = &primRsqrtOp,
+    .expOp = &primExpOp,
+    .logOp = &primLogOp,
+    .sinOp = &primSinOp,
+    .cosOp = &primCosOp,
+    .tanhOp = &primTanhOp,
+    .erfOp = &primErfOp,
+    .absOp = &primAbsOp,
+    .lessThan = &lessThanOp,
+    .whereSelect = &whereSelectOp,
+    .reduceSumOp = &primReduceSumOp,
+    .reduceMaxOp = &primReduceMaxOp,
+    .reduceMeanOp = &primReduceMeanOp,
+    .argmaxOp = &primArgMaxOp,
+    .reshapeOp = &primReshapeOp,
+    .transposeOp = &primTransposeOp,
+    .broadcastInDimOp = &primBroadcastInDimOp,
+    .dotGeneralOp = &primDotGeneralOp,
+    .scatterAddOp = &primScatterAddOp,
+    .scatterAddIntoOp = &primScatterAddIntoOp,
+    .gatherOp = &primGatherOp,
+    .sliceOp = &primSliceOp,
+    .concatPrimOp = &primConcatPrimOp,
+    .softmaxOp = &primSoftmaxOp,
+    .logSoftmaxOp = &primLogSoftmaxOp,
 };
 
 test "cuda compute vtable is type checked" {
@@ -1327,11 +3378,29 @@ test "cuda compute vtable is type checked" {
     const linear_no_bias_fn: *const fn (*anyopaque, CT, CT, usize, usize, usize) anyerror!CT = &linearNoBias;
     const rms_norm_fn: *const fn (*anyopaque, CT, CT, usize, f32) anyerror!CT = &rmsNorm;
     const rope_per_item_fn: *const fn (*anyopaque, CT, usize, usize, usize, usize, f32, f32, []const usize, []const usize, bool) anyerror!CT = &ropePerItem;
+    const subtract_fn: *const fn (*anyopaque, CT, CT) anyerror!CT = &subtractOp;
+    const divide_fn: *const fn (*anyopaque, CT, CT) anyerror!CT = &divideOp;
+    const exp_fn: *const fn (*anyopaque, CT) anyerror!CT = &primExpOp;
+    const log_fn: *const fn (*anyopaque, CT) anyerror!CT = &primLogOp;
+    const less_than_fn: *const fn (*anyopaque, CT, CT) anyerror!CT = &lessThanOp;
+    const where_select_fn: *const fn (*anyopaque, CT, CT, CT) anyerror!CT = &whereSelectOp;
+    const reshape_fn: *const fn (*anyopaque, CT, []const i64) anyerror!CT = &primReshapeOp;
+    const dot_general_fn: *const fn (*anyopaque, CT, CT, []const i64, []const i64, []const u8, []const u8, []const u8, []const u8) anyerror!CT = &primDotGeneralOp;
+    const to_float_batch_fn: *const fn (*anyopaque, []const CT, std.mem.Allocator) anyerror![][]f32 = &toFloat32BatchOp;
     _ = backend_kind_fn;
     _ = linear_fn;
     _ = linear_no_bias_fn;
     _ = rms_norm_fn;
     _ = rope_per_item_fn;
+    _ = subtract_fn;
+    _ = divide_fn;
+    _ = exp_fn;
+    _ = log_fn;
+    _ = less_than_fn;
+    _ = where_select_fn;
+    _ = reshape_fn;
+    _ = dot_general_fn;
+    _ = to_float_batch_fn;
     _ = vtable;
 }
 
@@ -1339,4 +3408,158 @@ test "cuda shape helpers reject incompatible shapes" {
     try std.testing.expect(try checkedMul(2, 3) == 6);
     try std.testing.expect(sameShape(&.{ 2, 3 }, &.{ 2, 3 }));
     try std.testing.expect(!sameShape(&.{ 2, 3 }, &.{ 3, 2 }));
+    try std.testing.expect(axesArePrefix(&.{ 0, 1 }));
+    try std.testing.expect(!axesArePrefix(&.{ 1, 0 }));
+    try std.testing.expect(isFullSlice(&.{ 0, 0 }, &.{ 2, 3 }, &.{ 1, 1 }, &.{ 2, 3 }));
+    try std.testing.expect(!isFullSlice(&.{ 1, 0 }, &.{ 2, 3 }, &.{ 1, 1 }, &.{ 2, 3 }));
+
+    const shape = try sharedLinearDotOutputShape(std.testing.allocator, &.{ 2, 3, 4 }, 2, 7);
+    defer std.testing.allocator.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 7 }, shape);
+
+    const gather_shape = try gatherOutputShape(std.testing.allocator, &.{ 2, 3, 4 }, 1, &.{ 5, 6 }, 30);
+    defer std.testing.allocator.free(gather_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 5, 6, 4 }, gather_shape);
+
+    const scalar_gather_shape = try gatherOutputShape(std.testing.allocator, &.{ 2, 3, 4 }, 1, &.{}, 1);
+    defer std.testing.allocator.free(scalar_gather_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, scalar_gather_shape);
+
+    const all_ones_gather_shape = try gatherOutputShape(std.testing.allocator, &.{ 2, 3, 4 }, 1, &.{ 1, 1 }, 1);
+    defer std.testing.allocator.free(all_ones_gather_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 1, 4 }, all_ones_gather_shape);
+
+    const argmax_keep_shape = try argMaxOutputShape(std.testing.allocator, &.{ 2, 3, 4 }, 2, true);
+    defer std.testing.allocator.free(argmax_keep_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 1 }, argmax_keep_shape);
+
+    const argmax_drop_shape = try argMaxOutputShape(std.testing.allocator, &.{ 2, 3, 4 }, 2, false);
+    defer std.testing.allocator.free(argmax_drop_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, argmax_drop_shape);
+}
+
+test "cuda reduction shape helpers cover last-dim and all-axes patterns" {
+    try std.testing.expect(isAllAxesReduction(&.{ 0, 1 }, 2));
+    try std.testing.expect(isAllAxesReduction(&.{ 1, 0 }, 2));
+    try std.testing.expect(!isAllAxesReduction(&.{1}, 2));
+    try std.testing.expect(!isAllAxesReduction(&.{ 0, 0 }, 2));
+
+    const last_dim = try reduceOutputShape(std.testing.allocator, &.{ 2, 3, 4 }, &.{2});
+    defer std.testing.allocator.free(last_dim);
+    try std.testing.expect(sameShape(last_dim, &.{ 2, 3, 1 }));
+
+    const all_axes = try reduceOutputShape(std.testing.allocator, &.{ 2, 3 }, &.{ 0, 1 });
+    defer std.testing.allocator.free(all_axes);
+    try std.testing.expect(sameShape(all_axes, &.{ 1, 1 }));
+}
+
+test "cuda shape-only planners identify safe device copies" {
+    try std.testing.expect(isAliasableTranspose(&.{ 2, 3 }, &.{ 0, 1 }));
+    try std.testing.expect(isAliasableTranspose(&.{ 2, 1, 3 }, &.{ 0, 2, 1 }));
+    try std.testing.expect(!isAliasableTranspose(&.{ 2, 3 }, &.{ 1, 0 }));
+
+    const transposed = try transposeAliasShape(std.testing.allocator, &.{ 2, 1, 3 }, &.{ 0, 2, 1 });
+    defer std.testing.allocator.free(transposed);
+    try std.testing.expect(sameShape(transposed, &.{ 2, 3, 1 }));
+
+    try std.testing.expect(isIdentityBroadcast(&.{ 2, 3 }, &.{ 0, 1 }, &.{ 2, 3 }));
+    try std.testing.expect(!isIdentityBroadcast(&.{ 2, 3 }, &.{1}, &.{3}));
+    try std.testing.expect(!isIdentityBroadcast(&.{ 2, 3 }, &.{ 0, 1 }, &.{ 1, 3 }));
+
+    const broadcast = (try planBroadcastInDim(&.{ 2, 2, 3 }, &.{ 0, 2 }, &.{ 2, 3 }, 6)).?;
+    try std.testing.expectEqual(@as(usize, 3), broadcast.target_rank);
+    try std.testing.expectEqual(@as(usize, 2), broadcast.input_rank);
+    try std.testing.expectEqual(@as(usize, 12), broadcast.out_count);
+    try std.testing.expectEqual(@as(usize, 6), broadcast.input_count);
+
+    const scalar_broadcast = (try planBroadcastInDim(&.{ 2, 3 }, &.{}, &.{}, 1)).?;
+    try std.testing.expectEqual(@as(usize, 6), scalar_broadcast.out_count);
+    try std.testing.expectEqual(@as(usize, 0), scalar_broadcast.input_rank);
+
+    try std.testing.expectError(error.InvalidShape, planBroadcastInDim(&.{ 2, 3 }, &.{ 0, 0 }, &.{ 2, 3 }, 6));
+    try std.testing.expectError(error.InvalidShape, planBroadcastInDim(&.{ 2, 3 }, &.{1}, &.{2}, 2));
+
+    const where_broadcast = (try planBroadcastShape3(&.{ 1, 4 }, &.{ 2, 4 }, &.{}, 4, 8, 1)).?;
+    try std.testing.expectEqual(@as(usize, 2), where_broadcast.rank);
+    try std.testing.expectEqual(@as(usize, 8), where_broadcast.count);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, where_broadcast.shape[0..where_broadcast.rank]);
+    try std.testing.expect((try planBroadcastShape3(&.{ 2, 3 }, &.{ 3, 2 }, &.{}, 6, 6, 1)) == null);
+
+    try std.testing.expect(isFullSlice(&.{ 0, 0 }, &.{ 2, 3 }, &.{ 1, 1 }, &.{ 2, 3 }));
+    try std.testing.expect(isFullSlice(&.{ 0, 0 }, &.{ -1, -1 }, &.{ 1, 1 }, &.{ 2, 3 }));
+    try std.testing.expect(!isFullSlice(&.{ 1, 0 }, &.{ 2, 3 }, &.{ 1, 1 }, &.{ 2, 3 }));
+    try std.testing.expect(!isFullSlice(&.{ 0, 0 }, &.{ 2, 3 }, &.{ 2, 1 }, &.{ 2, 3 }));
+}
+
+test "cuda softmax last-dimension resolver handles explicit and inferred dims" {
+    var explicit = CudaTensor{
+        .buffer = .{},
+        .dtype = .f32,
+        .shape = @constCast(&[_]i64{ 2, 3 }),
+        .elem_count = 6,
+    };
+    try std.testing.expectEqual(@as(?usize, 3), resolveSoftmaxLastDimCuda(&explicit, 0));
+    try std.testing.expectEqual(@as(?usize, 2), resolveSoftmaxLastDimCuda(&explicit, 2));
+
+    var inferred = CudaTensor{
+        .buffer = .{},
+        .dtype = .f32,
+        .shape = @constCast(&[_]i64{ 2, -1 }),
+        .elem_count = 10,
+    };
+    try std.testing.expectEqual(@as(?usize, 5), resolveSoftmaxLastDimCuda(&inferred, 0));
+}
+
+test "cuda strict mode blocks host training fallback boundary" {
+    var fake = CudaCompute{
+        .allocator = std.testing.allocator,
+        .ctx = undefined,
+        .kernels = undefined,
+        .allow_host_training_fallbacks = false,
+    };
+    var fallback: NativeFallback = undefined;
+    try std.testing.expectError(error.CudaHostTrainingFallbackDisabled, fallback.init(&fake, ""));
+}
+
+test "cuda dot general planner maps folded 2d matmul to linear dims" {
+    const plan = (try planDotGeneral2DLinear(
+        &.{ 4, 8 },
+        &.{ 16, 8 },
+        &.{1},
+        &.{1},
+        &.{},
+        &.{},
+    )).?;
+    try std.testing.expectEqual(@as(usize, 4), plan.rows);
+    try std.testing.expectEqual(@as(usize, 8), plan.in_dim);
+    try std.testing.expectEqual(@as(usize, 16), plan.out_dim);
+
+    try std.testing.expect((try planDotGeneral2DLinear(
+        &.{ 4, 8 },
+        &.{ 8, 16 },
+        &.{1},
+        &.{0},
+        &.{},
+        &.{},
+    )) == null);
+    try std.testing.expectError(error.InvalidShape, planDotGeneral2DLinear(
+        &.{ 4, 8 },
+        &.{ 16, 7 },
+        &.{1},
+        &.{1},
+        &.{},
+        &.{},
+    ));
+}
+
+test "cuda concat planner only accepts last-dimension concat" {
+    const plan = (try planConcatLastDim(&.{ 2, 3, 4 }, &.{ 2, 3, 5 }, 2)).?;
+    try std.testing.expectEqual(@as(usize, 6), plan.rows);
+    try std.testing.expectEqual(@as(usize, 4), plan.dim_a);
+    try std.testing.expectEqual(@as(usize, 5), plan.dim_b);
+    try std.testing.expectEqual(@as(usize, 9), plan.out_dim);
+    try std.testing.expectEqual(@as(usize, 54), plan.out_count);
+
+    try std.testing.expect((try planConcatLastDim(&.{ 2, 3, 4 }, &.{ 2, 3, 5 }, 1)) == null);
+    try std.testing.expectError(error.InvalidShape, planConcatLastDim(&.{ 2, 3, 4 }, &.{ 2, 4, 5 }, 2));
 }

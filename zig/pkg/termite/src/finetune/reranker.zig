@@ -17,6 +17,7 @@ const reranker_data = @import("reranker_data.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 const backends = @import("../backends/backends.zig");
 const runtime = @import("../runtime/root.zig");
+const build_options = @import("build_options");
 
 pub const EvalSummary = struct {
     examples_evaluated: usize,
@@ -34,7 +35,16 @@ pub const BackendChoice = enum {
     auto,
     native,
     mlx,
+    cuda,
 };
+
+pub fn parseBackendChoice(value: []const u8) ?BackendChoice {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "blas") or std.ascii.eqlIgnoreCase(value, "native")) return .native;
+    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
+    if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
+    return null;
+}
 
 pub const RuntimeEvalResult = struct {
     summary: EvalSummary,
@@ -281,10 +291,27 @@ fn computeOneGroupedRankingMetrics(
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => &.{ backends.BackendType.mlx, backends.BackendType.native },
+        .auto => if (backends.gpu_inventory.cudaRuntimeAvailable() and build_options.enable_mlx)
+            &.{ backends.BackendType.cuda, backends.BackendType.mlx, backends.BackendType.native }
+        else if (backends.gpu_inventory.cudaRuntimeAvailable())
+            &.{ backends.BackendType.cuda, backends.BackendType.native }
+        else if (build_options.enable_mlx)
+            &.{ backends.BackendType.mlx, backends.BackendType.native }
+        else
+            &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .mlx => &.{backends.BackendType.mlx},
+        .cuda => &.{backends.BackendType.cuda},
     };
+}
+
+test "reranker backend parser accepts cuda" {
+    try std.testing.expectEqual(BackendChoice.auto, parseBackendChoice("auto").?);
+    try std.testing.expectEqual(BackendChoice.native, parseBackendChoice("blas").?);
+    try std.testing.expectEqual(BackendChoice.native, parseBackendChoice("native").?);
+    try std.testing.expectEqual(BackendChoice.mlx, parseBackendChoice("mlx").?);
+    try std.testing.expectEqual(BackendChoice.cuda, parseBackendChoice("cuda").?);
+    try std.testing.expect(parseBackendChoice("bogus") == null);
 }
 
 test "compute reranker eval summary and grouped metrics" {

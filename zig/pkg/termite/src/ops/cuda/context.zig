@@ -28,6 +28,7 @@ pub const DeviceInfo = struct {
     name_len: usize = 0,
     compute_major: i32 = 0,
     compute_minor: i32 = 0,
+    total_memory_bytes: u64 = 0,
 
     pub fn nameSlice(self: *const DeviceInfo) []const u8 {
         return self.name[0..self.name_len];
@@ -62,6 +63,9 @@ pub const CudaContext = struct {
         info.name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
 
         try driver.check(driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device));
+        var total_memory: usize = 0;
+        try driver.check(driver.fns.cuDeviceTotalMem(&total_memory, device));
+        info.total_memory_bytes = total_memory;
 
         var ctx: CUcontext = null;
         try driver.check(driver.fns.cuDevicePrimaryCtxRetain(&ctx, device));

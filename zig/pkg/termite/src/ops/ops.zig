@@ -1467,6 +1467,8 @@ pub const ComputeBackend = struct {
         dotGeneralOp: ?*const fn (ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT = null,
         /// Scatter-add: accumulate updates into a zeroed output using indices.
         scatterAddOp: ?*const fn (ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT = null,
+        /// Scatter-add into an existing destination tensor.
+        scatterAddIntoOp: ?*const fn (ctx: *anyopaque, dest: CT, values: CT, indices: CT, dest_shape: []const i64, values_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT = null,
         /// Gather elements along an axis using indices.
         gatherOp: ?*const fn (ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT = null,
         /// Slice a tensor with starts/limits/strides per axis.
@@ -2943,6 +2945,10 @@ pub const ComputeBackend = struct {
     }
     pub fn primScatterAdd(self: *const ComputeBackend, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) !CT {
         if (self.vtable.scatterAddOp) |f| return f(self.ptr, input, indices, input_shape, indices_shape, axis);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn primScatterAddInto(self: *const ComputeBackend, dest: CT, values: CT, indices: CT, dest_shape: []const i64, values_shape: []const i64, indices_shape: []const i64, axis: u8) !CT {
+        if (self.vtable.scatterAddIntoOp) |f| return f(self.ptr, dest, values, indices, dest_shape, values_shape, indices_shape, axis);
         return error.UnsupportedPrimitiveOp;
     }
     pub fn primGather(self: *const ComputeBackend, input: CT, indices: CT, axis: u8, input_shape: []const i64) !CT {

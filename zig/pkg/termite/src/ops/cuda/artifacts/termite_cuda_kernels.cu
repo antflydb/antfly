@@ -524,10 +524,149 @@ extern "C" __global__ void termite_elementwise_f32(
         out = x / (1.0f + expf(-1.702f * x));
     } else if (op == 6u) {
         out = 1.0f / (1.0f + expf(-x));
+    } else if (op == 8u) {
+        out = x < y ? 1.0f : 0.0f;
+    } else if (op == 9u) {
+        out = x / y;
+    } else if (op == 10u) {
+        out = expf(x);
+    } else if (op == 11u) {
+        out = logf(x);
+    } else if (op == 12u) {
+        out = sqrtf(x);
+    } else if (op == 13u) {
+        out = rsqrtf(x);
+    } else if (op == 14u) {
+        out = fabsf(x);
+    } else if (op == 15u) {
+        out = sinf(x);
+    } else if (op == 16u) {
+        out = cosf(x);
+    } else if (op == 17u) {
+        out = erff(x);
+    } else if (op == 18u) {
+        out = x - y;
     } else {
         out = tanhf(x);
     }
     dst[i] = out;
+}
+
+extern "C" __global__ void termite_softmax_lastdim_f32(
+    float* dst,
+    const float* input,
+    unsigned int rows,
+    unsigned int dim,
+    unsigned int log_mode
+) {
+    __shared__ float scratch[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int row = blockIdx.x;
+    if (row >= rows || dim == 0u) return;
+
+    unsigned int base = row * dim;
+    float local_max = -3.402823466e+38f;
+    for (unsigned int j = tid; j < dim; j += 256u) {
+        float v = input[base + j];
+        local_max = fmaxf(local_max, v);
+    }
+    scratch[tid] = local_max;
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        __syncthreads();
+    }
+
+    float max_val = scratch[0];
+    float local_sum = 0.0f;
+    for (unsigned int j = tid; j < dim; j += 256u) {
+        local_sum += expf(input[base + j] - max_val);
+    }
+    scratch[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+
+    float log_sum = max_val + logf(scratch[0]);
+    for (unsigned int j = tid; j < dim; j += 256u) {
+        float z = input[base + j] - log_sum;
+        dst[base + j] = log_mode != 0u ? z : expf(z);
+    }
+}
+
+extern "C" __global__ void termite_reduce_lastdim_f32(
+    float* dst,
+    const float* input,
+    unsigned int rows,
+    unsigned int dim,
+    unsigned int op
+) {
+    __shared__ float scratch[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int row = blockIdx.x;
+    if (row >= rows || dim == 0u) return;
+
+    unsigned int base = row * dim;
+    float local = op == 1u ? -3.402823466e+38f : 0.0f;
+    for (unsigned int j = tid; j < dim; j += 256u) {
+        float v = input[base + j];
+        if (op == 1u) {
+            local = fmaxf(local, v);
+        } else {
+            local += v;
+        }
+    }
+    scratch[tid] = local;
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            if (op == 1u) {
+                scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            } else {
+                scratch[tid] += scratch[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        float out = scratch[0];
+        if (op == 2u) out /= (float)dim;
+        dst[row] = out;
+    }
+}
+
+extern "C" __global__ void termite_broadcast_in_dim_f32(
+    float* dst,
+    const float* input,
+    unsigned int out_count,
+    unsigned int out_rank,
+    unsigned int in_rank,
+    const unsigned int* target_shape,
+    const unsigned int* input_shape,
+    const unsigned int* axes
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= out_count) return;
+
+    unsigned int coords[8];
+    unsigned int tmp = idx;
+    for (int d = (int)out_rank - 1; d >= 0; --d) {
+        const unsigned int size = target_shape[d];
+        coords[d] = size == 0u ? 0u : tmp % size;
+        tmp = size == 0u ? 0u : tmp / size;
+    }
+
+    unsigned int in_offset = 0u;
+    for (unsigned int j = 0u; j < in_rank; ++j) {
+        const unsigned int axis = axes[j];
+        const unsigned int dim = input_shape[j];
+        unsigned int coord = coords[axis];
+        if (dim == 1u) coord = 0u;
+        in_offset = in_offset * dim + coord;
+    }
+    dst[idx] = input[in_offset];
 }
 
 extern "C" __global__ void termite_embedding_lookup_f32(
@@ -561,6 +700,59 @@ extern "C" __global__ void termite_take_rows_f32(
     unsigned int col = idx - row * dim;
     unsigned int src_row = row_ids[row];
     dst[idx] = src_row < source_rows ? input[src_row * dim + col] : 0.0f;
+}
+
+extern "C" __global__ void termite_scatter_add_rows_f32(
+    float* dst,
+    const float* input,
+    const unsigned int* row_ids,
+    unsigned int out_rows,
+    unsigned int rows,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = rows * dim;
+    if (idx >= count) return;
+    unsigned int row = idx / dim;
+    unsigned int col = idx - row * dim;
+    unsigned int out_row = row_ids[row];
+    if (out_row >= out_rows) return;
+    atomicAdd(&dst[out_row * dim + col], input[idx]);
+}
+
+extern "C" __global__ void termite_transpose2d_f32(
+    float* dst,
+    const float* input,
+    unsigned int rows,
+    unsigned int cols
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = rows * cols;
+    if (idx >= count) return;
+    unsigned int row = idx / cols;
+    unsigned int col = idx - row * cols;
+    dst[col * rows + row] = input[idx];
+}
+
+extern "C" __global__ void termite_argmax_lastdim_f32(
+    float* dst,
+    const float* input,
+    unsigned int rows,
+    unsigned int dim
+) {
+    unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || dim == 0u) return;
+    unsigned int base = row * dim;
+    float max_val = input[base];
+    unsigned int max_idx = 0u;
+    for (unsigned int col = 1u; col < dim; ++col) {
+        float value = input[base + col];
+        if (value > max_val) {
+            max_val = value;
+            max_idx = col;
+        }
+    }
+    dst[row] = (float)max_idx;
 }
 
 extern "C" __global__ void termite_gliner_word_embeddings_f32(

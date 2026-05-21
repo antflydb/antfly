@@ -105,15 +105,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
-    return null;
+    return reranker_head.parseBackendChoice(value);
 }
 
 fn printUsage() void {
     print(
-        \\usage: train-eval-reranker-head <model-dir> <train-jsonl-or-dir> <eval-jsonl-or-dir> <out-dir> [train-split] [eval-split] [--backend auto|blas|mlx] [--max-examples N] [--epochs N] [--learning-rate LR]
+        \\usage: train-eval-reranker-head <model-dir> <train-jsonl-or-dir> <eval-jsonl-or-dir> <out-dir> [train-split] [eval-split] [--backend auto|cuda|blas|mlx] [--max-examples N] [--epochs N] [--learning-rate LR]
         \\example: train-eval-reranker-head /tmp/bge-reranker /tmp/train /tmp/eval /tmp/out train eval --backend mlx --max-examples 128 --epochs 2 --learning-rate 0.0005
         \\
     , .{});
