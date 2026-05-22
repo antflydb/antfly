@@ -444,6 +444,13 @@ pub const IndexSnapshot = struct {
         return true;
     }
 
+    pub fn hasInvertedField(self: *const IndexSnapshot, field: []const u8) !bool {
+        for (self.segments) |*seg| {
+            if (try seg.reader.invertedIndex(field) != null) return true;
+        }
+        return false;
+    }
+
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
         if (self.global_doc_count == 0) return 0;
         const mutable = @constCast(self);

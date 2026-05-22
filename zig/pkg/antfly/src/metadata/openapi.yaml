@@ -177,8 +177,8 @@ tags:
       Array of Antfly type strings specifying how to index a field. Multiple types create multiple field mappings:
 
       - **Single type**: `"x-antfly-types": ["text"]` - Creates standard text field
-      - **Multiple types**: `"x-antfly-types": ["text", "keyword"]` - Creates `fieldName` (text) and `fieldName__keyword`
-      - **With search-as-you-type**: `"x-antfly-types": ["text", "search_as_you_type"]` - Creates `fieldName` (text) and `fieldName__2gram`
+      - **Multiple types**: `"x-antfly-types": ["text", "keyword"]` - Creates `fieldName` (text) and `fieldName.keyword`
+      - **With search-as-you-type**: `"x-antfly-types": ["text", "search_as_you_type"]` - Creates `fieldName` (text), `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
 
       **Type Combination Rules**:
       - `text` and `html` are mutually exclusive (choose one as primary type)
@@ -198,7 +198,7 @@ tags:
         "x-antfly-include-in-all": ["title", "body", "description"]
       }
       ```
-      Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `link`) are included, and only the primary field (not `__keyword` or `__2gram` variants).
+      Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `link`) are included, and only the primary field (not `.keyword`, `._2gram`, `._3gram`, or `._index_prefix` variants).
 
       ## Antfly Types
 
@@ -206,7 +206,7 @@ tags:
       - `text` - Full-text searchable with tokenization and analysis. Use for articles, descriptions, searchable content.
       - `html` - Full-text searchable with HTML tag stripping. Use for HTML content.
       - `keyword` - Exact-match strings (not analyzed). Use for IDs, tags, categories, filters.
-      - `search_as_you_type` - Edge n-gram analyzer for autocomplete. Creates `fieldName__2gram` mapping.
+      - `search_as_you_type` - Search-as-you-type mappings for autocomplete. Creates `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix` mappings.
       - `link` - URL/link field (keyword analyzer).
 
       ### Numeric and Boolean Types
@@ -241,13 +241,15 @@ tags:
 
       When multiple types are specified, Antfly creates additional field mappings with suffixes:
       - **Primary field** (`text` or `html`): Uses original field name
-      - **Keyword variant**: `fieldName__keyword`
-      - **Search-as-you-type**: `fieldName__2gram`
+      - **Keyword variant**: `fieldName.keyword`
+      - **Search-as-you-type**: `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
 
       Example: `"x-antfly-types": ["text", "keyword", "search_as_you_type"]` creates:
       - `title` (text analyzer)
-      - `title__keyword` (keyword analyzer)
-      - `title__2gram` (edge n-gram analyzer)
+      - `title.keyword` (keyword analyzer)
+      - `title._2gram` (2-token shingle analyzer)
+      - `title._3gram` (3-token shingle analyzer)
+      - `title._index_prefix` (edge n-gram prefix analyzer)
 
       ## Best Practices
 
@@ -1097,16 +1099,16 @@ tags:
       }
       ```
 
-      **3. Query the __2gram field:**
+      **3. Query the ._index_prefix field:**
       ```json
       {
         "full_text_search": {
-          "query": "name__2gram:lap"
+          "query": "name._index_prefix:lap"
         }
       }
       ```
 
-      The `search_as_you_type` type creates an edge n-gram indexed field (suffixed with `__2gram`)
+      The `search_as_you_type` type creates an edge n-gram indexed field (suffixed with `._index_prefix`)
       that matches partial input as users type. For example, "lap" matches "laptop", "lapel", etc.
 
       ## Reindexing Data

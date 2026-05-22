@@ -1151,6 +1151,23 @@ Status as of 2026-05-19:
   possible, avoiding a repeated stored-ID scan inside each bool clause; final
   result shaping still keeps the doc-id/stored-filter postprocess as a
   compatibility backstop.
+- Public hybrid vector queries now route both text clauses and structured
+  filter/exclusion clauses to the active read-schema full-text index before
+  remote or vector-worker execution. The public dense fast parser is disabled
+  for requests that carry `full_text_search`, `filter_query`,
+  `exclusion_query`, named bindings, or internal doc-filter wire fields, so
+  those clauses cannot be silently dropped by a packed benchmark-style parse.
+  Default dynamic schema-less string fields now emit the same exact
+  `field.keyword` companion as the no-schema mapper, which lets public
+  structured term filters resolve through the full-text postings in provisioned
+  swarm tables instead of widening vector search. Dense and sparse native
+  constraint derivation also intersects `req.full_text` result doc sets before
+  vector scoring, so the public hybrid guardrail's text + metadata + exclusion
+  shape constrains HBC candidates rather than relying only on result
+  postprocessing. The remaining performance issue observed at 100k documents is
+  the cost of building the full-text-derived doc set itself; HBC is constrained
+  correctly, but full-text projection still executes a broad scored text query
+  to collect matching ordinals.
 - Full-text segments now carry an optional document-ordinal sidecar section in
   local stored-document order. Text backfill, incremental projection, and split
   rebuild paths populate or preserve the sidecar when identity-table coverage is
@@ -1517,40 +1534,25 @@ Status as of 2026-05-19:
   lever if we need more: persist field-backed sparse vectors, or a compact
   sparse replay artifact, at write time so catch-up does not have to reread and
   reparse full JSON documents.
-  Field-backed dense and sparse vectors now follow the artifact-backed write
-  path: configured vector fields are extracted at write time, stored as
-  embedding artifacts, and stripped from the persisted document. If stripping
-  removes every top-level field, the DB stores `{}` so document identity and
-  ordinal mappings still exist for vector hits and resolved filters. Dense and
-  sparse replay now collect artifact-backed embedding writes before document
-  field replay, then skip document-field vector extraction only for doc keys
-  already covered by those embedding artifacts. Legacy/backfill documents that
-  still carry vector fields in stored JSON continue to replay through the
-  document-field path. The sparse doc-map fallback now decodes doc numbers and
-  forward entries before closing the backing cursor, avoiding poisoned borrowed
-  slices during reopened bulk-segment filter projection. Zig intentionally
-  rejects `_summaries`; supported enrichment-backed document fields are
-  `_chunks` (generated chunk artifacts), `_embeddings`, and `_edges`.
-  Sparse embedding artifacts now use a planar compact payload
+  Field-backed dense and sparse vectors remain ordinary stored document fields.
+  Configured vector indexes still extract those fields during document replay and
+  indexing, but they do not turn `field: []` payloads into embedding artifacts or
+  strip them from persisted JSON. Explicit precomputed vectors use `_embeddings`,
+  which is the artifact upload boundary alongside generated `_chunks` and
+  `_edges`; Zig intentionally still rejects `_summaries`. This keeps benchmark
+  field-backed vector cases measuring JSON document extraction plus index apply,
+  while `_embeddings` cases measure artifact write/read/replay behavior. The
+  earlier local experiment that promoted field-backed vectors into artifacts was
+  reverted because it changed document round-tripping semantics.
+  Sparse embedding artifacts still use a planar compact payload
   (`count | indices[] | values[]`) instead of interleaved `(index,value)` pairs.
-  That keeps the artifact binary and lets replay borrow validated `[]const u32`
-  and `[]const f32` slices directly from batched artifact reads when alignment
-  and endian constraints allow it, falling back to allocated decode otherwise.
-  Replay keeps the artifact read transaction open while the sparse bulk loader
-  consumes borrowed slices. On the 10k deferred DOCID query profile after
-  field-backed vectors moved to artifacts, sparse artifact apply dropped from
-  about `3.5s` (`artifact_decode_ms ~= 3341`) to about `147ms`
-  (`artifact_decode_ms ~= 3`, `artifact_views=10000`,
-  `artifact_copies=0`); total sparse replay is now dominated by artifact-key
-  collection/read orchestration rather than sparse vector decode or sparse
-  index apply. The next replay-profile pass added a non-allocating direct
-  embedding-artifact key parser and lets direct sparse artifact replay borrow
-  doc-key slices from replay artifact keys, while retaining the allocating
-  fallback for derived chunk embeddings or escaped internal-key components. On
-  the same 10k deferred profile, sparse artifact collection dropped from about
-  `9.6s` to about `4ms`, and total sparse replay dropped to about `112ms`
-  (`embedding_apply_ms ~= 104`). The remaining multi-second deferred index wait
-  in that benchmark is now outside sparse vector artifact collection/decode/apply.
+  That keeps explicit/generated artifact payloads binary and lets replay borrow
+  validated `[]const u32` and `[]const f32` slices directly from batched artifact
+  reads when alignment and endian constraints allow it, falling back to allocated
+  decode otherwise. Replay keeps the artifact read transaction open while the
+  sparse bulk loader consumes borrowed slices. Artifact-key parser and borrowed
+  decode optimizations apply to `_embeddings` and derived chunk embeddings; the
+  field-backed sparse DOCID benchmark remains on the document-field replay path.
   Follow-up write-path work added `--bulk-load` to the DOCID query benchmark,
   routed benchmark loads through an internal primary-store bulk session, added
   append-oriented docstore bulk batches, batched text-projection ordinal lookup,
@@ -1598,15 +1600,14 @@ Status as of 2026-05-19:
   wait is mostly replay-window collection plus document collection/read
   overhead, not sparse replay or segment construction.
   Follow-up write-path cleanup now removes more per-document overhead from the
-  same measured phases: top-level artifact-backed vector fields use a raw JSON
-  strip fast path before falling back to the full parser, primary document keys
-  and identity doc-to-ordinal keys are allocated at exact size instead of going
-  through temporary array-list builders, all-new identity batches pre-reserve
-  their KV write capacity, and full-text replay ordinal lookups use the replay
-  arena for transient lookup keys instead of per-document long-lived
-  allocator/free cycles. These are mechanical hot-path reductions; the last
-  local end-to-end timing run was discarded because unrelated desktop load made
-  multiple already-optimized phases regress together.
+  same measured phases: primary document keys and identity doc-to-ordinal keys
+  are allocated at exact size instead of going through temporary array-list
+  builders, all-new identity batches pre-reserve their KV write capacity, and
+  full-text replay ordinal lookups use the replay arena for transient lookup
+  keys instead of per-document long-lived allocator/free cycles. These are
+  mechanical hot-path reductions; the last local end-to-end timing run was
+  discarded because unrelated desktop load made multiple already-optimized
+  phases regress together.
   The first optimization from that evidence specialized
   `ResolvedDocSet` ordinal set algebra: list/list operators now use direct
   sorted-array merge/intersection/difference, bitmap/bitmap operators use
@@ -1623,6 +1624,21 @@ Status as of 2026-05-19:
   artifact-presence marker and keeps a conservative in-memory flag so fresh
   document-only stores skip those scans, while generated-enrichment targets and
   upgraded stores without the marker continue to take the safe cleanup path.
+  Public query guardrail profiling then exposed a schema-less exact-filter
+  gap: term/terms filters on ordinary string fields could not safely use the
+  analyzed text postings, so hybrid vector queries fell back to widening
+  through stored documents. Schema-less text extraction now also emits a
+  bounded keyword companion using the Elasticsearch-style `.keyword` subfield,
+  and structured term filters rewrite to that companion only when the target
+  text snapshot actually contains the required postings. Explicit
+  `search_as_you_type` schema derivation now follows Elasticsearch-style
+  subfield names as well: `field._2gram`, `field._3gram`, and
+  `field._index_prefix`, with `._index_prefix` carrying the edge-ngram prefix
+  analyzer. Focused storage tests cover schema-less keyword projection,
+  schema serialization, explicit/dynamic search-as-you-type variants, and the
+  vector/filter ordinal bridge; 1k public query guardrail runs with and without
+  schema both kept dense raw hits constrained at `20` rather than widening to
+  the full document set.
 - The identity table now has a persisted table/shard/range namespace record.
   Existing single-store callers use the compatibility namespace (`0/0/0`),
   while Zig `OpenOptions.identity_namespace` can seed and validate a

@@ -58,6 +58,15 @@ const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const algebraic_ir = db_mod.algebraic.ir;
+
+fn benchQueryApiPhaseProfileEnabled() bool {
+    return std.c.getenv("ANTFLY_BENCH_QUERY_API_PHASES\x00") != null or
+        std.c.getenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY\x00") != null;
+}
+
+fn nsToUsFloat(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1000.0;
+}
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_planner = db_mod.algebraic.planner;
 
@@ -1838,9 +1847,15 @@ pub const BoundTableReadSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
 
         const start_ns = platform_time.monotonicNs();
+        const phase_profile = benchQueryApiPhaseProfileEnabled();
+        const prepare_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try self.reads.reads.prepareSearchWithConsistency(self.reads.group_id, req, consistency);
+        const prepare_ns = if (phase_profile) platform_time.monotonicNs() - prepare_start_ns else 0;
+        const snapshot_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         const snapshot_req = try self.db.searchRequestAtCurrentIdentityGeneration(req);
+        const snapshot_ns = if (phase_profile) platform_time.monotonicNs() - snapshot_start_ns else 0;
         var execution: LocalQueryExecution = .{ .request = snapshot_req, .result = undefined };
+        const search_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         if (profiledDenseQuery(snapshot_req)) |dense| {
             const profiled = try self.db.searchDenseProfiled(alloc, dense.req, dense.query);
             execution = .{
@@ -1854,6 +1869,7 @@ pub const BoundTableReadSource = struct {
                 .result = try self.db.search(alloc, snapshot_req),
             };
         }
+        const search_ns = if (phase_profile) platform_time.monotonicNs() - search_start_ns else 0;
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -1863,9 +1879,34 @@ pub const BoundTableReadSource = struct {
             .dense_search = execution.dense_profile,
         };
         defer meta.deinit(alloc);
+        const agg_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyBoundQueryAggregations(self, alloc, response_req, &result, &meta, consistency);
+        const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
+        const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
-        return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
+        const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
+        const encode_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
+        const response = try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
+        if (phase_profile) {
+            const encode_ns = platform_time.monotonicNs() - encode_start_ns;
+            const total_ns = platform_time.monotonicNs() - start_ns;
+            std.debug.print(
+                "antfly_bench_query_api_phases prepare_us={d:.3} snapshot_us={d:.3} search_us={d:.3} aggregation_us={d:.3} post_us={d:.3} encode_us={d:.3} total_us={d:.3} hits={d} total_hits={d} response_bytes={d}\n",
+                .{
+                    nsToUsFloat(prepare_ns),
+                    nsToUsFloat(snapshot_ns),
+                    nsToUsFloat(search_ns),
+                    nsToUsFloat(agg_ns),
+                    nsToUsFloat(post_ns),
+                    nsToUsFloat(encode_ns),
+                    nsToUsFloat(total_ns),
+                    result.hits.len,
+                    result.total_hits,
+                    response.json.len,
+                },
+            );
+        }
+        return response;
     }
 
     fn preflightQuery(
@@ -3741,7 +3782,7 @@ fn tableReadsValidateDocIdentityReadyForMultiGroup(
     group_count: usize,
 ) !void {
     if (group_count <= 1) return;
-    try table_catalog.validateDocIdentityReadyForTableStrict(alloc, catalog, table_name);
+    try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
 }
 
 fn rejectRemoteRouteResolvedDocFilter(req: db_mod.types.SearchRequest, route: table_router.GroupRoute) !void {

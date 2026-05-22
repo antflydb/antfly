@@ -1778,7 +1778,7 @@ pub fn parseQueryRequest(
 
     // Packed dense requests are benchmark-oriented and unusual in production.
     // Skip the extra JSON parse unless the request even mentions embeddings.
-    if (std.mem.indexOf(u8, body, "\"embeddings\"") != null) {
+    if (std.mem.indexOf(u8, body, "\"embeddings\"") != null and fastDensePublicQueryMayApply(body)) {
         if (try tryParseFastDensePublicQueryRequest(alloc, body)) |fast| {
             return fast;
         }
@@ -2048,6 +2048,30 @@ const FastDensePublicQueryRequest = struct {
     distance_over: ?f32 = null,
     distance_under: ?f32 = null,
 };
+
+fn fastDensePublicQueryMayApply(body: []const u8) bool {
+    const disallowed = [_][]const u8{
+        "\"query\"",
+        "\"full_text_search\"",
+        "\"filter_query\"",
+        "\"exclusion_query\"",
+        "\"merge_config\"",
+        "\"reranker\"",
+        "\"pruner\"",
+        "\"semantic_search\"",
+        "\"sparse\"",
+        "\"graph\"",
+        "\"join\"",
+        "\"with\"",
+        "\"_filter_query_json\"",
+        "\"_exclusion_query_json\"",
+        db_mod.doc_filter_wire.field_name,
+    };
+    for (disallowed) |needle| {
+        if (std.mem.indexOf(u8, body, needle) != null) return false;
+    }
+    return true;
+}
 
 fn tryParseFastDensePublicQueryRequest(
     alloc: std.mem.Allocator,

@@ -3203,7 +3203,6 @@ pub const DB = struct {
             }
             extracted[i] = try mapper.extractWrite(self.alloc, write.key, write.value);
             try augmentExtractedWriteWithGraphFieldEdges(self, self.alloc, write.key, write.value, &extracted[i]);
-            try extractConfiguredVectorFields(self, write.key, &extracted[i]);
             extracted_initialized += 1;
             for (extracted[i].dense_embeddings) |*embedding| {
                 if (embedding.artifact_key != null) continue;
@@ -8609,6 +8608,14 @@ pub const DB = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (set.* == .all) {
+            const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
+            const generation_covers_all_creates = if (generation) |at|
+                identity_stats.max_created_generation <= at
+            else
+                true;
+            if (identity_stats.complete and identity_stats.tombstone_ordinals == 0 and generation_covers_all_creates) return .all;
+        }
         return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
     }
 
@@ -11792,130 +11799,6 @@ fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.
 
 fn parsePatternRfc3339ToNs(text: []const u8) !?u64 {
     return try db_query_graph.parsePatternRfc3339ToNs(text);
-}
-
-fn extractConfiguredVectorFields(self: *DB, doc_key: []const u8, extracted: *mapper.ExtractedWrite) !void {
-    const doc_value = extracted.cleaned_value orelse return;
-
-    var stripped_fields = std.ArrayListUnmanaged([]const u8).empty;
-    defer stripped_fields.deinit(self.alloc);
-
-    for (self.core.index_manager.dense_indexes.items) |entry| {
-        if (hasDenseEmbeddingForIndex(extracted.dense_embeddings, entry.config.name)) continue;
-        if (try mapper.extractDenseVectorField(self.alloc, doc_value, entry.field_name, entry.dims)) |vector| {
-            var vector_owned = true;
-            errdefer if (vector_owned) self.alloc.free(vector);
-            const index_name = try self.alloc.dupe(u8, entry.config.name);
-            var index_name_owned = true;
-            errdefer if (index_name_owned) self.alloc.free(index_name);
-            const owned_doc_key = try self.alloc.dupe(u8, doc_key);
-            var doc_key_owned = true;
-            errdefer if (doc_key_owned) self.alloc.free(owned_doc_key);
-            var embedding = mapper.DenseEmbeddingWrite{
-                .index_name = index_name,
-                .doc_key = owned_doc_key,
-                .vector = vector,
-            };
-            vector_owned = false;
-            index_name_owned = false;
-            doc_key_owned = false;
-            var embedding_owned = true;
-            errdefer if (embedding_owned) freeDenseEmbeddingWrite(self.alloc, &embedding);
-            try appendDenseEmbeddingToExtracted(self.alloc, extracted, embedding);
-            embedding_owned = false;
-            try appendUniqueBorrowedField(self.alloc, &stripped_fields, entry.field_name);
-        }
-    }
-
-    for (self.core.index_manager.sparse_indexes.items) |entry| {
-        if (hasSparseEmbeddingForIndex(extracted.sparse_embeddings, entry.config.name)) continue;
-        if (try mapper.extractSparseVectorField(self.alloc, doc_value, entry.field_name)) |raw_sparse_vec| {
-            var sparse_vec = raw_sparse_vec;
-            var sparse_vec_owned = true;
-            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
-            const index_name = try self.alloc.dupe(u8, entry.config.name);
-            var index_name_owned = true;
-            errdefer if (index_name_owned) self.alloc.free(index_name);
-            const owned_doc_key = try self.alloc.dupe(u8, doc_key);
-            var doc_key_owned = true;
-            errdefer if (doc_key_owned) self.alloc.free(owned_doc_key);
-            var embedding = mapper.SparseEmbeddingWrite{
-                .index_name = index_name,
-                .doc_key = owned_doc_key,
-                .indices = sparse_vec.indices,
-                .values = sparse_vec.values,
-            };
-            sparse_vec_owned = false;
-            index_name_owned = false;
-            doc_key_owned = false;
-            var embedding_owned = true;
-            errdefer if (embedding_owned) freeSparseEmbeddingWrite(self.alloc, &embedding);
-            try appendSparseEmbeddingToExtracted(self.alloc, extracted, embedding);
-            embedding_owned = false;
-            try appendUniqueBorrowedField(self.alloc, &stripped_fields, entry.field_name);
-        }
-    }
-
-    if (stripped_fields.items.len == 0) return;
-    const stripped = try mapper.stripTopLevelFieldsAlloc(self.alloc, doc_value, stripped_fields.items);
-    self.alloc.free(doc_value);
-    extracted.cleaned_value = stripped orelse try self.alloc.dupe(u8, "{}");
-}
-
-fn hasDenseEmbeddingForIndex(embeddings: []const mapper.DenseEmbeddingWrite, index_name: []const u8) bool {
-    for (embeddings) |embedding| {
-        if (std.mem.eql(u8, embedding.index_name, index_name)) return true;
-    }
-    return false;
-}
-
-fn hasSparseEmbeddingForIndex(embeddings: []const mapper.SparseEmbeddingWrite, index_name: []const u8) bool {
-    for (embeddings) |embedding| {
-        if (std.mem.eql(u8, embedding.index_name, index_name)) return true;
-    }
-    return false;
-}
-
-fn appendUniqueBorrowedField(alloc: Allocator, fields: *std.ArrayListUnmanaged([]const u8), field_name: []const u8) !void {
-    for (fields.items) |existing| {
-        if (std.mem.eql(u8, existing, field_name)) return;
-    }
-    try fields.append(alloc, field_name);
-}
-
-fn appendDenseEmbeddingToExtracted(alloc: Allocator, extracted: *mapper.ExtractedWrite, embedding: mapper.DenseEmbeddingWrite) !void {
-    const old = extracted.dense_embeddings;
-    const next = try alloc.alloc(mapper.DenseEmbeddingWrite, old.len + 1);
-    @memcpy(next[0..old.len], old);
-    next[old.len] = embedding;
-    if (old.len > 0) alloc.free(old);
-    extracted.dense_embeddings = next;
-}
-
-fn appendSparseEmbeddingToExtracted(alloc: Allocator, extracted: *mapper.ExtractedWrite, embedding: mapper.SparseEmbeddingWrite) !void {
-    const old = extracted.sparse_embeddings;
-    const next = try alloc.alloc(mapper.SparseEmbeddingWrite, old.len + 1);
-    @memcpy(next[0..old.len], old);
-    next[old.len] = embedding;
-    if (old.len > 0) alloc.free(old);
-    extracted.sparse_embeddings = next;
-}
-
-fn freeDenseEmbeddingWrite(alloc: Allocator, embedding: *mapper.DenseEmbeddingWrite) void {
-    alloc.free(embedding.index_name);
-    alloc.free(embedding.doc_key);
-    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-    if (embedding.vector.len > 0) alloc.free(embedding.vector);
-    embedding.* = undefined;
-}
-
-fn freeSparseEmbeddingWrite(alloc: Allocator, embedding: *mapper.SparseEmbeddingWrite) void {
-    alloc.free(embedding.index_name);
-    alloc.free(embedding.doc_key);
-    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-    if (embedding.indices.len > 0) alloc.free(embedding.indices);
-    if (embedding.values.len > 0) alloc.free(embedding.values);
-    embedding.* = undefined;
 }
 
 fn buildDerivedBatch(
@@ -19161,8 +19044,8 @@ test "db vector full text filters project through doc identity ordinals" {
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"body\":\"reject winner\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
-            .{ .key = "doc:b", .value = "{\"body\":\"keep winner\",\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
+            .{ .key = "doc:a", .value = "{\"body\":\"reject winner\",\"status\":\"active\",\"tenant\":\"tenantb\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"keep winner\",\"status\":\"active\",\"tenant\":\"tenanta\",\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
         },
         .sync_level = .full_index,
     });
@@ -19181,6 +19064,19 @@ test "db vector full text filters project through doc identity ordinals" {
     try std.testing.expectEqual(@as(usize, 1), dense_filtered.result.hits.len);
     try std.testing.expectEqualStrings("doc:b", dense_filtered.result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 1), dense_filtered.profile.raw_hit_count);
+
+    var dense_term_conjunct_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tenant\":\"tenanta\"}}]}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_term_conjunct_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_term_conjunct_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_term_conjunct_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_term_conjunct_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_term_conjunct_filter.profile.raw_hit_count);
 
     var sparse_filtered = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -19214,6 +19110,94 @@ test "db vector full text filters project through doc identity ordinals" {
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 0), stats.doc_set_planning.missing_ordinal_coverage_count);
+}
+
+test "db default dynamic schema vector term filters project through doc identity ordinals" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const default_schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, default_schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha winner\",\"status\":\"active\",\"tenant\":\"tenantb\",\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta winner\",\"status\":\"active\",\"tenant\":\"tenanta\",\"embedding\":[10,0]}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha winner\",\"status\":\"active\",\"tenant\":\"tenanta\",\"embedding\":[20,0]}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"alpha winner\",\"status\":\"draft\",\"tenant\":\"tenanta\",\"embedding\":[30,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var dense_term_conjunct_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .filter_query_json = "{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tenant\":\"tenanta\"}}]}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_term_conjunct_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), dense_term_conjunct_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), dense_term_conjunct_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_term_conjunct_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 2), dense_term_conjunct_filter.profile.raw_hit_count);
+
+    var dense_text_and_term_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_query_json = "{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tenant\":\"tenanta\"}}]}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_text_and_term_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_text_and_term_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_text_and_term_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", dense_text_and_term_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_text_and_term_filter.profile.raw_hit_count);
+
+    var dense_text_exclusion_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_query_json = "{\"term\":{\"tenant\":\"tenanta\"}}",
+        .exclusion_query_json = "{\"term\":{\"status\":\"draft\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_text_exclusion_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_text_exclusion_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_text_exclusion_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", dense_text_exclusion_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_text_exclusion_filter.profile.raw_hit_count);
+
+    const text_index = db.core.index_manager.textIndex("ft_v1").?;
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "status.keyword", "active"));
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant.keyword", "tenanta"));
 }
 
 test "db non chunked search paths apply broad live doc filter" {
@@ -26988,7 +26972,7 @@ test "db document _embeddings update vector index and strip stored special field
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
-test "db field-backed vector indexes store artifacts and strip vector fields" {
+test "db dense and sparse field-backed vector indexes preserve vector fields without embedding artifacts" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -27013,6 +26997,7 @@ test "db field-backed vector indexes store artifacts and strip vector fields" {
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[0,1,0],\"sparse\":{\"indices\":[3],\"values\":[1.0]}}" },
+            .{ .key = "doc:c", .value = "{\"embedding\":[0,0,1],\"sparse\":{\"indices\":[11],\"values\":[1.0]}}" },
         },
         .sync_level = .full_index,
     });
@@ -27020,8 +27005,21 @@ test "db field-backed vector indexes store artifacts and strip vector fields" {
     const stored = (try db.get(alloc, "doc:a")).?;
     defer alloc.free(stored);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"title\":\"alpha\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stored, "\"embedding\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stored, "\"sparse\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"embedding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"sparse\"") != null);
+
+    const vector_only_stored = (try db.get(alloc, "doc:c")).?;
+    defer alloc.free(vector_only_stored);
+    try std.testing.expect(std.mem.indexOf(u8, vector_only_stored, "\"embedding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector_only_stored, "\"sparse\"") != null);
+    try std.testing.expect(!std.mem.eql(u8, vector_only_stored, "{}"));
+
+    const dense_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(dense_artifact_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, dense_artifact_key));
+    const sparse_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
+    defer alloc.free(sparse_artifact_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, sparse_artifact_key));
 
     var dense = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -27045,6 +27043,30 @@ test "db field-backed vector indexes store artifacts and strip vector fields" {
     });
     defer sparse.deinit();
     try std.testing.expectEqualStrings("doc:a", sparse.hits[0].id);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[0,0,1],\"sparse\":{\"indices\":[11],\"values\":[1.0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const updated = (try db.get(alloc, "doc:a")).?;
+    defer alloc.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"embedding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"sparse\"") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, dense_artifact_key));
+
+    var dense_after = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 0.0, 0.0, 1.0 },
+            .k = 3,
+        } },
+        .limit = 3,
+    });
+    defer dense_after.deinit();
+    try std.testing.expectEqualStrings("doc:a", dense_after.hits[0].id);
 }
 
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {
@@ -30156,7 +30178,7 @@ test "db prefix wildcard and regexp queries use text dictionary filters" {
     try std.testing.expectEqual(@as(u32, 2), regexp.total_hits);
 }
 
-test "db search_as_you_type schema emits 2gram field variants" {
+test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -30214,12 +30236,14 @@ test "db search_as_you_type schema emits 2gram field variants" {
     });
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "name__2gram", "sm"));
-    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name__2gram", "iph"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._2gram", "smartphone apple"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._3gram", "smartphone apple iphone"));
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "sm"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "iph"));
 
     var ng_results = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "name__2gram", .term = "sm" } },
+        .query = .{ .term = .{ .field = "name._index_prefix", .term = "sm" } },
         .limit = 10,
     });
     defer ng_results.deinit();
@@ -30340,14 +30364,14 @@ test "db versioned full text indexes reload matching schema mappings after reope
         const text_v0 = db.core.index_manager.textIndex("full_text_index_v0").?;
         const text_v1 = db.core.index_manager.textIndex("full_text_index_v1").?;
 
-        try std.testing.expectEqual(@as(u32, 2), try text_v0.snapshot().termDocFreq(alloc, "name__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 0), try text_v0.snapshot().termDocFreq(alloc, "title__2gram", "br"));
-        try std.testing.expectEqual(@as(u32, 1), try text_v1.snapshot().termDocFreq(alloc, "title__2gram", "br"));
-        try std.testing.expectEqual(@as(u32, 0), try text_v1.snapshot().termDocFreq(alloc, "name__2gram", "ga"));
+        try std.testing.expectEqual(@as(u32, 2), try text_v0.snapshot().termDocFreq(alloc, "name._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 0), try text_v0.snapshot().termDocFreq(alloc, "title._index_prefix", "br"));
+        try std.testing.expectEqual(@as(u32, 1), try text_v1.snapshot().termDocFreq(alloc, "title._index_prefix", "br"));
+        try std.testing.expectEqual(@as(u32, 0), try text_v1.snapshot().termDocFreq(alloc, "name._index_prefix", "ga"));
 
         var old_index_result = try db.search(alloc, .{
             .index_name = "full_text_index_v0",
-            .query = .{ .term = .{ .field = "name__2gram", .term = "ga" } },
+            .query = .{ .term = .{ .field = "name._index_prefix", .term = "ga" } },
             .limit = 10,
         });
         defer old_index_result.deinit();
@@ -30355,7 +30379,7 @@ test "db versioned full text indexes reload matching schema mappings after reope
 
         var new_index_result = try db.search(alloc, .{
             .index_name = "full_text_index_v1",
-            .query = .{ .term = .{ .field = "title__2gram", .term = "br" } },
+            .query = .{ .term = .{ .field = "title._index_prefix", .term = "br" } },
             .limit = 10,
         });
         defer new_index_result.deinit();
@@ -30719,8 +30743,8 @@ test "db patternProperties text fields survive reopen" {
         });
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title__2gram", "no"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title._index_prefix", "no"));
     }
 
     {
@@ -30735,13 +30759,13 @@ test "db patternProperties text fields survive reopen" {
         });
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_green.title__2gram", "de"));
-        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title__2gram", "na"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_green.title._index_prefix", "de"));
+        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title._index_prefix", "na"));
 
         var result = try db.search(alloc, .{
             .index_name = "ft_v1",
-            .query = .{ .term = .{ .field = "meta.tag_green.title__2gram", .term = "de" } },
+            .query = .{ .term = .{ .field = "meta.tag_green.title._index_prefix", .term = "de" } },
             .limit = 10,
         });
         defer result.deinit();
@@ -30924,7 +30948,7 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
 
     var explicit_ngram = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "explicit__2gram", .term = "sm" } },
+        .query = .{ .term = .{ .field = "explicit._index_prefix", .term = "sm" } },
         .limit = 10,
     });
     defer explicit_ngram.deinit();
@@ -30942,7 +30966,7 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
 
     var pattern_ngram = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "patterns.tag_blue.title__2gram", .term = "bl" } },
+        .query = .{ .term = .{ .field = "patterns.tag_blue.title._index_prefix", .term = "bl" } },
         .limit = 10,
     });
     defer pattern_ngram.deinit();

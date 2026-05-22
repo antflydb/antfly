@@ -6098,6 +6098,48 @@ test "table workflow can drive real metadata service topology and split setup" {
     try std.testing.expectEqual(@as(usize, 1), tables.len);
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 
+    try svc.upsertStore(.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+    });
+    try svc.runRound();
+
+    var group_statuses = [_]metadata_table_manager.GroupStatusReport{
+        .{
+            .group_id = 8801,
+            .local_leader = true,
+            .local_voter = true,
+            .voter_count = 1,
+        },
+    };
+    var runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{
+        .{
+            .table_id = 88,
+            .table_name = "docs",
+            .group_id = 8801,
+            .store_id = 1,
+            .node_id = 1,
+            .source = "test",
+            .freshness = "fresh",
+            .doc_identity = .{
+                .namespace_table_id = 88,
+                .namespace_shard_id = 8801,
+                .namespace_range_id = 8801,
+                .next_ordinal = 1,
+                .complete = true,
+            },
+        },
+    };
+    try svc.reportStoreStatus(.{
+        .store_id = 1,
+        .group_statuses = &group_statuses,
+        .runtime_statuses = &runtime_statuses,
+    });
+    try svc.runRound();
+
     try workflow.bootstrapDesiredFromCommitted(&svc);
     const split_summary = try workflow.requestSplit(&svc, .{
         .transition_id = 9401,

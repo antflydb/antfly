@@ -21,6 +21,8 @@ const common = antfly.common;
 const db_mod = antfly.db;
 const metadata_api = antfly.metadata_api;
 const metadata_table_manager = antfly.metadata.table_manager;
+const schema_mod = antfly.schema;
+const table_schema_api = antfly.table_schema;
 const platform_time = antfly.platform_time;
 const raft_mod = antfly.raft;
 const http_common = antfly.common.http.http_common;
@@ -1439,6 +1441,14 @@ fn openAndSeedDb(
 ) !db_mod.DB {
     var db = try db_mod.DB.open(alloc, path, .{});
     errdefer db.close();
+
+    if (cfg.with_schema) {
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, benchmark_schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+    }
 
     const index_cfg = try std.fmt.allocPrint(
         alloc,

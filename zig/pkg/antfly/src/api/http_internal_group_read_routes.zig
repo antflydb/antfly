@@ -294,7 +294,13 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 else => return try http_route_helpers.textResponse(alloc, 400, "invalid vector worker request"),
             };
             defer envelope.deinit(alloc);
-            const vector_req = table_reads.searchRequestFromVectorWorkerEnvelope(&envelope);
+            var vector_req = table_reads.searchRequestFromVectorWorkerEnvelope(&envelope);
+            defer if (vector_req.primary_text_index_name) |index_name| alloc.free(index_name);
+            ctx.query_router.route(vector_route.table_name, &vector_req) catch |err| switch (err) {
+                error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
+                error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return try http_route_helpers.textResponse(alloc, 500, "invalid table metadata"),
+                else => return err,
+            };
 
             var result = (reads.queryGroupLocal(
                 alloc,

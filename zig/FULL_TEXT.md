@@ -30,6 +30,30 @@ The old shape mixed two different concerns:
 That made `full_text` sync heavier than it needed to be and hid the real cost of
 forced compaction in normal maintenance timings.
 
+## Field Layout
+
+Full-text field names should follow Elasticsearch-style multi-field naming now
+that the Zig implementation is still prerelease.
+
+- Exact string companions use `.keyword`.
+- `search_as_you_type` emits `._2gram`, `._3gram`, and `._index_prefix`.
+- Prefix/autocomplete matching should target `._index_prefix`; the `._2gram`
+  and `._3gram` fields are shingle fields for multi-token search-as-you-type
+  matching.
+- Schema-less string indexing emits both the analyzed field and a bounded
+  `.keyword` companion so term/terms filters can use postings without widening
+  vector queries through stored-document scans.
+- Public filter rewriting may map term/terms filters to `.keyword` only when
+  the target text snapshot contains that field. If the postings are absent, the
+  query must fall back or fail closed rather than treating the missing field as
+  a valid empty result.
+
+This intentionally breaks from the old Zig-only `__keyword` / `__2gram` suffixes
+and from the Go/Bleve naming. The benefit is that the public query surface,
+schema-derived fields, dynamic-template variants, and schema-less exact fields
+all use one familiar subfield convention before compatibility constraints make
+the layout expensive to change.
+
 ## Task List
 
 - [x] Stop draining scheduled text merges inside normal sync-level waits.

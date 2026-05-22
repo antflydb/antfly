@@ -1349,7 +1349,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     row_filter_json: ?[]const u8,
     join: SupportedJoinRequest,
     foreign_sources: foreign_mod.PostgresSourceMap,
-) (public_table_http.TableApi.ExecuteQueryError || error{OutOfMemory})![]u8 {
+) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch })![]u8 {
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
     var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer contract_request.deinit();
@@ -1370,6 +1370,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     var primary_result = ctx.executePlainQuery(alloc, source, table_name, primary_body, row_filter_json) catch |err| switch (err) {
         error.InvalidQueryRequest => return error.InvalidQueryRequest,
         error.TableNotFound => return error.NotFound,
+        error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         else => return error.InternalFailure,
     };
     defer primary_result.deinit(alloc);
@@ -1380,6 +1381,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     if (hits_ptr.items.len == 0) return alloc.dupe(u8, primary_result.json) catch return error.InternalFailure;
     const plan = planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources) catch |err| switch (err) {
         error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+        error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         else => return error.InternalFailure,
     };
 
@@ -1387,6 +1389,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         if (executeSupportedDistributedJoinFinalized(ctx, job_store, alloc, source, join, hits_ptr.items, requested_left_fields, appended_left_field, plan) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             else => {
                 std.log.err("distributed shuffle join failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -1404,6 +1407,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     var right_result = executeSupportedRightJoinQuery(ctx, job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources) catch |err| switch (err) {
         error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
         error.TableNotFound => return error.NotFound,
+        error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         else => return error.InternalFailure,
     };
     defer right_result.deinit(alloc);
@@ -1754,7 +1758,7 @@ fn validateDistributedJoinDocIdentityReady(
 ) !void {
     for (snapshot.ranges) |range| {
         if (range.table_id != table_id) continue;
-        const status = findJoinMergedGroupStatus(snapshot.merged_group_statuses, range.group_id) orelse return error.DocIdentityNamespaceMismatch;
+        const status = findJoinMergedGroupStatus(snapshot.merged_group_statuses, range.group_id) orelse continue;
         if (status.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
         if (status.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
         if (status.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;

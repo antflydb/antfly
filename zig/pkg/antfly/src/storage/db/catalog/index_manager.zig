@@ -8533,7 +8533,14 @@ pub const IndexManager = struct {
 
         var out = std.ArrayListUnmanaged(u64).empty;
         errdefer out.deinit(alloc);
+        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null else false;
         for (ordinals) |ordinal| {
+            if (prefer_primary_mapping) {
+                if (try self.lookupDenseVectorIdByOrdinalTxn(&txn, index_name, ordinal)) |vector_id| {
+                    if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+                    continue;
+                }
+            }
             const before_len = out.items.len;
             try self.appendDenseVectorIdsForOrdinalAlloc(alloc, &out, &runtime_store.store, index_name, ordinal);
             if (out.items.len != before_len) continue;

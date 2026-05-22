@@ -2778,11 +2778,27 @@ pub const DataServer = struct {
     }
 
     fn identityNamespaceForSplitDestination(self: *DataServer, source_group_id: u64, destination_group_id: u64) !?antfly.db.DocIdentityNamespace {
-        var snapshot = try self.write_source.catalog.adminSnapshot();
-        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
-        if (findRangeByGroupId(snapshot.ranges, destination_group_id)) |range| return identityNamespaceFromRange(range);
-        const source = findRangeByGroupId(snapshot.ranges, source_group_id) orelse return null;
-        return identityNamespaceFromRange(source);
+        _ = destination_group_id;
+        return try self.identityNamespaceForLocalGroupDb(source_group_id);
+    }
+
+    fn identityNamespaceForLocalGroupDb(self: *DataServer, group_id: u64) !?antfly.db.DocIdentityNamespace {
+        const root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, group_id);
+        defer self.alloc.free(root_dir);
+
+        var db = antfly.db.DB.open(self.alloc, root_dir, .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .transaction_recovery = .{ .enabled = false },
+            .text_merge = .{ .enabled = false },
+            .backend_runtime = try self.ensureBackendRuntime(),
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer db.close();
+        return db.core.identity_namespace;
     }
 
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {

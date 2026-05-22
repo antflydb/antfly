@@ -28,6 +28,7 @@ const segment_mod = @import("../../../segment.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
+const mapper_mod = @import("../document_mapper.zig");
 const platform_time = @import("../../../platform/time.zig");
 const platform = @import("antfly_platform");
 const vectorindex_mod = @import("antfly_vectorindex");
@@ -1311,10 +1312,6 @@ fn deriveNativeDocIdConstraintsAlloc(
     var structured_filter_doc_sets = StructuredFilterDocSetCache{};
     defer structured_filter_doc_sets.deinit(alloc);
 
-    if (active_executor.apply_live_all_docs) {
-        try applyLiveAllDocFilterToNativeConstraintsAlloc(alloc, &out, active_executor);
-    }
-
     if (resolvedDocFilterFromRequest(req)) |filter| {
         try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, filter, active_executor);
     }
@@ -1372,6 +1369,18 @@ fn deriveNativeDocIdConstraintsAlloc(
             }
         }
         out.resolved_stored_filters = true;
+    }
+
+    if (req.full_text) |text_query| {
+        if (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, text_query)) |resolved| {
+            var owned_resolved = resolved;
+            defer owned_resolved.deinit(alloc);
+            const filter = doc_set.ResolvedDocFilter{
+                .include = owned_resolved,
+                .exclude = .none,
+            };
+            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+        }
     }
 
     if (req.filter_query_json.len > 0) {
@@ -1486,7 +1495,27 @@ fn deriveNativeDocIdConstraintsAlloc(
         }
     }
 
+    if (active_executor.apply_live_all_docs and !out.positive_filter) {
+        try applyLiveAllDocFilterToNativeConstraintsAlloc(alloc, &out, active_executor);
+    }
+
     return out;
+}
+
+fn collectFullTextResolvedDocSetAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    text_query: types.TextQuery,
+) !?doc_set.ResolvedDocSet {
+    const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+
+    return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
 }
 
 fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
@@ -1509,6 +1538,10 @@ fn applyResolvedDocFilterAlloc(
     const exclude_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &filter.exclude, executor, &live_exclude);
 
     if (exclude_set.* == .all) {
+        markNativeDocIdConstraintsEmpty(out, alloc);
+        return;
+    }
+    if (include_set.* == .none) {
         markNativeDocIdConstraintsEmpty(out, alloc);
         return;
     }
@@ -1652,6 +1685,10 @@ fn applyResolvedDocFilterToTextDocNumsAlloc(
     const exclude_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &filter.exclude, executor, &live_exclude);
 
     if (exclude_set.* == .all) {
+        markNativeDocIdConstraintsEmpty(out, alloc);
+        return;
+    }
+    if (include_set.* == .none) {
         markNativeDocIdConstraintsEmpty(out, alloc);
         return;
     }
@@ -1831,20 +1868,34 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
+    return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
+}
+
+fn collectSearchQueryResolvedDocSetAlloc(
+    alloc: Allocator,
+    arena_alloc: Allocator,
+    executor: StructuredFilterResolverExecutor,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    search_query: search_mod.SearchQuery,
+) !?doc_set.ResolvedDocSet {
     const snapshot = text_entry.persistent.snapshot();
-    const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
-    var result = try search_mod.execute(alloc, snapshot, .{
-        .query = search_query,
-        .k = k,
-        .offset = 0,
-        .include_stored = false,
-        .distributed_text_stats = req.distributed_text_stats,
-    });
-    defer result.deinit();
-    if (result.hits.len == 0) return .none;
+    if (!(try searchQueryCanUseSnapshot(
+        snapshot,
+        search_query,
+        text_entry.text_analysis,
+        text_entry.runtime_schema,
+    ))) return null;
+
+    const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
+    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    defer alloc.free(doc_nums);
+    if (doc_nums.len == 0) {
+        const empty: doc_set.ResolvedDocSet = .none;
+        return empty;
+    }
 
     if (snapshot.hasDocOrdinalCoverage()) {
-        if (try resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(alloc, snapshot, result.hits, executor)) |resolved| {
+        if (try resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(alloc, snapshot, doc_nums, executor)) |resolved| {
             return resolved;
         }
     }
@@ -1852,12 +1903,9 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     const resolve = executor.resolve_doc_ids_to_doc_set orelse return null;
     var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
     defer freeDocIdArrayList(alloc, &doc_ids);
-    for (result.hits) |hit| {
-        const id = hit.id orelse blk: {
-            const stored = snapshot.storedDoc(hit.doc_id) orelse continue;
-            break :blk stored.id;
-        };
-        try appendOwnedDocId(alloc, &doc_ids, id);
+    for (doc_nums) |doc_num| {
+        const stored = snapshot.storedDoc(doc_num) orelse continue;
+        try appendOwnedDocId(alloc, &doc_ids, stored.id);
     }
     return try resolve(executor.ctx, alloc, doc_ids.items, executor.identity_read_generation);
 }
@@ -1872,7 +1920,16 @@ fn resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(
     defer doc_nums.deinit(alloc);
     for (hits) |hit| try appendDocNum(alloc, &doc_nums, hit.doc_id);
 
-    const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums.items)) orelse return null;
+    return try resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(alloc, snapshot, doc_nums.items, executor);
+}
+
+fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    executor: StructuredFilterResolverExecutor,
+) !?doc_set.ResolvedDocSet {
+    const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums)) orelse return null;
     defer alloc.free(ordinals);
     if (ordinals.len == 0) return null;
 
@@ -1916,6 +1973,12 @@ fn collectStructuredFilterDocIdsAlloc(
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     const snapshot = text_entry.persistent.snapshot();
+    if (!(try searchQueryCanUseSnapshot(
+        snapshot,
+        search_query,
+        text_entry.text_analysis,
+        text_entry.runtime_schema,
+    ))) return null;
     const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
         .query = search_query,
@@ -1937,6 +2000,63 @@ fn collectStructuredFilterDocIdsAlloc(
         try appendOwnedDocId(alloc, &out, id);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn searchQueryCanUseSnapshot(
+    snapshot: *const index_mod.IndexSnapshot,
+    query: search_mod.SearchQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !bool {
+    return switch (query) {
+        .match_none,
+        .match_all,
+        .doc_id,
+        .doc_num,
+        => true,
+        .knn => false,
+        .hybrid => false,
+        .match => |item| try snapshot.hasInvertedField(item.field),
+        .phrase => |item| try snapshot.hasInvertedField(item.field),
+        .term_phrase => |item| try snapshot.hasInvertedField(item.field),
+        .multi_phrase => |item| try snapshot.hasInvertedField(item.field),
+        .term => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
+            try snapshot.hasInvertedField(item.field),
+        .fuzzy => |item| try snapshot.hasInvertedField(item.field),
+        .numeric_range => |item| try snapshot.hasInvertedField(item.field),
+        .date_range => |item| try snapshot.hasInvertedField(item.field),
+        .bool_field => |item| try snapshot.hasInvertedField(item.field),
+        .geo_distance => |item| try snapshot.hasInvertedField(item.field),
+        .geo_bbox => |item| try snapshot.hasInvertedField(item.field),
+        .term_range => |item| try snapshot.hasInvertedField(item.field),
+        .ip_range => |item| try snapshot.hasInvertedField(item.field),
+        .geo_shape => |item| try snapshot.hasInvertedField(item.field),
+        .prefix => |item| try snapshot.hasInvertedField(item.field),
+        .wildcard => |item| try snapshot.hasInvertedField(item.field),
+        .regexp => |item| try snapshot.hasInvertedField(item.field),
+        .bool_query => |item| {
+            for (item.must) |child| {
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+            }
+            for (item.should) |child| {
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+            }
+            for (item.must_not) |child| {
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+            }
+            return true;
+        },
+    };
+}
+
+fn queryFieldUsesKeywordAnalyzer(
+    field: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !bool {
+    if (std.mem.endsWith(u8, field, mapper_mod.schema_less_exact_field_suffix)) return true;
+    const analyzer = (try resolveQueryAnalyzer(field, null, text_analysis, runtime_schema)) orelse return false;
+    return analyzer.tokenizer == .keyword and analyzer.filters.len == 0 and analyzer.char_filters.len == 0;
 }
 
 fn resolveFilterTextIndexEntry(
@@ -2055,13 +2175,17 @@ fn patternFilterValueToSearchQuery(
 
     if (value.object.get("term")) |term| {
         const field_value = try singleFieldString(term, "term");
-        return .{ .term = .{ .field = field_value.field, .term = field_value.value } };
+        return .{ .term = .{
+            .field = try exactTermFilterFieldAlloc(alloc, field_value.field, text_analysis, runtime_schema),
+            .term = field_value.value,
+        } };
     }
     if (value.object.get("terms")) |terms| {
         const field_terms = try singleFieldTerms(alloc, terms);
+        const exact_field = try exactTermFilterFieldAlloc(alloc, field_terms.field, text_analysis, runtime_schema);
         const should = try alloc.alloc(search_mod.SearchQuery, field_terms.terms.len);
         for (field_terms.terms, 0..) |term, i| {
-            should[i] = .{ .term = .{ .field = field_terms.field, .term = term } };
+            should[i] = .{ .term = .{ .field = exact_field, .term = term } };
         }
         return .{ .bool_query = .{ .should = should, .min_should = 1 } };
     }
@@ -2188,6 +2312,17 @@ fn singleFieldString(value: std.json.Value, value_key: []const u8) !FieldString 
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .string) return error.InvalidArgument;
     return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.string };
+}
+
+fn exactTermFilterFieldAlloc(
+    alloc: Allocator,
+    field: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) ![]const u8 {
+    if (try queryFieldUsesKeywordAnalyzer(field, text_analysis, runtime_schema)) return field;
+    if (std.mem.endsWith(u8, field, mapper_mod.schema_less_exact_field_suffix)) return field;
+    return try mapper_mod.schemaLessExactFieldNameAlloc(alloc, field);
 }
 
 fn singleFieldTerms(alloc: Allocator, value: std.json.Value) !FieldTerms {
@@ -3857,9 +3992,12 @@ fn logBenchDenseQueryProfile(
 ) void {
     const estimated_leaves = estimateLeafCount(index_stats);
     std.log.info(
-        "antfly_bench_dense_query index={s} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} hbc_us={d} doc_key_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
+        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} hbc_us={d} doc_key_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
         .{
             req.index_name orelse "",
+            req.primary_text_index_name orelse "",
+            req.filter_query_json.len > 0,
+            req.exclusion_query_json.len > 0,
             dense.k,
             req.limit,
             req.offset,
@@ -4480,6 +4618,7 @@ fn resolveConfiguredFieldAnalyzerName(text_analysis: introducer_mod.TextAnalysis
 }
 
 fn resolveIndexedFieldAnalyzer(schema: runtime_schema_mod.TableSchema, field: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, field, mapper_mod.schema_less_exact_field_suffix)) return "keyword";
     if (resolveExplicitFieldAnalyzer(schema, field)) |analyzer| return analyzer;
     if (resolveDynamicRuleFieldAnalyzer(schema, field)) |analyzer| return analyzer;
     if (resolveDynamicTemplateFieldAnalyzer(schema, field)) |analyzer| return analyzer;
@@ -4624,7 +4763,7 @@ test "resolveIndexedFieldAnalyzer uses compiled explicit and dynamic mappings" {
                     },
                     .{
                         .path = "title",
-                        .emitted_name = "title__keyword",
+                        .emitted_name = "title.keyword",
                         .analyzer = "keyword",
                     },
                 },
@@ -4638,8 +4777,16 @@ test "resolveIndexedFieldAnalyzer uses compiled explicit and dynamic mappings" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._2gram",
+                                .analyzer = "search_as_you_type_2gram",
+                            },
+                            .{
+                                .suffix = "._3gram",
+                                .analyzer = "search_as_you_type_3gram",
+                            },
+                            .{
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -4651,8 +4798,10 @@ test "resolveIndexedFieldAnalyzer uses compiled explicit and dynamic mappings" {
     };
 
     try std.testing.expectEqualStrings("french", resolveIndexedFieldAnalyzer(schema, "title").?);
-    try std.testing.expectEqualStrings("keyword", resolveIndexedFieldAnalyzer(schema, "title__keyword").?);
-    try std.testing.expectEqualStrings("search_as_you_type", resolveIndexedFieldAnalyzer(schema, "meta.tag_blue.title__2gram").?);
+    try std.testing.expectEqualStrings("keyword", resolveIndexedFieldAnalyzer(schema, "title.keyword").?);
+    try std.testing.expectEqualStrings("search_as_you_type_2gram", resolveIndexedFieldAnalyzer(schema, "meta.tag_blue.title._2gram").?);
+    try std.testing.expectEqualStrings("search_as_you_type_3gram", resolveIndexedFieldAnalyzer(schema, "meta.tag_blue.title._3gram").?);
+    try std.testing.expectEqualStrings("search_as_you_type_index_prefix", resolveIndexedFieldAnalyzer(schema, "meta.tag_blue.title._index_prefix").?);
     try std.testing.expectEqualStrings("keyword", resolveIndexedFieldAnalyzer(schema, "meta.created_at").?);
     try std.testing.expectEqualStrings("standard", resolveIndexedFieldAnalyzer(schema, "body").?);
     try std.testing.expectEqualStrings("standard", resolveIndexedFieldAnalyzer(schema, "attributes.color").?);

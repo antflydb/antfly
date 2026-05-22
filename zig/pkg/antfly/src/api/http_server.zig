@@ -4317,7 +4317,7 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        return self.executePublicTableQueryDispatch(alloc, source, table_name, body, row_filter_json) catch |err| switch (err) {
+        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             else => {
@@ -4336,6 +4336,39 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
     ) ![]u8 {
         return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null);
+    }
+
+    fn executePublicTableQueryDispatchWithReadinessRetry(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        body: []const u8,
+        row_filter_json: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) ![]u8 {
+        const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_poll_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            return self.executePublicTableQueryDispatchWithIdentity(
+                alloc,
+                source,
+                table_name,
+                body,
+                row_filter_json,
+                authenticated_identity,
+            ) catch |err| switch (err) {
+                error.DocIdentityNamespaceMismatch => {
+                    if (retry_timeout_ns > 0 and platform_time.monotonicNs() -| start_ns < retry_timeout_ns) {
+                        sleepNs(retry_poll_ns);
+                        continue;
+                    }
+                    return err;
+                },
+                else => return err,
+            };
+        }
     }
 
     fn executePublicTableQueryDispatchWithIdentity(
@@ -5219,7 +5252,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-        const response_body = self.executePublicTableQueryDispatchWithIdentity(
+        const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
             table_name,
@@ -5229,6 +5262,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");
