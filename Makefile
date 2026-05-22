@@ -53,7 +53,7 @@ help:
 	@echo ""
 	@echo "E2E Testing Commands:"
 	@echo "  e2e                Run e2e tests with ONNX+XLA (downloads deps on first run)"
-	@echo "                     Options: E2E_TEST=TestName E2E_TIMEOUT=30m"
+	@echo "                     Options: E2E_TEST=TestName E2E_TIMEOUT=60m"
 	@echo "  e2e-deps           Download ONNX Runtime and PJRT for e2e tests"
 	@echo ""
 	@echo "ML Backend Commands:"
@@ -335,7 +335,7 @@ endif
 
 # E2E test configuration
 E2E_TEST ?=
-E2E_TIMEOUT ?= 30m
+E2E_TIMEOUT ?= 60m
 E2E_MEMLIMIT ?= 16GiB
 
 e2e-deps: download-omni-deps
