@@ -1224,6 +1224,7 @@ fn detectFamily(model_type: []const u8) ModelFamily {
         .{ "qwen2_vl", ModelFamily.qwen2 },
         .{ "colqwen2", ModelFamily.qwen2 },
         .{ "qwen3", ModelFamily.qwen3 },
+        .{ "jina_embeddings_v5", ModelFamily.qwen3 },
         .{ "qwen3_5", ModelFamily.qwen3_5 },
         .{ "qwen3_5_text", ModelFamily.qwen3_5 },
         .{ "deepseek_v4", ModelFamily.deepseek_v4 },
@@ -1341,6 +1342,7 @@ fn applyFamilyDefaults(config: *Config) void {
 
 /// Detect if a model_type string is a decoder-only generative model.
 pub fn isGenerativeModel(model_type: []const u8) bool {
+    if (std.mem.eql(u8, model_type, "jina_embeddings_v5")) return false;
     return detectFamily(model_type) != .other;
 }
 
@@ -1523,6 +1525,36 @@ test "parse mistral config" {
     try std.testing.expectEqual(ModelFamily.mistral, config.family);
     try std.testing.expectEqual(@as(u32, 8), config.effectiveKVHeads());
     try std.testing.expectEqual(PositionEncoding.rope, config.position_encoding);
+}
+
+test "parse jina embeddings v5 config as qwen3 backbone" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "jina_embeddings_v5",
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 28,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 3072,
+        \\  "max_position_embeddings": 32768,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "rope_theta": 3500000,
+        \\  "tie_word_embeddings": true,
+        \\  "vocab_size": 151936
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(ModelFamily.qwen3, config.family);
+    try std.testing.expectEqual(@as(u32, 1024), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 28), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 8), config.effectiveKVHeads());
+    try std.testing.expectEqual(@as(u32, 128), config.headDim());
+    try std.testing.expectEqual(NormType.rms_norm, config.norm_type);
+    try std.testing.expectEqual(PositionEncoding.rope, config.position_encoding);
+    try std.testing.expectApproxEqAbs(@as(f32, 3_500_000.0), config.rope_theta, 1.0);
+    try std.testing.expect(config.weight_tying);
 }
 
 test "parse gemma3 multimodal config" {
@@ -1893,6 +1925,7 @@ test "isGenerativeModel" {
     try std.testing.expect(isGenerativeModel("bitnet-b1.58"));
     try std.testing.expect(isGenerativeModel("deepseek_v4"));
     try std.testing.expect(isGenerativeModel("deepseek-v4-flash"));
+    try std.testing.expect(!isGenerativeModel("jina_embeddings_v5"));
     try std.testing.expect(!isGenerativeModel("bert"));
     try std.testing.expect(!isGenerativeModel("t5"));
 }

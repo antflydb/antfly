@@ -1257,6 +1257,33 @@ pub fn hiddenForward(
     seq_len: usize,
     decode_context: ?*const DecodeContext,
 ) ![]f32 {
+    const hidden = try hiddenForwardResident(cb, allocator, config, input_ids, batch, seq_len, decode_context);
+    defer cb.free(hidden);
+    return cb.toFloat32(hidden, allocator);
+}
+
+pub fn hiddenForwardResident(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !CT {
+    return hiddenForwardResidentWithOverrides(cb, allocator, config, input_ids, batch, seq_len, decode_context, .{});
+}
+
+pub fn hiddenForwardResidentWithOverrides(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    raw_overrides: Layer0DecoderOverrides,
+) !CT {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -1271,7 +1298,7 @@ pub fn hiddenForward(
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
 
-    return hiddenForwardFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
+    return hiddenForwardFromEmbeddingsResidentWithOverrides(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors, raw_overrides);
 }
 
 pub fn hiddenForwardFromEmbeddings(
@@ -1284,6 +1311,35 @@ pub fn hiddenForwardFromEmbeddings(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) ![]f32 {
+    const hidden = try hiddenForwardFromEmbeddingsResident(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
+    defer cb.free(hidden);
+    return cb.toFloat32(hidden, allocator);
+}
+
+pub fn hiddenForwardFromEmbeddingsResident(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+) !CT {
+    return hiddenForwardFromEmbeddingsResidentWithOverrides(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors, .{});
+}
+
+pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    raw_overrides: Layer0DecoderOverrides,
+) !CT {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -1325,7 +1381,7 @@ pub fn hiddenForwardFromEmbeddings(
             layer,
             decode_context,
             ple_vectors,
-            .{},
+            raw_overrides,
             null,
             null,
             null,
@@ -1349,10 +1405,7 @@ pub fn hiddenForwardFromEmbeddings(
     if (final_hidden != hidden) cb.free(hidden);
     hidden = final_hidden;
 
-    // 5. Return hidden states
-    const result = try cb.toFloat32(hidden, allocator);
-    cb.free(hidden);
-    return result;
+    return hidden;
 }
 
 // --- Decoder block ---
@@ -3120,7 +3173,7 @@ fn decoderBlock(
     const kv_dim: usize = @as(usize, num_kv_heads) * head_dim;
     const q_dim: usize = @as(usize, num_heads) * head_dim;
     if (!disableDecoderRuntimeActivationDebug() and !shares_kv and config.family != .gpt2 and
-        config.family != .qwen3_5 and
+        config.family != .qwen3 and config.family != .qwen3_5 and
         attn_q_slot != null and attn_k_slot != null and attn_v_slot != null and
         attn_out_proj_linear_slot != null and mlp_gate_slot != null and
         mlp_up_slot != null and mlp_down_slot != null)
@@ -3283,7 +3336,24 @@ fn decoderBlock(
         };
         const k: CT, const v_omitted_local: bool, const v_local: CT = if (shares_kv)
             .{ try createZeroCT(cb, allocator, total * kv_dim), false, try createZeroCT(cb, allocator, total * kv_dim) }
-        else if (attn_k_slot != null and attn_v_slot != null and config.family != .gemma) blk_kv: {
+        else if (attn_k_slot != null and attn_v_slot != null and config.family == .qwen3) blk_kv: {
+            // The dense K/V pair slot path is not Qwen3-correct for Jina v5;
+            // individual prepared slots match the dynamic Metal projections.
+            const k_local = (try cb.decoderRuntimeApplyLinear(&.{
+                .slot = attn_k_slot.?,
+                .input = normed,
+                .in_dim = hidden_size,
+                .out_dim = num_kv_heads * head_dim,
+            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", &name_buf);
+            errdefer cb.free(k_local);
+            const v_local = (try cb.decoderRuntimeApplyLinear(&.{
+                .slot = attn_v_slot.?,
+                .input = normed,
+                .in_dim = hidden_size,
+                .out_dim = num_kv_heads * head_dim,
+            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", &name_buf);
+            break :blk_kv .{ k_local, false, v_local };
+        } else if (attn_k_slot != null and attn_v_slot != null and config.family != .gemma) blk_kv: {
             const kv = (try cb.decoderRuntimeApplyLinearPair(&.{
                 .slot_a = attn_k_slot.?,
                 .slot_b = attn_v_slot.?,
@@ -3438,7 +3508,7 @@ fn decoderBlock(
                     }
                 }
             },
-            .llama, .mistral, .qwen2, .bitnet => {
+            .llama, .mistral, .qwen2, .qwen3, .bitnet => {
                 if (mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null) {
                     const block_started_at = monotonicNowNs();
                     debug_timing_stats.gated_block_attempts += 1;
@@ -5394,14 +5464,16 @@ fn feedForward(
             // Gated FFN: gate = silu(x @ gate_w), up = x @ up_w, out = (gate * up) @ down_w
             const gate_w = try getFFNWeight(cb, config, layer, "gate", name_buf);
             defer cb.free(gate_w);
-            const gate_proj = try cb.linearNoBias(input, gate_w, total, hidden_size, inter_size);
+            const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
+            defer cb.free(up_w);
+            debug_timing_stats.ffn_project_pair_calls += 1;
+            const gate_up = try cb.linearNoBiasPair(input, gate_w, up_w, total, hidden_size, inter_size);
+            const gate_proj = gate_up.first;
             defer cb.free(gate_proj);
             const gate_act = try applyActivation(cb, config, gate_proj);
             defer cb.free(gate_act);
 
-            const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
-            defer cb.free(up_w);
-            const up_proj = try cb.linearNoBias(input, up_w, total, hidden_size, inter_size);
+            const up_proj = gate_up.second;
             defer cb.free(up_proj);
 
             const gated = try cb.multiply(gate_act, up_proj);
@@ -7004,11 +7076,29 @@ pub fn getModelWeight(cb: *const ComputeBackend, config: Config, name: []const u
         var buf: [256]u8 = undefined;
         const prefixed = try maybePrefixedModelName(config, name, &buf);
         return cb.getWeight(prefixed) catch |err| switch (err) {
-            error.MissingWeight => cb.getWeight(name),
+            error.MissingWeight => getModelWeightUnprefixedFallback(cb, name),
             else => err,
         };
     }
-    return cb.getWeight(name);
+    return getModelWeightUnprefixedFallback(cb, name);
+}
+
+fn getModelWeightUnprefixedFallback(cb: *const ComputeBackend, name: []const u8) !CT {
+    return cb.getWeight(name) catch |err| switch (err) {
+        error.MissingWeight => if (modelPrefixStrippedName(name)) |stripped| cb.getWeight(stripped) else err,
+        else => err,
+    };
+}
+
+fn modelPrefixStrippedName(name: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, "model.")) return null;
+    return name["model.".len..];
+}
+
+test "model weight fallback strips model prefix for bare Jina/Qwen backbones" {
+    try std.testing.expectEqualStrings("embed_tokens.weight", modelPrefixStrippedName("model.embed_tokens.weight") orelse return error.MissingFallback);
+    try std.testing.expectEqualStrings("layers.0.self_attn.q_proj.weight", modelPrefixStrippedName("model.layers.0.self_attn.q_proj.weight") orelse return error.MissingFallback);
+    try std.testing.expect(modelPrefixStrippedName("embed_tokens.weight") == null);
 }
 
 pub fn getFFNWeight(cb: *const ComputeBackend, config: Config, layer: usize, proj: []const u8, buf: *[256]u8) !CT {
@@ -7389,7 +7479,7 @@ pub fn applyActivation(cb: *const ComputeBackend, config: Config, input: CT) !CT
     };
 }
 
-fn decoderRuntimeActivationKind(activation: ActivationType) ops.DecoderRuntimeActivationKind {
+pub fn decoderRuntimeActivationKind(activation: ActivationType) ops.DecoderRuntimeActivationKind {
     return switch (activation) {
         .gelu => .gelu,
         .gelu_new => .gelu_new,
