@@ -3,12 +3,18 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 import { isProductEnabled } from "@/config/products";
 import { ApiConfigContext } from "@/contexts/api-config-context";
+import { getAntfarmRuntimeConfig } from "@/runtime-config";
 
 const getDefaultApiUrl = () => {
+  const configured = getAntfarmRuntimeConfig().apiUrl;
+  if (configured) return configured;
   return "/api/v1";
 };
 
 const getDefaultTermiteApiUrl = () => {
+  const configured = getAntfarmRuntimeConfig().termiteApiUrl;
+  if (configured) return configured;
+
   // In the antfly build, Termite is on a different server — proxy via /termite.
   // In the Termite-only build, the API is same-origin at /api/*.
   if (isProductEnabled("antfly")) {
@@ -21,13 +27,19 @@ const STORAGE_KEY = "antfarm-api-url";
 const TERMITE_STORAGE_KEY = "antfarm-termite-api-url";
 
 export function ApiConfigProvider({ children }: { children: ReactNode }) {
+  const runtimeConfig = getAntfarmRuntimeConfig();
+  const hasRuntimeApiUrl = Boolean(runtimeConfig.apiUrl);
+  const hasRuntimeTermiteApiUrl = Boolean(runtimeConfig.termiteApiUrl);
+
   // Try to load from localStorage, fallback to default
   const [apiUrl, setApiUrlState] = useState<string>(() => {
+    if (hasRuntimeApiUrl) return getDefaultApiUrl();
     const stored = localStorage.getItem(STORAGE_KEY);
     return stored || getDefaultApiUrl();
   });
 
   const [termiteApiUrl, setTermiteApiUrlState] = useState<string>(() => {
+    if (hasRuntimeTermiteApiUrl) return getDefaultTermiteApiUrl();
     const stored = localStorage.getItem(TERMITE_STORAGE_KEY);
     return stored || getDefaultTermiteApiUrl();
   });
@@ -35,6 +47,7 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
   const [client, setClient] = useState<AntflyClient>(() => new AntflyClient({ baseUrl: apiUrl }));
 
   const setApiUrl = (url: string) => {
+    if (hasRuntimeApiUrl) return;
     const trimmedUrl = url.trim();
     setApiUrlState(trimmedUrl);
     localStorage.setItem(STORAGE_KEY, trimmedUrl);
@@ -51,6 +64,7 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
   };
 
   const setTermiteApiUrl = (url: string) => {
+    if (hasRuntimeTermiteApiUrl) return;
     const trimmedUrl = url.trim();
     setTermiteApiUrlState(trimmedUrl);
     localStorage.setItem(TERMITE_STORAGE_KEY, trimmedUrl);
