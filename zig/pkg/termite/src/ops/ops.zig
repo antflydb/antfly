@@ -187,6 +187,59 @@ pub const GlinerLabelGruCombinedRequest = struct {
     hidden_size: usize,
 };
 
+pub const DenseMlp2Request = struct {
+    input: CT,
+    first_weight: CT,
+    first_bias: CT,
+    second_weight: CT,
+    second_bias: CT,
+    rows: usize,
+    in_dim: usize,
+    hidden_dim: usize,
+    out_dim: usize,
+    activation: DecoderRuntimeActivationKind = .relu,
+};
+
+pub const DenseFfnLayerNormRequest = struct {
+    input: CT,
+    residual: CT,
+    first_weight: CT,
+    first_bias: CT,
+    second_weight: CT,
+    second_bias: CT,
+    layer_norm_weight: CT,
+    layer_norm_bias: CT,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    eps: f32,
+    activation: DecoderRuntimeActivationKind = .gelu,
+};
+
+pub const DenseLinearLayerNormRequest = struct {
+    input: CT,
+    residual: CT,
+    weight: CT,
+    bias: CT,
+    layer_norm_weight: CT,
+    layer_norm_bias: CT,
+    rows: usize,
+    in_dim: usize,
+    hidden_size: usize,
+    eps: f32,
+};
+
+pub const DebertaEmbeddingsRequest = struct {
+    word_embeddings: CT,
+    layer_norm_weight: CT,
+    layer_norm_bias: CT,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    total: usize,
+    hidden_size: usize,
+    eps: f32,
+};
+
 /// Fused MoE forward: route selection + expert compute + scatter-add,
 /// entirely on GPU with no CPU round-trips for routing.
 pub const MoeForwardFusedRequest = struct {
@@ -331,6 +384,28 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_graph_plan_count: u64 = 0,
     metal_runtime_graph_plan_allocations: u64 = 0,
     metal_runtime_graph_plan_reuses: u64 = 0,
+    metal_runtime_deberta_encoder_frame_plan_attempts: u64 = 0,
+    metal_runtime_deberta_encoder_frame_plan_successes: u64 = 0,
+    metal_runtime_deberta_encoder_frame_plan_reuses: u64 = 0,
+    metal_runtime_deberta_encoder_frame_plan_failures: u64 = 0,
+    metal_runtime_deberta_embeddings_attempts: u64 = 0,
+    metal_runtime_deberta_embeddings_successes: u64 = 0,
+    metal_runtime_deberta_embeddings_fallbacks: u64 = 0,
+    metal_runtime_deberta_encoder_layer_attempts: u64 = 0,
+    metal_runtime_deberta_encoder_layer_successes: u64 = 0,
+    metal_runtime_deberta_encoder_layer_fallbacks: u64 = 0,
+    metal_runtime_mps_dense_linear_standalone_calls: u64 = 0,
+    metal_runtime_mps_dense_linear_active_frame_calls: u64 = 0,
+    metal_runtime_mps_dense_linear_standalone_wait_nanos: u64 = 0,
+    metal_runtime_mps_dense_linear_standalone_gpu_nanos: u64 = 0,
+    metal_runtime_last_frame_mps_dense_linear_count: u64 = 0,
+    metal_runtime_deberta_ffn_fused_calls: u64 = 0,
+    metal_runtime_deberta_ffn_fused_mps_matmuls: u64 = 0,
+    metal_runtime_deberta_ffn_fused_fallbacks: u64 = 0,
+    metal_runtime_mpsgraph_ffn_calls: u64 = 0,
+    metal_runtime_mpsgraph_ffn_fallbacks: u64 = 0,
+    metal_runtime_mpsgraph_ffn_compiles: u64 = 0,
+    metal_runtime_mpsgraph_ffn_cache_hits: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -646,6 +721,9 @@ pub const DecoderRuntimeDecodeItem = backend_contracts.DecoderRuntimeDecodeItem;
 pub const DecoderRuntimeDecodeRequest = backend_contracts.DecoderRuntimeDecodeRequest;
 pub const DecoderRuntimePrefillFramePlanRequest = backend_contracts.DecoderRuntimePrefillFramePlanRequest;
 pub const DecoderRuntimeGraphCommandPlanFrameRequest = backend_contracts.DecoderRuntimeGraphCommandPlanFrameRequest;
+pub const DebertaEncoderLayerSpec = backend_contracts.DebertaEncoderLayerSpec;
+pub const DebertaEncoderFramePlanRequest = backend_contracts.DebertaEncoderFramePlanRequest;
+pub const DebertaEncoderLayerRequest = backend_contracts.DebertaEncoderLayerRequest;
 
 pub const GraphPlanSlot = struct {
     slot: usize,
@@ -727,6 +805,10 @@ pub const ComputeBackend = struct {
         /// Backends may return null to use the host-id embedding path.
         embeddingLookupTensor: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT = null,
 
+        /// DeBERTa-v3 embedding block: word lookup + row LayerNorm + attention-mask multiply.
+        /// Backends may return null to use the generic embedding/layernorm/multiply path.
+        debertaEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaEmbeddingsRequest) anyerror!?CT = null,
+
         /// Gather rows from a [total, dim] tensor along axis 0.
         takeRows: ?*const fn (ctx: *anyopaque, request: *const TakeRowsRequest) anyerror!?CT = null,
 
@@ -750,6 +832,20 @@ pub const ComputeBackend = struct {
         /// Y = relu(X @ W^T + bias). Backends may fuse projection,
         /// bias, and activation; callers fall back to linear + relu.
         linearRelu: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
+
+        /// Two-layer dense MLP: activation(X @ W1^T + b1) @ W2^T + b2.
+        /// Backends may fuse scheduling and residency; callers fall back to
+        /// linear + activation + linear.
+        denseMlp2: ?*const fn (ctx: *anyopaque, request: *const DenseMlp2Request) anyerror!?CT = null,
+
+        /// DeBERTa FFN block: activation(X @ W1^T + b1) @ W2^T + b2,
+        /// residual add, then LayerNorm. Backends may keep the entire strip
+        /// resident; callers fall back to the generic ops sequence.
+        denseFfnLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DenseFfnLayerNormRequest) anyerror!?CT = null,
+
+        /// Dense projection, residual add, then LayerNorm. Used by DeBERTa
+        /// attention output blocks to keep the dense+norm strip resident.
+        denseLinearLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DenseLinearLayerNormRequest) anyerror!?CT = null,
 
         /// Y = gelu(X @ W^T + bias). Backends may fuse projection,
         /// bias, and activation; callers fall back to linear + gelu.
@@ -1204,6 +1300,16 @@ pub const ComputeBackend = struct {
         /// after accepting, errors should abort the active frame.
         decoderRuntimeExecuteGraphCommandPlanFrame: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGraphCommandPlanFrameRequest) anyerror!bool = null,
 
+        /// Build/cache a backend-owned GLiNER DeBERTa encoder frame plan.
+        /// This prepares model-specific encoder block metadata without
+        /// executing the frame.
+        debertaEncoderPlanFrame: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderFramePlanRequest) anyerror!bool = null,
+
+        /// Execute one GLiNER DeBERTa encoder layer from a previously
+        /// prepared backend-owned slot layout. Backends return null when the
+        /// shape/path should use the ordinary eager ops.
+        debertaEncoderLayer: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderLayerRequest) anyerror!?CT = null,
+
         /// Begin a backend-owned decoder frame. Backends that support this
         /// encode subsequent runtime operations into one command submission
         /// until `decoderRuntimeSubmitAndWaitFrame` is called.
@@ -1549,6 +1655,13 @@ pub const ComputeBackend = struct {
     pub fn embeddingLookupTensor(self: *const ComputeBackend, weight: CT, ids: CT, total: usize, dim: usize) !?CT {
         if (self.vtable.embeddingLookupTensor) |op| {
             return op(self.ptr, weight, ids, total, dim);
+        }
+        return null;
+    }
+
+    pub fn debertaEmbeddings(self: *const ComputeBackend, request: DebertaEmbeddingsRequest) !?CT {
+        if (self.vtable.debertaEmbeddings) |op| {
+            return op(self.ptr, &request);
         }
         return null;
     }
@@ -2052,6 +2165,21 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn denseMlp2(self: *const ComputeBackend, request: *const DenseMlp2Request) !?CT {
+        if (self.vtable.denseMlp2) |f| return f(self.ptr, request);
+        return null;
+    }
+
+    pub fn denseFfnLayerNorm(self: *const ComputeBackend, request: *const DenseFfnLayerNormRequest) !?CT {
+        if (self.vtable.denseFfnLayerNorm) |f| return f(self.ptr, request);
+        return null;
+    }
+
+    pub fn denseLinearLayerNorm(self: *const ComputeBackend, request: *const DenseLinearLayerNormRequest) !?CT {
+        if (self.vtable.denseLinearLayerNorm) |f| return f(self.ptr, request);
+        return null;
+    }
+
     pub fn linearGelu(
         self: *const ComputeBackend,
         input: CT,
@@ -2462,6 +2590,20 @@ pub const ComputeBackend = struct {
             return op(self.ptr, request);
         }
         return false;
+    }
+
+    pub fn debertaEncoderPlanFrame(self: *const ComputeBackend, request: *const DebertaEncoderFramePlanRequest) !bool {
+        if (self.vtable.debertaEncoderPlanFrame) |op| {
+            return op(self.ptr, request);
+        }
+        return false;
+    }
+
+    pub fn debertaEncoderLayer(self: *const ComputeBackend, request: *const DebertaEncoderLayerRequest) !?CT {
+        if (self.vtable.debertaEncoderLayer) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
     }
 
     pub fn decoderRuntimeBeginFrame(self: *const ComputeBackend) !bool {
