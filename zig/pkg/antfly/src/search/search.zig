@@ -1657,7 +1657,7 @@ fn executeBool(
     return buildResult(alloc, snap, all_scored, @intCast(all_scored.len), .exact, request);
 }
 
-fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mod.Filter {
+pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mod.Filter {
     return switch (sq) {
         .match_none => .{ .match_none = {} },
         .match_all => .{ .match_all = {} },

@@ -146,6 +146,11 @@ pub const SparseEmbedding = struct {
     }
 };
 
+pub const SparseEmbeddingView = struct {
+    indices: []const u32,
+    values: []const f32,
+};
+
 pub const GraphEdge = struct {
     weight: f64,
     created_at: u64,
@@ -176,9 +181,11 @@ pub fn encodeSparseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, indices: 
     var pos: usize = header_len;
     std.mem.writeInt(u32, out[pos..][0..4], @intCast(indices.len), .little);
     pos += @sizeOf(u32);
-    for (indices, values) |index, value| {
+    for (indices) |index| {
         std.mem.writeInt(u32, out[pos..][0..4], index, .little);
         pos += @sizeOf(u32);
+    }
+    for (values) |value| {
         std.mem.writeInt(u32, out[pos..][0..4], @as(u32, @bitCast(value)), .little);
         pos += @sizeOf(u32);
     }
@@ -186,6 +193,49 @@ pub fn encodeSparseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, indices: 
 }
 
 pub fn decodeSparseEmbeddingAlloc(alloc: Allocator, data: []const u8) !SparseEmbedding {
+    const payload = try sparseEmbeddingPayload(data);
+    const count = std.mem.readInt(u32, payload[0..4], .little);
+
+    const indices = try alloc.alloc(u32, count);
+    errdefer alloc.free(indices);
+    const values = try alloc.alloc(f32, count);
+    errdefer alloc.free(values);
+
+    var pos: usize = @sizeOf(u32);
+    for (indices) |*index| {
+        index.* = std.mem.readInt(u32, payload[pos..][0..4], .little);
+        pos += @sizeOf(u32);
+    }
+    for (values) |*value| {
+        value.* = @bitCast(std.mem.readInt(u32, payload[pos..][0..4], .little));
+        pos += @sizeOf(u32);
+    }
+    return .{ .indices = indices, .values = values };
+}
+
+pub fn sparseEmbeddingVectorView(data: []const u8) !?SparseEmbeddingView {
+    if (native_endian != .little) return null;
+    const payload = try sparseEmbeddingPayload(data);
+    const count = std.mem.readInt(u32, payload[0..4], .little);
+    if (count == 0) return .{ .indices = &.{}, .values = &.{} };
+
+    const indices_start = @sizeOf(u32);
+    const indices_end = indices_start + @as(usize, count) * @sizeOf(u32);
+    const values_end = indices_end + @as(usize, count) * @sizeOf(u32);
+    const indices_bytes = payload[indices_start..indices_end];
+    const values_bytes = payload[indices_end..values_end];
+    if ((@intFromPtr(indices_bytes.ptr) % @alignOf(u32)) != 0) return null;
+    if ((@intFromPtr(values_bytes.ptr) % @alignOf(f32)) != 0) return null;
+
+    const aligned_indices: []align(@alignOf(u32)) const u8 = @alignCast(indices_bytes);
+    const aligned_values: []align(@alignOf(f32)) const u8 = @alignCast(values_bytes);
+    return .{
+        .indices = std.mem.bytesAsSlice(u32, aligned_indices),
+        .values = std.mem.bytesAsSlice(f32, aligned_values),
+    };
+}
+
+fn sparseEmbeddingPayload(data: []const u8) ![]const u8 {
     const header = try decodeHeader(data);
     if (header.kind != .sparse_embedding) return error.InvalidArtifactKind;
     if (header.payload_len < @sizeOf(u32)) return error.InvalidArtifactPayload;
@@ -194,20 +244,7 @@ pub fn decodeSparseEmbeddingAlloc(alloc: Allocator, data: []const u8) !SparseEmb
     const count = std.mem.readInt(u32, payload[0..4], .little);
     const pair_bytes = payload.len - @sizeOf(u32);
     if (pair_bytes != @as(usize, count) * (@sizeOf(u32) + @sizeOf(u32))) return error.InvalidSparseEmbedding;
-
-    const indices = try alloc.alloc(u32, count);
-    errdefer alloc.free(indices);
-    const values = try alloc.alloc(f32, count);
-    errdefer alloc.free(values);
-
-    var pos: usize = @sizeOf(u32);
-    for (indices, values) |*index, *value| {
-        index.* = std.mem.readInt(u32, payload[pos..][0..4], .little);
-        pos += @sizeOf(u32);
-        value.* = @bitCast(std.mem.readInt(u32, payload[pos..][0..4], .little));
-        pos += @sizeOf(u32);
-    }
-    return .{ .indices = indices, .values = values };
+    return payload;
 }
 
 pub fn encodeGraphEdgeAlloc(
@@ -400,6 +437,33 @@ test "artifact codec encodes sparse embedding with version and source hash" {
     try std.testing.expectEqualSlices(u32, &.{ 3, 9 }, decoded.indices);
     try std.testing.expectEqual(@as(f32, 0.25), decoded.values[0]);
     try std.testing.expectEqual(@as(f32, 1.5), decoded.values[1]);
+
+    if (try sparseEmbeddingVectorView(encoded)) |view| {
+        try std.testing.expectEqualSlices(u32, &.{ 3, 9 }, view.indices);
+        try std.testing.expectEqualSlices(f32, &.{ 0.25, 1.5 }, view.values);
+    } else {
+        try std.testing.expect(native_endian != .little);
+    }
+}
+
+test "artifact codec sparse embedding view falls back when unaligned" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSparseEmbeddingAlloc(alloc, null, &.{ 1, 2, 3 }, &.{ 0.5, 0.25, 0.125 });
+    defer alloc.free(encoded);
+
+    const unaligned_storage = try alloc.alloc(u8, encoded.len + 1);
+    defer alloc.free(unaligned_storage);
+    @memcpy(unaligned_storage[1..], encoded);
+    const unaligned = unaligned_storage[1..];
+
+    if (native_endian == .little and (@intFromPtr((unaligned[header_len + @sizeOf(u32) ..]).ptr) % @alignOf(u32)) != 0) {
+        try std.testing.expectEqual(@as(?SparseEmbeddingView, null), try sparseEmbeddingVectorView(unaligned));
+    }
+
+    var decoded = try decodeSparseEmbeddingAlloc(alloc, unaligned);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, decoded.indices);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25, 0.125 }, decoded.values);
 }
 
 test "artifact codec encodes graph edge with version and source hash" {
