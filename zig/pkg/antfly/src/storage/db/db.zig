@@ -45,6 +45,10 @@ const background_runtime_mod = @import("../background_runtime.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const persistent_mod = @import("../persistent.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
+const sparse_mod = if (builtin.os.tag == .freestanding)
+    @import("sparse_stub.zig")
+else
+    @import("../../sparse/sparse.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -1328,6 +1332,42 @@ fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: 
     );
 }
 
+fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WriteProfile) void {
+    std.log.info(
+        "antfly_bench_sparse_write index={s} batch_calls={d} incremental_calls={d} bulk_append_calls={d} bulk_append_fallbacks={d} writes={d} deletes={d} postings={d} terms={d} reserve_ms={d} dedupe_ms={d} existence_check_ms={d} doc_num_ms={d} fwd_rev_put_ms={d} posting_collect_ms={d} posting_sort_ms={d} posting_write_ms={d} chunk_read_ms={d} chunk_encode_ms={d} chunk_put_ms={d} range_meta_encode_ms={d} range_meta_put_ms={d} term_meta_ms={d} commit_ms={d} incremental_delete_ms={d} incremental_insert_ms={d} incremental_refresh_ms={d} incremental_commit_ms={d}",
+        .{
+            index_name,
+            delta.batch_calls,
+            delta.incremental_calls,
+            delta.bulk_append_calls,
+            delta.bulk_append_fallbacks,
+            delta.writes,
+            delta.deletes,
+            delta.postings,
+            delta.terms,
+            nsToMs(delta.reserve_ns),
+            nsToMs(delta.dedupe_ns),
+            nsToMs(delta.existence_check_ns),
+            nsToMs(delta.doc_num_ns),
+            nsToMs(delta.fwd_rev_put_ns),
+            nsToMs(delta.posting_collect_ns),
+            nsToMs(delta.posting_sort_ns),
+            nsToMs(delta.posting_write_ns),
+            nsToMs(delta.chunk_read_ns),
+            nsToMs(delta.chunk_encode_ns),
+            nsToMs(delta.chunk_put_ns),
+            nsToMs(delta.range_meta_encode_ns),
+            nsToMs(delta.range_meta_put_ns),
+            nsToMs(delta.term_meta_ns),
+            nsToMs(delta.commit_ns),
+            nsToMs(delta.incremental_delete_ns),
+            nsToMs(delta.incremental_insert_ns),
+            nsToMs(delta.incremental_refresh_ns),
+            nsToMs(delta.incremental_commit_ns),
+        },
+    );
+}
+
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
 const small_derived_text_compact_segment_threshold: usize = 6;
@@ -2561,6 +2601,8 @@ pub const DB = struct {
         errdefer resources.store.abortBulkIngestSession();
         try resources.index_manager.beginDenseBulkIngestSessions();
         errdefer resources.index_manager.abortDenseBulkIngestSessions();
+        try resources.index_manager.beginSparseBulkIngestSessions();
+        errdefer resources.index_manager.abortSparseBulkIngestSessions();
         try resources.index_manager.beginAlgebraicBulkIngestSessions();
         self.bulk_ingest_coalescer.begin();
     }
@@ -2582,6 +2624,9 @@ pub const DB = struct {
                 first_err = err;
             };
             resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+            resources.index_manager.finishSparseBulkIngestSessionsWithOptions(options) catch |err| {
                 if (first_err == null) first_err = err;
             };
             resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
@@ -6736,7 +6781,10 @@ pub const DB = struct {
                 .sparse_vector => {
                     if (self.core.sparseIndex(item.name)) |entry| {
                         const sparse_stats = entry.index.stats();
-                        item.doc_count = sparse_stats.doc_count;
+                        item.doc_count = if (entry.chunk_name == null and runtime_stats.doc_count > 0)
+                            @min(sparse_stats.doc_count, runtime_stats.doc_count)
+                        else
+                            sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
@@ -12087,14 +12135,42 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         },
         .sparse_vector => {
             const apply_start_ns = monotonicTimeNs();
-            try ctx.index_manager.deleteSparseBatchByName(index_ref.name, batch.deleted_keys);
-            try ctx.index_manager.deleteSparseBatchByName(index_ref.name, batch.overwritten_doc_keys);
+            const emit_sparse_write_profile = benchMetricsEnabled();
+            const before_sparse_profile = if (emit_sparse_write_profile) ctx.index_manager.sparseWriteProfileByName(index_ref.name) else null;
+            const batch_options: backend_types.BatchOptions = .{ .mode = .bulk_ingest };
+            var collect_doc_profile: CollectSparseFieldWritesProfile = .{};
+            var sparse_delete_ns: u64 = 0;
+            var sparse_collect_doc_ns: u64 = 0;
+            var sparse_doc_index_ns: u64 = 0;
+            var sparse_collect_embedding_ns: u64 = 0;
+            var sparse_embedding_apply_ns: u64 = 0;
+            const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
+            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+            if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
-            var index_writes = try collectDocumentWrites(ctx.alloc, ctx.store, batch.documents, ctx.index_manager.byte_range);
+            const sparse_collect_doc_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            const sparse_field_name = ctx.index_manager.sparseFieldNameByName(index_ref.name) orelse return error.IndexNotFound;
+            var index_writes = try collectSparseFieldWritesProfiled(
+                ctx.alloc,
+                ctx.store,
+                batch.documents,
+                ctx.index_manager.byte_range,
+                sparse_field_name,
+                .{
+                    .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                    .prefer_available_inline_values = true,
+                },
+                if (emit_sparse_write_profile) &collect_doc_profile else null,
+            );
             defer index_writes.deinit();
+            if (emit_sparse_write_profile) sparse_collect_doc_ns = monotonicTimeNs() - sparse_collect_doc_start_ns;
             if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-            try ctx.index_manager.indexSparseBatchByName(index_ref.name, index_writes.items);
+            const sparse_doc_index_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            try ctx.index_manager.indexSparsePreparedWritesByNameWithOptions(index_ref.name, index_writes.items, batch_options);
+            if (emit_sparse_write_profile) sparse_doc_index_ns = monotonicTimeNs() - sparse_doc_index_start_ns;
 
+            const sparse_collect_embedding_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             var sparse_embeddings = try collectSparseEmbeddingWritesForBatch(
                 ctx.alloc,
                 ctx.index_manager,
@@ -12103,7 +12179,42 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
             );
             defer sparse_embeddings.deinit();
-            try ctx.index_manager.applySparseEmbeddingWritesByName(ctx.store, index_ref.name, sparse_embeddings.writes);
+            if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
+            const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
+            if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
+            if (before_sparse_profile) |before| {
+                if (ctx.index_manager.sparseWriteProfileByName(index_ref.name)) |after| {
+                    logSparseWriteProfileDelta(index_ref.name, sparse_mod.WriteProfile.delta(after, before));
+                }
+            }
+            if (emit_sparse_write_profile) {
+                std.log.info(
+                    "antfly_bench_sparse_doc_replay index={s} sequence={} documents={d} sparse_embeddings={d} total_ms={d} delete_ms={d} collect_doc_ms={d} collect_doc_scan_ms={d} collect_doc_sort_ms={d} collect_doc_read_ms={d} collect_doc_extract_ms={d} collect_doc_pending={d} collect_doc_output={d} collect_doc_store_hits={d} collect_doc_inline_hits={d} collect_doc_missing={d} collect_doc_no_vector={d} doc_index_ms={d} collect_embedding_ms={d} embedding_apply_ms={d}",
+                    .{
+                        index_ref.name,
+                        batch.sequence,
+                        batch.documents.len,
+                        batch.sparse_embeddings.len,
+                        nsToMs(monotonicTimeNs() - apply_start_ns),
+                        nsToMs(sparse_delete_ns),
+                        nsToMs(sparse_collect_doc_ns),
+                        nsToMs(collect_doc_profile.scan_ns),
+                        nsToMs(collect_doc_profile.sort_ns),
+                        nsToMs(collect_doc_profile.read_ns),
+                        nsToMs(collect_doc_profile.extract_ns),
+                        collect_doc_profile.pending_documents,
+                        collect_doc_profile.output_writes,
+                        collect_doc_profile.store_hits,
+                        collect_doc_profile.inline_hits,
+                        collect_doc_profile.missing_required,
+                        collect_doc_profile.skipped_without_vector,
+                        nsToMs(sparse_doc_index_ns),
+                        nsToMs(sparse_collect_embedding_ns),
+                        nsToMs(sparse_embedding_apply_ns),
+                    },
+                );
+            }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.sparse_apply_ns, apply_start_ns);
         },
         .graph => {
@@ -12258,6 +12369,33 @@ const OwnedBatchWrites = struct {
     }
 };
 
+const CollectDocumentWritesProfile = struct {
+    scan_ns: u64 = 0,
+    sort_ns: u64 = 0,
+    read_ns: u64 = 0,
+    materialize_ns: u64 = 0,
+    input_documents: usize = 0,
+    pending_documents: usize = 0,
+    output_writes: usize = 0,
+    missing_required: usize = 0,
+    inline_hits: usize = 0,
+    store_hits: usize = 0,
+};
+
+const CollectSparseFieldWritesProfile = struct {
+    scan_ns: u64 = 0,
+    sort_ns: u64 = 0,
+    read_ns: u64 = 0,
+    extract_ns: u64 = 0,
+    input_documents: usize = 0,
+    pending_documents: usize = 0,
+    output_writes: usize = 0,
+    missing_required: usize = 0,
+    inline_hits: usize = 0,
+    store_hits: usize = 0,
+    skipped_without_vector: usize = 0,
+};
+
 const OwnedDenseEmbeddingWrites = struct {
     alloc: Allocator,
     owns_doc_keys: bool = false,
@@ -12290,6 +12428,11 @@ const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
 };
 
+const CollectDocumentWritesOptions = struct {
+    prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
+    prefer_available_inline_values: bool = false,
+};
+
 fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
     return if (internal_keys.isInternalUserKey(key))
         try alloc.dupe(u8, key)
@@ -12297,11 +12440,188 @@ fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
         try internal_keys.documentKeyAlloc(alloc, key);
 }
 
+const OwnedSparseFieldWrites = struct {
+    alloc: Allocator,
+    items: []sparse_mod.SparseWrite = &.{},
+    missing_required: usize = 0,
+
+    fn deinit(self: *@This()) void {
+        for (self.items) |item| {
+            self.alloc.free(@constCast(item.vec.indices));
+            self.alloc.free(@constCast(item.vec.values));
+        }
+        if (self.items.len > 0) self.alloc.free(self.items);
+        self.* = undefined;
+    }
+};
+
+fn collectSparseFieldWritesProfiled(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    documents: []const derived_types.DerivedDocument,
+    byte_range: types.ByteRange,
+    field_name: []const u8,
+    opts: CollectDocumentWritesOptions,
+    profile: ?*CollectSparseFieldWritesProfile,
+) !OwnedSparseFieldWrites {
+    const PendingDocumentWrite = struct {
+        doc_key: []const u8,
+        store_key: []u8,
+        inline_value: ?[]const u8,
+    };
+
+    var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
+    defer {
+        for (pending.items) |item| alloc.free(item.store_key);
+        pending.deinit(alloc);
+    }
+
+    var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
+    errdefer {
+        for (writes.items) |item| {
+            alloc.free(@constCast(item.vec.indices));
+            alloc.free(@constCast(item.vec.values));
+        }
+        writes.deinit(alloc);
+    }
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    var missing_required: usize = 0;
+    const trust_inline = opts.prefer_available_inline_values or
+        if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
+            store.nextReplaySequence(sequence + 1) == sequence + 1
+        else
+            false;
+
+    if (profile) |p| p.input_documents = documents.len;
+    const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
+    for (documents) |doc| {
+        if (doc.action != .upsert) continue;
+        if (!byte_range.contains(doc.key)) continue;
+        if (trust_inline and doc.cleaned_value != null) {
+            const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
+            if (try mapper.extractSparseVectorField(alloc, doc.cleaned_value.?, field_name)) |raw_sparse_vec| {
+                var sparse_vec = raw_sparse_vec;
+                writes.append(alloc, .{
+                    .doc_id = doc.key,
+                    .vec = .{
+                        .indices = sparse_vec.indices,
+                        .values = sparse_vec.values,
+                    },
+                }) catch |err| {
+                    sparse_vec.deinit(alloc);
+                    return err;
+                };
+                if (profile) |p| p.output_writes += 1;
+            } else if (profile) |p| {
+                p.skipped_without_vector += 1;
+            }
+            if (profile) |p| {
+                p.extract_ns += monotonicTimeNs() - extract_start_ns;
+                p.inline_hits += 1;
+            }
+            continue;
+        }
+        try pending.append(alloc, .{
+            .doc_key = doc.key,
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .inline_value = doc.cleaned_value,
+        });
+    }
+    if (profile) |p| {
+        p.scan_ns = monotonicTimeNs() - scan_start_ns -| p.extract_ns;
+        p.pending_documents = pending.items.len;
+    }
+
+    if (pending.items.len == 0) {
+        return .{
+            .alloc = alloc,
+            .items = try writes.toOwnedSlice(alloc),
+            .missing_required = missing_required,
+        };
+    }
+
+    const SortContext = struct {};
+    const sort_start_ns = if (profile != null) monotonicTimeNs() else 0;
+    std.mem.sort(PendingDocumentWrite, pending.items, SortContext{}, struct {
+        fn lessThan(_: SortContext, lhs: PendingDocumentWrite, rhs: PendingDocumentWrite) bool {
+            return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
+        }
+    }.lessThan);
+    if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
+
+    const read_keys = try alloc.alloc([]const u8, pending.items.len);
+    defer alloc.free(read_keys);
+    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
+    defer alloc.free(read_values);
+
+    for (pending.items, 0..) |item, i| {
+        read_keys[i] = item.store_key;
+        read_values[i] = null;
+    }
+    const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
+    try txn.getManySorted(read_keys, read_values);
+    if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
+
+    for (pending.items, 0..) |item, i| {
+        const value = if (read_values[i]) |store_value| blk: {
+            if (profile) |p| p.store_hits += 1;
+            break :blk store_value;
+        } else if (item.inline_value) |inline_value| blk: {
+            if (profile) |p| p.inline_hits += 1;
+            break :blk inline_value;
+        } else {
+            missing_required += 1;
+            continue;
+        };
+        const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
+        if (try mapper.extractSparseVectorField(alloc, value, field_name)) |raw_sparse_vec| {
+            var sparse_vec = raw_sparse_vec;
+            writes.append(alloc, .{
+                .doc_id = item.doc_key,
+                .vec = .{
+                    .indices = sparse_vec.indices,
+                    .values = sparse_vec.values,
+                },
+            }) catch |err| {
+                sparse_vec.deinit(alloc);
+                return err;
+            };
+            if (profile) |p| p.output_writes += 1;
+        } else if (profile) |p| {
+            p.skipped_without_vector += 1;
+        }
+        if (profile) |p| p.extract_ns += monotonicTimeNs() - extract_start_ns;
+    }
+    if (profile) |p| {
+        p.missing_required = missing_required;
+        p.output_writes = writes.items.len;
+    }
+
+    return .{
+        .alloc = alloc,
+        .items = try writes.toOwnedSlice(alloc),
+        .missing_required = missing_required,
+    };
+}
+
 fn collectDocumentWrites(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     documents: []const derived_types.DerivedDocument,
     byte_range: types.ByteRange,
+) !OwnedBatchWrites {
+    return try collectDocumentWritesProfiled(alloc, store, documents, byte_range, .{}, null);
+}
+
+fn collectDocumentWritesProfiled(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    documents: []const derived_types.DerivedDocument,
+    byte_range: types.ByteRange,
+    opts: CollectDocumentWritesOptions,
+    profile: ?*CollectDocumentWritesProfile,
 ) !OwnedBatchWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
@@ -12324,15 +12644,36 @@ fn collectDocumentWrites(
     var txn = try store.beginProbeTxn();
     defer txn.abort();
     var missing_required: usize = 0;
+    const trust_inline = opts.prefer_available_inline_values or
+        if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
+            store.nextReplaySequence(sequence + 1) == sequence + 1
+        else
+            false;
 
+    if (profile) |p| p.input_documents = documents.len;
+    const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
         if (!byte_range.contains(doc.key)) continue;
+        if (trust_inline and doc.cleaned_value != null) {
+            const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
+            try writes.append(alloc, .{
+                .key = doc.key,
+                .value = owned_value,
+            });
+            if (profile) |p| p.inline_hits += 1;
+            continue;
+        }
         try pending.append(alloc, .{
             .doc_key = doc.key,
             .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
             .inline_value = doc.cleaned_value,
         });
+    }
+    if (profile) |p| {
+        p.scan_ns = monotonicTimeNs() - scan_start_ns;
+        p.pending_documents = pending.items.len;
+        p.output_writes = writes.items.len;
     }
 
     if (pending.items.len == 0) {
@@ -12343,11 +12684,13 @@ fn collectDocumentWrites(
     }
 
     const SortContext = struct {};
+    const sort_start_ns = if (profile != null) monotonicTimeNs() else 0;
     std.mem.sort(PendingDocumentWrite, pending.items, SortContext{}, struct {
         fn lessThan(_: SortContext, lhs: PendingDocumentWrite, rhs: PendingDocumentWrite) bool {
             return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
         }
     }.lessThan);
+    if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
     const read_keys = try alloc.alloc([]const u8, pending.items.len);
     defer alloc.free(read_keys);
@@ -12358,10 +12701,19 @@ fn collectDocumentWrites(
         read_keys[i] = item.store_key;
         read_values[i] = null;
     }
+    const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
     try txn.getManySorted(read_keys, read_values);
+    if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
 
+    const materialize_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse item.inline_value orelse {
+        const value = if (read_values[i]) |store_value| blk: {
+            if (profile) |p| p.store_hits += 1;
+            break :blk store_value;
+        } else if (item.inline_value) |inline_value| blk: {
+            if (profile) |p| p.inline_hits += 1;
+            break :blk inline_value;
+        } else {
             missing_required += 1;
             continue;
         };
@@ -12370,6 +12722,11 @@ fn collectDocumentWrites(
             .key = item.doc_key,
             .value = owned_value,
         });
+    }
+    if (profile) |p| {
+        p.materialize_ns = monotonicTimeNs() - materialize_start_ns;
+        p.output_writes = writes.items.len;
+        p.missing_required = missing_required;
     }
 
     return .{

@@ -896,7 +896,7 @@ pub const Backend = struct {
             self.write_stats.manifest_writes != before_manifest_writes;
     }
 
-    fn activeImmutableMemtableCount(self: *const Backend) usize {
+    pub fn activeImmutableMemtableCount(self: *const Backend) usize {
         std.debug.assert(self.immutable_head <= self.immutable_memtables.items.len);
         return self.immutable_memtables.items.len - self.immutable_head;
     }
