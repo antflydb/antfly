@@ -2550,11 +2550,7 @@ fn searchDenseInternal(
         @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
     else
         @intCast(index_stats.active_count);
-    const stored_filter_candidate_window: u32 = @min(
-        bounded_full_candidate_count,
-        @max(paging.limit *| 32, @as(u32, 1024)),
-    );
-    const hbc_effective_k: u32 = if (full_candidate_window) stored_filter_candidate_window else effective_k;
+    const hbc_effective_k: u32 = if (full_candidate_window) bounded_full_candidate_count else effective_k;
 
     const hbc_req: vectorindex_mod.SearchRequest = .{
         .query = dense.vector,
