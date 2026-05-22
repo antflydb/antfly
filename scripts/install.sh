@@ -85,10 +85,10 @@ EOF
     status "Installing Antfly $EDITION version $TAG..."
 
     # Construct download URL
-    # Default: antfly_VERSION_OS_ARCH.tar.gz
-    # Omni:    antfly-omni_VERSION_OS_ARCH.tar.gz
-    if [ "$EDITION" = "omni" ]; then
-        ARCHIVE_NAME="antfly-omni_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+    # Default:     antfly_VERSION_OS_ARCH.tar.gz
+    # Go fallback: antfly-go_VERSION_OS_ARCH.tar.gz
+    if [ "$EDITION" = "go" ]; then
+        ARCHIVE_NAME="antfly-go_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
     else
         ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
     fi
@@ -116,14 +116,17 @@ EOF
 
     status "Installing binaries to $INSTALL_DIR..."
 
-    # Install antfly
+    # Install antfly or antfly-go
     if [ -f "$TEMP_DIR/antfly" ]; then
         install_binary "$TEMP_DIR/antfly" "$INSTALL_DIR/antfly"
     fi
+    if [ -f "$TEMP_DIR/antfly-go" ]; then
+        install_binary "$TEMP_DIR/antfly-go" "$INSTALL_DIR/antfly-go"
+    fi
 
-    # Install bundled libraries (omni edition)
+    # Install bundled libraries (Go fallback edition)
     if [ -d "$TEMP_DIR/lib" ]; then
-        status "Installing bundled libraries to $LIB_DIR..."
+        status "Installing bundled Go runtime libraries to $LIB_DIR..."
         if [ -w "$(dirname "$LIB_DIR")" ] || [ "$(id -u)" -eq 0 ]; then
             mkdir -p "$LIB_DIR"
             cp -r "$TEMP_DIR/lib/"* "$LIB_DIR/"
@@ -131,7 +134,7 @@ EOF
             sudo mkdir -p "$LIB_DIR"
             sudo cp -r "$TEMP_DIR/lib/"* "$LIB_DIR/"
         fi
-        status "Installed ONNX Runtime libraries to $LIB_DIR"
+        status "Installed Go runtime libraries to $LIB_DIR"
     fi
 
     # Install shell completions if available
@@ -140,33 +143,43 @@ EOF
 
         # Bash completions
         if [ -f "$TEMP_DIR/completions/antfly.bash" ]; then
+            COMPLETION_NAME="antfly"
+            [ "$EDITION" = "go" ] && COMPLETION_NAME="antfly-go"
             BASH_COMPLETION_DIR="${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions"
             mkdir -p "$BASH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.bash" "$BASH_COMPLETION_DIR/antfly" 2>/dev/null || true
+            cp "$TEMP_DIR/completions/antfly.bash" "$BASH_COMPLETION_DIR/$COMPLETION_NAME" 2>/dev/null || true
         fi
 
         # Zsh completions
         if [ -f "$TEMP_DIR/completions/antfly.zsh" ]; then
+            COMPLETION_NAME="_antfly"
+            [ "$EDITION" = "go" ] && COMPLETION_NAME="_antfly-go"
             ZSH_COMPLETION_DIR="${ZSH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions}"
             mkdir -p "$ZSH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.zsh" "$ZSH_COMPLETION_DIR/_antfly" 2>/dev/null || true
+            cp "$TEMP_DIR/completions/antfly.zsh" "$ZSH_COMPLETION_DIR/$COMPLETION_NAME" 2>/dev/null || true
         fi
 
         # Fish completions
         if [ -f "$TEMP_DIR/completions/antfly.fish" ]; then
+            COMPLETION_NAME="antfly.fish"
+            [ "$EDITION" = "go" ] && COMPLETION_NAME="antfly-go.fish"
             FISH_COMPLETION_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
             mkdir -p "$FISH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.fish" "$FISH_COMPLETION_DIR/antfly.fish" 2>/dev/null || true
+            cp "$TEMP_DIR/completions/antfly.fish" "$FISH_COMPLETION_DIR/$COMPLETION_NAME" 2>/dev/null || true
         fi
     fi
 
     status "Antfly installation complete!"
     status ""
-    status "Run 'antfly --help' to get started"
+    if [ "$EDITION" = "go" ]; then
+        status "Run 'antfly-go --help' to get started"
+    else
+        status "Run 'antfly --help' to get started"
+    fi
 
-    if [ "$EDITION" = "omni" ]; then
+    if [ "$EDITION" = "go" ]; then
         status ""
-        status "Omni edition includes ONNX Runtime and XLA backends."
+        status "Go fallback edition includes the previous Go/omni runtime."
         status "Libraries installed to $LIB_DIR"
     fi
 
@@ -209,12 +222,13 @@ Antfly Installer
 
 Usage:
   curl -fsSL https://antfly.io/install.sh | sh
-  curl -fsSL https://antfly.io/install.sh | sh -s -- --omni
-  curl -fsSL https://antfly.io/install.sh | sh -s -- --omni v0.0.0-dev50
+  curl -fsSL https://antfly.io/install.sh | sh -s -- --go
+  curl -fsSL https://antfly.io/install.sh | sh -s -- --go v0.0.0-dev50
 
 Options:
   -h, --help    Show this help message
-  --omni        Install the omni edition (includes ONNX Runtime + XLA backends)
+  --go          Install the previous Go/omni runtime as antfly-go
+  --omni        Alias for --go
   [version]     Install a specific version (e.g., v0.0.0-dev50)
                 If not specified, installs the latest version.
 
@@ -230,8 +244,8 @@ For more information, visit: https://docs.antfly.io
 EOF
                 exit 0
                 ;;
-            --omni)
-                EDITION="omni"
+            --go|--omni)
+                EDITION="go"
                 shift
                 ;;
             *)
