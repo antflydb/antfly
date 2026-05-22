@@ -1944,6 +1944,7 @@ pub const SparseIndex = struct {
                 new_doc_nums[decoded.doc_nums.len] = doc_num;
                 @memcpy(new_weights[0..decoded.weights.len], decoded.weights);
                 new_weights[decoded.weights.len] = weight;
+                sortDocNumsAndWeights(new_doc_nums, new_weights);
 
                 const existing_range = self.readChunkRangeMeta(txn, term_id, last_chunk_idx) catch null;
                 const min_doc_id = if (existing_range) |range|

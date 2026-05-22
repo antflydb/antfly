@@ -1182,18 +1182,41 @@ fn collectTextSearchQueryDocIdsAlloc(
     text_entry: *index_manager_mod.IndexManager.TextIndex,
     search_query: search_mod.SearchQuery,
 ) ![]const []const u8 {
+    const profile_enabled = benchQueryProfileEvery() != null;
+    const total_start = if (profile_enabled) platform_time.monotonicNs() else 0;
     const snapshot = text_entry.persistent.snapshot();
     var filter_arena = std.heap.ArenaAllocator.init(alloc);
     defer filter_arena.deinit();
+    const convert_start = if (profile_enabled) platform_time.monotonicNs() else 0;
     const filter = search_mod.searchQueryToFilterArena(filter_arena.allocator(), search_query) catch return try collectScoredTextSearchQueryDocIdsAlloc(alloc, req, text_entry, search_query);
+    const convert_ns = if (profile_enabled) platform_time.monotonicNs() - convert_start else 0;
+    const execute_start = if (profile_enabled) platform_time.monotonicNs() else 0;
     const doc_nums = snapshot.executeFilter(alloc, filter) catch return try collectScoredTextSearchQueryDocIdsAlloc(alloc, req, text_entry, search_query);
+    const execute_ns = if (profile_enabled) platform_time.monotonicNs() - execute_start else 0;
     defer alloc.free(doc_nums);
 
+    const hydrate_start = if (profile_enabled) platform_time.monotonicNs() else 0;
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
     for (doc_nums) |doc_num| {
         const stored = snapshot.storedDoc(doc_num) orelse continue;
         try appendOwnedDocId(alloc, &out, stored.id);
+    }
+    if (profile_enabled) {
+        const hydrate_ns = platform_time.monotonicNs() - hydrate_start;
+        std.log.info(
+            "antfly_bench_query_text_constraints index={s} global_docs={d} matched_doc_nums={d} output_doc_ids={d} total_us={d} convert_us={d} execute_filter_us={d} hydrate_doc_ids_us={d}",
+            .{
+                text_entry.config.name,
+                snapshot.global_doc_count,
+                doc_nums.len,
+                out.items.len,
+                nsToUs(platform_time.monotonicNs() - total_start),
+                nsToUs(convert_ns),
+                nsToUs(execute_ns),
+                nsToUs(hydrate_ns),
+            },
+        );
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -1662,6 +1685,8 @@ fn deriveNativeDenseConstraintsAlloc(
     executor: DenseSearchExecutor,
     index_name: []const u8,
 ) !NativeDenseConstraints {
+    const profile_enabled = benchQueryProfileEvery() != null;
+    const total_start = if (profile_enabled) platform_time.monotonicNs() else 0;
     var out = NativeDenseConstraints{};
     errdefer out.deinit(alloc);
 
@@ -1670,14 +1695,20 @@ fn deriveNativeDenseConstraintsAlloc(
         out.filter_ids = req.filter_ids;
     }
 
+    const doc_start = if (profile_enabled) platform_time.monotonicNs() else 0;
     var doc_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
     });
+    const doc_ns = if (profile_enabled) platform_time.monotonicNs() - doc_start else 0;
     defer doc_constraints.deinit(alloc);
 
+    var map_filter_ns: u64 = 0;
+    var map_exclude_ns: u64 = 0;
     if (doc_constraints.positive_filter) {
+        const map_start = if (profile_enabled) platform_time.monotonicNs() else 0;
         const mapped = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
+        if (profile_enabled) map_filter_ns = platform_time.monotonicNs() - map_start;
         if (out.positive_filter) {
             const intersected = try intersectVectorIdsAlloc(alloc, out.filter_ids, mapped);
             alloc.free(mapped);
@@ -1692,13 +1723,33 @@ fn deriveNativeDenseConstraintsAlloc(
     }
 
     if (doc_constraints.exclude_doc_ids.len > 0) {
+        const map_start = if (profile_enabled) platform_time.monotonicNs() else 0;
         const mapped_excludes = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
+        if (profile_enabled) map_exclude_ns = platform_time.monotonicNs() - map_start;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
     }
     if (out.exclude_ids.len == 0 and req.exclude_ids.len > 0) {
         out.exclude_ids = req.exclude_ids;
     }
     out.resolved_stored_filters = doc_constraints.resolved_stored_filters;
+    if (profile_enabled) {
+        std.log.info(
+            "antfly_bench_query_dense_constraints index={s} total_us={d} derive_doc_us={d} map_filter_us={d} map_exclude_us={d} filter_doc_ids={d} exclude_doc_ids={d} filter_vector_ids={d} exclude_vector_ids={d} positive_filter={} resolved_stored_filters={}",
+            .{
+                index_name,
+                nsToUs(platform_time.monotonicNs() - total_start),
+                nsToUs(doc_ns),
+                nsToUs(map_filter_ns),
+                nsToUs(map_exclude_ns),
+                doc_constraints.filter_doc_ids.len,
+                doc_constraints.exclude_doc_ids.len,
+                out.filter_ids.len,
+                out.exclude_ids.len,
+                out.positive_filter,
+                out.resolved_stored_filters,
+            },
+        );
+    }
     return out;
 }
 
