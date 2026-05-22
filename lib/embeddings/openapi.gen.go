@@ -64,16 +64,25 @@ type AntflyEmbedderConfig = map[string]interface{}
 
 // BedrockEmbedderConfig Configuration for the AWS Bedrock embedding provider.
 //
-// Uses AWS credentials from environment or IAM roles.
+// Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles.
 //
-// **Example Models:** cohere.embed-english-v4, amazon.titan-embed-text-v2:0
+// **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
 //
 // **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 type BedrockEmbedderConfig struct {
 	// BatchSize The batch size for embedding requests to optimize throughput.
 	BatchSize *int `json:"batch_size,omitempty"`
 
-	// Model The Bedrock model ID to use (e.g., 'cohere.embed-english-v4', 'amazon.titan-embed-text-v2:0').
+	// Dimension Output dimension for embedding models that support configurable dimensions.
+	Dimension *int `json:"dimension,omitempty"`
+
+	// Dimensions Output dimension for embedding models that use OpenAI-compatible plural naming.
+	Dimensions *int `json:"dimensions,omitempty"`
+
+	// InputType Specifies the type of input for optimized Cohere Bedrock embeddings.
+	InputType *string `json:"input_type,omitempty"`
+
+	// Model The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
 	Model string `json:"model"`
 
 	// Region The AWS region for the Bedrock service (e.g., 'us-east-1').
@@ -81,6 +90,9 @@ type BedrockEmbedderConfig struct {
 
 	// StripNewLines Whether to strip new lines from the input text before embedding.
 	StripNewLines *bool `json:"strip_new_lines,omitempty"`
+
+	// Truncate How to handle inputs longer than the max token length for Cohere Bedrock embeddings.
+	Truncate *string `json:"truncate,omitempty"`
 }
 
 // CohereEmbedderConfig Configuration for the Cohere embedding provider.

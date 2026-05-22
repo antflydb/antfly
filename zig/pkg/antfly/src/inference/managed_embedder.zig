@@ -23,6 +23,7 @@ const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
 const scraping = @import("antfly_scraping");
 const inference_types = @import("types.zig");
+const bedrock_provider = @import("bedrock.zig");
 const openai_provider = @import("openai.zig");
 const termite_provider = @import("termite.zig");
 const chunking_types = @import("../chunking/types.zig");
@@ -46,6 +47,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 pub const ProviderKind = enum {
     openai,
     ollama,
+    bedrock,
     termite,
     antfly,
 };
@@ -293,6 +295,10 @@ pub const ManagedEmbeddingEntry = struct {
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
+    region: []u8 = "",
+    input_type: []u8 = "",
+    truncate: []u8 = "",
+    bedrock_credentials: bedrock_provider.CredentialCache = .{},
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
@@ -310,6 +316,10 @@ pub const ManagedEmbeddingEntry = struct {
         alloc.free(self.index_name);
         alloc.free(self.model);
         alloc.free(self.base_url);
+        if (self.region.len > 0) alloc.free(self.region);
+        if (self.input_type.len > 0) alloc.free(self.input_type);
+        if (self.truncate.len > 0) alloc.free(self.truncate);
+        self.bedrock_credentials.deinit(alloc);
         if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.auth_header_cache.deinit(alloc);
         self.* = undefined;
@@ -836,6 +846,10 @@ fn parseManagedEmbeddingEntry(
         options.local_termite_provider
     else
         null;
+    const bedrock_region: []u8 = if (provider == .bedrock) try resolveBedrockRegion(alloc, embedder_cfg) else @constCast("");
+    errdefer if (bedrock_region.len > 0) alloc.free(bedrock_region);
+    const bedrock_endpoint: []u8 = if (provider == .bedrock) try resolveBedrockEndpoint(alloc, embedder_cfg, bedrock_region) else @constCast("");
+    errdefer if (bedrock_endpoint.len > 0) alloc.free(bedrock_endpoint);
 
     return .{
         .alloc = alloc,
@@ -845,15 +859,19 @@ fn parseManagedEmbeddingEntry(
         .base_url = switch (provider) {
             .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
             .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
+            .bedrock => bedrock_endpoint,
             .termite => if (local_termite_provider != null)
                 try alloc.dupe(u8, "")
             else
                 try resolveTermiteBaseUrl(alloc, embedder_cfg),
             .antfly => try alloc.dupe(u8, ""),
         },
+        .region = bedrock_region,
+        .input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else "",
+        .truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else "",
         .api_key = switch (provider) {
             .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
-            .ollama, .termite, .antfly => null,
+            .ollama, .bedrock, .termite, .antfly => null,
         },
         .secret_store = options.secret_store,
         .remote_content = options.remote_content,
@@ -906,6 +924,7 @@ fn parseEmbedderProvider(embedder: embeddings_types.Config) !ProviderKind {
     return switch (embedder.provider) {
         .openai => .openai,
         .ollama => .ollama,
+        .bedrock => .bedrock,
         .termite => .termite,
         .antfly => .antfly,
         else => error.UnsupportedEmbeddingProvider,
@@ -960,6 +979,7 @@ fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_REQUESTS_PER_MINUTE",
         .ollama => "ANTFLY_OLLAMA_EMBED_REQUESTS_PER_MINUTE",
+        .bedrock => "ANTFLY_BEDROCK_EMBED_REQUESTS_PER_MINUTE",
         .termite => "ANTFLY_TERMITE_EMBED_REQUESTS_PER_MINUTE",
         .antfly => "ANTFLY_TERMITE_EMBED_REQUESTS_PER_MINUTE",
     };
@@ -969,6 +989,7 @@ fn providerBurstEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_BURST",
         .ollama => "ANTFLY_OLLAMA_EMBED_BURST",
+        .bedrock => "ANTFLY_BEDROCK_EMBED_BURST",
         .termite => "ANTFLY_TERMITE_EMBED_BURST",
         .antfly => "ANTFLY_TERMITE_EMBED_BURST",
     };
@@ -1194,6 +1215,30 @@ fn embedWithEntryParts(
     parts: []const template_mod.ContentPart,
     dims: u32,
 ) ![]f32 {
+    if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
+        waitForEntryPacer(entry);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+
+        var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+        defer http.deinit();
+
+        var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
+            .region = entry.region,
+            .endpoint = entry.base_url,
+            .input_type = entry.input_type,
+            .truncate = entry.truncate,
+            .dimension = dims,
+        }, &@constCast(entry).bedrock_credentials);
+        defer provider.deinit();
+
+        var result = try provider.embedParts(alloc, entry.model, parts);
+        defer result.deinit();
+        if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
+        if (dims > 0 and result.vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+        return try alloc.dupe(f32, result.vectors[0]);
+    }
+
     if ((entry.provider == .termite or entry.provider == .antfly) and (entry.multimodal or partsContainMedia(parts))) {
         if (entry.local_termite_provider != null and entry.provider == .antfly) {
             return error.UnsupportedEmbeddingProvider;
@@ -1287,7 +1332,7 @@ fn embedSparseBatchWithEntry(
             }
             return embeddings;
         },
-        .openai, .ollama => return error.UnsupportedEmbeddingProvider,
+        .openai, .ollama, .bedrock => return error.UnsupportedEmbeddingProvider,
     }
 }
 
@@ -1332,6 +1377,18 @@ fn resolveTermiteBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Co
     );
     defer alloc.free(raw);
     return try appendPathIfMissing(alloc, raw, "/api");
+}
+
+fn resolveBedrockRegion(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    if (embedder.region.len > 0) return try alloc.dupe(u8, embedder.region);
+    if (resolveOptionalEnv(alloc, "AWS_REGION")) |value| return value;
+    if (resolveOptionalEnv(alloc, "AWS_DEFAULT_REGION")) |value| return value;
+    return try alloc.dupe(u8, "us-east-1");
+}
+
+fn resolveBedrockEndpoint(alloc: std.mem.Allocator, embedder: embeddings_types.Config, region: []const u8) ![]u8 {
+    if (embedder.url.len > 0) return try alloc.dupe(u8, embedder.url);
+    return try std.fmt.allocPrint(alloc, "https://bedrock-runtime.{s}.amazonaws.com", .{region});
 }
 
 fn resolveConfigString(
@@ -1402,6 +1459,9 @@ fn embedBatchWithEntry(
             }
             return try embedBatchWithOpenAiCompatible(alloc, entry, texts, dims);
         },
+        .bedrock => {
+            return try embedBatchWithBedrock(alloc, entry, texts, dims);
+        },
         .termite, .antfly => {
             if (entry.local_termite_provider) |local| {
                 waitForEntryPacer(entry);
@@ -1433,6 +1493,64 @@ fn embedBatchWithEntry(
             return try adoptDenseBatchResult(alloc, &result);
         },
     }
+}
+
+fn embedBatchWithBedrock(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+) ![]const []const f32 {
+    const max_batch = bedrock_provider.maxBatchSize(entry.model);
+    var out = std.ArrayListUnmanaged([]const f32).empty;
+    errdefer {
+        for (out.items) |vector| alloc.free(vector);
+        out.deinit(alloc);
+    }
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer http.deinit();
+
+    var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
+        .region = entry.region,
+        .endpoint = entry.base_url,
+        .input_type = entry.input_type,
+        .truncate = entry.truncate,
+        .dimension = dims,
+    }, &@constCast(entry).bedrock_credentials);
+    defer provider.deinit();
+
+    var offset: usize = 0;
+    while (offset < texts.len) {
+        const end = @min(texts.len, offset + max_batch);
+        const vectors = try embedBatchWithBedrockRequest(alloc, entry, &provider, texts[offset..end], dims);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try out.ensureUnusedCapacity(alloc, vectors.len);
+        for (vectors) |vector| out.appendAssumeCapacity(vector);
+        alloc.free(vectors);
+        offset = end;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn embedBatchWithBedrockRequest(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    provider: *bedrock_provider.Provider,
+    texts: []const []const u8,
+    dims: u32,
+) ![]const []const f32 {
+    waitForEntryPacer(entry);
+    var result = try provider.embedText(alloc, entry.model, texts);
+    errdefer result.deinit();
+    if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
+    for (result.vectors) |vector| {
+        if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
+    }
+    return try adoptDenseBatchResult(alloc, &result);
 }
 
 fn embedBatchWithOpenAiCompatiblePacedChunks(
