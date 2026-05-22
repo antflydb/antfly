@@ -885,6 +885,56 @@ fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.kHeadNormSlot(configured_layer_count, layer);
 }
 
+fn layerRopeThetaForActiveDim(gpt_config: gpt_mod.Config, layer: usize) f32 {
+    const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
+    const base_theta = gpt_config.layerRopeTheta(layer);
+    const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
+    const active_dim: f32 = @floatFromInt(rope_dim);
+    if (active_dim < freq_dim) {
+        return std.math.pow(f32, base_theta, active_dim / freq_dim);
+    }
+    return base_theta;
+}
+
+pub fn fillDenseQwen3LayerSpecs(
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    out: []ops.DecoderRuntimeLayerSpec,
+) ![]const ops.DecoderRuntimeLayerSpec {
+    if (gpt_config.family != .qwen3) return error.UnsupportedModelFamily;
+    const layer_count = @min(configured_layer_count, gpt_config.num_hidden_layers);
+    if (layer_count > out.len) return error.OutOfMemory;
+    for (0..layer_count) |layer| {
+        const head_dim = gpt_config.effectiveHeadDimForLayer(layer);
+        const kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
+        out[layer] = .{
+            .kv_heads = kv_heads,
+            .head_dim = head_dim,
+            .intermediate_size = gpt_config.intermediateSize(layer),
+            .kv_layer_index = layer,
+            .shares_kv = false,
+            .sliding_window = 0,
+            .rope_dim = @intCast(gpt_config.layerRopeDim(layer)),
+            .rope_active_dim = @intCast(gpt_config.layerRopeActiveDim(layer)),
+            .rope_theta = layerRopeThetaForActiveDim(gpt_config, layer),
+            .attn_pre_norm_slot = normSlot(layer, .attn_pre),
+            .attn_post_norm_slot = normSlot(layer, .ffn_pre),
+            .ffn_pre_norm_slot = normSlot(layer, .ffn_pre),
+            .ffn_post_norm_slot = normSlot(layer, .ffn_pre),
+            .q_head_norm_slot = qHeadNormSlot(configured_layer_count, layer),
+            .k_head_norm_slot = kHeadNormSlot(configured_layer_count, layer),
+            .q_linear_slot = linearSlot(layer, .attn_q),
+            .k_linear_slot = linearSlot(layer, .attn_k),
+            .v_linear_slot = linearSlot(layer, .attn_v),
+            .attention_linear_slot = linearSlot(layer, .attn_out_proj),
+            .gate_ffn_linear_slot = linearSlot(layer, .mlp_gate),
+            .up_ffn_linear_slot = linearSlot(layer, .mlp_up),
+            .down_ffn_linear_slot = linearSlot(layer, .mlp_down),
+        };
+    }
+    return out[0..layer_count];
+}
+
 const DirectHiddenResult = struct {
     hidden: ops.CT,
     total_rows: usize,
@@ -1208,7 +1258,7 @@ pub fn supportsConfig(gpt_config: gpt_mod.Config) bool {
         // path after prefill because vision/PLE state is already reflected in
         // the retained KV. The remaining unsupported cases are the extra
         // decoder-side sublayers that still branch the block structure.
-        .llama, .mistral, .qwen2 => !gpt_config.usesMoe() and !gpt_config.hasPle(),
+        .llama, .mistral, .qwen2, .qwen3 => !gpt_config.usesMoe() and !gpt_config.hasPle(),
         .gemma => gemma4_runtime.supportsRuntimeConfig(gpt_config),
         else => false,
     };
@@ -1560,6 +1610,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             .num_attention_heads = gpt_config.num_attention_heads,
             .global_head_dim = gpt_config.global_head_dim,
             .ple_hidden_size = gpt_config.ple_hidden_size,
+            .final_norm_slot = finalNormSlot(configured_layer_count),
             .norm_eps = gpt_config.norm_eps,
             .rope_freq_scale = gpt_config.rope_freq_scale,
             .rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs,
@@ -1742,12 +1793,12 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 .rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs,
                 .global_head_dim = gpt_config.global_head_dim,
                 .attention_linear_slot = linearSlot(layer, .attn_out_proj),
-                .attention_post_linear_rms_norm_slot = normSlot(layer, .attn_post),
+                .attention_post_linear_rms_norm_slot = if (gpt_config.family == .qwen3) null else normSlot(layer, .attn_post),
                 .hidden_size = gpt_config.hidden_size,
                 .eps = gpt_config.norm_eps,
                 .ffn_rms_norm_slot = normSlot(layer, .ffn_pre),
                 .ffn_post_gate_rms_norm_slot = null,
-                .ffn_post_down_rms_norm_slot = normSlot(layer, .ffn_post),
+                .ffn_post_down_rms_norm_slot = if (gpt_config.family == .qwen3) null else normSlot(layer, .ffn_post),
                 .gate_ffn_linear_slot = linearSlot(layer, .mlp_gate),
                 .up_ffn_linear_slot = linearSlot(layer, .mlp_up),
                 .down_ffn_linear_slot = linearSlot(layer, .mlp_down),
@@ -4025,9 +4076,12 @@ fn forwardFinalHiddenLastRowDirect(
     return last_hidden;
 }
 
-pub fn buildOverrides(gpt_config: gpt_mod.Config, configured_layer_count: usize) gpt_arch.Layer0DecoderOverrides {
+pub fn buildOverridesWithLevel(
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    configured_override_level: usize,
+) gpt_arch.Layer0DecoderOverrides {
     const prepared_layer_count = preparedLayers(@min(configured_layer_count, gpt_config.num_hidden_layers));
-    const configured_override_level = overrideLevel();
     var overrides = gpt_arch.Layer0DecoderOverrides{};
     for (0..prepared_layer_count) |layer| {
         if (configured_override_level >= 1) {
@@ -4052,6 +4106,37 @@ pub fn buildOverrides(gpt_config: gpt_mod.Config, configured_layer_count: usize)
         }
     }
     return overrides;
+}
+
+pub fn buildOverrides(gpt_config: gpt_mod.Config, configured_layer_count: usize) gpt_arch.Layer0DecoderOverrides {
+    return buildOverridesWithLevel(gpt_config, configured_layer_count, overrideLevel());
+}
+
+fn prepareLinearNoBiasSlotForConfig(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    slot: usize,
+    weight: ops.CT,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (gpt_config.family != .qwen3) {
+        return decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, slot, weight, in_dim, out_dim);
+    }
+
+    // Jina v5 applies a LoRA retrieval adapter into the loaded f32 tensor.
+    // Preparing from raw bf16 bytes would bypass that merge for resident slots.
+    const shape = try cb.tensorShape(weight, allocator);
+    defer allocator.free(shape);
+    const shape_i32 = try allocator.alloc(i32, shape.len);
+    defer allocator.free(shape_i32);
+    for (shape, 0..) |dim, i| shape_i32[i] = @intCast(dim);
+    const values = try cb.toFloat32(weight, allocator);
+    defer allocator.free(values);
+    const dense = try cb.fromFloat32Shape(values, shape_i32);
+    defer cb.free(dense);
+    return decoder_rms_runtime.prepareLinearNoBiasDenseSlot(cb, allocator, slot, dense, in_dim, out_dim, true);
 }
 
 pub fn prepareDecodeRuntime(
@@ -4133,39 +4218,41 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
 
-        if (gpt_config.family == .gemma) {
+        if (gpt_config.family == .gemma or gpt_config.family == .qwen3) {
             var primary_buf: [256]u8 = undefined;
 
-            started_at = monotonicNowNs();
-            const ffn_pre_norm_name = std.fmt.bufPrint(&primary_buf, "model.layers.{d}.pre_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong;
-            const ffn_pre_norm_w = gpt_arch.getModelWeight(cb, gpt_config, ffn_pre_norm_name) catch attn_post_norm_w;
-            const owns_ffn_pre = ffn_pre_norm_w != attn_post_norm_w;
-            defer if (owns_ffn_pre) cb.free(ffn_pre_norm_w);
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-            started_at = monotonicNowNs();
-            if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, normSlot(layer, .ffn_pre), ffn_pre_norm_w, gpt_config.hidden_size))) {
-                timing_stats.prepare_ffn_pre_norm_failures += 1;
-                tracePrepareLayerFailure(layer, "ffn_pre_norm", normSlot(layer, .ffn_pre), gpt_config.hidden_size, gpt_config.hidden_size);
-                return false;
-            }
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
+            if (gpt_config.family == .gemma) {
+                started_at = monotonicNowNs();
+                const ffn_pre_norm_name = std.fmt.bufPrint(&primary_buf, "model.layers.{d}.pre_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong;
+                const ffn_pre_norm_w = gpt_arch.getModelWeight(cb, gpt_config, ffn_pre_norm_name) catch attn_post_norm_w;
+                const owns_ffn_pre = ffn_pre_norm_w != attn_post_norm_w;
+                defer if (owns_ffn_pre) cb.free(ffn_pre_norm_w);
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+                started_at = monotonicNowNs();
+                if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, normSlot(layer, .ffn_pre), ffn_pre_norm_w, gpt_config.hidden_size))) {
+                    timing_stats.prepare_ffn_pre_norm_failures += 1;
+                    tracePrepareLayerFailure(layer, "ffn_pre_norm", normSlot(layer, .ffn_pre), gpt_config.hidden_size, gpt_config.hidden_size);
+                    return false;
+                }
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
 
-            started_at = monotonicNowNs();
-            const ffn_post_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
-            const ffn_post_norm_w = try gpt_arch.getModelWeight(cb, gpt_config, ffn_post_norm_name);
-            defer cb.free(ffn_post_norm_w);
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-            started_at = monotonicNowNs();
-            if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, normSlot(layer, .ffn_post), ffn_post_norm_w, gpt_config.hidden_size))) {
-                timing_stats.prepare_ffn_post_norm_failures += 1;
-                tracePrepareLayerFailure(layer, "ffn_post_norm", normSlot(layer, .ffn_post), gpt_config.hidden_size, gpt_config.hidden_size);
-                return false;
+                started_at = monotonicNowNs();
+                const ffn_post_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
+                const ffn_post_norm_w = try gpt_arch.getModelWeight(cb, gpt_config, ffn_post_norm_name);
+                defer cb.free(ffn_post_norm_w);
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+                started_at = monotonicNowNs();
+                if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, normSlot(layer, .ffn_post), ffn_post_norm_w, gpt_config.hidden_size))) {
+                    timing_stats.prepare_ffn_post_norm_failures += 1;
+                    tracePrepareLayerFailure(layer, "ffn_post_norm", normSlot(layer, .ffn_post), gpt_config.hidden_size, gpt_config.hidden_size);
+                    return false;
+                }
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
             }
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
 
             started_at = monotonicNowNs();
             const q_head_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_norm.weight", .{layer});
@@ -4205,7 +4292,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, linearSlot(layer, .attn_q), q_w, gpt_config.hidden_size, attention_input_size))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_q), q_w, gpt_config.hidden_size, attention_input_size))) {
             timing_stats.prepare_attn_q_failures += 1;
             tracePrepareLayerFailure(layer, "attn_q", linearSlot(layer, .attn_q), gpt_config.hidden_size, attention_input_size);
             return false;
@@ -4220,7 +4307,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim))) {
             timing_stats.prepare_attn_k_failures += 1;
             tracePrepareLayerFailure(layer, "attn_k", linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
             return false;
@@ -4235,7 +4322,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim))) {
             timing_stats.prepare_attn_v_failures += 1;
             tracePrepareLayerFailure(layer, "attn_v", linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
             return false;
@@ -4257,9 +4344,10 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        const prepared_attn_out = try decoder_rms_runtime.prepareLinearNoBiasSlot(
+        const prepared_attn_out = try prepareLinearNoBiasSlotForConfig(
             cb,
             allocator,
+            gpt_config,
             linearSlot(layer, .attn_out_proj),
             attn_out_w,
             attention_input_size,
@@ -4279,7 +4367,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, linearSlot(layer, .mlp_gate), gate_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer)))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_gate), gate_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer)))) {
             timing_stats.prepare_mlp_gate_failures += 1;
             tracePrepareLayerFailure(layer, "mlp_gate", linearSlot(layer, .mlp_gate), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
             return false;
@@ -4293,7 +4381,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, linearSlot(layer, .mlp_up), up_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer)))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_up), up_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer)))) {
             timing_stats.prepare_mlp_up_failures += 1;
             tracePrepareLayerFailure(layer, "mlp_up", linearSlot(layer, .mlp_up), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
             return false;
@@ -4307,7 +4395,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, linearSlot(layer, .mlp_down), down_w, gpt_config.intermediateSize(layer), gpt_config.hidden_size))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_down), down_w, gpt_config.intermediateSize(layer), gpt_config.hidden_size))) {
             timing_stats.prepare_mlp_down_failures += 1;
             tracePrepareLayerFailure(layer, "mlp_down", linearSlot(layer, .mlp_down), gpt_config.intermediateSize(layer), gpt_config.hidden_size);
             return false;

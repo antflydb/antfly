@@ -53,14 +53,23 @@ fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []con
     return b.fmt("onnxruntime/{s}-{s}", .{ platform_str, arch_str });
 }
 
-fn defaultMlxRoot(b: *std.Build) ?[]const u8 {
+fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
+    if (target.result.os.tag != .macos) return false;
+    const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
+    const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
+    return pathExists(b, header) and pathExists(b, library);
+}
+
+fn defaultMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
     const roots = [_][]const u8{
         "/opt/homebrew",
+        "/opt/homebrew/opt/mlx-c",
         "/usr/local",
+        "/usr/local/opt/mlx-c",
         "/usr",
     };
     for (roots) |root| {
-        if (pathExists(b, b.fmt("{s}/lib/libmlxc.dylib", .{root}))) return root;
+        if (mlxRootAvailable(b, target, root)) return root;
     }
     return null;
 }
@@ -169,18 +178,34 @@ pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, wasm_memory_model, "wasm32") and !std.mem.eql(u8, wasm_memory_model, "wasm64")) {
         @panic("invalid -Dwasm-memory-model (expected wasm32 or wasm64)");
     }
+    const onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime backend");
+    const enable_onnx = if (enable_wasm or !link_libc) false else (onnx_option orelse false);
     const onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root (default: ./onnxruntime/<platform>)");
-    const default_onnx_root = defaultOnnxRuntimeRoot(b, target);
-    const effective_onnx_root = onnx_root_opt orelse default_onnx_root;
-    const enable_onnx = if (enable_wasm or !link_libc) false else (b.option(bool, "onnx", "Enable ONNX Runtime backend (default: false)") orelse false);
+    const effective_onnx_root = onnx_root_opt orelse defaultOnnxRuntimeRoot(b, target);
     const mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with lib/libmlxc.dylib");
-    const default_mlx_root = defaultMlxRoot(b);
-    const effective_mlx_root = mlx_root_opt orelse default_mlx_root;
-    const mlx_requested = if (enable_wasm or !link_libc) false else (b.option(bool, "mlx", "Enable MLX backend (macOS only, default: false)") orelse false);
+    const mlx_option = b.option(bool, "mlx", "Enable MLX backend (macOS only)");
+    const mlx_requested = if (enable_wasm or !link_libc) false else (mlx_option orelse false);
     // Metal kernels are independent of MLX, but MLX decoder paths currently
     // dispatch through Metal kernels. Disabling Metal therefore disables MLX.
     const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (mlx_requested or target.result.os.tag == .macos));
     const enable_mlx = enable_metal and mlx_requested;
+    const effective_mlx_root = if (enable_mlx)
+        mlx_root_opt orelse defaultMlxRoot(b, target)
+    else
+        mlx_root_opt;
+    if (enable_onnx) {
+        const onnx_runtime_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{effective_onnx_root})) and
+            pathExists(b, b.fmt("{s}/lib", .{effective_onnx_root}));
+        if (!onnx_runtime_available) {
+            @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
+        }
+    }
+    if (enable_mlx) {
+        const root = effective_mlx_root orelse @panic("-Dmlx=true requires an MLX C install; pass -Dmlx-root=<path>");
+        if (!mlxRootAvailable(b, target, root)) {
+            @panic("-Dmlx=true requires an MLX C install with include/mlx/c/mlx.h and lib/libmlxc.dylib");
+        }
+    }
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
     const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
     if (!std.mem.eql(u8, cuda_artifacts, "portable")) {

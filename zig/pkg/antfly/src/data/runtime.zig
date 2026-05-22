@@ -66,6 +66,7 @@ const CliConfig = struct {
     tick_ms: ?u64 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
+    secret_store_path: ?[]const u8 = null,
     help: bool = false,
 
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
@@ -6872,8 +6873,23 @@ pub fn runFromIterator(
         return;
     }
 
+    var secret_store: antfly.common.secrets.FileStore = undefined;
+    var secret_store_initialized = false;
+    defer if (secret_store_initialized) secret_store.deinit();
+
+    if (cli.secret_store_path) |raw_secret_store_path| {
+        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
+        defer alloc.free(normalized_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+        secret_store_initialized = true;
+    }
+
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPath(alloc, config_path)
+        try antfly.common.config.loadFromPathWithSecrets(
+            alloc,
+            config_path,
+            if (secret_store_initialized) &secret_store else null,
+        )
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
@@ -6940,6 +6956,7 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .auth_enabled = auth_enabled,
             .user_manager = if (user_manager) |*manager| manager else null,
+            .secret_store = if (secret_store_initialized) &secret_store else null,
         },
     }, metadata_api_urls.urls);
     defer data_server.deinit();
@@ -7063,6 +7080,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--replica-catalog-path")) {
             cfg.replica_catalog_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--secret-store-path")) {
+            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
         }
         return error.InvalidArguments;
@@ -7220,6 +7241,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
+        \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
@@ -7292,6 +7314,14 @@ test "data runtime cli accepts config path" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
+}
+
+test "data runtime cli accepts secret store path" {
+    const argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
 }
 
 test "data runtime resolves metadata api urls from common config" {

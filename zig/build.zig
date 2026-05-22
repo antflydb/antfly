@@ -70,6 +70,13 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
+    if (target.result.os.tag != .macos) return false;
+    const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
+    const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
+    return pathExists(b, header) and pathExists(b, library);
+}
+
 fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{
         "uv",
@@ -244,9 +251,7 @@ fn detectMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
         "/usr/local/opt/mlx-c",
     };
     for (candidates) |root| {
-        const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
-        const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
-        if (pathExists(b, header) and pathExists(b, library)) return root;
+        if (mlxRootAvailable(b, target, root)) return root;
     }
     return null;
 }
@@ -1025,24 +1030,28 @@ pub fn build(b: *std.Build) void {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
+    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX termite support when available");
+    const termite_mlx_requested = if (link_libc)
+        termite_mlx_option orelse false
+    else
+        false;
     const termite_mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with include/ and lib/");
-    const detected_termite_mlx_root = detectMlxRoot(b, target);
-    const termite_mlx_root = termite_mlx_root_opt orelse detected_termite_mlx_root;
+    const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite");
+    const termite_enable_onnx = if (link_libc)
+        termite_onnx_option orelse false
+    else
+        false;
     const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded Termite");
     const termite_onnx_root = termite_onnx_root_opt orelse defaultTermiteOnnxRoot(b, target);
-    const termite_mlx_requested = if (link_libc)
-        b.option(bool, "mlx", "Enable MLX termite support (default: false)") orelse false
-    else
-        false;
-    const termite_enable_onnx = if (link_libc)
-        b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite (default: false)") orelse false
-    else
-        false;
     const termite_enable_metal = if (link_libc)
         b.option(bool, "metal", "Enable Apple Metal kernels for embedded Termite") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
     else
         false;
     const termite_enable_mlx = termite_enable_metal and termite_mlx_requested;
+    const termite_mlx_root = if (termite_enable_mlx)
+        termite_mlx_root_opt orelse detectMlxRoot(b, target)
+    else
+        termite_mlx_root_opt;
     const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA termite support through the NVIDIA Driver API") orelse false;
     const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
     if (!std.mem.eql(u8, termite_cuda_artifacts, "portable")) {
@@ -1058,8 +1067,18 @@ pub fn build(b: *std.Build) void {
         termite_blas_root_opt
     else
         null;
-    if (termite_enable_mlx and termite_mlx_root == null) {
-        @panic("-Dmlx=true requires MLX C to be available; install mlx-c or pass -Dmlx-root=<path>");
+    if (termite_enable_mlx) {
+        const root = termite_mlx_root orelse @panic("-Dmlx=true requires an MLX C install; pass -Dmlx-root=<path>");
+        if (!mlxRootAvailable(b, target, root)) {
+            @panic("-Dmlx=true requires an MLX C install with include/mlx/c/mlx.h and lib/libmlxc.dylib");
+        }
+    }
+    if (termite_enable_onnx) {
+        const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
+            pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
+        if (!termite_onnx_available) {
+            @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
+        }
     }
     const delegated_termite_steps = addDelegatedTermiteBuildSteps(
         b,
@@ -5826,7 +5845,13 @@ pub fn build(b: *std.Build) void {
         .root_module = antfly_main_mod,
     });
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
+    const install_antfarm_assets = b.addInstallDirectory(.{
+        .source_dir = b.path("../src/metadata/antfarm"),
+        .install_dir = .prefix,
+        .install_subdir = "share/antfly/antfarm",
+    });
     b.getInstallStep().dependOn(&install_antfly.step);
+    b.getInstallStep().dependOn(&install_antfarm_assets.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
@@ -5836,6 +5861,7 @@ pub fn build(b: *std.Build) void {
     antfly_step.dependOn(&run_antfly.step);
     const install_antfly_step = b.step("install-antfly", "Build and install the top-level Antfly CLI");
     install_antfly_step.dependOn(&install_antfly.step);
+    install_antfly_step.dependOn(&install_antfarm_assets.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
     run_recall_harness_default.addArgs(&.{

@@ -90,6 +90,82 @@ func (h *StoreAPI) finishShardStart(shardID types.ID) {
 	delete(h.startingShards, shardID)
 }
 
+const allowedFileBackupDirsEnv = "ANTFLY_ALLOWED_FILE_BACKUP_DIRS"
+
+func pathWithinBase(path, base string) bool {
+	cleanPath := filepath.Clean(path)
+	cleanBase := filepath.Clean(base)
+	if cleanPath == cleanBase {
+		return true
+	}
+	return strings.HasPrefix(cleanPath, cleanBase+string(os.PathSeparator))
+}
+
+func safeJoinUnder(base, name string) (string, error) {
+	if filepath.IsAbs(name) || strings.Contains(name, string(os.PathSeparator)) || strings.Contains(name, "/") || strings.Contains(name, `\\`) {
+		return "", fmt.Errorf("path component %q must be a file name", name)
+	}
+	joined := filepath.Clean(filepath.Join(base, name))
+	if !pathWithinBase(joined, base) {
+		return "", fmt.Errorf("path %s escapes base directory %s", joined, base)
+	}
+	return joined, nil
+}
+
+func (h *StoreAPI) allowedLocalBackupDirs() ([]string, error) {
+	baseDir, err := filepath.Abs(h.antflyConfig.GetBaseDir())
+	if err != nil {
+		return nil, fmt.Errorf("resolving antfly base directory: %w", err)
+	}
+
+	allowed := []string{filepath.Clean(baseDir)}
+	for _, configured := range filepath.SplitList(os.Getenv(allowedFileBackupDirsEnv)) {
+		configured = strings.TrimSpace(configured)
+		if configured == "" {
+			continue
+		}
+		abs, err := filepath.Abs(configured)
+		if err != nil {
+			return nil, fmt.Errorf("resolving allowed file backup directory %q: %w", configured, err)
+		}
+		allowed = append(allowed, filepath.Clean(abs))
+	}
+
+	return allowed, nil
+}
+
+func (h *StoreAPI) localBackupDir(location string) (string, error) {
+	after, ok := strings.CutPrefix(location, "file://")
+	if !ok {
+		return "", fmt.Errorf("location must use file://")
+	}
+	if strings.TrimSpace(after) == "" {
+		return "", fmt.Errorf("file backup location cannot be empty")
+	}
+	dir, err := filepath.Abs(after)
+	if err != nil {
+		return "", fmt.Errorf("resolving file backup location: %w", err)
+	}
+	allowedDirs, err := h.allowedLocalBackupDirs()
+	if err != nil {
+		return "", err
+	}
+	for _, allowedDir := range allowedDirs {
+		if pathWithinBase(dir, allowedDir) {
+			return filepath.Clean(dir), nil
+		}
+	}
+	return "", fmt.Errorf("file backup location %s must be under antfly base directory or a directory listed in %s", dir, allowedFileBackupDirsEnv)
+}
+
+func validateBackupIDForHTTP(w http.ResponseWriter, backupID string) bool {
+	if err := common.ValidateBackupID(backupID); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid backup ID: %v", err), http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 func downloadFromS3(
 	ctx context.Context,
 	logger *zap.Logger,
@@ -277,6 +353,9 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					if req.RestoreConfig == nil {
 						return fmt.Errorf("%w: RestoreConfig is required when uploading a backup file", ErrBadRequest)
 					}
+					if err := common.ValidateBackupID(req.RestoreConfig.BackupID); err != nil {
+						return fmt.Errorf("%w: invalid backup ID: %v", ErrBadRequest, err)
+					}
 					if !strings.HasPrefix(filePart.FileName(), req.RestoreConfig.BackupID) {
 						return fmt.Errorf("%w: uploaded file name %s does not match expected backup ID %s", ErrBadRequest, filePart.FileName(), req.RestoreConfig.BackupID)
 					}
@@ -292,8 +371,11 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					if err := os.MkdirAll(snapDir, os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
 						return fmt.Errorf("creating snapshot directory %s: %w", snapDir, err)
 					}
-					destPath := filepath.Join(snapDir, backupFileName)
-					if _, err := os.Stat(destPath); err == nil { //nolint:gosec // G703: path from internal config
+					destPath, err := safeJoinUnder(snapDir, backupFileName)
+					if err != nil {
+						return fmt.Errorf("%w: invalid backup path: %v", ErrBadRequest, err)
+					}
+					if _, err := os.Stat(destPath); err == nil { //nolint:gosec // G703: path validated under snap dir
 						// TODO (ajr) Send the expected checksum from the leader to verify integrity
 						h.logger.Info("Backup file already exists, skipping save",
 							zap.String("destPath", destPath),
@@ -356,6 +438,9 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 		// Process RestoreConfig if present and archive not already set by multipart
 		if req.RestoreConfig != nil && initWithDBArchive == "" {
 			restoreConf := req.RestoreConfig
+			if err := common.ValidateBackupID(restoreConf.BackupID); err != nil {
+				return fmt.Errorf("%w: invalid backup ID: %v", ErrBadRequest, err)
+			}
 			format := common.NormalizeBackupFormat(restoreConf.Format)
 			// newShardID is the shardID for this node, restoreConf.BackupID is the ID given by the leader.
 			backupFileName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
@@ -370,7 +455,10 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 			) // Directory creation handled by downloadFromS3 or local copy
 
 			if strings.HasPrefix(restoreConf.Location, "s3://") {
-				destPath := filepath.Join(snapDir, backupFileName)
+				destPath, err := safeJoinUnder(snapDir, backupFileName)
+				if err != nil {
+					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
+				}
 				// Don't cancel the download if the request context is canceled,
 				// it could take a while.
 				if err := downloadFromS3(context.Background(), h.logger, restoreConf.Location, backupFileName, destPath, &h.antflyConfig.Storage.S3); err != nil {
@@ -378,7 +466,10 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					if format == common.BackupFormatNative {
 						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
 					}
-					alternateDestPath := filepath.Join(snapDir, alternateName)
+					alternateDestPath, alternatePathErr := safeJoinUnder(snapDir, alternateName)
+					if alternatePathErr != nil {
+						alternateDestPath = destPath
+					}
 					alternateErr := downloadFromS3(context.Background(), h.logger, restoreConf.Location, alternateName, alternateDestPath, &h.antflyConfig.Storage.S3)
 					if alternateErr != nil {
 						h.logger.Error(
@@ -399,24 +490,36 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					backupFileName = alternateName
 				}
 				initWithDBArchive = initArchiveFromBackupFile(backupFileName)
-			} else if after, ok0 := strings.CutPrefix(restoreConf.Location, "file://"); ok0 {
+			} else if strings.HasPrefix(restoreConf.Location, "file://") {
 				// This case might occur if the leader specifies a local file path accessible to this node,
-				// though typically for file transfers it would use multipart.
-				localBasePath := after
-				srcPath := filepath.Join(localBasePath, backupFileName)
+				// though typically for file transfers it would use multipart. Restrict local filesystem
+				// restore sources to the configured Antfly base directory.
+				localBasePath, err := h.localBackupDir(restoreConf.Location)
+				if err != nil {
+					return fmt.Errorf("%w: invalid restore location: %v", ErrBadRequest, err)
+				}
+				srcPath, err := safeJoinUnder(localBasePath, backupFileName)
+				if err != nil {
+					return fmt.Errorf("%w: invalid restore path: %v", ErrBadRequest, err)
+				}
 
 				if _, statErr := os.Stat(srcPath); os.IsNotExist(statErr) {
 					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
 					if format == common.BackupFormatNative {
 						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
 					}
-					alternatePath := filepath.Join(localBasePath, alternateName)
-					if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
-						backupFileName = alternateName
-						srcPath = alternatePath
+					alternatePath, alternatePathErr := safeJoinUnder(localBasePath, alternateName)
+					if alternatePathErr == nil {
+						if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
+							backupFileName = alternateName
+							srcPath = alternatePath
+						}
 					}
 				}
-				destPath := filepath.Join(snapDir, backupFileName)
+				destPath, err := safeJoinUnder(snapDir, backupFileName)
+				if err != nil {
+					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
+				}
 
 				if _, err := os.Stat(srcPath); err == nil { //nolint:gosec // G703: path from internal config
 					if err := os.MkdirAll(snapDir, os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
@@ -913,6 +1016,9 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to read request body: %v", err), http.StatusBadRequest)
 		return
 	}
+	if !validateBackupIDForHTTP(w, req.BackupID) {
+		return
+	}
 	req.Format = common.NormalizeBackupFormat(req.Format)
 
 	shard, _ := h.store.Shard(shardID)
@@ -925,17 +1031,34 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 	// Native backup: create tar.zst of Pebble checkpoint
 	// FIXME (ajr) Backups should include the byte range of the shard maybe?
 	fileName := common.ShardBackupFileName(req.BackupID, shardID)
+	var localDir string
+	if strings.HasPrefix(req.Location, "file://") {
+		var err error
+		localDir, err = h.localBackupDir(req.Location)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+			return
+		}
+	}
 	if err := shard.Backup(r.Context(), req.Location, strings.TrimSuffix(fileName, ".tar.zst")); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to backup: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if after, ok0 := strings.CutPrefix(req.Location, "file://"); ok0 {
+	if strings.HasPrefix(req.Location, "file://") {
 		// Try user-provided location first (single-node), then fall back to snapDir (distributed)
-		userPath := filepath.Join(after, fileName)
+		userPath, err := safeJoinUnder(localDir, fileName)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid backup path: %v", err), http.StatusBadRequest)
+			return
+		}
 		dataDir := h.antflyConfig.GetBaseDir()
 		snapDir := common.SnapDir(dataDir, shardID, h.store.ID())
-		snapPath := filepath.Join(snapDir, fileName)
+		snapPath, err := safeJoinUnder(snapDir, fileName)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid snapshot backup path: %v", err), http.StatusBadRequest)
+			return
+		}
 
 		filePath := userPath
 		if _, err := os.Stat(userPath); os.IsNotExist(err) { //nolint:gosec // G703: internal path with traversal protection
@@ -976,13 +1099,22 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	fileName := common.ShardPortableBackupFileName(req.BackupID, shardID)
 	destDir := common.SnapDir(h.antflyConfig.GetBaseDir(), shardID, h.store.ID())
 	streamResponse := false
-	if after, ok := strings.CutPrefix(req.Location, "file://"); ok {
-		destDir = after
+	if strings.HasPrefix(req.Location, "file://") {
+		localDir, err := h.localBackupDir(req.Location)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+			return
+		}
+		destDir = localDir
 		streamResponse = true
 	} else if req.Location == "" {
 		streamResponse = true
 	}
-	destPath := filepath.Join(destDir, fileName)
+	destPath, err := safeJoinUnder(destDir, fileName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid backup path: %v", err), http.StatusBadRequest)
+		return
+	}
 
 	if err := os.MkdirAll(destDir, 0o750); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create backup dir: %v", err), http.StatusInternalServerError)

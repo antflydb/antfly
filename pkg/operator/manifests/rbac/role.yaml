@@ -28,23 +28,9 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - nodes/proxy
-  verbs:
-  - get
-- apiGroups:
-  - ""
-  resources:
   - pods
   verbs:
   - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
   - get
   - list
   - watch

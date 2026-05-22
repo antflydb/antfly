@@ -544,6 +544,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         if (arch_config == .gpt and arch_config.gpt.family == .gpt2) {
             try transposeGpt2Conv1dWeights(allocator, &resident_weights);
         }
+        try applyJinaV5RetrievalAdapterIfPresent(allocator, model_path, mf, &resident_weights);
     }
 
     const keep_store = shouldRetainTensorStore(store.kind(), lazy_weights.count());
@@ -794,6 +795,10 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
     if (store.kind() != .gguf) {
         refineArchConfigFromWeights(&arch_config, &resident_weights);
+    }
+
+    if (store.kind() == .safetensors) {
+        try applyJinaV5RetrievalAdapterIfPresent(allocator, model_path, mf, &resident_weights);
     }
 
     const keep_store = shouldRetainTensorStore(store.kind(), lazy_weights.count());
@@ -1061,6 +1066,15 @@ fn createGpuHostedSessionWithTaskOverride(
 
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
+    var gpu_jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null;
+    errdefer if (gpu_jina_lora_adapter) |adapter| adapter.destroy();
+    if (std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5") and backend_type == .mlx) {
+        if (try jinaRetrievalAdapterPaths(allocator, model_path)) |paths| {
+            allocator.free(paths.config);
+            allocator.free(paths.weights);
+            return error.JinaV5AdapterMergeRequiresNativeBackend;
+        }
+    }
 
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
@@ -1207,6 +1221,14 @@ fn createGpuHostedSessionWithTaskOverride(
             if (tensor_store.?.kind() != .gguf) {
                 try refineArchConfigFromStore(allocator, tensor_store.?, all_names, &arch_config);
             }
+            if (backend_type == .metal and std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5")) {
+                if (try jinaRetrievalAdapterPaths(allocator, model_path)) |paths| {
+                    defer allocator.free(paths.config);
+                    defer allocator.free(paths.weights);
+                    const cfg = try parseJinaLoraConfig(allocator, paths.config);
+                    gpu_jina_lora_adapter = try gpu_hosted_store_mod.JinaLoraAdapter.create(allocator, paths.weights, cfg.scale());
+                }
+            }
         }
         break :blk "";
     } else return error.NoSafetensorsFile;
@@ -1259,8 +1281,10 @@ fn createGpuHostedSessionWithTaskOverride(
             .allow_direct_quant = direct_quant_enabled,
             .quant_execution_mode = quant_mode,
             .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
+            .jina_lora_adapter = gpu_jina_lora_adapter,
         }),
     };
+    gpu_jina_lora_adapter = null;
     errdefer archClose(impl);
     try initGpuHostedPrefetch(impl);
     return .{ .ptr = impl, .vtable = &arch_vtable };
@@ -1299,7 +1323,10 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
             if (t5_mod.isT5Model(model_type)) {
                 return .{ .t5 = try t5_mod.parseConfig(allocator, config_bytes) };
             }
-            if (gpt_mod.isGenerativeModel(model_type) or std.mem.eql(u8, model_type, "colqwen2")) {
+            if (gpt_mod.isGenerativeModel(model_type) or
+                std.mem.eql(u8, model_type, "colqwen2") or
+                std.mem.eql(u8, model_type, "jina_embeddings_v5"))
+            {
                 var cfg = try gpt_mod.parseConfig(allocator, config_bytes);
                 if (mf.gguf_path) |gguf_path| {
                     if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
@@ -2987,6 +3014,7 @@ const GpuHostedBackendInit = struct {
     allow_direct_quant: bool,
     quant_execution_mode: MlxQuantExecutionMode,
     prefer_f32_dense_tensors: bool,
+    jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null,
 };
 
 fn makeGpuHostedBackendData(
@@ -3018,6 +3046,7 @@ fn makeGpuHostedBackendData(
         .native_quant = native_quant,
         .prefer_f32_dense_tensors = init.prefer_f32_dense_tensors,
         .mirror_kv_to_manager = false,
+        .jina_lora_adapter = init.jina_lora_adapter,
     };
     return switch (backend_type) {
         .mlx => if (comptime build_options.enable_mlx) .{ .mlx = data } else unreachable,
@@ -3245,6 +3274,82 @@ fn transposeGpt2Conv1dLoadedWeightInPlace(
     if (w.owns_shape) allocator.free(w.shape);
     w.shape = new_shape;
     w.owns_shape = true;
+}
+
+const JinaLoraConfig = struct {
+    rank: usize = 32,
+    alpha: f32 = 32.0,
+
+    fn scale(self: JinaLoraConfig) f32 {
+        return self.alpha / @as(f32, @floatFromInt(self.rank));
+    }
+};
+
+fn parseJinaLoraConfig(allocator: std.mem.Allocator, path: []const u8) !JinaLoraConfig {
+    const bytes = try c_file.readFile(allocator, path);
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidAdapterConfig;
+    const obj = parsed.value.object;
+
+    var cfg = JinaLoraConfig{};
+    if (obj.get("r")) |value| {
+        if (value == .integer and value.integer > 0) cfg.rank = @intCast(value.integer);
+    }
+    if (obj.get("lora_alpha")) |value| {
+        cfg.alpha = switch (value) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| @floatCast(f),
+            else => cfg.alpha,
+        };
+    }
+    return cfg;
+}
+
+fn jinaRetrievalAdapterPaths(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+) !?struct { config: []const u8, weights: []const u8 } {
+    const config_path = try std.fs.path.join(allocator, &.{ model_path, "adapters", "retrieval", "adapter_config.json" });
+    errdefer allocator.free(config_path);
+    const weights_path = try std.fs.path.join(allocator, &.{ model_path, "adapters", "retrieval", "adapter_model.safetensors" });
+    errdefer allocator.free(weights_path);
+
+    if (!c_file.fileExists(allocator, config_path) and !c_file.fileExists(allocator, weights_path)) {
+        allocator.free(config_path);
+        allocator.free(weights_path);
+        return null;
+    }
+    if (!c_file.fileExists(allocator, config_path) or !c_file.fileExists(allocator, weights_path)) {
+        allocator.free(config_path);
+        allocator.free(weights_path);
+        return error.IncompleteJinaV5Adapter;
+    }
+
+    return .{ .config = config_path, .weights = weights_path };
+}
+
+fn applyJinaV5RetrievalAdapterIfPresent(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    mf: manifest_mod.ModelManifest,
+    resident_weights: *std.StringHashMapUnmanaged(LoadedWeight),
+) !void {
+    if (!std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5")) return;
+
+    const paths = try jinaRetrievalAdapterPaths(allocator, model_path) orelse return;
+    defer allocator.free(paths.config);
+    defer allocator.free(paths.weights);
+
+    const cfg = try parseJinaLoraConfig(allocator, paths.config);
+    var adapter = try gpu_hosted_store_mod.JinaLoraAdapter.create(allocator, paths.weights, cfg.scale());
+    defer adapter.destroy();
+
+    var it = resident_weights.iterator();
+    while (it.next()) |entry| {
+        try adapter.mergeIntoLoadedWeight(entry.key_ptr.*, entry.value_ptr);
+    }
 }
 
 fn transposeGpt2Conv1dResidentMlxWeights(
@@ -5208,6 +5313,7 @@ fn archClose(ptr: *anyopaque) void {
                 mlx_compute_mod.deinitPrefetchQueue(gpu_data);
                 if (gpu_data.residency) |*residency| residency.deinit();
                 gpu_data.native_quant.deinit();
+                if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
                 var resident_transposed_it = gpu_data.resident_transposed_weights.iterator();
                 while (resident_transposed_it.next()) |entry| {
@@ -5243,6 +5349,7 @@ fn archClose(ptr: *anyopaque) void {
                 if (comptime build_options.enable_mlx) {
                     gpu_data.native_quant.deinit();
                 }
+                if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
             }
         },

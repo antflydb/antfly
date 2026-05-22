@@ -38,7 +38,7 @@ func (p *ExternalTermitePool) ValidateExternalTermitePool() error {
 	switch p.Spec.WorkloadType {
 	case "", WorkloadTypeReadHeavy, WorkloadTypeWriteHeavy, WorkloadTypeBurst, WorkloadTypeGeneral:
 	default:
-		allErrors = append(allErrors, fmt.Sprintf("spec.workloadType must be one of: read-heavy, write-heavy, burst, general"))
+		allErrors = append(allErrors, "spec.workloadType must be one of: read-heavy, write-heavy, burst, general")
 	}
 
 	if len(p.Spec.Endpoints) == 0 {

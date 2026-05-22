@@ -18,6 +18,7 @@ package common
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/antflydb/antfly/lib/types"
@@ -82,6 +83,25 @@ func ParseStorageDBDir(dbDir string) (types.ID, types.ID, error) {
 		return 0, 0, fmt.Errorf("invalid storage db dir %s: %w", dbDir, err)
 	}
 	return shardID, nodeID, nil
+}
+
+var backupIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// ValidateBackupID rejects backup identifiers that cannot safely be embedded in
+// Antfly backup filenames. Backup IDs are user-controlled at several API
+// boundaries, so they must remain single path components before being passed to
+// ShardBackupFileName or ShardPortableBackupFileName.
+func ValidateBackupID(backupID string) error {
+	if backupID == "" {
+		return fmt.Errorf("backup ID cannot be empty")
+	}
+	if backupID == "." || backupID == ".." || strings.Contains(backupID, "..") {
+		return fmt.Errorf("backup ID %q must not contain path traversal", backupID)
+	}
+	if !backupIDPattern.MatchString(backupID) {
+		return fmt.Errorf("backup ID %q may only contain letters, numbers, dot, underscore, or dash", backupID)
+	}
+	return nil
 }
 
 func ShardBackupFileName(backupID string, shardID types.ID) string {

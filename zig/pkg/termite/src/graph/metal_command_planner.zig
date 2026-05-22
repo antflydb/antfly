@@ -577,6 +577,8 @@ pub const GatedFramePlanCursor = struct {
         options: struct {
             shares_kv: bool,
             value_norm: bool,
+            kv_seed: bool = true,
+            include_ple: bool = true,
         },
     ) ?GatedFrameLayerWindow {
         const layer_start = self.next_index;
@@ -589,7 +591,7 @@ pub const GatedFramePlanCursor = struct {
         if (!options.shares_kv) {
             if (!self.consume(&index, .k_head_norm_rope)) return null;
             if (options.value_norm and !self.consume(&index, .v_norm)) return null;
-            if (!self.consume(&index, .kv_seed)) return null;
+            if (options.kv_seed and !self.consume(&index, .kv_seed)) return null;
         }
         const block_start = index;
 
@@ -600,9 +602,11 @@ pub const GatedFramePlanCursor = struct {
         if (!self.consume(&index, .ffn_gate_up_activation)) return null;
         if (!self.consume(&index, .ffn_down_linear)) return null;
         if (!self.consume(&index, .ffn_post_norm_residual)) return null;
-        if (!self.consume(&index, .ple_gate_activation)) return null;
-        if (!self.consume(&index, .ple_projection)) return null;
-        if (!self.consume(&index, .ple_post_norm_residual)) return null;
+        if (options.include_ple) {
+            if (!self.consume(&index, .ple_gate_activation)) return null;
+            if (!self.consume(&index, .ple_projection)) return null;
+            if (!self.consume(&index, .ple_post_norm_residual)) return null;
+        }
 
         self.next_index = index;
         return .{
@@ -1133,9 +1137,10 @@ pub const GatedLayerCommandLowerer = struct {
         up_linear_slot: usize,
         down_linear_slot: usize,
         ffn_post_norm_slot: usize,
-        ple_gate_linear_slot: usize,
-        ple_proj_linear_slot: usize,
-        ple_post_norm_slot: usize,
+        include_ple: bool = true,
+        ple_gate_linear_slot: usize = 0,
+        ple_proj_linear_slot: usize = 0,
+        ple_post_norm_slot: usize = 0,
         source: usize,
         region: usize,
         rows: usize = 1,
@@ -1275,8 +1280,8 @@ pub const GatedLayerCommandLowerer = struct {
         const attn_output_op = quantOp(options.quant_formats.attention_output, rows, options.attention_input_size, options.hidden_size);
         const ffn_gate_op = quantOp(options.quant_formats.gate, rows, options.hidden_size, options.intermediate_size);
         const ffn_down_op = quantOp(options.quant_formats.down, rows, options.intermediate_size, options.hidden_size);
-        const ple_gate_op = quantOp(options.quant_formats.ple_gate, rows, options.hidden_size, options.ple_hidden_size);
-        const ple_projection_op = quantOp(options.quant_formats.ple_projection, rows, options.ple_hidden_size, options.hidden_size);
+        const ple_gate_op = if (options.include_ple) quantOp(options.quant_formats.ple_gate, rows, options.hidden_size, options.ple_hidden_size) else quantOp(.unknown, rows, options.hidden_size, options.ple_hidden_size);
+        const ple_projection_op = if (options.include_ple) quantOp(options.quant_formats.ple_projection, rows, options.ple_hidden_size, options.hidden_size) else quantOp(.unknown, rows, options.ple_hidden_size, options.hidden_size);
         const attention_kv_len = if (options.kv_len != 0) options.kv_len else rows;
         const attention_plan = quant_matmul.attentionPlanWithStorage(rows, attention_kv_len, options.head_dim, options.attention_kv_format, options.attention_storage);
         self.ops[self.op_count] = .{
@@ -1343,26 +1348,28 @@ pub const GatedLayerCommandLowerer = struct {
         self.op_count += 1;
         self.ops[self.op_count] = .{ .kind = .ffn_post_norm_residual, .source = options.source, .region = options.region, .resources = &self.ffn_post_resources };
         self.op_count += 1;
-        self.ops[self.op_count] = .{
-            .kind = .ple_gate_activation,
-            .source = options.source,
-            .region = options.region,
-            .resources = &self.ple_gate_resources,
-            .quant_matmul = ple_gate_op.quant_matmul,
-            .operator_plan = ple_gate_op.operator_plan,
-        };
-        self.op_count += 1;
-        self.ops[self.op_count] = .{
-            .kind = .ple_projection,
-            .source = options.source,
-            .region = options.region,
-            .resources = &self.ple_proj_resources,
-            .quant_matmul = ple_projection_op.quant_matmul,
-            .operator_plan = ple_projection_op.operator_plan,
-        };
-        self.op_count += 1;
-        self.ops[self.op_count] = .{ .kind = .ple_post_norm_residual, .source = options.source, .region = options.region, .resources = &self.ple_post_resources };
-        self.op_count += 1;
+        if (options.include_ple) {
+            self.ops[self.op_count] = .{
+                .kind = .ple_gate_activation,
+                .source = options.source,
+                .region = options.region,
+                .resources = &self.ple_gate_resources,
+                .quant_matmul = ple_gate_op.quant_matmul,
+                .operator_plan = ple_gate_op.operator_plan,
+            };
+            self.op_count += 1;
+            self.ops[self.op_count] = .{
+                .kind = .ple_projection,
+                .source = options.source,
+                .region = options.region,
+                .resources = &self.ple_proj_resources,
+                .quant_matmul = ple_projection_op.quant_matmul,
+                .operator_plan = ple_projection_op.operator_plan,
+            };
+            self.op_count += 1;
+            self.ops[self.op_count] = .{ .kind = .ple_post_norm_residual, .source = options.source, .region = options.region, .resources = &self.ple_post_resources };
+            self.op_count += 1;
+        }
 
         const ffn_gated_dtype = resolveFfnActivationDType(
             options.activation_dtype,
@@ -1386,9 +1393,11 @@ pub const GatedLayerCommandLowerer = struct {
         self.addScratchSize(@intFromEnum(Resource.ffn_gated), rows * options.intermediate_size * ffn_gated_dtype.byteSize(), ffn_gated_dtype);
         self.addScratchSize(@intFromEnum(Resource.ffn_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
         self.addScratchSize(@intFromEnum(Resource.ffn_output), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.ple_input), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.ple_gated), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.ple_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
+        if (options.include_ple) {
+            self.addScratchSize(@intFromEnum(Resource.ple_input), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
+            self.addScratchSize(@intFromEnum(Resource.ple_gated), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
+            self.addScratchSize(@intFromEnum(Resource.ple_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
+        }
 
         self.command_view = try self.command_storage.build(self.ops[0..self.op_count], .{}, self.scratch_sizes[0..self.scratch_size_count]);
         self.plan_view = self.command_view.planView();
@@ -1613,9 +1622,10 @@ pub const GatedFrameCommandLowerer = struct {
         for (options.layers) |layer| {
             const attention_input_size = std.math.mul(usize, options.num_attention_heads, layer.head_dim) catch return error.InvalidPrefillFrame;
             const kv_dim = std.math.mul(usize, layer.kv_heads, layer.head_dim) catch return error.InvalidPrefillFrame;
-            const ple_gate_slot = layer.ple_gate_linear_slot orelse return error.UnsupportedPrefillFrame;
-            const ple_proj_slot = layer.ple_proj_linear_slot orelse return error.UnsupportedPrefillFrame;
-            const ple_post_slot = layer.ple_post_norm_slot orelse return error.UnsupportedPrefillFrame;
+            const include_ple = options.ple_hidden_size != 0;
+            const ple_gate_slot = if (include_ple) layer.ple_gate_linear_slot orelse return error.UnsupportedPrefillFrame else 0;
+            const ple_proj_slot = if (include_ple) layer.ple_proj_linear_slot orelse return error.UnsupportedPrefillFrame else 0;
+            const ple_post_slot = if (include_ple) layer.ple_post_norm_slot orelse return error.UnsupportedPrefillFrame else 0;
             var layer_plan = PrefillGatedLayerCommandLowerer{};
             try layer_plan.build(.{
                 .shares_kv = layer.shares_kv,
@@ -1628,7 +1638,7 @@ pub const GatedFrameCommandLowerer = struct {
                 .k_head_norm_slot = layer.k_head_norm_slot orelse 0,
                 .attention_layer_index = layer.kv_layer_index,
                 .value_norm = options.global_head_dim != 0 and !layer.shares_kv,
-                .kv_seed = !layer.shares_kv,
+                .kv_seed = options.attention_storage == .paged and !layer.shares_kv,
                 .quant_formats = layer.quant_formats,
                 .activation_dtype = frame_descriptor.activation_dtype,
                 .attention_linear_slot = layer.attention_linear_slot,
@@ -1638,6 +1648,7 @@ pub const GatedFrameCommandLowerer = struct {
                 .up_linear_slot = layer.up_linear_slot,
                 .down_linear_slot = layer.down_linear_slot,
                 .ffn_post_norm_slot = layer.ffn_post_norm_slot,
+                .include_ple = include_ple,
                 .ple_gate_linear_slot = ple_gate_slot,
                 .ple_proj_linear_slot = ple_proj_slot,
                 .ple_post_norm_slot = ple_post_slot,
