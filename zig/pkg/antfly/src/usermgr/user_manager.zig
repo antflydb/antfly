@@ -1057,6 +1057,22 @@ pub const UserManager = struct {
     }
 };
 
+pub fn ensureDefaultAdminUser(manager: *UserManager) !void {
+    var existing = manager.getUser("admin") catch |err| switch (err) {
+        error.UserNotFound => {
+            var admin_permission = [_]Permission{
+                try Permission.initOwned(manager.alloc, .@"*", "*", .admin),
+            };
+            defer admin_permission[0].deinit(manager.alloc);
+            var user = try manager.createUser("admin", "admin", &admin_permission);
+            user.deinit(manager.alloc);
+            return;
+        },
+        else => return err,
+    };
+    existing.deinit(manager.alloc);
+}
+
 pub fn initDefaultEnforcer(alloc: Allocator, adapter: casbin.Adapter) !casbin.Enforcer {
     return try casbin.Enforcer.init(alloc, try casbin.Model.fromString(alloc, default_rbac_model_text), adapter);
 }
@@ -1398,6 +1414,29 @@ test "usermgr create authenticate and persist users through store" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("alice", loaded.username);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", loaded.metadata_json);
+}
+
+test "usermgr default admin seed is idempotent and grants admin" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    try ensureDefaultAdminUser(&manager);
+    try ensureDefaultAdminUser(&manager);
+
+    var authed = try manager.authenticateUser("admin", "admin");
+    defer authed.deinit(alloc);
+    try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
 }
 
 test "usermgr permissions and row filters mirror go semantics" {

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"time"
 
@@ -39,10 +40,15 @@ func errorToDirective(err error) raymond.SafeString {
 
 // resolveCredentials resolves S3 credentials and security config for a URL,
 // falling back to defaults on error.
-func resolveCredentials(url, credentials string) (*scraping.S3Credentials, *scraping.ContentSecurityConfig) {
-	s3Creds, securityConfig, err := scraping.ResolveS3Credentials(url, credentials)
+func resolveCredentials(rawURL, credentials string) (*scraping.S3Credentials, *scraping.ContentSecurityConfig) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "s3") {
+		return nil, scraping.GetEffectiveSecurity()
+	}
+
+	s3Creds, securityConfig, err := scraping.ResolveS3Credentials(rawURL, credentials)
 	if err != nil {
-		log.Printf("credential resolution failed for %s: %v", url, err)
+		log.Printf("S3 credential resolution failed for %s: %v", rawURL, err)
 		s3Creds = scraping.GetDefaultS3Credentials()
 		securityConfig = scraping.GetDefaultSecurityConfig()
 	}

@@ -134,6 +134,9 @@ const (
 	// ReasonRolloutInProgress indicates StatefulSet changes are still rolling out
 	ReasonRolloutInProgress = "RolloutInProgress"
 
+	// ReasonRolloutBlocked indicates StatefulSet changes are blocked by stale unhealthy pods
+	ReasonRolloutBlocked = "RolloutBlocked"
+
 	// ReasonRolloutComplete indicates StatefulSet changes have rolled out
 	ReasonRolloutComplete = "RolloutComplete"
 
@@ -215,11 +218,11 @@ type AntflyClusterSpec struct {
 	// +optional
 	Swarm *SwarmSpec `json:"swarm,omitempty"`
 
-	// Termite defines an operator-managed TermitePool associated with this cluster.
-	// When set, the Antfly operator creates or updates a TermitePool named
-	// "<cluster-name>-termite" in the same namespace and owned by this cluster.
+	// Termite configures inference pools used by this cluster.
+	// Pools may be owned by this cluster, referenced as customer-managed shared
+	// pools, or referenced as platform-managed shared pools.
 	// +optional
-	Termite *termitev1alpha1.TermitePoolSpec `json:"termite,omitempty"`
+	Termite *AntflyTermiteSpec `json:"termite,omitempty"`
 
 	// ProductTier records the CloudAF/product tier intent that was expanded
 	// into the explicit operator fields below. The operator does not resolve
@@ -240,6 +243,11 @@ type AntflyClusterSpec struct {
 
 	// Config is the configuration file content for Antfly
 	Config string `json:"config"`
+
+	// SecretStore mounts a Kubernetes Secret containing an Antfly secrets.json
+	// file for runtime secret resolution.
+	// +optional
+	SecretStore *SecretStoreSpec `json:"secretStore,omitempty"`
 
 	// Storage defines the storage configuration
 	Storage StorageSpec `json:"storage"`
@@ -264,6 +272,22 @@ type AntflyClusterSpec struct {
 	// If not specified, the default ServiceAccount for the namespace is used
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
+// SecretStoreSpec configures a mounted Antfly secrets.json file.
+type SecretStoreSpec struct {
+	// SecretName is the Kubernetes Secret name in the AntflyCluster namespace.
+	SecretName string `json:"secretName"`
+
+	// Key is the Secret data key containing the Antfly secrets file.
+	// Defaults to secrets.json.
+	// +optional
+	Key string `json:"key,omitempty"`
+
+	// Path is the absolute file path where the secret file should be mounted.
+	// Defaults to /run/antfly/secrets/secrets.json.
+	// +optional
+	Path string `json:"path,omitempty"`
 }
 
 // ProductTierSpec records product-tier provenance for a CR whose concrete
@@ -299,6 +323,75 @@ type ProductTierSpec struct {
 	// spec.termite is set.
 	// +optional
 	TermiteTier string `json:"termiteTier,omitempty"`
+}
+
+// AntflyTermiteMode selects how an AntflyCluster uses Termite inference pools.
+type AntflyTermiteMode string
+
+const (
+	// AntflyTermiteModeDisabled disables cluster-level inference integration.
+	AntflyTermiteModeDisabled AntflyTermiteMode = "Disabled"
+
+	// AntflyTermiteModePlatformShared uses platform-operated shared inference pools.
+	AntflyTermiteModePlatformShared AntflyTermiteMode = "PlatformShared"
+
+	// AntflyTermiteModeManaged creates TermitePools owned by this AntflyCluster.
+	AntflyTermiteModeManaged AntflyTermiteMode = "Managed"
+
+	// AntflyTermiteModeSharedRef uses existing customer-managed TermitePools.
+	AntflyTermiteModeSharedRef AntflyTermiteMode = "SharedRef"
+)
+
+// AntflyTermiteSpec configures Termite inference pools for an AntflyCluster.
+type AntflyTermiteSpec struct {
+	// Mode selects how Termite pools are provided.
+	// +kubebuilder:validation:Enum=Disabled;PlatformShared;Managed;SharedRef
+	// +kubebuilder:default=Managed
+	// +optional
+	Mode AntflyTermiteMode `json:"mode,omitempty"`
+
+	// ManagedPools are TermitePools created and owned by this AntflyCluster.
+	// Valid when mode is Managed.
+	// +optional
+	ManagedPools []ManagedTermitePoolSpec `json:"managedPools,omitempty"`
+
+	// SharedPools references existing customer-managed TermitePools.
+	// Valid when mode is SharedRef.
+	// +optional
+	SharedPools []TermitePoolReference `json:"sharedPools,omitempty"`
+
+	// PlatformPools references platform-operated shared TermitePools.
+	// Valid when mode is PlatformShared.
+	// +optional
+	PlatformPools []TermitePoolReference `json:"platformPools,omitempty"`
+}
+
+// ManagedTermitePoolSpec describes one TermitePool owned by an AntflyCluster.
+type ManagedTermitePoolSpec struct {
+	// Name is the child TermitePool name. If omitted for a single managed pool,
+	// the operator uses "<antflycluster-name>-termite".
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Spec is the TermitePool spec to apply to the child pool.
+	Spec termitev1alpha1.TermitePoolSpec `json:"spec"`
+}
+
+// TermitePoolReference points at an existing shared TermitePool or service.
+type TermitePoolReference struct {
+	// Name is the referenced TermitePool or logical platform pool name.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace is the referenced pool namespace. If omitted, the cluster
+	// namespace is used.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// APIURL optionally pins the Termite API URL for this reference. When omitted,
+	// higher-level platform wiring may resolve the URL from the referenced pool.
+	// +optional
+	APIURL string `json:"apiURL,omitempty"`
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes

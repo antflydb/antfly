@@ -23,4 +23,7 @@
 //	// Get individual resources
 //	sa := manifests.ServiceAccount()
 //	role := manifests.ClusterRole()
+//
+//	// Get optional storage auto-grow RBAC resources
+//	storageAutoGrowRBAC := manifests.StorageAutoGrowRBACResources()
 package manifests

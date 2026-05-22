@@ -33,7 +33,6 @@ type AntflyRestoreReconciler struct {
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyrestores/finalizers,verbs=update
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile handles AntflyRestore reconciliation
 func (r *AntflyRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -257,7 +256,7 @@ func (r *AntflyRestoreReconciler) buildRestoreJob(restore *antflyv1.AntflyRestor
 							// directly as argv without shell interpretation —
 							// no quoting needed (unlike the backup controller
 							// which uses shell form for $(date) expansion).
-							Command: []string{"/antfly", "cli"},
+							Command: []string{"/antfly"},
 							Args:    args,
 							EnvFrom: envFrom,
 						},

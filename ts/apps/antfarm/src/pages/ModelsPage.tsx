@@ -232,9 +232,17 @@ function formatNumber(num: number): string {
   return num.toString();
 }
 
+function isHuggingFaceSource(source: string): boolean {
+  return source.includes("/") && !source.startsWith("/") && !source.includes("://");
+}
+
 // Hook to fetch HuggingFace stats for a model
 function useHFStats(source: string): HFStats {
+  const shouldFetch = isHuggingFaceSource(source);
   const [stats, setStats] = useState<HFStats>(() => {
+    if (!shouldFetch) {
+      return { downloads: 0, likes: 0, loading: false, error: true };
+    }
     const cached = hfStatsCache.get(source);
     if (cached) {
       return { ...cached, loading: false, error: false };
@@ -243,6 +251,11 @@ function useHFStats(source: string): HFStats {
   });
 
   useEffect(() => {
+    if (!shouldFetch) {
+      setStats({ downloads: 0, likes: 0, loading: false, error: true });
+      return;
+    }
+
     // Skip if already cached
     const cached = hfStatsCache.get(source);
     if (cached) {
@@ -292,7 +305,7 @@ function useHFStats(source: string): HFStats {
     fetchStats();
 
     return () => controller.abort();
-  }, [source]);
+  }, [source, shouldFetch]);
 
   return stats;
 }
@@ -322,6 +335,10 @@ const HFLogo: React.FC<{ className?: string }> = ({ className }) => (
 // Stats display component for cards
 const ModelStats: React.FC<{ source: string; compact?: boolean }> = ({ source, compact }) => {
   const { downloads, likes, loading, error } = useHFStats(source);
+
+  if (!isHuggingFaceSource(source)) {
+    return null;
+  }
 
   if (loading) {
     return (
@@ -546,6 +563,7 @@ const ModelDetailSheet: React.FC<{
     if (opt.generatorOnly && model.type !== "generator") return false;
     return model.variants.includes(opt.type);
   });
+  const canShowDownloadCommand = allowDownloads && model.sourceUrl !== "";
 
   const selectedVariantInfo = selectedVariant
     ? availableVariants.find((q) => q.type === selectedVariant)
@@ -648,11 +666,17 @@ const ModelDetailSheet: React.FC<{
           )}
 
           {/* Download Configuration */}
-          {!allowDownloads ? (
+          {!canShowDownloadCommand ? (
             <div className="rounded-lg border border-border bg-muted/30 px-4 py-3">
               <p className="text-xs text-muted-foreground">
-                Use <code className="font-mono bg-muted px-1 py-0.5 rounded">termite pull</code> CLI
-                or the Termite operator to manage models in production deployments.
+                {model.sourceUrl ? (
+                  <>
+                    Use <code className="font-mono bg-muted px-1 py-0.5 rounded">termite pull</code>{" "}
+                    CLI or the Termite operator to manage models in production deployments.
+                  </>
+                ) : (
+                  "This model is provided by the running Termite runtime and does not need a download command."
+                )}
               </p>
             </div>
           ) : (
@@ -847,20 +871,22 @@ const ModelDetailSheet: React.FC<{
           )}
 
           {/* HuggingFace link */}
-          <a
-            href={model.sourceUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={cn(
-              "flex items-center justify-center gap-2 w-full py-2.5 rounded-lg",
-              "text-sm text-muted-foreground hover:text-foreground",
-              "border border-border hover:border-foreground/20",
-              "transition-colors"
-            )}
-          >
-            <ExternalLink className="w-3.5 h-3.5" />
-            View on HuggingFace
-          </a>
+          {model.sourceUrl && (
+            <a
+              href={model.sourceUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cn(
+                "flex items-center justify-center gap-2 w-full py-2.5 rounded-lg",
+                "text-sm text-muted-foreground hover:text-foreground",
+                "border border-border hover:border-foreground/20",
+                "transition-colors"
+              )}
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              View on HuggingFace
+            </a>
+          )}
         </div>
       </SheetContent>
     </Sheet>
@@ -1030,7 +1056,8 @@ const ModelsPage: React.FC = () => {
     setSheetOpen(true);
   };
 
-  const registryCount = models.filter((m) => m.inRegistry).length;
+  const readyCount = models.filter((m) => m.inRegistry).length;
+  const huggingFaceCount = models.filter((m) => m.sourceUrl).length;
 
   // Loading state
   if (loading) {
@@ -1070,7 +1097,7 @@ const ModelsPage: React.FC = () => {
     return (
       <DashboardPage className="min-h-full items-center justify-center">
         <ErrorState
-          message="Could not load the model registry. Check your network connection and try again."
+          message="Could not load models from Termite. Check the runtime connection and try again."
           onRetry={retry}
         />
       </DashboardPage>
@@ -1083,23 +1110,23 @@ const ModelsPage: React.FC = () => {
         <div>
           <DashboardPageTitle className="font-aeonik">Model Directory</DashboardPageTitle>
           <DashboardPageDescription>
-            Browse {models.length} optimized models for embeddings, NER, chunking, and more. All
-            models run locally via ONNX.
+            Browse {models.length} models reported by Termite. Models run locally through the Zig
+            runtime.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
           <div className="flex items-center gap-4 text-sm text-muted-foreground">
             <span>
               <span className="font-medium text-foreground tabular-nums">
-                <AnimatedCounter value={registryCount} />
+                <AnimatedCounter value={readyCount} />
               </span>{" "}
               ready
             </span>
             <span>
               <span className="font-medium text-foreground tabular-nums">
-                <AnimatedCounter value={models.length - registryCount} />
+                <AnimatedCounter value={huggingFaceCount} />
               </span>{" "}
-              exportable
+              Hugging Face
             </span>
           </div>
         </DashboardPageActions>

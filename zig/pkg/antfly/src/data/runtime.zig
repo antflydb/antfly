@@ -52,6 +52,7 @@ const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
+    health_enabled: ?bool = null,
     health_port: ?u16 = null,
     raft_bind_host: ?[]const u8 = null,
     raft_bind_port: ?u16 = null,
@@ -65,6 +66,7 @@ const CliConfig = struct {
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
+    secret_store_path: ?[]const u8 = null,
     help: bool = false,
 
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
@@ -1314,6 +1316,7 @@ pub const DataServer = struct {
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
+    store_registration_confirmed: bool = false,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
@@ -1661,16 +1664,20 @@ pub const DataServer = struct {
         }
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
-        self.registerNodeIfConfigured() catch |err| switch (err) {
-            error.HttpConnectionClosing,
-            error.ConnectionResetByPeer,
-            error.ConnectionRefused,
-            error.BrokenPipe,
-            error.EndOfStream,
-            error.UnexpectedHttpStatus,
-            => {},
-            else => return err,
-        };
+        if (self.store_registration != null) {
+            self.store_status_dirty = true;
+            self.registerNodeIfConfigured() catch |err| switch (err) {
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.ConnectionRefused,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.UnexpectedHttpStatus,
+                error.NotListening,
+                => std.log.warn("data node registration deferred err={}", .{err}),
+                else => return err,
+            };
+        }
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
             error.SystemResources,
@@ -1707,6 +1714,19 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata != null and self.store_registration != null) {
+            if (!self.store_registration_confirmed) {
+                self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
+                    error.HttpConnectionClosing,
+                    error.ConnectionResetByPeer,
+                    error.ConnectionRefused,
+                    error.BrokenPipe,
+                    error.EndOfStream,
+                    error.UnexpectedHttpStatus,
+                    error.NotListening,
+                    => {},
+                    else => return register_err,
+                };
+            }
             self.store_status_ticks += 1;
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
             const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
@@ -1736,6 +1756,7 @@ pub const DataServer = struct {
                     error.UnexpectedHttpStatus,
                     => {},
                     error.UnknownStore => {
+                        self.store_registration_confirmed = false;
                         self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
                             error.HttpConnectionClosing,
                             error.ConnectionResetByPeer,
@@ -2826,6 +2847,7 @@ pub const DataServer = struct {
             .failure_domain = registration.failure_domain,
             .live = true,
         });
+        self.store_registration_confirmed = true;
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
@@ -6699,8 +6721,23 @@ pub fn runFromIterator(
         return;
     }
 
+    var secret_store: antfly.common.secrets.FileStore = undefined;
+    var secret_store_initialized = false;
+    defer if (secret_store_initialized) secret_store.deinit();
+
+    if (cli.secret_store_path) |raw_secret_store_path| {
+        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
+        defer alloc.free(normalized_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+        secret_store_initialized = true;
+    }
+
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPath(alloc, config_path)
+        try antfly.common.config.loadFromPathWithSecrets(
+            alloc,
+            config_path,
+            if (secret_store_initialized) &secret_store else null,
+        )
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
@@ -6747,7 +6784,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try ensureDefaultAdminUser(&user_manager.?);
+        // This seeds only the local auth store and must remain auth-gated.
+        // Raft-backed metadata writes during metadata bootstrap can block
+        // clustered startup before raft listeners are running.
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -6768,6 +6808,7 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .auth_enabled = auth_enabled,
             .user_manager = if (user_manager) |*manager| manager else null,
+            .secret_store = if (secret_store_initialized) &secret_store else null,
         },
     }, metadata_api_urls.urls);
     defer data_server.deinit();
@@ -6781,7 +6822,11 @@ pub fn runFromIterator(
     std.debug.print("\n", .{});
 
     var data_health = HealthSource{ .data_server = &data_server };
-    const health_port = cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else null;
+    const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
+    const health_port = if (health_enabled)
+        cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
+    else
+        null;
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
         "data",
@@ -6839,6 +6884,15 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--health")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.health_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--health=")) {
+            cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--auth")) {
             const value = args.next() orelse return error.InvalidArguments;
             cfg.auth_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
@@ -6882,6 +6936,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--replica-catalog-path")) {
             cfg.replica_catalog_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--secret-store-path")) {
+            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
         }
         return error.InvalidArguments;
@@ -7030,21 +7088,6 @@ fn parseBoolFlag(value: []const u8) ?bool {
     return null;
 }
 
-fn ensureDefaultAdminUser(manager: *antfly.usermgr.UserManager) !void {
-    _ = manager.getUser("admin") catch |err| switch (err) {
-        error.UserNotFound => {
-            var admin_permission = [_]antfly.usermgr.Permission{
-                try antfly.usermgr.Permission.initOwned(manager.alloc, .@"*", "*", .admin),
-            };
-            defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
-            user.deinit(manager.alloc);
-            return;
-        },
-        else => return err,
-    };
-}
-
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
         \\Usage: {s} [options]
@@ -7055,7 +7098,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-port <port>              Data API bind port (default: 0)
         \\  --raft-host <host>             Data raft bind host (default: 127.0.0.1)
         \\  --raft-port <port>             Data raft bind port (default: 0 when registered)
-        \\  --health-port <port>           Dedicated health/metrics bind port (default: unset)
+        \\  --health <true|false>          Enable health/metrics server (default: true)
+        \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --auth <true|false>            Enable auth middleware and local user store
         \\  --metadata-api <uri>           Metadata orchestration/API URL (repeat for multiple endpoints)
         \\  --node-id <id>                 Register this split data process as metadata node <id>
@@ -7066,6 +7110,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --data-dir <path>              Local storage root for data node data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
+        \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
@@ -7138,6 +7183,14 @@ test "data runtime cli accepts config path" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
+}
+
+test "data runtime cli accepts secret store path" {
+    const argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
 }
 
 test "data runtime resolves metadata api urls from common config" {
@@ -7227,6 +7280,18 @@ test "data runtime parses auth flag" {
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, parsed.auth_enabled.?);
+}
+
+test "data runtime leaves auth disabled unless config or cli enables it" {
+    var cli = CliConfig{};
+    defer cli.deinit(std.testing.allocator);
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = true;
+    try std.testing.expect(resolveAuthEnabled(cli, null));
+
+    cli.auth_enabled = false;
+    try std.testing.expect(!resolveAuthEnabled(cli, null));
 }
 
 test "data runtime local group status uses injected leadership source" {

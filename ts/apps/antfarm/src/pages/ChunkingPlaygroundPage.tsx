@@ -173,7 +173,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
         });
         if (response.ok) {
           const data = await response.json();
-          setAvailableModels(data.chunkers || []);
+          setAvailableModels(Object.keys(data.chunkers || {}));
         }
       } catch {
         // Ignore fetch errors
@@ -186,7 +186,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     return () => controller.abort();
   }, [termiteApiUrl]);
 
-  // Handle ?model= URL param from Model Registry "Open in Playground"
+  // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
     const modelParam = searchParams.get("model");
     if (modelParam && modelsLoaded && availableModels.includes(modelParam)) {

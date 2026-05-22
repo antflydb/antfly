@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 
 ZIG ?= zig
+ZIG_BUILD_FLAGS ?=
 UV ?= uv
 SCRIPTS_PY := $(UV) run --project scripts --locked python
 TERMITE_BIN ?= ./pkg/termite/zig-out/bin/termite
@@ -30,7 +31,7 @@ force-download-onnx: ## Force re-download of ONNX Runtime + GenAI.
 	$(MAKE) download-onnx
 
 build: download-onnx ## Build antfly with embedded Termite + ONNX inference.
-	$(ZIG) build install-antfly
+	$(ZIG) build install-antfly $(ZIG_BUILD_FLAGS)
 
 test: ## Run the default Zig test aggregate.
 	$(ZIG) build test
@@ -51,7 +52,7 @@ termite-e2e-models: ## Prefetch the curated termite E2E model set with `termite 
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
 generate: openapi-generate snowball-generate ## Regenerate checked-in generated sources.
 
@@ -81,7 +82,7 @@ license-check: ## Check first-party source files have license headers.
 tla-tools:
 	@bash scripts/tla-tools.sh
 
-tla-check: tla-check-txn tla-check-split tla-check-snap
+tla-check: tla-check-txn tla-check-split tla-check-snap tla-check-lsm
 
 tla-check-txn: tla-tools
 	@echo "==> Model checking transaction spec..."
@@ -102,6 +103,13 @@ tla-check-snap: tla-tools
 	source scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \
+	  -workers auto -deadlock
+
+tla-check-lsm: tla-tools
+	@echo "==> Model checking LSM lifecycle OOM safety..."
+	source scripts/tla-tools.sh && \
+	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
+	  -config specs/tla/AntflyLsmLifecycle.cfg specs/tla/AntflyLsmLifecycle.tla \
 	  -workers auto -deadlock
 
 tla-trace-raft: tla-tools

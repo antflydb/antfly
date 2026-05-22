@@ -300,6 +300,7 @@ pub const ProvisionedTableReadCache = struct {
             if (!self.hasTableLocked(table_name) and self.cachedTableCountLocked() >= max_cached_tables) self.evictOldestTableLocked();
             const owned_table_name = try self.alloc.dupe(u8, table_name);
             errdefer self.alloc.free(owned_table_name);
+            try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
             const owned_entry = try self.alloc.create(Entry);
             errdefer self.alloc.destroy(owned_entry);
             owned_entry.* = .{
@@ -521,7 +522,7 @@ pub const ProvisionedTableReadCache = struct {
             self.alloc.destroy(entry);
             return;
         }
-        self.retired_entries.append(self.alloc, entry) catch @panic("OOM");
+        self.retired_entries.appendAssumeCapacity(entry);
     }
 
     fn destroyRetiredEntryLocked(self: *ProvisionedTableReadCache, entry: *Entry) void {
@@ -15940,5 +15941,78 @@ test "provisioned read cache retires invalidated entries until the last lease is
     try std.testing.expectEqual(@as(usize, 1), cache.retired_entries.items.len);
 
     reopened.release();
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+}
+
+test "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    const path = "/tmp/antfly-api-provisioned-read-cache-retire-oom";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
+    defer lsm_cache.deinit();
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+    cache.lsm_cache = &lsm_cache;
+
+    var lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 1, "docs");
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    cache.invalidateTable("docs");
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len + cache.retired_entries.items.len);
+
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
 }

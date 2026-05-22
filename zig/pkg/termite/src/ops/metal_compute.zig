@@ -406,6 +406,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         contract: ops.DecoderRuntimeDecodeContract,
         layer_count: usize,
         rows: usize,
+        batch: usize,
+        seq_len: usize,
         hidden_size: usize,
         vocab_size: usize,
         num_attention_heads: usize,
@@ -8384,6 +8386,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const h_q = num_heads * head_dim;
         const total = batch * seq_len;
+        if (attn_bias == null) {
+            if (try self.applyBatchedDenseCausalAttentionDevice(
+                Q,
+                K,
+                V,
+                batch,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                null,
+            )) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
         if (batch == 1) {
             var q_mt = try self.ownedMetalTensorFromCt(Q);
             defer q_mt.deinit();
@@ -8438,6 +8455,82 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer self.allocator.free(output);
         const out_shape = [_]i32{ @intCast(total), @intCast(h_q) };
         return denseBuf(self.allocator, output, true, &out_shape);
+    }
+
+    fn applyBatchedDenseCausalAttentionDevice(
+        self: *MetalCompute,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        planned_layer_contract: ?ops.PlannedLayerContract,
+    ) !?MetalTensor {
+        if (batch == 0 or seq_len == 0 or num_heads == 0 or num_kv_heads == 0 or head_dim == 0) return null;
+        if (num_heads % num_kv_heads != 0) return null;
+        const total = batch * seq_len;
+        const q_width = num_heads * head_dim;
+        const kv_width = num_kv_heads * head_dim;
+
+        var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
+        defer q_mt.deinit();
+        var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
+        defer k_mt.deinit();
+        var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
+        defer v_mt.deinit();
+        if (q_mt.ndim() != 2 or k_mt.ndim() != 2 or v_mt.ndim() != 2) return null;
+        if (@as(usize, @intCast(q_mt.dim(0))) != total or @as(usize, @intCast(k_mt.dim(0))) != total or @as(usize, @intCast(v_mt.dim(0))) != total) return null;
+        if (@as(usize, @intCast(q_mt.dim(1))) != q_width or @as(usize, @intCast(k_mt.dim(1))) != kv_width or @as(usize, @intCast(v_mt.dim(1))) != kv_width) return null;
+
+        var output: ?MetalTensor = null;
+        errdefer if (output) |*tensor| tensor.deinit();
+        for (0..batch) |b| {
+            const q_offset = b * seq_len * q_width * @sizeOf(f32);
+            const kv_offset = b * seq_len * kv_width * @sizeOf(f32);
+            const q_bytes = seq_len * q_width * @sizeOf(f32);
+            const kv_bytes = seq_len * kv_width * @sizeOf(f32);
+            const q_shape = [_]i32{ @intCast(seq_len), @intCast(q_width) };
+            const kv_shape = [_]i32{ @intCast(seq_len), @intCast(kv_width) };
+            var q_view = try q_mt.retainedView(q_offset, q_bytes, &q_shape);
+            defer q_view.deinit();
+            var k_view = try k_mt.retainedView(kv_offset, kv_bytes, &kv_shape);
+            defer k_view.deinit();
+            var v_view = try v_mt.retainedView(kv_offset, kv_bytes, &kv_shape);
+            defer v_view.deinit();
+
+            const chunk = (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                .q = q_view,
+                .k = k_view,
+                .v = v_view,
+                .bias = @as(?MetalTensor, null),
+                .attn_or_mask = @as(?[]const u8, null),
+                .q_len = seq_len,
+                .kv_len = seq_len,
+                .num_heads = num_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .query_position_offset = @as(usize, 0),
+                .kv_position_offset = @as(usize, 0),
+                .sliding_window = @as(usize, 0),
+                .total_sequence_len = seq_len,
+                .planned_layer_contract = planned_layer_contract orelse ops.PlannedLayerContract{},
+            })) orelse return null;
+            if (output) |prior| {
+                var prior_mut = prior;
+                defer prior_mut.deinit();
+                var chunk_mut = chunk;
+                defer chunk_mut.deinit();
+                output = try metal_runtime.concatenateRows(self.provider_impl, prior_mut, chunk_mut);
+            } else {
+                output = chunk;
+            }
+        }
+        const result = output orelse return null;
+        output = null;
+        return result;
     }
 
     fn runAttentionOp(ctx: *anyopaque, request: *const ops.RunAttentionRequest) anyerror!?CT {
@@ -12189,9 +12282,255 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return staged_result;
     }
 
+    fn denseCausalBatchShape(self: *MetalCompute, request: *const ops.RunGatedDecoderBlockRequest) ?struct { rows: usize, batch: usize, seq_len: usize } {
+        const residual_buf = toBuf(request.residual);
+        if (residual_buf.quantized_storage != null) return null;
+        const shape = residual_buf.logical_shape orelse return null;
+        if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0) return null;
+        const rows: usize = @intCast(shape[0]);
+        if (@as(usize, @intCast(shape[1])) != request.hidden_size) return null;
+        const attention = request.attention;
+        if (attention.mode != .dense_causal or attention.attn_or_mask != null or attention.kv_batch != null) return null;
+        if (attention.query_sequence_len == 0 or attention.query_sequence_len != attention.kv_sequence_len) return null;
+        if (attention.total_sequence_len != attention.query_sequence_len or attention.kv_position_offset != 0 or attention.sliding_window != 0) return null;
+        if (rows % attention.query_sequence_len != 0) return null;
+        _ = self;
+        return .{
+            .rows = rows,
+            .batch = rows / attention.query_sequence_len,
+            .seq_len = attention.query_sequence_len,
+        };
+    }
+
+    fn applyBatchedHeadNormRopeDevice(
+        self: *MetalCompute,
+        input: MetalTensor,
+        batch: usize,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        slot: usize,
+        rope_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        consecutive_pairs: bool,
+        value_scale: f32,
+        output_index: usize,
+    ) !?MetalTensor {
+        if (batch == 0 or seq_len == 0 or heads == 0 or head_dim == 0 or rope_dim == 0) return null;
+        const row_width = heads * head_dim;
+        if (!input.isDevice() or input.ndim() != 2) return null;
+        if (@as(usize, @intCast(input.dim(0))) != batch * seq_len or @as(usize, @intCast(input.dim(1))) != row_width) return null;
+        _ = output_index;
+        return metal_runtime.decoderRuntimeApplyHeadRmsNormRopeBatched(self.provider_impl, .{
+            .slot = slot,
+            .input = input,
+            .total_heads = batch * seq_len * heads,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .position = 0,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .eps = 0.0,
+            .value_scale = value_scale,
+            .consecutive_pairs = consecutive_pairs,
+        }, heads, seq_len);
+    }
+
+    fn runDenseCausalGatedDecoderBlockOp(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        request: *const ops.RunGatedDecoderBlockRequest,
+    ) anyerror!?CT {
+        const trace = metalPrefillTraceRequested();
+        const shape = self.denseCausalBatchShape(request) orelse return null;
+        if (request.ple != null) {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=ple\n", .{request.attention.layer_index});
+            return null;
+        }
+        if (request.global_head_dim != 0) {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=global-head-dim\n", .{request.attention.layer_index});
+            return null;
+        }
+        if (request.rope_active_dim == 0) {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=rope-dim\n", .{request.attention.layer_index});
+            return null;
+        }
+        const q_slot = request.q_linear_slot;
+        const k_slot = request.k_linear_slot;
+        const v_slot = request.v_linear_slot;
+        const q_norm_slot = request.q_head_norm_slot;
+        const k_norm_slot = request.k_head_norm_slot;
+        const attention_input_size = request.num_heads * request.head_dim;
+        const kv_dim = request.num_kv_heads * request.head_dim;
+        if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(
+            self.provider_impl,
+            shape.rows,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            request.hidden_size,
+            request.intermediate_size,
+            request.graph_plan_tail_vocab_size,
+        )) {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=reserve-scratch rows={d}\n", .{ request.attention.layer_index, shape.rows });
+            return null;
+        }
+
+        var q_ct: CT = undefined;
+        var q_owned = false;
+        defer if (q_owned) freeOp(ctx, q_ct);
+        var k_ct: CT = undefined;
+        var k_owned = false;
+        defer if (k_owned) freeOp(ctx, k_ct);
+        var v_ct: CT = undefined;
+        var v_owned = false;
+        defer if (v_owned) freeOp(ctx, v_ct);
+
+        if (request.attention_input) |attention_input| {
+            const q_slot_value = q_slot orelse return null;
+            const k_slot_value = k_slot orelse return null;
+            const v_slot_value = v_slot orelse return null;
+            q_ct = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                .slot = q_slot_value,
+                .input = attention_input,
+                .in_dim = request.hidden_size,
+                .out_dim = attention_input_size,
+            })) orelse {
+                if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=q-linear slot={d}\n", .{ request.attention.layer_index, q_slot_value });
+                return null;
+            };
+            q_owned = true;
+            k_ct = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                .slot = k_slot_value,
+                .input = attention_input,
+                .in_dim = request.hidden_size,
+                .out_dim = kv_dim,
+            })) orelse {
+                if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=k-linear slot={d}\n", .{ request.attention.layer_index, k_slot_value });
+                return null;
+            };
+            k_owned = true;
+            v_ct = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                .slot = v_slot_value,
+                .input = attention_input,
+                .in_dim = request.hidden_size,
+                .out_dim = kv_dim,
+            })) orelse {
+                if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=v-linear slot={d}\n", .{ request.attention.layer_index, v_slot_value });
+                return null;
+            };
+            v_owned = true;
+        } else {
+            q_ct = request.q orelse return null;
+            k_ct = request.k orelse return null;
+            v_ct = request.v orelse return null;
+        }
+        const frame_active = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+        self.activePlannedComputeBarrier(frame_active);
+
+        const q_norm_value = q_norm_slot orelse return null;
+        const k_norm_value = k_norm_slot orelse return null;
+        var q_projected_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
+        defer q_projected_mt.deinit();
+        var k_projected_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
+        defer k_projected_mt.deinit();
+
+        var q_rope_mt = (try self.applyBatchedHeadNormRopeDevice(
+            q_projected_mt,
+            shape.batch,
+            shape.seq_len,
+            request.num_heads,
+            request.head_dim,
+            q_norm_value,
+            request.rope_active_dim,
+            request.rope_theta,
+            request.rope_freq_scale,
+            request.rope_consecutive_pairs,
+            1.0,
+            3,
+        )) orelse {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=q-rope rows={d} batch={d} seq={d} heads={d} head_dim={d} rope={d}\n", .{ request.attention.layer_index, shape.rows, shape.batch, shape.seq_len, request.num_heads, request.head_dim, request.rope_active_dim });
+            return null;
+        };
+        defer q_rope_mt.deinit();
+        var k_rope_mt = (try self.applyBatchedHeadNormRopeDevice(
+            k_projected_mt,
+            shape.batch,
+            shape.seq_len,
+            request.num_kv_heads,
+            request.head_dim,
+            k_norm_value,
+            request.rope_active_dim,
+            request.rope_theta,
+            request.rope_freq_scale,
+            request.rope_consecutive_pairs,
+            1.0,
+            4,
+        )) orelse {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=k-rope rows={d} batch={d} seq={d} heads={d} head_dim={d} rope={d}\n", .{ request.attention.layer_index, shape.rows, shape.batch, shape.seq_len, request.num_kv_heads, request.head_dim, request.rope_active_dim });
+            return null;
+        };
+        defer k_rope_mt.deinit();
+        self.activePlannedComputeBarrier(frame_active);
+        const q_ready = try self.ctFromOwnedMetalTensor(try q_rope_mt.retainedCopy());
+        defer freeOp(ctx, q_ready);
+        const k_ready = try self.ctFromOwnedMetalTensor(try k_rope_mt.retainedCopy());
+        defer freeOp(ctx, k_ready);
+
+        var attention_output_mt = (try self.applyBatchedDenseCausalAttentionDevice(
+            q_ready,
+            k_ready,
+            v_ct,
+            shape.batch,
+            shape.seq_len,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            null,
+        )) orelse {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=attention batch={d} seq={d}\n", .{ request.attention.layer_index, shape.batch, shape.seq_len });
+            return null;
+        };
+        defer attention_output_mt.deinit();
+        self.activePlannedComputeBarrier(frame_active);
+
+        var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
+        defer residual_mt.deinit();
+        var block_mt = (try self.finishGatedDecoderBlockFromAttentionOutputMt(
+            request,
+            request.attention.layer_index,
+            attention_output_mt,
+            residual_mt,
+            null,
+        )) orelse {
+            if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=finish-block\n", .{request.attention.layer_index});
+            return null;
+        };
+        errdefer block_mt.deinit();
+        var result = try self.ctFromOwnedMetalTensor(block_mt);
+
+        if (request.output_scale_value) |scale| {
+            const scale_ct = try self.scalarDecodeCt(scale);
+            defer freeOp(ctx, scale_ct);
+            const scaled = try multiplyOp(ctx, result, scale_ct);
+            freeOp(ctx, result);
+            result = scaled;
+        } else if (request.output_scale) |scale_ct| {
+            const scaled = try multiplyOp(ctx, result, scale_ct);
+            freeOp(ctx, result);
+            result = scaled;
+        }
+
+        return result;
+    }
+
     fn runGatedDecoderBlockOp(ctx: *anyopaque, request: *const ops.RunGatedDecoderBlockRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const attention = request.attention;
+        if (attention.mode == .dense_causal) {
+            return try runDenseCausalGatedDecoderBlockOp(ctx, self, request);
+        }
         if (attention.mode != .paged_decode and attention.mode != .paged_prefill) return null;
         if (attention.mode == .paged_decode and attention.query_sequence_len != 1) return null;
         if (attention.query_sequence_len == 0 or attention.attn_or_mask != null) return null;
@@ -15591,6 +15930,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const ple_token_embedding_weight = request.ple_token_embedding_weight orelse return false;
                 if (!(try validateDecodeEmbeddingWeight(ctx, self, ple_token_embedding_weight, request.vocab_size, request.ple_hidden_size * request.layer_count))) return false;
             },
+            .qwen3_dense_text_embedding => return false,
         }
         if (!metal_runtime.decoderRuntimeReserveGreedyTailScratch(self.provider_impl, request.vocab_size)) {
             self.timing_stats.active_decode_frame_scratch_failures += 1;
@@ -15786,6 +16126,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn declinePrefillFrameExecute(self: *MetalCompute, reason: PrefillFrameExecuteDeclineReason) bool {
+        if (metalPrefillTraceRequested()) {
+            std.debug.print("prefill-trace: metal-prefill-frame-execute decline={s}\n", .{@tagName(reason)});
+        }
         switch (reason) {
             .no_runtime => self.timing_stats.prefill_frame_execute_no_runtime += 1,
             .no_active_frame => self.timing_stats.prefill_frame_execute_no_active_frame += 1,
@@ -15860,6 +16203,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .contract = request.contract,
             .layer_count = request.layer_count,
             .rows = request.rows,
+            .batch = request.batch,
+            .seq_len = request.seq_len,
             .hidden_size = request.hidden_size,
             .vocab_size = request.vocab_size,
             .num_attention_heads = request.num_attention_heads,
@@ -15891,7 +16236,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer {
             if (!plan_success) self.timing_stats.prefill_frame_plan_failures += 1;
         }
-        if (request.contract != .gemma4_gated_ple_shared_kv) {
+        if (request.contract != .gemma4_gated_ple_shared_kv and request.contract != .qwen3_dense_text_embedding) {
             traceMetalPrefillFramePlan("decline=contract", .{});
             return false;
         }
@@ -15913,8 +16258,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             traceMetalPrefillFramePlan("decline=tail-vocab", .{});
             return false;
         }
-        if (request.ple_hidden_size == 0) {
+        if (request.contract == .gemma4_gated_ple_shared_kv and request.ple_hidden_size == 0) {
             traceMetalPrefillFramePlan("decline=ple-hidden", .{});
+            return false;
+        }
+        if (request.contract == .qwen3_dense_text_embedding and
+            (request.batch == 0 or request.seq_len == 0 or request.rows != request.batch * request.seq_len or request.ple_hidden_size != 0 or request.include_tail))
+        {
+            traceMetalPrefillFramePlan("decline=qwen3-shape batch={d} seq={d} rows={d} ple={d} tail={}", .{ request.batch, request.seq_len, request.rows, request.ple_hidden_size, request.include_tail });
             return false;
         }
         const plan_key = prefillFramePlanKey(request);
@@ -15954,7 +16305,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     return false;
                 }
             }
-            if (layer.ple_gate_linear_slot == null or layer.ple_proj_linear_slot == null or layer.ple_post_norm_slot == null) {
+            if (request.contract == .gemma4_gated_ple_shared_kv and (layer.ple_gate_linear_slot == null or layer.ple_proj_linear_slot == null or layer.ple_post_norm_slot == null)) {
                 traceMetalPrefillFramePlan("decline=ple-slot layer={d}", .{index});
                 return false;
             }
@@ -15992,14 +16343,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 traceMetalPrefillFramePlan("decline=down-format layer={d} slot={d} in={d} out={d}", .{ index, layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size });
                 return false;
             };
-            const ple_gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse {
-                traceMetalPrefillFramePlan("decline=ple-gate-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size });
-                return false;
-            };
-            const ple_projection_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse {
-                traceMetalPrefillFramePlan("decline=ple-proj-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size });
-                return false;
-            };
+            const ple_gate_format = if (request.ple_hidden_size != 0)
+                self.preparedLinearMatmulFormatForLinearSlot(layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse {
+                    traceMetalPrefillFramePlan("decline=ple-gate-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size });
+                    return false;
+                }
+            else
+                metal_command_planner.QuantMatmulFormat.unknown;
+            const ple_projection_format = if (request.ple_hidden_size != 0)
+                self.preparedLinearMatmulFormatForLinearSlot(layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse {
+                    traceMetalPrefillFramePlan("decline=ple-proj-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size });
+                    return false;
+                }
+            else
+                metal_command_planner.QuantMatmulFormat.unknown;
             layers[index] = .{
                 .shares_kv = layer.shares_kv,
                 .kv_layer_index = layer.kv_layer_index,
@@ -16063,7 +16420,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .lm_head_slot = request.final_lm_head_slot,
                 .tail_quant_format = tail_quant_format,
                 .include_tail = request.include_tail,
-                .activation_dtype = .f16,
+                .activation_dtype = if (request.contract == .qwen3_dense_text_embedding) .f32 else .f16,
+                .attention_storage = if (request.contract == .qwen3_dense_text_embedding) .dense else .paged,
                 .layers = layers,
                 .source = @intFromEnum(metal_runtime.ComputeSource.layer),
                 .layer_region = @intFromEnum(metal_runtime.ComputeRegion.layer),
@@ -16097,6 +16455,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const runtime = self.provider_impl.raw_decode_runtime orelse return self.declinePrefillFrameExecute(.no_runtime);
         if (!metal_runtime.hasActiveFrame(runtime)) return self.declinePrefillFrameExecute(.no_active_frame);
+        if (request.contract == .qwen3_dense_text_embedding) {
+            const ok = try self.executeQwen3DenseEmbeddingFrame(ctx, request);
+            execute_success = ok;
+            return ok;
+        }
         if (request.contract != .gemma4_gated_ple_shared_kv) return self.declinePrefillFrameExecute(.invalid_contract);
         if (request.rows <= 1 or request.layer_count == 0 or request.layers.len != request.layer_count) return self.declinePrefillFrameExecute(.invalid_shape);
         if (request.hidden_size == 0 or request.vocab_size == 0 or request.num_attention_heads == 0) return self.declinePrefillFrameExecute(.invalid_shape);
@@ -16120,6 +16483,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const layer_window = frame_cursor.nextLayer(.{
                 .shares_kv = layer.shares_kv,
                 .value_norm = request.global_head_dim != 0 and !layer.shares_kv,
+                .kv_seed = true,
+                .include_ple = true,
             }) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
             const layer_dispatch = self.activePrefillFrameLayerDispatch(layer_window, full_frame_contract) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
 
@@ -16164,12 +16529,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .rope_consecutive_pairs = request.rope_consecutive_pairs,
                 .global_head_dim = request.global_head_dim,
                 .attention_linear_slot = layer.attention_linear_slot,
-                .attention_post_linear_rms_norm_slot = layer.attn_post_norm_slot,
+                .attention_post_linear_rms_norm_slot = null,
                 .hidden_size = request.hidden_size,
                 .eps = request.norm_eps,
                 .ffn_rms_norm_slot = layer.ffn_pre_norm_slot,
                 .ffn_post_gate_rms_norm_slot = null,
-                .ffn_post_down_rms_norm_slot = layer.ffn_post_norm_slot,
+                .ffn_post_down_rms_norm_slot = null,
                 .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
                 .up_ffn_linear_slot = layer.up_ffn_linear_slot,
                 .down_ffn_linear_slot = layer.down_ffn_linear_slot,
@@ -16204,6 +16569,140 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         request.output_hidden.* = hidden;
         owns_hidden = false;
         execute_success = true;
+        self.timing_stats.prefill_frame_execute_successes += 1;
+        return true;
+    }
+
+    fn executeQwen3DenseEmbeddingFrame(
+        self: *MetalCompute,
+        ctx: *anyopaque,
+        request: *const ops.DecoderRuntimeGraphCommandPlanFrameRequest,
+    ) anyerror!bool {
+        if (request.contract != .qwen3_dense_text_embedding) return self.declinePrefillFrameExecute(.invalid_contract);
+        if (request.rows <= 1 or request.layer_count == 0 or request.layers.len != request.layer_count) return self.declinePrefillFrameExecute(.invalid_shape);
+        if (request.batch == 0 or request.seq_len == 0 or request.rows != request.batch * request.seq_len) return self.declinePrefillFrameExecute(.invalid_shape);
+        if (request.hidden_size == 0 or request.num_attention_heads == 0 or request.global_head_dim != 0 or request.ple_hidden_size != 0) return self.declinePrefillFrameExecute(.invalid_shape);
+        if (request.output_hidden.* != null) return self.declinePrefillFrameExecute(.output_hidden_set);
+        const frame_plan = &(self.active_prefill_frame_plan orelse return self.declinePrefillFrameExecute(.missing_plan));
+
+        var hidden = request.hidden;
+        var owns_hidden = false;
+        errdefer if (owns_hidden) freeOp(ctx, hidden);
+
+        const full_frame_contract = self.activePrefillFrameFullContract() orelse {
+            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=full-contract\n", .{});
+            return self.declinePrefillFrameExecute(.plan_mismatch);
+        };
+        var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
+        for (request.layers, 0..) |layer, layer_index| {
+            if (layer.shares_kv or layer.sliding_window != 0) return self.declinePrefillFrameExecute(.invalid_shape);
+            const head_dim = layer.head_dim;
+            if (head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return self.declinePrefillFrameExecute(.invalid_shape);
+            const layer_window = frame_cursor.nextLayer(.{
+                .shares_kv = false,
+                .value_norm = false,
+                .kv_seed = false,
+                .include_ple = false,
+            }) orelse {
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=cursor layer={d} next={d} ops={d}\n", .{ layer_index, frame_cursor.next_index, frame_plan.view().ops.len });
+                return self.declinePrefillFrameExecute(.plan_mismatch);
+            };
+            const layer_dispatch = self.activePrefillFrameLayerDispatch(layer_window, full_frame_contract) orelse {
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=dispatch layer={d} start={d} end={d}\n", .{ layer_index, layer_window.layer_start, layer_window.layer_end });
+                return self.declinePrefillFrameExecute(.plan_mismatch);
+            };
+
+            const attn_normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+                .slot = layer.attn_pre_norm_slot,
+                .input = hidden,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+            })) orelse {
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=attn-rms layer={d}\n", .{layer_index});
+                return self.declinePrefillFrameExecute(.plan_mismatch);
+            };
+            defer freeOp(ctx, attn_normed);
+
+            var attention = request.attention;
+            attention.mode = .dense_causal;
+            attention.layer_index = layer_index;
+            attention.query_sequence_len = request.seq_len;
+            attention.kv_sequence_len = request.seq_len;
+            attention.total_sequence_len = request.seq_len;
+            attention.kv_position_offset = 0;
+            attention.sliding_window = 0;
+            attention.skip_kv_write = false;
+            attention.attn_or_mask = null;
+            attention.kv_batch = null;
+            attention.kv_cache = null;
+            attention.kv_manager = null;
+            attention.kv_storage = null;
+
+            const prev_hidden = hidden;
+            const block_hidden = (try runGatedDecoderBlockOp(ctx, &.{
+                .attention_input = attn_normed,
+                .residual = hidden,
+                .attention = attention,
+                .num_heads = request.num_attention_heads,
+                .num_kv_heads = layer.kv_heads,
+                .head_dim = head_dim,
+                .q_linear_slot = layer.q_linear_slot,
+                .k_linear_slot = layer.k_linear_slot,
+                .v_linear_slot = layer.v_linear_slot,
+                .q_head_norm_slot = layer.q_head_norm_slot,
+                .k_head_norm_slot = layer.k_head_norm_slot,
+                .rope_active_dim = layer.rope_active_dim,
+                .rope_theta = layer.rope_theta,
+                .rope_freq_scale = request.rope_freq_scale,
+                .rope_consecutive_pairs = request.rope_consecutive_pairs,
+                .global_head_dim = request.global_head_dim,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .attention_post_linear_rms_norm_slot = null,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+                .ffn_rms_norm_slot = layer.ffn_pre_norm_slot,
+                .ffn_post_gate_rms_norm_slot = null,
+                .ffn_post_down_rms_norm_slot = null,
+                .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = layer.up_ffn_linear_slot,
+                .down_ffn_linear_slot = layer.down_ffn_linear_slot,
+                .intermediate_size = layer.intermediate_size,
+                .activation = request.activation,
+                .output_scale_value = layer.output_scale_value,
+                .planned_setup_contract = .{},
+                .planned_layer_contract = .{},
+                .planned_frame_contract = layer_dispatch.full_contract,
+                .planned_frame_layer_window = .{
+                    .layer_start = layer_dispatch.window.layer_start,
+                    .setup_start = layer_dispatch.window.setup_start,
+                    .block_start = layer_dispatch.window.block_start,
+                    .layer_end = layer_dispatch.window.layer_end,
+                },
+            })) orelse {
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=block layer={d}\n", .{layer_index});
+                return self.declinePrefillFrameExecute(.plan_mismatch);
+            };
+            if (owns_hidden) freeOp(ctx, prev_hidden);
+            hidden = block_hidden;
+            owns_hidden = true;
+        }
+
+        if (!frame_cursor.complete()) {
+            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=incomplete next={d} ops={d}\n", .{ frame_cursor.next_index, frame_plan.view().ops.len });
+            return self.declinePrefillFrameExecute(.plan_mismatch);
+        }
+        const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = request.final_norm_slot,
+            .input = hidden,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+        })) orelse {
+            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=final-rms\n", .{});
+            return self.declinePrefillFrameExecute(.plan_mismatch);
+        };
+        if (owns_hidden) freeOp(ctx, hidden);
+        request.output_hidden.* = final_hidden;
+        owns_hidden = false;
         self.timing_stats.prefill_frame_execute_successes += 1;
         return true;
     }
@@ -17064,12 +17563,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer input.deinit();
-        const rows: usize = @intCast(input.dim(0));
+        var linear_input = try retainedLinearInputView(&input, request.in_dim);
+        defer linear_input.deinit();
+        const rows: usize = @intCast(linear_input.dim(0));
         if (try metal_runtime.tryApplyQuantizedRuntimeLinearPair(
             self.provider_impl,
             request.slot_a,
             request.slot_b,
-            input,
+            linear_input,
             rows,
             request.in_dim,
             request.out_dim,
@@ -17083,7 +17584,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.provider_impl,
             request.slot_a,
             request.slot_b,
-            input,
+            linear_input,
             rows,
             request.in_dim,
             request.out_dim,

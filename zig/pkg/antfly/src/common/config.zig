@@ -26,14 +26,20 @@ const transcribing = @import("antfly_transcribing");
 const synthesizing = @import("antfly_synthesizing");
 const platform = @import("antfly_platform");
 
+const default_max_shard_size_bytes: u64 = 64 * 1024 * 1024;
+const default_max_shards_per_table: u32 = 20;
+const default_config_shards_per_table: u32 = 3;
+const default_swarm_shards_per_table: u32 = 1;
+pub const default_health_port: u16 = 4200;
+
 pub const Config = struct {
     registry: provider_registry.Registry,
     speech_to_text: transcribing.Registry,
     text_to_speech: synthesizing.Registry,
     auth_enabled: bool = false,
     swarm_mode: bool = false,
+    health_enabled: bool = true,
     health_port: ?u16 = null,
-    registry_url: ?[]u8 = null,
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
@@ -128,12 +134,12 @@ pub const Config = struct {
     pub const RemoteContentConfig = scraping.RemoteContentConfig;
 
     pub const ShardAllocationConfig = struct {
-        default_shards_per_table: u32 = 1,
-        max_shard_size_bytes: u64 = 0,
+        default_shards_per_table: u32 = default_config_shards_per_table,
+        max_shard_size_bytes: u64 = default_max_shard_size_bytes,
         min_shard_size_bytes: u64 = 0,
         min_shards_per_table: u32 = 1,
-        max_shards_per_table: u32 = 0,
-        disable_shard_alloc: bool = false,
+        max_shards_per_table: u32 = default_max_shards_per_table,
+        disable_shard_alloc: bool = true,
         auto_range_transition_per_table_limit: u32 = 1,
         auto_range_transition_cluster_limit: u32 = 1,
         shard_cooldown_millis: u64 = 60 * std.time.ms_per_s,
@@ -192,34 +198,30 @@ pub const Config = struct {
             synthesizing.Registry.init(alloc);
         errdefer text_to_speech.deinit();
 
+        const swarm_mode = try optionalBoolField(root, "swarm_mode") orelse false;
         return .{
             .registry = registry,
             .speech_to_text = speech_to_text,
             .text_to_speech = text_to_speech,
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
-            .swarm_mode = try optionalBoolField(root, "swarm_mode") orelse false,
+            .swarm_mode = swarm_mode,
+            .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
             .health_port = if (validated.value.health_port) |value|
                 std.math.cast(u16, value) orelse return error.InvalidConfig
             else
-                null,
-            .registry_url = if (validated.value.registry_url) |value| try alloc.dupe(u8, value) else null,
+                default_health_port,
             .log = validated.value.log,
             .tls = if (validated.value.tls) |tls| .{
                 .cert = if (tls.cert) |value| try alloc.dupe(u8, value) else null,
                 .key = if (tls.key) |value| try alloc.dupe(u8, value) else null,
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
-            .metadata = try parseMetadataConfig(alloc, root, validated.value.metadata.orchestration_urls),
-            .storage = .{
-                .local_base_dir = try alloc.dupe(u8, validated.value.storage.local.base_dir),
-                .data_backend = validated.value.storage.data,
-                .metadata_backend = validated.value.storage.metadata,
-                .s3_bucket = if (validated.value.storage.s3) |s3| try alloc.dupe(u8, s3.bucket) else null,
-                .s3_prefix = if (validated.value.storage.s3) |s3|
-                    if (s3.prefix) |prefix| try alloc.dupe(u8, prefix) else null
-                else
-                    null,
-            },
+            .metadata = try parseMetadataConfig(
+                alloc,
+                root,
+                if (validated.value.metadata) |metadata| metadata.orchestration_urls else null,
+            ),
+            .storage = try storageFromOpenApi(alloc, validated.value.storage),
             .termite = if (validated.value.termite) |termite| .{
                 .api_url = if (termite.api_url.len > 0) try alloc.dupe(u8, termite.api_url) else null,
                 .models_dir = if (termite.models_dir) |value| try alloc.dupe(u8, value) else null,
@@ -231,18 +233,40 @@ pub const Config = struct {
             else
                 null,
             .shard_allocation = .{
-                .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse 1,
-                .max_shard_size_bytes = try optionalU64Field(root, "max_shard_size_bytes") orelse 0,
+                .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (swarm_mode) default_swarm_shards_per_table else default_config_shards_per_table,
+                .max_shard_size_bytes = try optionalU64Field(root, "max_shard_size_bytes") orelse default_max_shard_size_bytes,
                 .min_shard_size_bytes = try optionalU64Field(root, "min_shard_size_bytes") orelse 0,
                 .min_shards_per_table = try optionalU32Field(root, "min_shards_per_table") orelse 1,
-                .max_shards_per_table = try optionalU32Field(root, "max_shards_per_table") orelse 0,
-                .disable_shard_alloc = try optionalBoolField(root, "disable_shard_alloc") orelse false,
+                .max_shards_per_table = try optionalU32Field(root, "max_shards_per_table") orelse default_max_shards_per_table,
+                .disable_shard_alloc = try optionalBoolField(root, "disable_shard_alloc") orelse true,
                 .auto_range_transition_per_table_limit = try optionalU32Field(root, "auto_range_transition_per_table_limit") orelse 1,
                 .auto_range_transition_cluster_limit = try optionalU32Field(root, "auto_range_transition_cluster_limit") orelse 1,
                 .shard_cooldown_millis = try optionalU64Field(root, "shard_cooldown_millis") orelse 60 * std.time.ms_per_s,
                 .min_shard_merge_age_millis = try optionalU64Field(root, "min_shard_merge_age_millis") orelse 5 * 60 * std.time.ms_per_s,
             },
         };
+    }
+
+    fn storageFromOpenApi(
+        alloc: std.mem.Allocator,
+        storage: ?common_openapi.StorageConfig,
+    ) !StorageConfig {
+        var parsed: StorageConfig = .{};
+        errdefer parsed.deinit(alloc);
+
+        const value = storage orelse return parsed;
+        parsed.data_backend = value.data;
+        parsed.metadata_backend = value.metadata;
+
+        if (value.local) |local| {
+            if (local.base_dir) |base_dir| parsed.local_base_dir = try alloc.dupe(u8, base_dir);
+        }
+        if (value.s3) |s3| {
+            parsed.s3_bucket = try alloc.dupe(u8, s3.bucket);
+            if (s3.prefix) |prefix| parsed.s3_prefix = try alloc.dupe(u8, prefix);
+        }
+
+        return parsed;
     }
 
     pub fn deinit(self: *Config) void {
@@ -253,7 +277,6 @@ pub const Config = struct {
         self.termite.deinit(self.registry.allocator);
         self.speech_to_text.deinit();
         self.text_to_speech.deinit();
-        if (self.registry_url) |value| self.registry.allocator.free(value);
         if (self.remote_content) |*remote_content| remote_content.deinit(self.registry.allocator);
         self.registry.deinit();
         self.* = undefined;
@@ -783,6 +806,28 @@ test "common config extracts termite settings" {
     try std.testing.expectEqualStrings("termite-secret", cfg.termite.s3_credentials.?.secret_access_key.?);
 }
 
+test "common config defaults shard scalar fields" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:7001"
+        \\    }
+        \\  },
+        \\  "storage": {
+        \\    "local": { "base_dir": "antflydb" }
+        \\  }
+        \\}
+    ;
+    var cfg = try Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
+    try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
+    try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
+}
+
 test "common config treats go orchestration urls as metadata api discovery urls" {
     const alloc = std.testing.allocator;
     const raw =
@@ -813,7 +858,7 @@ test "common config treats go orchestration urls as metadata api discovery urls"
     try std.testing.expectEqual(@as(usize, 0), cfg.metadata.raft_urls.len);
 }
 
-test "common config preserves remote content logging storage and registry fields" {
+test "common config preserves remote content logging and storage fields" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -827,7 +872,6 @@ test "common config preserves remote content logging storage and registry fields
         \\    "style": "json"
         \\  },
         \\  "health_port": 4200,
-        \\  "registry_url": "https://registry.antfly.io/v1",
         \\  "swarm_mode": true,
         \\  "storage": {
         \\    "local": { "base_dir": "antflydb" },
@@ -871,8 +915,8 @@ test "common config preserves remote content logging storage and registry fields
     defer cfg.deinit();
 
     try std.testing.expectEqual(true, cfg.swarm_mode);
+    try std.testing.expect(cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, 4200), cfg.health_port);
-    try std.testing.expectEqualStrings("https://registry.antfly.io/v1", cfg.registry_url.?);
     try std.testing.expectEqual(logging_openapi.Level.debug, cfg.log.?.level.?);
     try std.testing.expectEqual(logging_openapi.Style.json, cfg.log.?.style.?);
     try std.testing.expectEqual(common_openapi.StorageBackend.s3, cfg.storage.data_backend.?);
@@ -1231,13 +1275,60 @@ test "common config resolves stable local role base dir by default" {
     try std.testing.expectEqualStrings(expected, base);
 }
 
-test "common config rejects invalid generated config shape" {
+test "common config parses minimal config with runtime defaults" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(
-        error.MissingField,
-        Config.parseFromSlice(
-            alloc,
-            "{\"metadata\":{},\"replication_factor\":1,\"default_shards_per_table\":1,\"max_shard_size_bytes\":1024,\"max_shards_per_table\":4}",
-        ),
+    var cfg = try Config.parseFromSlice(alloc, "{}");
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cfg.metadata.orchestration_urls.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.metadata.raft_urls.len);
+    try std.testing.expect(cfg.storage.local_base_dir == null);
+    try std.testing.expect(cfg.health_enabled);
+    try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
+    try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
+    try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
+    try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
+    try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+}
+
+test "common config can disable health server" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc, "{\"health_enabled\": false}");
+    defer cfg.deinit();
+
+    try std.testing.expect(!cfg.health_enabled);
+    try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
+}
+
+test "common config accepts partial metadata and storage objects" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc,
+        \\{
+        \\  "metadata": {},
+        \\  "storage": {
+        \\    "local": {},
+        \\    "data": "local"
+        \\  }
+        \\}
     );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cfg.metadata.orchestration_urls.len);
+    try std.testing.expect(cfg.storage.local_base_dir == null);
+    try std.testing.expectEqual(common_openapi.StorageBackend.local, cfg.storage.data_backend.?);
+    try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
+}
+
+test "common config applies swarm shard defaults when swarm mode is set" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc,
+        \\{"swarm_mode": true}
+    );
+    defer cfg.deinit();
+
+    try std.testing.expect(cfg.swarm_mode);
+    try std.testing.expectEqual(@as(u32, default_swarm_shards_per_table), cfg.shard_allocation.default_shards_per_table);
+    try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
+    try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
+    try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
 }

@@ -31,6 +31,7 @@ const CliConfig = struct {
     api_port: ?u16 = null,
     cluster_json: ?[]const u8 = null,
     join: bool = false,
+    health_enabled: ?bool = null,
     health_port: ?u16 = null,
     tick_ms: ?u64 = null,
     local_node_id: ?u64 = null,
@@ -38,6 +39,7 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
+    secret_store_path: ?[]const u8 = null,
     help: bool = false,
 };
 
@@ -468,8 +470,23 @@ pub fn runFromIterator(
         return;
     }
 
+    var secret_store: antfly.common.secrets.FileStore = undefined;
+    var secret_store_initialized = false;
+    defer if (secret_store_initialized) secret_store.deinit();
+
+    if (cli.secret_store_path) |raw_secret_store_path| {
+        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
+        defer alloc.free(normalized_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+        secret_store_initialized = true;
+    }
+
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPath(alloc, config_path)
+        try antfly.common.config.loadFromPathWithSecrets(
+            alloc,
+            config_path,
+            if (secret_store_initialized) &secret_store else null,
+        )
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
@@ -517,6 +534,7 @@ pub fn runFromIterator(
         .admin_bind_host = admin_listener.bind_host,
         .admin_bind_port = admin_listener.bind_port,
         .reconciler_config = shardAllocationReconcilerConfig(if (loaded_config) |*cfg| cfg else null),
+        .secret_store = if (secret_store_initialized) &secret_store else null,
     });
     defer server.deinit();
     try server.start();
@@ -531,7 +549,11 @@ pub fn runFromIterator(
     std.debug.print("metadata admin api listening on {s}\n", .{admin_uri});
 
     var metadata_health = HealthSource{ .server = &server };
-    const health_port = cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else null;
+    const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
+    const health_port = if (health_enabled)
+        cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
+    else
+        null;
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
         "metadata",
@@ -601,6 +623,15 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--health")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.health_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--health=")) {
+            cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--tick-ms")) {
             cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -619,6 +650,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--snapshot-root-dir")) {
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--secret-store-path")) {
+            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
         }
         return error.InvalidArguments;
@@ -918,20 +953,35 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
         \\  --join                         Join an existing metadata cluster (not yet supported)
-        \\  --health-port <port>           Dedicated health/metrics bind port (default: unset)
+        \\  --health <true|false>          Enable health/metrics server (default: true)
+        \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
         \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Snapshot root directory
+        \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
 }
 
+fn parseBoolFlag(raw: []const u8) ?bool {
+    if (std.mem.eql(u8, raw, "true")) return true;
+    if (std.mem.eql(u8, raw, "false")) return false;
+    return null;
+}
+
 test "metadata runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "metadata runtime cli accepts secret store path" {
+    var argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const cfg = try parseCli(&iter);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
 }
 
 test "metadata runtime server uses wal replica state backend by default" {
