@@ -2414,6 +2414,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
         mutable: ActiveMemTable,
+        bulk_appends: State = .{},
         snapshot: ?State = null,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
@@ -2444,6 +2445,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (self.closed) return;
             const backend = self.backend;
             self.mutable.deinit(self.allocator);
+            self.bulk_appends.deinit(self.allocator);
             invalidateSnapshot(&self.snapshot, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
@@ -2461,12 +2463,15 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
+                self.bulk_appends.deinit(self.allocator);
+                self.bulk_appends = .{};
                 invalidateSnapshot(&self.snapshot, self.allocator);
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 self.backend.releaseReader();
                 self.closed = true;
             };
+            const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
@@ -2484,7 +2489,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
                 invalidateSnapshot(&self.snapshot, self.allocator);
-                if (mutated and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+                if ((mutated or direct_ingested_bulk_appends) and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 try self.backend.maybeFlushMutable();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
@@ -2501,6 +2506,49 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 finalize_err = err;
             };
             if (finalize_err) |err| return err;
+        }
+
+        fn tryCommitDirectBulkAppends(self: *@This()) !bool {
+            if (self.bulk_appends.entries.items.len == 0) return false;
+            if (self.batch_options.mode != .bulk_ingest) {
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+
+            state_mod.sortStateEntries(&self.bulk_appends);
+            if (!bulkStateEntriesAreUnique(&self.bulk_appends)) {
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (!self.backend.shouldDirectIngestBulkState(&self.bulk_appends)) {
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+
+            if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&self.bulk_appends);
+            try self.backend.ingestSortedState(&self.bulk_appends);
+            self.bulk_appends.deinit(self.allocator);
+            self.bulk_appends = .{};
+            invalidateSnapshot(&self.snapshot, self.allocator);
+            return true;
+        }
+
+        fn bulkStateEntriesAreUnique(state: *const State) bool {
+            if (state.entries.items.len <= 1) return true;
+            var previous = state.entries.items[0];
+            for (state.entries.items[1..]) |entry| {
+                if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
+                previous = entry;
+            }
+            return true;
         }
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
@@ -2535,6 +2583,15 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            var bulk_idx = self.bulk_appends.entries.items.len;
+            while (bulk_idx > 0) {
+                bulk_idx -= 1;
+                const entry = self.bulk_appends.entries.items[bulk_idx];
+                if (compareEntryTo(entry, self.namespace, key) == .eq) {
+                    if (entry.tombstone) return error.NotFound;
+                    return entry.value;
+                }
+            }
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
@@ -2556,20 +2613,38 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                if (self.mutable.findIndex(self.namespace, key)) |idx| {
-                    overlay_point_gets += 1;
-                    const entry = self.mutable.entries.items[idx];
-                    if (entry.tombstone) {
-                        misses += 1;
-                    } else {
-                        values[i] = entry.value;
-                        hits += 1;
+                var bulk_idx = self.bulk_appends.entries.items.len;
+                while (bulk_idx > 0) {
+                    bulk_idx -= 1;
+                    const entry = self.bulk_appends.entries.items[bulk_idx];
+                    if (compareEntryTo(entry, self.namespace, key) == .eq) {
+                        overlay_point_gets += 1;
+                        if (entry.tombstone) {
+                            misses += 1;
+                        } else {
+                            values[i] = entry.value;
+                            hits += 1;
+                        }
+                        break;
                     }
+                } else {
+                    if (self.mutable.findIndex(self.namespace, key)) |idx| {
+                        overlay_point_gets += 1;
+                        const entry = self.mutable.entries.items[idx];
+                        if (entry.tombstone) {
+                            misses += 1;
+                        } else {
+                            values[i] = entry.value;
+                            hits += 1;
+                        }
+                        continue;
+                    }
+                    miss_keys[miss_count] = key;
+                    miss_indexes[miss_count] = i;
+                    miss_count += 1;
                     continue;
                 }
-                miss_keys[miss_count] = key;
-                miss_indexes[miss_count] = i;
-                miss_count += 1;
+                continue;
             }
             self.backend.recordPointGets(overlay_point_gets);
 
@@ -2608,6 +2683,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
+            if (self.batch_options.mode == .bulk_ingest) {
+                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
+                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
+                invalidateSnapshot(&self.snapshot, self.allocator);
+                return;
+            }
             try self.mutable.appendUpsert(self.allocator, self.namespace, key, value, false);
             invalidateSnapshot(&self.snapshot, self.allocator);
         }
@@ -2622,6 +2703,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 const locked = lockBackend(BackendType, self.backend);
                 defer unlockBackend(BackendType, self.backend, locked);
                 self.snapshot = try self.backend.materializeVisibleStateWithOverlay(&self.backend.mutable, &self.mutable);
+                try state_mod.applyState(&self.snapshot.?, self.allocator, &self.bulk_appends);
             }
             return .{
                 .state = &self.snapshot.?,
