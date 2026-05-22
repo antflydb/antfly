@@ -1022,8 +1022,23 @@ fn deriveNativeDocIdConstraintsAlloc(
         out.resolved_stored_filters = true;
     }
 
+    if (req.full_text) |text_query| {
+        if (try collectFullTextDocIdsAlloc(alloc, req, executor, text_query)) |doc_ids| {
+            if (out.positive_filter) {
+                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, doc_ids);
+                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
+                freeDocIdSlice(alloc, doc_ids);
+                out.filter_doc_ids = intersected;
+            } else {
+                out.filter_doc_ids = doc_ids;
+            }
+            out.filter_doc_ids_owned = true;
+            out.positive_filter = true;
+        }
+    }
+
     if (req.filter_query_json.len > 0) {
-        if (try collectStructuredFilterDocIdsAlloc(alloc, req, executor, req.filter_query_json)) |doc_ids| {
+        if (if (req.full_text == null) try collectStructuredFilterDocIdsAlloc(alloc, req, executor, req.filter_query_json) else null) |doc_ids| {
             if (out.positive_filter) {
                 const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, doc_ids);
                 if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
@@ -1083,7 +1098,7 @@ fn deriveNativeDocIdConstraintsAlloc(
     }
 
     if (req.exclusion_query_json.len > 0) {
-        if (try collectStructuredFilterDocIdsAlloc(alloc, req, executor, req.exclusion_query_json)) |doc_ids| {
+        if (if (req.full_text == null) try collectStructuredFilterDocIdsAlloc(alloc, req, executor, req.exclusion_query_json) else null) |doc_ids| {
             if (out.exclude_doc_ids.len > 0) {
                 const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, doc_ids);
                 if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
@@ -1121,6 +1136,23 @@ fn deriveNativeDocIdConstraintsAlloc(
     return out;
 }
 
+fn collectFullTextDocIdsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    text_query: types.TextQuery,
+) !?[]const []const u8 {
+    if (text_query == .match_all) return null;
+    const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const search_query = textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
+
+    return try collectTextSearchQueryDocIdsAlloc(alloc, req, text_entry, search_query);
+}
+
 fn collectStructuredFilterDocIdsAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -1135,6 +1167,15 @@ fn collectStructuredFilterDocIdsAlloc(
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
+    return try collectTextSearchQueryDocIdsAlloc(alloc, req, text_entry, search_query);
+}
+
+fn collectTextSearchQueryDocIdsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    search_query: search_mod.SearchQuery,
+) ![]const []const u8 {
     const snapshot = text_entry.persistent.snapshot();
     const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{

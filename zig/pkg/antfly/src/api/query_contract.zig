@@ -1712,7 +1712,7 @@ pub fn parseQueryRequest(
 
     // Packed dense requests are benchmark-oriented and unusual in production.
     // Skip the extra JSON parse unless the request even mentions embeddings.
-    if (std.mem.indexOf(u8, body, "\"embeddings\"") != null) {
+    if (std.mem.indexOf(u8, body, "\"embeddings\"") != null and fastDensePublicQueryMayApply(body)) {
         if (try tryParseFastDensePublicQueryRequest(alloc, body)) |fast| {
             return fast;
         }
@@ -1968,6 +1968,29 @@ const FastDensePublicQueryRequest = struct {
     distance_over: ?f32 = null,
     distance_under: ?f32 = null,
 };
+
+fn fastDensePublicQueryMayApply(body: []const u8) bool {
+    const disallowed = [_][]const u8{
+        "\"query\"",
+        "\"full_text_search\"",
+        "\"filter_query\"",
+        "\"exclusion_query\"",
+        "\"merge_config\"",
+        "\"reranker\"",
+        "\"pruner\"",
+        "\"semantic_search\"",
+        "\"sparse\"",
+        "\"graph\"",
+        "\"join\"",
+        "\"with\"",
+        "\"_filter_query_json\"",
+        "\"_exclusion_query_json\"",
+    };
+    for (disallowed) |needle| {
+        if (std.mem.indexOf(u8, body, needle) != null) return false;
+    }
+    return true;
+}
 
 fn tryParseFastDensePublicQueryRequest(
     alloc: std.mem.Allocator,
@@ -5071,6 +5094,21 @@ test "api query contract parses packed dense embeddings via antfly-json" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), parsed.req.dense_queries[0].query.vector[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), parsed.req.dense_queries[0].query.vector[1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), parsed.req.dense_queries[0].query.vector[2], 0.0001);
+}
+
+test "api query contract does not use dense fast path for composed vector requests" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"full_text_search":{"match":"alpha","field":"body"},"filter_query":{"term":{"status":"active"}},"exclusion_query":{"term":{"category":"archived"}},"limit":3}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
+    try std.testing.expect(parsed.req.full_text != null);
+    try std.testing.expect(parsed.req.filter_query_json.len > 0);
+    try std.testing.expect(parsed.req.exclusion_query_json.len > 0);
 }
 
 test "api query contract parses packed sparse embeddings via antfly-json" {
