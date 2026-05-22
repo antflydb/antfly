@@ -1583,6 +1583,20 @@ Status as of 2026-05-19:
   identity metadata (`~3.2s`), derived artifact construction (`~5.0s`), and
   primary sorted ingest (`~7.7s`), with deferred index wait around `6.3s`
   (`~2.6s` full-text apply, `~78ms` sparse apply, and replay-window collection).
+  Follow-up local bulk-load work made the in-memory LSM direct-ingest path take
+  ownership of sorted arena-backed states instead of rebuilding table data, kept
+  write-only deferred loads on thin replay records even without index workers,
+  batched full-text ordinal lookup, and let full-text replay index borrowed store
+  values while the read transaction is open instead of materializing a second
+  owned write batch. On the same 10k deferred/full-text+sparse `--bulk-load`
+  profile, total load dropped to about `10.8s`, `store_write_ns` stayed around
+  `0.8s`, primary sorted ingest dropped to about `4ms`, and derived replay
+  construction dropped to about `1.0s`. Deferred index wait is now about `6.1s`;
+  sparse replay remains about `80ms`, and full-text apply is about `2.1s`, with
+  `ANTFLY_BENCH_METRICS` showing the text indexer itself spends about `41ms`
+  building the segment and about `705ms` inserting it. The remaining full-text
+  wait is mostly replay-window collection plus document collection/read
+  overhead, not sparse replay or segment construction.
   The first optimization from that evidence specialized
   `ResolvedDocSet` ordinal set algebra: list/list operators now use direct
   sorted-array merge/intersection/difference, bitmap/bitmap operators use

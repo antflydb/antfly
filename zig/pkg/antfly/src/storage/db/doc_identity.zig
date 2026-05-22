@@ -206,6 +206,53 @@ pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?Do
     return std.mem.readInt(u32, raw[0..4], .big);
 }
 
+pub fn lookupOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, doc_ids: []const []const u8) ![]?DocOrdinal {
+    const mutable_txn = txn;
+    var ordinals = try alloc.alloc(?DocOrdinal, doc_ids.len);
+    errdefer alloc.free(ordinals);
+    @memset(ordinals, null);
+    if (doc_ids.len == 0) return ordinals;
+
+    const PendingOrdinalLookup = struct {
+        source_index: usize,
+        key: []u8,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            return std.mem.lessThan(u8, lhs.key, rhs.key);
+        }
+    };
+
+    var pending = try alloc.alloc(PendingOrdinalLookup, doc_ids.len);
+    defer {
+        for (pending) |item| alloc.free(item.key);
+        alloc.free(pending);
+    }
+    for (doc_ids, 0..) |doc_id, i| {
+        pending[i] = .{
+            .source_index = i,
+            .key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id),
+        };
+    }
+    std.sort.pdq(PendingOrdinalLookup, pending, {}, PendingOrdinalLookup.lessThan);
+
+    var read_keys = try alloc.alloc([]const u8, pending.len);
+    defer alloc.free(read_keys);
+    var read_values = try alloc.alloc(?[]const u8, pending.len);
+    defer alloc.free(read_values);
+    for (pending, 0..) |item, i| {
+        read_keys[i] = item.key;
+        read_values[i] = null;
+    }
+
+    try mutable_txn.getManySorted(read_keys, read_values);
+    for (pending, 0..) |item, i| {
+        const raw = read_values[i] orelse continue;
+        if (raw.len != @sizeOf(u32)) return error.InvalidDocIdentity;
+        ordinals[item.source_index] = std.mem.readInt(u32, raw[0..4], .big);
+    }
+    return ordinals;
+}
+
 pub fn lookupDocIdTxn(alloc: Allocator, txn: anytype, ordinal: DocOrdinal) !?[]u8 {
     const mutable_txn = txn;
     const key = internal_keys.identityOrdinalToDocKey(ordinal);
@@ -802,6 +849,16 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
 ) !void {
     if (doc_upserts.len == 0 and doc_deletes.len == 0) return;
 
+    if (try appendBatchIdentityMetadataAllNewFastPath(
+        alloc,
+        store,
+        namespace,
+        generation,
+        out,
+        doc_upserts,
+        doc_deletes,
+    )) return;
+
     var txn = try store.beginProbeTxn();
     defer txn.abort();
 
@@ -878,6 +935,102 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
     if (reserved_new_ordinal) {
         try appendNextOrdinalWrite(alloc, out, next_ordinal);
     }
+}
+
+const IdentityLookup = struct {
+    key: []u8,
+};
+
+fn identityLookupLessThan(_: void, lhs: IdentityLookup, rhs: IdentityLookup) bool {
+    return std.mem.lessThan(u8, lhs.key, rhs.key);
+}
+
+fn appendBatchIdentityMetadataAllNewFastPath(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    namespace: Namespace,
+    generation: u64,
+    out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    doc_upserts: []const []const u8,
+    doc_deletes: []const []const u8,
+) !bool {
+    if (doc_upserts.len == 0 or doc_deletes.len != 0) return false;
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+
+    const missing_namespace = if (try loadNamespaceTxn(&txn)) |stored_namespace| blk: {
+        if (!stored_namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+        break :blk false;
+    } else true;
+
+    var doc_lookups = try alloc.alloc(IdentityLookup, doc_upserts.len);
+    defer {
+        for (doc_lookups) |lookup| alloc.free(lookup.key);
+        alloc.free(doc_lookups);
+    }
+    for (doc_upserts, 0..) |doc_id, i| {
+        doc_lookups[i] = .{
+            .key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id),
+        };
+    }
+    std.sort.pdq(IdentityLookup, doc_lookups, {}, identityLookupLessThan);
+    if (identityLookupsContainDuplicateKeys(doc_lookups)) return false;
+    if (try anyIdentityLookupExists(alloc, &txn, doc_lookups)) return false;
+
+    var canonical_lookups = try alloc.alloc(IdentityLookup, doc_upserts.len);
+    defer {
+        for (canonical_lookups) |lookup| alloc.free(lookup.key);
+        alloc.free(canonical_lookups);
+    }
+    for (doc_upserts, 0..) |doc_id, i| {
+        const canonical_key = internal_keys.identityCanonicalToOrdinalKey(canonicalDocIdForNamespace(namespace, doc_id));
+        canonical_lookups[i] = .{
+            .key = try alloc.dupe(u8, canonical_key[0..]),
+        };
+    }
+    std.sort.pdq(IdentityLookup, canonical_lookups, {}, identityLookupLessThan);
+    if (identityLookupsContainDuplicateKeys(canonical_lookups)) return false;
+    if (try anyIdentityLookupExists(alloc, &txn, canonical_lookups)) return false;
+
+    if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
+    var next_ordinal = try readNextOrdinalTxn(&txn);
+    const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
+    if (doc_upserts.len > available_ordinals) return error.DocOrdinalExhausted;
+    for (doc_upserts) |doc_id| {
+        const ordinal = try reserveOrdinalLocal(&next_ordinal);
+        const state = OrdinalState{
+            .canonical_doc_id = canonicalDocIdForNamespace(namespace, doc_id),
+            .created_generation = generation,
+        };
+        try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+    }
+    try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    return true;
+}
+
+fn identityLookupsContainDuplicateKeys(lookups: []const IdentityLookup) bool {
+    if (lookups.len <= 1) return false;
+    var previous = lookups[0].key;
+    for (lookups[1..]) |lookup| {
+        if (std.mem.eql(u8, previous, lookup.key)) return true;
+        previous = lookup.key;
+    }
+    return false;
+}
+
+fn anyIdentityLookupExists(alloc: Allocator, txn: anytype, lookups: []const IdentityLookup) !bool {
+    if (lookups.len == 0) return false;
+    var keys = try alloc.alloc([]const u8, lookups.len);
+    defer alloc.free(keys);
+    const values = try alloc.alloc(?[]const u8, lookups.len);
+    defer alloc.free(values);
+    for (lookups, 0..) |lookup, i| keys[i] = lookup.key;
+    try txn.getManySorted(keys, values);
+    for (values) |maybe_value| {
+        if (maybe_value != null) return true;
+    }
+    return false;
 }
 
 fn readNextOrdinalTxn(txn: anytype) !DocOrdinal {

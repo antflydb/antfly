@@ -3347,7 +3347,7 @@ pub const DB = struct {
         defer freeOwnedKeySlice(self.alloc, deleted_artifact_keys);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
-        const use_thin_replay_fast_path = self.executor.hasWorkers() and
+        const use_thin_replay_fast_path =
             effective_req.sync_level != .full_text and
             effective_req.sync_level != .enrichments and
             effective_req.sync_level != .aknn and
@@ -13462,24 +13462,18 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 try collectCombinedDeleteKeys(ctx.alloc, batch.deleted_keys, batch.overwritten_doc_keys);
             defer if (batch.deleted_keys.len > 0 and batch.overwritten_doc_keys.len > 0) ctx.alloc.free(delete_keys);
 
-            var index_writes = try collectTextDocumentWritesForIndex(
+            const missing_required = try applyTextDocumentsForIndex(
                 ctx.alloc,
                 ctx.store,
                 ctx.index_manager,
                 batch.documents,
                 index_ref.name,
                 ctx.index_manager.byte_range,
-                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
-            );
-            defer index_writes.deinit();
-            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-            try ctx.index_manager.applyTextBatchByNameWithOptions(
-                ctx.store,
-                index_ref.name,
                 delete_keys,
-                index_writes.items,
+                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
                 text_replay_options,
             );
+            if (missing_required != 0) return error.ReplayDocumentNotVisible;
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
         },
         .dense_vector => {
@@ -14211,15 +14205,17 @@ fn attachInlineUpsertDocumentValues(
     }
 }
 
-fn collectTextDocumentWritesForIndex(
+fn applyTextDocumentsForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_manager: *index_manager_mod.IndexManager,
     documents: []const derived_types.DerivedDocument,
     index_name: []const u8,
     byte_range: types.ByteRange,
+    delete_keys: []const []const u8,
     opts: CollectTextDocumentWritesOptions,
-) !OwnedBatchWrites {
+    index_opts: index_manager_mod.IndexBatchOptions,
+) !usize {
     const chunk_name = index_manager.textChunkName(index_name);
     const PendingTextWrite = struct {
         doc_key: []const u8,
@@ -14234,10 +14230,7 @@ fn collectTextDocumentWritesForIndex(
     }
 
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    errdefer {
-        for (writes.items) |item| alloc.free(@constCast(item.value));
-        writes.deinit(alloc);
-    }
+    defer writes.deinit(alloc);
 
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
@@ -14249,10 +14242,9 @@ fn collectTextDocumentWritesForIndex(
         if (!byte_range.contains(doc.key)) continue;
         if (!documentTargetsTextIndex(doc, index_name, chunk_name != null)) continue;
         if (trust_inline and doc.cleaned_value != null) {
-            const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
             try writes.append(alloc, .{
                 .key = doc.key,
-                .value = owned_value,
+                .value = doc.cleaned_value.?,
             });
             continue;
         }
@@ -14264,10 +14256,8 @@ fn collectTextDocumentWritesForIndex(
     }
 
     if (pending.items.len == 0) {
-        return .{
-            .alloc = alloc,
-            .items = try writes.toOwnedSlice(alloc),
-        };
+        try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
+        return 0;
     }
 
     var txn = try store.beginProbeTxn();
@@ -14297,18 +14287,15 @@ fn collectTextDocumentWritesForIndex(
             missing_required += 1;
             continue;
         };
-        const owned_value = try alloc.dupe(u8, value);
         try writes.append(alloc, .{
             .key = item.doc_key,
-            .value = owned_value,
+            .value = value,
         });
     }
 
-    return .{
-        .alloc = alloc,
-        .items = try writes.toOwnedSlice(alloc),
-        .missing_required = missing_required,
-    };
+    if (missing_required != 0) return missing_required;
+    try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
+    return missing_required;
 }
 
 fn documentTargetsTextIndex(doc: derived_types.DerivedDocument, index_name: []const u8, is_chunk_index: bool) bool {

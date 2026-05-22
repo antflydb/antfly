@@ -5946,23 +5946,36 @@ pub const IndexManager = struct {
     fn indexTextBatchForConfig(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, writes: []const types.BatchWrite) !TextBatchMutationStats {
         if (writes.len == 0) return .{};
 
-        var docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
-        defer docs.deinit(self.alloc);
-        var identity_txn = try store.beginProbeTxn();
-        defer identity_txn.abort();
+        var filtered = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer filtered.deinit(self.alloc);
 
         for (writes) |write| {
             if (!self.keyInRange(write.key)) continue;
             if (!try textIndexShouldConsumeDoc(self, entry, write.key)) continue;
-            try docs.append(self.alloc, .{
-                .key = write.key,
-                .value = write.value,
-                .doc_ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, &identity_txn, write.key),
-            });
+            try filtered.append(self.alloc, write);
         }
 
-        if (docs.items.len == 0) return .{};
-        return try self.indexTextProjectionDocs(store, entry, docs.items);
+        if (filtered.items.len == 0) return .{};
+
+        var doc_ids = try self.alloc.alloc([]const u8, filtered.items.len);
+        defer self.alloc.free(doc_ids);
+        for (filtered.items, 0..) |write, i| doc_ids[i] = write.key;
+
+        var identity_txn = try store.beginProbeTxn();
+        defer identity_txn.abort();
+        const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(self.alloc, &identity_txn, doc_ids);
+        defer self.alloc.free(ordinals);
+
+        var docs = try self.alloc.alloc(mapper.MapperDoc, filtered.items.len);
+        defer self.alloc.free(docs);
+        for (filtered.items, 0..) |write, i| {
+            docs[i] = .{
+                .key = write.key,
+                .value = write.value,
+                .doc_ordinal = ordinals[i],
+            };
+        }
+        return try self.indexTextProjectionDocs(store, entry, docs);
     }
 
     fn indexTextProjectionDocs(
@@ -6029,20 +6042,39 @@ pub const IndexManager = struct {
     ) !TextBatchMutationStats {
         if (source_docs.len == 0) return .{};
 
-        var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
-        const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, source_docs);
+        const profile_enabled = benchMetricsEnabled();
+        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var ordinals_ns: u64 = 0;
+        var projection_ns: u64 = 0;
+        var analyzer_merge_ns: u64 = 0;
+        var segment_build_ns: u64 = 0;
+        var index_segment_ns: u64 = 0;
 
+        var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+        const ordinals_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, source_docs);
+        if (profile_enabled) ordinals_ns = platform_time.monotonicNs() - ordinals_start_ns;
+
+        const projection_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         const projection_batch = try mapper.buildTextProjectionBatchFromSource(arena, source_docs_with_ordinals, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
+        if (profile_enabled) projection_ns = platform_time.monotonicNs() - projection_start_ns;
         if (projection_batch.observed_field_analyzers.len > 0) {
+            const analyzer_merge_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
+            if (profile_enabled) analyzer_merge_ns = platform_time.monotonicNs() - analyzer_merge_start_ns;
         }
 
+        const segment_build_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         const segments = try mapper.buildTextSegmentsFromProjectionBatch(arena, projection_batch, entry.text_analysis, .{
             .target_segment_bytes = @intCast(default_merge_policy.max_segment_size),
         });
+        if (profile_enabled) segment_build_ns = platform_time.monotonicNs() - segment_build_start_ns;
 
         var indexed_any = false;
+        var segment_bytes: usize = 0;
+        const index_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         for (segments) |seg| {
+            segment_bytes += seg.len;
             entry.persistent.indexSegment(seg) catch |err| {
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("index text batch indexSegment failed: {s}", .{@errorName(err)});
@@ -6050,6 +6082,26 @@ pub const IndexManager = struct {
                 return err;
             };
             indexed_any = true;
+        }
+        if (profile_enabled) {
+            index_segment_ns = platform_time.monotonicNs() - index_segment_start_ns;
+            std.log.info(
+                "antfly_bench_text_index index={s} source_docs={d} projection_docs={d} observed_analyzers={d} segments={d} segment_bytes={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d}",
+                .{
+                    entry.config.name,
+                    source_docs.len,
+                    projection_batch.docs.len,
+                    projection_batch.observed_field_analyzers.len,
+                    segments.len,
+                    segment_bytes,
+                    nsToMs(platform_time.monotonicNs() - total_start_ns),
+                    nsToMs(ordinals_ns),
+                    nsToMs(projection_ns),
+                    nsToMs(analyzer_merge_ns),
+                    nsToMs(segment_build_ns),
+                    nsToMs(index_segment_ns),
+                },
+            );
         }
         return .{ .indexed_any = indexed_any };
     }

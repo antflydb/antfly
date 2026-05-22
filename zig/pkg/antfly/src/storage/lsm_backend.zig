@@ -1308,7 +1308,7 @@ pub const Backend = struct {
         var sorted = try self.mutable.toStateMove(self.allocator);
         errdefer sorted.deinit(self.allocator);
         self.mutable_wal_range = .{};
-        try self.ingestSortedState(&sorted);
+        try self.ingestOwnedSortedState(&sorted);
         sorted.deinit(self.allocator);
         self.syncTrackedInMemoryStateUsageCurrentLocked();
         return true;
@@ -1645,6 +1645,45 @@ pub const Backend = struct {
             };
         }
         try self.ingestSortedTableEntries(entries);
+    }
+
+    pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (state.entries.items.len == 0) return;
+        if (self.root_dir != null) {
+            try self.ingestSortedState(state);
+            return;
+        }
+
+        if (self.mutable.entries.items.len > 0) {
+            try self.flushMutable();
+        }
+
+        const start_ns = self.writeStatsNowNs();
+        const target_bytes = @max(@as(usize, 1), @min(self.options.max_run_file_bytes, lsm_table_file.max_entry_data_len));
+        var new_runs: std.ArrayListUnmanaged(Run) = .empty;
+        if (state.arena_owner != null and estimateStateBytes(state) <= target_bytes) {
+            var moved = state.*;
+            state.* = .{};
+            errdefer moved.deinit(self.allocator);
+            try new_runs.ensureUnusedCapacity(self.allocator, 1);
+            const run = try compaction_mod.makeRun(Backend, self, moved);
+            new_runs.appendAssumeCapacity(run);
+        } else if (state.arena_owner != null) {
+            try self.ingestSortedState(state);
+            return;
+        } else {
+            new_runs = try compaction_mod.makeRuns(Backend, self, state);
+        }
+        errdefer {
+            for (new_runs.items) |*run| run.deinit(self.allocator);
+            new_runs.deinit(self.allocator);
+        }
+
+        self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+
+        compaction_mod.sortRuns(self.runs.items);
     }
 
     pub fn shouldDirectIngestBulkState(self: *const Backend, state: *const State) bool {

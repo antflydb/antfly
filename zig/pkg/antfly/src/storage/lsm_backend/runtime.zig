@@ -2563,7 +2563,11 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             }
 
             if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&self.bulk_appends);
-            try self.backend.ingestSortedState(&self.bulk_appends);
+            if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                try self.backend.ingestOwnedSortedState(&self.bulk_appends);
+            } else {
+                try self.backend.ingestSortedState(&self.bulk_appends);
+            }
             if (@hasDecl(BackendType, "recordBulkAppendSuccess")) self.backend.recordBulkAppendSuccess(entries, sort_ns);
             self.bulk_appends.deinit(self.allocator);
             self.bulk_appends = .{};
@@ -2604,7 +2608,11 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 var sorted = try self.mutable.toStateMove(self.allocator);
                 errdefer sorted.deinit(self.allocator);
                 const sort_ns = elapsedNs(sort_start_ns);
-                try self.backend.ingestSortedState(&sorted);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             } else {
@@ -2618,7 +2626,11 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
                 if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&sorted);
-                try self.backend.ingestSortedState(&sorted);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             }
@@ -4636,7 +4648,11 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 var sorted = try self.mutable.toStateMove(self.allocator);
                 errdefer sorted.deinit(self.allocator);
                 const sort_ns = elapsedNs(sort_start_ns);
-                try self.backend.ingestSortedState(&sorted);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             } else {
@@ -4650,7 +4666,11 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
                 if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&sorted);
-                try self.backend.ingestSortedState(&sorted);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             }
