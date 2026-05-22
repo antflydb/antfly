@@ -1200,7 +1200,7 @@ fn collectTextSearchQueryDocIdsAlloc(
     errdefer freeDocIdArrayList(alloc, &out);
     for (doc_nums) |doc_num| {
         const stored = snapshot.storedDoc(doc_num) orelse continue;
-        try appendOwnedDocId(alloc, &out, stored.id);
+        try out.append(alloc, try alloc.dupe(u8, stored.id));
     }
     if (profile_enabled) {
         const hydrate_ns = platform_time.monotonicNs() - hydrate_start;
@@ -2582,7 +2582,11 @@ fn searchDenseInternal(
         @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
     else
         @intCast(index_stats.active_count);
-    const hbc_effective_k: u32 = if (full_candidate_window) bounded_full_candidate_count else effective_k;
+    const stored_filter_candidate_window: u32 = @min(
+        bounded_full_candidate_count,
+        @max(paging.limit *| 32, @as(u32, 1024)),
+    );
+    const hbc_effective_k: u32 = if (full_candidate_window) stored_filter_candidate_window else effective_k;
 
     const hbc_req: vectorindex_mod.SearchRequest = .{
         .query = dense.vector,
