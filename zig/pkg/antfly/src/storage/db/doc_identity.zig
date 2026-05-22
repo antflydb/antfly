@@ -955,6 +955,8 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     doc_deletes: []const []const u8,
 ) !bool {
     if (doc_upserts.len == 0 or doc_deletes.len != 0) return false;
+    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 4), 2);
+    try out.ensureUnusedCapacity(alloc, identity_write_capacity);
 
     var txn = try store.beginProbeTxn();
     defer txn.abort();
@@ -976,7 +978,7 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     }
     std.sort.pdq(IdentityLookup, doc_lookups, {}, identityLookupLessThan);
     if (identityLookupsContainDuplicateKeys(doc_lookups)) return false;
-    if (try anyIdentityLookupExists(alloc, &txn, doc_lookups)) return false;
+    if (!missing_namespace and try anyIdentityLookupExists(alloc, &txn, doc_lookups)) return false;
 
     var canonical_lookups = try alloc.alloc(IdentityLookup, doc_upserts.len);
     defer {
@@ -991,7 +993,7 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     }
     std.sort.pdq(IdentityLookup, canonical_lookups, {}, identityLookupLessThan);
     if (identityLookupsContainDuplicateKeys(canonical_lookups)) return false;
-    if (try anyIdentityLookupExists(alloc, &txn, canonical_lookups)) return false;
+    if (!missing_namespace and try anyIdentityLookupExists(alloc, &txn, canonical_lookups)) return false;
 
     if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
     var next_ordinal = try readNextOrdinalTxn(&txn);

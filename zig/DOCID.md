@@ -1597,6 +1597,16 @@ Status as of 2026-05-19:
   building the segment and about `705ms` inserting it. The remaining full-text
   wait is mostly replay-window collection plus document collection/read
   overhead, not sparse replay or segment construction.
+  Follow-up write-path cleanup now removes more per-document overhead from the
+  same measured phases: top-level artifact-backed vector fields use a raw JSON
+  strip fast path before falling back to the full parser, primary document keys
+  and identity doc-to-ordinal keys are allocated at exact size instead of going
+  through temporary array-list builders, all-new identity batches pre-reserve
+  their KV write capacity, and full-text replay ordinal lookups use the replay
+  arena for transient lookup keys instead of per-document long-lived
+  allocator/free cycles. These are mechanical hot-path reductions; the last
+  local end-to-end timing run was discarded because unrelated desktop load made
+  multiple already-optimized phases regress together.
   The first optimization from that evidence specialized
   `ResolvedDocSet` ordinal set algebra: list/list operators now use direct
   sorted-array merge/intersection/difference, bitmap/bitmap operators use

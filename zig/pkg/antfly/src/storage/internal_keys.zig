@@ -153,11 +153,11 @@ pub fn appendDocumentRangeLower(list: *std.ArrayListUnmanaged(u8), alloc: Alloca
 }
 
 pub fn documentKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try appendDocumentPrefix(&list, alloc, doc_key);
-    try list.append(alloc, primary_kind);
-    return try list.toOwnedSlice(alloc);
+    var key = try alloc.alloc(u8, 1 + encodedComponentLen(doc_key) + 1);
+    key[0] = user_namespace;
+    const pos = 1 + encodeComponent(key[1..], doc_key);
+    key[pos] = primary_kind;
+    return key;
 }
 
 pub fn ttlKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
@@ -660,12 +660,11 @@ pub fn replayLatestSequenceKey(hint_ordinal: u8) [4]u8 {
 }
 
 pub fn identityDocToOrdinalKeyAlloc(alloc: Allocator, doc_id: []const u8) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try list.append(alloc, identity_namespace);
-    try list.append(alloc, identity_doc_to_ordinal_kind);
-    try appendEncodedComponent(&list, alloc, doc_id);
-    return try list.toOwnedSlice(alloc);
+    var key = try alloc.alloc(u8, 2 + encodedComponentLen(doc_id));
+    key[0] = identity_namespace;
+    key[1] = identity_doc_to_ordinal_kind;
+    _ = encodeComponent(key[2..], doc_id);
+    return key;
 }
 
 pub fn identityOrdinalToDocKey(ordinal: u32) [1 + 1 + @sizeOf(u32)]u8 {

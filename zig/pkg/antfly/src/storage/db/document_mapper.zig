@@ -2281,6 +2281,13 @@ fn cloneWithoutSpecialFields(alloc: Allocator, root: std.json.Value) !std.json.V
 
 pub fn stripTopLevelFieldsAlloc(alloc: Allocator, data: []const u8, fields: []const []const u8) !?[]u8 {
     if (fields.len == 0) return try alloc.dupe(u8, data);
+    fast_path: {
+        const stripped = stripTopLevelFieldsRawFastAlloc(alloc, data, fields) catch |err| switch (err) {
+            error.UnsupportedSparseFastPath => break :fast_path,
+            else => return err,
+        };
+        return stripped;
+    }
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{
         .allocate = .alloc_always,
@@ -2299,6 +2306,70 @@ pub fn stripTopLevelFieldsAlloc(alloc: Allocator, data: []const u8, fields: []co
 
     if (value.object.count() == 0) return null;
     return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+fn stripTopLevelFieldsRawFastAlloc(alloc: Allocator, data: []const u8, fields: []const []const u8) !?[]u8 {
+    var pos: usize = 0;
+    skipJsonWhitespace(data, &pos);
+    if (pos >= data.len or data[pos] != '{') return try alloc.dupe(u8, data);
+    pos += 1;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var wrote_any = false;
+    var removed_any = false;
+
+    while (true) {
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == '}') {
+            pos += 1;
+            break;
+        }
+
+        const entry_start = pos;
+        const field = try parseRawJsonString(data, &pos);
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len or data[pos] != ':') return error.SyntaxError;
+        pos += 1;
+        skipJsonWhitespace(data, &pos);
+        try skipRawJsonValue(data, &pos);
+        const entry_end = pos;
+
+        if (containsTopLevelField(fields, field)) {
+            removed_any = true;
+        } else {
+            if (wrote_any) try out.append(alloc, ',');
+            try out.appendSlice(alloc, data[entry_start..entry_end]);
+            wrote_any = true;
+        }
+
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == ',') {
+            pos += 1;
+            continue;
+        }
+        if (data[pos] == '}') {
+            pos += 1;
+            break;
+        }
+        return error.SyntaxError;
+    }
+
+    skipJsonWhitespace(data, &pos);
+    if (pos != data.len) return error.SyntaxError;
+    if (!removed_any) {
+        out.deinit(alloc);
+        return try alloc.dupe(u8, data);
+    }
+    if (!wrote_any) {
+        out.deinit(alloc);
+        return null;
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 fn containsTopLevelField(fields: []const []const u8, field: []const u8) bool {
@@ -2923,6 +2994,29 @@ test "document mapper extracts sparse vector from configured field" {
     try std.testing.expectEqual(@as(u32, 5), vec.indices[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), vec.values[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), vec.values[1], 0.0001);
+}
+
+test "document mapper strips top-level vector fields with raw fast path" {
+    const alloc = std.testing.allocator;
+
+    const stripped = (try stripTopLevelFieldsAlloc(
+        alloc,
+        "{\"title\":\"alpha\",\"sparse\":{\"indices\":[1],\"values\":[1.0]},\"tail\":true}",
+        &.{"sparse"},
+    )).?;
+    defer alloc.free(stripped);
+
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\",\"tail\":true}", stripped);
+}
+
+test "document mapper strips all selected top-level fields to null document" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect((try stripTopLevelFieldsAlloc(
+        alloc,
+        "{\"sparse\":{\"indices\":[1],\"values\":[1.0]}}",
+        &.{"sparse"},
+    )) == null);
 }
 
 test "document mapper extracts sparse vector from token weight map" {

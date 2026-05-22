@@ -6107,7 +6107,7 @@ pub const IndexManager = struct {
     }
 
     fn textProjectionSourceDocsWithOrdinals(
-        self: *IndexManager,
+        _: *IndexManager,
         arena: std.mem.Allocator,
         store: *docstore_mod.DocStore,
         source_docs: []const mapper.TextProjectionSourceDoc,
@@ -6119,16 +6119,13 @@ pub const IndexManager = struct {
             store_key: []u8,
         };
         var pending = std.ArrayListUnmanaged(PendingOrdinalLookup).empty;
-        defer {
-            for (pending.items) |item| self.alloc.free(item.store_key);
-            pending.deinit(self.alloc);
-        }
+        defer pending.deinit(arena);
 
         for (docs, 0..) |doc, i| {
             if (doc.doc_ordinal != null) continue;
-            try pending.append(self.alloc, .{
+            try pending.append(arena, .{
                 .source_index = i,
-                .store_key = try internal_keys.identityDocToOrdinalKeyAlloc(self.alloc, doc.key),
+                .store_key = try internal_keys.identityDocToOrdinalKeyAlloc(arena, doc.key),
             });
         }
         if (pending.items.len == 0) return docs;
@@ -6139,10 +6136,8 @@ pub const IndexManager = struct {
             }
         }.lessThan);
 
-        const read_keys = try self.alloc.alloc([]const u8, pending.items.len);
-        defer self.alloc.free(read_keys);
-        const read_values = try self.alloc.alloc(?[]const u8, pending.items.len);
-        defer self.alloc.free(read_values);
+        const read_keys = try arena.alloc([]const u8, pending.items.len);
+        const read_values = try arena.alloc(?[]const u8, pending.items.len);
         for (pending.items, 0..) |item, i| {
             read_keys[i] = item.store_key;
             read_values[i] = null;
