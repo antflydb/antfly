@@ -1096,6 +1096,11 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileSwarmStatefulSet(ctx, efCache, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
+		if repaired, err := r.repairBlockedStatefulSetRollouts(ctx, workingCluster); err != nil {
+			return ctrl.Result{}, err
+		} else if repaired {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 
 		r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
 			r.reconcilePVCExpansion(ctx, workingCluster, "swarm", "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster)),
@@ -3111,6 +3116,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 
 func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.AntflyCluster, statefulSets ...*appsv1.StatefulSet) {
 	var waiting []string
+	var blocked []string
 	for _, sts := range statefulSets {
 		if sts == nil || sts.Name == "" {
 			waiting = append(waiting, "StatefulSet is not observed yet")
@@ -3125,7 +3131,12 @@ func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.Antfl
 			continue
 		}
 		if sts.Status.UpdatedReplicas < replicas {
-			waiting = append(waiting, fmt.Sprintf("%s has %d/%d updated replicas", sts.Name, sts.Status.UpdatedReplicas, replicas))
+			message := fmt.Sprintf("%s has %d/%d updated replicas", sts.Name, sts.Status.UpdatedReplicas, replicas)
+			if statefulSetRolloutAppearsBlocked(sts, replicas) {
+				blocked = append(blocked, message)
+			} else {
+				waiting = append(waiting, message)
+			}
 			continue
 		}
 		if sts.Status.ReadyReplicas < replicas {
@@ -3137,7 +3148,11 @@ func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.Antfl
 		Type:               antflyv1.TypeRollout,
 		ObservedGeneration: cluster.Generation,
 	}
-	if len(waiting) > 0 {
+	if len(blocked) > 0 {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = antflyv1.ReasonRolloutBlocked
+		condition.Message = strings.Join(blocked, "; ")
+	} else if len(waiting) > 0 {
 		condition.Status = metav1.ConditionUnknown
 		condition.Reason = antflyv1.ReasonRolloutInProgress
 		condition.Message = strings.Join(waiting, "; ")
@@ -3150,7 +3165,28 @@ func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.Antfl
 	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
 }
 
+func statefulSetRolloutAppearsBlocked(sts *appsv1.StatefulSet, replicas int32) bool {
+	if sts == nil || replicas <= 0 {
+		return false
+	}
+	if sts.Status.UpdateRevision == "" || sts.Status.CurrentRevision == "" || sts.Status.UpdateRevision == sts.Status.CurrentRevision {
+		return false
+	}
+	return sts.Status.UpdatedReplicas == 0 && sts.Status.ReadyReplicas == 0
+}
+
 func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollouts(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	if effectiveTopologyMode(cluster) == topologyModeSwarm {
+		swarmSts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-swarm", Namespace: cluster.Namespace}, swarmSts); err != nil {
+			if !errors.IsNotFound(err) {
+				return false, err
+			}
+			return false, nil
+		}
+		return r.repairBlockedStatefulSetRollout(ctx, cluster, swarmSts, "swarm")
+	}
+
 	metadataSts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}, metadataSts); err != nil {
 		if !errors.IsNotFound(err) {
