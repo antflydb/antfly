@@ -24,6 +24,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const apply_state = @import("../derived/apply_state.zig");
+const change_journal_mod = @import("../derived/change_journal.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const enrichment_catalog = @import("enrichment_catalog.zig");
@@ -4388,6 +4389,7 @@ pub const IndexManager = struct {
 
     fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         if (try self.configRequiresEnrichmentReplay(cfg)) return;
+        if (try self.configHasPendingSparseEmbeddingArtifactReplay(store, cfg)) return;
         try apply_state.saveAppliedSequenceWithCheckpoint(
             self.alloc,
             store,
@@ -4395,6 +4397,52 @@ pub const IndexManager = struct {
             cfg.name,
             store.lastReplaySequence(0),
         );
+    }
+
+    fn configHasPendingSparseEmbeddingArtifactReplay(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !bool {
+        if (cfg.kind != .sparse_vector) return false;
+        const expected_embedding_name = try self.sparseConfigEmbeddingNameAlloc(cfg);
+        defer self.alloc.free(expected_embedding_name);
+
+        const Context = struct {
+            alloc: Allocator,
+            expected_embedding_name: []const u8,
+            found: bool = false,
+
+            fn handle(ctx: *@This(), _: u64, payload: []const u8) !void {
+                if (ctx.found) return;
+                var decoded = try change_journal_mod.decodeRecord(ctx.alloc, payload);
+                defer decoded.deinit();
+                for (decoded.record.changed_artifact_keys) |artifact_key| {
+                    if (internal_keys.isEmbeddingArtifactKey(artifact_key) and internal_keys.matchesEmbeddingArtifactName(artifact_key, ctx.expected_embedding_name)) {
+                        ctx.found = true;
+                        return;
+                    }
+                    if (internal_keys.isDerivedEmbeddingArtifactKey(artifact_key) and internal_keys.matchesDerivedEmbeddingArtifactName(artifact_key, ctx.expected_embedding_name)) {
+                        ctx.found = true;
+                        return;
+                    }
+                }
+            }
+        };
+
+        var ctx = Context{
+            .alloc = self.alloc,
+            .expected_embedding_name = expected_embedding_name,
+        };
+        store.forEachReplayEntryFromHint(0, .sparse_vector, &ctx, Context.handle) catch |err| switch (err) {
+            error.ReplayIndexUnavailable => return false,
+            else => return err,
+        };
+        return ctx.found;
+    }
+
+    fn sparseConfigEmbeddingNameAlloc(self: *IndexManager, cfg: types.IndexConfig) ![]u8 {
+        if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
+            defer generator.deinit(self.alloc);
+            if (generator.embedding_name) |embedding_name| return try self.alloc.dupe(u8, embedding_name);
+        }
+        return try self.alloc.dupe(u8, cfg.name);
     }
 
     fn appendOpenedIndex(self: *IndexManager, opened: OpenedIndex) !void {
@@ -7965,7 +8013,7 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             const indices = write.indices;
             const values = write.values;
-            if (write.artifact_key != null and indices.len == 0) {
+            if (write.artifact_key != null) {
                 try pending_artifact_loads.append(self.alloc, .{
                     .doc_key = write.doc_key,
                     .artifact_key = write.artifact_key.?,
