@@ -898,7 +898,7 @@ static int termite_metal_encode_q8_0_linear_raw_on_encoder(termite_metal_decode_
 static int termite_metal_encode_q8_0_linear_raw_on_encoder_planned(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint8_t planned_dispatch, int failure_code);
 static int termite_metal_encode_q8_0_linear_raw_on_encoder_planned_family(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint8_t planned_dispatch, termite_metal_q8_0_linear_family_kind q8_family, int failure_code);
 static int termite_metal_encode_argmax_logits_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> logits_buffer, size_t logits_offset, size_t out_dim, int failure_code);
-static int termite_metal_encode_head_rms_rope_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, size_t norm_slot, size_t total_heads, size_t head_dim, size_t rope_dim, size_t position, float theta, float freq_scale, float eps, float value_scale, uint32_t consecutive_pairs, size_t heads_per_row, id<MTLBuffer> output_buffer, size_t output_offset, int failure_code);
+static int termite_metal_encode_head_rms_rope_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, size_t norm_slot, size_t total_heads, size_t head_dim, size_t rope_dim, size_t position, float theta, float freq_scale, float eps, float value_scale, uint32_t consecutive_pairs, size_t heads_per_row, size_t position_period, id<MTLBuffer> output_buffer, size_t output_offset, int failure_code);
 static int termite_metal_encode_attention_f32_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> q_buffer, size_t q_offset, id<MTLBuffer> k_buffer, size_t k_offset, id<MTLBuffer> v_buffer, size_t v_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t q_len, size_t kv_tokens, size_t num_heads, size_t num_kv_heads, size_t head_dim, size_t query_position_offset, size_t kv_position_offset, size_t sliding_window, size_t total_sequence_len, int failure_code);
 static int termite_metal_encode_dense_linear_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, id<MTLBuffer> input_buffer, size_t input_offset, size_t in_dim, size_t out_dim, id<MTLBuffer> output_buffer, size_t output_offset, int failure_code);
 static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_key_device_slot(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, size_t slot, uint32_t format, void *k_handle, size_t k_offset, void *v_handle, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t base_key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size);
@@ -1360,6 +1360,7 @@ typedef struct termite_metal_head_rms_rope_params {
     float value_scale;
     uint32_t consecutive_pairs;
     uint32_t heads_per_row;
+    uint32_t position_period;
 } termite_metal_head_rms_rope_params;
 
 typedef struct termite_metal_attention_f32_params {
@@ -1685,7 +1686,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_linear_params { uint rows; uint in_dim; uint out_dim; uint row_blocks; };\n"
            "struct termite_metal_qkv_linear_params { uint rows; uint in_dim; uint q_out_dim; uint kv_out_dim; uint row_blocks; };\n"
            "struct termite_metal_key_scores_params { uint q_len; uint block_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; };\n"
-           "struct termite_metal_head_rms_rope_params { uint total_heads; uint head_dim; uint rope_dim; uint position; float theta; float freq_scale; float eps; float value_scale; uint consecutive_pairs; uint heads_per_row; };\n"
+           "struct termite_metal_head_rms_rope_params { uint total_heads; uint head_dim; uint rope_dim; uint position; float theta; float freq_scale; float eps; float value_scale; uint consecutive_pairs; uint heads_per_row; uint position_period; };\n"
            "struct termite_metal_tl1_params { uint rows; uint in_dim; uint out_dim; uint packed_len; uint bm; uint cfg_by; uint bmm; };\n"
            "struct termite_metal_tl2_params { uint rows; uint in_dim; uint out_dim; uint scale_off; uint three_value_len; uint three_sign_len; uint bm; uint cfg_by; uint bmm; uint three_cols; uint two_cols; };\n"
            "struct termite_metal_embed_absolute_position_params { uint token_id; uint position_id; uint hidden_size; };\n"
@@ -2314,6 +2315,7 @@ static NSString *termite_metal_shader_source(void) {
            "        float x1 = input[base + idx1] * inv_rms * weight[idx1] * p.value_scale;\n"
            "        float freq = 1.0f / pow(p.theta, float(2u * j) / float(p.rope_dim));\n"
            "        uint row = p.heads_per_row == 0u ? 0u : head / p.heads_per_row;\n"
+           "        if (p.position_period != 0u) row = row % p.position_period;\n"
            "        float angle = float(p.position + row) * p.freq_scale * freq;\n"
            "        float c = cos(angle); float s = sin(angle);\n"
            "        if (d == idx0) output[base + d] = x0 * c - x1 * s;\n"
@@ -9668,6 +9670,7 @@ termite_metal_provider *termite_metal_provider_create(void) {
 
 void termite_metal_provider_destroy(termite_metal_provider *provider) {
     if (provider == NULL) return;
+    @autoreleasepool {
     provider->q4_0_pipeline = nil;
     provider->q4_1_pipeline = nil;
     provider->q5_0_pipeline = nil;
@@ -9692,6 +9695,7 @@ void termite_metal_provider_destroy(termite_metal_provider *provider) {
     provider->queue = nil;
     provider->device = nil;
     free(provider);
+    }
 }
 
 termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
@@ -10062,6 +10066,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
 
 void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL) return;
+    @autoreleasepool {
     if (runtime->submitted_frame_cb != nil) {
         (void)termite_metal_decode_runtime_wait_frame(runtime);
     }
@@ -10420,6 +10425,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_span_v_row_stride = 0;
     runtime->attention_span_position_offset = 0;
     free(runtime);
+    }
 }
 
 int termite_metal_decode_runtime_prepare_absolute_embeddings(
@@ -11764,7 +11770,51 @@ int termite_metal_decode_runtime_apply_head_rms_rope_device(
             encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_HEAD_ROPE);
             if (encoder == nil) return -9;
         }
-        const int encode_rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, input_buffer, input_offset, norm_slot, total_heads, head_dim, rope_dim, position, theta, freq_scale, eps, value_scale, consecutive_pairs, total_heads, output_buffer, output_offset, -9);
+        const int encode_rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, input_buffer, input_offset, norm_slot, total_heads, head_dim, rope_dim, position, theta, freq_scale, eps, value_scale, consecutive_pairs, total_heads, 0, output_buffer, output_offset, -9);
+        if (!planned_encoder) [encoder endEncoding];
+        if (encode_rc != 0) return encode_rc;
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+int termite_metal_decode_runtime_apply_head_rms_rope_batched_device(
+    termite_metal_decode_runtime *runtime,
+    void *input_handle,
+    size_t input_offset,
+    size_t norm_slot,
+    size_t total_heads,
+    size_t head_dim,
+    size_t rope_dim,
+    size_t position,
+    float theta,
+    float freq_scale,
+    float eps,
+    float value_scale,
+    uint32_t consecutive_pairs,
+    size_t heads_per_row,
+    size_t position_period,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
+    if (norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY || total_heads == 0 || head_dim == 0 || rope_dim == 0 || heads_per_row == 0) return -3;
+    if (total_heads > UINT32_MAX || head_dim > UINT32_MAX || rope_dim > UINT32_MAX || position > UINT32_MAX || heads_per_row > UINT32_MAX || position_period > UINT32_MAX) return -5;
+    @autoreleasepool {
+        id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        const size_t bytes = total_heads * head_dim * sizeof(float);
+        if (input_offset + bytes > input_buffer.length) return -6;
+        if (output_offset + bytes > output_buffer.length) return -7;
+        bool frame_owned = (runtime->active_frame_cb == nil);
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -8;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        const BOOL planned_encoder = (encoder != nil);
+        if (!planned_encoder) {
+            encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_HEAD_ROPE);
+            if (encoder == nil) return -9;
+        }
+        const int encode_rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, input_buffer, input_offset, norm_slot, total_heads, head_dim, rope_dim, position, theta, freq_scale, eps, value_scale, consecutive_pairs, heads_per_row, position_period, output_buffer, output_offset, -9);
         if (!planned_encoder) [encoder endEncoding];
         if (encode_rc != 0) return encode_rc;
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -11808,7 +11858,7 @@ int termite_metal_decode_runtime_apply_head_rms_rope_scratch_device(
             encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_HEAD_ROPE);
             if (encoder == nil) return -9;
         }
-        const int encode_rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, input_buffer, input_offset, norm_slot, total_heads, head_dim, rope_dim, position, theta, freq_scale, eps, value_scale, consecutive_pairs, heads_per_row, output_buffer, 0, -9);
+        const int encode_rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, input_buffer, input_offset, norm_slot, total_heads, head_dim, rope_dim, position, theta, freq_scale, eps, value_scale, consecutive_pairs, heads_per_row, 0, output_buffer, 0, -9);
         if (!planned_encoder) [encoder endEncoding];
         if (encode_rc != 0) return encode_rc;
         const int rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -13413,6 +13463,7 @@ static int termite_metal_encode_head_rms_rope_on_encoder(
     float value_scale,
     uint32_t consecutive_pairs,
     size_t heads_per_row,
+    size_t position_period,
     id<MTLBuffer> output_buffer,
     size_t output_offset,
     int failure_code
@@ -13421,7 +13472,7 @@ static int termite_metal_encode_head_rms_rope_on_encoder(
     if (runtime->head_rms_rope_pipeline == nil) return failure_code;
     if (norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY || total_heads == 0 || head_dim == 0 || rope_dim == 0 || heads_per_row == 0) return failure_code;
     if (runtime->rms_norm_slot_prepared[norm_slot] == 0 || runtime->rms_norm_hidden_sizes[norm_slot] != head_dim) return failure_code;
-    if (total_heads > UINT32_MAX || head_dim > UINT32_MAX || rope_dim > UINT32_MAX || position > UINT32_MAX || heads_per_row > UINT32_MAX) return failure_code;
+    if (total_heads > UINT32_MAX || head_dim > UINT32_MAX || rope_dim > UINT32_MAX || position > UINT32_MAX || heads_per_row > UINT32_MAX || position_period > UINT32_MAX) return failure_code;
     size_t elems = 0;
     size_t bytes = 0;
     if (!termite_metal_size_mul(total_heads, head_dim, &elems) ||
@@ -13453,6 +13504,7 @@ static int termite_metal_encode_head_rms_rope_on_encoder(
         .value_scale = value_scale,
         .consecutive_pairs = consecutive_pairs,
         .heads_per_row = (uint32_t)heads_per_row,
+        .position_period = (uint32_t)position_period,
     };
     [encoder setComputePipelineState:runtime->head_rms_rope_pipeline];
     [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
@@ -14664,13 +14716,13 @@ int termite_metal_decode_runtime_apply_prefill_quantized_setup_device(
 
         if (rc == 0) rc = termite_metal_planned_layer_cursor_before_op(&planned_cursor, TERMITE_METAL_PLAN_OP_DECODE_Q_HEAD_NORM_ROPE);
         if (rc == 0) {
-            rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, q_projected_buffer, 0, q_norm_slot, rows * num_heads, head_dim, rope_dim, position, theta, freq_scale, 0.0f, query_value_scale, consecutive_pairs, num_heads, q_ready_buffer, 0, -27);
+            rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, q_projected_buffer, 0, q_norm_slot, rows * num_heads, head_dim, rope_dim, position, theta, freq_scale, 0.0f, query_value_scale, consecutive_pairs, num_heads, 0, q_ready_buffer, 0, -27);
         }
         if (rc == 0) rc = termite_metal_planned_layer_cursor_fallback_barrier_after_op(&planned_cursor);
 
         if (rc == 0 && !shares_kv) rc = termite_metal_planned_layer_cursor_before_op(&planned_cursor, TERMITE_METAL_PLAN_OP_DECODE_K_HEAD_NORM_ROPE);
         if (rc == 0 && !shares_kv) {
-            rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, k_projected_buffer, 0, k_norm_slot, rows * num_kv_heads, head_dim, rope_dim, position, theta, freq_scale, 0.0f, 1.0f, consecutive_pairs, num_kv_heads, k_ready_buffer, 0, -28);
+            rc = termite_metal_encode_head_rms_rope_on_encoder(runtime, encoder, k_projected_buffer, 0, k_norm_slot, rows * num_kv_heads, head_dim, rope_dim, position, theta, freq_scale, 0.0f, 1.0f, consecutive_pairs, num_kv_heads, 0, k_ready_buffer, 0, -28);
         }
         if (rc == 0 && !shares_kv) rc = termite_metal_planned_layer_cursor_fallback_barrier_after_op(&planned_cursor);
 

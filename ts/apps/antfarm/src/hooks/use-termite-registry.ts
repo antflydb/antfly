@@ -4,42 +4,97 @@ import type {
   ModelType,
   ModelTypeInfo,
   QuantizationOption,
-  QuantizationType,
   RecognizerCapability,
   TermiteModel,
 } from "@/data/termite-models";
+import { useApiConfig } from "@/hooks/use-api-config";
 
-// Always use the relative path — Vite proxy (dev) or Go reverse proxy (production)
-const REGISTRY_URL = "/registry/index.json";
 const FETCH_TIMEOUT = 10000; // 10 seconds
 
-// Remote registry response types
-interface RegistryModelResponse {
-  name: string;
-  owner: string;
-  source: string;
-  type: ModelType;
-  description: string;
-  capabilities?: RecognizerCapability[];
-  variants: QuantizationType[];
-  backends?: Backend[];
-  size?: number; // Size in bytes from registry
+type TermiteTaskKey =
+  | "embedders"
+  | "rerankers"
+  | "chunkers"
+  | "generators"
+  | "recognizers"
+  | "rewriters"
+  | "readers"
+  | "transcribers";
+
+interface TermiteModelInfoResponse {
+  capabilities?: unknown;
+  inputs?: unknown;
 }
 
-interface RegistryResponse {
-  schemaVersion: number;
-  models: RegistryModelResponse[];
+type TermiteModelsResponse = Partial<
+  Record<TermiteTaskKey, Record<string, TermiteModelInfoResponse>>
+> & {
+  object?: unknown;
+  data?: unknown;
+};
+
+const TASK_TO_TYPE: Record<TermiteTaskKey, ModelType> = {
+  embedders: "embedder",
+  rerankers: "reranker",
+  chunkers: "chunker",
+  generators: "generator",
+  recognizers: "recognizer",
+  rewriters: "rewriter",
+  readers: "reader",
+  transcribers: "transcriber",
+};
+
+const MODEL_TYPE_NAMES: Record<ModelType, string> = {
+  embedder: "embedding",
+  reranker: "reranking",
+  chunker: "chunking",
+  recognizer: "recognition",
+  rewriter: "rewriting",
+  generator: "generation",
+  reader: "reader",
+  transcriber: "transcription",
+};
+
+const TASK_KEYS = Object.keys(TASK_TO_TYPE) as TermiteTaskKey[];
+
+function isTermiteModelsResponse(value: unknown): value is TermiteModelsResponse {
+  if (typeof value !== "object" || value === null) return false;
+  return TASK_KEYS.some((task) => {
+    const models = (value as Partial<TermiteModelsResponse>)[task];
+    return typeof models === "object" && models !== null && !Array.isArray(models);
+  });
 }
 
-function isRegistryResponse(value: unknown): value is RegistryResponse {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    Array.isArray((value as Partial<RegistryResponse>).models)
-  );
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
 }
 
-// Static model type metadata (not provided by registry)
+function isRecognizerCapability(value: string): value is RecognizerCapability {
+  return value === "labels" || value === "zeroshot" || value === "relations" || value === "answers";
+}
+
+function modelId(type: ModelType, name: string): string {
+  return `${type}-${name}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function isHuggingFaceModelRef(name: string): boolean {
+  return name.includes("/") && !name.startsWith("/") && !name.includes("://");
+}
+
+function modelDescription(type: ModelType, name: string, inputs: string[]): string {
+  if (type === "chunker" && name.startsWith("fixed_")) {
+    return "Built-in fixed-size chunker available without downloading a model.";
+  }
+
+  const inputText = inputs.length > 0 ? ` for ${inputs.join(", ")} input` : "";
+  return `Installed ${MODEL_TYPE_NAMES[type]} model reported by Termite${inputText}.`;
+}
+
+// Static model type metadata (not provided by Termite's model list)
 const MODEL_TYPES: ModelTypeInfo[] = [
   {
     type: "embedder",
@@ -93,7 +148,7 @@ const MODEL_TYPES: ModelTypeInfo[] = [
   },
 ];
 
-// Static quantization options (not provided by registry)
+// Static quantization options (not provided by Termite's model list)
 const QUANTIZATION_OPTIONS: QuantizationOption[] = [
   {
     type: "f32",
@@ -139,101 +194,127 @@ export interface TermiteRegistryState {
   retry: () => void;
 }
 
-// Transform registry model to TermiteModel format
-function transformModel(apiModel: RegistryModelResponse): TermiteModel {
-  // Generate ID from name (lowercase, replace underscores with dashes)
-  const id = apiModel.name.toLowerCase().replace(/_/g, "-");
-
-  // Generate source URL from source (owner/model format)
-  const sourceUrl = apiModel.source ? `https://huggingface.co/${apiModel.source}` : "";
-
-  // Format size as human-readable string if available
-  const size = apiModel.size ? formatBytes(apiModel.size) : undefined;
+// Transform Termite's live /ml/v1/models response into the UI model card format.
+function transformModel(
+  task: TermiteTaskKey,
+  name: string,
+  info: TermiteModelInfoResponse
+): TermiteModel {
+  const type = TASK_TO_TYPE[task];
+  const capabilities = stringArray(info.capabilities).filter(isRecognizerCapability);
+  const inputs = stringArray(info.inputs);
+  const sourceUrl = isHuggingFaceModelRef(name) ? `https://huggingface.co/${name}` : "";
 
   return {
-    id,
-    name: apiModel.name,
-    source: apiModel.source,
+    id: modelId(type, name),
+    name,
+    source: name,
     sourceUrl,
-    type: apiModel.type,
-    description: apiModel.description,
-    capabilities: apiModel.capabilities,
-    variants: apiModel.variants || [],
-    backends: apiModel.backends,
-    size,
-    inRegistry: true, // All models from registry are in registry
+    type,
+    description: modelDescription(type, name, inputs),
+    capabilities,
+    variants: sourceUrl ? ["f32"] : [],
+    backends: ["onnx" as Backend],
+    inRegistry: true,
   };
 }
 
-// Format bytes to human-readable string
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+function transformModels(data: TermiteModelsResponse): TermiteModel[] {
+  const models: TermiteModel[] = [];
+  const seen = new Set<string>();
+
+  for (const task of TASK_KEYS) {
+    const taskModels = data[task];
+    if (!taskModels) continue;
+
+    for (const [name, info] of Object.entries(taskModels)) {
+      const model = transformModel(task, name, info ?? {});
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      models.push(model);
+    }
+  }
+
+  return models;
 }
 
-// Cache for registry data to avoid refetching
-let registryCache: {
+// Cache model data while keeping each configured Termite endpoint isolated.
+let modelCache: {
+  key: string;
   models: TermiteModel[];
   types: ModelTypeInfo[];
   quantizationOptions: QuantizationOption[];
 } | null = null;
 
 export function useTermiteRegistry(): TermiteRegistryState {
-  const [models, setModels] = useState<TermiteModel[]>(registryCache?.models ?? []);
-  const [types, setTypes] = useState<ModelTypeInfo[]>(registryCache?.types ?? []);
+  const { termiteApiUrl } = useApiConfig();
+  const cacheKey = `${termiteApiUrl}/ml/v1/models`;
+  const cached = modelCache?.key === cacheKey ? modelCache : null;
+  const [models, setModels] = useState<TermiteModel[]>(cached?.models ?? []);
+  const [types, setTypes] = useState<ModelTypeInfo[]>(cached?.types ?? []);
   const [quantizationOptions, setQuantizationOptions] = useState<QuantizationOption[]>(
-    registryCache?.quantizationOptions ?? []
+    cached?.quantizationOptions ?? []
   );
-  const [loading, setLoading] = useState(!registryCache);
+  const [loading, setLoading] = useState(!cached);
   const [error, setError] = useState<string | null>(null);
   const isMountedRef = useRef(true);
 
-  const fetchRegistry = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
-    setError(null);
+  const fetchRegistry = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoading(true);
+      setError(null);
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => {
+        controller.abort(new DOMException("Request timed out", "TimeoutError"));
+      }, FETCH_TIMEOUT);
+      const abortFromParent = () => controller.abort(signal?.reason);
+      signal?.addEventListener("abort", abortFromParent, { once: true });
 
-    try {
-      const response = await fetch(REGISTRY_URL, {
-        method: "GET",
-        signal: signal ?? AbortSignal.timeout(FETCH_TIMEOUT),
-      });
+      try {
+        const response = await fetch(cacheKey, {
+          method: "GET",
+          signal: controller.signal,
+        });
 
-      if (!response.ok) {
-        throw new Error(`Failed to fetch registry: ${response.status}`);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch Termite models: ${response.status}`);
+        }
+
+        const data: unknown = await response.json();
+
+        if (!isMountedRef.current) return;
+
+        if (!isTermiteModelsResponse(data)) {
+          throw new Error("Termite model response is missing model groups");
+        }
+
+        const transformedModels = transformModels(data);
+
+        modelCache = {
+          key: cacheKey,
+          models: transformedModels,
+          types: MODEL_TYPES,
+          quantizationOptions: QUANTIZATION_OPTIONS,
+        };
+
+        setModels(transformedModels);
+        setTypes(MODEL_TYPES);
+        setQuantizationOptions(QUANTIZATION_OPTIONS);
+        setLoading(false);
+      } catch (err) {
+        if (signal?.aborted) return;
+        if (!isMountedRef.current) return;
+
+        const message = err instanceof Error ? err.message : "Failed to fetch Termite models";
+        setError(message);
+        setLoading(false);
+      } finally {
+        window.clearTimeout(timeoutId);
+        signal?.removeEventListener("abort", abortFromParent);
       }
-
-      const data: unknown = await response.json();
-
-      if (!isMountedRef.current) return;
-
-      if (!isRegistryResponse(data)) {
-        throw new Error("Model registry response is missing a models array");
-      }
-
-      const transformedModels = data.models.map(transformModel);
-
-      // Update cache (types and quantization are static)
-      registryCache = {
-        models: transformedModels,
-        types: MODEL_TYPES,
-        quantizationOptions: QUANTIZATION_OPTIONS,
-      };
-
-      setModels(transformedModels);
-      setTypes(MODEL_TYPES);
-      setQuantizationOptions(QUANTIZATION_OPTIONS);
-      setLoading(false);
-    } catch (err) {
-      if ((err as Error).name === "AbortError") return;
-      if (!isMountedRef.current) return;
-
-      const message = err instanceof Error ? err.message : "Failed to fetch model registry";
-      setError(message);
-      setLoading(false);
-    }
-  }, []);
+    },
+    [cacheKey]
+  );
 
   const retry = useCallback(() => {
     fetchRegistry();
@@ -243,8 +324,12 @@ export function useTermiteRegistry(): TermiteRegistryState {
   useEffect(() => {
     isMountedRef.current = true;
 
-    // Skip fetch if we have cached data
-    if (registryCache) {
+    // Skip fetch if we have cached data for this Termite endpoint.
+    if (modelCache?.key === cacheKey) {
+      setModels(modelCache.models);
+      setTypes(modelCache.types);
+      setQuantizationOptions(modelCache.quantizationOptions);
+      setLoading(false);
       return () => {
         isMountedRef.current = false;
       };
@@ -257,7 +342,7 @@ export function useTermiteRegistry(): TermiteRegistryState {
       isMountedRef.current = false;
       controller.abort();
     };
-  }, [fetchRegistry]);
+  }, [cacheKey, fetchRegistry]);
 
   return {
     models,

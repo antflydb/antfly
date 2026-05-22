@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const antfly = @import("antfly-zig");
 const structlog = @import("structlog");
 const cmd = @import("cmd/mod.zig");
 const httpx = @import("httpx");
@@ -40,6 +41,10 @@ pub fn main(init: std.process.Init) !void {
         printUsage(argv0);
         return;
     }
+    if (std.mem.eql(u8, subcommand, "--version") or std.mem.eql(u8, subcommand, "version")) {
+        printVersion();
+        return;
+    }
 
     // Server-side subcommands
     if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
@@ -50,9 +55,9 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table", "index", "query", "lookup",
-        "load",  "insert", "delete",
-        "agents", "backup", "restore", "internal",
+        "table",  "index",   "query",    "lookup",
+        "load",   "insert",  "delete",   "agents",
+        "backup", "restore", "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
@@ -119,6 +124,10 @@ fn printUsage(argv0: []const u8) void {
         \\  internal       Internal cluster management
         \\
     , .{argv0});
+}
+
+fn printVersion() void {
+    std.debug.print("antfly {s} (zig runtime)\n", .{antfly.build_options.antfly_version});
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {

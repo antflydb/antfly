@@ -93,6 +93,10 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     }
 
     pub fn deinitOwned(self: *MetalNativeProvider) void {
+        metal_runtime.flushActiveFrame(self.raw_decode_runtime) catch {};
+        if (metal_runtime.hasActiveFrame(self.raw_decode_runtime)) {
+            metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
+        }
         metal_runtime.resetGatheredSpans(self);
         for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.clearRawLinearSlot(self, slot);
         for (0..decoder_runtime_layer_norm_slot_capacity) |slot| {

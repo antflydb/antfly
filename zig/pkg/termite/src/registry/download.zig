@@ -583,6 +583,27 @@ fn appendPreferredSafetensorsPayload(
     return appendFirstMatchingFile(allocator, to_download, files, &safetensors_candidates);
 }
 
+fn isAdapterArtifact(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "adapters/")) return false;
+    return std.mem.endsWith(u8, path, "/adapter_config.json") or
+        std.mem.endsWith(u8, path, "/adapter_model.safetensors");
+}
+
+fn appendAdapterArtifacts(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+) !usize {
+    var appended: usize = 0;
+    for (files) |file| {
+        if (!isAdapterArtifact(file.name)) continue;
+        if (try appendMatchingFileIfMissing(allocator, to_download, files, file.name)) {
+            appended += 1;
+        }
+    }
+    return appended;
+}
+
 fn hasFile(files: []const HubFile, candidate: []const u8) bool {
     for (files) |file| {
         if (std.mem.eql(u8, file.name, candidate)) return true;
@@ -817,6 +838,7 @@ pub fn downloadModel(
                 }
             }
         }
+        _ = try appendAdapterArtifacts(allocator, &to_download, files);
     }
 
     var found_model_payload = false;
@@ -1511,6 +1533,28 @@ test "safetensors selection falls back to single file without usable index" {
 
     try std.testing.expectEqual(@as(usize, 1), to_download.items.len);
     try std.testing.expectEqualStrings("model.safetensors", to_download.items[0].name);
+}
+
+test "adapter artifact selection includes jina task adapter sidecars" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "config.json" },
+        .{ .name = "adapters/retrieval/adapter_config.json" },
+        .{ .name = "adapters/retrieval/adapter_model.safetensors" },
+        .{ .name = "adapters/retrieval/README.md" },
+        .{ .name = "model.safetensors" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    const count = try appendAdapterArtifacts(allocator, &to_download, &files);
+
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("adapters/retrieval/adapter_config.json", to_download.items[0].name);
+    try std.testing.expectEqualStrings("adapters/retrieval/adapter_model.safetensors", to_download.items[1].name);
 }
 
 test "verify file sha256 matches expected digest" {

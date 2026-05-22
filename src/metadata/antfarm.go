@@ -56,43 +56,6 @@ func addAntfarmRoutes(mux *http.ServeMux) {
 	mux.Handle("/", http.FileServer(spaFileSystem{http.FS(subFS)}))
 }
 
-// addRegistryProxy adds a reverse proxy that forwards /registry/* requests
-// to the model registry, stripping the /registry prefix.
-func addRegistryProxy(mux *http.ServeMux, registryBaseURL string) {
-	target, err := url.Parse(registryBaseURL)
-	if err != nil {
-		return
-	}
-
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(target)
-			// SetURL joins target.Path with the full incoming path, e.g.
-			// /v1 + /registry/index.json → /v1/registry/index.json.
-			// We need target.Path + incoming path minus /registry prefix,
-			// i.e. /v1/index.json.
-			stripped := strings.TrimPrefix(r.In.URL.Path, "/registry")
-			if stripped == "" {
-				stripped = "/"
-			}
-			r.Out.URL.Path = path.Join(target.Path, stripped)
-			r.Out.URL.RawPath = ""
-			r.Out.Host = target.Host
-			// Don't leak antfly auth credentials to the registry
-			r.Out.Header.Del("Authorization")
-			r.Out.Header.Del("Cookie")
-			// Strip Accept-Encoding to get an uncompressed response from
-			// the upstream; avoids encoding mismatches through the proxy.
-			r.Out.Header.Del("Accept-Encoding")
-		},
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 10 * time.Second,
-		},
-	}
-
-	mux.Handle("/registry/", proxy)
-}
-
 // addTermiteProxy adds a reverse proxy that forwards /termite/* requests
 // to the Termite API, stripping the /termite prefix.
 func addTermiteProxy(mux *http.ServeMux, termiteURL string) {

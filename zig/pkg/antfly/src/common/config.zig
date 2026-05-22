@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const common_openapi = @import("antfly_common_openapi");
 const logging_openapi = @import("antfly_logging_openapi");
 const middleware_openapi = @import("antfly_middleware_openapi");
@@ -23,6 +24,7 @@ const provider_registry = @import("provider_registry.zig");
 const secrets = @import("secrets.zig");
 const transcribing = @import("antfly_transcribing");
 const synthesizing = @import("antfly_synthesizing");
+const platform = @import("antfly_platform");
 
 const default_max_shard_size_bytes: u64 = 64 * 1024 * 1024;
 const default_max_shards_per_table: u32 = 20;
@@ -38,7 +40,6 @@ pub const Config = struct {
     swarm_mode: bool = false,
     health_enabled: bool = true,
     health_port: ?u16 = null,
-    registry_url: ?[]u8 = null,
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
@@ -209,7 +210,6 @@ pub const Config = struct {
                 std.math.cast(u16, value) orelse return error.InvalidConfig
             else
                 default_health_port,
-            .registry_url = if (validated.value.registry_url) |value| try alloc.dupe(u8, value) else null,
             .log = validated.value.log,
             .tls = if (validated.value.tls) |tls| .{
                 .cert = if (tls.cert) |value| try alloc.dupe(u8, value) else null,
@@ -277,7 +277,6 @@ pub const Config = struct {
         self.termite.deinit(self.registry.allocator);
         self.speech_to_text.deinit();
         self.text_to_speech.deinit();
-        if (self.registry_url) |value| self.registry.allocator.free(value);
         if (self.remote_content) |*remote_content| remote_content.deinit(self.registry.allocator);
         self.registry.deinit();
         self.* = undefined;
@@ -311,12 +310,25 @@ pub fn loadFromPathWithSecrets(
 }
 
 pub fn resolveLocalRoleBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config, role: []const u8) ![]u8 {
+    const base = try resolveLocalBaseDir(alloc, cfg);
+    defer alloc.free(base);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, role });
+}
+
+pub fn resolveLocalBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config) ![]u8 {
     if (cfg) |loaded| {
         if (loaded.storage.local_base_dir) |dir| {
-            return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, role });
+            return try alloc.dupe(u8, dir);
         }
     }
-    return try std.fmt.allocPrint(alloc, ".zig-cache/{s}", .{role});
+    return try defaultLocalBaseDir(alloc);
+}
+
+pub fn defaultLocalBaseDir(alloc: std.mem.Allocator) ![]u8 {
+    const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    const home = platform.env.getenv(home_var) orelse return try alloc.dupe(u8, "antflydb");
+    if (home.len == 0) return try alloc.dupe(u8, "antflydb");
+    return try std.fs.path.join(alloc, &.{ home, ".antfly" });
 }
 
 fn parseMetadataConfig(
@@ -846,7 +858,7 @@ test "common config treats go orchestration urls as metadata api discovery urls"
     try std.testing.expectEqual(@as(usize, 0), cfg.metadata.raft_urls.len);
 }
 
-test "common config preserves remote content logging storage and registry fields" {
+test "common config preserves remote content logging and storage fields" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -860,7 +872,6 @@ test "common config preserves remote content logging storage and registry fields
         \\    "style": "json"
         \\  },
         \\  "health_port": 4200,
-        \\  "registry_url": "https://registry.antfly.io/v1",
         \\  "swarm_mode": true,
         \\  "storage": {
         \\    "local": { "base_dir": "antflydb" },
@@ -906,7 +917,6 @@ test "common config preserves remote content logging storage and registry fields
     try std.testing.expectEqual(true, cfg.swarm_mode);
     try std.testing.expect(cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, 4200), cfg.health_port);
-    try std.testing.expectEqualStrings("https://registry.antfly.io/v1", cfg.registry_url.?);
     try std.testing.expectEqual(logging_openapi.Level.debug, cfg.log.?.level.?);
     try std.testing.expectEqual(logging_openapi.Style.json, cfg.log.?.style.?);
     try std.testing.expectEqual(common_openapi.StorageBackend.s3, cfg.storage.data_backend.?);
@@ -1254,9 +1264,15 @@ test "common config resolves local role base dir from config" {
 }
 
 test "common config resolves stable local role base dir by default" {
-    const base = try resolveLocalRoleBaseDir(std.testing.allocator, null, "swarm");
-    defer std.testing.allocator.free(base);
-    try std.testing.expectEqualStrings(".zig-cache/swarm", base);
+    const alloc = std.testing.allocator;
+    const default_base = try defaultLocalBaseDir(alloc);
+    defer alloc.free(default_base);
+    const expected = try std.fs.path.join(alloc, &.{ default_base, "swarm" });
+    defer alloc.free(expected);
+
+    const base = try resolveLocalRoleBaseDir(alloc, null, "swarm");
+    defer alloc.free(base);
+    try std.testing.expectEqualStrings(expected, base);
 }
 
 test "common config parses minimal config with runtime defaults" {

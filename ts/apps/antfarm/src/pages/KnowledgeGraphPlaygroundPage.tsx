@@ -323,7 +323,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     return () => controller.abort();
   }, [termiteApiUrl]);
 
-  // Handle ?model= URL param from Model Registry "Open in Playground"
+  // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
     const modelParam = searchParams.get("model");
     if (modelParam && modelsLoaded && availableModels.includes(modelParam)) {
