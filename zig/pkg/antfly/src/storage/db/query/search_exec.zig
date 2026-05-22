@@ -239,6 +239,12 @@ pub const DenseSearchExecutor = struct {
         index_name: []const u8,
         doc_key: []const u8,
     ) anyerror!?u64,
+    lookup_vector_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        doc_keys: []const []const u8,
+    ) anyerror![]u64 = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1177,6 +1183,28 @@ fn collectTextSearchQueryDocIdsAlloc(
     search_query: search_mod.SearchQuery,
 ) ![]const []const u8 {
     const snapshot = text_entry.persistent.snapshot();
+    var filter_arena = std.heap.ArenaAllocator.init(alloc);
+    defer filter_arena.deinit();
+    const filter = search_mod.searchQueryToFilterArena(filter_arena.allocator(), search_query) catch return try collectScoredTextSearchQueryDocIdsAlloc(alloc, req, text_entry, search_query);
+    const doc_nums = snapshot.executeFilter(alloc, filter) catch return try collectScoredTextSearchQueryDocIdsAlloc(alloc, req, text_entry, search_query);
+    defer alloc.free(doc_nums);
+
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeDocIdArrayList(alloc, &out);
+    for (doc_nums) |doc_num| {
+        const stored = snapshot.storedDoc(doc_num) orelse continue;
+        try appendOwnedDocId(alloc, &out, stored.id);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectScoredTextSearchQueryDocIdsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    search_query: search_mod.SearchQuery,
+) ![]const []const u8 {
+    const snapshot = text_entry.persistent.snapshot();
     const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
         .query = search_query,
@@ -1790,6 +1818,9 @@ fn denseVectorIdsForDocIdsAlloc(
     executor: DenseSearchExecutor,
     index_name: []const u8,
 ) ![]u64 {
+    if (executor.lookup_vector_ids) |lookup_many| {
+        return try lookup_many(executor.ctx, alloc, index_name, doc_ids);
+    }
     var out = std.ArrayListUnmanaged(u64).empty;
     errdefer out.deinit(alloc);
     for (doc_ids) |doc_id| {

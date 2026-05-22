@@ -12102,13 +12102,6 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
-            var index_writes = try collectDocumentWrites(ctx.alloc, ctx.store, batch.documents, ctx.index_manager.byte_range);
-            defer index_writes.deinit();
-            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-            const dense_doc_index_start_ns = monotonicTimeNs();
-            try ctx.index_manager.indexDenseBatchByNameWithOptions(ctx.store, index_ref.name, index_writes.items, batch_options);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_doc_index_ns, dense_doc_index_start_ns);
-
             var dense_embeddings = try collectDenseEmbeddingWritesForBatch(
                 ctx.alloc,
                 ctx.index_manager,
@@ -12117,6 +12110,24 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
             );
             defer dense_embeddings.deinit();
+
+            var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
+            defer dense_embedding_doc_keys.deinit(ctx.alloc);
+
+            var index_writes = try collectDocumentWritesProfiled(
+                ctx.alloc,
+                ctx.store,
+                batch.documents,
+                ctx.index_manager.byte_range,
+                .{ .skip_doc_keys = &dense_embedding_doc_keys },
+                null,
+            );
+            defer index_writes.deinit();
+            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+            const dense_doc_index_start_ns = monotonicTimeNs();
+            try ctx.index_manager.indexDenseBatchByNameWithOptions(ctx.store, index_ref.name, index_writes.items, batch_options);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_doc_index_ns, dense_doc_index_start_ns);
+
             const dense_embedding_start_ns = monotonicTimeNs();
             try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, dense_embeddings.writes, batch_options);
             if (profile) |active_profile| {
@@ -12149,6 +12160,20 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
+            const sparse_collect_embedding_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            var sparse_embeddings = try collectSparseEmbeddingWritesForBatch(
+                ctx.alloc,
+                ctx.index_manager,
+                batch.sparse_embeddings,
+                batch.changed_artifact_keys,
+                index_ref.name,
+            );
+            defer sparse_embeddings.deinit();
+            if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
+
+            var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
+            defer sparse_embedding_doc_keys.deinit(ctx.alloc);
+
             const sparse_collect_doc_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             const sparse_field_name = ctx.index_manager.sparseFieldNameByName(index_ref.name) orelse return error.IndexNotFound;
             var index_writes = try collectSparseFieldWritesProfiled(
@@ -12160,6 +12185,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 .{
                     .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
                     .prefer_available_inline_values = true,
+                    .skip_doc_keys = &sparse_embedding_doc_keys,
                 },
                 if (emit_sparse_write_profile) &collect_doc_profile else null,
             );
@@ -12170,16 +12196,6 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.indexSparsePreparedWritesByNameWithOptions(index_ref.name, index_writes.items, batch_options);
             if (emit_sparse_write_profile) sparse_doc_index_ns = monotonicTimeNs() - sparse_doc_index_start_ns;
 
-            const sparse_collect_embedding_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
-            var sparse_embeddings = try collectSparseEmbeddingWritesForBatch(
-                ctx.alloc,
-                ctx.index_manager,
-                batch.sparse_embeddings,
-                batch.changed_artifact_keys,
-                index_ref.name,
-            );
-            defer sparse_embeddings.deinit();
-            if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
             const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
             if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
@@ -12431,6 +12447,7 @@ const CollectTextDocumentWritesOptions = struct {
 const CollectDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     prefer_available_inline_values: bool = false,
+    skip_doc_keys: ?*const std.StringHashMapUnmanaged(void) = null,
 };
 
 fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
@@ -12499,6 +12516,9 @@ fn collectSparseFieldWritesProfiled(
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
         if (!byte_range.contains(doc.key)) continue;
+        if (opts.skip_doc_keys) |skip_doc_keys| {
+            if (skip_doc_keys.contains(doc.key)) continue;
+        }
         if (trust_inline and doc.cleaned_value != null) {
             const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
             if (try mapper.extractSparseVectorField(alloc, doc.cleaned_value.?, field_name)) |raw_sparse_vec| {
@@ -12655,6 +12675,9 @@ fn collectDocumentWritesProfiled(
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
         if (!byte_range.contains(doc.key)) continue;
+        if (opts.skip_doc_keys) |skip_doc_keys| {
+            if (skip_doc_keys.contains(doc.key)) continue;
+        }
         if (trust_inline and doc.cleaned_value != null) {
             const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
             try writes.append(alloc, .{
@@ -12741,6 +12764,30 @@ fn collectCombinedDeleteKeys(alloc: Allocator, deleted_keys: []const []const u8,
     @memcpy(combined[0..deleted_keys.len], deleted_keys);
     @memcpy(combined[deleted_keys.len..], overwritten_doc_keys);
     return combined;
+}
+
+fn denseEmbeddingDocKeySet(
+    alloc: Allocator,
+    embeddings: []const mapper.DenseEmbeddingWrite,
+) !std.StringHashMapUnmanaged(void) {
+    var set = std.StringHashMapUnmanaged(void){};
+    errdefer set.deinit(alloc);
+    for (embeddings) |embedding| {
+        try set.put(alloc, embedding.doc_key, {});
+    }
+    return set;
+}
+
+fn sparseEmbeddingDocKeySet(
+    alloc: Allocator,
+    embeddings: []const mapper.SparseEmbeddingWrite,
+) !std.StringHashMapUnmanaged(void) {
+    var set = std.StringHashMapUnmanaged(void){};
+    errdefer set.deinit(alloc);
+    for (embeddings) |embedding| {
+        try set.put(alloc, embedding.doc_key, {});
+    }
+    return set;
 }
 
 fn attachInlineUpsertDocumentValues(
@@ -17922,7 +17969,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     var result = try db.extractEnrichments(alloc, &.{
         .{
             .key = "doc:a",
-            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_summaries\":{\"sum_idx\":\"brief\"},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":2.0}]}}}",
+            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":2.0}]}}}",
         },
     });
     defer result.deinit(alloc);
@@ -17942,13 +17989,29 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     try std.testing.expectEqualStrings("sparse_idx", result.sparse_embeddings[0].index_name);
     try std.testing.expectEqual(@as(usize, 2), result.sparse_embeddings[0].indices.len);
 
-    try std.testing.expectEqual(@as(usize, 1), result.summaries.len);
-    try std.testing.expectEqualStrings("sum_idx", result.summaries[0].index_name);
-    try std.testing.expectEqualStrings("brief", result.summaries[0].text);
+    try std.testing.expectEqual(@as(usize, 0), result.summaries.len);
 
     try std.testing.expectEqual(@as(usize, 1), result.graph_writes.len);
     try std.testing.expectEqualStrings("graph_v1", result.graph_writes[0].index_name);
     try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
+}
+
+test "db extractEnrichments rejects unsupported summaries field" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expectError(error.UnsupportedSummaryField, db.extractEnrichments(alloc, &.{
+        .{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\",\"_summaries\":{\"sum_idx\":\"brief\"}}",
+        },
+    }));
 }
 
 test "db computeEnrichments synchronously builds chunk and embedding outputs" {
