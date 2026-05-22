@@ -134,6 +134,9 @@ const (
 	// ReasonRolloutInProgress indicates StatefulSet changes are still rolling out
 	ReasonRolloutInProgress = "RolloutInProgress"
 
+	// ReasonRolloutBlocked indicates StatefulSet changes are blocked by stale unhealthy pods
+	ReasonRolloutBlocked = "RolloutBlocked"
+
 	// ReasonRolloutComplete indicates StatefulSet changes have rolled out
 	ReasonRolloutComplete = "RolloutComplete"
 
