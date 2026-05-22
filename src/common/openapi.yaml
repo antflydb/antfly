@@ -136,11 +136,6 @@ components:
           type: boolean
           description: "Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node."
           default: false
-        registry_url:
-          type: string
-          format: uri
-          description: "URL of the model registry for the Antfarm dashboard. Defaults to https://registry.antfly.io/v1"
-          example: "https://registry.antfly.io/v1"
         embedders:
           type: object
           additionalProperties:

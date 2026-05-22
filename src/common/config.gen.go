@@ -194,9 +194,6 @@ type Config struct {
 	// MinShardsPerTable Minimum number of shards to keep for a table. Automatic merges will not reduce a table below this count.
 	MinShardsPerTable uint64 `json:"min_shards_per_table,omitempty,omitzero"`
 
-	// RegistryUrl URL of the model registry for the Antfarm dashboard. Defaults to https://registry.antfly.io/v1
-	RegistryUrl string `json:"registry_url,omitempty,omitzero"`
-
 	// RemoteContent Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates).
 	// Consolidates S3 credentials and security settings separate from backup storage.
 	//

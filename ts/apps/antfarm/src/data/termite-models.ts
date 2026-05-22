@@ -1,5 +1,5 @@
 // Termite Model Type Definitions
-// Types and helper functions for working with Termite registry models
+// Types and helper functions for working with Termite model directory entries
 
 export type ModelType =
   | "embedder"
@@ -214,7 +214,7 @@ export function getDownloadCommand(model: TermiteModel, quantization?: Quantizat
   const source = shellSafe(model.source);
 
   if (model.inRegistry) {
-    // Registry pull: termite pull SOURCE (variant appended with colon)
+    // Hugging Face pull: termite pull SOURCE (variant appended with colon)
     let cmd = `termite pull ${source}`;
     if (quantization) {
       cmd += `:${quantization}`;

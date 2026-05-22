@@ -262,6 +262,18 @@ func (h *Harness) Trace() *TraceRecorder {
 	return h.tracer
 }
 
+func (h *Harness) getMetadataNode(nodeID types.ID) *metadataNode {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.metadataNodes[nodeID]
+}
+
+func (h *Harness) getStoreNode(storeID types.ID) *storeNode {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.stores[storeID]
+}
+
 func (h *Harness) MetadataNode() *metadata.MetadataStore {
 	node, err := h.metadataLeaderNode()
 	if err != nil {
@@ -286,7 +298,7 @@ func (h *Harness) WaitForMetadataLeader(timeout time.Duration) (types.ID, error)
 func (h *Harness) currentMetadataLeader() (types.ID, bool) {
 	if len(h.metadataOrder) == 1 {
 		nodeID := h.metadataOrder[0]
-		node := h.metadataNodes[nodeID]
+		node := h.getMetadataNode(nodeID)
 		if node != nil && node.kv != nil {
 			return nodeID, true
 		}
@@ -295,7 +307,7 @@ func (h *Harness) currentMetadataLeader() (types.ID, bool) {
 	leaderVotes := make(map[types.ID]int)
 	healthy := 0
 	for _, nodeID := range h.metadataOrder {
-		node := h.metadataNodes[nodeID]
+		node := h.getMetadataNode(nodeID)
 		if node == nil || node.kv == nil {
 			continue
 		}
@@ -309,7 +321,7 @@ func (h *Harness) currentMetadataLeader() (types.ID, bool) {
 	quorum := healthy/2 + 1
 	for leaderID, votes := range leaderVotes {
 		if votes >= quorum {
-			if node := h.metadataNodes[leaderID]; node != nil && node.kv != nil {
+			if node := h.getMetadataNode(leaderID); node != nil && node.kv != nil {
 				return leaderID, true
 			}
 		}
@@ -322,7 +334,7 @@ func (h *Harness) metadataLeaderNode() (*metadataNode, error) {
 	if !ok {
 		return nil, fmt.Errorf("metadata leader unavailable")
 	}
-	node := h.metadataNodes[leaderID]
+	node := h.getMetadataNode(leaderID)
 	if node == nil || node.kv == nil || node.node == nil {
 		return nil, fmt.Errorf("metadata leader %s unavailable", leaderID)
 	}
@@ -335,7 +347,7 @@ func (h *Harness) applyStoreClientFactory(factory tablemgr.StoreClientFactory) {
 		h.tableManager.SetStoreClientFactory(factory)
 	}
 	for _, nodeID := range h.metadataOrder {
-		node := h.metadataNodes[nodeID]
+		node := h.getMetadataNode(nodeID)
 		if node == nil || node.tm == nil {
 			continue
 		}
@@ -348,7 +360,7 @@ func (h *Harness) applyStoreClientFactoryToMetadataNode(nodeID types.ID) {
 	if factory == nil {
 		return
 	}
-	node := h.metadataNodes[nodeID]
+	node := h.getMetadataNode(nodeID)
 	if node == nil || node.tm == nil {
 		return
 	}
@@ -465,7 +477,7 @@ func (h *Harness) Close() error {
 	var firstErr error
 	for i := len(h.storeOrder) - 1; i >= 0; i-- {
 		storeID := h.storeOrder[i]
-		node := h.stores[storeID]
+		node := h.getStoreNode(storeID)
 		if node == nil || node.store == nil {
 			continue
 		}
@@ -483,7 +495,7 @@ func (h *Harness) Close() error {
 	}
 	for i := len(h.metadataOrder) - 1; i >= 0; i-- {
 		nodeID := h.metadataOrder[i]
-		node := h.metadataNodes[nodeID]
+		node := h.getMetadataNode(nodeID)
 		if node == nil || node.kv == nil {
 			continue
 		}
@@ -681,7 +693,7 @@ func (h *Harness) StartShardOnAllStores(shardID types.ID) error {
 	start := &store.ShardStartConfig{ShardConfig: *conf}
 	peers := h.storePeers()
 	for _, storeID := range h.storeOrder {
-		node := h.stores[storeID]
+		node := h.getStoreNode(storeID)
 		if node == nil || node.store == nil {
 			return fmt.Errorf("store %s not running", storeID)
 		}
@@ -822,7 +834,7 @@ func (h *Harness) LookupFromStore(storeID, shardID types.ID, keys []string) (map
 }
 
 func (h *Harness) CrashStore(storeID types.ID) error {
-	node := h.stores[storeID]
+	node := h.getStoreNode(storeID)
 	if node == nil || node.store == nil {
 		return fmt.Errorf("store %s is not running", storeID)
 	}
@@ -837,7 +849,7 @@ func (h *Harness) CrashStore(storeID types.ID) error {
 }
 
 func (h *Harness) CrashMetadataNode(nodeID types.ID) error {
-	node := h.metadataNodes[nodeID]
+	node := h.getMetadataNode(nodeID)
 	if node == nil || node.kv == nil {
 		return fmt.Errorf("metadata node %s is not running", nodeID)
 	}
@@ -855,7 +867,7 @@ func (h *Harness) CrashMetadataNode(nodeID types.ID) error {
 }
 
 func (h *Harness) RestartMetadataNode(nodeID types.ID) error {
-	node := h.metadataNodes[nodeID]
+	node := h.getMetadataNode(nodeID)
 	if node == nil {
 		return fmt.Errorf("metadata node %s is not configured", nodeID)
 	}
@@ -901,7 +913,7 @@ func (h *Harness) HealMetadataNode(nodeID types.ID) {
 }
 
 func (h *Harness) RestartStore(storeID types.ID) error {
-	node := h.stores[storeID]
+	node := h.getStoreNode(storeID)
 	if node == nil {
 		return fmt.Errorf("store %s is not configured", storeID)
 	}
@@ -1049,7 +1061,7 @@ func (h *Harness) startStore(storeID types.ID) error {
 }
 
 func (h *Harness) restartStore(storeID types.ID) error {
-	node := h.stores[storeID]
+	node := h.getStoreNode(storeID)
 	if node == nil {
 		return fmt.Errorf("store %s is not configured", storeID)
 	}
@@ -1141,7 +1153,7 @@ func (h *Harness) yieldBackgroundWork() {
 
 func (h *Harness) checkStoreErrors() error {
 	for _, storeID := range h.storeOrder {
-		node := h.stores[storeID]
+		node := h.getStoreNode(storeID)
 		if node == nil || node.errC == nil {
 			continue
 		}
@@ -1169,7 +1181,7 @@ func (h *Harness) checkStoreErrors() error {
 
 func (h *Harness) checkMetadataErrors() error {
 	for _, nodeID := range h.metadataOrder {
-		node := h.metadataNodes[nodeID]
+		node := h.getMetadataNode(nodeID)
 		if node == nil || node.errC == nil {
 			continue
 		}
@@ -1224,7 +1236,7 @@ func (h *Harness) runWithProgress(timeout time.Duration, fn func() error) error 
 func (h *Harness) storePeers() common.Peers {
 	peers := make(common.Peers, 0, len(h.storeOrder))
 	for _, storeID := range h.storeOrder {
-		node := h.stores[storeID]
+		node := h.getStoreNode(storeID)
 		peers = append(peers, common.Peer{
 			ID:  storeID,
 			URL: node.info.RaftURL,

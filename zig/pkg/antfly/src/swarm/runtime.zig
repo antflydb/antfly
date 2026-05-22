@@ -26,6 +26,15 @@ const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const http_common = antfly.common.http.http_common;
 const public_api_max_requests_per_connection: u32 = 64;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
+const default_public_port: u16 = 8080;
+const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
+const antfarm_installed_asset_root = "../share/antfly/antfarm";
+const antfarm_asset_roots = [_][]const u8{
+    "src/metadata/antfarm",
+    "../src/metadata/antfarm",
+    "/usr/share/antfly/antfarm",
+    "antfarm",
+};
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -876,6 +885,7 @@ fn serveUnifiedInner(
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
     try registerInternalGroupRoutes(&server);
+    try registerAntfarmRoutes(&server);
 
     try server.bind();
 
@@ -914,6 +924,162 @@ fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 
 fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.json(.{ .status = "ready" });
+}
+
+fn registerAntfarmRoutes(server: anytype) !void {
+    try server.get("/", antfarmIndexHandler);
+    try server.get("/assets/*", antfarmAssetHandler);
+    try server.get("/fonts/*", antfarmFontHandler);
+    try server.get("/*", antfarmSpaHandler);
+}
+
+fn antfarmIndexHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    return serveAntfarmFile(ctx, "index.html");
+}
+
+fn antfarmAssetHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    return serveAntfarmPrefixedFile(ctx, "/assets/", "assets/");
+}
+
+fn antfarmFontHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    return serveAntfarmPrefixedFile(ctx, "/fonts/", "fonts/");
+}
+
+fn antfarmSpaHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    const path = ctx.request.uri.path;
+    if (isAntfarmReservedPath(path)) {
+        return ctx.status(404).text("not found");
+    }
+    if (!std.mem.startsWith(u8, path, "/")) {
+        return ctx.status(400).text("invalid path");
+    }
+
+    const rel_path = path[1..];
+    if (rel_path.len > 0 and std.mem.indexOfScalar(u8, rel_path, '.') != null) {
+        return serveAntfarmFile(ctx, rel_path);
+    }
+    return serveAntfarmFile(ctx, "index.html");
+}
+
+fn serveAntfarmPrefixedFile(ctx: *httpx.Context, prefix: []const u8, rel_prefix: []const u8) anyerror!httpx.Response {
+    const path = ctx.request.uri.path;
+    if (!std.mem.startsWith(u8, path, prefix)) {
+        return ctx.status(400).text("invalid path");
+    }
+    const suffix = path[prefix.len..];
+    if (suffix.len == 0) {
+        return ctx.status(404).text("not found");
+    }
+
+    var rel_buf: [1024]u8 = undefined;
+    const rel_path = std.fmt.bufPrint(&rel_buf, "{s}{s}", .{ rel_prefix, suffix }) catch {
+        return ctx.status(414).text("path too long");
+    };
+    return serveAntfarmFile(ctx, rel_path);
+}
+
+fn serveAntfarmFile(ctx: *httpx.Context, rel_path: []const u8) anyerror!httpx.Response {
+    if (hasUnsafeStaticPath(rel_path)) {
+        return ctx.status(400).text("invalid path");
+    }
+
+    if (try serveInstalledAntfarmFile(ctx, rel_path)) |resp| {
+        return resp;
+    }
+
+    for (antfarm_asset_roots) |root| {
+        var full_path_buf: [4096]u8 = undefined;
+        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ root, rel_path }) catch continue;
+        if (try serveAntfarmPath(ctx, rel_path, full_path)) |resp| return resp;
+    }
+
+    return ctx.status(404).text("not found");
+}
+
+fn serveInstalledAntfarmFile(ctx: *httpx.Context, rel_path: []const u8) anyerror!?httpx.Response {
+    const exe_dir = std.process.executableDirPathAlloc(ctx.io, ctx.allocator) catch return null;
+    defer ctx.allocator.free(exe_dir);
+
+    var full_path_buf: [4096]u8 = undefined;
+    const full_path = std.fmt.bufPrint(
+        &full_path_buf,
+        "{s}/{s}/{s}",
+        .{ exe_dir, antfarm_installed_asset_root, rel_path },
+    ) catch return null;
+
+    return try serveAntfarmPath(ctx, rel_path, full_path);
+}
+
+fn serveAntfarmPath(ctx: *httpx.Context, rel_path: []const u8, full_path: []const u8) anyerror!?httpx.Response {
+    const body = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        full_path,
+        ctx.allocator,
+        std.Io.Limit.limited(antfarm_max_file_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.IsDir => return null,
+        error.StreamTooLong => return try ctx.status(413).text("file too large"),
+        else => return err,
+    };
+
+    var resp = httpx.Response.init(ctx.allocator, 200);
+    errdefer resp.deinit();
+    try resp.headers.set("Content-Type", antfarmContentType(rel_path));
+    resp.body = body;
+    resp.body_owned = true;
+    return resp;
+}
+
+fn hasUnsafeStaticPath(path: []const u8) bool {
+    if (path.len == 0) return true;
+    if (path[0] == '/') return true;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return true;
+    if (std.mem.indexOfScalar(u8, path, '\\') != null) return true;
+    if (std.mem.indexOf(u8, path, "..") != null) return true;
+    var i: usize = 0;
+    while (i + 2 < path.len) : (i += 1) {
+        if (path[i] != '%' or path[i + 1] != '2') continue;
+        if (path[i + 2] == 'f' or path[i + 2] == 'F' or path[i + 2] == 'e' or path[i + 2] == 'E') return true;
+    }
+    return false;
+}
+
+fn isAntfarmReservedPath(path: []const u8) bool {
+    const reserved = [_][]const u8{
+        "/api",
+        "/ml",
+        "/termite",
+        "/metadata",
+        "/internal",
+        "/mcp",
+        "/healthz",
+        "/readyz",
+        "/registry",
+    };
+    for (reserved) |prefix| {
+        if (std.mem.eql(u8, path, prefix)) return true;
+        if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix) and path[prefix.len] == '/') return true;
+    }
+    return false;
+}
+
+fn antfarmContentType(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js") or std.mem.endsWith(u8, path, ".mjs")) return "application/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
+    if (std.mem.endsWith(u8, path, ".woff")) return "font/woff";
+    if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
+    if (std.mem.endsWith(u8, path, ".ttf")) return "font/ttf";
+    if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
+    if (std.mem.endsWith(u8, path, ".map")) return "application/json";
+    if (std.mem.endsWith(u8, path, ".txt")) return "text/plain; charset=utf-8";
+    return "application/octet-stream";
 }
 
 fn localReplicaRootReconcileHook(data_server: *antfly.data.runtime.DataServer) antfly.metadata_service.LocalReplicaRootReconcileHook {
@@ -1291,7 +1457,7 @@ fn resolveMetadataClusterPeers(
 fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig {
     return .{
         .bind_host = cli.bind_host orelse "127.0.0.1",
-        .bind_port = cli.bind_port orelse 0,
+        .bind_port = cli.bind_port orelse default_public_port,
     };
 }
 
@@ -1345,7 +1511,7 @@ fn printUsage() void {
         \\Options:
         \\  --config <path>                       JSON common config file
         \\  --host <host>                         Public API host (default: 127.0.0.1)
-        \\  --port <port>                         Public API port (default: 0)
+        \\  --port <port>                         Public API port (default: 8080)
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
@@ -1492,6 +1658,28 @@ test "swarm runtime registers internal group routes explicitly" {
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_status_suffix));
 }
 
+test "swarm runtime registers antfarm static routes" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try registerAntfarmRoutes(&server);
+
+    try std.testing.expect(server.hasRoute(.get, "/"));
+    try std.testing.expect(server.hasRoute(.get, "/assets/*"));
+    try std.testing.expect(server.hasRoute(.get, "/fonts/*"));
+    try std.testing.expect(server.hasRoute(.get, "/*"));
+}
+
+test "swarm runtime antfarm path guards keep api routes reserved" {
+    try std.testing.expect(isAntfarmReservedPath("/api/v1/tables"));
+    try std.testing.expect(isAntfarmReservedPath("/ml/v1/models"));
+    try std.testing.expect(isAntfarmReservedPath("/termite/readyz"));
+    try std.testing.expect(!isAntfarmReservedPath("/models"));
+    try std.testing.expect(hasUnsafeStaticPath("../index.html"));
+    try std.testing.expect(hasUnsafeStaticPath("%2e%2e/index.html"));
+    try std.testing.expect(!hasUnsafeStaticPath("assets/index.js"));
+}
+
 test "parse cli accepts config path" {
     var argv = [_][*:0]const u8{ "--config", "antfly.json" };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -1520,6 +1708,12 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host.?);
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.termite_models_dir.?);
+}
+
+test "swarm runtime defaults public listener to antfarm port" {
+    const listener = resolvePublicListener(.{});
+    try std.testing.expectEqualStrings("127.0.0.1", listener.bind_host);
+    try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
 }
 
 test "termite config uses cli override before common config" {
