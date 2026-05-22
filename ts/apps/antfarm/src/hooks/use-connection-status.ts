@@ -14,7 +14,7 @@ const CHECK_INTERVAL_DISCONNECTED = 30000; // 30 seconds when disconnected
 const CONNECTION_CHECK_TIMEOUT = 5000; // 5 seconds timeout for health checks
 
 export function useConnectionStatus(): ConnectionStatus {
-  const { termiteApiUrl } = useApiConfig();
+  const { apiUrl, termiteApiUrl } = useApiConfig();
   const [antflyStatus, setAntflyStatus] = useState<ServerStatus>("checking");
   const [termiteStatus, setTermiteStatus] = useState<ServerStatus>("checking");
   const isMountedRef = useRef(true);
@@ -26,7 +26,7 @@ export function useConnectionStatus(): ConnectionStatus {
     }
 
     try {
-      const response = await fetch("/api/v1/status", {
+      const response = await fetch(`${apiUrl}/status`, {
         method: "GET",
         signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
       });
@@ -38,7 +38,7 @@ export function useConnectionStatus(): ConnectionStatus {
         setAntflyStatus("disconnected");
       }
     }
-  }, []);
+  }, [apiUrl]);
 
   const checkTermite = useCallback(
     async (signal?: AbortSignal) => {
