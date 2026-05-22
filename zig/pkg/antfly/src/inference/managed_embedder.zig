@@ -23,6 +23,8 @@ const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
 const scraping = @import("antfly_scraping");
 const inference_types = @import("types.zig");
+const objectstore = @import("objectstore");
+const gemini_provider = @import("gemini.zig");
 const openai_provider = @import("openai.zig");
 const termite_provider = @import("termite.zig");
 const chunking_types = @import("../chunking/types.zig");
@@ -46,6 +48,8 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 pub const ProviderKind = enum {
     openai,
     ollama,
+    gemini,
+    vertex,
     termite,
     antfly,
 };
@@ -293,8 +297,11 @@ pub const ManagedEmbeddingEntry = struct {
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
+    project_id: []const u8 = "",
+    location: []const u8 = "",
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
+    google_token_source: ?*objectstore.GoogleAuth.CachedTokenSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     dimensions: u32,
@@ -310,8 +317,14 @@ pub const ManagedEmbeddingEntry = struct {
         alloc.free(self.index_name);
         alloc.free(self.model);
         alloc.free(self.base_url);
+        if (self.project_id.len > 0) alloc.free(self.project_id);
+        if (self.location.len > 0) alloc.free(self.location);
         if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.auth_header_cache.deinit(alloc);
+        if (self.google_token_source) |source| {
+            source.deinit();
+            alloc.destroy(source);
+        }
         self.* = undefined;
     }
 };
@@ -836,6 +849,24 @@ fn parseManagedEmbeddingEntry(
         options.local_termite_provider
     else
         null;
+    const vertex_location = if (provider == .vertex)
+        try resolveVertexLocation(alloc, embedder_cfg)
+    else
+        "";
+    errdefer if (vertex_location.len > 0) alloc.free(vertex_location);
+    const google_token_source = if (provider == .vertex)
+        try initVertexTokenSource(alloc, embedder_cfg)
+    else
+        null;
+    errdefer if (google_token_source) |source| {
+        source.deinit();
+        alloc.destroy(source);
+    };
+    const vertex_project_id = if (provider == .vertex)
+        try resolveVertexProjectId(alloc, embedder_cfg, google_token_source)
+    else
+        "";
+    errdefer if (vertex_project_id.len > 0) alloc.free(vertex_project_id);
 
     return .{
         .alloc = alloc,
@@ -845,16 +876,22 @@ fn parseManagedEmbeddingEntry(
         .base_url = switch (provider) {
             .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
             .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
+            .gemini => try resolveGeminiBaseUrl(alloc, embedder_cfg),
+            .vertex => try resolveVertexBaseUrl(alloc, embedder_cfg, vertex_location),
             .termite => if (local_termite_provider != null)
                 try alloc.dupe(u8, "")
             else
                 try resolveTermiteBaseUrl(alloc, embedder_cfg),
             .antfly => try alloc.dupe(u8, ""),
         },
+        .project_id = vertex_project_id,
+        .location = vertex_location,
         .api_key = switch (provider) {
             .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
-            .ollama, .termite, .antfly => null,
+            .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
+            .ollama, .vertex, .termite, .antfly => null,
         },
+        .google_token_source = google_token_source,
         .secret_store = options.secret_store,
         .remote_content = options.remote_content,
         .dimensions = if (sparse) 0 else try resolveEmbeddingDimensions(cfg),
@@ -906,6 +943,8 @@ fn parseEmbedderProvider(embedder: embeddings_types.Config) !ProviderKind {
     return switch (embedder.provider) {
         .openai => .openai,
         .ollama => .ollama,
+        .gemini => .gemini,
+        .vertex => .vertex,
         .termite => .termite,
         .antfly => .antfly,
         else => error.UnsupportedEmbeddingProvider,
@@ -927,7 +966,14 @@ fn parseEmbedderConfigFromValue(
 fn resolveEmbedderRequestsPerMinute(value: std.json.Value, provider: ProviderKind) !u32 {
     if (configObjectU32(value, "requests_per_minute")) |rpm| return rpm;
     if (configObjectU32(value, "rpm")) |rpm| return rpm;
-    return envOptionalU32(providerRequestsPerMinuteEnv(provider)) orelse envOptionalU32("ANTFLY_EMBED_REQUESTS_PER_MINUTE") orelse 0;
+    return envOptionalU32(providerRequestsPerMinuteEnv(provider)) orelse envOptionalU32("ANTFLY_EMBED_REQUESTS_PER_MINUTE") orelse defaultRequestsPerMinute(provider);
+}
+
+fn defaultRequestsPerMinute(provider: ProviderKind) u32 {
+    return switch (provider) {
+        .gemini => 100,
+        else => 0,
+    };
 }
 
 fn resolveEmbedderBurst(value: std.json.Value, provider: ProviderKind) !u32 {
@@ -960,6 +1006,8 @@ fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_REQUESTS_PER_MINUTE",
         .ollama => "ANTFLY_OLLAMA_EMBED_REQUESTS_PER_MINUTE",
+        .gemini => "ANTFLY_GEMINI_EMBED_REQUESTS_PER_MINUTE",
+        .vertex => "ANTFLY_VERTEX_EMBED_REQUESTS_PER_MINUTE",
         .termite => "ANTFLY_TERMITE_EMBED_REQUESTS_PER_MINUTE",
         .antfly => "ANTFLY_TERMITE_EMBED_REQUESTS_PER_MINUTE",
     };
@@ -969,6 +1017,8 @@ fn providerBurstEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_BURST",
         .ollama => "ANTFLY_OLLAMA_EMBED_BURST",
+        .gemini => "ANTFLY_GEMINI_EMBED_BURST",
+        .vertex => "ANTFLY_VERTEX_EMBED_BURST",
         .termite => "ANTFLY_TERMITE_EMBED_BURST",
         .antfly => "ANTFLY_TERMITE_EMBED_BURST",
     };
@@ -1194,6 +1244,10 @@ fn embedWithEntryParts(
     parts: []const template_mod.ContentPart,
     dims: u32,
 ) ![]f32 {
+    if (entry.provider == .gemini or entry.provider == .vertex) {
+        return try embedGeminiPartsWithEntry(alloc, entry, parts, dims);
+    }
+
     if ((entry.provider == .termite or entry.provider == .antfly) and (entry.multimodal or partsContainMedia(parts))) {
         if (entry.local_termite_provider != null and entry.provider == .antfly) {
             return error.UnsupportedEmbeddingProvider;
@@ -1218,6 +1272,91 @@ fn embedWithEntryParts(
     const flattened = try flattenContentPartsToText(alloc, parts);
     defer alloc.free(flattened);
     return try embedWithEntry(alloc, entry, flattened, dims);
+}
+
+fn embedBatchWithGemini(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+) ![]const []const f32 {
+    waitForEntryPacer(entry);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer http.deinit();
+
+    var provider = gemini_provider.Provider.init(alloc, &http, entry.base_url, geminiApiKind(entry));
+    provider.project_id = entry.project_id;
+    provider.location = entry.location;
+    try setGeminiProviderHeaders(&provider, alloc, @constCast(entry));
+    defer provider.deinit();
+
+    const vectors = try provider.embedTextBatch(alloc, entry.model, texts, dims);
+    errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+    if (vectors.len == 0) return error.EmptyEmbeddingResponse;
+    for (vectors) |vector| {
+        if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
+    }
+    return vectors;
+}
+
+fn embedGeminiPartsWithEntry(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    parts: []const template_mod.ContentPart,
+    dims: u32,
+) ![]f32 {
+    waitForEntryPacer(entry);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer http.deinit();
+
+    var provider = gemini_provider.Provider.init(alloc, &http, entry.base_url, geminiApiKind(entry));
+    provider.project_id = entry.project_id;
+    provider.location = entry.location;
+    try setGeminiProviderHeaders(&provider, alloc, @constCast(entry));
+    defer provider.deinit();
+
+    const vector = try provider.embedParts(alloc, entry.model, parts, dims);
+    errdefer alloc.free(vector);
+    if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
+    return vector;
+}
+
+fn geminiApiKind(entry: *const ManagedEmbeddingEntry) gemini_provider.ApiKind {
+    return switch (entry.provider) {
+        .gemini => .gemini,
+        .vertex => .vertex,
+        else => unreachable,
+    };
+}
+
+fn setGeminiProviderHeaders(provider: *gemini_provider.Provider, alloc: std.mem.Allocator, entry: *ManagedEmbeddingEntry) !void {
+    switch (entry.provider) {
+        .gemini => {
+            const api_key = if (entry.api_key) |*api_key_ref|
+                try optionalSecretOwned(alloc, api_key_ref, entry.secret_store)
+            else
+                null;
+            defer if (api_key) |value| alloc.free(value);
+            if (api_key) |value| {
+                const headers = [_]gemini_provider.HeaderPair{.{ "x-goog-api-key", value }};
+                try provider.setHeaders(&headers);
+            }
+        },
+        .vertex => {
+            const token_source = entry.google_token_source orelse return error.MissingServiceAccount;
+            const auth_header = try token_source.authorizationValueAlloc(alloc);
+            defer alloc.free(auth_header);
+            const headers = [_]gemini_provider.HeaderPair{.{ "Authorization", auth_header }};
+            try provider.setHeaders(&headers);
+        },
+        else => unreachable,
+    }
 }
 
 fn embedSparseWithEntry(
@@ -1287,7 +1426,7 @@ fn embedSparseBatchWithEntry(
             }
             return embeddings;
         },
-        .openai, .ollama => return error.UnsupportedEmbeddingProvider,
+        .openai, .ollama, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
     }
 }
 
@@ -1310,6 +1449,63 @@ fn resolveOpenAiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Con
     );
     defer alloc.free(raw);
     return try appendPathIfMissing(alloc, raw, "/v1");
+}
+
+fn resolveGeminiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    return try resolveConfigString(
+        alloc,
+        if (embedder.url.len > 0) embedder.url else null,
+        "GEMINI_BASE_URL",
+        "https://generativelanguage.googleapis.com/v1beta",
+    );
+}
+
+fn resolveVertexBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config, location: []const u8) ![]u8 {
+    if (embedder.url.len > 0) return try alloc.dupe(u8, embedder.url);
+    if (resolveOptionalEnv(alloc, "VERTEXAI_BASE_URL")) |value| return value;
+    if (resolveOptionalEnv(alloc, "GOOGLE_VERTEX_BASE_URL")) |value| return value;
+    return try gemini_provider.vertexBaseUrlAlloc(alloc, location);
+}
+
+fn resolveVertexLocation(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    if (embedder.location.len > 0) return try alloc.dupe(u8, embedder.location);
+    if (resolveOptionalEnv(alloc, "VERTEXAI_LOCATION")) |value| return value;
+    if (resolveOptionalEnv(alloc, "GOOGLE_CLOUD_LOCATION")) |value| return value;
+    if (resolveOptionalEnv(alloc, "GOOGLE_CLOUD_REGION")) |value| return value;
+    return try alloc.dupe(u8, "us-central1");
+}
+
+fn resolveVertexProjectId(
+    alloc: std.mem.Allocator,
+    embedder: embeddings_types.Config,
+    token_source: ?*objectstore.GoogleAuth.CachedTokenSource,
+) ![]u8 {
+    if (embedder.project_id.len > 0) return try alloc.dupe(u8, embedder.project_id);
+    if (resolveOptionalEnv(alloc, "VERTEXAI_PROJECT")) |value| return value;
+    if (resolveOptionalEnv(alloc, "GOOGLE_CLOUD_PROJECT")) |value| return value;
+    if (resolveOptionalEnv(alloc, "GCLOUD_PROJECT")) |value| return value;
+    if (token_source) |source| {
+        if (source.cfg.service_account.project_id) |value| return try alloc.dupe(u8, value);
+    }
+    return error.MissingProjectId;
+}
+
+const vertex_oauth_scope = "https://www.googleapis.com/auth/cloud-platform";
+
+fn initVertexTokenSource(alloc: std.mem.Allocator, embedder: embeddings_types.Config) !*objectstore.GoogleAuth.CachedTokenSource {
+    if (embedder.credentials_path.len > 0) {
+        const source = try alloc.create(objectstore.GoogleAuth.CachedTokenSource);
+        errdefer alloc.destroy(source);
+        var service_account = try objectstore.GoogleAuth.serviceAccountFromFileAlloc(alloc, embedder.credentials_path);
+        var cfg = objectstore.GoogleAuth.configFromServiceAccountAlloc(alloc, service_account, vertex_oauth_scope) catch |err| {
+            service_account.deinit(alloc);
+            return err;
+        };
+        errdefer cfg.deinit(alloc);
+        source.* = try objectstore.GoogleAuth.CachedTokenSource.init(alloc, cfg);
+        return source;
+    }
+    return try objectstore.GoogleAuth.tokenSourceFromEnvAlloc(alloc, vertex_oauth_scope);
 }
 
 fn resolveOllamaBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
@@ -1402,6 +1598,7 @@ fn embedBatchWithEntry(
             }
             return try embedBatchWithOpenAiCompatible(alloc, entry, texts, dims);
         },
+        .gemini, .vertex => return try embedBatchWithGemini(alloc, entry, texts, dims),
         .termite, .antfly => {
             if (entry.local_termite_provider) |local| {
                 waitForEntryPacer(entry);
@@ -1562,6 +1759,20 @@ fn optionalBearerAuthHeaderOwned(
     };
 }
 
+fn optionalSecretOwned(
+    alloc: std.mem.Allocator,
+    secret_ref: *const common_secrets.SecretValue,
+    secret_store: ?*common_secrets.FileStore,
+) !?[]u8 {
+    return secret_ref.resolveOwned(alloc, secret_store) catch |err| switch (err) {
+        error.SecretNotFound => switch (secret_ref.*) {
+            .env_var => return null,
+            else => return err,
+        },
+        else => return err,
+    };
+}
+
 fn mapEmbedStatus(status: std.http.Status) anyerror {
     return switch (status) {
         .too_many_requests => error.EmbedRateLimited,
@@ -1637,6 +1848,67 @@ test "managed embedder parses openai and termite entries from indexes metadata" 
     try std.testing.expectEqualStrings("https://api.openai.com/v1", managed.entries[0].base_url);
     try std.testing.expectEqual(ProviderKind.termite, managed.entries[1].provider);
     try std.testing.expectEqualStrings("http://localhost:8082/api", managed.entries[1].base_url);
+}
+
+pub fn testParseGeminiApiEntry() !void {
+    var managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{
+        \\  "semantic_idx":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"gemini","model":"gemini-embedding-2","api_key":"${secret:gemini.api_key}"}}
+        \\}
+    );
+    defer managed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), managed.entries.len);
+    try std.testing.expectEqual(ProviderKind.gemini, managed.entries[0].provider);
+    try std.testing.expectEqualStrings("gemini-embedding-2", managed.entries[0].model);
+    try std.testing.expectEqualStrings("https://generativelanguage.googleapis.com/v1beta", managed.entries[0].base_url);
+    try std.testing.expect(managed.entries[0].api_key != null);
+    try std.testing.expectEqual(@as(u32, 100), managed.entries[0].requests_per_minute);
+}
+
+pub fn testParseExplicitVertexEntryWithCredentialsPath() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "service-account.json",
+        .data =
+        \\{
+        \\  "project_id": "service-project",
+        \\  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+        \\  "client_email": "svc@example.iam.gserviceaccount.com",
+        \\  "token_uri": "https://oauth2.googleapis.com/token"
+        \\}
+        ,
+    });
+    const rel_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "service-account.json" });
+    defer alloc.free(rel_path);
+
+    const indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "semantic_idx":{{"type":"embeddings","field":"body","dimension":3072,"embedder":{{"provider":"vertex","model":"gemini-embedding-001","project_id":"service-project","location":"us-central1","credentials_path":{f}}}}}
+        \\}}
+    , .{std.json.fmt(rel_path, .{})});
+    defer alloc.free(indexes_json);
+
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc, indexes_json);
+    defer managed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), managed.entries.len);
+    try std.testing.expectEqual(ProviderKind.vertex, managed.entries[0].provider);
+    try std.testing.expectEqualStrings("service-project", managed.entries[0].project_id);
+    try std.testing.expectEqualStrings("us-central1", managed.entries[0].location);
+    try std.testing.expectEqualStrings("https://us-central1-aiplatform.googleapis.com/v1beta1", managed.entries[0].base_url);
+    try std.testing.expect(managed.entries[0].google_token_source != null);
+}
+
+test "managed embedder parses gemini api entry" {
+    try testParseGeminiApiEntry();
+}
+
+test "managed embedder parses explicit vertex entry with credentials path" {
+    try testParseExplicitVertexEntryWithCredentialsPath();
 }
 
 test "managed embedder interface deinit uses owner allocator" {
