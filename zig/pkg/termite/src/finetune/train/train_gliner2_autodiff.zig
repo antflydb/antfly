@@ -60,7 +60,7 @@ const mlx_c = if (build_options.enable_mlx) mlx_mod.c else struct {};
 const gliner2_data = termite.finetune.gliner2_data;
 const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
 const real_autodiff = termite.finetune.real_autodiff_trainer;
-const deberta_graph = @import("../../architectures/deberta_graph.zig");
+const deberta_graph = termite.architectures.deberta_graph;
 
 const print = std.debug.print;
 
@@ -115,7 +115,10 @@ pub fn main(init: std.process.Init) !void {
     var seed: u64 = 42;
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--model-dir")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printUsage();
+            return;
+        } else if (std.mem.eql(u8, arg, "--model-dir")) {
             model_dir = args.next() orelse return error.MissingModelDir;
         } else if (std.mem.eql(u8, arg, "--train-data")) {
             train_data = args.next() orelse return error.MissingTrainData;
@@ -840,9 +843,8 @@ fn printUsage() void {
         \\  --seed <n>                RNG seed (default: 42)
         \\
         \\notes:
-        \\  Tokenization uses a placeholder char-level encoding. For production
-        \\  quality, wire gliner2_data.Tokenizer.initGLiNER2HF for proper Unigram
-        \\  tokenization of the DeBERTa-v3 vocabulary.
+        \\  Tokenization uses gliner2_data.Tokenizer.initGLiNER2HF and the
+        \\  GLiNER2 prompt format backed by the model tokenizer files.
         \\
         \\example:
         \\  train-gliner2-autodiff --model-dir /models/deberta-v3-base \

@@ -36,6 +36,20 @@ const tests = [_]common.TestSpec{
         .imports = &.{.termite_finetune_data},
     },
     .{
+        .step_name = "test-gliner2-e2e",
+        .root_source_file = "src/finetune/test/test_gliner2_e2e.zig",
+        .description = "Run synthetic GLiNER2 full-encoder LoRA e2e tests",
+        .imports = &.{ .antfly_platform, .build_options, .ml, .termite_internal },
+        .native_link = .default,
+    },
+    .{
+        .step_name = "test-gliner2-real-training",
+        .root_source_file = "src/finetune/test/test_gliner2_real_training.zig",
+        .description = "Run optional real-model GLiNER2 full-encoder LoRA training tests",
+        .imports = &.{ .antfly_platform, .build_options, .ml, .termite_internal },
+        .native_link = .default,
+    },
+    .{
         .step_name = "test-entity-cleanup-data",
         .root_source_file = "src/test_entity_cleanup_data.zig",
         .description = "Run isolated entity cleanup finetune data tests",
@@ -50,7 +64,7 @@ const tests = [_]common.TestSpec{
         .step_name = "test-entity-cleanup-gliner-cache",
         .root_source_file = "src/test_entity_cleanup_gliner_cache.zig",
         .description = "Run isolated GLiNER2-native entity cleanup cache tests",
-        .imports = &.{ .build_options, .termite_hf_tokenizer, .termite_linalg, .ml, .onnx_graph },
+        .imports = &.{ .antfly_platform, .build_options, .termite_hf_tokenizer, .termite_linalg, .ml, .onnx_graph },
         .native_link = .default,
     },
     .{

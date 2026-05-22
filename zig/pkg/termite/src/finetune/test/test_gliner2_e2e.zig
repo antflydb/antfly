@@ -33,23 +33,24 @@
 
 const std = @import("std");
 const ml = @import("ml");
+const termite = @import("termite_internal");
 
 const Graph = ml.graph.Graph;
 const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
 
-const deberta_graph = @import("../../architectures/deberta_graph.zig");
-const native_compute_mod = @import("../../ops/native_compute.zig");
+const deberta_graph = termite.architectures.deberta_graph;
+const native_compute_mod = termite.native_compute.native;
 const NativeCompute = native_compute_mod.NativeCompute;
 const WeightStore = native_compute_mod.WeightStore;
-const ops_mod = @import("../../ops/ops.zig");
+const ops_mod = termite.ops;
 
-const real_autodiff = @import("../real_autodiff_trainer.zig");
-const gliner2_autodiff = @import("../gliner2_real_autodiff.zig");
-const weight_source = @import("../../models/weight_source.zig");
+const real_autodiff = termite.finetune.real_autodiff_trainer;
+const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
+const weight_source = termite.models.weight_source;
 const LoadedWeight = weight_source.LoadedWeight;
-const Tensor = @import("../../backends/tensor.zig").Tensor;
+const Tensor = termite.backends.Tensor;
 
 // ── Tiny DeBERTa config (for GLiNER2 backbone) ───────────────────────
 

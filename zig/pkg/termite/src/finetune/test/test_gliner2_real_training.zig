@@ -26,50 +26,43 @@
 //   - LoRA injection + autodiff + optimizer produce finite, decreasing loss.
 //   - At least one LoRA B weight is non-zero (optimizer actually updated).
 //
-// MODEL:
-//   ~/.cache/huggingface/hub/models--fastino--gliner2-base-v1/snapshots/
-//   283f4af5e598631a5352b8c388b6906853146f07/
-//
-// DATA:
-//   /tmp/ner_train.jsonl (JSONL with {text, entities} per line)
+// MODEL/DATA:
+//   Set TERMITE_GLINER2_REAL_MODEL_DIR to a local fastino/gliner2-base-v1
+//   directory and TERMITE_GLINER2_REAL_NER_JSONL to a JSONL file with
+//   {text, entities} rows. The test skips when either variable is absent.
 //
 // NOTE: This test requires the full build module graph (`ml`, BLAS linkage).
 // It will NOT compile standalone via `zig test`. Run via:
 //   zig build test-gliner2-real-training
-// after adding a build step in build.zig, or by referencing this file from
-// an existing test root that has the required imports.
+// with the environment variables above when you want the real-model gate.
 
 const std = @import("std");
 const ml = @import("ml");
+const platform = @import("antfly_platform");
+const termite = @import("termite_internal");
 
 const Graph = ml.graph.Graph;
 const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
 
-const deberta_graph = @import("../../architectures/deberta_graph.zig");
-const native_compute_mod = @import("../../ops/native_compute.zig");
+const deberta_graph = termite.architectures.deberta_graph;
+const native_compute_mod = termite.native_compute.native;
 const NativeCompute = native_compute_mod.NativeCompute;
 const WeightStore = native_compute_mod.WeightStore;
-const ops_mod = @import("../../ops/ops.zig");
+const ops_mod = termite.ops;
 const CT = ops_mod.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
 
-const real_autodiff = @import("../real_autodiff_trainer.zig");
-const gliner2_autodiff = @import("../gliner2_real_autodiff.zig");
-const weight_source_mod = @import("../../models/weight_source.zig");
+const real_autodiff = termite.finetune.real_autodiff_trainer;
+const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
+const weight_source_mod = termite.models.weight_source;
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const LoadedWeight = weight_source_mod.LoadedWeight;
-const Tensor = @import("../../backends/tensor.zig").Tensor;
+const Tensor = termite.backends.Tensor;
 
-// ── Model + data paths ──────────────────────────────────────────────────
-
-const model_dir = "/Users/tim/.cache/huggingface/hub/models--fastino--gliner2-base-v1" ++
-    "/snapshots/283f4af5e598631a5352b8c388b6906853146f07";
-
-const safetensors_path = model_dir ++ "/model.safetensors";
-
-const ner_data_path = "/tmp/ner_train.jsonl";
+const model_dir_env = "TERMITE_GLINER2_REAL_MODEL_DIR";
+const ner_data_env = "TERMITE_GLINER2_REAL_NER_JSONL";
 
 // ── DeBERTa config matching the encoder_config/config.json ──────────────
 
@@ -133,15 +126,14 @@ fn loadNerExamples(
     errdefer arena.deinit();
     const aa = arena.allocator();
 
-    // Read file via std.fs (absolute path).
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    const stat = try file.stat();
-    const file_bytes = try aa.alloc(u8, stat.size);
-    const bytes_read = try file.readAll(file_bytes);
-    const content = file_bytes[0..bytes_read];
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        aa,
+        .limited(64 * 1024 * 1024),
+    );
 
-    var examples = std.ArrayListUnmanaged(NerExample){};
+    var examples = std.ArrayListUnmanaged(NerExample).empty;
 
     var line_iter = std.mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| {
@@ -159,7 +151,7 @@ fn loadNerExamples(
             };
         };
 
-        var entities = std.ArrayListUnmanaged(NerEntity){};
+        var entities = std.ArrayListUnmanaged(NerEntity).empty;
         if (obj.get("entities")) |ents_val| {
             if (ents_val == .array) {
                 for (ents_val.array.items) |ent_val| {
@@ -309,6 +301,10 @@ fn fillBatchBuffers(
 
 test "GLiNER2 real training: loss decreases on actual model weights" {
     const allocator = std.testing.allocator;
+    const model_dir = platform.env.getenv(model_dir_env) orelse return error.SkipZigTest;
+    const ner_data_path = platform.env.getenv(ner_data_env) orelse return error.SkipZigTest;
+    const safetensors_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(safetensors_path);
 
     // ----------------------------------------------------------------
     // 1. Load safetensors weights with encoder. prefix stripping
@@ -320,7 +316,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     };
 
     // Track which names we heap-allocated so we can free them.
-    var owned_names = std.ArrayListUnmanaged([]const u8){};
+    var owned_names = std.ArrayListUnmanaged([]const u8).empty;
     defer owned_names.deinit(allocator);
 
     defer {

@@ -16,6 +16,8 @@ const std = @import("std");
 const runtime_build = @import("build/runtime.zig");
 const finetune_common = @import("build/finetune/common.zig");
 const finetune_tests = @import("build/finetune/tests.zig");
+const finetune_tools = @import("build/finetune/tools.zig");
+const finetune_workflows = @import("build/finetune/workflows.zig");
 
 fn resolveSharedLibRoot(b: *std.Build) []const u8 {
     return b.option(
@@ -609,12 +611,15 @@ pub fn build(b: *std.Build) void {
         .pjrt_mod = pjrt_mod,
         .protobuf_mod = protobuf_mod,
         .termite_linalg_mod = termite_linalg_mod,
+        .antfly_platform_mod = platform_mod,
         .enable_system_blas = enable_system_blas,
         .blas_root = blas_root,
         .enable_mlx = enable_mlx,
         .mlx_root = effective_mlx_root,
         .enable_metal = enable_metal,
     };
+    finetune_tools.register(finetune_ctx);
+    finetune_workflows.register(finetune_ctx);
     finetune_tests.register(finetune_ctx);
 
     const run_tests = b.addRunArtifact(tests);
