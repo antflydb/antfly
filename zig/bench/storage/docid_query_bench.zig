@@ -38,6 +38,7 @@ const Config = struct {
     require_public_resolution_delta: bool = false,
     progress_every: usize = 0,
     defer_full_index_load: bool = false,
+    bulk_load: bool = false,
 };
 
 const QueryShape = enum {
@@ -178,6 +179,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn loadDocs(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) ![][]u8 {
     const load_start = nanotime();
+    const primary_lsm_before = db.snapshotPrimaryLsmWriteStatsForTest();
     const doc_ids = try alloc.alloc([]u8, cfg.docs);
     errdefer {
         for (doc_ids[0..]) |doc_id| if (doc_id.len > 0) alloc.free(doc_id);
@@ -194,6 +196,12 @@ fn loadDocs(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) ![][]u8 {
     }
     var total_profile = db_mod.BatchProfile{};
     var batches: usize = 0;
+    var bulk_active = false;
+    if (cfg.bulk_load) {
+        try db.beginPrimaryStoreAutoBulkIngestSession();
+        bulk_active = true;
+    }
+    errdefer if (bulk_active) db.abortPrimaryStoreAutoBulkIngestSession();
 
     for (0..cfg.docs) |i| {
         const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{i});
@@ -217,7 +225,12 @@ fn loadDocs(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) ![][]u8 {
         batches += 1;
         printLoadProgress(cfg, cfg.docs, load_start);
     }
+    if (bulk_active) {
+        try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{ .compact = false });
+        bulk_active = false;
+    }
     printLoadSummary(cfg, batches, nanotime() - load_start, total_profile);
+    printPrimaryLsmWriteSummary(cfg, primary_lsm_before, db.snapshotPrimaryLsmWriteStatsForTest());
     return doc_ids;
 }
 
@@ -236,11 +249,12 @@ fn printLoadProgress(cfg: Config, loaded: usize, load_start: u64) void {
 
 fn printLoadSummary(cfg: Config, batches: usize, elapsed_ns: u64, profile: db_mod.BatchProfile) void {
     std.debug.print(
-        "{{\"event\":\"docid_query_bench_load_summary\",\"docs\":{d},\"batches\":{d},\"sync_level\":\"{s}\",\"elapsed_ns\":{d},\"profile_total_ns\":{d},\"extract_writes_ns\":{d},\"delete_artifacts_ns\":{d},\"precompute_generated_ns\":{d},\"identity_capacity_ns\":{d},\"identity_metadata_ns\":{d},\"identity_metadata_writes\":{d},\"build_derived_ns\":{d},\"apply_shadow_ns\":{d},\"collect_sync_targets_ns\":{d},\"store_write_ns\":{d},\"append_replay_journal_ns\":{d},\"backlog_pressure_ns\":{d},\"executor_notify_ns\":{d},\"sync_wait_ns\":{d},\"wait_sync_ns\":{d},\"derived_apply_ns\":{d},\"full_text_apply_ns\":{d},\"sparse_apply_ns\":{d},\"index_sync_ns\":{d}}}\n",
+        "{{\"event\":\"docid_query_bench_load_summary\",\"docs\":{d},\"batches\":{d},\"sync_level\":\"{s}\",\"bulk_load\":{},\"elapsed_ns\":{d},\"profile_total_ns\":{d},\"extract_writes_ns\":{d},\"delete_artifacts_ns\":{d},\"precompute_generated_ns\":{d},\"identity_capacity_ns\":{d},\"identity_metadata_ns\":{d},\"identity_metadata_writes\":{d},\"build_derived_ns\":{d},\"apply_shadow_ns\":{d},\"collect_sync_targets_ns\":{d},\"store_write_ns\":{d},\"append_replay_journal_ns\":{d},\"backlog_pressure_ns\":{d},\"executor_notify_ns\":{d},\"sync_wait_ns\":{d},\"wait_sync_ns\":{d},\"derived_apply_ns\":{d},\"full_text_apply_ns\":{d},\"sparse_apply_ns\":{d},\"index_sync_ns\":{d}}}\n",
         .{
             cfg.docs,
             batches,
             db_mod.types.publicSyncLevelText(loadSyncLevel(cfg)),
+            cfg.bulk_load,
             elapsed_ns,
             profile.total_ns,
             profile.extract_writes_ns,
@@ -300,6 +314,73 @@ fn addBatchProfile(total: *db_mod.BatchProfile, item: db_mod.BatchProfile) void 
     total.applied_sequence_save_ns += item.applied_sequence_save_ns;
     total.replay_journal_truncate_ns += item.replay_journal_truncate_ns;
     total.notify_enrichment_ns += item.notify_enrichment_ns;
+}
+
+fn lsmWriteStatsDelta(after: anytype, before: @TypeOf(after)) @TypeOf(after) {
+    var out = after;
+    inline for (std.meta.fields(@TypeOf(after))) |field| {
+        @field(out, field.name) = @field(after, field.name) -| @field(before, field.name);
+    }
+    return out;
+}
+
+fn printPrimaryLsmWriteSummary(cfg: Config, before: anytype, after: @TypeOf(before)) void {
+    const before_stats = before orelse return;
+    const after_stats = after orelse return;
+    const stats_delta = lsmWriteStatsDelta(after_stats, before_stats);
+    std.debug.print(
+        "{{\"event\":\"docid_query_bench_primary_lsm_write_summary\",\"docs\":{d},\"bulk_load\":{},\"flushes\":{d},\"flush_input_entries\":{d},\"flush_ns\":{d},\"sorted_ingest_runs\":{d},\"sorted_ingest_bytes\":{d},\"sorted_ingest_ns\":{d},\"table_file_writes\":{d},\"table_file_bytes\":{d},\"table_file_logical_entry_bytes\":{d},\"table_file_physical_entry_bytes\":{d},\"manifest_writes\":{d},\"manifest_ns\":{d},\"wal_append_records\":{d},\"wal_append_entries\":{d},\"wal_append_bytes\":{d},\"wal_append_ns\":{d},\"immutable_rotations\":{d},\"immutable_flushes\":{d},\"immutable_flush_entries\":{d},\"immutable_flush_ns\":{d}}}\n",
+        .{
+            cfg.docs,
+            cfg.bulk_load,
+            stats_delta.flushes,
+            stats_delta.flush_input_entries,
+            stats_delta.flush_ns,
+            stats_delta.sorted_ingest_runs,
+            stats_delta.sorted_ingest_bytes,
+            stats_delta.sorted_ingest_ns,
+            stats_delta.table_file_writes,
+            stats_delta.table_file_bytes,
+            stats_delta.table_file_logical_entry_bytes,
+            stats_delta.table_file_physical_entry_bytes,
+            stats_delta.manifest_writes,
+            stats_delta.manifest_ns,
+            stats_delta.wal_append_records,
+            stats_delta.wal_append_entries,
+            stats_delta.wal_append_bytes,
+            stats_delta.wal_append_ns,
+            stats_delta.immutable_rotations,
+            stats_delta.immutable_flushes,
+            stats_delta.immutable_flush_entries,
+            stats_delta.immutable_flush_ns,
+        },
+    );
+    std.debug.print(
+        "{{\"event\":\"docid_query_bench_primary_lsm_bulk_summary\",\"docs\":{d},\"bulk_load\":{},\"bulk_append_attempts\":{d},\"bulk_append_entries\":{d},\"bulk_append_direct_successes\":{d},\"bulk_append_direct_entries\":{d},\"bulk_append_fallback_non_bulk\":{d},\"bulk_append_fallback_unsupported\":{d},\"bulk_append_fallback_backend_pending\":{d},\"bulk_append_fallback_duplicate_keys\":{d},\"bulk_append_fallback_below_threshold\":{d},\"bulk_append_fallback_to_mutable_entries\":{d},\"bulk_append_sort_ns\":{d},\"direct_bulk_ingest_attempts\":{d},\"direct_bulk_ingest_entries\":{d},\"direct_bulk_ingest_successes\":{d},\"direct_bulk_ingest_entries_direct\":{d},\"direct_bulk_ingest_fallback_unsupported\":{d},\"direct_bulk_ingest_fallback_backend_mutable\":{d},\"direct_bulk_ingest_fallback_below_threshold\":{d},\"direct_bulk_ingest_sort_ns\":{d}}}\n",
+        .{
+            cfg.docs,
+            cfg.bulk_load,
+            stats_delta.bulk_append_attempts,
+            stats_delta.bulk_append_entries,
+            stats_delta.bulk_append_direct_successes,
+            stats_delta.bulk_append_direct_entries,
+            stats_delta.bulk_append_fallback_non_bulk,
+            stats_delta.bulk_append_fallback_unsupported,
+            stats_delta.bulk_append_fallback_backend_pending,
+            stats_delta.bulk_append_fallback_duplicate_keys,
+            stats_delta.bulk_append_fallback_below_threshold,
+            stats_delta.bulk_append_fallback_to_mutable_entries,
+            stats_delta.bulk_append_sort_ns,
+            stats_delta.direct_bulk_ingest_attempts,
+            stats_delta.direct_bulk_ingest_entries,
+            stats_delta.direct_bulk_ingest_successes,
+            stats_delta.direct_bulk_ingest_entries_direct,
+            stats_delta.direct_bulk_ingest_fallback_unsupported,
+            stats_delta.direct_bulk_ingest_fallback_backend_mutable,
+            stats_delta.direct_bulk_ingest_fallback_below_threshold,
+            stats_delta.direct_bulk_ingest_sort_ns,
+        },
+    );
 }
 
 fn makeDocValue(alloc: std.mem.Allocator, i: usize, cfg: Config) ![]u8 {
@@ -770,6 +851,8 @@ fn parseArgs(args_in: std.process.Args) !Config {
             cfg.progress_every = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--defer-full-index-load")) {
             cfg.defer_full_index_load = true;
+        } else if (std.mem.eql(u8, arg, "--bulk-load")) {
+            cfg.bulk_load = true;
         } else {
             std.debug.print("invalid argument: {s}\n", .{arg});
             return error.InvalidArgument;

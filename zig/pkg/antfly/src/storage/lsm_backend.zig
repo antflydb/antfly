@@ -152,6 +152,25 @@ pub const Backend = struct {
         immutable_flushes: u64 = 0,
         immutable_flush_entries: u64 = 0,
         immutable_flush_ns: u64 = 0,
+        bulk_append_attempts: u64 = 0,
+        bulk_append_entries: u64 = 0,
+        bulk_append_direct_successes: u64 = 0,
+        bulk_append_direct_entries: u64 = 0,
+        bulk_append_fallback_non_bulk: u64 = 0,
+        bulk_append_fallback_unsupported: u64 = 0,
+        bulk_append_fallback_backend_pending: u64 = 0,
+        bulk_append_fallback_duplicate_keys: u64 = 0,
+        bulk_append_fallback_below_threshold: u64 = 0,
+        bulk_append_fallback_to_mutable_entries: u64 = 0,
+        bulk_append_sort_ns: u64 = 0,
+        direct_bulk_ingest_attempts: u64 = 0,
+        direct_bulk_ingest_entries: u64 = 0,
+        direct_bulk_ingest_successes: u64 = 0,
+        direct_bulk_ingest_entries_direct: u64 = 0,
+        direct_bulk_ingest_fallback_unsupported: u64 = 0,
+        direct_bulk_ingest_fallback_backend_mutable: u64 = 0,
+        direct_bulk_ingest_fallback_below_threshold: u64 = 0,
+        direct_bulk_ingest_sort_ns: u64 = 0,
     };
 
     pub const MaintenanceStats = struct {
@@ -1295,6 +1314,20 @@ pub const Backend = struct {
         return true;
     }
 
+    pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
+        if (!self.options.direct_bulk_ingest) return false;
+        if (self.mutable.entries.items.len == 0) return true;
+        if (self.activeImmutableMemtableCount() != 0) return false;
+        self.invalidateMutableReadSnapshot();
+        var sorted = try self.mutable.toStateMove(self.allocator);
+        errdefer sorted.deinit(self.allocator);
+        self.mutable_wal_range = .{};
+        try self.ingestSortedState(&sorted);
+        sorted.deinit(self.allocator);
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        return true;
+    }
+
     fn rotateMutableToImmutable(self: *Backend) !void {
         if (self.mutable.entries.items.len == 0) return;
         self.invalidateMutableReadSnapshot();
@@ -1793,6 +1826,67 @@ pub const Backend = struct {
                 self.recordTableCompressionWriteStats(run.compression_stats);
             }
         }
+    }
+
+    pub fn recordBulkAppendAttempt(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_attempts +|= 1;
+        self.write_stats.bulk_append_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackNonBulk(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_fallback_non_bulk +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackUnsupported(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_fallback_unsupported +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackBackendPending(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_fallback_backend_pending +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackDuplicateKeys(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.bulk_append_fallback_duplicate_keys +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+        self.write_stats.bulk_append_sort_ns +|= sort_ns;
+    }
+
+    pub fn recordBulkAppendFallbackBelowThreshold(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.bulk_append_fallback_below_threshold +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+        self.write_stats.bulk_append_sort_ns +|= sort_ns;
+    }
+
+    pub fn recordBulkAppendSuccess(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.bulk_append_direct_successes +|= 1;
+        self.write_stats.bulk_append_direct_entries +|= @intCast(entries);
+        self.write_stats.bulk_append_sort_ns +|= sort_ns;
+    }
+
+    pub fn recordDirectBulkIngestAttempt(self: *Backend, entries: usize) void {
+        self.write_stats.direct_bulk_ingest_attempts +|= 1;
+        self.write_stats.direct_bulk_ingest_entries +|= @intCast(entries);
+    }
+
+    pub fn recordDirectBulkIngestFallbackUnsupported(self: *Backend) void {
+        self.write_stats.direct_bulk_ingest_fallback_unsupported +|= 1;
+    }
+
+    pub fn recordDirectBulkIngestFallbackBackendMutable(self: *Backend) void {
+        self.write_stats.direct_bulk_ingest_fallback_backend_mutable +|= 1;
+    }
+
+    pub fn recordDirectBulkIngestFallbackBelowThreshold(self: *Backend) void {
+        self.write_stats.direct_bulk_ingest_fallback_below_threshold +|= 1;
+    }
+
+    pub fn recordDirectBulkIngestSuccess(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.direct_bulk_ingest_successes +|= 1;
+        self.write_stats.direct_bulk_ingest_entries_direct +|= @intCast(entries);
+        self.write_stats.direct_bulk_ingest_sort_ns +|= sort_ns;
     }
 
     fn recordTableCompressionWriteStats(self: *Backend, stats: lsm_table_file.CompressionStats) void {

@@ -3610,6 +3610,10 @@ pub const IndexManager = struct {
     }
 
     fn textProjectionOptions(self: *const IndexManager, arena: Allocator) !mapper.TextProjectionOptions {
+        return try self.textProjectionOptionsForSchema(arena, false);
+    }
+
+    fn textProjectionOptionsForSchema(self: *const IndexManager, arena: Allocator, schema_less_fast_projection: bool) !mapper.TextProjectionOptions {
         var vector_paths = std.ArrayListUnmanaged([]const u8).empty;
         defer vector_paths.deinit(arena);
 
@@ -3624,7 +3628,15 @@ pub const IndexManager = struct {
         return .{
             .vector_field_paths = paths,
             .strip_numeric_array_heuristic = false,
+            .schema_less_fast_projection = schema_less_fast_projection,
         };
+    }
+
+    fn allTextIndexesSchemaLess(self: *const IndexManager) bool {
+        for (self.text_indexes.items) |entry| {
+            if (entry.runtime_schema != null) return false;
+        }
+        return true;
     }
 
     pub fn indexBatch(self: *IndexManager, store: *docstore_mod.DocStore, writes: []const types.BatchWrite) !void {
@@ -3641,7 +3653,7 @@ pub const IndexManager = struct {
             const source_batch = try mapper.buildTextProjectionSourceBatchFromWritesWithOptions(
                 arena,
                 writes,
-                try self.textProjectionOptions(arena),
+                try self.textProjectionOptionsForSchema(arena, self.allTextIndexesSchemaLess()),
             );
 
             for (self.text_indexes.items) |*entry| {
@@ -5965,7 +5977,7 @@ pub const IndexManager = struct {
         const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
             arena,
             docs,
-            try self.textProjectionOptions(arena),
+            try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null),
         );
         return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_batch.docs);
     }
@@ -6018,19 +6030,9 @@ pub const IndexManager = struct {
         if (source_docs.len == 0) return .{};
 
         var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
-        var identity_txn = try store.beginProbeTxn();
-        defer identity_txn.abort();
-        var source_docs_with_ordinals = std.ArrayListUnmanaged(mapper.TextProjectionSourceDoc).empty;
-        defer source_docs_with_ordinals.deinit(arena);
-        for (source_docs) |source_doc| {
-            var doc = source_doc;
-            if (doc.doc_ordinal == null) {
-                doc.doc_ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, &identity_txn, doc.key);
-            }
-            try source_docs_with_ordinals.append(arena, doc);
-        }
+        const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, source_docs);
 
-        const projection_batch = try mapper.buildTextProjectionBatchFromSource(arena, source_docs_with_ordinals.items, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
+        const projection_batch = try mapper.buildTextProjectionBatchFromSource(arena, source_docs_with_ordinals, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
         if (projection_batch.observed_field_analyzers.len > 0) {
             try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
         }
@@ -6050,6 +6052,61 @@ pub const IndexManager = struct {
             indexed_any = true;
         }
         return .{ .indexed_any = indexed_any };
+    }
+
+    fn textProjectionSourceDocsWithOrdinals(
+        self: *IndexManager,
+        arena: std.mem.Allocator,
+        store: *docstore_mod.DocStore,
+        source_docs: []const mapper.TextProjectionSourceDoc,
+    ) ![]mapper.TextProjectionSourceDoc {
+        var docs = try arena.dupe(mapper.TextProjectionSourceDoc, source_docs);
+
+        const PendingOrdinalLookup = struct {
+            source_index: usize,
+            store_key: []u8,
+        };
+        var pending = std.ArrayListUnmanaged(PendingOrdinalLookup).empty;
+        defer {
+            for (pending.items) |item| self.alloc.free(item.store_key);
+            pending.deinit(self.alloc);
+        }
+
+        for (docs, 0..) |doc, i| {
+            if (doc.doc_ordinal != null) continue;
+            try pending.append(self.alloc, .{
+                .source_index = i,
+                .store_key = try internal_keys.identityDocToOrdinalKeyAlloc(self.alloc, doc.key),
+            });
+        }
+        if (pending.items.len == 0) return docs;
+
+        std.mem.sort(PendingOrdinalLookup, pending.items, {}, struct {
+            fn lessThan(_: void, lhs: PendingOrdinalLookup, rhs: PendingOrdinalLookup) bool {
+                return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
+            }
+        }.lessThan);
+
+        const read_keys = try self.alloc.alloc([]const u8, pending.items.len);
+        defer self.alloc.free(read_keys);
+        const read_values = try self.alloc.alloc(?[]const u8, pending.items.len);
+        defer self.alloc.free(read_values);
+        for (pending.items, 0..) |item, i| {
+            read_keys[i] = item.store_key;
+            read_values[i] = null;
+        }
+
+        var identity_txn = try store.beginProbeTxn();
+        defer identity_txn.abort();
+        try identity_txn.getManySorted(read_keys, read_values);
+
+        for (pending.items, 0..) |item, i| {
+            const raw = read_values[i] orelse continue;
+            if (raw.len != @sizeOf(doc_identity.DocOrdinal)) return error.InvalidDocIdentity;
+            docs[item.source_index].doc_ordinal = std.mem.readInt(doc_identity.DocOrdinal, raw[0..4], .big);
+        }
+
+        return docs;
     }
 
     fn textCompactionDue(index: *persistent_mod.PersistentIndex, opts: IndexBatchOptions) bool {

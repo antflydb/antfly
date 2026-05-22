@@ -4566,8 +4566,8 @@ pub const Index = struct {
         generation: ?u64,
     ) !bool {
         const at = generation orelse return true;
-        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_id)) orelse return true;
-        const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return true;
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_id)) orelse return false;
+        const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return false;
         return state.isVisibleAt(at);
     }
 
@@ -4579,7 +4579,7 @@ pub const Index = struct {
     ) !bool {
         _ = self;
         const at = generation orelse return true;
-        const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return true;
+        const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return false;
         return state.isVisibleAt(at);
     }
 

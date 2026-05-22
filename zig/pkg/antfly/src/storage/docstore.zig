@@ -552,6 +552,13 @@ pub const DocStore = struct {
                 try self.runtime.?.put(key, value);
             }
 
+            pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                if (supports_lmdb) {
+                    if (self.raw != null) return error.Unsupported;
+                }
+                try self.runtime.?.appendPut(key, value);
+            }
+
             pub fn delete(self: @This(), key: []const u8) !void {
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
@@ -980,8 +987,23 @@ pub const DocStore = struct {
                 else => return err,
             };
         }
-        for (writes) |kv| {
-            try txn.put(kv.key, kv.value);
+        var used_bulk_append = false;
+        if (deletes.len == 0 and options.mode == .bulk_ingest) {
+            used_bulk_append = true;
+            for (writes) |kv| {
+                txn.appendPut(kv.key, kv.value) catch |err| switch (err) {
+                    error.Unsupported => {
+                        used_bulk_append = false;
+                        break;
+                    },
+                    else => return err,
+                };
+            }
+        }
+        if (!used_bulk_append) {
+            for (writes) |kv| {
+                try txn.put(kv.key, kv.value);
+            }
         }
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);

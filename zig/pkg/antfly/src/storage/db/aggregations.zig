@@ -1713,7 +1713,9 @@ fn computeAlgebraicTermsAggregation(
     var plan_result = try algebraic_mod.planner.planBucketQueryAlloc(alloc, index, query);
     defer plan_result.deinit(alloc);
     if (generation != null) {
+        if (request.algebraic_join == null and (plan_result.join_kind != null or plan_result.derived_join_fold != null)) return null;
         if (plan_result.derived_join_fold) |derived| {
+            if (request.algebraic_join == null) return null;
             return try computeDerivedJoinTermsAggregation(
                 alloc,
                 index,
@@ -12149,7 +12151,7 @@ test "algebraic aggregation planner can use configured implicit join materializa
     try std.testing.expectEqual(@as(u64, 1), status_value.planner_algebraic_selected);
     try std.testing.expectEqual(@as(u64, 0), status_value.planner_fallback_count);
 
-    if (try computeAlgebraicAggregation(alloc, requests[0], result, .{
+    if (try computeAlgebraicAggregation(alloc, requests[0], .{
         .index_manager = &manager,
         .doc_store = &store,
         .algebraic_scope = .root,

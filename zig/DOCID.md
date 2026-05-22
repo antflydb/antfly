@@ -1551,8 +1551,39 @@ Status as of 2026-05-19:
   `9.6s` to about `4ms`, and total sparse replay dropped to about `112ms`
   (`embedding_apply_ms ~= 104`). The remaining multi-second deferred index wait
   in that benchmark is now outside sparse vector artifact collection/decode/apply.
-  The first
-  optimization from that evidence specialized
+  Follow-up write-path work added `--bulk-load` to the DOCID query benchmark,
+  routed benchmark loads through an internal primary-store bulk session, added
+  append-oriented docstore bulk batches, batched text-projection ordinal lookup,
+  and added a schema-less raw-text projection fast path for documents that do
+  not require JSON string unescaping or stored-vector sanitization. Those
+  changes did not materially improve the pathological local DOCID setup: a
+  10k deferred/full-text+sparse run with `--bulk-load` still spent about
+  `86.9s` loading, including about `69.4s` in primary `store_write_ns`, while
+  sparse replay stayed around `140ms`. Public swarm guardrail comparisons show
+  that this is not representative of the normal public write path: dense 100k
+  swarm loading took about `32.4s` to insert and `67.3s` through index
+  visibility, and schema-less hybrid 10k swarm loading took about `2.1s` to
+  insert and `8.4s` through index visibility. The next DOCID profiling step is
+  therefore primary-store/direct-ingest instrumentation for the local benchmark
+  path: record whether direct bulk append is used or why it falls back, split
+  WAL/sort/table-ingest/mutable-put timings, and compare record counts per
+  document against the public guardrail path before treating 100k local DOCID
+  profiles as product evidence.
+  That instrumentation exposed the local-path bug: append-only primary records
+  could direct-ingest, but small non-append metadata records stayed in the
+  mutable table and blocked later append batches, forcing the next batch down
+  the mutable flush path. The LSM bulk path now drains pending mutable bulk
+  records into sorted ingest before declaring append direct-ingest ineligible.
+  On a 1k deferred bulk profile this removed append fallback completely and cut
+  `store_write_ns` from roughly `488ms` to `48ms`; on the 10k profile, load
+  dropped from about `86.9s` to about `22.0s`. The new primary-LSM summary shows
+  no flushes, two successful append direct-ingests, about `70k` direct-ingested
+  primary entries, and about `7.7s` in sorted ingest/table construction. The
+  remaining local DOCID setup cost is now split across extraction (`~4.6s`),
+  identity metadata (`~3.2s`), derived artifact construction (`~5.0s`), and
+  primary sorted ingest (`~7.7s`), with deferred index wait around `6.3s`
+  (`~2.6s` full-text apply, `~78ms` sparse apply, and replay-window collection).
+  The first optimization from that evidence specialized
   `ResolvedDocSet` ordinal set algebra: list/list operators now use direct
   sorted-array merge/intersection/difference, bitmap/bitmap operators use
   roaring `orWith`/`andWith`/`andNotWith`, and list/bitmap operators avoid

@@ -161,6 +161,8 @@ pub const TextProjectionSourceDoc = struct {
     stored_data: []const u8,
     typed_source: ?std.json.Value,
     doc_ordinal: ?u32 = null,
+    schema_less_text_fields: []const introducer_mod.TextField = &.{},
+    schema_less_fast_projection: bool = false,
 };
 
 pub const TextProjectionSourceBatch = struct {
@@ -170,10 +172,11 @@ pub const TextProjectionSourceBatch = struct {
 pub const TextProjectionOptions = struct {
     vector_field_paths: []const []const u8 = &.{},
     strip_numeric_array_heuristic: bool = true,
+    schema_less_fast_projection: bool = false,
 };
 
 const ExtractedTextFields = struct {
-    fields: []introducer_mod.TextField,
+    fields: []const introducer_mod.TextField,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
 };
@@ -252,7 +255,9 @@ pub fn buildTextProjectionBatch(
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !TextProjectionBatch {
-    const source = try buildTextProjectionSourceBatch(arena, docs);
+    const source = try buildTextProjectionSourceBatchWithOptions(arena, docs, .{
+        .schema_less_fast_projection = schema == null,
+    });
     return try buildTextProjectionBatchFromSource(arena, source.docs, text_analysis, schema, observed_field_analyzers);
 }
 
@@ -312,6 +317,19 @@ fn appendTextProjectionSourceDoc(
     doc_ordinal: ?u32,
     opts: TextProjectionOptions,
 ) !void {
+    if (opts.schema_less_fast_projection and canUseSchemaLessRawTextFastPath(value, opts)) {
+        try source_docs.append(arena, .{
+            .key = key,
+            .root = .null,
+            .stored_data = value,
+            .typed_source = null,
+            .doc_ordinal = doc_ordinal,
+            .schema_less_text_fields = try extractStringFieldsNoSchemaRaw(arena, value, opts),
+            .schema_less_fast_projection = true,
+        });
+        return;
+    }
+
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{});
     const root = parsed.value;
     const stored_projection = try fullTextStoredProjection(arena, root, value, opts);
@@ -335,8 +353,10 @@ pub fn buildTextProjectionBatchFromSource(
     defer text_docs.deinit(arena);
 
     for (source_docs) |doc| {
-        const root = doc.root;
-        const extracted = try extractTextFieldsFromValue(arena, root, text_analysis, schema, observed_field_analyzers);
+        const extracted = if (schema == null and doc.schema_less_fast_projection)
+            ExtractedTextFields{ .fields = doc.schema_less_text_fields }
+        else
+            try extractTextFieldsFromValue(arena, doc.root, text_analysis, schema, observed_field_analyzers);
         if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0) continue;
 
         try text_docs.append(arena, .{
@@ -1695,6 +1715,157 @@ fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]
     return try alloc.dupe(introducer_mod.TextField, fields.items);
 }
 
+fn canUseSchemaLessRawTextFastPath(data: []const u8, opts: TextProjectionOptions) bool {
+    if (opts.strip_numeric_array_heuristic) return false;
+    // Raw strings are borrowed from the document. Escapes require JSON string
+    // decoding, so keep those on the full parser path.
+    if (std.mem.indexOfScalar(u8, data, '\\') != null) return false;
+    if (std.mem.indexOf(u8, data, "\"_edges\"") != null) return false;
+    if (std.mem.indexOf(u8, data, "\"_embeddings\"") != null) return false;
+    for (opts.vector_field_paths) |path| {
+        const first = firstProjectionPathSegment(path);
+        if (first.len == 0) continue;
+        if (rawJsonObjectMayContainField(data, first)) return false;
+    }
+    return true;
+}
+
+fn firstProjectionPathSegment(path: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, path, '.') orelse return path;
+    return path[0..dot];
+}
+
+fn rawJsonObjectMayContainField(data: []const u8, field: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, data, pos, '"')) |start| {
+        pos = start + 1;
+        const end = std.mem.indexOfScalarPos(u8, data, pos, '"') orelse return false;
+        if (std.mem.eql(u8, data[pos..end], field)) return true;
+        pos = end + 1;
+    }
+    return false;
+}
+
+fn extractStringFieldsNoSchemaRaw(
+    alloc: Allocator,
+    data: []const u8,
+    opts: TextProjectionOptions,
+) ![]introducer_mod.TextField {
+    var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
+    defer fields.deinit(alloc);
+    var path = std.ArrayListUnmanaged(u8).empty;
+    defer path.deinit(alloc);
+
+    var pos: usize = 0;
+    skipJsonWhitespace(data, &pos);
+    if (pos >= data.len or data[pos] != '{') return error.SyntaxError;
+    pos += 1;
+    try collectStringFieldsNoSchemaRawObject(alloc, &fields, data, &pos, &path, opts);
+    skipJsonWhitespace(data, &pos);
+    if (pos != data.len) return error.SyntaxError;
+    return try alloc.dupe(introducer_mod.TextField, fields.items);
+}
+
+fn collectStringFieldsNoSchemaRawObject(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    data: []const u8,
+    pos: *usize,
+    path: *std.ArrayListUnmanaged(u8),
+    opts: TextProjectionOptions,
+) anyerror!void {
+    var first = true;
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == '}') {
+            pos.* += 1;
+            return;
+        }
+        if (!first) {
+            if (data[pos.*] != ',') return error.SyntaxError;
+            pos.* += 1;
+            skipJsonWhitespace(data, pos);
+        }
+        first = false;
+
+        const key = try parseRawJsonString(data, pos);
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len or data[pos.*] != ':') return error.SyntaxError;
+        pos.* += 1;
+
+        if (key.len > 0 and key[0] == '_') {
+            try skipRawJsonValue(data, pos);
+            continue;
+        }
+
+        const old_len = try pushProjectionPath(alloc, path, key);
+        defer path.shrinkRetainingCapacity(old_len);
+        if (projectionPathMatchesAny(opts.vector_field_paths, path.items)) {
+            try skipRawJsonValue(data, pos);
+            continue;
+        }
+        try collectStringFieldsNoSchemaRawValue(alloc, fields, data, pos, path, opts);
+    }
+}
+
+fn collectStringFieldsNoSchemaRawArray(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    data: []const u8,
+    pos: *usize,
+    path: *std.ArrayListUnmanaged(u8),
+    opts: TextProjectionOptions,
+) anyerror!void {
+    var first = true;
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return;
+        }
+        if (!first) {
+            if (data[pos.*] != ',') return error.SyntaxError;
+            pos.* += 1;
+            skipJsonWhitespace(data, pos);
+        }
+        first = false;
+        try collectStringFieldsNoSchemaRawValue(alloc, fields, data, pos, path, opts);
+    }
+}
+
+fn collectStringFieldsNoSchemaRawValue(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    data: []const u8,
+    pos: *usize,
+    path: *std.ArrayListUnmanaged(u8),
+    opts: TextProjectionOptions,
+) anyerror!void {
+    skipJsonWhitespace(data, pos);
+    if (pos.* >= data.len) return error.SyntaxError;
+    switch (data[pos.*]) {
+        '"' => {
+            const text = try parseRawJsonString(data, pos);
+            if (path.items.len == 0) return;
+            try fields.append(alloc, .{
+                .field_name = try alloc.dupe(u8, path.items),
+                .text = text,
+            });
+        },
+        '{' => {
+            pos.* += 1;
+            try collectStringFieldsNoSchemaRawObject(alloc, fields, data, pos, path, opts);
+        },
+        '[' => {
+            pos.* += 1;
+            try collectStringFieldsNoSchemaRawArray(alloc, fields, data, pos, path, opts);
+        },
+        else => try skipRawJsonValue(data, pos),
+    }
+}
+
 fn collectStringFieldsNoSchema(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
@@ -2319,6 +2490,34 @@ test "document mapper builds text segment from nested string fields without sche
     try std.testing.expect((try reader.invertedIndex("title")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.summary")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
+}
+
+test "document mapper schema-less fast projection indexes nested string fields" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source_batch = try buildTextProjectionSourceBatchWithOptions(arena, &.{
+        .{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"meta\":{\"summary\":\"beta gamma\",\"tags\":[\"delta\"]},\"count\":1}" },
+    }, .{
+        .strip_numeric_array_heuristic = false,
+        .schema_less_fast_projection = true,
+    });
+    try std.testing.expect(source_batch.docs[0].schema_less_fast_projection);
+
+    const projection_batch = try buildTextProjectionBatchFromSource(arena, source_batch.docs, text_analysis, null, null);
+    const segment = (try buildTextSegmentFromProjectionBatch(alloc, projection_batch, text_analysis)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("title")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.summary")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
+    try std.testing.expect((try reader.invertedIndex("count")) == null);
 }
 
 test "document mapper emits schema-driven search_as_you_type variants" {
