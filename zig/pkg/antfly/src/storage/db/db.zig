@@ -22704,12 +22704,6 @@ test "db full-text backfill resumes after interrupted reopen" {
     const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
-    if (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, interrupted_state)) |decoded_state| {
-        defer alloc.free(decoded_state);
-        std.debug.print("sparse interrupted resume key decoded={s} len={d}\n", .{ decoded_state, interrupted_state.len });
-    } else {
-        std.debug.print("sparse interrupted resume key undecoded len={d}\n", .{interrupted_state.len});
-    }
 
     index_manager_mod.test_abort_text_backfill_after_batches = null;
 

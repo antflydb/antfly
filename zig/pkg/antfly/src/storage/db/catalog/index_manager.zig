@@ -2046,21 +2046,11 @@ pub const IndexManager = struct {
     pub fn requiresEnrichmentReplay(self: *const IndexManager, name: []const u8) !bool {
         for (self.dense_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            if (try parseDenseGeneratorConfig(self.alloc, entry.config.config_json)) |generator| {
-                defer generator.deinit(self.alloc);
-                return true;
-            }
-            const dense_cfg = try parseDenseConfig(self.alloc, entry.config.config_json);
-            defer dense_cfg.deinit(self.alloc);
-            return dense_cfg.embedding_name != null and !dense_cfg.external and self.getEnrichment(.embedding, dense_cfg.embedding_name.?) != null;
+            return try self.configRequiresEnrichmentReplay(entry.config);
         }
         for (self.sparse_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            if (try parseSparseGeneratorConfig(self.alloc, entry.config.config_json)) |generator| {
-                defer generator.deinit(self.alloc);
-                return true;
-            }
-            return false;
+            return try self.configRequiresEnrichmentReplay(entry.config);
         }
         return false;
     }
@@ -4374,6 +4364,39 @@ pub const IndexManager = struct {
         return std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ self.base_path, name });
     }
 
+    fn configRequiresEnrichmentReplay(self: *const IndexManager, cfg: types.IndexConfig) !bool {
+        switch (cfg.kind) {
+            .dense_vector => {
+                if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
+                    defer generator.deinit(self.alloc);
+                    return true;
+                }
+                const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
+                defer dense_cfg.deinit(self.alloc);
+                return dense_cfg.embedding_name != null and !dense_cfg.external and self.getEnrichment(.embedding, dense_cfg.embedding_name.?) != null;
+            },
+            .sparse_vector => {
+                if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
+                    defer generator.deinit(self.alloc);
+                    return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        if (try self.configRequiresEnrichmentReplay(cfg)) return;
+        try apply_state.saveAppliedSequenceWithCheckpoint(
+            self.alloc,
+            store,
+            self.applied_sequence_checkpoint_path,
+            cfg.name,
+            store.lastReplaySequence(0),
+        );
+    }
+
     fn appendOpenedIndex(self: *IndexManager, opened: OpenedIndex) !void {
         switch (opened) {
             .full_text => |entry| {
@@ -4529,6 +4552,7 @@ pub const IndexManager = struct {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.update(if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);
+                    try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
@@ -4729,6 +4753,7 @@ pub const IndexManager = struct {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.update(if (resume_from) |buf| buf else "");
                     try self.backfillSparseIndex(store, &entry, resume_from);
+                    try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
