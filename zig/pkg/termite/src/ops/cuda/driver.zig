@@ -186,8 +186,13 @@ pub const CudaDriver = struct {
     }
 
     pub fn check(self: *const CudaDriver, result: CUresult) Error!void {
-        _ = self;
-        if (result != CUDA_SUCCESS) return error.CudaDriverError;
+        if (result != CUDA_SUCCESS) {
+            std.debug.print(
+                "cuda driver call failed: {s}: {s} ({d})\n",
+                .{ self.errorName(result), self.errorString(result), result },
+            );
+            return error.CudaDriverError;
+        }
     }
 
     pub fn errorName(self: *const CudaDriver, result: CUresult) []const u8 {

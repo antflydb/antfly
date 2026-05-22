@@ -138,7 +138,7 @@ pub const SessionManager = struct {
         model_path: []const u8,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
-        if (isExplicitSingleBackend(self.preferred_backends, .cuda) and !gpu_inventory.cudaRuntimeAvailable()) {
+        if (isExplicitSingleBackend(self.preferred_backends, .cuda) and !build_options.enable_cuda) {
             return error.CudaRuntimeUnavailable;
         }
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
@@ -148,7 +148,7 @@ pub const SessionManager = struct {
 
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
-            if (!backend.runtimeAvailable()) {
+            if (!backend.runtimeAvailable() and !isExplicitSingleBackend(self.preferred_backends, backend)) {
                 if (backend == .cuda) {
                     const cuda = gpu_inventory.cudaStatus();
                     std.log.info("skipping CUDA backend for {s}: {s}", .{ model_path, cuda.reasonText() });

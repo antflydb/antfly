@@ -118,9 +118,15 @@ pub const CudaCompute = struct {
     gqa_graph_disabled_for_session: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !CudaCompute {
-        var ctx = try context_mod.CudaContext.initDefault();
+        var ctx = context_mod.CudaContext.initDefault() catch |err| {
+            std.debug.print("cuda compute init failed during context setup: {s}\n", .{@errorName(err)});
+            return err;
+        };
         errdefer ctx.deinit();
-        const kernels = try kernels_mod.KernelModule.load(&ctx);
+        const kernels = kernels_mod.KernelModule.load(&ctx) catch |err| {
+            std.debug.print("cuda compute init failed during kernel module load: {s}\n", .{@errorName(err)});
+            return err;
+        };
         return .{
             .allocator = allocator,
             .ctx = ctx,
