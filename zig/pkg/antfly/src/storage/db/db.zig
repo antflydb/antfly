@@ -8018,6 +8018,7 @@ pub const DB = struct {
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_vector_ids = denseVectorIdsCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8040,6 +8041,7 @@ pub const DB = struct {
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_vector_ids = denseVectorIdsCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8306,6 +8308,16 @@ pub const DB = struct {
     ) anyerror!?u64 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.index_manager.lookupDenseVectorId(self.core.store, index_name, doc_key);
+    }
+
+    fn denseVectorIdsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        doc_keys: []const []const u8,
+    ) anyerror![]u64 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupDenseVectorIdsAlloc(alloc, self.core.store, index_name, doc_keys);
     }
 
     fn sparseIndexCallback(
@@ -22692,6 +22704,12 @@ test "db full-text backfill resumes after interrupted reopen" {
     const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
+    if (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, interrupted_state)) |decoded_state| {
+        defer alloc.free(decoded_state);
+        std.debug.print("sparse interrupted resume key decoded={s} len={d}\n", .{ decoded_state, interrupted_state.len });
+    } else {
+        std.debug.print("sparse interrupted resume key undecoded len={d}\n", .{interrupted_state.len});
+    }
 
     index_manager_mod.test_abort_text_backfill_after_batches = null;
 
