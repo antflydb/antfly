@@ -4301,7 +4301,7 @@ pub const IndexManager = struct {
 
         var flushed_batches: usize = 0;
         var saw_visible_doc = false;
-        var last_key: ?[]const u8 = null;
+        var max_flushed_key: ?[]const u8 = null;
 
         const flush_batch = struct {
             fn run(
@@ -4354,15 +4354,17 @@ pub const IndexManager = struct {
                 .key = doc_id,
                 .value = doc.value,
             });
-            last_key = doc.key;
+            if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
+                max_flushed_key = doc.key;
+            }
 
             if (mapped_docs.items.len >= text_backfill_batch_size) {
-                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, last_key.?, &flushed_batches);
+                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
             }
         }
 
         if (mapped_docs.items.len > 0) {
-            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, last_key.?, &flushed_batches);
+            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -5466,7 +5468,7 @@ pub const IndexManager = struct {
         var flushed_batches: usize = 0;
         var backfilled_doc_count: u64 = 0;
         var saw_visible_doc = false;
-        var last_key: ?[]const u8 = null;
+        var max_flushed_key: ?[]const u8 = null;
 
         const flush_batch = struct {
             fn run(
@@ -5511,7 +5513,9 @@ pub const IndexManager = struct {
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, doc.value, entry.field_name)) orelse continue;
             errdefer sparse_vec.deinit(self.alloc);
             saw_visible_doc = true;
-            last_key = doc.key;
+            if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
+                max_flushed_key = doc.key;
+            }
             try writes.append(self.alloc, .{
                 .doc_id = try self.alloc.dupe(u8, raw_key),
                 .vec = .{
@@ -5520,12 +5524,12 @@ pub const IndexManager = struct {
                 },
             });
             if (writes.items.len >= sparse_backfill_batch_size) {
-                try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches, &backfilled_doc_count);
+                try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
             }
         }
 
         if (writes.items.len > 0) {
-            try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches, &backfilled_doc_count);
+            try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -5781,6 +5785,18 @@ pub const IndexManager = struct {
         const metadata = (try entry.index.getMetadata(vector_id)) orelse return null;
         self.alloc.free(metadata);
         return vector_id;
+    }
+
+    pub fn lookupDenseVectorIdsAlloc(self: *IndexManager, alloc: Allocator, store: anytype, index_name: []const u8, doc_keys: []const []const u8) ![]u64 {
+        _ = store;
+        _ = self.denseIndex(index_name) orelse return &.{};
+
+        var out = std.ArrayListUnmanaged(u64).empty;
+        errdefer out.deinit(alloc);
+        for (doc_keys) |doc_key| {
+            try out.append(alloc, deterministicDenseVectorId(doc_key));
+        }
+        return try out.toOwnedSlice(alloc);
     }
 
     fn lookupDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
