@@ -3022,27 +3022,120 @@ pub const SparseIndex = struct {
         var cur = try read_txn.openCursor();
         defer cur.close();
 
+        const PrunedDoc = struct {
+            doc_num: u64,
+            doc_id: []u8,
+
+            fn deinit(doc: *@This(), allocator: Allocator) void {
+                allocator.free(doc.doc_id);
+                doc.* = undefined;
+            }
+        };
+
         var term_ids = std.ArrayListUnmanaged(u32).empty;
         defer term_ids.deinit(alloc);
+        var pruned_docs = std.ArrayListUnmanaged(PrunedDoc).empty;
+        defer {
+            for (pruned_docs.items) |*doc| doc.deinit(alloc);
+            pruned_docs.deinit(alloc);
+        }
+        var seen_doc_nums = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer seen_doc_nums.deinit(alloc);
 
-        const first = (try cur.seekAtOrAfter(taggedPrefix(key_inv))) orelse return;
+        const CollectTermsContext = struct {
+            alloc: Allocator,
+            terms: *std.ArrayListUnmanaged(u32),
 
-        var entry = first;
-        while (true) {
-            if (entry.key.len == 0 or entry.key[0] != key_inv) break;
-            const term_id = parseTermRangeKey(entry.key) orelse {
-                entry = (try cur.next()) orelse break;
-                continue;
-            };
-            const range = try decodeChunkRangeMeta(entry.value);
-            switch (classifyChunkRange(range, lower, upper)) {
-                .outside => {},
-                .right_only, .mixed => try term_ids.append(alloc, term_id),
+            fn visit(ctx: *@This(), term_id: u32) !void {
+                try ctx.terms.append(ctx.alloc, term_id);
             }
-            entry = (try cur.next()) orelse break;
+        };
+        var collect_terms_ctx = CollectTermsContext{ .alloc = alloc, .terms = &term_ids };
+
+        const appendPrunedDoc = struct {
+            fn run(
+                allocator: Allocator,
+                docs: *std.ArrayListUnmanaged(PrunedDoc),
+                seen: *std.AutoHashMapUnmanaged(u64, void),
+                doc_num: u64,
+                doc_id: []const u8,
+            ) !void {
+                const gop = try seen.getOrPut(allocator, doc_num);
+                if (gop.found_existing) return;
+                errdefer _ = seen.remove(doc_num);
+                try docs.append(allocator, .{
+                    .doc_num = doc_num,
+                    .doc_id = try allocator.dupe(u8, doc_id),
+                });
+            }
+        }.run;
+
+        const fwd_first = if (lower.len == 0)
+            (try cur.seekAtOrAfter(taggedPrefix(key_fwd)))
+        else blk: {
+            const start_key = try fwdKeyAlloc(alloc, lower);
+            defer alloc.free(start_key);
+            break :blk try cur.seekAtOrAfter(start_key);
+        };
+        var maybe_fwd_entry = fwd_first;
+        while (maybe_fwd_entry) |entry| {
+            const doc_id = fwdDocIdFromKey(entry.key) orelse break;
+            if (upper.len > 0 and std.mem.order(u8, doc_id, upper) != .lt) break;
+            if (docIdInOwnedRange(doc_id, lower, upper)) {
+                const doc_num = try forEachFwdTermId(entry.value, CollectTermsContext, &collect_terms_ctx, CollectTermsContext.visit);
+                try appendPrunedDoc(alloc, &pruned_docs, &seen_doc_nums, doc_num, doc_id);
+            }
+            maybe_fwd_entry = try cur.next();
         }
 
-        if (term_ids.items.len == 0) return;
+        const DocMapPruneContext = struct {
+            alloc: Allocator,
+            lower: []const u8,
+            upper: []const u8,
+            terms_ctx: *CollectTermsContext,
+            docs: *std.ArrayListUnmanaged(PrunedDoc),
+            seen: *std.AutoHashMapUnmanaged(u64, void),
+
+            fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                if (!docIdInOwnedRange(entry.doc_id, ctx.lower, ctx.upper)) return false;
+                _ = try forEachFwdTermId(entry.fwd_data, CollectTermsContext, ctx.terms_ctx, CollectTermsContext.visit);
+                try appendPrunedDoc(ctx.alloc, ctx.docs, ctx.seen, entry.doc_num, entry.doc_id);
+                return false;
+            }
+        };
+        var docmap_ctx = DocMapPruneContext{
+            .alloc = alloc,
+            .lower = lower,
+            .upper = upper,
+            .terms_ctx = &collect_terms_ctx,
+            .docs = &pruned_docs,
+            .seen = &seen_doc_nums,
+        };
+        var maybe_docmap = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
+        while (maybe_docmap) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
+            _ = try forEachDocMapEntry(entry.value, &docmap_ctx, DocMapPruneContext.visit);
+            maybe_docmap = try cur.next();
+        }
+
+        if (try cur.seekAtOrAfter(taggedPrefix(key_inv))) |first| {
+            var entry = first;
+            while (true) {
+                if (entry.key.len == 0 or entry.key[0] != key_inv) break;
+                const term_id = parseTermRangeKey(entry.key) orelse {
+                    entry = (try cur.next()) orelse break;
+                    continue;
+                };
+                const range = try decodeChunkRangeMeta(entry.value);
+                switch (classifyChunkRange(range, lower, upper)) {
+                    .outside => {},
+                    .right_only, .mixed => try term_ids.append(alloc, term_id),
+                }
+                entry = (try cur.next()) orelse break;
+            }
+        }
+
+        if (term_ids.items.len == 0 and pruned_docs.items.len == 0) return;
 
         var write_txn = try self.beginWriteTxn();
         errdefer write_txn.abort();
@@ -3052,8 +3145,18 @@ pub const SparseIndex = struct {
             self.doc_count = prev_doc_count;
             self.term_count = prev_term_count;
         }
-        for (term_ids.items) |term_id| {
+        const pruned_term_ids = sortAndDedupU32(term_ids.items);
+        for (pruned_term_ids) |term_id| {
             try pruneTermPostings(alloc, &write_txn, self.dbi, term_id, lower, upper);
+        }
+        for (pruned_docs.items) |doc| {
+            const fwd_key = try fwdKeyAlloc(alloc, doc.doc_id);
+            defer alloc.free(fwd_key);
+            txnDelete(&write_txn, self.dbi, fwd_key) catch {};
+            var rev_key_buf: [256]u8 = undefined;
+            txnDelete(&write_txn, self.dbi, revKey(&rev_key_buf, doc.doc_num)) catch {};
+            var tombstone_key_buf: [16]u8 = undefined;
+            try txnPut(&write_txn, self.dbi, docTombstoneKey(&tombstone_key_buf, doc.doc_num), &.{});
         }
         const stats_after = try scanStatsInTxn(&write_txn, self.dbi);
         self.doc_count = stats_after.doc_count;

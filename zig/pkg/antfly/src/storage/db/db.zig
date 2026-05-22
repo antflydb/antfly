@@ -24889,6 +24889,72 @@ test "db search fuses full_text and dense named searches before graph expansion"
     try std.testing.expectEqualStrings("doc:c", result.graph_results[0].hits[0].id);
 }
 
+test "db hybrid search does not hard-filter dense leg with scoring full_text" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"semantic alpha concept\",\"_embeddings\":{\"dv_v1\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"keyword quickstart only\",\"_embeddings\":{\"dv_v1\":[0,1,0]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"plain body unrelated\",\"_embeddings\":{\"dv_v1\":[0,0,1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "quickstart" } },
+        .dense_queries = &.{
+            .{
+                .name = "dv_v1",
+                .index_name = "dv_v1",
+                .query = .{
+                    .vector = &.{ 1.0, 0.0, 0.0 },
+                    .k = 3,
+                },
+            },
+        },
+        .merge_config = .{
+            .strategy = .rsf,
+            .window_size = 10,
+            .weights = &.{
+                .{ .name = "$full_text_results", .weight = 0.4 },
+                .{ .name = "dv_v1", .weight = 1.0 },
+            },
+        },
+        .limit = 3,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(result.total_hits >= 2);
+    var saw_semantic_only_hit = false;
+    var saw_text_hit = false;
+    for (result.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "doc:a")) saw_semantic_only_hit = true;
+        if (std.mem.eql(u8, hit.id, "doc:b")) saw_text_hit = true;
+    }
+    try std.testing.expect(saw_semantic_only_hit);
+    try std.testing.expect(saw_text_hit);
+}
+
 test "db search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
