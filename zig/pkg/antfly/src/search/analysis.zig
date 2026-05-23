@@ -1291,11 +1291,25 @@ pub const html_analyzer = Analyzer{
     .filters = &.{ .lowercase, .stop_words, .stemmer },
 };
 
-/// Search-as-you-type: unicode_words → lowercase → edge_ngram(min=2, max=4)
-pub const search_as_you_type_analyzer = Analyzer{
+/// Search-as-you-type 2-gram shingle subfield: unicode_words → lowercase → shingle(2)
+pub const search_as_you_type_2gram_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 2, .max = 2 } } },
+};
+
+/// Search-as-you-type 3-gram shingle subfield: unicode_words → lowercase → shingle(3)
+pub const search_as_you_type_3gram_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 3, .max = 3 } } },
+};
+
+/// Search-as-you-type prefix subfield: unicode_words → lowercase → edge_ngram(min=2, max=4)
+pub const search_as_you_type_index_prefix_analyzer = Analyzer{
     .tokenizer = .unicode_words,
     .filters = &.{ .lowercase, .{ .edge_ngram = .{ .min = 2, .max = 4 } } },
 };
+
+pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
 
 /// Language-specific analyzer: unicode_words → lowercase → language stop words → language stemmer
 pub fn languageAnalyzer(comptime lang: Language) Analyzer {
@@ -1326,6 +1340,9 @@ pub fn builtinAnalyzerByName(name: []const u8) ?*const Analyzer {
     if (std.mem.eql(u8, name, "keyword")) return &keyword_analyzer;
     if (std.mem.eql(u8, name, "html") or std.mem.eql(u8, name, "html_analyzer")) return &html_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type") or std.mem.eql(u8, name, "search_as_you_type_analyzer")) return &search_as_you_type_analyzer;
+    if (std.mem.eql(u8, name, "search_as_you_type_2gram")) return &search_as_you_type_2gram_analyzer;
+    if (std.mem.eql(u8, name, "search_as_you_type_3gram")) return &search_as_you_type_3gram_analyzer;
+    if (std.mem.eql(u8, name, "search_as_you_type_index_prefix")) return &search_as_you_type_index_prefix_analyzer;
     if (std.mem.eql(u8, name, "german")) return &german_analyzer;
     if (std.mem.eql(u8, name, "french")) return &french_analyzer;
     if (std.mem.eql(u8, name, "spanish")) return &spanish_analyzer;
@@ -1786,16 +1803,26 @@ test "html_analyzer end-to-end" {
     }
 }
 
-test "search_as_you_type analyzer" {
+test "search_as_you_type analyzers" {
     const alloc = std.testing.allocator;
-    const tokens = try search_as_you_type_analyzer.analyze(alloc, "hello");
-    defer Analyzer.freeTokens(alloc, tokens);
+    const grams2 = try search_as_you_type_2gram_analyzer.analyze(alloc, "quick brown fox");
+    defer Analyzer.freeTokens(alloc, grams2);
+    try std.testing.expectEqual(@as(usize, 2), grams2.len);
+    try std.testing.expectEqualStrings("quick brown", grams2[0].term);
+    try std.testing.expectEqualStrings("brown fox", grams2[1].term);
+
+    const grams3 = try search_as_you_type_3gram_analyzer.analyze(alloc, "quick brown fox");
+    defer Analyzer.freeTokens(alloc, grams3);
+    try std.testing.expectEqual(@as(usize, 1), grams3.len);
+    try std.testing.expectEqualStrings("quick brown fox", grams3[0].term);
 
     // "hello" → lowercase → "hello" → edge_ngram(2,4) → "he","hel","hell"
-    try std.testing.expectEqual(@as(usize, 3), tokens.len);
-    try std.testing.expectEqualStrings("he", tokens[0].term);
-    try std.testing.expectEqualStrings("hel", tokens[1].term);
-    try std.testing.expectEqualStrings("hell", tokens[2].term);
+    const prefixes = try search_as_you_type_index_prefix_analyzer.analyze(alloc, "hello");
+    defer Analyzer.freeTokens(alloc, prefixes);
+    try std.testing.expectEqual(@as(usize, 3), prefixes.len);
+    try std.testing.expectEqualStrings("he", prefixes[0].term);
+    try std.testing.expectEqualStrings("hel", prefixes[1].term);
+    try std.testing.expectEqualStrings("hell", prefixes[2].term);
 }
 
 test "german analyzer end-to-end" {

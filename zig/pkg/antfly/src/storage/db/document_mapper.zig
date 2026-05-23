@@ -22,6 +22,9 @@ const schema_api = @import("../../schema/mod.zig");
 const runtime_schema = @import("../schema.zig");
 const types = @import("types.zig");
 
+pub const schema_less_exact_field_suffix = ".keyword";
+pub const schema_less_exact_max_bytes: usize = 1024;
+
 pub const MapperDoc = struct {
     key: []const u8,
     value: []const u8,
@@ -1551,11 +1554,11 @@ fn collectDynamicSchemaTextFields(
             }
             if (document_schema) |resolved| {
                 if (pathFallsUnderInferTypeDynamicPath(resolved, path)) {
-                    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+                    try appendDynamicSchemaLessStringTextFields(alloc, fields, path, text, text_analysis, observed_field_analyzers);
                     return;
                 }
                 if (pathFallsUnderOpenDynamicPath(resolved, path)) {
-                    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+                    try appendDynamicSchemaLessStringTextFields(alloc, fields, path, text, text_analysis, observed_field_analyzers);
                 }
             }
         },
@@ -1682,6 +1685,28 @@ fn appendNamedTextField(
     }
 }
 
+fn appendDynamicSchemaLessStringTextFields(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    path: []const u8,
+    text: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+) !void {
+    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+    if (observed_field_analyzers) |collector| {
+        try appendObservedFieldAnalyzer(alloc, collector, path, "standard");
+    }
+    if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
+
+    const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
+    defer alloc.free(exact_field);
+    try appendNamedTextField(alloc, fields, exact_field, text, "keyword", false, text_analysis);
+    if (observed_field_analyzers) |collector| {
+        try appendObservedFieldAnalyzer(alloc, collector, exact_field, "keyword");
+    }
+}
+
 fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]introducer_mod.TextField {
     var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
     defer fields.deinit(alloc);
@@ -1719,9 +1744,20 @@ fn collectStringFieldsNoSchema(
                 .field_name = try alloc.dupe(u8, path),
                 .text = text,
             });
+            if (text.len <= schema_less_exact_max_bytes and !std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) {
+                try fields.append(alloc, .{
+                    .field_name = try schemaLessExactFieldNameAlloc(alloc, path),
+                    .text = text,
+                    .analyzer = &analysis_mod.keyword_analyzer,
+                });
+            }
         },
         else => {},
     }
+}
+
+fn schemaLessExactFieldNameAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ path, schema_less_exact_field_suffix });
 }
 
 fn resolveFullTextDocument(schema: runtime_schema.TableSchema, root: std.json.ObjectMap) ?runtime_schema.FullTextDocument {
@@ -2304,13 +2340,13 @@ test "document mapper emits schema-driven search_as_you_type variants" {
                     },
                     .{
                         .path = "name",
-                        .emitted_name = "name__keyword",
+                        .emitted_name = "name.keyword",
                         .analyzer = "keyword",
                     },
                     .{
                         .path = "name",
-                        .emitted_name = "name__2gram",
-                        .analyzer = "search_as_you_type",
+                        .emitted_name = "name._index_prefix",
+                        .analyzer = "search_as_you_type_index_prefix",
                     },
                 },
             },
@@ -2326,8 +2362,8 @@ test "document mapper emits schema-driven search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("name")) != null);
-    try std.testing.expect((try reader.invertedIndex("name__keyword")) != null);
-    try std.testing.expect((try reader.invertedIndex("name__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("name.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("name._index_prefix")) != null);
 }
 
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
@@ -2343,7 +2379,7 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
                 .path_match = "meta.*",
                 .mapping = .{
                     .field_type = .search_as_you_type,
-                    .analyzer = "search_as_you_type",
+                    .analyzer = "search_as_you_type_index_prefix",
                 },
             },
         },
@@ -2358,7 +2394,7 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.nickname")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.nickname__2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._index_prefix")) == null);
 }
 
 test "document mapper honors dynamic-template exclusions and mapping type" {
@@ -2459,8 +2495,8 @@ test "document mapper emits additional-properties search_as_you_type variants" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2478,7 +2514,7 @@ test "document mapper emits additional-properties search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.nickname")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.nickname__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._index_prefix")) != null);
 }
 
 test "document mapper emits nested additional-properties search_as_you_type variants" {
@@ -2501,8 +2537,8 @@ test "document mapper emits nested additional-properties search_as_you_type vari
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2520,7 +2556,7 @@ test "document mapper emits nested additional-properties search_as_you_type vari
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.foo.title")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.foo.title__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.foo.title._index_prefix")) != null);
 }
 
 test "document mapper emits pattern-properties search_as_you_type variants" {
@@ -2544,8 +2580,8 @@ test "document mapper emits pattern-properties search_as_you_type variants" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2563,9 +2599,9 @@ test "document mapper emits pattern-properties search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title._index_prefix")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.skip.title")) == null);
-    try std.testing.expect((try reader.invertedIndex("meta.skip.title__2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.skip.title._index_prefix")) == null);
 }
 
 test "document mapper emits additionalProperties true fallback text fields" {

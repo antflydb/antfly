@@ -882,8 +882,18 @@ test "schema serialize/deserialize round-trip" {
                     },
                     .{
                         .path = "title",
-                        .emitted_name = "title__2gram",
-                        .analyzer = "search_as_you_type",
+                        .emitted_name = "title._2gram",
+                        .analyzer = "search_as_you_type_2gram",
+                    },
+                    .{
+                        .path = "title",
+                        .emitted_name = "title._3gram",
+                        .analyzer = "search_as_you_type_3gram",
+                    },
+                    .{
+                        .path = "title",
+                        .emitted_name = "title._index_prefix",
+                        .analyzer = "search_as_you_type_index_prefix",
                     },
                 },
                 .dynamic_rules = &.{
@@ -897,8 +907,16 @@ test "schema serialize/deserialize round-trip" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._2gram",
+                                .analyzer = "search_as_you_type_2gram",
+                            },
+                            .{
+                                .suffix = "._3gram",
+                                .analyzer = "search_as_you_type_3gram",
+                            },
+                            .{
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -929,15 +947,21 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(loaded.dynamic_templates[0].mapping.doc_values);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents.len);
     try std.testing.expectEqualStrings("my_type", loaded.full_text_documents[0].name);
-    try std.testing.expectEqual(@as(usize, 2), loaded.full_text_documents[0].fields.len);
-    try std.testing.expectEqualStrings("title__2gram", loaded.full_text_documents[0].fields[1].emitted_name);
-    try std.testing.expectEqualStrings("search_as_you_type", loaded.full_text_documents[0].fields[1].analyzer);
+    try std.testing.expectEqual(@as(usize, 4), loaded.full_text_documents[0].fields.len);
+    try std.testing.expectEqualStrings("title._2gram", loaded.full_text_documents[0].fields[1].emitted_name);
+    try std.testing.expectEqualStrings("search_as_you_type_2gram", loaded.full_text_documents[0].fields[1].analyzer);
+    try std.testing.expectEqualStrings("title._3gram", loaded.full_text_documents[0].fields[2].emitted_name);
+    try std.testing.expectEqualStrings("search_as_you_type_3gram", loaded.full_text_documents[0].fields[2].analyzer);
+    try std.testing.expectEqualStrings("title._index_prefix", loaded.full_text_documents[0].fields[3].emitted_name);
+    try std.testing.expectEqualStrings("search_as_you_type_index_prefix", loaded.full_text_documents[0].fields[3].analyzer);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].dynamic_rules.len);
     try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].dynamic_rules[0].parent_path);
     try std.testing.expectEqualStrings("^tag_[a-z]+$", loaded.full_text_documents[0].dynamic_rules[0].segment_pattern.?);
     try std.testing.expectEqualStrings("title", loaded.full_text_documents[0].dynamic_rules[0].relative_path);
-    try std.testing.expectEqual(@as(usize, 2), loaded.full_text_documents[0].dynamic_rules[0].variants.len);
-    try std.testing.expectEqualStrings("__2gram", loaded.full_text_documents[0].dynamic_rules[0].variants[1].suffix);
+    try std.testing.expectEqual(@as(usize, 4), loaded.full_text_documents[0].dynamic_rules[0].variants.len);
+    try std.testing.expectEqualStrings("._2gram", loaded.full_text_documents[0].dynamic_rules[0].variants[1].suffix);
+    try std.testing.expectEqualStrings("._3gram", loaded.full_text_documents[0].dynamic_rules[0].variants[2].suffix);
+    try std.testing.expectEqualStrings("._index_prefix", loaded.full_text_documents[0].dynamic_rules[0].variants[3].suffix);
     try std.testing.expectEqual(@as(usize, 2), loaded.full_text_documents[0].open_dynamic_paths.len);
     try std.testing.expectEqualStrings("", loaded.full_text_documents[0].open_dynamic_paths[0]);
     try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].open_dynamic_paths[1]);
