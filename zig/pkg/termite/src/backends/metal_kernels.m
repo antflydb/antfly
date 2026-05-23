@@ -31,7 +31,7 @@
 #define TERMITE_METAL_LINEAR_SLOT_CAPACITY 512
 #define TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY 256
 #define TERMITE_METAL_SCRATCH_POOL_CAPACITY 16
-#define TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY 26
+#define TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY 29
 #define TERMITE_METAL_GRAPH_PLAN_PROJECTION_SLOT_BASE 0
 #define TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE 6
 #define TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT 10
@@ -43,6 +43,9 @@
 #define TERMITE_METAL_GRAPH_PLAN_ATTENTION_SPAN_VALUE_SLOT 16
 #define TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE 17
 #define TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE 21
+#define TERMITE_METAL_GRAPH_PLAN_DEBERTA_CC_SCORE_SLOT 26
+#define TERMITE_METAL_GRAPH_PLAN_DEBERTA_C2P_SCORE_SLOT 27
+#define TERMITE_METAL_GRAPH_PLAN_DEBERTA_P2C_SCORE_SLOT 28
 #define TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY TERMITE_METAL_LINEAR_SLOT_CAPACITY
 #define TERMITE_METAL_GENERIC_EMBEDDING_CACHE_CAPACITY 8
 #define TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT 4
@@ -388,6 +391,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> sdpa_f32_pipeline;
     id<MTLComputePipelineState> disentangled_relative_attention_f32_pipeline;
     id<MTLComputePipelineState> disentangled_relative_attention_f32_tg_pipeline;
+    id<MTLComputePipelineState> deberta_relative_score_gemm_f32_pipeline;
+    id<MTLComputePipelineState> deberta_relative_score_softmax_pv_f32_pipeline;
     id<MTLComputePipelineState> transpose_f32_pipeline;
     id<MTLComputePipelineState> dot_general_2d_f32_pipeline;
     id<MTLComputePipelineState> dot_general_batched_f32_pipeline;
@@ -740,6 +745,9 @@ typedef struct termite_metal_decode_runtime {
     uint64_t deberta_ffn_fused_calls;
     uint64_t deberta_ffn_fused_mps_matmuls;
     uint64_t deberta_ffn_fused_fallbacks;
+    uint64_t deberta_attention_legacy_calls;
+    uint64_t deberta_attention_gemm_calls;
+    uint64_t deberta_attention_gemm_fallbacks;
     termite_metal_mpsgraph_ffn_cache mpsgraph_ffn_cache;
     uint64_t mpsgraph_ffn_calls;
     uint64_t mpsgraph_ffn_fallbacks;
@@ -901,6 +909,9 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t deberta_ffn_fused_calls;
     uint64_t deberta_ffn_fused_mps_matmuls;
     uint64_t deberta_ffn_fused_fallbacks;
+    uint64_t deberta_attention_legacy_calls;
+    uint64_t deberta_attention_gemm_calls;
+    uint64_t deberta_attention_gemm_fallbacks;
     uint64_t mpsgraph_ffn_calls;
     uint64_t mpsgraph_ffn_fallbacks;
     uint64_t mpsgraph_ffn_compiles;
@@ -1770,6 +1781,17 @@ typedef struct termite_metal_disentangled_relative_attention_f32_params {
     uint32_t reserved2;
 } termite_metal_disentangled_relative_attention_f32_params;
 
+typedef struct termite_metal_deberta_relative_score_gemm_f32_params {
+    uint32_t batch;
+    uint32_t seq_len;
+    uint32_t rel_len;
+    uint32_t num_heads;
+    uint32_t head_dim;
+    uint32_t mode;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} termite_metal_deberta_relative_score_gemm_f32_params;
+
 typedef struct termite_metal_transpose_f32_params {
     uint32_t rank;
     uint32_t total;
@@ -1882,6 +1904,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_convert_dtype_f32_params { uint elem_count; uint kind; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
+           "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
            "struct termite_metal_dot_general_2d_f32_params { uint m; uint n; uint k; uint rhs_contract_axis; };\n"
            "struct termite_metal_dot_general_batched_f32_params { uint batch_count; uint m; uint n; uint k; uint rhs_contract_axis; uint reserved0; uint reserved1; uint reserved2; };\n"
@@ -3592,7 +3615,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint ki = lid; ki < p.seq_len; ki += width) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; float score = -3.402823466e+38f;\n"
            "        if (allowed) { uint k_base = (b * p.seq_len + ki) * hidden + head_off; uint rel_idx = qi + p.seq_len - 1u - ki; uint rel_base = rel_idx * hidden + head_off; float acc = 0.0f;\n"
-           "            for (uint x = 0u; x < p.head_dim; ++x) { float qx = q[q_base + x]; acc += qx * k[k_base + x] + qx * k_r[rel_base + x] + q_r[rel_base + x] * k[k_base + x]; }\n"
+           "            if (p.head_dim == 64u) { const device float4 *q4 = reinterpret_cast<const device float4 *>(q + q_base); const device float4 *k4 = reinterpret_cast<const device float4 *>(k + k_base); const device float4 *kr4 = reinterpret_cast<const device float4 *>(k_r + rel_base); const device float4 *qr4 = reinterpret_cast<const device float4 *>(q_r + rel_base); for (uint x4 = 0u; x4 < 16u; ++x4) { float4 qx = q4[x4]; float4 kx = k4[x4]; acc += dot(qx, kx) + dot(qx, kr4[x4]) + dot(qr4[x4], kx); } } else { for (uint x = 0u; x < p.head_dim; ++x) { float qx = q[q_base + x]; acc += qx * k[k_base + x] + qx * k_r[rel_base + x] + q_r[rel_base + x] * k[k_base + x]; } }\n"
            "            score = acc * scale; local_best = max(local_best, score); }\n"
            "        scores[ki] = score;\n"
            "    }\n"
@@ -3605,6 +3628,20 @@ static NSString *termite_metal_shader_source(void) {
            "    float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
            "    for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint k_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[ki] * v[k_base + d]; } output[(b * p.seq_len + qi) * hidden + head_off + d] = accum; }\n"
+           "}\n"
+           "kernel void termite_deberta_relative_score_gemm_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *q_r [[buffer(2)]], device const float *k_r [[buffer(3)]], device float *out [[buffer(4)]], constant termite_metal_deberta_relative_score_gemm_f32_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint width = p.mode == 0u ? p.seq_len : p.rel_len; uint rows_per_bh = p.seq_len * width; uint bh_count = p.batch * p.num_heads; uint total = bh_count * rows_per_bh; if (gid >= total || p.head_dim == 0u || width == 0u) return;\n"
+           "    uint r = gid % width; uint tmp = gid / width; uint token = tmp % p.seq_len; uint bh = tmp / p.seq_len; uint h = bh % p.num_heads; uint b = bh / p.num_heads; uint hidden = p.num_heads * p.head_dim; uint head_off = h * p.head_dim; uint left_base = (b * p.seq_len + token) * hidden + head_off; uint right_base = 0u;\n"
+           "    const device float *left = q; const device float *right = k; if (p.mode == 0u) { right_base = (b * p.seq_len + r) * hidden + head_off; } else if (p.mode == 1u) { right = k_r; right_base = r * hidden + head_off; } else { left = k; right = q_r; right_base = r * hidden + head_off; }\n"
+           "    float acc = 0.0f; if (p.head_dim == 64u) { const device float4 *l4 = reinterpret_cast<const device float4 *>(left + left_base); const device float4 *r4 = reinterpret_cast<const device float4 *>(right + right_base); for (uint x4 = 0u; x4 < 16u; ++x4) acc += dot(l4[x4], r4[x4]); } else { for (uint d = 0u; d < p.head_dim; ++d) acc += left[left_base + d] * right[right_base + d]; } out[gid] = acc;\n"
+           "}\n"
+           "kernel void termite_deberta_relative_score_softmax_pv_f32(device const float *cc [[buffer(0)]], device const float *c2p [[buffer(1)]], device const float *p2c [[buffer(2)]], device const float *v [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_disentangled_relative_attention_f32_params &p [[buffer(6)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    uint qi = tg.x; uint h = tg.y; uint b = tg.z; if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u || qi >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
+           "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint rel_len = p.seq_len * 2u - 1u; uint bh = b * p.num_heads + h; uint cc_base = (bh * p.seq_len + qi) * p.seq_len; uint c2p_base = (bh * p.seq_len + qi) * rel_len; float scale = rsqrt(float(p.head_dim) * 3.0f); threadgroup float *scores = scratch; threadgroup float *partials = scratch + p.seq_len;\n"
+           "    float local_best = -3.402823466e+38f; for (uint ki = lid; ki < p.seq_len; ki += width) { bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; uint rel_idx = qi + p.seq_len - 1u - ki; uint p2c_idx = (bh * p.seq_len + ki) * rel_len + rel_idx; float score = allowed ? (cc[cc_base + ki] + c2p[c2p_base + rel_idx] + p2c[p2c_idx]) * scale : -3.402823466e+38f; scores[ki] = score; local_best = max(local_best, score); } partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0]; float local_sum = 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); } partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    uint head_off = h * p.head_dim; for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[ki] * v[v_base + d]; } output[(b * p.seq_len + qi) * hidden + head_off + d] = accum; }\n"
            "}\n"
            "kernel void termite_transpose_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_transpose_f32_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.total || p.rank == 0u || p.rank > 8u) return;\n"
@@ -10735,6 +10772,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->sdpa_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32");
         runtime->disentangled_relative_attention_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_disentangled_relative_attention_f32");
         runtime->disentangled_relative_attention_f32_tg_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_disentangled_relative_attention_f32_tg");
+        runtime->deberta_relative_score_gemm_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_deberta_relative_score_gemm_f32");
+        runtime->deberta_relative_score_softmax_pv_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_deberta_relative_score_softmax_pv_f32");
         runtime->transpose_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_transpose_f32");
         runtime->dot_general_2d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_2d_f32");
         runtime->dot_general_batched_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_batched_f32");
@@ -11117,6 +11156,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->sdpa_f32_pipeline = nil;
     runtime->disentangled_relative_attention_f32_pipeline = nil;
     runtime->disentangled_relative_attention_f32_tg_pipeline = nil;
+    runtime->deberta_relative_score_gemm_f32_pipeline = nil;
+    runtime->deberta_relative_score_softmax_pv_f32_pipeline = nil;
     runtime->transpose_f32_pipeline = nil;
     runtime->dot_general_2d_f32_pipeline = nil;
     runtime->dot_general_batched_f32_pipeline = nil;
@@ -21313,6 +21354,79 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         {
             return -16;
         }
+        const BOOL gemm_attention_requested = (batch >= 4 && batch <= 8 && seq_len >= 256);
+        if (gemm_attention_requested &&
+            runtime->deberta_relative_score_gemm_f32_pipeline != nil &&
+            runtime->deberta_relative_score_softmax_pv_f32_pipeline != nil &&
+            seq_len <= 1024 &&
+            head_dim <= 1024)
+        {
+            const size_t rel_score_count = batch * num_heads * seq_len * rel_len;
+            const size_t cc_score_count = batch * num_heads * seq_len * seq_len;
+            if (rel_score_count <= SIZE_MAX / sizeof(float) && cc_score_count <= SIZE_MAX / sizeof(float)) {
+                const size_t cc_score_bytes = cc_score_count * sizeof(float);
+                const size_t rel_score_bytes = rel_score_count * sizeof(float);
+                const size_t gemm_slots[3] = {
+                    TERMITE_METAL_GRAPH_PLAN_DEBERTA_CC_SCORE_SLOT,
+                    TERMITE_METAL_GRAPH_PLAN_DEBERTA_C2P_SCORE_SLOT,
+                    TERMITE_METAL_GRAPH_PLAN_DEBERTA_P2C_SCORE_SLOT,
+                };
+                const size_t gemm_bytes[3] = { cc_score_bytes, rel_score_bytes, rel_score_bytes };
+                if (termite_metal_decode_runtime_reserve_graph_plan_slots(runtime, gemm_slots, gemm_bytes, 3) == 0) {
+                    id<MTLBuffer> cc_buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DEBERTA_CC_SCORE_SLOT];
+                    id<MTLBuffer> c2p_buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DEBERTA_C2P_SCORE_SLOT];
+                    id<MTLBuffer> p2c_buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DEBERTA_P2C_SCORE_SLOT];
+                    BOOL gemm_encoder_owned = YES;
+                    id<MTLComputeCommandEncoder> gemm_encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &gemm_encoder_owned);
+                    if (gemm_encoder == nil) return -16;
+                    termite_metal_deberta_relative_score_gemm_f32_params score_params = {
+                        .batch = (uint32_t)batch,
+                        .seq_len = (uint32_t)seq_len,
+                        .rel_len = (uint32_t)rel_len,
+                        .num_heads = (uint32_t)num_heads,
+                        .head_dim = (uint32_t)head_dim,
+                        .mode = 0,
+                        .reserved0 = 0,
+                        .reserved1 = 0,
+                    };
+                    [gemm_encoder setComputePipelineState:runtime->deberta_relative_score_gemm_f32_pipeline];
+                    [gemm_encoder setBuffer:q_buffer offset:q_offset atIndex:0];
+                    [gemm_encoder setBuffer:k_buffer offset:k_offset atIndex:1];
+                    [gemm_encoder setBuffer:q_r_buffer offset:q_r_offset atIndex:2];
+                    [gemm_encoder setBuffer:k_r_buffer offset:k_r_offset atIndex:3];
+                    [gemm_encoder setBuffer:cc_buffer offset:0 atIndex:4];
+                    [gemm_encoder setBytes:&score_params length:sizeof(score_params) atIndex:5];
+                    [gemm_encoder dispatchThreads:MTLSizeMake(cc_score_count, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, cc_score_count), 1, 1)];
+                    score_params.mode = 1;
+                    [gemm_encoder setBuffer:c2p_buffer offset:0 atIndex:4];
+                    [gemm_encoder setBytes:&score_params length:sizeof(score_params) atIndex:5];
+                    [gemm_encoder dispatchThreads:MTLSizeMake(rel_score_count, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, rel_score_count), 1, 1)];
+                    score_params.mode = 2;
+                    [gemm_encoder setBuffer:p2c_buffer offset:0 atIndex:4];
+                    [gemm_encoder setBytes:&score_params length:sizeof(score_params) atIndex:5];
+                    [gemm_encoder dispatchThreads:MTLSizeMake(rel_score_count, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, rel_score_count), 1, 1)];
+                    [gemm_encoder setComputePipelineState:runtime->deberta_relative_score_softmax_pv_f32_pipeline];
+                    [gemm_encoder setBuffer:cc_buffer offset:0 atIndex:0];
+                    [gemm_encoder setBuffer:c2p_buffer offset:0 atIndex:1];
+                    [gemm_encoder setBuffer:p2c_buffer offset:0 atIndex:2];
+                    [gemm_encoder setBuffer:v_buffer offset:v_offset atIndex:3];
+                    [gemm_encoder setBuffer:mask_buffer offset:mask_offset atIndex:4];
+                    [gemm_encoder setBuffer:output_buffer offset:output_offset atIndex:5];
+                    [gemm_encoder setBytes:&params length:sizeof(params) atIndex:6];
+                    const NSUInteger softmax_width = 64u;
+                    [gemm_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((seq_len + softmax_width) * sizeof(float)) atIndex:0];
+                    [gemm_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
+                           threadsPerThreadgroup:MTLSizeMake(softmax_width, 1, 1)];
+                    runtime->deberta_attention_gemm_calls += 1;
+                    termite_metal_end_scoped_compute_encoder(gemm_encoder, gemm_encoder_owned);
+                    return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
+                }
+            }
+            runtime->deberta_attention_gemm_fallbacks += 1;
+        }
         if (getenv("TERMITE_METAL_DISABLE_DEBERTA_TG_ATTENTION") == NULL &&
             runtime->disentangled_relative_attention_f32_tg_pipeline != nil &&
             seq_len <= 512 &&
@@ -21334,6 +21448,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
             [tg_encoder setThreadgroupMemoryLength:(seq_len + tg_width) * sizeof(float) atIndex:0];
             [tg_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
                        threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+            runtime->deberta_attention_legacy_calls += 1;
             termite_metal_end_scoped_compute_encoder(tg_encoder, tg_encoder_owned);
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
         }
@@ -21351,6 +21466,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
         [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_f32_pipeline, total), 1, 1)];
+        runtime->deberta_attention_legacy_calls += 1;
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
     }
@@ -32289,6 +32405,9 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->deberta_ffn_fused_calls = runtime->deberta_ffn_fused_calls;
     snapshot->deberta_ffn_fused_mps_matmuls = runtime->deberta_ffn_fused_mps_matmuls;
     snapshot->deberta_ffn_fused_fallbacks = runtime->deberta_ffn_fused_fallbacks;
+    snapshot->deberta_attention_legacy_calls = runtime->deberta_attention_legacy_calls;
+    snapshot->deberta_attention_gemm_calls = runtime->deberta_attention_gemm_calls;
+    snapshot->deberta_attention_gemm_fallbacks = runtime->deberta_attention_gemm_fallbacks;
     snapshot->mpsgraph_ffn_calls = runtime->mpsgraph_ffn_calls;
     snapshot->mpsgraph_ffn_fallbacks = runtime->mpsgraph_ffn_fallbacks;
     snapshot->mpsgraph_ffn_compiles = runtime->mpsgraph_ffn_compiles;
