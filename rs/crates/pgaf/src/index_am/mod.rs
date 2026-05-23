@@ -20,7 +20,8 @@ fn _antfly_amhandler(_fcinfo: pgrx::pg_sys::FunctionCallInfo) -> Internal {
 }
 
 const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = {
-    let mut am = unsafe { std::mem::MaybeUninit::<pgrx::pg_sys::IndexAmRoutine>::zeroed().assume_init() };
+    let mut am =
+        unsafe { std::mem::MaybeUninit::<pgrx::pg_sys::IndexAmRoutine>::zeroed().assume_init() };
 
     am.type_ = pgrx::pg_sys::NodeTag::T_IndexAmRoutine;
 

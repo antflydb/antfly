@@ -81,7 +81,10 @@ pub unsafe extern "C-unwind" fn amoptions(
     reloptions: pg_sys::Datum,
     validate: bool,
 ) -> *mut pg_sys::bytea {
-    let relopt_kind = RELOPT_KIND.get().copied().expect("options::init() not called");
+    let relopt_kind = RELOPT_KIND
+        .get()
+        .copied()
+        .expect("options::init() not called");
     let table = relopt_table();
     unsafe {
         pg_sys::build_reloptions(

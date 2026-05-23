@@ -26,22 +26,22 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = ROOT.parent
+REPO_ROOT = ROOT
 
 ELV2_ROOTS = (
-    "pkg/antfly",
-    "pkg/antfly-embedded",
-    "e2e/antfly",
+    "zig/pkg/antfly",
+    "zig/pkg/antfly-embedded",
+    "zig/e2e/antfly",
 )
 
 APACHE_ROOTS = (
-    "build.zig",
-    "build.zig.zon",
-    "pkg/antfly-client",
-    "pkg/termite",
-    "pkg/termite-client",
-    "lib",
-    "e2e/termite",
+    "zig/build.zig",
+    "zig/build.zig.zon",
+    "zig/pkg/antfly-client",
+    "zig/pkg/termite",
+    "zig/pkg/termite-client",
+    "zig/lib",
+    "zig/e2e/termite",
     "scripts",
     "tools",
     "specs",

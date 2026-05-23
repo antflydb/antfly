@@ -42,14 +42,14 @@ pub unsafe extern "C-unwind" fn ambuild(
             heap_relation,
             index_relation,
             index_info,
-            true,                        // allow_sync
-            false,                       // anyvisible
-            false,                       // progress
-            0,                           // start_blockno
-            pg_sys::InvalidBlockNumber,  // numblocks
+            true,                       // allow_sync
+            false,                      // anyvisible
+            false,                      // progress
+            0,                          // start_blockno
+            pg_sys::InvalidBlockNumber, // numblocks
             Some(build_callback),
             &mut state as *mut BuildState as *mut std::os::raw::c_void,
-            std::ptr::null_mut(),        // scan
+            std::ptr::null_mut(), // scan
         )
     };
 

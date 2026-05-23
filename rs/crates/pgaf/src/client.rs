@@ -82,11 +82,7 @@ impl AntflyClient {
     ///
     /// The body is sent as-is to `POST /tables/{table}/query`.
     /// Callers (e.g. the query builder functions) construct the JSON.
-    pub fn search_raw(
-        &self,
-        table: &str,
-        body: &Value,
-    ) -> Result<Vec<SearchHit>, ClientError> {
+    pub fn search_raw(&self, table: &str, body: &Value) -> Result<Vec<SearchHit>, ClientError> {
         let path = format!("tables/{}/query", table);
         let url = self
             .base_url
@@ -147,12 +143,7 @@ impl AntflyClient {
     /// Insert a single document via the batch API.
     ///
     /// Uses `sync_level: "full_text"` so the document is immediately searchable.
-    pub fn sync_document(
-        &self,
-        table: &str,
-        doc_id: &str,
-        doc: &Value,
-    ) -> Result<(), ClientError> {
+    pub fn sync_document(&self, table: &str, doc_id: &str, doc: &Value) -> Result<(), ClientError> {
         let path = format!("tables/{}/batch", table);
         let url = self
             .base_url

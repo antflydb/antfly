@@ -64,7 +64,10 @@ export class AntflyClient {
   private config: AntflyConfig;
 
   constructor(config: AntflyConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      baseUrl: normalizeBaseUrl(config.baseUrl),
+    };
     this.client = this.buildClient();
   }
 
@@ -82,7 +85,7 @@ export class AntflyClient {
           return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
         case "apiKey":
           return `ApiKey ${btoa(`${auth.keyId}:${auth.keySecret}`)}`;
-        case "bearer":
+        case "token":
           return `Bearer ${auth.token}`;
       }
     }
@@ -106,7 +109,7 @@ export class AntflyClient {
     }
 
     return createClient<paths>({
-      baseUrl: normalizeAntflyBaseUrl(this.config.baseUrl),
+      baseUrl: normalizeBaseUrl(this.config.baseUrl),
       headers,
       bodySerializer: (body) => {
         if (typeof body === "string") {
@@ -119,7 +122,7 @@ export class AntflyClient {
 
   /**
    * Update authentication credentials.
-   * Accepts any auth type: basic (username/password), apiKey, or bearer.
+   * Accepts any auth type: basic (username/password), apiKey, or token.
    * For backwards compat, calling setAuth(username, password) still works.
    */
   setAuth(auth: AntflyAuth): void;
@@ -236,7 +239,7 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
-    const response = await fetch(`${normalizeAntflyBaseUrl(this.config.baseUrl)}/api/v1/agents/retrieval`, {
+    const response = await fetch(`${normalizeBaseUrl(this.config.baseUrl)}/api/v1/agents/retrieval`, {
       method: "POST",
       headers,
       body: JSON.stringify(request),
@@ -669,7 +672,7 @@ export class AntflyClient {
         // Merge with any additional headers
         Object.assign(headers, config.headers);
 
-        const response = await fetch(`${normalizeAntflyBaseUrl(config.baseUrl)}/api/v1/tables/${tableName}/lookup`, {
+        const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/api/v1/tables/${tableName}/lookup`, {
           method: "POST",
           headers,
           body: JSON.stringify(request || {}),
@@ -911,6 +914,6 @@ export class AntflyClient {
   }
 }
 
-function normalizeAntflyBaseUrl(baseUrl: string): string {
+export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/$/, "").replace(/\/api\/v1$/, "");
 }

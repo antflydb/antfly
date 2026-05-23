@@ -28,6 +28,8 @@ vi.mock("openapi-fetch", () => ({
 
 // Import client after mocking
 const { AntflyClient } = await import("../src/client.js");
+const { normalizeBaseUrl } = await import("../src/client.js");
+const { default: createClient } = await import("openapi-fetch");
 
 describe("AntflyClient", () => {
   let client: AntflyClient;
@@ -53,6 +55,34 @@ describe("AntflyClient", () => {
 
     it("should have access to raw client", () => {
       expect(client.getRawClient()).toBeDefined();
+    });
+
+    it("should normalize local and CloudAF base URLs", () => {
+      expect(normalizeBaseUrl("http://localhost:8080")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/api/v1")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance")).toBe(
+        "https://platform.antfly.io/cloud/v1/instance"
+      );
+      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance/api/v1")).toBe(
+        "https://platform.antfly.io/cloud/v1/instance"
+      );
+    });
+
+    it("should configure token auth", () => {
+      new AntflyClient({
+        baseUrl: "https://platform.antfly.io/cloud/v1/instance",
+        auth: { type: "token", token: "antflydb_test" },
+      });
+
+      expect(createClient).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          baseUrl: "https://platform.antfly.io/cloud/v1/instance",
+          headers: expect.objectContaining({
+            Authorization: "Bearer antflydb_test",
+          }),
+        })
+      );
     });
   });
 

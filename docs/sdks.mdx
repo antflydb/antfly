@@ -37,7 +37,7 @@ Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust.
 
 ## Authentication
 
-All three authentication methods are supported across SDKs: basic auth, API key, and bearer token.
+All three authentication methods are supported across SDKs: basic auth, API key, and token.
 
 ### Basic Auth
 
@@ -81,20 +81,20 @@ All three authentication methods are supported across SDKs: basic auth, API key,
   }
 ]} />
 
-### Bearer Token
+### Token
 
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `client, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBearerToken("your-token"),\n)`
+    code: `client, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithToken("your-token"),\n)`
   },
   {
     language: "TypeScript",
-    code: `const client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: {\n    type: 'bearer',\n    token: 'your-token',\n  },\n});`
+    code: `const client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: {\n    type: 'token',\n    token: 'your-token',\n  },\n});`
   },
   {
     language: "Python",
-    code: `client = AntflyClient(\n    base_url='http://localhost:8080',\n    bearer_token='your-token',\n)`
+    code: `client = AntflyClient(\n    base_url='http://localhost:8080',\n    token='your-token',\n)`
   },
   {
     language: "Rust",

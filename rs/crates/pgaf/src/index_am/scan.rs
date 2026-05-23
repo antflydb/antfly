@@ -25,8 +25,8 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     };
 
     unsafe {
-        (*scan).opaque = pgrx::PgMemoryContexts::CurrentMemoryContext
-            .leak_and_drop_on_delete(state) as *mut std::os::raw::c_void;
+        (*scan).opaque = pgrx::PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(state)
+            as *mut std::os::raw::c_void;
     }
 
     scan
@@ -105,8 +105,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
     // Execute search on first call
     if state.current == 0 && state.results.is_empty() {
         if let Some(ref query) = state.query {
-            let (url, collection) =
-                unsafe { options::get_options((*scan).indexRelation) };
+            let (url, collection) = unsafe { options::get_options((*scan).indexRelation) };
 
             let client = AntflyClient::new(&url).unwrap_or_else(|e| {
                 pgrx::error!("pgaf: failed to create client: {}", e);

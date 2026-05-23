@@ -15,6 +15,7 @@ import (
 type InternalClient struct {
 	baseURL    string
 	httpClient *http.Client
+	token      string
 }
 
 // NewInternalClient creates a new internal admin client
@@ -36,11 +37,34 @@ func NewInternalClient(baseURL string, httpClient *http.Client) *InternalClient 
 	}
 }
 
+// WithToken configures token authentication for internal admin requests.
+func (c *InternalClient) WithToken(token string) *InternalClient {
+	c.token = token
+	return c
+}
+
+func (c *InternalClient) newRequest(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return req, nil
+}
+
 // AddMetadataPeer adds a new peer to the metadata raft cluster
 func (c *InternalClient) AddMetadataPeer(nodeID uint64, raftURL string) error {
 	// Make POST request to internal endpoint
 	url := fmt.Sprintf("%s/_internal/v1/peer/%d", c.baseURL, nodeID)
-	resp, err := c.httpClient.Post(url, "application/octet-stream", strings.NewReader(raftURL))
+	req, err := c.newRequest(http.MethodPost, url, strings.NewReader(raftURL))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.httpClient.Do(req) //nolint:gosec // URL constructed from trusted c.baseURL
 	if err != nil {
 		return fmt.Errorf("failed to add peer: %w", err)
 	}
@@ -58,7 +82,7 @@ func (c *InternalClient) AddMetadataPeer(nodeID uint64, raftURL string) error {
 func (c *InternalClient) RemoveMetadataPeer(nodeID uint64) error {
 	// Make DELETE request to internal endpoint
 	url := fmt.Sprintf("%s/_internal/v1/peer/%d", c.baseURL, nodeID)
-	req, err := http.NewRequest("DELETE", url, nil)
+	req, err := c.newRequest(http.MethodDelete, url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -99,7 +123,12 @@ type ShardInfo struct {
 func (c *InternalClient) GetMetadataStatus() (*MetadataStatus, error) {
 	// Make GET request to the internal status endpoint
 	url := fmt.Sprintf("%s/_internal/v1/status", c.baseURL)
-	resp, err := c.httpClient.Get(url)
+	req, err := c.newRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req) //nolint:gosec // URL constructed from trusted c.baseURL
 	if err != nil {
 		return nil, fmt.Errorf("failed to get metadata status: %w", err)
 	}

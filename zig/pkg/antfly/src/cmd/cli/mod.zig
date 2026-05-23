@@ -29,7 +29,7 @@ pub const OutputFormat = enum { json, table_fmt };
 
 pub const GlobalConfig = struct {
     url: []const u8 = "http://localhost:8080",
-    auth_bearer: ?[]const u8 = null,
+    token: ?[]const u8 = null,
     output: OutputFormat = .json,
 };
 
@@ -37,21 +37,21 @@ pub const GlobalConfig = struct {
 ///
 /// Supported env vars:
 ///   ANTFLY_URL    — server base URL (default http://localhost:8080)
-///   ANTFLY_BEARER — bearer token for authentication
+///   ANTFLY_TOKEN  — bearer token for authentication
 pub fn parseGlobalFlags() GlobalConfig {
     var config = GlobalConfig{};
     if (platform.env.getenv("ANTFLY_URL")) |raw| {
         config.url = raw;
     }
-    if (platform.env.getenv("ANTFLY_BEARER")) |raw| {
-        config.auth_bearer = raw;
+    if (platform.env.getenv("ANTFLY_TOKEN")) |raw| {
+        config.token = raw;
     }
     return config;
 }
 
 pub fn initClient(allocator: std.mem.Allocator, http: *httpx.Client, config: GlobalConfig) !antfly_client.AntflyClient {
     var client = try antfly_client.AntflyClient.init(allocator, http, config.url);
-    if (config.auth_bearer) |token| {
+    if (config.token) |token| {
         try client.setBearer(token);
     }
     return client;

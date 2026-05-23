@@ -42,8 +42,9 @@ fn strip_non_json_media_types(spec: &mut serde_yaml::Value) {
                 for (_method, operation) in methods.iter_mut() {
                     strip_content_map(operation.get_mut("requestBody"), &json_key);
 
-                    if let Some(responses) =
-                        operation.get_mut("responses").and_then(|r| r.as_mapping_mut())
+                    if let Some(responses) = operation
+                        .get_mut("responses")
+                        .and_then(|r| r.as_mapping_mut())
                     {
                         for (_status, resp) in responses.iter_mut() {
                             strip_content_map(Some(resp), &json_key);
@@ -72,8 +73,9 @@ content:
         for (_path, methods) in paths.iter_mut() {
             if let Some(methods) = methods.as_mapping_mut() {
                 for (_method, operation) in methods.iter_mut() {
-                    if let Some(responses) =
-                        operation.get_mut("responses").and_then(|r| r.as_mapping_mut())
+                    if let Some(responses) = operation
+                        .get_mut("responses")
+                        .and_then(|r| r.as_mapping_mut())
                     {
                         for (code, resp) in responses.iter_mut() {
                             let code_str = match code {
@@ -86,11 +88,9 @@ content:
                                 continue;
                             }
                             // If it has content with a non-Error schema, replace it
-                            if let Some(content) =
-                                resp.get("content").and_then(|c| c.as_mapping())
+                            if let Some(content) = resp.get("content").and_then(|c| c.as_mapping())
                             {
-                                let json_key =
-                                    serde_yaml::Value::String("application/json".into());
+                                let json_key = serde_yaml::Value::String("application/json".into());
                                 if let Some(media) = content.get(&json_key) {
                                     if let Some(schema) = media.get("schema") {
                                         let is_error_ref = schema

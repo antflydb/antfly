@@ -38,13 +38,15 @@ mod tests {
         // Give antfly time to index
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let count = Spi::get_one::<i64>(
-            "SELECT count(*) FROM e2e_docs WHERE content @@@ 'fix computer'",
-        )
-        .unwrap()
-        .unwrap();
+        let count =
+            Spi::get_one::<i64>("SELECT count(*) FROM e2e_docs WHERE content @@@ 'fix computer'")
+                .unwrap()
+                .unwrap();
 
-        assert!(count > 0, "Expected at least 1 result for 'fix computer', got {count}");
+        assert!(
+            count > 0,
+            "Expected at least 1 result for 'fix computer', got {count}"
+        );
     }
 
     #[pg_test]
@@ -85,12 +87,9 @@ mod tests {
             return;
         };
 
-        let result = Spi::get_one::<String>(&format!(
-            "SELECT antfly_status('{}')",
-            base_url
-        ))
-        .unwrap()
-        .unwrap();
+        let result = Spi::get_one::<String>(&format!("SELECT antfly_status('{}')", base_url))
+            .unwrap()
+            .unwrap();
 
         assert!(
             result.contains("connected"),
@@ -100,19 +99,19 @@ mod tests {
 
     #[pg_test]
     fn test_query_builder_search_produces_json() {
-        let result =
-            Spi::get_one::<String>("SELECT pgaf.search('hello world')").unwrap().unwrap();
+        let result = Spi::get_one::<String>("SELECT pgaf.search('hello world')")
+            .unwrap()
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["full_text_search"]["query"], "hello world");
     }
 
     #[pg_test]
     fn test_query_builder_semantic_produces_json() {
-        let result = Spi::get_one::<String>(
-            "SELECT pgaf.semantic('hello world', ARRAY['emb_idx'])",
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            Spi::get_one::<String>("SELECT pgaf.semantic('hello world', ARRAY['emb_idx'])")
+                .unwrap()
+                .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["semantic_search"], "hello world");
         assert_eq!(v["indexes"][0], "emb_idx");
@@ -133,11 +132,10 @@ mod tests {
 
     #[pg_test]
     fn test_query_builder_filter_prefix() {
-        let result = Spi::get_one::<String>(
-            "SELECT pgaf.search('hello', filter_prefix => 'tenant:acme:')",
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            Spi::get_one::<String>("SELECT pgaf.search('hello', filter_prefix => 'tenant:acme:')")
+                .unwrap()
+                .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["full_text_search"]["query"], "hello");
         assert_eq!(v["filter_prefix"], "tenant:acme:");

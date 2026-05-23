@@ -24,6 +24,14 @@ from antfly.client_generated.types import UNSET
 from .exceptions import AntflyException
 
 
+def normalize_base_url(base_url: str) -> str:
+    """Return the Antfly API base URL for local or CloudAF endpoints."""
+    trimmed = base_url.rstrip("/")
+    if trimmed.endswith("/api/v1"):
+        return trimmed
+    return f"{trimmed}/api/v1"
+
+
 class AntflyClient:
     """High-level client for interacting with Antfly database."""
 
@@ -33,7 +41,7 @@ class AntflyClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         api_key: Optional[tuple[str, str]] = None,
-        bearer_token: Optional[str] = None,
+        token: Optional[str] = None,
         timeout: float = 30.0,
     ):
         """
@@ -42,17 +50,17 @@ class AntflyClient:
         Supports three authentication methods (mutually exclusive):
         - Basic auth: provide ``username`` and ``password``
         - API key: provide ``api_key`` as ``(key_id, key_secret)``
-        - Bearer token: provide ``bearer_token``
+        - Token: provide ``token``
 
         Args:
-            base_url: Base URL of the Antfly server
+            base_url: Base URL of the Antfly server or CloudAF proxy
             username: Username for basic authentication (optional)
             password: Password for basic authentication (optional)
             api_key: Tuple of (key_id, key_secret) for API key authentication (optional)
-            bearer_token: Bearer token string for token authentication (optional)
+            token: Token string for token authentication (optional)
             timeout: Request timeout in seconds
         """
-        self.base_url = base_url.rstrip("/")
+        self.base_url = normalize_base_url(base_url)
 
         httpx_args: dict[str, Any] = {}
 
@@ -66,10 +74,10 @@ class AntflyClient:
                 timeout=Timeout(timeout),
                 httpx_args=httpx_args,
             )
-        elif bearer_token is not None:
+        elif token is not None:
             self._client = AuthenticatedClient(
                 base_url=self.base_url,
-                token=bearer_token,
+                token=token,
                 prefix="Bearer",
                 timeout=Timeout(timeout),
                 httpx_args=httpx_args,

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Step lifecycle SSE events for Answer Agent streaming
 - AI Elements adapters and replication route types
 - Embedding, DenseEmbedding, SparseEmbedding type exports
-- API key and bearer token auth support
+- API key and token auth support
 - MergeConfig and updated index types
 - Sparse bool and consolidated index types
 

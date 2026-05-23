@@ -87,8 +87,7 @@ type AntflyClient struct {
 
 // NewAntflyClient creates a new Antfly client with an HTTP client.
 func NewAntflyClient(baseURL string, httpClient *http.Client) (*AntflyClient, error) {
-	baseURL = normalizeAntflyBaseURL(baseURL)
-	client, err := oapi.NewClient(baseURL, oapi.WithHTTPClient(httpClient))
+	client, err := oapi.NewClient(NormalizeBaseURL(baseURL), oapi.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, err
 	}
@@ -98,20 +97,15 @@ func NewAntflyClient(baseURL string, httpClient *http.Client) (*AntflyClient, er
 }
 
 // NewAntflyClientWithOptions creates a new Antfly client with variadic options.
-// Use with WithBasicAuth, WithApiKey, or WithBearerToken for authentication.
+// Use with WithBasicAuth, WithApiKey, or WithToken for authentication.
 func NewAntflyClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*AntflyClient, error) {
-	baseURL = normalizeAntflyBaseURL(baseURL)
-	client, err := oapi.NewClient(baseURL, opts...)
+	client, err := oapi.NewClient(NormalizeBaseURL(baseURL), opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &AntflyClient{
 		client: client,
 	}, nil
-}
-
-func normalizeAntflyBaseURL(baseURL string) string {
-	return strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/api/v1")
 }
 
 // WithBasicAuth returns a RequestEditorFn that adds HTTP Basic Authentication.
@@ -133,10 +127,8 @@ func WithApiKey(keyID, keySecret string) oapi.RequestEditorFn {
 	}
 }
 
-// WithBearerToken returns a RequestEditorFn that adds Bearer token authentication.
-// The token should be base64(keyID:keySecret) for Antfly API keys, or an opaque token
-// from a proxy.
-func WithBearerToken(token string) oapi.RequestEditorFn {
+// WithToken returns a RequestEditorFn that adds token authentication.
+func WithToken(token string) oapi.RequestEditorFn {
 	return func(_ context.Context, req *http.Request) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 		return nil

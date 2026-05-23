@@ -13,9 +13,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
 ) {
     unsafe {
         // Without a @@@ clause, discourage the planner from using this index.
-        if (*path).indexclauses.is_null()
-            || (*(*path).indexclauses).length == 0
-        {
+        if (*path).indexclauses.is_null() || (*(*path).indexclauses).length == 0 {
             *index_startup_cost = f64::MAX;
             *index_total_cost = f64::MAX;
             *index_selectivity = 0.0;
