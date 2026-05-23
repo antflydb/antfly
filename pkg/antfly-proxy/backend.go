@@ -87,7 +87,7 @@ func (ServerlessBackendAdapter) Kind() BackendKind {
 }
 
 func (ServerlessBackendAdapter) BaseURL(req RequestContext, route NamespaceRoute) (string, error) {
-	if req.Operation == OperationWrite || req.Operation == OperationAdmin {
+	if isMutatingOperation(req.Operation) {
 		if strings.TrimSpace(route.ServerlessAPIURL) == "" {
 			return "", fmt.Errorf("table %q has no serverless api URL", route.TableName())
 		}

@@ -86,7 +86,7 @@ func (r *Router) ResolveBackend(ctx context.Context, req RequestContext) (Backen
 		return kind, adapter, route, nil
 	}
 
-	if req.Operation == OperationWrite {
+	if isMutatingOperation(req.Operation) {
 		if route.AllowStateful {
 			return resolve(BackendStateful)
 		}
@@ -131,6 +131,10 @@ func (r *Router) ResolveBackend(ctx context.Context, req RequestContext) (Backen
 
 func (req RequestContext) ResourceName() string {
 	return firstNonEmpty(req.Table, req.Namespace)
+}
+
+func isMutatingOperation(operation OperationKind) bool {
+	return operation == OperationWrite || operation == OperationAdmin
 }
 
 func (route NamespaceRoute) TableName() string {
