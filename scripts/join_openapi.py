@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from openapi_spec_validator import validate_spec
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -204,6 +205,11 @@ def add_redocly_tag_groups(spec: dict) -> dict:
     return spec
 
 
+def validate_openapi_spec(spec: dict, source: Path) -> None:
+    validate_spec(spec, base_uri=source.resolve().as_uri())
+    print(f"validated {source}")
+
+
 def load_shared_joiner():
     spec = importlib.util.spec_from_file_location("antfly_openapi_joiner", SHARED_JOINER)
     if spec is None or spec.loader is None:
@@ -271,12 +277,18 @@ def main(argv: list[str]) -> int:
         has_drift = joiner.compare_specs(joined, current)
         return 1 if has_drift else 0
 
+    if argv and argv[0] == "--validate":
+        target = ROOT / (argv[1] if len(argv) > 1 else "openapi.yaml")
+        validate_openapi_spec(joiner.load_yaml(target), target)
+        return 0
+
     joined = joiner.bundle_joined_spec(joiner.join_specs(metadata, usermgr))
     add_redocly_tag_groups(joined)
     output = ROOT / (argv[0] if argv else "openapi.joined.yaml")
     order_openapi_like_reference(joined, output)
     dump_yaml(joined, output)
     print(f"wrote {output}")
+    validate_openapi_spec(joined, output)
     return 0
 
 
