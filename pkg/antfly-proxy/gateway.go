@@ -299,10 +299,10 @@ func parsePublicAPIPath(path string) (tenant string, table string, backendPath s
 }
 
 func resolveRequestOperation(method, path, hint string) (OperationKind, error) {
-	required := inferOperationFromBackendPath(method, path)
-	if required == "" {
-		required = inferOperationFromMethod(method)
+	if inferred := inferOperationFromBackendPath(method, path); inferred != "" {
+		return inferred, nil
 	}
+	required := inferOperationFromMethod(method)
 	if strings.TrimSpace(hint) == "" {
 		return required, nil
 	}

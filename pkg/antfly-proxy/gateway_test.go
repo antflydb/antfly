@@ -141,9 +141,16 @@ func TestResolveRequestOperationEnforcesInferredMinimum(t *testing.T) {
 			want:   OperationRead,
 		},
 		{
-			name:   "hints can request stricter auth",
+			name:   "known read paths ignore stricter hints",
 			method: http.MethodPost,
 			path:   "/query/search",
+			hint:   "admin",
+			want:   OperationRead,
+		},
+		{
+			name:   "hints can request stricter auth for generic paths",
+			method: http.MethodPost,
+			path:   "/ingest-batch",
 			hint:   "admin",
 			want:   OperationAdmin,
 		},
