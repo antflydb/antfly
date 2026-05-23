@@ -2726,7 +2726,7 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
                 .path_match = "meta.*",
                 .mapping = .{
                     .field_type = .search_as_you_type,
-                    .analyzer = "search_as_you_type",
+                    .analyzer = "search_as_you_type_index_prefix",
                 },
             },
         },
@@ -2742,6 +2742,8 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
 
     try std.testing.expect((try reader.invertedIndex("meta.nickname")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.nickname._2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._3gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._index_prefix")) == null);
 }
 
 test "document mapper honors dynamic-template exclusions and mapping type" {

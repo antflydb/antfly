@@ -1303,10 +1303,10 @@ pub const search_as_you_type_3gram_analyzer = Analyzer{
     .filters = &.{ .lowercase, .{ .shingle = .{ .min = 3, .max = 3 } } },
 };
 
-/// Search-as-you-type prefix subfield: unicode_words → lowercase → edge_ngram(min=2, max=4)
+/// Search-as-you-type prefix subfield: unicode_words → lowercase → shingle(1..3) → edge_ngram(min=2, max=20)
 pub const search_as_you_type_index_prefix_analyzer = Analyzer{
     .tokenizer = .unicode_words,
-    .filters = &.{ .lowercase, .{ .edge_ngram = .{ .min = 2, .max = 4 } } },
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 1, .max = 3 } }, .{ .edge_ngram = .{ .min = 2, .max = 20 } } },
 };
 
 pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
@@ -1803,6 +1803,13 @@ test "html_analyzer end-to-end" {
     }
 }
 
+fn expectTokenTerm(tokens: []const Token, expected: []const u8) !void {
+    for (tokens) |token| {
+        if (std.mem.eql(u8, token.term, expected)) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "search_as_you_type analyzers" {
     const alloc = std.testing.allocator;
     const grams2 = try search_as_you_type_2gram_analyzer.analyze(alloc, "quick brown fox");
@@ -1816,13 +1823,19 @@ test "search_as_you_type analyzers" {
     try std.testing.expectEqual(@as(usize, 1), grams3.len);
     try std.testing.expectEqualStrings("quick brown fox", grams3[0].term);
 
-    // "hello" → lowercase → "hello" → edge_ngram(2,4) → "he","hel","hell"
+    // "hello" → lowercase → shingle(1,3) → "hello" → edge_ngram(2,20)
     const prefixes = try search_as_you_type_index_prefix_analyzer.analyze(alloc, "hello");
     defer Analyzer.freeTokens(alloc, prefixes);
-    try std.testing.expectEqual(@as(usize, 3), prefixes.len);
+    try std.testing.expectEqual(@as(usize, 4), prefixes.len);
     try std.testing.expectEqualStrings("he", prefixes[0].term);
     try std.testing.expectEqualStrings("hel", prefixes[1].term);
     try std.testing.expectEqualStrings("hell", prefixes[2].term);
+    try std.testing.expectEqualStrings("hello", prefixes[3].term);
+
+    const phrase_prefixes = try search_as_you_type_index_prefix_analyzer.analyze(alloc, "quick brown fox");
+    defer Analyzer.freeTokens(alloc, phrase_prefixes);
+    try expectTokenTerm(phrase_prefixes, "brown f");
+    try expectTokenTerm(phrase_prefixes, "quick brown f");
 }
 
 test "german analyzer end-to-end" {

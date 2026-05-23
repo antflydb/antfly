@@ -16,9 +16,9 @@ title: Downloads
 Antfly is currently in pre-alpha development.
 We are actively working on features and improvements, and we welcome your feedback.
 
-Antfly ships with bundled [ONNX Runtime](https://onnxruntime.ai/) and [XLA](https://openxla.org/) backends for fast local ML inference. This allows Antfly to generate embeddings, rerank results, and chunk text directly without requiring an external service like Ollama.
+Antfly now ships the native Zig runtime as the default `antfly` binary. The previous Go/omni runtime remains available as `antfly-go` for old data directories, rollback, and portable backup creation before restoring into a fresh Zig data directory.
 
-<DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} variant="omni" />
+<DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
 
 ### Installation Instructions
 
@@ -43,12 +43,21 @@ brew tap antflydb/taps
 brew install antfly
 ```
 
-This installs `antfly` with bundled ONNX Runtime and XLA libraries for local ML inference. CLI commands are available directly as `antfly <command>` (e.g., `antfly query`, `antfly table create`).
+This installs the native Zig runtime as `antfly`. CLI commands are available directly as `antfly <command>` (e.g., `antfly query`, `antfly table create`).
 
 To run Antfly as a local service:
 
 ```bash
 brew services start antfly
+```
+
+When migrating from the Go/omni runtime to the Zig runtime, do not reuse the old data directory in place. Create a portable backup with the previous Go/omni binary, start the Zig runtime with a fresh data directory, then restore the backup.
+
+To keep using the previous Go/omni runtime or create that backup:
+
+```bash
+brew install antflydb/taps/antfly-go
+antfly-go --help
 ```
   </TabsContent>
 
@@ -57,19 +66,19 @@ brew services start antfly
 ### Install using the install script (recommended)
 
 ```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
 ```
 
 Or install a specific version:
 
 ```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni {ANTFLY_VERSION}
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- {ANTFLY_VERSION}
 ```
 
 ### Or manually extract the binaries
 
 ```bash
-tar -xzf antfly-omni_{ANTFLY_VERSION}_Darwin_arm64.tar.gz
+tar -xzf antfly_{ANTFLY_VERSION}_Darwin_arm64.tar.gz
 ```
 
 ### Make the binaries executable
@@ -81,16 +90,23 @@ chmod +x antfly
 ### Remove the quarantine attribute
 
 ```bash
-xattr -dr com.apple.quarantine antfly lib/
+xattr -dr com.apple.quarantine antfly
 ```
 
-### Ensure the binaries and libraries are accessible
+### Ensure the binary is accessible
 
-The `lib/` directory contains the bundled ONNX Runtime and XLA libraries. Keep it alongside the `antfly` binary, or set `DYLD_LIBRARY_PATH`:
+Add the extracted directory to your `PATH`:
 
 ```bash
-export DYLD_LIBRARY_PATH=$(pwd)/lib:$DYLD_LIBRARY_PATH
 export PATH=$PATH:$(pwd)
+```
+
+### Go/omni fallback
+
+Use `--go` to install the previous runtime as `antfly-go`:
+
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --go
 ```
 </Steps>
   </TabsContent>
@@ -100,19 +116,19 @@ export PATH=$PATH:$(pwd)
 ### Install using the install script (recommended)
 
 ```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
 ```
 
 Or install a specific version:
 
 ```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni {ANTFLY_VERSION}
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- {ANTFLY_VERSION}
 ```
 
 ### Or manually extract the binaries
 
 ```bash
-tar -xzf antfly-omni_{ANTFLY_VERSION}_Linux_x86_64.tar.gz
+tar -xzf antfly_{ANTFLY_VERSION}_Linux_x86_64.tar.gz
 ```
 
 For ARM64, use `Linux_arm64` instead.
@@ -123,23 +139,30 @@ For ARM64, use `Linux_arm64` instead.
 chmod +x antfly
 ```
 
-### Ensure the binaries and libraries are accessible
+### Ensure the binary is accessible
 
-The `lib/` directory contains the bundled ONNX Runtime and XLA libraries. Keep it alongside the `antfly` binary, or set `LD_LIBRARY_PATH`:
+Add the extracted directory to your `PATH`:
 
 ```bash
-export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 export PATH=$PATH:$(pwd)
+```
+
+### Go/omni fallback
+
+Use `--go` to install the previous runtime as `antfly-go`:
+
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --go
 ```
 </Steps>
   </TabsContent>
 
   <TabsContent value="windows">
 <Callout type="info">
-The Windows build is a pure Go binary without bundled ML backends. Use an external embedding provider like Ollama for ML inference on Windows.
+The Windows build is the previous pure Go binary without bundled ML backends. Use an external embedding provider like Ollama for ML inference on Windows.
 </Callout>
 
-<DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
+<DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} variant="go" />
 
 <Steps>
 ### Extract the ZIP file

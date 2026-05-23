@@ -36,7 +36,7 @@ help:
 	@echo "  build              Build the Zig antfly binary"
 	@echo "  build-go           Build the legacy Go antfly binary"
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
-	@echo "  build-docs         Join and lint OpenAPI specifications"
+	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate code, client SDKs, and all website documentation (API, config, changelog)"
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
@@ -107,8 +107,7 @@ build-go: build-antfarm generate
 	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
 
 build-docs:
-	npx @redocly/cli@latest join src/metadata/api.yaml src/usermgr/api.yaml
-	npx @redocly/cli@latest lint openapi.yaml
+	uv run --project zig/scripts --locked python scripts/join_openapi.py openapi.yaml
 
 generate: build-docs tidy
 	$(GO) generate ./...

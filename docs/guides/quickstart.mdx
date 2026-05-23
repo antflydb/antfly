@@ -30,7 +30,7 @@ antfly --version
 
   <TabsContent value="linux">
 ```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- --omni
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
 
 # Verify
 antfly --version
@@ -44,10 +44,10 @@ See the [Downloads page](/docs/downloads) for a complete Docker Compose setup wi
 
 ## Start Antfly
 
-Pull a text embedding model for semantic search. [Termite](/docs/guides/termite) is Antfly's built-in ML inference engine — it runs ONNX-optimized models locally for fast CPU inference, no external APIs needed.
+Pull a multimodal embedding model for text and image search. [Termite](/docs/guides/termite) is Antfly's built-in ML inference engine — it runs quantized models locally for fast inference, no external APIs needed.
 
 ```bash
-antfly termite pull --variants i8 BAAI/bge-small-en-v1.5
+antfly termite pull antflydb/clipclap:gguf:Q4_K_M
 ```
 
 Start Antfly in swarm mode:
@@ -100,7 +100,7 @@ antfly table create --table wikipedia \
     "template": "{{title}} {{body}}",
     "embedder": {
       "provider": "termite",
-      "model": "BAAI/bge-small-en-v1.5"
+      "model": "antflydb/clipclap"
     },
     "chunker": {
       "provider": "antfly",
@@ -124,7 +124,7 @@ curl -X POST http://localhost:8080/api/v1/tables/wikipedia \
         "template": "{{title}} {{body}}",
         "embedder": {
           "provider": "termite",
-          "model": "BAAI/bge-small-en-v1.5"
+          "model": "antflydb/clipclap"
         },
         "chunker": {
           "provider": "antfly",
@@ -154,7 +154,7 @@ await client.tables.create('wikipedia', {
       template: '{{title}} {{body}}',
       embedder: {
         provider: 'termite',
-        model: 'BAAI/bge-small-en-v1.5',
+        model: 'antflydb/clipclap',
       },
       chunker: {
         provider: 'antfly',
@@ -180,7 +180,7 @@ client.create_table(
             'template': '{{title}} {{body}}',
             'embedder': {
                 'provider': 'termite',
-                'model': 'BAAI/bge-small-en-v1.5',
+                'model': 'antflydb/clipclap',
             },
             'chunker': {
                 'provider': 'antfly',
@@ -215,7 +215,7 @@ _, err = client.CreateTableWithResponse(
 				"template": "{{title}} {{body}}",
 				"embedder": map[string]interface{}{
 					"provider": "termite",
-					"model":    "BAAI/bge-small-en-v1.5",
+					"model":    "antflydb/clipclap",
 				},
 				"chunker": map[string]interface{}{
 					"provider": "antfly",
@@ -245,7 +245,7 @@ client.create_table("wikipedia", &json!({
             "template": "{{title}} {{body}}",
             "embedder": {
                 "provider": "termite",
-                "model": "BAAI/bge-small-en-v1.5"
+                "model": "antflydb/clipclap"
             },
             "chunker": {
                 "provider": "antfly",
@@ -825,13 +825,13 @@ let resp = client
 
 ## Image Search
 
-Search by visual content using CLIP, a multimodal embedding model that understands both text descriptions and images.
+Search by visual content using ClipClap, a multimodal embedding model that understands text, images, and audio.
 
 <Steps>
-### Pull the CLIP model
+### Confirm the ClipClap model is available
 
 ```bash
-antfly termite pull openai/clip-vit-base-patch32
+antfly termite pull antflydb/clipclap:gguf:Q4_K_M
 ```
 
 <Callout type="info">
@@ -840,7 +840,7 @@ If Antfly doesn't detect the new model, restart `antfly swarm`.
 
 ### Add an image index to your table
 
-Add a CLIP-based index to embed each article's Wikipedia thumbnail:
+Add a ClipClap-based index to embed each article's Wikipedia thumbnail:
 
 <Tabs defaultValue="cli">
   <TabsList>
@@ -858,7 +858,7 @@ antfly index create --table wikipedia \
   --index thumbnail \
   --type embeddings \
   --template "{{media url=thumbnail_url}}" \
-  --embedder '{"provider": "termite", "model": "openai/clip-vit-base-patch32"}' \
+  --embedder '{"provider": "termite", "model": "antflydb/clipclap"}' \
   --dimension 512
 ```
   </TabsContent>
@@ -872,7 +872,7 @@ curl -X POST http://localhost:8080/api/v1/tables/wikipedia/indexes/thumbnail \
     "template": "{{media url=thumbnail_url}}",
     "embedder": {
       "provider": "termite",
-      "model": "openai/clip-vit-base-patch32"
+      "model": "antflydb/clipclap"
     },
     "dimension": 512,
     "distance_metric": "cosine"
@@ -887,7 +887,7 @@ await client.tables.addIndex('wikipedia', 'thumbnail', {
   template: '{{media url=thumbnail_url}}',
   embedder: {
     provider: 'termite',
-    model: 'openai/clip-vit-base-patch32',
+    model: 'antflydb/clipclap',
   },
   dimension: 512,
   distance_metric: 'cosine',
@@ -904,7 +904,7 @@ client.add_index(
     template='{{media url=thumbnail_url}}',
     embedder={
         'provider': 'termite',
-        'model': 'openai/clip-vit-base-patch32',
+        'model': 'antflydb/clipclap',
     },
     dimension=512,
     distance_metric='cosine',
@@ -923,7 +923,7 @@ _, err = client.AddIndexWithResponse(
 		Template: strPtr("{{media url=thumbnail_url}}"),
 		Embedder: &map[string]interface{}{
 			"provider": "termite",
-			"model":    "openai/clip-vit-base-patch32",
+			"model":    "antflydb/clipclap",
 		},
 		Dimension:      intPtr(512),
 		DistanceMetric: strPtr("cosine"),
@@ -940,7 +940,7 @@ client
         "template": "{{media url=thumbnail_url}}",
         "embedder": {
             "provider": "termite",
-            "model": "openai/clip-vit-base-patch32"
+            "model": "antflydb/clipclap"
         },
         "dimension": 512,
         "distance_metric": "cosine"
@@ -954,7 +954,7 @@ Adding an index to a table with existing data triggers background embedding gene
 
 ### Search by visual content
 
-CLIP understands visual concepts, so you can describe what you're looking for in natural language:
+ClipClap understands visual concepts, so you can describe what you're looking for in natural language:
 
 <Tabs defaultValue="cli">
   <TabsList>
@@ -1050,7 +1050,7 @@ let resp = client
 </Tabs>
 
 <Callout type="tip">
-CLIP responds best to concrete visual descriptions ("red sports car", "mountain landscape") rather than abstract concepts. For a deeper dive, see the [Image Search with CLIP](/docs/examples/image-search) example.
+Multimodal image search responds best to concrete visual descriptions ("red sports car", "mountain landscape") rather than abstract concepts. For a deeper dive, see the [Image Search with CLIP](/docs/examples/image-search) example.
 </Callout>
 </Steps>
 
@@ -1062,11 +1062,11 @@ Combine search with LLM-powered classification and generation using the retrieva
 ### Pull a generation model
 
 ```bash
-antfly termite pull hf:onnxruntime/Gemma-3-ONNX
+antfly termite pull ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_K_M
 ```
 
 <Callout type="info">
-`onnxruntime/Gemma-3-ONNX` (~4B params, 5.7 GB) runs locally via Termite and supports all RAG features — classification, generation, reasoning, and follow-up questions. For alternative providers, see the [next step](#rag-with-alternative-providers).
+`ggml-org/gemma-4-e2b-it-gguf` runs locally via Termite and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. For alternative providers, see the [next step](#rag-with-alternative-providers).
 </Callout>
 
 ### Classify and generate
@@ -1098,7 +1098,7 @@ antfly agents retrieval --table wikipedia \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{
     "provider": "termite",
-    "model": "onnxruntime/Gemma-3-ONNX"
+    "model": "ggml-org/gemma-4-e2b-it-gguf"
   }' \
   --max-context-tokens 512 \
   --classify --reasoning --generate --followup
@@ -1125,7 +1125,7 @@ curl -X POST http://localhost:8080/api/v1/agents/retrieval \
     }],
     "generator": {
       "provider": "termite",
-      "model": "onnxruntime/Gemma-3-ONNX"
+      "model": "ggml-org/gemma-4-e2b-it-gguf"
     },
     "max_context_tokens": 512,
     "classify": true,
@@ -1154,7 +1154,7 @@ const result = await client.agents.retrieval({
   }],
   generator: {
     provider: 'termite',
-    model: 'onnxruntime/Gemma-3-ONNX',
+    model: 'ggml-org/gemma-4-e2b-it-gguf',
   },
   max_context_tokens: 512,
   classify: true,
@@ -1183,7 +1183,7 @@ result = client.agents.retrieval(
     }],
     generator={
         'provider': 'termite',
-        'model': 'onnxruntime/Gemma-3-ONNX',
+        'model': 'ggml-org/gemma-4-e2b-it-gguf',
     },
     max_context_tokens=512,
     classify=True,
@@ -1217,7 +1217,7 @@ resp, err := client.RetrievalAgentWithResponse(
 		}},
 		Generator: &antfly.Generator{
 			Provider: strPtr("termite"),
-			Model:    strPtr("onnxruntime/Gemma-3-ONNX"),
+			Model:    strPtr("ggml-org/gemma-4-e2b-it-gguf"),
 		},
 		MaxContextTokens: intPtr(512),
 		Classify:         boolPtr(true),
@@ -1248,7 +1248,7 @@ let resp = client
         }],
         "generator": {
             "provider": "termite",
-            "model": "onnxruntime/Gemma-3-ONNX"
+            "model": "ggml-org/gemma-4-e2b-it-gguf"
         },
         "max_context_tokens": 512,
         "classify": true,
@@ -1333,7 +1333,7 @@ antfly agents retrieval --table wikipedia \
 
 <Callout type="info">
 **Choosing a generator model:**
-- **`onnxruntime/Gemma-3-ONNX`** (~4B params, 5.7 GB) — local ONNX inference via Termite, no API key needed, supports all RAG features
+- **`ggml-org/gemma-4-e2b-it-gguf`** — local GGUF inference via Termite, no API key needed, supports all RAG features
 - **Ollama `gemma3:4b-it-qat`** — local inference via Ollama, quantized for fast CPU/GPU performance
 - **Gemini `gemini-2.5-flash`** — cloud API, fast and high quality, requires API key
 - **OpenAI `gpt-4.1-mini`** — cloud API, fast and high quality, requires API key

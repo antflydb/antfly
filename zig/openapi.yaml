@@ -214,73 +214,76 @@ tags:
     \ type**: `\"x-antfly-types\": [\"text\"]` - Creates standard text field\n- **Multiple\
     \ types**: `\"x-antfly-types\": [\"text\", \"keyword\"]` - Creates `fieldName`\
     \ (text) and `fieldName.keyword`\n- **With search-as-you-type**: `\"x-antfly-types\"\
-    : [\"text\", \"search_as_you_type\"]` - Creates `fieldName` (text), `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`\n\
-    \n**Type Combination Rules**:\n- `text` and `html` are mutually exclusive (choose\
-    \ one as primary type)\n- Primary types (`text`, `html`) can be combined with\
-    \ variants (`keyword`, `search_as_you_type`)\n- `search_as_you_type` + `keyword`\
-    \ allowed without primary type (auto-adds `text`)\n\n### `x-antfly-index`\nBoolean\
-    \ to disable indexing for a field:\n```json\n{\"type\": \"string\", \"x-antfly-index\"\
-    : false}\n```\n\n### `x-antfly-include-in-all`\nSchema-level array of field names\
-    \ to include in the special `_all` field for cross-field search:\n```json\n{\n\
-    \  \"x-antfly-include-in-all\": [\"title\", \"body\", \"description\"]\n}\n```\n\
-    Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `link`)\
-    \ are included, and only the primary field (not `.keyword`, `._2gram`, `._3gram`, or `._index_prefix` variants).\n\
-    \n## Antfly Types\n\n### Text Types\n- `text` - Full-text searchable with tokenization\
-    \ and analysis. Use for articles, descriptions, searchable content.\n- `html`\
-    \ - Full-text searchable with HTML tag stripping. Use for HTML content.\n- `keyword`\
-    \ - Exact-match strings (not analyzed). Use for IDs, tags, categories, filters.\n\
-    - `search_as_you_type` - Search-as-you-type mappings for autocomplete. Creates `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`\
-    \ mapping.\n- `link` - URL/link field (keyword analyzer).\n\n### Numeric and Boolean\
-    \ Types\n- `numeric` - Numbers (integers and floats). Use for counts, prices,\
-    \ scores.\n- `boolean` - True/false values.\n\n### Date/Time Types\n- `datetime`\
-    \ - Timestamp fields. Use for created/updated dates, events.\n\n### Geospatial\
-    \ Types\n- `geopoint` - Latitude/longitude point. Use for locations, coordinates.\n\
-    - `geoshape` - Complex geographic shape. Use for boundaries, regions.\n\n### Special\
-    \ Types\n- `embedding` - Vector embeddings (not indexed in Bleve). Use for similarity\
-    \ search.\n- `blob` - Binary data (not indexed). Use for images, files, binary\
-    \ content.\n\n## Type Inference\n\nIf `x-antfly-types` is not specified, types\
-    \ are inferred from JSON Schema `type`:\n- `\"type\": \"string\"` → `[\"text\"\
-    ]`\n- `\"type\": \"number\"` or `\"integer\"` → `[\"numeric\"]`\n- `\"type\":\
-    \ \"boolean\"` → `[\"boolean\"]`\n\n## Automatic Fields\n\nAntfly automatically\
-    \ adds these fields to all document schemas:\n- **`_timestamp`**: Datetime field\
-    \ for document timestamps\n- **`_summaries`**: Object field (map of index names\
-    \ to summary text) for AI-generated summaries\n\n## Field Naming Conventions\n\
-    \nWhen multiple types are specified, Antfly creates additional field mappings\
-    \ with suffixes:\n- **Primary field** (`text` or `html`): Uses original field\
-    \ name\n- **Keyword variant**: `fieldName.keyword`\n- **Search-as-you-type**:\
-    \ `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`\n\nExample: `\"x-antfly-types\": [\"text\", \"keyword\",\
-    \ \"search_as_you_type\"]` creates:\n- `title` (text analyzer)\n- `title.keyword`\
-    \ (keyword analyzer)\n- `title._2gram` (2-token shingle analyzer)\n- `title._3gram` (3-token shingle analyzer)\n- `title._index_prefix` (edge n-gram prefix analyzer)\n\n## Best Practices\n\
-    \n- Use `text` for searchable content, `keyword` for exact matching\n- Combine\
-    \ types for flexible querying: `[\"text\", \"keyword\"]` enables both full-text\
-    \ and exact search\n- Add `search_as_you_type` for autocomplete functionality\n\
-    - Use `html` type for HTML content to strip tags during indexing\n- Specify `x-antfly-include-in-all`\
-    \ for important searchable fields\n\n## Performance Considerations\n\n- `text`\
-    \ and `html` fields have higher indexing cost due to text analysis\n- `keyword`\
-    \ fields are faster to index but don't support partial matches\n- `search_as_you_type`\
-    \ adds edge n-gram indexing overhead\n- `embedding` and `blob` fields are automatically\
-    \ excluded from text indexing\n- Multiple types per field increase index size\
-    \ and indexing time\n\n## Document TTL (Time-To-Live)\n\nAntfly supports automatic\
-    \ expiration and deletion of documents after a specified duration.\nDocuments\
-    \ are automatically removed by a background cleanup job running on the Raft leader.\n\
-    \n### Basic Configuration\n\nConfigure TTL when creating a table using `ttl_duration`:\n\
-    \n```json\n{\n  \"name\": \"sessions\",\n  \"ttl_duration\": \"24h\",\n  \"document_schemas\"\
-    : {\n    \"session\": {\n      \"schema\": {\n        \"type\": \"object\",\n\
-    \        \"properties\": {\n          \"user_id\": {\"type\": \"string\"},\n \
-    \         \"data\": {\"type\": \"object\"}\n        }\n      }\n    }\n  }\n}\n\
-    ```\n\n**How it works:**\n- Documents expire after the specified duration from\
-    \ their timestamp\n- Uses `_timestamp` field by default (automatically added at\
-    \ insertion)\n- Background cleanup runs every 30 seconds on the Raft leader\n\
-    - Expired documents are filtered from queries immediately (before cleanup)\n-\
-    \ Deletions are batched (1000 documents at a time) and go through Raft consensus\n\
-    \n### Custom TTL Reference Field\n\nUse a custom timestamp field instead of `_timestamp`:\n\
-    \n```json\n{\n  \"name\": \"events\",\n  \"ttl_duration\": \"7d\",\n  \"ttl_field\"\
-    : \"created_at\",\n  \"document_schemas\": {\n    \"event\": {\n      \"schema\"\
-    : {\n        \"type\": \"object\",\n        \"properties\": {\n          \"created_at\"\
-    : {\"type\": \"string\", \"format\": \"date-time\"},\n          \"event_type\"\
-    : {\"type\": \"string\"}\n        },\n        \"required\": [\"created_at\"]\n\
-    \      }\n    }\n  }\n}\n```\n\n**Requirements:**\n- Custom TTL field must be\
-    \ present in all documents\n- Must be in RFC3339 format (e.g., `2025-01-01T12:00:00Z`)\n\
+    : [\"text\", \"search_as_you_type\"]` - Creates `fieldName` (text), `fieldName._2gram`,\
+    \ `fieldName._3gram`, and `fieldName._index_prefix`\n\n**Type Combination Rules**:\n\
+    - `text` and `html` are mutually exclusive (choose one as primary type)\n- Primary\
+    \ types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`)\n\
+    - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)\n\
+    \n### `x-antfly-index`\nBoolean to disable indexing for a field:\n```json\n{\"\
+    type\": \"string\", \"x-antfly-index\": false}\n```\n\n### `x-antfly-include-in-all`\n\
+    Schema-level array of field names to include in the special `_all` field for cross-field\
+    \ search:\n```json\n{\n  \"x-antfly-include-in-all\": [\"title\", \"body\", \"\
+    description\"]\n}\n```\nOnly text-based types (`text`, `html`, `keyword`, `search_as_you_type`,\
+    \ `link`) are included, and only the primary field (not `.keyword`, `._2gram`,\
+    \ `._3gram`, or `._index_prefix` variants).\n\n## Antfly Types\n\n### Text Types\n\
+    - `text` - Full-text searchable with tokenization and analysis. Use for articles,\
+    \ descriptions, searchable content.\n- `html` - Full-text searchable with HTML\
+    \ tag stripping. Use for HTML content.\n- `keyword` - Exact-match strings (not\
+    \ analyzed). Use for IDs, tags, categories, filters.\n- `search_as_you_type` -\
+    \ Search-as-you-type mappings for autocomplete. Creates `fieldName._2gram`, `fieldName._3gram`,\
+    \ and `fieldName._index_prefix` mappings.\n- `link` - URL/link field (keyword\
+    \ analyzer).\n\n### Numeric and Boolean Types\n- `numeric` - Numbers (integers\
+    \ and floats). Use for counts, prices, scores.\n- `boolean` - True/false values.\n\
+    \n### Date/Time Types\n- `datetime` - Timestamp fields. Use for created/updated\
+    \ dates, events.\n\n### Geospatial Types\n- `geopoint` - Latitude/longitude point.\
+    \ Use for locations, coordinates.\n- `geoshape` - Complex geographic shape. Use\
+    \ for boundaries, regions.\n\n### Special Types\n- `embedding` - Vector embeddings\
+    \ (not indexed in Bleve). Use for similarity search.\n- `blob` - Binary data (not\
+    \ indexed). Use for images, files, binary content.\n\n## Type Inference\n\nIf\
+    \ `x-antfly-types` is not specified, types are inferred from JSON Schema `type`:\n\
+    - `\"type\": \"string\"` → `[\"text\"]`\n- `\"type\": \"number\"` or `\"integer\"\
+    ` → `[\"numeric\"]`\n- `\"type\": \"boolean\"` → `[\"boolean\"]`\n\n## Automatic\
+    \ Fields\n\nAntfly automatically adds these fields to all document schemas:\n\
+    - **`_timestamp`**: Datetime field for document timestamps\n- **`_summaries`**:\
+    \ Object field (map of index names to summary text) for AI-generated summaries\n\
+    \n## Field Naming Conventions\n\nWhen multiple types are specified, Antfly creates\
+    \ additional field mappings with suffixes:\n- **Primary field** (`text` or `html`):\
+    \ Uses original field name\n- **Keyword variant**: `fieldName.keyword`\n- **Search-as-you-type**:\
+    \ `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`\n\nExample:\
+    \ `\"x-antfly-types\": [\"text\", \"keyword\", \"search_as_you_type\"]` creates:\n\
+    - `title` (text analyzer)\n- `title.keyword` (keyword analyzer)\n- `title._2gram`\
+    \ (2-token shingle analyzer)\n- `title._3gram` (3-token shingle analyzer)\n- `title._index_prefix`\
+    \ (edge n-gram prefix analyzer)\n\n## Best Practices\n\n- Use `text` for searchable\
+    \ content, `keyword` for exact matching\n- Combine types for flexible querying:\
+    \ `[\"text\", \"keyword\"]` enables both full-text and exact search\n- Add `search_as_you_type`\
+    \ for autocomplete functionality\n- Use `html` type for HTML content to strip\
+    \ tags during indexing\n- Specify `x-antfly-include-in-all` for important searchable\
+    \ fields\n\n## Performance Considerations\n\n- `text` and `html` fields have higher\
+    \ indexing cost due to text analysis\n- `keyword` fields are faster to index but\
+    \ don't support partial matches\n- `search_as_you_type` adds edge n-gram indexing\
+    \ overhead\n- `embedding` and `blob` fields are automatically excluded from text\
+    \ indexing\n- Multiple types per field increase index size and indexing time\n\
+    \n## Document TTL (Time-To-Live)\n\nAntfly supports automatic expiration and deletion\
+    \ of documents after a specified duration.\nDocuments are automatically removed\
+    \ by a background cleanup job running on the Raft leader.\n\n### Basic Configuration\n\
+    \nConfigure TTL when creating a table using `ttl_duration`:\n\n```json\n{\n  \"\
+    name\": \"sessions\",\n  \"ttl_duration\": \"24h\",\n  \"document_schemas\": {\n\
+    \    \"session\": {\n      \"schema\": {\n        \"type\": \"object\",\n    \
+    \    \"properties\": {\n          \"user_id\": {\"type\": \"string\"},\n     \
+    \     \"data\": {\"type\": \"object\"}\n        }\n      }\n    }\n  }\n}\n```\n\
+    \n**How it works:**\n- Documents expire after the specified duration from their\
+    \ timestamp\n- Uses `_timestamp` field by default (automatically added at insertion)\n\
+    - Background cleanup runs every 30 seconds on the Raft leader\n- Expired documents\
+    \ are filtered from queries immediately (before cleanup)\n- Deletions are batched\
+    \ (1000 documents at a time) and go through Raft consensus\n\n### Custom TTL Reference\
+    \ Field\n\nUse a custom timestamp field instead of `_timestamp`:\n\n```json\n\
+    {\n  \"name\": \"events\",\n  \"ttl_duration\": \"7d\",\n  \"ttl_field\": \"created_at\"\
+    ,\n  \"document_schemas\": {\n    \"event\": {\n      \"schema\": {\n        \"\
+    type\": \"object\",\n        \"properties\": {\n          \"created_at\": {\"\
+    type\": \"string\", \"format\": \"date-time\"},\n          \"event_type\": {\"\
+    type\": \"string\"}\n        },\n        \"required\": [\"created_at\"]\n    \
+    \  }\n    }\n  }\n}\n```\n\n**Requirements:**\n- Custom TTL field must be present\
+    \ in all documents\n- Must be in RFC3339 format (e.g., `2025-01-01T12:00:00Z`)\n\
     - Documents without the field will fail validation\n\n### Duration Format\n\n\
     TTL durations use Go duration format:\n- `30s` - 30 seconds\n- `5m` - 5 minutes\n\
     - `24h` - 24 hours\n- `7d` - 7 days (treated as 168h)\n- `168h` - 1 week\n\n###\
@@ -593,15 +596,16 @@ tags:
     ,\n            \"x-antfly-types\": [\"text\", \"search_as_you_type\"]\n      \
     \    }\n        }\n      }\n    }\n  }\n}\n```\n\n**2. Create full-text index:**\n\
     ```json\n{\n  \"indexes\": {\n    \"search_idx\": {\n      \"type\": \"full_text\"\
-    \n    }\n  }\n}\n```\n\n**3. Query the ._index_prefix field:**\n```json\n{\n  \"full_text_search\"\
-    : {\n    \"query\": \"name._index_prefix:lap\"\n  }\n}\n```\n\nThe `search_as_you_type`\
-    \ type creates an edge n-gram indexed field (suffixed with `._index_prefix`)\nthat matches\
-    \ partial input as users type. For example, \"lap\" matches \"laptop\", \"lapel\"\
-    , etc.\n\n## Reindexing Data\n\nWhat happens when you need to reindex? Antfly\
-    \ handles reindexing through async enrichment,\nautomatically rebuilding indexes\
-    \ in the background. Here's what to expect when reindexing\ndata (after adding\
-    \ a new index or changing configuration):\n\n### Adding a New Index to Existing\
-    \ Table\n\nAntfly handles reindexing automatically through async enrichment:\n\
+    \n    }\n  }\n}\n```\n\n**3. Query with bool-prefix multi-match:**\n```json\n\
+    {\n  \"full_text_search\": {\n    \"multi_match\": {\n      \"query\": \"lap\"\
+    ,\n      \"type\": \"bool_prefix\",\n      \"fields\": [\"name\"]\n    }\n  }\n\
+    }\n```\n\nThe `search_as_you_type` type creates shingle and prefix subfields that\
+    \ match partial input\nas users type. For example, \"lap\" matches \"laptop\"\
+    , \"lapel\", etc.\n\n## Reindexing Data\n\nWhat happens when you need to reindex?\
+    \ Antfly handles reindexing through async enrichment,\nautomatically rebuilding\
+    \ indexes in the background. Here's what to expect when reindexing\ndata (after\
+    \ adding a new index or changing configuration):\n\n### Adding a New Index to\
+    \ Existing Table\n\nAntfly handles reindexing automatically through async enrichment:\n\
     \n**1. Add the index:**\n```bash\nPOST /tables/{tableName}/indexes/{indexName}\n\
     {\n  \"type\": \"embeddings\",\n  \"embedder\": {...}\n}\n```\n\n**2. Enrichment\
     \ happens automatically:**\n- Existing documents are enriched in the background\n\
@@ -7219,6 +7223,33 @@ components:
           - and
       required:
       - match
+    MultiMatchBody:
+      type: object
+      properties:
+        query:
+          type: string
+        fields:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        type:
+          type: string
+          enum:
+          - bool_prefix
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+      - query
+      - fields
+      - type
+    MultiMatchQuery:
+      type: object
+      properties:
+        multi_match:
+          $ref: '#/components/schemas/MultiMatchBody'
+      required:
+      - multi_match
     MatchPhraseQuery:
       type: object
       properties:
@@ -7583,6 +7614,7 @@ components:
       oneOf:
       - $ref: '#/components/schemas/TermQuery'
       - $ref: '#/components/schemas/MatchQuery'
+      - $ref: '#/components/schemas/MultiMatchQuery'
       - $ref: '#/components/schemas/MatchPhraseQuery'
       - $ref: '#/components/schemas/PhraseQuery'
       - $ref: '#/components/schemas/MultiPhraseQuery'

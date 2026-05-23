@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const build_options = @import("build_options");
+pub const build_options = @import("build_options");
 
 // Encoding & data structures
 pub const roaring = @import("encoding/roaring.zig");

@@ -116,7 +116,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         var semantic_resolver = SemanticStatusResolver{ .source = self.server.source, .local_termite_provider = self.server.local_termite_provider };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
-        var parsed = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
+        var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try std.fmt.allocPrint(alloc, "query_request failed runtime parse: {s}", .{@errorName(err)}),
             else => return err,
         };
@@ -146,7 +146,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         var semantic_resolver = SemanticStatusResolver{ .source = self.server.source, .local_termite_provider = self.server.local_termite_provider };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
-        var parsed = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
+        var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return null,
             else => return err,
         };
@@ -11796,7 +11796,7 @@ test "api http server serves runtime schema debug on table and index detail" {
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_index.value.debug.binding.index_name);
     try std.testing.expectEqualStrings("read", parsed_index.value.debug.binding.schema_slot.?);
     try std.testing.expect(parsed_index.value.debug.binding.runtime_schema != null);
-    try std.testing.expect(Helpers.hasAnalyzer(parsed_index.value.debug.binding.runtime_schema.?, "search_as_you_type"));
+    try std.testing.expect(Helpers.hasAnalyzer(parsed_index.value.debug.binding.runtime_schema.?, "search_as_you_type_index_prefix"));
 }
 
 test "api http server serves table index metadata routes" {

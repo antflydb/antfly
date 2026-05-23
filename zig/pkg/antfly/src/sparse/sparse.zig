@@ -491,6 +491,34 @@ const DocMapLookup = struct {
     fwd_data: []const u8,
 };
 
+const CollectedSparseDocs = struct {
+    alloc: Allocator,
+    writes: std.ArrayListUnmanaged(SparseWrite) = .empty,
+    doc_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    term_ids: std.ArrayListUnmanaged(u32) = .empty,
+    selected_doc_nums: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+    fn deinit(self: *@This()) void {
+        for (self.writes.items) |write| {
+            self.alloc.free(@constCast(write.doc_id));
+            self.alloc.free(@constCast(write.vec.indices));
+            self.alloc.free(@constCast(write.vec.values));
+        }
+        self.writes.deinit(self.alloc);
+        for (self.doc_ids.items) |doc_id| self.alloc.free(doc_id);
+        self.doc_ids.deinit(self.alloc);
+        self.term_ids.deinit(self.alloc);
+        self.selected_doc_nums.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn takeDocIds(self: *@This()) ![][]u8 {
+        const out = try self.doc_ids.toOwnedSlice(self.alloc);
+        self.doc_ids = .empty;
+        return out;
+    }
+};
+
 fn appendU32Le(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, value, .little);
@@ -881,6 +909,13 @@ fn sortAndDedupU32(items: []u32) []u32 {
         out_len += 1;
     }
     return items[0..out_len];
+}
+
+fn u32SliceContains(items: []const u32, needle: u32) bool {
+    for (items) |item| {
+        if (item == needle) return true;
+    }
+    return false;
 }
 
 fn sortDocNumsAndWeights(doc_nums: []u32, weights: []f32) void {
@@ -2234,6 +2269,146 @@ pub const SparseIndex = struct {
         return error.NotFound;
     }
 
+    fn appendCollectedSparseDoc(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        collected: *CollectedSparseDocs,
+        doc_id: []const u8,
+        fwd_data: []const u8,
+        collect_doc_ids: bool,
+    ) !void {
+        const decoded = try decodeFwdEntry(alloc, fwd_data);
+        defer alloc.free(decoded.term_ids);
+        defer alloc.free(decoded.weights);
+        if (decoded.doc_num > std.math.maxInt(u32)) return error.DocNumOverflow;
+        if (self.docNumDeleted(txn, decoded.doc_num)) return;
+
+        const doc_num_u32: u32 = @intCast(decoded.doc_num);
+        const gop = try collected.selected_doc_nums.getOrPut(alloc, doc_num_u32);
+        if (gop.found_existing) return;
+        errdefer _ = collected.selected_doc_nums.remove(doc_num_u32);
+
+        const owned_doc_id = try alloc.dupe(u8, doc_id);
+        const owned_indices = try alloc.dupe(u32, decoded.term_ids);
+        const owned_values = try alloc.dupe(f32, decoded.weights);
+        var write_ownership_transferred = false;
+        errdefer if (!write_ownership_transferred) {
+            alloc.free(owned_doc_id);
+            alloc.free(owned_indices);
+            alloc.free(owned_values);
+        };
+
+        try collected.term_ids.appendSlice(alloc, decoded.term_ids);
+        try collected.writes.append(alloc, .{
+            .doc_id = owned_doc_id,
+            .vec = .{
+                .indices = owned_indices,
+                .values = owned_values,
+            },
+            .doc_num = doc_num_u32,
+        });
+        write_ownership_transferred = true;
+        if (collect_doc_ids) {
+            const listed_doc_id = try alloc.dupe(u8, doc_id);
+            errdefer alloc.free(listed_doc_id);
+            try collected.doc_ids.append(alloc, listed_doc_id);
+        }
+    }
+
+    fn collectRangeSparseDocs(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        lower: []const u8,
+        upper: []const u8,
+        collect_doc_ids: bool,
+    ) !CollectedSparseDocs {
+        var collected = CollectedSparseDocs{ .alloc = alloc };
+        errdefer collected.deinit();
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        const fwd_first = if (lower.len == 0)
+            try cur.seekAtOrAfter(taggedPrefix(key_fwd))
+        else blk: {
+            const start_key = try fwdKeyAlloc(alloc, lower);
+            defer alloc.free(start_key);
+            break :blk try cur.seekAtOrAfter(start_key);
+        };
+
+        var maybe_entry = fwd_first;
+        while (maybe_entry) |entry| {
+            const doc_id = fwdDocIdFromKey(entry.key) orelse break;
+            if (upper.len > 0 and std.mem.order(u8, doc_id, upper) != .lt) break;
+            if (docIdInOwnedRange(doc_id, lower, upper)) {
+                try self.appendCollectedSparseDoc(alloc, txn, &collected, doc_id, entry.value, collect_doc_ids);
+            }
+            maybe_entry = try cur.next();
+        }
+
+        const DocMapContext = struct {
+            index: *SparseIndex,
+            alloc: Allocator,
+            txn: @TypeOf(txn),
+            lower: []const u8,
+            upper: []const u8,
+            collect_doc_ids: bool,
+            collected: *CollectedSparseDocs,
+
+            fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                if (!docIdInOwnedRange(entry.doc_id, ctx.lower, ctx.upper)) return false;
+                try ctx.index.appendCollectedSparseDoc(ctx.alloc, ctx.txn, ctx.collected, entry.doc_id, entry.fwd_data, ctx.collect_doc_ids);
+                return false;
+            }
+        };
+        var docmap_ctx = DocMapContext{
+            .index = self,
+            .alloc = alloc,
+            .txn = txn,
+            .lower = lower,
+            .upper = upper,
+            .collect_doc_ids = collect_doc_ids,
+            .collected = &collected,
+        };
+        maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
+        while (maybe_entry) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
+            _ = try forEachDocMapEntry(entry.value, &docmap_ctx, DocMapContext.visit);
+            maybe_entry = try cur.next();
+        }
+
+        return collected;
+    }
+
+    fn collectPreparedSparseDocs(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        doc_ids_in: []const []const u8,
+        collect_doc_ids: bool,
+    ) !CollectedSparseDocs {
+        var collected = CollectedSparseDocs{ .alloc = alloc };
+        errdefer collected.deinit();
+
+        for (doc_ids_in) |doc_id| {
+            const fwd = self.lookupFwdEntryByDocIdAlloc(alloc, txn, doc_id) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            defer {
+                alloc.free(fwd.term_ids);
+                alloc.free(fwd.weights);
+            }
+            const fwd_data = try encodeFwdEntry(alloc, fwd.doc_num, fwd.term_ids, fwd.weights);
+            defer alloc.free(fwd_data);
+            try self.appendCollectedSparseDoc(alloc, txn, &collected, doc_id, fwd_data, collect_doc_ids);
+        }
+
+        return collected;
+    }
+
     fn docNumDeleted(self: *SparseIndex, txn: anytype, doc_num: u64) bool {
         _ = self;
         var tombstone_buf: [16]u8 = undefined;
@@ -2397,6 +2572,9 @@ pub const SparseIndex = struct {
         }
         var direct_filter_doc_nums = try self.docNumSetFromSliceAlloc(alloc, constraints.filter_doc_nums);
         defer direct_filter_doc_nums.deinit(alloc);
+        if (constraints.filter_doc_nums.len > 0 and direct_filter_doc_nums.count() == 0) {
+            return try alloc.alloc(SearchResult, 0);
+        }
 
         var exclude_doc_nums = try self.resolveDocNumSetAlloc(alloc, &txn, constraints.exclude_doc_ids);
         defer exclude_doc_nums.deinit(alloc);
@@ -2652,199 +2830,41 @@ pub const SparseIndex = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        var cur = try txn.openCursor();
-        defer cur.close();
+        var collected = try self.collectRangeSparseDocs(alloc, &txn, lower, upper, true);
+        defer collected.deinit();
 
-        var writes = std.ArrayListUnmanaged(SparseWrite).empty;
-        defer {
-            for (writes.items) |write| {
-                alloc.free(@constCast(write.doc_id));
-                alloc.free(@constCast(write.vec.indices));
-                alloc.free(@constCast(write.vec.values));
-            }
-            writes.deinit(alloc);
+        if (collected.writes.items.len > 0) {
+            try dest.batchWithOptions(collected.writes.items, &.{}, .{
+                .defer_term_range_updates = true,
+                .prefer_bulk_build = true,
+                .assume_new_doc_ids = true,
+            });
         }
-
-        var doc_ids = std.ArrayListUnmanaged([]u8).empty;
-        errdefer {
-            for (doc_ids.items) |doc_id| alloc.free(doc_id);
-            doc_ids.deinit(alloc);
-        }
-
-        const first = (try cur.seekAtOrAfter(taggedPrefix(key_fwd))) orelse return .{ .doc_ids = try doc_ids.toOwnedSlice(alloc) };
-
-        var entry = first;
-        while (true) {
-            const doc_id = fwdDocIdFromKey(entry.key) orelse break;
-            if (std.mem.order(u8, doc_id, lower) != .lt and (upper.len == 0 or std.mem.order(u8, doc_id, upper) == .lt)) {
-                const decoded = try decodeFwdEntry(alloc, entry.value);
-                defer alloc.free(decoded.term_ids);
-                defer alloc.free(decoded.weights);
-
-                const owned_doc_id = try alloc.dupe(u8, doc_id);
-                errdefer alloc.free(owned_doc_id);
-                const owned_indices = try alloc.dupe(u32, decoded.term_ids);
-                errdefer alloc.free(owned_indices);
-                const owned_values = try alloc.dupe(f32, decoded.weights);
-                errdefer alloc.free(owned_values);
-
-                try writes.append(alloc, .{
-                    .doc_id = owned_doc_id,
-                    .vec = .{
-                        .indices = owned_indices,
-                        .values = owned_values,
-                    },
-                });
-                try doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
-            }
-
-            entry = (try cur.next()) orelse break;
-        }
-
-        if (writes.items.len > 0) {
-            const max_sparse_writes_per_txn = 16;
-            var start: usize = 0;
-            while (start < writes.items.len) {
-                const end = @min(start + max_sparse_writes_per_txn, writes.items.len);
-                try dest.batch(writes.items[start..end], &.{});
-                start = end;
-            }
-        }
-        return .{ .doc_ids = try doc_ids.toOwnedSlice(alloc) };
+        return .{ .doc_ids = try collected.takeDocIds() };
     }
 
     pub fn handoffRangeInto(self: *SparseIndex, dest: *SparseIndex, alloc: Allocator, lower: []const u8, upper: []const u8, collect_doc_ids: bool) !SplitRebuildResult {
         var src_txn = try self.beginReadTxn();
         defer src_txn.abort();
 
-        var src_cur = try src_txn.openCursor();
-        defer src_cur.close();
-
-        var dest_txn = try dest.beginWriteTxn();
-        errdefer dest_txn.abort();
-        const prev_dest_next_doc_num = dest.next_doc_num;
-        const prev_dest_doc_count = dest.doc_count;
-        const prev_dest_term_count = dest.term_count;
-        errdefer {
-            dest.next_doc_num = prev_dest_next_doc_num;
-            dest.doc_count = prev_dest_doc_count;
-            dest.term_count = prev_dest_term_count;
-        }
-
-        var doc_ids = std.ArrayListUnmanaged([]u8).empty;
-        errdefer {
-            for (doc_ids.items) |doc_id| alloc.free(doc_id);
-            doc_ids.deinit(alloc);
-        }
-        var selected_docs = std.AutoHashMapUnmanaged(u32, []u8).empty;
-        defer {
-            var selected_it = selected_docs.iterator();
-            while (selected_it.next()) |selected| alloc.free(selected.value_ptr.*);
-            selected_docs.deinit(alloc);
-        }
-        var touched_terms = std.ArrayListUnmanaged(u32).empty;
-        defer touched_terms.deinit(alloc);
-        const TouchedTermsContext = struct {
-            alloc: Allocator,
-            terms: *std.ArrayListUnmanaged(u32),
-
-            fn visit(ctx: *@This(), term_id: u32) !void {
-                try ctx.terms.append(ctx.alloc, term_id);
-            }
-        };
-        var touched_terms_ctx = TouchedTermsContext{ .alloc = alloc, .terms = &touched_terms };
-
-        var max_doc_num: u64 = dest.next_doc_num;
         const select_started = nowNs();
-
-        const first = if (lower.len == 0)
-            (try src_cur.seekAtOrAfter(taggedPrefix(key_fwd))) orelse {
-                try persistSparseCounters(dest, &dest_txn);
-                try dest_txn.commit();
-                return .{
-                    .doc_ids = try doc_ids.toOwnedSlice(alloc),
-                    .select_docs_ns = elapsedSince(select_started),
-                };
-            }
-        else blk: {
-            const start_key = try fwdKeyAlloc(alloc, lower);
-            defer alloc.free(start_key);
-            break :blk (try src_cur.seekAtOrAfter(start_key)) orelse {
-                try persistSparseCounters(dest, &dest_txn);
-                try dest_txn.commit();
-                return .{
-                    .doc_ids = try doc_ids.toOwnedSlice(alloc),
-                    .select_docs_ns = elapsedSince(select_started),
-                };
-            };
-        };
-
-        var entry = first;
-        while (true) {
-            const doc_id = fwdDocIdFromKey(entry.key) orelse break;
-            if (upper.len > 0 and std.mem.order(u8, doc_id, upper) != .lt) break;
-            if (std.mem.order(u8, doc_id, lower) != .lt and (upper.len == 0 or std.mem.order(u8, doc_id, upper) == .lt)) {
-                const doc_num = try forEachFwdTermId(entry.value, TouchedTermsContext, &touched_terms_ctx, TouchedTermsContext.visit);
-                if (doc_num > std.math.maxInt(u32)) return error.DocNumOverflow;
-                const owned_doc_id = try alloc.dupe(u8, doc_id);
-                errdefer alloc.free(owned_doc_id);
-                const gop = try selected_docs.getOrPut(alloc, @intCast(doc_num));
-                if (gop.found_existing) {
-                    alloc.free(owned_doc_id);
-                } else {
-                    gop.value_ptr.* = owned_doc_id;
-                }
-                if (collect_doc_ids) {
-                    try doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
-                }
-
-                try txnPut(&dest_txn, dest.dbi, entry.key, entry.value);
-                var rev_buf: [256]u8 = undefined;
-                const rk = revKey(&rev_buf, doc_num);
-                try txnPut(&dest_txn, dest.dbi, rk, gop.value_ptr.*);
-                max_doc_num = @max(max_doc_num, doc_num + 1);
-                dest.doc_count += 1;
-            }
-
-            entry = (try src_cur.next()) orelse break;
-        }
-
+        var collected = try self.collectRangeSparseDocs(alloc, &src_txn, lower, upper, collect_doc_ids);
+        defer collected.deinit();
         const select_docs_ns = elapsedSince(select_started);
-        const terms_started = nowNs();
-        if (touched_terms.items.len > 0) {
-            var selected_lookup = try SelectedDocLookup.init(alloc, &selected_docs);
-            defer selected_lookup.deinit(alloc);
-            const term_ids = sortAndDedupU32(touched_terms.items);
 
-            for (term_ids) |term_id| {
-                var range_key_buf: [256]u8 = undefined;
-                const range_data = txnGet(&src_txn, self.dbi, termRangeKey(&range_key_buf, term_id)) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
-                const range = try decodeChunkRangeMeta(range_data);
-                switch (classifyChunkRange(range, lower, upper)) {
-                    .outside => {},
-                    .right_only => try handoffWholeTermPostings(&src_txn, self.dbi, &dest_txn, dest.dbi, term_id, range_data),
-                    .mixed => try handoffTermPostings(alloc, &src_txn, self.dbi, &dest_txn, dest.dbi, term_id, lower, upper, &selected_lookup),
-                }
-            }
-        }
-        const terms_ns = elapsedSince(terms_started);
-
-        dest.next_doc_num = @max(dest.next_doc_num, max_doc_num);
         const commit_started = nowNs();
-        const stats_after = try scanStatsInTxn(&dest_txn, dest.dbi);
-        dest.doc_count = stats_after.doc_count;
-        dest.term_count = stats_after.term_count;
-        try persistSparseCounters(dest, &dest_txn);
-        try dest_txn.commit();
+        if (collected.writes.items.len > 0) {
+            try dest.batchWithOptions(collected.writes.items, &.{}, .{
+                .defer_term_range_updates = true,
+                .prefer_bulk_build = true,
+                .assume_new_doc_ids = true,
+            });
+        }
         const commit_ns = elapsedSince(commit_started);
 
         return .{
-            .doc_ids = try doc_ids.toOwnedSlice(alloc),
+            .doc_ids = try collected.takeDocIds(),
             .select_docs_ns = select_docs_ns,
-            .terms_ns = terms_ns,
             .commit_ns = commit_ns,
         };
     }
@@ -2853,104 +2873,26 @@ pub const SparseIndex = struct {
         var src_txn = try self.beginReadTxn();
         defer src_txn.abort();
 
-        var dest_txn = try dest.beginWriteTxn();
-        errdefer dest_txn.abort();
-        const prev_dest_next_doc_num = dest.next_doc_num;
-        const prev_dest_doc_count = dest.doc_count;
-        const prev_dest_term_count = dest.term_count;
-        errdefer {
-            dest.next_doc_num = prev_dest_next_doc_num;
-            dest.doc_count = prev_dest_doc_count;
-            dest.term_count = prev_dest_term_count;
-        }
-
-        var doc_ids = std.ArrayListUnmanaged([]u8).empty;
-        errdefer {
-            for (doc_ids.items) |doc_id| alloc.free(doc_id);
-            doc_ids.deinit(alloc);
-        }
-        var selected_doc_nums = std.ArrayListUnmanaged(u32).empty;
-        defer selected_doc_nums.deinit(alloc);
-        var selected_doc_ids = std.ArrayListUnmanaged([]const u8).empty;
-        defer selected_doc_ids.deinit(alloc);
-        var touched_terms = std.ArrayListUnmanaged(u32).empty;
-        defer touched_terms.deinit(alloc);
-        const TouchedTermsContext = struct {
-            alloc: Allocator,
-            terms: *std.ArrayListUnmanaged(u32),
-
-            fn visit(ctx: *@This(), term_id: u32) !void {
-                try ctx.terms.append(ctx.alloc, term_id);
-            }
-        };
-        var touched_terms_ctx = TouchedTermsContext{ .alloc = alloc, .terms = &touched_terms };
-
-        var max_doc_num: u64 = dest.next_doc_num;
         const select_started = nowNs();
-        var key_buf = std.ArrayListUnmanaged(u8).empty;
-        defer key_buf.deinit(alloc);
-
-        for (doc_ids_in) |doc_id| {
-            key_buf.clearRetainingCapacity();
-            try key_buf.append(alloc, key_fwd);
-            try key_buf.appendSlice(alloc, doc_id);
-            const fwd_value = txnGet(&src_txn, self.dbi, key_buf.items) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-
-            const doc_num = try forEachFwdTermId(fwd_value, TouchedTermsContext, &touched_terms_ctx, TouchedTermsContext.visit);
-            if (doc_num > std.math.maxInt(u32)) return error.DocNumOverflow;
-            try selected_doc_nums.append(alloc, @intCast(doc_num));
-            try selected_doc_ids.append(alloc, doc_id);
-            if (collect_doc_ids) {
-                try doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
-            }
-
-            try txnPut(&dest_txn, dest.dbi, key_buf.items, fwd_value);
-            var rev_buf: [256]u8 = undefined;
-            const rk = revKey(&rev_buf, doc_num);
-            try txnPut(&dest_txn, dest.dbi, rk, doc_id);
-            max_doc_num = @max(max_doc_num, doc_num + 1);
-        }
-
+        _ = lower;
+        _ = upper;
+        var collected = try self.collectPreparedSparseDocs(alloc, &src_txn, doc_ids_in, collect_doc_ids);
+        defer collected.deinit();
         const select_docs_ns = elapsedSince(select_started);
-        const terms_started = nowNs();
-        if (touched_terms.items.len > 0) {
-            const selected_doc_ids_const: []const []const u8 = @ptrCast(selected_doc_ids.items);
-            var selected_lookup = try SelectedDocLookup.initFromPairs(alloc, selected_doc_nums.items, selected_doc_ids_const);
-            defer selected_lookup.deinit(alloc);
-            const term_ids = sortAndDedupU32(touched_terms.items);
 
-            for (term_ids) |term_id| {
-                var range_key_buf: [256]u8 = undefined;
-                const range_data = txnGet(&src_txn, self.dbi, termRangeKey(&range_key_buf, term_id)) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
-                const range = try decodeChunkRangeMeta(range_data);
-                switch (classifyChunkRange(range, lower, upper)) {
-                    .outside => {},
-                    .right_only => try handoffWholeTermPostings(&src_txn, self.dbi, &dest_txn, dest.dbi, term_id, range_data),
-                    .mixed => try handoffTermPostings(alloc, &src_txn, self.dbi, &dest_txn, dest.dbi, term_id, lower, upper, &selected_lookup),
-                }
-            }
-        }
-        const terms_ns = elapsedSince(terms_started);
-
-        dest.next_doc_num = @max(dest.next_doc_num, max_doc_num);
         const commit_started = nowNs();
-        const stats_after = try scanStatsInTxn(&dest_txn, dest.dbi);
-        dest.doc_count = stats_after.doc_count;
-        dest.term_count = stats_after.term_count;
-        try persistSparseCounters(dest, &dest_txn);
-        try dest_txn.commit();
+        if (collected.writes.items.len > 0) {
+            try dest.batchWithOptions(collected.writes.items, &.{}, .{
+                .defer_term_range_updates = true,
+                .prefer_bulk_build = true,
+                .assume_new_doc_ids = true,
+            });
+        }
         const commit_ns = elapsedSince(commit_started);
 
         return .{
-            .doc_ids = try doc_ids.toOwnedSlice(alloc),
+            .doc_ids = try collected.takeDocIds(),
             .select_docs_ns = select_docs_ns,
-            .terms_ns = terms_ns,
             .commit_ns = commit_ns,
         };
     }
@@ -2959,54 +2901,71 @@ pub const SparseIndex = struct {
         var src_txn = try self.beginReadTxn();
         defer src_txn.abort();
 
-        var src_cur = try src_txn.openCursor();
-        defer src_cur.close();
-
-        var selected_doc_nums = std.AutoHashMapUnmanaged(u32, void).empty;
-        defer selected_doc_nums.deinit(alloc);
-
-        const first = if (lower.len == 0)
-            (try src_cur.seekAtOrAfter(taggedPrefix(key_fwd))) orelse return .{}
-        else blk: {
-            const start_key = try fwdKeyAlloc(alloc, lower);
-            defer alloc.free(start_key);
-            break :blk (try src_cur.seekAtOrAfter(start_key)) orelse return .{};
-        };
-
-        var entry = first;
-        while (true) {
-            const doc_id = fwdDocIdFromKey(entry.key) orelse break;
-            if (upper.len > 0 and std.mem.order(u8, doc_id, upper) != .lt) break;
-            if (std.mem.order(u8, doc_id, lower) != .lt and (upper.len == 0 or std.mem.order(u8, doc_id, upper) == .lt)) {
-                const doc_num = try decodeFwdDocNum(entry.value);
-                if (doc_num > std.math.maxInt(u32)) return error.DocNumOverflow;
-                try selected_doc_nums.put(alloc, @intCast(doc_num), {});
-            }
-
-            entry = (try src_cur.next()) orelse break;
-        }
+        var collected = try self.collectRangeSparseDocs(alloc, &src_txn, lower, upper, false);
+        defer collected.deinit();
 
         var out: SplitPlanningStats = .{
-            .selected_docs = selected_doc_nums.size,
+            .selected_docs = collected.selected_doc_nums.size,
         };
 
-        const first_term = (try src_cur.seekAtOrAfter(taggedPrefix(key_inv))) orelse return out;
-        entry = first_term;
-        while (true) {
-            if (entry.key.len == 0 or entry.key[0] != key_inv) break;
-            const term_id = parseTermRangeKey(entry.key) orelse {
+        const term_ids = sortAndDedupU32(collected.term_ids.items);
+        out.touched_terms = term_ids.len;
+
+        var src_cur = try src_txn.openCursor();
+        defer src_cur.close();
+        if (try src_cur.seekAtOrAfter(taggedPrefix(key_inv))) |first_term| {
+            var entry = first_term;
+            while (true) {
+                if (entry.key.len == 0 or entry.key[0] != key_inv) break;
+                const term_id = parseTermRangeKey(entry.key) orelse {
+                    entry = (try src_cur.next()) orelse break;
+                    continue;
+                };
+                if (!u32SliceContains(term_ids, term_id)) {
+                    entry = (try src_cur.next()) orelse break;
+                    continue;
+                }
+                const range = try decodeChunkRangeMeta(entry.value);
+                switch (classifyChunkRange(range, lower, upper)) {
+                    .outside => {},
+                    .right_only, .mixed => {
+                        try accumulateSplitPlanningStats(alloc, &src_txn, self.dbi, term_id, lower, upper, &collected.selected_doc_nums, &out);
+                    },
+                }
                 entry = (try src_cur.next()) orelse break;
-                continue;
-            };
-            const range = try decodeChunkRangeMeta(entry.value);
-            switch (classifyChunkRange(range, lower, upper)) {
-                .outside => {},
-                .right_only, .mixed => {
-                    out.touched_terms += 1;
-                    try accumulateSplitPlanningStats(alloc, &src_txn, self.dbi, term_id, lower, upper, &selected_doc_nums, &out);
-                },
             }
-            entry = (try src_cur.next()) orelse break;
+        }
+
+        var maybe_segment = try src_cur.seekAtOrAfter(taggedPrefix(key_segment));
+        while (maybe_segment) |segment_entry| {
+            if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
+            for (term_ids) |term_id| {
+                const SegmentStatsContext = struct {
+                    selected_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
+                    out: *SplitPlanningStats,
+
+                    fn visit(ctx: *@This(), decoded: DecodedChunk) !void {
+                        var kept: usize = 0;
+                        for (decoded.doc_nums) |doc_num| {
+                            if (ctx.selected_doc_nums.contains(doc_num)) kept += 1;
+                        }
+                        if (kept == 0) return;
+                        if (kept == decoded.doc_nums.len) {
+                            ctx.out.right_only_chunks += 1;
+                            ctx.out.right_only_postings += kept;
+                        } else {
+                            ctx.out.mixed_chunks += 1;
+                            ctx.out.mixed_right_postings += kept;
+                        }
+                    }
+                };
+                var segment_ctx = SegmentStatsContext{
+                    .selected_doc_nums = &collected.selected_doc_nums,
+                    .out = &out,
+                };
+                try forEachSegmentChunk(alloc, segment_entry.value, term_id, &segment_ctx, SegmentStatsContext.visit);
+            }
+            maybe_segment = try src_cur.next();
         }
 
         return out;
@@ -3019,27 +2978,120 @@ pub const SparseIndex = struct {
         var cur = try read_txn.openCursor();
         defer cur.close();
 
+        const PrunedDoc = struct {
+            doc_num: u64,
+            doc_id: []u8,
+
+            fn deinit(doc: *@This(), allocator: Allocator) void {
+                allocator.free(doc.doc_id);
+                doc.* = undefined;
+            }
+        };
+
         var term_ids = std.ArrayListUnmanaged(u32).empty;
         defer term_ids.deinit(alloc);
+        var pruned_docs = std.ArrayListUnmanaged(PrunedDoc).empty;
+        defer {
+            for (pruned_docs.items) |*doc| doc.deinit(alloc);
+            pruned_docs.deinit(alloc);
+        }
+        var seen_doc_nums = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer seen_doc_nums.deinit(alloc);
 
-        const first = (try cur.seekAtOrAfter(taggedPrefix(key_inv))) orelse return;
+        const CollectTermsContext = struct {
+            alloc: Allocator,
+            terms: *std.ArrayListUnmanaged(u32),
 
-        var entry = first;
-        while (true) {
-            if (entry.key.len == 0 or entry.key[0] != key_inv) break;
-            const term_id = parseTermRangeKey(entry.key) orelse {
-                entry = (try cur.next()) orelse break;
-                continue;
-            };
-            const range = try decodeChunkRangeMeta(entry.value);
-            switch (classifyChunkRange(range, lower, upper)) {
-                .outside => {},
-                .right_only, .mixed => try term_ids.append(alloc, term_id),
+            fn visit(ctx: *@This(), term_id: u32) !void {
+                try ctx.terms.append(ctx.alloc, term_id);
             }
-            entry = (try cur.next()) orelse break;
+        };
+        var collect_terms_ctx = CollectTermsContext{ .alloc = alloc, .terms = &term_ids };
+
+        const appendPrunedDoc = struct {
+            fn run(
+                allocator: Allocator,
+                docs: *std.ArrayListUnmanaged(PrunedDoc),
+                seen: *std.AutoHashMapUnmanaged(u64, void),
+                doc_num: u64,
+                doc_id: []const u8,
+            ) !void {
+                const gop = try seen.getOrPut(allocator, doc_num);
+                if (gop.found_existing) return;
+                errdefer _ = seen.remove(doc_num);
+                try docs.append(allocator, .{
+                    .doc_num = doc_num,
+                    .doc_id = try allocator.dupe(u8, doc_id),
+                });
+            }
+        }.run;
+
+        const fwd_first = if (lower.len == 0)
+            (try cur.seekAtOrAfter(taggedPrefix(key_fwd)))
+        else blk: {
+            const start_key = try fwdKeyAlloc(alloc, lower);
+            defer alloc.free(start_key);
+            break :blk try cur.seekAtOrAfter(start_key);
+        };
+        var maybe_fwd_entry = fwd_first;
+        while (maybe_fwd_entry) |entry| {
+            const doc_id = fwdDocIdFromKey(entry.key) orelse break;
+            if (upper.len > 0 and std.mem.order(u8, doc_id, upper) != .lt) break;
+            if (docIdInOwnedRange(doc_id, lower, upper)) {
+                const doc_num = try forEachFwdTermId(entry.value, CollectTermsContext, &collect_terms_ctx, CollectTermsContext.visit);
+                try appendPrunedDoc(alloc, &pruned_docs, &seen_doc_nums, doc_num, doc_id);
+            }
+            maybe_fwd_entry = try cur.next();
         }
 
-        if (term_ids.items.len == 0) return;
+        const DocMapPruneContext = struct {
+            alloc: Allocator,
+            lower: []const u8,
+            upper: []const u8,
+            terms_ctx: *CollectTermsContext,
+            docs: *std.ArrayListUnmanaged(PrunedDoc),
+            seen: *std.AutoHashMapUnmanaged(u64, void),
+
+            fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                if (!docIdInOwnedRange(entry.doc_id, ctx.lower, ctx.upper)) return false;
+                _ = try forEachFwdTermId(entry.fwd_data, CollectTermsContext, ctx.terms_ctx, CollectTermsContext.visit);
+                try appendPrunedDoc(ctx.alloc, ctx.docs, ctx.seen, entry.doc_num, entry.doc_id);
+                return false;
+            }
+        };
+        var docmap_ctx = DocMapPruneContext{
+            .alloc = alloc,
+            .lower = lower,
+            .upper = upper,
+            .terms_ctx = &collect_terms_ctx,
+            .docs = &pruned_docs,
+            .seen = &seen_doc_nums,
+        };
+        var maybe_docmap = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
+        while (maybe_docmap) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
+            _ = try forEachDocMapEntry(entry.value, &docmap_ctx, DocMapPruneContext.visit);
+            maybe_docmap = try cur.next();
+        }
+
+        if (try cur.seekAtOrAfter(taggedPrefix(key_inv))) |first| {
+            var entry = first;
+            while (true) {
+                if (entry.key.len == 0 or entry.key[0] != key_inv) break;
+                const term_id = parseTermRangeKey(entry.key) orelse {
+                    entry = (try cur.next()) orelse break;
+                    continue;
+                };
+                const range = try decodeChunkRangeMeta(entry.value);
+                switch (classifyChunkRange(range, lower, upper)) {
+                    .outside => {},
+                    .right_only, .mixed => try term_ids.append(alloc, term_id),
+                }
+                entry = (try cur.next()) orelse break;
+            }
+        }
+
+        if (term_ids.items.len == 0 and pruned_docs.items.len == 0) return;
 
         var write_txn = try self.beginWriteTxn();
         errdefer write_txn.abort();
@@ -3049,8 +3101,18 @@ pub const SparseIndex = struct {
             self.doc_count = prev_doc_count;
             self.term_count = prev_term_count;
         }
-        for (term_ids.items) |term_id| {
+        const pruned_term_ids = sortAndDedupU32(term_ids.items);
+        for (pruned_term_ids) |term_id| {
             try pruneTermPostings(alloc, &write_txn, self.dbi, term_id, lower, upper);
+        }
+        for (pruned_docs.items) |doc| {
+            const fwd_key = try fwdKeyAlloc(alloc, doc.doc_id);
+            defer alloc.free(fwd_key);
+            txnDelete(&write_txn, self.dbi, fwd_key) catch {};
+            var rev_key_buf: [256]u8 = undefined;
+            txnDelete(&write_txn, self.dbi, revKey(&rev_key_buf, doc.doc_num)) catch {};
+            var tombstone_key_buf: [16]u8 = undefined;
+            try txnPut(&write_txn, self.dbi, docTombstoneKey(&tombstone_key_buf, doc.doc_num), &.{});
         }
         const stats_after = try scanStatsInTxn(&write_txn, self.dbi);
         self.doc_count = stats_after.doc_count;
@@ -3126,6 +3188,27 @@ fn scanStatsInTxn(txn: anytype, dbi: anytype) !SparseIndex.Stats {
     while (maybe_entry) |entry| {
         if (entry.key.len > 0 and entry.key[0] == key_rev) out.doc_count += 1;
         if (entry.key.len > 0 and entry.key[0] == key_term_catalog) out.term_count += 1;
+        if (entry.key.len > 0 and entry.key[0] == key_docmap_segment) {
+            const CountDocMapContext = struct {
+                txn: @TypeOf(txn),
+                count: u64 = 0,
+
+                fn visit(ctx: *@This(), item: DocMapLookup) !bool {
+                    var tombstone_buf: [16]u8 = undefined;
+                    _ = txnGet(ctx.txn, {}, docTombstoneKey(&tombstone_buf, item.doc_num)) catch |err| switch (err) {
+                        error.NotFound => {
+                            ctx.count += 1;
+                            return false;
+                        },
+                        else => return err,
+                    };
+                    return false;
+                }
+            };
+            var ctx = CountDocMapContext{ .txn = txn };
+            _ = try forEachDocMapEntry(entry.value, &ctx, CountDocMapContext.visit);
+            out.doc_count += ctx.count;
+        }
         maybe_entry = try cur.next();
     }
     return out;
@@ -3910,6 +3993,49 @@ test "sparse handoff range preserves doc numbers and postings" {
     try std.testing.expectEqualStrings("b", results[1].doc_id);
 }
 
+test "sparse handoff range includes bulk-built docmap docs" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tmpPath(&src_buf, "split-src-bulk");
+    defer cleanupTmp(src_path);
+    var dest_buf: [256]u8 = undefined;
+    const dest_path = tmpPath(&dest_buf, "split-dest-bulk");
+    defer cleanupTmp(dest_path);
+
+    var src = try SparseIndex.open(alloc, src_path, .{ .chunk_size = 2 });
+    defer src.close();
+    var dest = try SparseIndex.open(alloc, dest_path, .{ .chunk_size = 2 });
+    defer dest.close();
+
+    const writes = [_]SparseWrite{
+        .{ .doc_id = "a", .vec = .{ .indices = &.{1}, .values = &.{0.1} } },
+        .{ .doc_id = "b", .vec = .{ .indices = &.{1}, .values = &.{0.2} } },
+        .{ .doc_id = "c", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 0.9, 0.7 } } },
+        .{ .doc_id = "d", .vec = .{ .indices = &.{2}, .values = &.{0.8} } },
+    };
+    try src.batchWithOptions(&writes, &.{}, .{
+        .defer_term_range_updates = true,
+        .prefer_bulk_build = true,
+        .assume_new_doc_ids = true,
+    });
+
+    var rebuilt = try src.handoffRangeInto(&dest, alloc, "c", "", true);
+    defer rebuilt.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), rebuilt.doc_ids.len);
+    try std.testing.expectEqual(@as(u64, 4), dest.next_doc_num);
+    try std.testing.expectEqual(@as(u64, 2), dest.stats().doc_count);
+
+    const query = SparseVector{ .indices = &.{2}, .values = &.{1.0} };
+    const results = try dest.search(alloc, &query, 4);
+    defer SparseIndex.freeResults(alloc, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("d", results[0].doc_id);
+    try std.testing.expectEqualStrings("c", results[1].doc_id);
+}
+
 test "sparse split planning stats classify right-only and mixed chunks" {
     const alloc = std.testing.allocator;
 
@@ -3935,6 +4061,36 @@ test "sparse split planning stats classify right-only and mixed chunks" {
     try std.testing.expectEqual(@as(usize, 1), stats.mixed_chunks);
     try std.testing.expectEqual(@as(usize, 3), stats.right_only_postings);
     try std.testing.expectEqual(@as(usize, 1), stats.mixed_right_postings);
+}
+
+test "sparse split planning stats include bulk-built segment docs" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tmpPath(&src_buf, "split-plan-bulk");
+    defer cleanupTmp(src_path);
+
+    var src = try SparseIndex.open(alloc, src_path, .{ .chunk_size = 2 });
+    defer src.close();
+
+    const writes = [_]SparseWrite{
+        .{ .doc_id = "a", .vec = .{ .indices = &.{1}, .values = &.{0.1} } },
+        .{ .doc_id = "b", .vec = .{ .indices = &.{1}, .values = &.{0.2} } },
+        .{ .doc_id = "c", .vec = .{ .indices = &.{1}, .values = &.{0.9} } },
+        .{ .doc_id = "d", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 0.8, 0.7 } } },
+    };
+    try src.batchWithOptions(&writes, &.{}, .{
+        .defer_term_range_updates = true,
+        .prefer_bulk_build = true,
+        .assume_new_doc_ids = true,
+    });
+
+    const stats = try src.splitPlanningStats(alloc, "c", "");
+    try std.testing.expectEqual(@as(usize, 2), stats.selected_docs);
+    try std.testing.expectEqual(@as(usize, 2), stats.touched_terms);
+    try std.testing.expectEqual(@as(usize, 2), stats.right_only_chunks);
+    try std.testing.expectEqual(@as(usize, 0), stats.mixed_chunks);
+    try std.testing.expectEqual(@as(usize, 3), stats.right_only_postings);
 }
 
 test "sparse empty search returns empty" {

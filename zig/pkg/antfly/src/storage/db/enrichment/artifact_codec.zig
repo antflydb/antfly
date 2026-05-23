@@ -431,6 +431,11 @@ test "artifact codec encodes sparse embedding with version and source hash" {
     try std.testing.expect(header.flags.has_source_hash);
     try std.testing.expectEqual(hash, header.source_hash);
     try std.testing.expectEqual(@as(?u64, hash), try sourceHash(encoded));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, encoded[header_len..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, encoded[header_len + 4 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, encoded[header_len + 8 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 0.25))), std.mem.readInt(u32, encoded[header_len + 12 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.5))), std.mem.readInt(u32, encoded[header_len + 16 ..][0..4], .little));
 
     var decoded = try decodeSparseEmbeddingAlloc(alloc, encoded);
     defer decoded.deinit(alloc);

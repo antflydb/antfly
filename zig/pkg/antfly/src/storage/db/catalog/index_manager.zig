@@ -25,6 +25,7 @@ const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const doc_identity = @import("../doc_identity.zig");
 const apply_state = @import("../derived/apply_state.zig");
+const change_journal_mod = @import("../derived/change_journal.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const enrichment_catalog = @import("enrichment_catalog.zig");
@@ -91,6 +92,7 @@ const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
 const sparse_backfill_batch_size: usize = 1024;
+pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 
 pub const ManagedIndexRef = struct {
@@ -2056,21 +2058,11 @@ pub const IndexManager = struct {
     pub fn requiresEnrichmentReplay(self: *const IndexManager, name: []const u8) !bool {
         for (self.dense_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            if (try parseDenseGeneratorConfig(self.alloc, entry.config.config_json)) |generator| {
-                defer generator.deinit(self.alloc);
-                return true;
-            }
-            const dense_cfg = try parseDenseConfig(self.alloc, entry.config.config_json);
-            defer dense_cfg.deinit(self.alloc);
-            return dense_cfg.embedding_name != null and !dense_cfg.external and self.getEnrichment(.embedding, dense_cfg.embedding_name.?) != null;
+            return try self.configRequiresEnrichmentReplay(entry.config);
         }
         for (self.sparse_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            if (try parseSparseGeneratorConfig(self.alloc, entry.config.config_json)) |generator| {
-                defer generator.deinit(self.alloc);
-                return true;
-            }
-            return false;
+            return try self.configRequiresEnrichmentReplay(entry.config);
         }
         return false;
     }
@@ -4339,7 +4331,7 @@ pub const IndexManager = struct {
 
         var flushed_batches: usize = 0;
         var saw_visible_doc = false;
-        var last_key: ?[]const u8 = null;
+        var max_flushed_key: ?[]const u8 = null;
 
         const flush_batch = struct {
             fn run(
@@ -4393,15 +4385,17 @@ pub const IndexManager = struct {
                 .value = doc.value,
                 .doc_ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, &identity_txn, doc_id),
             });
-            last_key = doc.key;
+            if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
+                max_flushed_key = doc.key;
+            }
 
             if (mapped_docs.items.len >= text_backfill_batch_size) {
-                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, last_key.?, &flushed_batches);
+                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
             }
         }
 
         if (mapped_docs.items.len > 0) {
-            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, last_key.?, &flushed_batches);
+            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -4409,6 +4403,86 @@ pub const IndexManager = struct {
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ self.base_path, name });
+    }
+
+    fn configRequiresEnrichmentReplay(self: *const IndexManager, cfg: types.IndexConfig) !bool {
+        switch (cfg.kind) {
+            .dense_vector => {
+                if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
+                    defer generator.deinit(self.alloc);
+                    return true;
+                }
+                const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
+                defer dense_cfg.deinit(self.alloc);
+                return dense_cfg.embedding_name != null and !dense_cfg.external and self.getEnrichment(.embedding, dense_cfg.embedding_name.?) != null;
+            },
+            .sparse_vector => {
+                if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
+                    defer generator.deinit(self.alloc);
+                    return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        if (try self.configRequiresEnrichmentReplay(cfg)) return;
+        if (try self.configHasPendingSparseEmbeddingArtifactReplay(store, cfg)) return;
+        try apply_state.saveAppliedSequenceWithCheckpoint(
+            self.alloc,
+            store,
+            self.applied_sequence_checkpoint_path,
+            cfg.name,
+            store.lastReplaySequence(0),
+        );
+    }
+
+    fn configHasPendingSparseEmbeddingArtifactReplay(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !bool {
+        if (cfg.kind != .sparse_vector) return false;
+        const expected_embedding_name = try self.sparseConfigEmbeddingNameAlloc(cfg);
+        defer self.alloc.free(expected_embedding_name);
+
+        const Context = struct {
+            alloc: Allocator,
+            expected_embedding_name: []const u8,
+            found: bool = false,
+
+            fn handle(ctx: *@This(), _: u64, payload: []const u8) !void {
+                if (ctx.found) return;
+                var decoded = try change_journal_mod.decodeRecord(ctx.alloc, payload);
+                defer decoded.deinit();
+                for (decoded.record.changed_artifact_keys) |artifact_key| {
+                    if (internal_keys.isEmbeddingArtifactKey(artifact_key) and internal_keys.matchesEmbeddingArtifactName(artifact_key, ctx.expected_embedding_name)) {
+                        ctx.found = true;
+                        return;
+                    }
+                    if (internal_keys.isDerivedEmbeddingArtifactKey(artifact_key) and internal_keys.matchesDerivedEmbeddingArtifactName(artifact_key, ctx.expected_embedding_name)) {
+                        ctx.found = true;
+                        return;
+                    }
+                }
+            }
+        };
+
+        var ctx = Context{
+            .alloc = self.alloc,
+            .expected_embedding_name = expected_embedding_name,
+        };
+        store.forEachReplayEntryFromHint(0, .sparse_vector, &ctx, Context.handle) catch |err| switch (err) {
+            error.ReplayIndexUnavailable => return false,
+            else => return err,
+        };
+        return ctx.found;
+    }
+
+    fn sparseConfigEmbeddingNameAlloc(self: *IndexManager, cfg: types.IndexConfig) ![]u8 {
+        if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
+            defer generator.deinit(self.alloc);
+            if (generator.embedding_name) |embedding_name| return try self.alloc.dupe(u8, embedding_name);
+        }
+        return try self.alloc.dupe(u8, cfg.name);
     }
 
     fn appendOpenedIndex(self: *IndexManager, opened: OpenedIndex) !void {
@@ -4566,6 +4640,7 @@ pub const IndexManager = struct {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.update(if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);
+                    try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
@@ -4766,6 +4841,7 @@ pub const IndexManager = struct {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.update(if (resume_from) |buf| buf else "");
                     try self.backfillSparseIndex(store, &entry, resume_from);
+                    try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
@@ -5502,9 +5578,9 @@ pub const IndexManager = struct {
         }
 
         var flushed_batches: usize = 0;
-        var backfilled_doc_count: u64 = 0;
+        var backfilled_doc_count: u64 = entry.index.doc_count;
         var saw_visible_doc = false;
-        var last_key: ?[]const u8 = null;
+        var max_flushed_key: ?[]const u8 = null;
 
         const flush_batch = struct {
             fn run(
@@ -5538,6 +5614,7 @@ pub const IndexManager = struct {
             }
         }.run;
 
+        const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
         for (docs) |doc| {
             if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
             if (resume_from) |resume_key| {
@@ -5547,9 +5624,12 @@ pub const IndexManager = struct {
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, doc.value, entry.field_name)) orelse continue;
-            errdefer sparse_vec.deinit(self.alloc);
+            var sparse_vec_owned = true;
+            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
             saw_visible_doc = true;
-            last_key = doc.key;
+            if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
+                max_flushed_key = doc.key;
+            }
             try writes.append(self.alloc, .{
                 .doc_id = try self.alloc.dupe(u8, raw_key),
                 .vec = .{
@@ -5557,13 +5637,14 @@ pub const IndexManager = struct {
                     .values = sparse_vec.values,
                 },
             });
-            if (writes.items.len >= sparse_backfill_batch_size) {
-                try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches, &backfilled_doc_count);
+            sparse_vec_owned = false;
+            if (writes.items.len >= backfill_batch_size) {
+                try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
             }
         }
 
         if (writes.items.len > 0) {
-            try flush_batch(self, entry, rebuild_state, &writes, last_key.?, &flushed_batches, &backfilled_doc_count);
+            try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -6368,7 +6449,8 @@ pub const IndexManager = struct {
             }
             const extract_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, write.value, entry.field_name)) orelse continue;
-            errdefer sparse_vec.deinit(self.alloc);
+            var sparse_vec_owned = true;
+            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
             if (profile_enabled) {
                 profile.extract_ns += platform_time.monotonicNs() - extract_start_ns;
                 profile.extracted += 1;
@@ -6382,6 +6464,7 @@ pub const IndexManager = struct {
                     .values = sparse_vec.values,
                 },
             });
+            sparse_vec_owned = false;
             if (profile_enabled) profile.append_ns += platform_time.monotonicNs() - append_start_ns;
         }
         if (profile_enabled) profile.scan_ns = platform_time.monotonicNs() - scan_start_ns -| profile.extract_ns -| profile.append_ns;

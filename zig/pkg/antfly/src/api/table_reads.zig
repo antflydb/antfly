@@ -12082,6 +12082,27 @@ fn appendTextQueryValue(
             }
             try out.append(alloc, '}');
         },
+        .multi_match_bool_prefix => |multi_match| {
+            try out.appendSlice(alloc, "{\"multi_match\":{\"query\":");
+            try appendJsonString(alloc, out, multi_match.query);
+            try out.appendSlice(alloc, ",\"type\":\"bool_prefix\",\"fields\":[");
+            for (multi_match.fields, 0..) |field, i| {
+                if (i > 0) try out.append(alloc, ',');
+                if (field.boost == 1.0) {
+                    try appendJsonString(alloc, out, field.field);
+                } else {
+                    const boosted_field = try std.fmt.allocPrint(alloc, "{s}^{d}", .{ field.field, field.boost });
+                    defer alloc.free(boosted_field);
+                    try appendJsonString(alloc, out, boosted_field);
+                }
+            }
+            try out.append(alloc, ']');
+            if (multi_match.boost != 1.0) {
+                try out.appendSlice(alloc, ",\"boost\":");
+                try out.print(alloc, "{d}", .{multi_match.boost});
+            }
+            try out.appendSlice(alloc, "}}");
+        },
         .match_phrase => |phrase| {
             try out.appendSlice(alloc, "{\"match_phrase\":");
             try appendJsonString(alloc, out, phrase.text);

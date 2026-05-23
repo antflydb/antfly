@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const common_openapi = @import("antfly_common_openapi");
 const logging_openapi = @import("antfly_logging_openapi");
 const middleware_openapi = @import("antfly_middleware_openapi");
@@ -23,6 +24,7 @@ const provider_registry = @import("provider_registry.zig");
 const secrets = @import("secrets.zig");
 const transcribing = @import("antfly_transcribing");
 const synthesizing = @import("antfly_synthesizing");
+const platform = @import("antfly_platform");
 
 const default_max_shard_size_bytes: u64 = 64 * 1024 * 1024;
 const default_max_shards_per_table: u32 = 20;
@@ -308,12 +310,25 @@ pub fn loadFromPathWithSecrets(
 }
 
 pub fn resolveLocalRoleBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config, role: []const u8) ![]u8 {
+    const base = try resolveLocalBaseDir(alloc, cfg);
+    defer alloc.free(base);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, role });
+}
+
+pub fn resolveLocalBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config) ![]u8 {
     if (cfg) |loaded| {
         if (loaded.storage.local_base_dir) |dir| {
-            return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, role });
+            return try alloc.dupe(u8, dir);
         }
     }
-    return try std.fmt.allocPrint(alloc, ".zig-cache/{s}", .{role});
+    return try defaultLocalBaseDir(alloc);
+}
+
+pub fn defaultLocalBaseDir(alloc: std.mem.Allocator) ![]u8 {
+    const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    const home = platform.env.getenv(home_var) orelse return try alloc.dupe(u8, "antflydb");
+    if (home.len == 0) return try alloc.dupe(u8, "antflydb");
+    return try std.fs.path.join(alloc, &.{ home, ".antfly" });
 }
 
 fn parseMetadataConfig(
@@ -1249,9 +1264,15 @@ test "common config resolves local role base dir from config" {
 }
 
 test "common config resolves stable local role base dir by default" {
-    const base = try resolveLocalRoleBaseDir(std.testing.allocator, null, "swarm");
-    defer std.testing.allocator.free(base);
-    try std.testing.expectEqualStrings(".zig-cache/swarm", base);
+    const alloc = std.testing.allocator;
+    const default_base = try defaultLocalBaseDir(alloc);
+    defer alloc.free(default_base);
+    const expected = try std.fs.path.join(alloc, &.{ default_base, "swarm" });
+    defer alloc.free(expected);
+
+    const base = try resolveLocalRoleBaseDir(alloc, null, "swarm");
+    defer alloc.free(base);
+    try std.testing.expectEqualStrings(expected, base);
 }
 
 test "common config parses minimal config with runtime defaults" {

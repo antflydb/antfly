@@ -26,6 +26,13 @@ pub const TermQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const MultiMatchBody = struct {
+    query: []const u8,
+    fields: []const []const u8,
+    type: []const u8,
+    boost: ?Boost = null,
+};
+
 pub const PrefixQuery = struct {
     prefix: []const u8,
     field: ?[]const u8 = null,
@@ -172,6 +179,10 @@ pub const GeoShapeGeometry = struct {
     relation: []const u8,
 };
 
+pub const MultiMatchQuery = struct {
+    multi_match: MultiMatchBody,
+};
+
 pub const GeoShapeQuery = struct {
     geometry: GeoShapeGeometry,
     field: ?[]const u8 = null,
@@ -218,6 +229,7 @@ pub const Query = union(enum) {
     ip_range_query: *IPRangeQuery,
     match_all_query: *MatchAllQuery,
     match_none_query: *MatchNoneQuery,
+    multi_match_query: *MultiMatchQuery,
     prefix_query: *PrefixQuery,
     query_string_query: *QueryStringQuery,
     regexp_query: *RegexpQuery,
@@ -370,6 +382,11 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MatchNoneQuery, allocator, source, options)) |parsed| return .{ .match_none_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "multi_match",
+        })) {
+            if (try parseStructuralVariant(MultiMatchQuery, allocator, source, options)) |parsed| return .{ .multi_match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "prefix",
         })) {
             if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
@@ -419,6 +436,7 @@ pub const Query = union(enum) {
             .ip_range_query => |v| try jw.write(v.*),
             .match_all_query => |v| try jw.write(v.*),
             .match_none_query => |v| try jw.write(v.*),
+            .multi_match_query => |v| try jw.write(v.*),
             .prefix_query => |v| try jw.write(v.*),
             .query_string_query => |v| try jw.write(v.*),
             .regexp_query => |v| try jw.write(v.*),

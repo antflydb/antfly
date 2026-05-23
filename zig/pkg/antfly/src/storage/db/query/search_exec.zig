@@ -4996,6 +4996,7 @@ pub fn textQueryToSearchQuery(
             .analyzer = try resolveQueryAnalyzer(match.field, match.analyzer, text_analysis, runtime_schema),
             .boost = match.boost,
         } },
+        .multi_match_bool_prefix => |multi_match| try multiMatchBoolPrefixToSearchQuery(alloc, multi_match, text_analysis, runtime_schema),
         .match_phrase => |phrase| .{ .phrase = .{
             .field = phrase.field,
             .text = phrase.text,
@@ -5042,6 +5043,155 @@ fn textQuerySliceToSearchQuerySlice(
         out[i] = try textQueryToSearchQuery(alloc, item, text_analysis, runtime_schema);
     }
     return out;
+}
+
+const ResolvedMultiMatchField = struct {
+    field: []const u8,
+    boost: f32,
+};
+
+const search_as_you_type_max_shingle_size: usize = 3;
+
+fn multiMatchBoolPrefixToSearchQuery(
+    alloc: Allocator,
+    multi_match: anytype,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    var fields = std.ArrayListUnmanaged(ResolvedMultiMatchField).empty;
+    defer fields.deinit(alloc);
+    for (multi_match.fields) |field| {
+        try appendResolvedMultiMatchFields(alloc, &fields, field, text_analysis, runtime_schema);
+    }
+
+    var should = std.ArrayListUnmanaged(search_mod.SearchQuery).empty;
+    errdefer should.deinit(alloc);
+    for (fields.items) |field| {
+        if (try fieldBoolPrefixSearchQuery(alloc, field, multi_match.query, text_analysis, runtime_schema)) |query| {
+            try should.append(alloc, query);
+        }
+    }
+
+    if (should.items.len == 0) return .{ .match_none = {} };
+    return .{ .bool_query = .{
+        .should = try should.toOwnedSlice(alloc),
+        .min_should = 1,
+        .boost = multi_match.boost,
+    } };
+}
+
+fn appendResolvedMultiMatchFields(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(ResolvedMultiMatchField),
+    requested: types.TextMultiMatchField,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !void {
+    try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost);
+    if (isSearchAsYouTypeGeneratedField(requested.field)) return;
+    if (!try fieldHasSearchAsYouTypeSubfields(alloc, text_analysis, runtime_schema, requested.field)) return;
+
+    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{requested.field});
+    try appendUniqueResolvedMultiMatchField(alloc, fields, two_gram, requested.boost);
+    const three_gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{requested.field});
+    try appendUniqueResolvedMultiMatchField(alloc, fields, three_gram, requested.boost);
+    const index_prefix = try std.fmt.allocPrint(alloc, "{s}._index_prefix", .{requested.field});
+    try appendUniqueResolvedMultiMatchField(alloc, fields, index_prefix, requested.boost);
+}
+
+fn appendUniqueResolvedMultiMatchField(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(ResolvedMultiMatchField),
+    field: []const u8,
+    boost: f32,
+) !void {
+    for (fields.items) |item| {
+        if (std.mem.eql(u8, item.field, field)) return;
+    }
+    try fields.append(alloc, .{ .field = field, .boost = boost });
+}
+
+fn fieldHasSearchAsYouTypeSubfields(
+    alloc: Allocator,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+    field: []const u8,
+) !bool {
+    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{field});
+    defer alloc.free(two_gram);
+    if (resolveConfiguredFieldAnalyzerName(text_analysis, two_gram)) |analyzer| {
+        if (std.mem.eql(u8, analyzer, "search_as_you_type_2gram")) return true;
+    }
+    if (runtime_schema) |schema| {
+        if (resolveIndexedFieldAnalyzer(schema, two_gram)) |analyzer| {
+            if (std.mem.eql(u8, analyzer, "search_as_you_type_2gram")) return true;
+        }
+    }
+    return false;
+}
+
+fn fieldBoolPrefixSearchQuery(
+    alloc: Allocator,
+    field: ResolvedMultiMatchField,
+    text: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !?search_mod.SearchQuery {
+    if (std.mem.endsWith(u8, field.field, "._index_prefix")) {
+        const tokens = try analysis_mod.simple_analyzer.analyze(alloc, text);
+        defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+        if (tokens.len == 0) return null;
+        const start = if (tokens.len > search_as_you_type_max_shingle_size)
+            tokens.len - search_as_you_type_max_shingle_size
+        else
+            0;
+        return .{ .term = .{
+            .field = field.field,
+            .term = try joinTokenTermsAlloc(alloc, tokens[start..]),
+            .boost = field.boost,
+        } };
+    }
+
+    const analyzer = (try resolveQueryAnalyzer(field.field, null, text_analysis, runtime_schema)) orelse &analysis_mod.default_analyzer;
+    const tokens = try analyzer.analyze(alloc, text);
+    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+    if (tokens.len == 0) return null;
+
+    var should = std.ArrayListUnmanaged(search_mod.SearchQuery).empty;
+    errdefer should.deinit(alloc);
+    if (tokens.len > 1) {
+        for (tokens[0 .. tokens.len - 1]) |token| {
+            try should.append(alloc, .{ .term = .{
+                .field = field.field,
+                .term = try alloc.dupe(u8, token.term),
+            } });
+        }
+    }
+    try should.append(alloc, .{ .prefix = .{
+        .field = field.field,
+        .prefix = try alloc.dupe(u8, tokens[tokens.len - 1].term),
+    } });
+    return .{ .bool_query = .{
+        .should = try should.toOwnedSlice(alloc),
+        .min_should = 1,
+        .boost = field.boost,
+    } };
+}
+
+fn joinTokenTermsAlloc(alloc: Allocator, tokens: []const analysis_mod.Token) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (tokens, 0..) |token, idx| {
+        if (idx > 0) try out.append(alloc, ' ');
+        try out.appendSlice(alloc, token.term);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn isSearchAsYouTypeGeneratedField(field: []const u8) bool {
+    return std.mem.endsWith(u8, field, "._2gram") or
+        std.mem.endsWith(u8, field, "._3gram") or
+        std.mem.endsWith(u8, field, "._index_prefix");
 }
 
 fn resolveQueryAnalyzer(
@@ -5317,6 +5467,26 @@ test "resolveSearchEffort maps effort to leaf-aware HBC width" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), resolveSearchEpsilon(0.0), 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 7.0), resolveSearchEpsilon(default_balanced_search_effort), 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 100.0), resolveSearchEpsilon(1.0), 0.01);
+}
+
+test "multi_match bool_prefix index prefix uses trailing shingle window" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const fields = [_]types.TextMultiMatchField{
+        .{ .field = "name._index_prefix" },
+    };
+    const query = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "premium smartphone apple ip",
+        .fields = &fields,
+    } }, .{}, null);
+
+    try std.testing.expect(query == .bool_query);
+    try std.testing.expectEqual(@as(usize, 1), query.bool_query.should.len);
+    try std.testing.expect(query.bool_query.should[0] == .term);
+    try std.testing.expectEqualStrings("name._index_prefix", query.bool_query.should[0].term.field);
+    try std.testing.expectEqualStrings("smartphone apple ip", query.bool_query.should[0].term.term);
 }
 
 fn testDenseIndexCallback(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {

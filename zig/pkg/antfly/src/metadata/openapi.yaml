@@ -1099,17 +1099,21 @@ tags:
       }
       ```
 
-      **3. Query the ._index_prefix field:**
+      **3. Query with bool-prefix multi-match:**
       ```json
       {
         "full_text_search": {
-          "query": "name._index_prefix:lap"
+          "multi_match": {
+            "query": "lap",
+            "type": "bool_prefix",
+            "fields": ["name"]
+          }
         }
       }
       ```
 
-      The `search_as_you_type` type creates an edge n-gram indexed field (suffixed with `._index_prefix`)
-      that matches partial input as users type. For example, "lap" matches "laptop", "lapel", etc.
+      The `search_as_you_type` type creates shingle and prefix subfields that match partial input
+      as users type. For example, "lap" matches "laptop", "lapel", etc.
 
       ## Reindexing Data
 

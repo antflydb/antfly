@@ -64,6 +64,7 @@ const CliConfig = struct {
     store_role: ?[]const u8 = null,
     failure_domain: ?[]const u8 = null,
     tick_ms: ?u64 = null,
+    data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
@@ -6894,6 +6895,10 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
+    defer alloc.free(data_dir);
+    try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
 
@@ -7074,6 +7079,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--data-dir")) {
+            cfg.data_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--replica-root-dir")) {
             cfg.replica_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
@@ -7091,13 +7100,25 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     return cfg;
 }
 
+fn resolveLocalBaseDir(
+    alloc: std.mem.Allocator,
+    cli: CliConfig,
+    cfg: ?*const antfly.common.config.Config,
+) ![]u8 {
+    if (cli.data_dir) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    return try antfly.common.config.resolveLocalBaseDir(alloc, cfg);
+}
+
 fn resolvePaths(
     alloc: std.mem.Allocator,
     cli: CliConfig,
     cfg: ?*const antfly.common.config.Config,
 ) !ResolvedPaths {
+    const local_base = try resolveLocalBaseDir(alloc, cli, cfg);
+    defer alloc.free(local_base);
+
     if (cli.replica_root_dir != null and cli.replica_catalog_path != null) {
-        const base = try antfly.common.config.resolveLocalRoleBaseDir(alloc, cfg, "data");
+        const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
         defer alloc.free(base);
         const replica_root_dir = try normalizeResolvedPathAlloc(alloc, cli.replica_root_dir.?);
         errdefer alloc.free(replica_root_dir);
@@ -7115,7 +7136,7 @@ fn resolvePaths(
         };
     }
 
-    const base = try antfly.common.config.resolveLocalRoleBaseDir(alloc, cfg, "data");
+    const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
     defer alloc.free(base);
     const replica_root_dir = if (cli.replica_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
@@ -7239,6 +7260,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --store-role <role>            Registered store role (default: data)
         \\  --failure-domain <name>        Registered store failure domain
         \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
+        \\  --data-dir <path>              Local storage root for data node data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --secret-store-path <path>     Antfly secrets.json file path
