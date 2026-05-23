@@ -16,6 +16,7 @@ package embeddings
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -387,12 +388,41 @@ func (l *BedrockImpl) RateLimiter() *rate.Limiter {
 	return l.limiter
 }
 
+// titanMultimodalModel is the only Bedrock-hosted model that currently accepts
+// image input alongside text. Other Bedrock embedding models (cohere.embed-*,
+// amazon.titan-embed-text-*) are text-only.
+const titanMultimodalModel = "amazon.titan-embed-image-v1"
+
 func (l *BedrockImpl) Embed(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
 	if len(contents) == 0 {
 		return [][]float32{}, nil
 	}
 
-	// Bedrock text embeddings: extract text from content parts
+	// Route to the appropriate embedding method based on content type.
+	if !allText(contents) {
+		if l.caps.IsTextOnly() {
+			return nil, fmt.Errorf(
+				"binary content (images, audio, video) requires a multimodal model "+
+					"(set multimodal: true in config), got %s",
+				l.model,
+			)
+		}
+		if l.model != titanMultimodalModel {
+			return nil, fmt.Errorf(
+				"the bedrock provider currently supports multimodal embedding only for "+
+					"%s, got %s",
+				titanMultimodalModel, l.model,
+			)
+		}
+		return l.embedMultimodal(ctx, contents)
+	}
+	return l.embedText(ctx, contents)
+}
+
+// embedText generates embeddings for text-only content via Bedrock. Works for
+// all Bedrock embedding models (Titan text v1/v2, Titan Multimodal G1 in
+// text-only mode, Cohere embed-* family).
+func (l *BedrockImpl) embedText(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
 	values := ExtractText(contents)
 
 	// Process texts in batches
@@ -440,6 +470,64 @@ func (l *BedrockImpl) Embed(ctx context.Context, contents [][]ai.ContentPart) ([
 	}
 
 	return results, nil
+}
+
+// embedMultimodal generates embeddings via Bedrock Titan Multimodal G1 for
+// mixed text/image content. Each input item may contain a TextContent, a
+// BinaryContent, or both — when both are present in the same item, Titan G1
+// returns a single fused embedding in the shared text/image semantic space.
+// See https://docs.aws.amazon.com/bedrock/latest/userguide/titan-multiemb-models.html
+func (l *BedrockImpl) embedMultimodal(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
+	results := make([][]float32, 0, len(contents))
+	for i, parts := range contents {
+		body, err := buildTitanMultimodalBody(parts)
+		if err != nil {
+			return nil, fmt.Errorf("building multimodal request for item %d: %w", i, err)
+		}
+
+		resp, err := l.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
+			ModelId:     &l.model,
+			Body:        body,
+			ContentType: aws.String("application/json"),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("invoking bedrock model: %w", err)
+		}
+
+		var result struct {
+			Embedding []float32 `json:"embedding"`
+		}
+		if err := json.Unmarshal(resp.Body, &result); err != nil {
+			return nil, fmt.Errorf("unmarshaling response: %w", err)
+		}
+		results = append(results, result.Embedding)
+	}
+	return results, nil
+}
+
+// buildTitanMultimodalBody serializes a single item's content parts into the
+// Titan Multimodal G1 request body. Returns an error if neither a non-empty
+// text part nor a non-empty binary part is present (Titan G1 requires at
+// least one).
+func buildTitanMultimodalBody(parts []ai.ContentPart) ([]byte, error) {
+	body := map[string]any{}
+	for _, part := range parts {
+		switch p := part.(type) {
+		case ai.TextContent:
+			if p.Text != "" {
+				body["inputText"] = p.Text
+			}
+		case ai.BinaryContent:
+			if len(p.Data) > 0 {
+				body["inputImage"] = base64.StdEncoding.EncodeToString(p.Data)
+			}
+		}
+	}
+	if len(body) == 0 {
+		return nil, errors.New(
+			"multimodal embedding requires at least one non-empty TextContent or BinaryContent")
+	}
+	return json.Marshal(body)
 }
 
 // NewEmbedderConfigFromJSON creates an EmbedderConfig from raw JSON. Mostly useful for testing.
