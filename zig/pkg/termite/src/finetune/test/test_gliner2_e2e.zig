@@ -48,9 +48,12 @@ const ops_mod = termite.ops;
 
 const real_autodiff = termite.finetune.real_autodiff_trainer;
 const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
+const gliner2_bundle = termite.finetune.gliner2;
+const gliner2_data = termite.finetune.gliner2_data;
 const weight_source = termite.models.weight_source;
 const LoadedWeight = weight_source.LoadedWeight;
 const Tensor = termite.backends.Tensor;
+const compat = termite.io.compat;
 
 // ── Tiny DeBERTa config (for GLiNER2 backbone) ───────────────────────
 
@@ -214,6 +217,7 @@ test "GLiNER2 e2e: loss decreases over training steps" {
 
     // 3. Create the RealAutodiffTrainer with LoRA targeting query_proj + value_proj.
     const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
+    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
         &cb,
@@ -228,6 +232,7 @@ test "GLiNER2 e2e: loss decreases over training steps" {
             .grad_accum_steps = 1,
             .lora_a_init_std = 0.02,
             .seed = 42,
+            .regular_trainable_params = &regular_trainable_params,
         },
     );
     defer trainer.deinit();
@@ -308,4 +313,213 @@ test "GLiNER2 e2e: loss decreases over training steps" {
         std.debug.print("FAIL: all LoRA B weights are still zero after training\n", .{});
         return error.LoraWeightsNotUpdated;
     }
+
+    try std.testing.expectEqual(@as(usize, 2), trainer.regular_params.items.len);
+    var classifier_head_updated = false;
+    for (trainer.regular_params.items) |slot| {
+        const original = weight_store.resident_weights.getPtr(slot.name) orelse return error.MissingClassifierHead;
+        const original_data = original.tensor.asFloat32();
+        try std.testing.expectEqual(original_data.len, slot.weights.len);
+        for (slot.weights, original_data) |after, before| {
+            if (after != before) {
+                classifier_head_updated = true;
+                break;
+            }
+        }
+        if (classifier_head_updated) break;
+    }
+    if (!classifier_head_updated) {
+        std.debug.print("FAIL: classifier head weights did not update\n", .{});
+        return error.ClassifierHeadNotUpdated;
+    }
+}
+
+test "GLiNER2 inference: fixed text produces deterministic token logits" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        var it = weight_store.resident_weights.iterator();
+        while (it.next()) |entry| {
+            var lw = entry.value_ptr.*;
+            if (std.mem.startsWith(u8, lw.tensor.name, "encoder.layer.")) {
+                allocator.free(lw.tensor.name);
+            }
+            lw.deinit();
+        }
+        weight_store.resident_weights.deinit(allocator);
+    }
+
+    var prng = std.Random.DefaultPrng.init(777);
+    const rng = prng.random();
+    try populateGliner2Weights(allocator, &weight_store, rng);
+
+    var native = NativeCompute.init(allocator, &weight_store, null);
+    var cb = native.computeBackend();
+
+    const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
+    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    var trainer = try real_autodiff.RealAutodiffTrainer.init(
+        allocator,
+        &cb,
+        .{
+            .lora = .{
+                .rank = 4,
+                .alpha = 1.0,
+                .target_patterns = &lora_targets,
+            },
+            .lr_schedule = .{ .constant = 1e-3 },
+            .max_grad_norm = 1.0,
+            .grad_accum_steps = 1,
+            .lora_a_init_std = 0.02,
+            .seed = 42,
+            .regular_trainable_params = &regular_trainable_params,
+        },
+    );
+    defer trainer.deinit();
+
+    var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+    const entity_types = [_][]const u8{ "organization", "location" };
+    const examples = [_]gliner2_data.Example{
+        .{ .text = "google in london", .entities = &.{} },
+    };
+    const infer_seq_len: u32 = 32;
+    var batch = try gliner2_data.buildSimpleBatch(allocator, &tokenizer, &examples, &entity_types, infer_seq_len, 4, 1);
+    defer batch.deinit();
+
+    var input_ids: [infer_seq_len]i64 = undefined;
+    var attention_mask: [infer_seq_len]f32 = undefined;
+    for (0..infer_seq_len) |idx| {
+        input_ids[idx] = batch.input_ids[idx];
+        attention_mask[idx] = @floatFromInt(batch.attention_mask[idx]);
+    }
+
+    var ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
+        .graph_config = deberta_config,
+        .num_classes = NUM_CLASSES,
+    });
+    var zero_targets: [infer_seq_len * NUM_CLASSES]f32 = undefined;
+    @memset(&zero_targets, 0.0);
+    const bootstrap_input = gliner2_autodiff.makeTrainerInput(
+        &ctx,
+        &input_ids,
+        &attention_mask,
+        &zero_targets,
+        gliner2_autodiff.tokenTargetsShape(1, infer_seq_len, NUM_CLASSES),
+        1,
+        infer_seq_len,
+    );
+    try trainer.ensureGraphBuilt(bootstrap_input);
+
+    const classifier_bias = [_]f32{ -0.75, -0.25, 0.0, 0.5, 1.25 };
+    for (trainer.regular_params.items) |*slot| {
+        if (std.mem.eql(u8, slot.name, "classifier.weight")) {
+            @memset(slot.weights, 0.0);
+        } else if (std.mem.eql(u8, slot.name, "classifier.bias")) {
+            try std.testing.expectEqual(classifier_bias.len, slot.weights.len);
+            @memcpy(slot.weights, &classifier_bias);
+        }
+    }
+
+    const logits = try gliner2_autodiff.tokenLogitsForBatch(
+        allocator,
+        &trainer,
+        &ctx,
+        &input_ids,
+        &attention_mask,
+        1,
+        infer_seq_len,
+    );
+    defer allocator.free(logits);
+    try std.testing.expectEqual(@as(usize, infer_seq_len * NUM_CLASSES), logits.len);
+
+    const logits_again = try gliner2_autodiff.tokenLogitsForBatch(
+        allocator,
+        &trainer,
+        &ctx,
+        &input_ids,
+        &attention_mask,
+        1,
+        infer_seq_len,
+    );
+    defer allocator.free(logits_again);
+
+    for (0..infer_seq_len) |row_idx| {
+        const row = logits[row_idx * NUM_CLASSES ..][0..NUM_CLASSES];
+        const row_again = logits_again[row_idx * NUM_CLASSES ..][0..NUM_CLASSES];
+        for (classifier_bias, 0..) |expected, class_idx| {
+            try std.testing.expectApproxEqAbs(expected, row[class_idx], 1e-5);
+            try std.testing.expectApproxEqAbs(row[class_idx], row_again[class_idx], 1e-6);
+        }
+        try std.testing.expectEqual(@as(usize, 4), argmax(row));
+    }
+
+    const out_dir = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_e2e_task_head_export_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(out_dir);
+    compat.cwd().deleteTree(compat.io(), out_dir) catch {};
+    try compat.cwd().createDirPath(compat.io(), out_dir);
+    defer compat.cwd().deleteTree(compat.io(), out_dir) catch {};
+
+    const weight_slot = regularParamSlot(&trainer, "classifier.weight") orelse return error.MissingClassifierHead;
+    const bias_slot = regularParamSlot(&trainer, "classifier.bias") orelse return error.MissingClassifierHead;
+    const task_head_params = [_]gliner2_bundle.AutodiffAdapterParam{
+        .{
+            .name = weight_slot.name,
+            .dims = weight_slot.dims,
+            .weights = weight_slot.weights,
+        },
+        .{
+            .name = bias_slot.name,
+            .dims = bias_slot.dims,
+            .weights = bias_slot.weights,
+        },
+    };
+    var exported_head = try gliner2_bundle.exportAutodiffRegularParamsAsSafetensors(allocator, out_dir, &task_head_params);
+    defer gliner2_bundle.freeAutodiffRegularParamExportSummary(allocator, &exported_head);
+
+    var reloaded_head = try gliner2_bundle.loadClassifierTaskHead(allocator, exported_head.checkpoint_path);
+    defer reloaded_head.deinit();
+    try std.testing.expectEqual(@as(usize, NUM_CLASSES), reloaded_head.num_classes);
+    try std.testing.expectEqual(@as(usize, HIDDEN), reloaded_head.hidden_size);
+    try std.testing.expectEqualSlices(f32, weight_slot.weights, reloaded_head.weight);
+    try std.testing.expectEqualSlices(f32, bias_slot.weights, reloaded_head.bias);
+
+    const zero_hidden = [_]f32{0.0} ** (2 * HIDDEN);
+    const reloaded_logits = try reloaded_head.scoreRowsAlloc(allocator, &zero_hidden);
+    defer allocator.free(reloaded_logits);
+    for (0..2) |row_idx| {
+        const row = reloaded_logits[row_idx * NUM_CLASSES ..][0..NUM_CLASSES];
+        for (classifier_bias, 0..) |expected, class_idx| {
+            try std.testing.expectApproxEqAbs(expected, row[class_idx], 1e-6);
+        }
+        try std.testing.expectEqual(@as(usize, 4), argmax(row));
+    }
+}
+
+fn argmax(values: []const f32) usize {
+    std.debug.assert(values.len > 0);
+    var best_idx: usize = 0;
+    var best = values[0];
+    for (values[1..], 1..) |value, idx| {
+        if (value > best) {
+            best = value;
+            best_idx = idx;
+        }
+    }
+    return best_idx;
+}
+
+fn regularParamSlot(
+    trainer: *const real_autodiff.RealAutodiffTrainer,
+    name: []const u8,
+) ?*const real_autodiff.RealAutodiffTrainer.ParamSlot {
+    for (trainer.regular_params.items) |*slot| {
+        if (std.mem.eql(u8, slot.name, name)) return slot;
+    }
+    return null;
 }

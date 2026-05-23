@@ -46,6 +46,7 @@ pub const finetune = struct {
     pub const gliner2 = @import("finetune/gliner2.zig");
     pub const gliner2_boundary = @import("finetune/gliner2_boundary.zig");
     pub const gliner2_data = @import("finetune/gliner2_data.zig");
+    pub const gliner2_run_validation = @import("finetune/gliner2_run_validation.zig");
     pub const entity_cleanup_data = @import("finetune/entity_cleanup_data.zig");
     pub const entity_cleanup_gliner_cache = @import("finetune/entity_cleanup_gliner_cache.zig");
     pub const entity_cleanup_model = @import("finetune/entity_cleanup_model.zig");

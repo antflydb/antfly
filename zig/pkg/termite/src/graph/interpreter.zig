@@ -2376,15 +2376,55 @@ pub fn executeNode(
             var dest_buf: [8]i64 = undefined;
             var values_buf: [8]i64 = undefined;
             var indices_buf: [8]i64 = undefined;
-            const dest_shape = fillShapeDims(graph, ins[0], &dest_buf);
-            const values_shape = fillShapeDims(graph, ins[1], &values_buf);
-            const indices_shape = fillShapeDims(graph, ins[2], &indices_buf);
+            var generated_dest: ?CT = null;
+            defer if (generated_dest) |ct| cb.free(ct);
+
+            var dest: CT = undefined;
+            var scatter_values: CT = undefined;
+            var indices: CT = undefined;
+            var dest_shape: []const i64 = undefined;
+            var values_shape: []const i64 = undefined;
+            var indices_shape: []const i64 = undefined;
+
+            if (graph.node(node_id).num_inputs == 2) {
+                const out_shape = graph.node(node_id).output_shape;
+                const rank = out_shape.rank();
+                if (rank > dest_buf.len) return error.UnsupportedShape;
+                var dims_i32: [8]i32 = undefined;
+                for (0..rank) |axis| {
+                    const dim = out_shape.dim(@intCast(axis));
+                    if (dim <= 0) return error.UnsupportedShape;
+                    dest_buf[axis] = dim;
+                    dims_i32[axis] = @intCast(dim);
+                }
+                const elem_count_i64 = out_shape.numElements() orelse return error.UnsupportedShape;
+                if (elem_count_i64 < 0) return error.UnsupportedShape;
+                const elem_count: usize = @intCast(elem_count_i64);
+                const zeros = try std.heap.page_allocator.alloc(f32, elem_count);
+                defer std.heap.page_allocator.free(zeros);
+                @memset(zeros, 0.0);
+                generated_dest = try cb.fromFloat32Shape(zeros, dims_i32[0..rank]);
+
+                dest = generated_dest.?;
+                scatter_values = V.get(ins[0]);
+                indices = V.get(ins[1]);
+                dest_shape = dest_buf[0..rank];
+                values_shape = fillShapeDims(graph, ins[0], &values_buf);
+                indices_shape = fillShapeDims(graph, ins[1], &indices_buf);
+            } else {
+                dest = V.get(ins[0]);
+                scatter_values = V.get(ins[1]);
+                indices = V.get(ins[2]);
+                dest_shape = fillShapeDims(graph, ins[0], &dest_buf);
+                values_shape = fillShapeDims(graph, ins[1], &values_buf);
+                indices_shape = fillShapeDims(graph, ins[2], &indices_buf);
+            }
             return executeScatterAdd(
                 std.heap.page_allocator,
                 cb,
-                V.get(ins[0]),
-                V.get(ins[1]),
-                V.get(ins[2]),
+                dest,
+                scatter_values,
+                indices,
                 dest_shape,
                 values_shape,
                 indices_shape,
@@ -3351,6 +3391,47 @@ test "scatter_add interpreter uses dest values and explicit indices input" {
     defer allocator.free(actual);
 
     try std.testing.expectEqualSlices(f32, &.{ 16, 28, 33, 44, 50, 60 }, actual);
+}
+
+test "scatter_add interpreter supports autodiff two-input gather gradient form" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const values = try builder.parameter("values", Shape.init(.f32, &.{ 3, 2 }));
+    const indices = try builder.parameter("indices", Shape.init(.i64, &.{3}));
+    const out = try g.addNode(.{
+        .op = .{ .scatter_add = .{ .axis = 0 } },
+        .output_shape = Shape.init(.f32, &.{ 3, 2 }),
+        .inputs = .{ values, indices, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var tc_backend = TestCompute.init(allocator);
+    defer tc_backend.deinit();
+    defer tc_backend.freeWeights();
+    var cb = tc_backend.backend();
+
+    const values_ct = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    const indices_ct = try cb.fromFloat32Shape(&.{ 0, 1, 0 }, &.{3});
+    defer cb.free(values_ct);
+    defer cb.free(indices_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = values, .value = values_ct },
+        .{ .node_id = indices, .value = indices_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb);
+
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualSlices(f32, &.{ 6, 8, 3, 4, 0, 0 }, actual);
 }
 
 test "shouldReshapeToDeclaredShape does not collapse higher-rank tensors" {

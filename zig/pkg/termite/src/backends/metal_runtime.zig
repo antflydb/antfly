@@ -20283,35 +20283,35 @@ test "metal native decoder runtime active frame keeps common op params stable" {
     var mul_frame = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, &elem_shape);
     defer mul_frame.deinit();
 
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), rhs.deviceHandle(), rhs.deviceByteOffset(), elem_count, add_ref.deviceHandle(), add_ref.deviceByteOffset()));
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_multiply_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), rhs.deviceHandle(), rhs.deviceByteOffset(), elem_count, mul_ref.deviceHandle(), mul_ref.deviceByteOffset()));
+    const table_rows: usize = 4;
+    const table_dim: usize = 5;
+    var table: [table_rows * table_dim]f32 = undefined;
+    for (&table, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i)) * 0.0625;
+    var ids = [_]u32{ 3, 1, 2 };
+    const embed_shape = [_]i32{ @intCast(ids.len), @intCast(table_dim) };
+    var embed_ref = try MetalTensor.deviceAllocate(runtime, ids.len * table_dim * @sizeOf(f32), .private, embed_shape[0..]);
+    defer embed_ref.deinit();
+    var embed_frame = try MetalTensor.deviceAllocate(runtime, ids.len * table_dim * @sizeOf(f32), .private, embed_shape[0..]);
+    defer embed_frame.deinit();
 
     const rope_chunks: usize = 3;
     const head_dim: usize = 8;
     var rope_data: [rope_chunks * head_dim]f32 = undefined;
     for (&rope_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 11));
     const rope_shape = [_]i32{ @intCast(rope_chunks), @intCast(head_dim) };
-    const positions = [_]u32{ 0, 2, 5 };
+    var positions = [_]u32{ 0, 2, 5 };
     var rope_input = try testDeviceTensorFromSlice(runtime, &rope_data, &rope_shape);
     defer rope_input.deinit();
     var rope_ref = try MetalTensor.deviceAllocate(runtime, rope_data.len * @sizeOf(f32), .private, &rope_shape);
     defer rope_ref.deinit();
     var rope_frame = try MetalTensor.deviceAllocate(runtime, rope_data.len * @sizeOf(f32), .private, &rope_shape);
     defer rope_frame.deinit();
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_rope_device(runtime, rope_input.deviceHandle(), rope_input.deviceByteOffset(), &positions, rope_chunks, head_dim, 4, 10000.0, 1.0, 1, rope_ref.deviceHandle(), rope_ref.deviceByteOffset()));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_rope_device(runtime, rope_input.deviceHandle(), rope_input.deviceByteOffset(), positions[0..].ptr, rope_chunks, head_dim, 4, 10000.0, 1.0, 1, rope_ref.deviceHandle(), rope_ref.deviceByteOffset()));
 
-    const table_rows: usize = 4;
-    const table_dim: usize = 5;
-    var table: [table_rows * table_dim]f32 = undefined;
-    for (&table, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i)) * 0.0625;
-    const ids = [_]u32{ 3, 1, 2 };
-    const embed_shape = [_]i32{ @intCast(ids.len), @intCast(table_dim) };
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_embedding_table(runtime, &table, table_rows, table_dim));
-    var embed_ref = try MetalTensor.deviceAllocate(runtime, ids.len * table_dim * @sizeOf(f32), .private, &embed_shape);
-    defer embed_ref.deinit();
-    var embed_frame = try MetalTensor.deviceAllocate(runtime, ids.len * table_dim * @sizeOf(f32), .private, &embed_shape);
-    defer embed_frame.deinit();
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_embedding_lookup_prepared_device(runtime, &ids, ids.len, table_dim, embed_ref.deviceHandle(), embed_ref.deviceByteOffset()));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), rhs.deviceHandle(), rhs.deviceByteOffset(), elem_count, add_ref.deviceHandle(), add_ref.deviceByteOffset()));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_multiply_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), rhs.deviceHandle(), rhs.deviceByteOffset(), elem_count, mul_ref.deviceHandle(), mul_ref.deviceByteOffset()));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_embedding_table(runtime, table[0..].ptr, table_rows, table_dim));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_embedding_lookup_prepared_device(runtime, ids[0..].ptr, ids.len, table_dim, embed_ref.deviceHandle(), embed_ref.deviceByteOffset()));
 
     const norm_rows: usize = 2;
     const norm_hidden: usize = 8;
@@ -20322,7 +20322,7 @@ test "metal native decoder runtime active frame keeps common op params stable" {
     for (&norm_weight, 0..) |*value, i| value.* = 0.75 + @as(f32, @floatFromInt(i)) * 0.03125;
     for (&norm_bias, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 4)) * 0.015625;
     const norm_shape = [_]i32{ @intCast(norm_rows), @intCast(norm_hidden) };
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_layer_norm(runtime, 0, &norm_weight, &norm_bias, norm_hidden));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_layer_norm(runtime, 0, norm_weight[0..].ptr, norm_bias[0..].ptr, norm_hidden));
     var norm_input = try testDeviceTensorFromSlice(runtime, &norm_input_data, &norm_shape);
     defer norm_input.deinit();
     var norm_ref = try MetalTensor.deviceAllocate(runtime, norm_input_data.len * @sizeOf(f32), .private, &norm_shape);
@@ -20335,8 +20335,8 @@ test "metal native decoder runtime active frame keeps common op params stable" {
     errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
     try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), rhs.deviceHandle(), rhs.deviceByteOffset(), elem_count, add_frame.deviceHandle(), add_frame.deviceByteOffset()));
     try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_multiply_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), rhs.deviceHandle(), rhs.deviceByteOffset(), elem_count, mul_frame.deviceHandle(), mul_frame.deviceByteOffset()));
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_rope_device(runtime, rope_input.deviceHandle(), rope_input.deviceByteOffset(), &positions, rope_chunks, head_dim, 4, 10000.0, 1.0, 1, rope_frame.deviceHandle(), rope_frame.deviceByteOffset()));
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_embedding_lookup_prepared_device(runtime, &ids, ids.len, table_dim, embed_frame.deviceHandle(), embed_frame.deviceByteOffset()));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_rope_device(runtime, rope_input.deviceHandle(), rope_input.deviceByteOffset(), positions[0..].ptr, rope_chunks, head_dim, 4, 10000.0, 1.0, 1, rope_frame.deviceHandle(), rope_frame.deviceByteOffset()));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_embedding_lookup_prepared_device(runtime, ids[0..].ptr, ids.len, table_dim, embed_frame.deviceHandle(), embed_frame.deviceByteOffset()));
     try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_layer_norm_device(runtime, 0, norm_input.deviceHandle(), norm_input.deviceByteOffset(), norm_rows, norm_hidden, 1e-5, norm_frame.deviceHandle(), norm_frame.deviceByteOffset()));
     try submitFrame(runtime);
     try waitFrame(runtime);

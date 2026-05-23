@@ -32,6 +32,13 @@ const workflow_commands = [_]common.CommandSpec{
         .native_link = .default,
     },
     .{
+        .name = "run-gliner2-autodiff-smoke-workflow",
+        .root_source_file = "src/finetune/train/run_gliner2_autodiff_smoke_workflow.zig",
+        .description = "Run train-gliner2-autodiff followed by validate-gliner2-autodiff-run for a real-model smoke gate",
+        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .protobuf, .termite_linalg },
+        .native_link = .default,
+    },
+    .{
         .name = "run-gemma4-lora-pilot-workflow",
         .root_source_file = "src/finetune/train/run_gemma4_lora_pilot_workflow.zig",
         .description = "Run a larger single-device Gemma4 LoRA text or multimodal pilot workflow",

@@ -60,7 +60,20 @@ const commands = [_]common.CommandSpec{
         .name = "inspect-gliner2-dataset",
         .root_source_file = "src/finetune/tools/inspect_gliner2_dataset.zig",
         .description = "Inspect GLiNER2 finetune dataset stats, coverage, and encoded batch shapes",
-        .imports = &.{.termite_finetune_data},
+        .imports = &.{ .build_options, .termite_internal },
+    },
+    .{
+        .name = "validate-gliner2-autodiff-run",
+        .root_source_file = "src/finetune/tools/validate_gliner2_autodiff_run.zig",
+        .description = "Validate train-gliner2-autodiff metrics, manifest, and saved adapter parameter files",
+        .imports = gemma_lora_imports,
+    },
+    .{
+        .name = "eval-gliner2-autodiff-adapter",
+        .root_source_file = "src/finetune/tools/eval_gliner2_autodiff_adapter.zig",
+        .description = "Run fixed-text semantic eval against a saved GLiNER2 autodiff PEFT adapter and task head",
+        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .termite_linalg },
+        .native_link = .default,
     },
     .{
         .name = "prepare-entity-cleanup-cache",

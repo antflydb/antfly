@@ -34,6 +34,8 @@
 //   --lora-alpha <f>             LoRA alpha scaling (default: 32)
 //   --lora-targets <csv>         Target module patterns (default: "query_proj,value_proj")
 //   --num-classes <n>            Entity classes including O (default: 5)
+//   --objective <name>           token or span-start (default: token)
+//   --max-span-width <n>         Max span width for span-start objective (default: 4)
 //   --max-examples <n>           Cap on training examples (0 = all, default: 0)
 //   --max-grad-norm <f>          Gradient clipping norm (default: 1.0)
 //   --grad-accum <n>             Gradient accumulation steps (default: 1)
@@ -58,8 +60,10 @@ const mlx_c = if (build_options.enable_mlx) mlx_mod.c else struct {};
 
 // Finetune module imports — accessed via the termite internal module tree.
 const gliner2_data = termite.finetune.gliner2_data;
+const gliner2_bundle = termite.finetune.gliner2;
 const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
 const real_autodiff = termite.finetune.real_autodiff_trainer;
+const run_validation = termite.finetune.gliner2_run_validation;
 const deberta_graph = termite.architectures.deberta_graph;
 
 const print = std.debug.print;
@@ -80,6 +84,8 @@ const Options = struct {
     lora_alpha: f32 = 32.0,
     lora_targets: []const u8 = "query_proj,value_proj",
     num_classes: u32 = 5,
+    objective: gliner2_autodiff.GlinerObjective = .token,
+    max_span_width: u32 = 4,
     max_examples: usize = 0,
     max_grad_norm: f32 = 1.0,
     grad_accum: u32 = 1,
@@ -109,6 +115,8 @@ pub fn main(init: std.process.Init) !void {
     var lora_alpha: f32 = 32.0;
     var lora_targets: []const u8 = "query_proj,value_proj";
     var num_classes: u32 = 5;
+    var objective: gliner2_autodiff.GlinerObjective = .token;
+    var max_span_width: u32 = 4;
     var max_examples: usize = 0;
     var max_grad_norm: f32 = 1.0;
     var grad_accum: u32 = 1;
@@ -147,6 +155,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--num-classes")) {
             const val = args.next() orelse return error.MissingNumClasses;
             num_classes = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--objective")) {
+            const val = args.next() orelse return error.MissingObjective;
+            objective = try parseObjective(val);
+        } else if (std.mem.eql(u8, arg, "--max-span-width")) {
+            const val = args.next() orelse return error.MissingMaxSpanWidth;
+            max_span_width = try std.fmt.parseUnsigned(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--max-examples")) {
             const val = args.next() orelse return error.MissingMaxExamples;
             max_examples = try std.fmt.parseUnsigned(usize, val, 10);
@@ -190,6 +204,8 @@ pub fn main(init: std.process.Init) !void {
         .lora_alpha = lora_alpha,
         .lora_targets = lora_targets,
         .num_classes = num_classes,
+        .objective = objective,
+        .max_span_width = max_span_width,
         .max_examples = max_examples,
         .max_grad_norm = max_grad_norm,
         .grad_accum = grad_accum,
@@ -231,6 +247,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.max_grad_norm,
         opts.grad_accum,
     });
+    print("  objective={s} max_span_width={d}\n", .{ objectiveName(opts.objective), opts.max_span_width });
 
     // ------------------------------------------------------------------
     // 2. Load DeBERTa config — GLiNER2 stores the encoder config under
@@ -273,7 +290,20 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var safetensors_source: ?*SafetensorsSource = null;
     defer if (safetensors_source) |s| s.weightSource().deinit();
 
-    const use_mlx = build_options.enable_mlx;
+    const force_native = envFlag("TERMITE_GLINER2_FORCE_NATIVE");
+    const mlx_runtime_available = if (comptime build_options.enable_mlx)
+        (!force_native and (mlx.metalDeviceAvailable() or mlx.allowCpuStreamWithoutMetal()))
+    else
+        false;
+    if (comptime build_options.enable_mlx) {
+        if (force_native) {
+            print("info: TERMITE_GLINER2_FORCE_NATIVE is set; using native CPU/BLAS\n", .{});
+        } else if (!mlx_runtime_available) {
+            print("warning: MLX build enabled but no Metal device is available; falling back to native CPU/BLAS\n", .{});
+        }
+    }
+
+    const use_mlx = if (comptime build_options.enable_mlx) mlx_runtime_available else false;
     const cb = if (use_mlx) blk: {
         // ── MLX path: load weights directly into MLX arrays ──────────
         const raw_weights = try mlx.loadSafetensors(st_path, allocator, mlx.openDefaultStream().stream);
@@ -393,6 +423,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         native_backend = native_compute.NativeCompute.init(allocator, &native_ws, null);
         break :blk native_backend.computeBackend();
     };
+    defer if (!use_mlx) deinitNativeWeightStore(allocator, &native_ws);
 
     print("  backend: {s}\n", .{if (use_mlx) "MLX (Apple Silicon)" else "native CPU/BLAS"});
 
@@ -423,31 +454,34 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 6. Build a label-to-class-index mapping from the training data
     // ------------------------------------------------------------------
-    // Class 0 is always the "O" (no entity) class. Entity labels seen in
-    // the data are assigned indices 1..num_classes-1 in order of first
-    // appearance; any labels beyond (num_classes - 1) are clamped to the
-    // last slot. This keeps the mapping deterministic without requiring
-    // the user to provide an explicit label list.
+    // Class 0 is always the "O" (no entity) class. Entity labels are sorted
+    // before assignment so class ids are deterministic. Refuse to train if
+    // the dataset has more labels than the configured class head can
+    // represent; silently collapsing labels corrupts the supervised signal.
     var label_map = std.StringHashMapUnmanaged(u32){};
     defer label_map.deinit(allocator);
-    var next_class: u32 = 1; // 0 = O
-    for (examples) |ex| {
-        for (ex.entities) |ent| {
-            if (label_map.get(ent.label) == null) {
-                const cls = if (next_class < opts.num_classes) next_class else opts.num_classes - 1;
-                try label_map.put(allocator, ent.label, cls);
-                if (next_class < opts.num_classes) next_class += 1;
-            }
-        }
+    const entity_types = try gliner2_data.buildLabelVocab(allocator, examples, null);
+    defer {
+        for (entity_types) |label| allocator.free(label);
+        allocator.free(entity_types);
     }
-    // Build ordered entity type list for the tokenizer prompt.
-    var entity_types = std.ArrayListUnmanaged([]const u8).empty;
-    defer entity_types.deinit(allocator);
-    {
-        var it = label_map.iterator();
-        while (it.next()) |entry| {
-            try entity_types.append(allocator, entry.key_ptr.*);
-        }
+    if (entity_types.len + 1 > opts.num_classes) {
+        print("error: dataset has {d} entity labels but num_classes={d} only has {d} entity slots\n", .{
+            entity_types.len,
+            opts.num_classes,
+            if (opts.num_classes > 0) opts.num_classes - 1 else 0,
+        });
+        return error.TooManyEntityTypes;
+    }
+    if (opts.objective == .span_start and entity_types.len + 1 != @as(usize, @intCast(opts.num_classes))) {
+        print("error: span-start objective currently requires num_classes == entity_label_count + 1 ({d}); got {d}\n", .{
+            entity_types.len + 1,
+            opts.num_classes,
+        });
+        return error.SpanObjectiveRequiresExactClassCount;
+    }
+    for (entity_types, 0..) |label, idx| {
+        try label_map.put(allocator, label, @intCast(idx + 1));
     }
     print("  entity labels mapped: {d} (num_classes={d})\n", .{ label_map.count(), opts.num_classes });
 
@@ -492,6 +526,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var gliner_ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
         .graph_config = graph_config,
         .num_classes = opts.num_classes,
+        .objective = opts.objective,
     });
 
     // ------------------------------------------------------------------
@@ -502,6 +537,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .alpha = opts.lora_alpha,
         .target_patterns = target_patterns.items,
     };
+    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
 
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
@@ -515,6 +551,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .hidden_size_hint = deberta_config.hidden_size,
             .num_layers_hint = deberta_config.num_hidden_layers,
             .seed = opts.seed,
+            .regular_trainable_params = &regular_trainable_params,
         },
     );
     defer trainer.deinit();
@@ -536,13 +573,17 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     const bs: usize = opts.batch_size;
     const nc: usize = opts.num_classes;
     const batch_tokens = bs * sl;
+    const span_target_width: usize = if (opts.num_classes > 1) 2 * (@as(usize, @intCast(opts.num_classes)) - 1) + 1 else 1;
+    const max_span_target_values = bs * sl * @as(usize, @intCast(opts.max_span_width)) * span_target_width;
+    const target_buf_values = @max(batch_tokens * nc, max_span_target_values);
 
     var input_ids = try allocator.alloc(i64, batch_tokens);
     defer allocator.free(input_ids);
     var attention_mask = try allocator.alloc(f32, batch_tokens);
     defer allocator.free(attention_mask);
-    // Targets: one-hot [batch * seq_len, num_classes]
-    var targets_buf = try allocator.alloc(f32, batch_tokens * nc);
+    // Token mode: [batch * seq_len, num_classes].
+    // Span mode: [batch * max_spans, 2 * entity_types + 1].
+    var targets_buf = try allocator.alloc(f32, target_buf_values);
     defer allocator.free(targets_buf);
 
     var rng = std.Random.DefaultPrng.init(opts.seed);
@@ -550,13 +591,17 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
     var cumulative_loss: f64 = 0.0;
     var total_steps: u64 = 0;
+    var metrics_jsonl: std.Io.Writer.Allocating = .init(allocator);
+    defer metrics_jsonl.deinit();
 
     for (0..opts.epochs) |epoch| {
         // Shuffle examples at the start of each epoch.
         prng.shuffle(gliner2_data.Example, examples);
 
+        const epoch_started_ns = monotonicNowNs();
         var epoch_loss: f64 = 0.0;
         var epoch_steps: u64 = 0;
+        var epoch_target_stats = BatchTargetStats{};
 
         var batch_start: usize = 0;
         while (batch_start < total_examples) {
@@ -564,50 +609,101 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             const actual_batch: u32 = @intCast(batch_end - batch_start);
             const ab: usize = actual_batch;
 
-            // Tokenize batch + build entity targets.
-            fillBatchBuffers(
-                allocator,
-                &tokenizer,
-                entity_types.items,
-                examples[batch_start..batch_end],
-                opts.seq_len,
-                opts.num_classes,
-                &label_map,
-                input_ids,
-                attention_mask,
-                targets_buf,
-            );
+            // Tokenize batch + build entity/span targets.
+            const step_started_ns = monotonicNowNs();
+            var target_stats = BatchTargetStats{};
+            var targets_shape: ml.graph.Shape = undefined;
+            var target_slice: []const f32 = undefined;
+            switch (opts.objective) {
+                .token => {
+                    target_stats = fillBatchBuffers(
+                        allocator,
+                        &tokenizer,
+                        entity_types,
+                        examples[batch_start..batch_end],
+                        opts.seq_len,
+                        opts.num_classes,
+                        &label_map,
+                        input_ids,
+                        attention_mask,
+                        targets_buf[0 .. ab * sl * nc],
+                    );
+                    targets_shape = gliner2_autodiff.tokenTargetsShape(
+                        actual_batch,
+                        opts.seq_len,
+                        opts.num_classes,
+                    );
+                    target_slice = targets_buf[0 .. ab * sl * nc];
+                },
+                .span_start => {
+                    var encoded = try gliner2_data.buildSimpleBatch(
+                        allocator,
+                        &tokenizer,
+                        examples[batch_start..batch_end],
+                        entity_types,
+                        opts.seq_len,
+                        opts.max_span_width,
+                        ab,
+                    );
+                    defer encoded.deinit();
+
+                    if (encoded.input_ids.len != ab * sl or encoded.attention_mask.len != ab * sl) return error.InvalidGlinerBatchShape;
+                    for (0..ab * sl) |i| {
+                        input_ids[i] = encoded.input_ids[i];
+                        attention_mask[i] = @floatFromInt(encoded.attention_mask[i]);
+                    }
+
+                    const width = 2 * encoded.num_entity_types + 1;
+                    const target_len = encoded.batch_size * encoded.max_spans * width;
+                    const span_stats = try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatch(
+                        &encoded,
+                        targets_buf[0..target_len],
+                    );
+                    target_stats = BatchTargetStats.fromSpanStart(span_stats, encoded.num_entity_types);
+                    targets_shape = gliner2_autodiff.spanStartTargetsShape(
+                        actual_batch,
+                        @intCast(encoded.max_spans),
+                        @intCast(encoded.num_entity_types),
+                    );
+                    target_slice = targets_buf[0..target_len];
+                },
+            }
+            const target_built_ns = monotonicNowNs();
 
             // Build TrainerInput via the GLiNER2 convenience builder.
-            const targets_shape = gliner2_autodiff.tokenTargetsShape(
-                actual_batch,
-                opts.seq_len,
-                opts.num_classes,
-            );
-
             const trainer_input = gliner2_autodiff.makeTrainerInput(
                 &gliner_ctx,
                 input_ids[0 .. ab * sl],
                 attention_mask[0 .. ab * sl],
-                targets_buf[0 .. ab * sl * nc],
+                target_slice,
                 targets_shape,
                 actual_batch,
                 opts.seq_len,
             );
 
             const result = try trainer.step(trainer_input);
+            const step_finished_ns = monotonicNowNs();
+            const timing = StepTiming{
+                .target_build_ns = elapsedNs(step_started_ns, target_built_ns),
+                .train_step_ns = elapsedNs(target_built_ns, step_finished_ns),
+                .step_wall_ns = elapsedNs(step_started_ns, step_finished_ns),
+                .profile = result.profile,
+            };
             epoch_loss += result.loss;
             epoch_steps += 1;
+            epoch_target_stats.add(target_stats);
             total_steps += 1;
+            try writeStepMetric(&metrics_jsonl.writer, epoch + 1, total_steps, epoch_steps, result.loss, result.grad_norm, result.optimizer_stepped, target_stats, timing);
 
             if (total_steps % 10 == 0 or batch_end >= total_examples) {
-                print("  [epoch {d}/{d}] step {d}/{d}  loss={d:.6}  grad_norm={d:.4}{s}\n", .{
+                print("  [epoch {d}/{d}] step {d}/{d}  loss={d:.6}  grad_norm={d:.4}  supervised_tok/s={d:.2}{s}\n", .{
                     epoch + 1,
                     opts.epochs,
                     epoch_steps,
                     steps_per_epoch,
                     result.loss,
                     result.grad_norm,
+                    timing.supervisedTokensPerSecond(target_stats),
                     if (result.optimizer_stepped) "" else " (accum)",
                 });
             }
@@ -633,16 +729,209 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             approx_acc,
             gold_ent_count,
         });
+        const epoch_timing = EpochTiming{
+            .epoch_wall_ns = elapsedNs(epoch_started_ns, monotonicNowNs()),
+        };
+        try writeEpochMetric(&metrics_jsonl.writer, epoch + 1, avg_epoch_loss, approx_acc, gold_ent_count, epoch_steps, epoch_target_stats, epoch_timing);
     }
 
     // ------------------------------------------------------------------
     // 11. Save adapters
     // ------------------------------------------------------------------
     try trainer.saveAdapters(opts.out_dir);
-    print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
+    const autodiff_params = try collectAutodiffAdapterParams(allocator, &trainer);
+    defer allocator.free(autodiff_params);
+    var peft_export = try gliner2_bundle.exportAutodiffAdaptersAsPeftBundle(
+        allocator,
+        opts.out_dir,
+        opts.model_dir,
+        opts.lora_rank,
+        opts.lora_alpha,
+        target_patterns.items,
+        autodiff_params,
+    );
+    defer gliner2_bundle.freeAutodiffAdapterExportSummary(allocator, &peft_export);
+    const regular_params = try collectRegularTrainableParams(allocator, &trainer);
+    defer allocator.free(regular_params);
+    var regular_export = try gliner2_bundle.exportAutodiffRegularParamsAsSafetensors(
+        allocator,
+        opts.out_dir,
+        regular_params,
+    );
+    defer gliner2_bundle.freeAutodiffRegularParamExportSummary(allocator, &regular_export);
+
+    const metrics_path = try std.fs.path.join(allocator, &.{ opts.out_dir, run_validation.metrics_file_name });
+    defer allocator.free(metrics_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
     const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
+    try writeTrainingManifest(allocator, opts, deberta_config.hidden_size, entity_types, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count);
+    print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
+
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
+}
+
+fn writeStepMetric(
+    writer: *std.Io.Writer,
+    epoch: usize,
+    global_step: u64,
+    epoch_step: u64,
+    loss: f32,
+    grad_norm: f32,
+    optimizer_stepped: bool,
+    target_stats: BatchTargetStats,
+    timing: StepTiming,
+) !void {
+    try std.json.Stringify.value(.{
+        .event = "step",
+        .epoch = epoch,
+        .step = global_step,
+        .epoch_step = epoch_step,
+        .loss = loss,
+        .grad_norm = grad_norm,
+        .optimizer_stepped = optimizer_stepped,
+        .supervised_token_count = target_stats.supervised_token_count,
+        .entity_token_count = target_stats.entity_token_count,
+        .ignored_token_count = target_stats.ignored_token_count,
+        .entity_token_rate = target_stats.entityTokenRate(),
+        .target_build_ms = nsToMillis(timing.target_build_ns),
+        .train_step_ms = nsToMillis(timing.train_step_ns),
+        .step_wall_ms = nsToMillis(timing.step_wall_ns),
+        .graph_build_ms = nsToMillis(timing.profile.graph_build_ns),
+        .runtime_input_ms = nsToMillis(timing.profile.runtime_input_ns),
+        .autodiff_ms = nsToMillis(timing.profile.autodiff_ns),
+        .execute_ms = nsToMillis(timing.profile.execute_ns),
+        .extract_ms = nsToMillis(timing.profile.extract_ns),
+        .optimizer_update_ms = nsToMillis(timing.profile.optimizer_update_ns),
+        .trainer_total_ms = nsToMillis(timing.profile.total_ns),
+        .peak_resident_bytes = timing.profile.peak_resident_bytes,
+        .supervised_tokens_per_second = timing.supervisedTokensPerSecond(target_stats),
+    }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeEpochMetric(
+    writer: *std.Io.Writer,
+    epoch: usize,
+    avg_loss: f64,
+    approx_accuracy_percent: f64,
+    gold_entities: u64,
+    steps: u64,
+    target_stats: BatchTargetStats,
+    timing: EpochTiming,
+) !void {
+    try std.json.Stringify.value(.{
+        .event = "epoch",
+        .epoch = epoch,
+        .avg_loss = avg_loss,
+        .approx_accuracy_percent = approx_accuracy_percent,
+        .gold_entities = gold_entities,
+        .steps = steps,
+        .supervised_token_count = target_stats.supervised_token_count,
+        .entity_token_count = target_stats.entity_token_count,
+        .ignored_token_count = target_stats.ignored_token_count,
+        .entity_token_rate = target_stats.entityTokenRate(),
+        .epoch_wall_ms = nsToMillis(timing.epoch_wall_ns),
+        .supervised_tokens_per_second = tokensPerSecond(target_stats.supervised_token_count, timing.epoch_wall_ns),
+    }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeTrainingManifest(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    hidden_size: u32,
+    entity_labels: []const []const u8,
+    example_count: usize,
+    total_steps: u64,
+    final_avg_loss: f64,
+    adapter_parameter_file_count: usize,
+    peft_adapter_tensor_count: usize,
+    regular_trainable_tensor_count: usize,
+) !void {
+    const manifest_path = try std.fs.path.join(allocator, &.{ opts.out_dir, run_validation.manifest_file_name });
+    defer allocator.free(manifest_path);
+
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try std.json.Stringify.value(.{
+        .schema_version = "gliner2_autodiff_training/v1",
+        .artifact_family_version = "gliner2_autodiff_adapter/v1",
+        .model_dir = opts.model_dir,
+        .train_data = opts.train_data,
+        .out_dir = opts.out_dir,
+        .metrics_file = run_validation.metrics_file_name,
+        .adapter_parameter_format = "real_autodiff_bin/v1",
+        .adapter_parameter_file_count = adapter_parameter_file_count,
+        .peft_adapter_checkpoint = gliner2_bundle.adapter_checkpoint_file_name,
+        .peft_adapter_config = gliner2_bundle.adapter_config_file_name,
+        .peft_adapter_tensor_count = peft_adapter_tensor_count,
+        .regular_trainable_checkpoint = gliner2_bundle.task_head_checkpoint_file_name,
+        .regular_trainable_tensor_count = regular_trainable_tensor_count,
+        .regular_trainable_params = .{ "classifier.weight", "classifier.bias" },
+        .epochs = opts.epochs,
+        .batch_size = opts.batch_size,
+        .seq_len = opts.seq_len,
+        .learning_rate = opts.learning_rate,
+        .lora_rank = opts.lora_rank,
+        .lora_alpha = opts.lora_alpha,
+        .lora_targets = opts.lora_targets,
+        .num_classes = opts.num_classes,
+        .objective = objectiveName(opts.objective),
+        .max_span_width = opts.max_span_width,
+        .hidden_size = hidden_size,
+        .entity_labels = entity_labels,
+        .entity_label_count = entity_labels.len,
+        .max_examples = opts.max_examples,
+        .max_grad_norm = opts.max_grad_norm,
+        .grad_accum = opts.grad_accum,
+        .seed = opts.seed,
+        .example_count = example_count,
+        .total_steps = total_steps,
+        .final_avg_loss = final_avg_loss,
+    }, .{ .whitespace = .indent_2 }, &buffer.writer);
+    try buffer.writer.writeByte('\n');
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = manifest_path, .data = buffer.written() });
+}
+
+fn collectAutodiffAdapterParams(
+    allocator: std.mem.Allocator,
+    trainer: *const real_autodiff.RealAutodiffTrainer,
+) ![]gliner2_bundle.AutodiffAdapterParam {
+    const params = try allocator.alloc(gliner2_bundle.AutodiffAdapterParam, trainer.lora_params.items.len);
+    for (trainer.lora_params.items, 0..) |slot, idx| {
+        params[idx] = .{
+            .name = slot.name,
+            .dims = slot.dims,
+            .weights = slot.weights,
+        };
+    }
+    return params;
+}
+
+fn collectRegularTrainableParams(
+    allocator: std.mem.Allocator,
+    trainer: *const real_autodiff.RealAutodiffTrainer,
+) ![]gliner2_bundle.AutodiffAdapterParam {
+    const params = try allocator.alloc(gliner2_bundle.AutodiffAdapterParam, trainer.regular_params.items.len);
+    for (trainer.regular_params.items, 0..) |slot, idx| {
+        params[idx] = .{
+            .name = slot.name,
+            .dims = slot.dims,
+            .weights = slot.weights,
+        };
+    }
+    return params;
+}
+
+fn deinitNativeWeightStore(allocator: std.mem.Allocator, weight_store: *native_compute.WeightStore) void {
+    var it = weight_store.resident_weights.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        entry.value_ptr.deinit();
+    }
+    weight_store.resident_weights.deinit(allocator);
+    weight_store.lazy_weights.deinit(allocator);
 }
 
 // ---------------------------------------------------------------------------
@@ -689,13 +978,79 @@ fn jsonU32(val: std.json.Value) ?u32 {
 // Batch buffer construction (real HF tokenizer + entity targets)
 // ---------------------------------------------------------------------------
 
+const BatchTargetStats = struct {
+    supervised_token_count: u64 = 0,
+    entity_token_count: u64 = 0,
+    ignored_token_count: u64 = 0,
+
+    fn entityTokenRate(self: BatchTargetStats) f64 {
+        if (self.supervised_token_count == 0) return 0.0;
+        return @as(f64, @floatFromInt(self.entity_token_count)) /
+            @as(f64, @floatFromInt(self.supervised_token_count));
+    }
+
+    fn add(self: *BatchTargetStats, other: BatchTargetStats) void {
+        self.supervised_token_count += other.supervised_token_count;
+        self.entity_token_count += other.entity_token_count;
+        self.ignored_token_count += other.ignored_token_count;
+    }
+
+    fn fromSpanStart(stats: gliner2_autodiff.SpanStartTargetStats, num_entity_types: usize) BatchTargetStats {
+        return .{
+            .supervised_token_count = stats.valid_span_count * @as(u64, @intCast(num_entity_types)),
+            .entity_token_count = stats.positive_span_label_count,
+            .ignored_token_count = stats.ignored_span_count * @as(u64, @intCast(num_entity_types)),
+        };
+    }
+};
+
+const StepTiming = struct {
+    target_build_ns: u64,
+    train_step_ns: u64,
+    step_wall_ns: u64,
+    profile: real_autodiff.StepProfile = .{},
+
+    fn supervisedTokensPerSecond(self: StepTiming, stats: BatchTargetStats) f64 {
+        return tokensPerSecond(stats.supervised_token_count, self.step_wall_ns);
+    }
+};
+
+const EpochTiming = struct {
+    epoch_wall_ns: u64,
+};
+
+fn monotonicNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
+    if (end_ns <= start_ns) return 0;
+    return end_ns - start_ns;
+}
+
+fn nsToMillis(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn tokensPerSecond(tokens: u64, ns: u64) f64 {
+    if (tokens == 0 or ns == 0) return 0.0;
+    const seconds = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    return @as(f64, @floatFromInt(tokens)) / seconds;
+}
+
 /// Fills input_ids, attention_mask, and one-hot targets for one batch
 /// using the real DeBERTa-v3 Unigram tokenizer with the GLiNER2 HF
 /// prompt format: [P] entity_types... [E] [SEP_TEXT] text_tokens...
 ///
 /// Entity annotations map to word-level positions via the tokenizer's
 /// `words_mask` / `first_token_positions` outputs, then to one-hot
-/// targets per token position.
+/// targets per text-token position. Prompt, entity-label, separator, and
+/// padding tokens are represented by all-zero rows so they do not contribute
+/// to the token-classifier fallback loss.
 fn fillBatchBuffers(
     allocator: std.mem.Allocator,
     tokenizer: *const gliner2_data.Tokenizer,
@@ -707,9 +1062,10 @@ fn fillBatchBuffers(
     input_ids: []i64,
     attention_mask: []f32,
     targets: []f32,
-) void {
+) BatchTargetStats {
     const sl: usize = seq_len;
     const nc: usize = num_classes;
+    var stats = BatchTargetStats{};
 
     // Scratch buffers for the tokenizer (i32 outputs).
     var tok_ids_buf: [4096]i32 = undefined;
@@ -796,13 +1152,19 @@ fn fillBatchBuffers(
                 // This token belongs to word (wm-1). Use its class.
                 const cls = word_class_buf[@intCast(wm - 1)];
                 targets[row + cls] = 1.0;
+                stats.supervised_token_count += 1;
+                if (cls > 0) stats.entity_token_count += 1;
             } else if (tok_mask[p] != 0) {
-                // Non-padding, non-word token (special tokens) → O class.
-                targets[row] = 1.0;
+                // Non-padding, non-word token (prompt/special tokens): ignore.
+                stats.ignored_token_count += 1;
+            } else {
+                stats.ignored_token_count += 1;
             }
             // Padding (tok_mask==0): all-zero → contributes 0 to loss.
         }
     }
+
+    return stats;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +1199,8 @@ fn printUsage() void {
         \\  --lora-alpha <f>          LoRA alpha scaling (default: 32)
         \\  --lora-targets <csv>      Target module patterns (default: query_proj,value_proj)
         \\  --num-classes <n>         Entity classes incl. O tag (default: 5)
+        \\  --objective <name>        token or span-start (default: token)
+        \\  --max-span-width <n>      Max span width for span-start objective (default: 4)
         \\  --max-examples <n>        Cap on training examples (default: 0 = all)
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
@@ -850,6 +1214,32 @@ fn printUsage() void {
         \\  train-gliner2-autodiff --model-dir /models/deberta-v3-base \
         \\    --train-data /data/ner/train.jsonl --out-dir /output/lora \
         \\    --epochs 5 --batch-size 16 --num-classes 7 --learning-rate 2e-5
+        \\  train-gliner2-autodiff --model-dir /models/gliner2 \
+        \\    --train-data /data/ner/train.jsonl --out-dir /output/span-lora \
+        \\    --objective span-start --max-span-width 4
         \\
     });
+}
+
+fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
+    if (std.mem.eql(u8, value, "token")) return .token;
+    if (std.mem.eql(u8, value, "span-start") or std.mem.eql(u8, value, "span_start")) return .span_start;
+    print("error: unsupported --objective '{s}' (expected token or span-start)\n", .{value});
+    return error.InvalidObjective;
+}
+
+fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
+    return switch (objective) {
+        .token => "token",
+        .span_start => "span-start",
+    };
+}
+
+fn envFlag(name: [:0]const u8) bool {
+    const value = std.c.getenv(name) orelse return false;
+    const slice = std.mem.span(value);
+    return std.mem.eql(u8, slice, "1") or
+        std.ascii.eqlIgnoreCase(slice, "true") or
+        std.ascii.eqlIgnoreCase(slice, "yes") or
+        std.ascii.eqlIgnoreCase(slice, "on");
 }

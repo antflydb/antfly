@@ -137,6 +137,12 @@ pub const TrainerConfig = struct {
     lora_a_init_std: f32 = 0.02,
     /// RNG seed used to initialize A matrices.
     seed: u64 = 42,
+    /// Regular graph parameters that should be owned and updated by the
+    /// trainer in addition to LoRA adapter parameters. Names must match
+    /// parameter nodes in the post-LoRA graph. Initial values are copied
+    /// from the backend weight store during graph construction and then
+    /// rebound from trainer-owned buffers on each step.
+    regular_trainable_params: []const []const u8 = &.{},
 
     /// Optional distributed gradient-reduction hook. Called exactly once per
     /// accumulation flush, immediately before the optimizer step, with a
@@ -215,6 +221,19 @@ pub const StepResult = struct {
     /// gradient-accumulation window closed). False when the step only
     /// accumulated gradients for a later flush.
     optimizer_stepped: bool,
+    profile: StepProfile = .{},
+};
+
+pub const StepProfile = struct {
+    graph_build_ns: u64 = 0,
+    runtime_input_ns: u64 = 0,
+    train_step_ns: u64 = 0,
+    autodiff_ns: u64 = 0,
+    execute_ns: u64 = 0,
+    extract_ns: u64 = 0,
+    optimizer_update_ns: u64 = 0,
+    total_ns: u64 = 0,
+    peak_resident_bytes: usize = 0,
 };
 
 const ExecutionMode = enum {
@@ -241,6 +260,8 @@ pub const RealAutodiffTrainer = struct {
     /// Per-LoRA-parameter state. Indices match `graph_state.lora_adapter.adapters`:
     /// `lora_params[i*2]` = A matrix, `lora_params[i*2+1]` = B matrix.
     lora_params: std.ArrayListUnmanaged(ParamSlot) = .empty,
+    /// Per-regular-parameter state for non-LoRA trainables such as task heads.
+    regular_params: std.ArrayListUnmanaged(ParamSlot) = .empty,
 
     pub const ParamSlot = struct {
         /// Parameter name as stored in the graph string table (borrowed).
@@ -300,6 +321,12 @@ pub const RealAutodiffTrainer = struct {
             self.allocator.free(slot.dims);
         }
         self.lora_params.deinit(self.allocator);
+        for (self.regular_params.items) |*slot| {
+            self.allocator.free(slot.weights);
+            self.allocator.free(slot.grad_accum);
+            self.allocator.free(slot.dims);
+        }
+        self.regular_params.deinit(self.allocator);
         self.optimizer_state.deinit();
         self.* = undefined;
     }
@@ -328,8 +355,13 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn runStep(self: *RealAutodiffTrainer, input: TrainerInput, mode: ExecutionMode) !StepResult {
+        const total_start_ns = monotonicNowNs();
+        var profile = StepProfile{};
+
         // 1. Lazy graph construction.
+        const graph_build_start_ns = monotonicNowNs();
         try self.ensureGraphBuilt(input);
+        profile.graph_build_ns = elapsedNs(graph_build_start_ns, monotonicNowNs());
         const gs = &self.graph_state.?;
 
         // 2. Optional activation-budget reservation via the coordinator.
@@ -341,6 +373,7 @@ pub const RealAutodiffTrainer = struct {
         // 3. Build the runtime input map: input_ids + mask + targets + all
         //    LoRA parameter tensors. The underlying interpreter will free the
         //    CT handles after execution — we re-upload them on every step.
+        const runtime_input_start_ns = monotonicNowNs();
         var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
         defer {
             var it = rt.iterator();
@@ -367,6 +400,9 @@ pub const RealAutodiffTrainer = struct {
         for (self.lora_params.items) |slot| {
             try putRuntimeInput(self.allocator, self.compute_backend, &rt, slot.node_id, slot.weights, slot.dims);
         }
+        for (self.regular_params.items) |slot| {
+            try putRuntimeInput(self.allocator, self.compute_backend, &rt, slot.node_id, slot.weights, slot.dims);
+        }
 
         // 3b. Architecture-specific input binding. This is how BERT
         //     position_ids, Qwen2 RoPE tables, LayoutLMv3 bbox components,
@@ -375,17 +411,29 @@ pub const RealAutodiffTrainer = struct {
         if (input.bind_arch_inputs) |bind_fn| {
             try bind_fn(input.ctx, self.compute_backend, self.allocator, &gs.graph, &rt, input.batch, input.seq_len, input.attention_mask);
         }
+        profile.runtime_input_ns = elapsedNs(runtime_input_start_ns, monotonicNowNs());
 
         // 4. Run the graph training step (autodiff + execute + extract).
         if (mode == .train) {
             self.optimizer_state.step_count = @intCast(self.step_count + 1);
         }
 
-        // Collect the list of LoRA parameter names we want gradients for.
-        var trainable = try self.allocator.alloc([]const u8, self.lora_params.items.len);
+        // Collect the list of trainer-owned parameter names we want
+        // gradients for: LoRA adapters plus explicitly enrolled regular
+        // trainables such as task heads.
+        var trainable = try self.allocator.alloc([]const u8, self.lora_params.items.len + self.regular_params.items.len);
         defer self.allocator.free(trainable);
-        for (self.lora_params.items, 0..) |slot, i| trainable[i] = slot.name;
+        var trainable_idx: usize = 0;
+        for (self.lora_params.items) |slot| {
+            trainable[trainable_idx] = slot.name;
+            trainable_idx += 1;
+        }
+        for (self.regular_params.items) |slot| {
+            trainable[trainable_idx] = slot.name;
+            trainable_idx += 1;
+        }
 
+        const train_step_start_ns = monotonicNowNs();
         var step_result = try training.trainStep(
             self.allocator,
             &gs.graph,
@@ -394,12 +442,18 @@ pub const RealAutodiffTrainer = struct {
             rt,
             .{ .trainable_params = trainable },
         );
+        profile.train_step_ns = elapsedNs(train_step_start_ns, monotonicNowNs());
+        profile.autodiff_ns = step_result.profile.autodiff_ns;
+        profile.execute_ns = step_result.profile.execute_ns;
+        profile.extract_ns = step_result.profile.extract_ns;
+        profile.peak_resident_bytes = step_result.profile.peak_resident_bytes;
         defer step_result.deinit();
 
         const loss_value = step_result.loss;
 
         var grad_norm: f32 = 0.0;
         var stepped = false;
+        const optimizer_update_start_ns = monotonicNowNs();
         switch (mode) {
             .train => {
                 // 5. Accumulate gradients (mean over the accumulation window).
@@ -417,15 +471,33 @@ pub const RealAutodiffTrainer = struct {
                         for (slot.grad_accum, g) |*a, v| a.* += v * scale;
                     }
                 }
+                for (self.regular_params.items) |*slot| {
+                    const g = step_result.gradients.get(slot.name) orelse {
+                        if (self.accum_count == 0) @memset(slot.grad_accum, 0.0);
+                        continue;
+                    };
+                    if (g.len != slot.grad_accum.len) return error.GradientShapeMismatch;
+                    if (self.accum_count == 0) {
+                        for (slot.grad_accum, g) |*a, v| a.* = v * scale;
+                    } else {
+                        for (slot.grad_accum, g) |*a, v| a.* += v * scale;
+                    }
+                }
                 self.accum_count += 1;
 
                 // 6. If the accumulation window is full, clip + step the optimizer.
                 if (self.accum_count >= accum_steps) {
                     if (self.config.reduce_grads) |reduce_fn| {
-                        var blocks = try self.allocator.alloc(GradBlock, self.lora_params.items.len);
+                        var blocks = try self.allocator.alloc(GradBlock, self.lora_params.items.len + self.regular_params.items.len);
                         defer self.allocator.free(blocks);
-                        for (self.lora_params.items, 0..) |*slot, i| {
-                            blocks[i] = .{ .name = slot.name, .data = slot.grad_accum };
+                        var block_idx: usize = 0;
+                        for (self.lora_params.items) |*slot| {
+                            blocks[block_idx] = .{ .name = slot.name, .data = slot.grad_accum };
+                            block_idx += 1;
+                        }
+                        for (self.regular_params.items) |*slot| {
+                            blocks[block_idx] = .{ .name = slot.name, .data = slot.grad_accum };
+                            block_idx += 1;
                         }
                         const ctx = self.config.reduce_grads_ctx orelse @as(*anyopaque, @ptrFromInt(@alignOf(usize)));
                         try reduce_fn(ctx, blocks);
@@ -437,11 +509,25 @@ pub const RealAutodiffTrainer = struct {
                         for (self.lora_params.items) |*slot| {
                             for (slot.grad_accum) |*v| v.* *= clip;
                         }
+                        for (self.regular_params.items) |*slot| {
+                            for (slot.grad_accum) |*v| v.* *= clip;
+                        }
                     }
 
                     const lr = self.config.lr_schedule.lr(@intCast(self.step_count));
                     const opt_config = optimizers.Optimizer{ .adamw = self.config.optimizer };
                     for (self.lora_params.items) |*slot| {
+                        try optimizers.step(
+                            opt_config,
+                            &self.optimizer_state,
+                            lr,
+                            slot.name,
+                            slot.weights,
+                            slot.grad_accum,
+                        );
+                        @memset(slot.grad_accum, 0);
+                    }
+                    for (self.regular_params.items) |*slot| {
                         try optimizers.step(
                             opt_config,
                             &self.optimizer_state,
@@ -460,6 +546,7 @@ pub const RealAutodiffTrainer = struct {
                 grad_norm = try self.gradientNormFromResult(&step_result);
             },
         }
+        profile.optimizer_update_ns = elapsedNs(optimizer_update_start_ns, monotonicNowNs());
 
         // 7. Release pinned LoRA blocks.
         if (self.coord != null) {
@@ -467,11 +554,13 @@ pub const RealAutodiffTrainer = struct {
         }
 
         if (mode == .train) self.step_count += 1;
+        profile.total_ns = elapsedNs(total_start_ns, monotonicNowNs());
         return .{
             .loss = loss_value,
             .grad_norm = grad_norm,
             .step = self.step_count,
             .optimizer_stepped = stepped,
+            .profile = profile,
         };
     }
 
@@ -603,6 +692,11 @@ pub const RealAutodiffTrainer = struct {
             try self.appendParamSlot(info.lora_a_name, info.lora_a_id, a_node.output_shape, true, &rnd);
             try self.appendParamSlot(info.lora_b_name, info.lora_b_id, b_node.output_shape, false, &rnd);
         }
+        for (self.config.regular_trainable_params) |name| {
+            const node_id = findParameterByName(&lora_result.graph, name) orelse return error.TrainableParameterNotFound;
+            const node = lora_result.graph.node(node_id);
+            try self.appendRegularParamSlotFromBackend(name, node_id, node.output_shape);
+        }
 
         // 4. Register residency blocks with the coordinator, if attached.
         if (self.coord) |coord| {
@@ -671,6 +765,45 @@ pub const RealAutodiffTrainer = struct {
         });
     }
 
+    fn appendRegularParamSlotFromBackend(
+        self: *RealAutodiffTrainer,
+        name: []const u8,
+        node_id: NodeId,
+        shape: Shape,
+    ) !void {
+        if (isLoraParamName(name)) return error.InvalidRegularTrainableParameter;
+        for (self.lora_params.items) |slot| {
+            if (std.mem.eql(u8, slot.name, name)) return error.DuplicateTrainableParameter;
+        }
+        for (self.regular_params.items) |slot| {
+            if (std.mem.eql(u8, slot.name, name)) return error.DuplicateTrainableParameter;
+        }
+
+        const n_elems: usize = @intCast(shape.numElements() orelse return error.DynamicShapeNotAllowed);
+        const ct = try self.compute_backend.getWeight(name);
+        defer self.compute_backend.free(ct);
+        const weights = try self.compute_backend.toFloat32(ct, self.allocator);
+        errdefer self.allocator.free(weights);
+        if (weights.len != n_elems) return error.TrainableParameterShapeMismatch;
+
+        const grad_accum = try self.allocator.alloc(f32, n_elems);
+        errdefer self.allocator.free(grad_accum);
+        @memset(grad_accum, 0.0);
+
+        const rank = shape.rank();
+        const dims = try self.allocator.alloc(i32, rank);
+        errdefer self.allocator.free(dims);
+        for (0..rank) |i| dims[i] = @intCast(shape.dim(@intCast(i)));
+
+        try self.regular_params.append(self.allocator, .{
+            .name = name,
+            .weights = weights,
+            .grad_accum = grad_accum,
+            .node_id = node_id,
+            .dims = dims,
+        });
+    }
+
     fn reserveActivationBudget(self: *RealAutodiffTrainer, input: TrainerInput) !void {
         const coord = self.coord orelse return;
         _ = coord;
@@ -707,12 +840,19 @@ pub const RealAutodiffTrainer = struct {
         for (self.lora_params.items) |slot| {
             for (slot.grad_accum) |g| total += @as(f64, g) * @as(f64, g);
         }
+        for (self.regular_params.items) |slot| {
+            for (slot.grad_accum) |g| total += @as(f64, g) * @as(f64, g);
+        }
         return @floatCast(@sqrt(total));
     }
 
     fn gradientNormFromResult(self: *const RealAutodiffTrainer, step_result: *const training.TrainStepResult) !f32 {
         var total: f64 = 0.0;
         for (self.lora_params.items) |slot| {
+            const g = step_result.gradients.get(slot.name) orelse continue;
+            for (g) |value| total += @as(f64, value) * @as(f64, value);
+        }
+        for (self.regular_params.items) |slot| {
             const g = step_result.gradients.get(slot.name) orelse continue;
             for (g) |value| total += @as(f64, value) * @as(f64, value);
         }
@@ -740,6 +880,33 @@ fn shapeToDims(allocator: std.mem.Allocator, shape: Shape) ![]i32 {
     const dims = try allocator.alloc(i32, rank);
     for (0..rank) |i| dims[i] = @intCast(shape.dim(@intCast(i)));
     return dims;
+}
+
+fn monotonicNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
+    if (end_ns <= start_ns) return 0;
+    return end_ns - start_ns;
+}
+
+fn findParameterByName(graph: *const Graph, name: []const u8) ?NodeId {
+    for (graph.parameters.items) |param_id| {
+        const node = graph.node(param_id);
+        if (node.op != .parameter) continue;
+        if (std.mem.eql(u8, graph.parameterName(node), name)) return param_id;
+    }
+    return null;
+}
+
+fn isLoraParamName(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, ".lora_A") != null or
+        std.mem.indexOf(u8, name, ".lora_B") != null;
 }
 
 const TopologicalSortResult = struct {

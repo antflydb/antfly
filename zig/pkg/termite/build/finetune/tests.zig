@@ -50,6 +50,12 @@ const tests = [_]common.TestSpec{
         .native_link = .default,
     },
     .{
+        .step_name = "test-gliner2-run-validation",
+        .root_source_file = "src/finetune/test/test_gliner2_run_validation.zig",
+        .description = "Run GLiNER2 autodiff training artifact and metrics validation tests",
+        .imports = &.{ .build_options, .termite_internal },
+    },
+    .{
         .step_name = "test-entity-cleanup-data",
         .root_source_file = "src/test_entity_cleanup_data.zig",
         .description = "Run isolated entity cleanup finetune data tests",
