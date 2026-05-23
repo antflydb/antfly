@@ -112,6 +112,101 @@ func TestGatewayRejectsNonTablePublicPath(t *testing.T) {
 	}
 }
 
+func TestResolveRequestOperationEnforcesInferredMinimum(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		hint   string
+		want   OperationKind
+	}{
+		{
+			name:   "table root mutations require admin",
+			method: http.MethodPost,
+			path:   "/",
+			hint:   "write",
+			want:   OperationAdmin,
+		},
+		{
+			name:   "admin paths cannot be downgraded",
+			method: http.MethodDelete,
+			path:   "/admin/indexes/title",
+			hint:   "write",
+			want:   OperationAdmin,
+		},
+		{
+			name:   "query post remains read",
+			method: http.MethodPost,
+			path:   "/query/search",
+			want:   OperationRead,
+		},
+		{
+			name:   "hints can request stricter auth",
+			method: http.MethodPost,
+			path:   "/query/search",
+			hint:   "admin",
+			want:   OperationAdmin,
+		},
+		{
+			name:   "generic mutating paths cannot be downgraded",
+			method: http.MethodPut,
+			path:   "/ingest-batch",
+			hint:   "read",
+			want:   OperationWrite,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveRequestOperation(tt.method, tt.path, tt.hint)
+			if err != nil {
+				t.Fatalf("resolve operation: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGatewayRequiresAdminForTableRootMutation(t *testing.T) {
+	gateway := NewGateway(NewRouter([]NamespaceRoute{
+		{
+			Tenant:        "t1",
+			Table:         "docs",
+			Namespace:     "docs",
+			AllowStateful: true,
+			StatefulURL:   "http://stateful.invalid/api/v1/tables/docs",
+		},
+	}))
+	gateway.authenticator = StaticBearerAuthenticator{
+		Required: true,
+		Tokens: map[string]Principal{
+			"test-token": {
+				Subject:           "user-1",
+				Tenant:            "t1",
+				AllowedTables:     []string{"docs"},
+				AllowedOperations: []OperationKind{OperationWrite},
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/proxy/", strings.NewReader(`{"columns":[]}`))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("X-Antfly-Tenant", "t1")
+	req.Header.Set("X-Antfly-Table", "docs")
+	req.Header.Set("X-Antfly-Operation", "write")
+	rec := httptest.NewRecorder()
+	gateway.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("got status %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `cannot perform operation "admin"`) {
+		t.Fatalf("unexpected body %q", rec.Body.String())
+	}
+}
+
 func TestGatewayServeHTTPProxyForward(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/tables/docs/query/search" {
