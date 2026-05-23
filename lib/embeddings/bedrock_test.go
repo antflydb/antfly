@@ -86,6 +86,31 @@ func TestBedrockTitanMultimodalFusesTextAndImage(t *testing.T) {
 	require.Equal(t, base64.StdEncoding.EncodeToString([]byte{9, 8, 7}), body["inputImage"])
 }
 
+func TestBedrockTitanMultimodalImageURLDataURI(t *testing.T) {
+	client := &mockBedrockRuntime{resp: []byte(`{"embedding":[0.3,0.4]}`)}
+	emb := newTestBedrock("amazon.titan-embed-image-v1", client)
+
+	_, err := emb.Embed(context.Background(), [][]ai.ContentPart{{
+		ai.ImageURLContent{URL: "data:image/png;base64,AQID"},
+	}})
+	require.NoError(t, err)
+
+	body := decodeBody(t, client.bodies[0])
+	require.NotContains(t, body, "inputText")
+	require.Equal(t, "AQID", body["inputImage"])
+}
+
+func TestBedrockTitanMultimodalRemoteImageURLRequiresRemoteMedia(t *testing.T) {
+	client := &mockBedrockRuntime{resp: []byte(`{"embedding":[0.3,0.4]}`)}
+	emb := newTestBedrock("amazon.titan-embed-image-v1", client)
+
+	_, err := emb.Embed(context.Background(), [][]ai.ContentPart{{
+		ai.ImageURLContent{URL: "https://example.com/image.png"},
+	}})
+	require.ErrorContains(t, err, "use remoteMedia")
+	require.Empty(t, client.bodies)
+}
+
 func TestBedrockCohereTextBatchRequest(t *testing.T) {
 	client := &mockBedrockRuntime{resp: []byte(`{"embeddings":[[0.1,0.2],[0.3,0.4]]}`)}
 	emb := newTestBedrock("cohere.embed-english-v3", client)
@@ -152,6 +177,34 @@ func TestBedrockCohereV4MixedRequest(t *testing.T) {
 	imagePart := content[1].(map[string]any)
 	require.Equal(t, "image_url", imagePart["type"])
 	require.Equal(t, "data:image/png;base64,"+base64.StdEncoding.EncodeToString([]byte{4, 5, 6}), imagePart["image_url"].(map[string]any)["url"])
+}
+
+func TestBedrockCohereV4ImageURLDataURI(t *testing.T) {
+	client := &mockBedrockRuntime{resp: []byte(`{"embeddings":{"float":[[0.5,0.6]]}}`)}
+	emb := newTestBedrock("cohere.embed-v4", client)
+
+	_, err := emb.Embed(context.Background(), [][]ai.ContentPart{{
+		ai.ImageURLContent{URL: "data:image/png;base64,AQID"},
+	}})
+	require.NoError(t, err)
+
+	body := decodeBody(t, client.bodies[0])
+	inputs := body["inputs"].([]any)
+	content := inputs[0].(map[string]any)["content"].([]any)
+	imagePart := content[0].(map[string]any)
+	require.Equal(t, "image_url", imagePart["type"])
+	require.Equal(t, "data:image/png;base64,AQID", imagePart["image_url"].(map[string]any)["url"])
+}
+
+func TestBedrockCohereV4RemoteImageURLRequiresRemoteMedia(t *testing.T) {
+	client := &mockBedrockRuntime{resp: []byte(`{"embeddings":{"float":[[0.5,0.6]]}}`)}
+	emb := newTestBedrock("cohere.embed-v4", client)
+
+	_, err := emb.Embed(context.Background(), [][]ai.ContentPart{{
+		ai.ImageURLContent{URL: "https://example.com/image.png"},
+	}})
+	require.ErrorContains(t, err, "use remoteMedia")
+	require.Empty(t, client.bodies)
 }
 
 func TestBedrockCohereV4MixedRespectsProviderBatchLimit(t *testing.T) {

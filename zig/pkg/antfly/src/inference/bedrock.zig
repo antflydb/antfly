@@ -303,8 +303,16 @@ fn titanMultimodalBody(alloc: std.mem.Allocator, parts: []const template_mod.Con
             saw_content = true;
         },
         .media_url => |url| {
-            try appendTitanInputText(alloc, &text_out, url);
-            if (std.mem.trim(u8, url, " \t\r\n").len > 0) saw_content = true;
+            const trimmed = std.mem.trim(u8, url, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            const binary = try bedrockImageDataUri(alloc, trimmed);
+            if (image_seen) return error.TooManyImages;
+            image_seen = true;
+            const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
+            const encoded = try alloc.alloc(u8, encoded_len);
+            _ = std.base64.standard.Encoder.encode(encoded, binary.data);
+            try body.put(alloc, "inputImage", .{ .string = encoded });
+            saw_content = true;
         },
     };
     if (text_out.items.len > 0) {
@@ -350,11 +358,16 @@ fn cohereV4Body(alloc: std.mem.Allocator, parts: []const template_mod.ContentPar
             try obj.put(alloc, "image_url", .{ .object = image_url });
             try content.append(.{ .object = obj });
         },
-        .media_url => |url| if (url.len > 0) {
+        .media_url => |url| if (std.mem.trim(u8, url, " \t\r\n").len > 0) {
+            const binary = try bedrockImageDataUri(alloc, std.mem.trim(u8, url, " \t\r\n"));
+            const data_uri = try imageDataUriAlloc(alloc, binary.mime_type, binary.data);
             var obj = std.json.ObjectMap.empty;
             errdefer obj.deinit(alloc);
-            try obj.put(alloc, "type", .{ .string = "text" });
-            try obj.put(alloc, "text", .{ .string = url });
+            var image_url = std.json.ObjectMap.empty;
+            errdefer image_url.deinit(alloc);
+            try image_url.put(alloc, "url", .{ .string = data_uri });
+            try obj.put(alloc, "type", .{ .string = "image_url" });
+            try obj.put(alloc, "image_url", .{ .object = image_url });
             try content.append(.{ .object = obj });
         },
     };
@@ -385,8 +398,29 @@ fn cohereV4Body(alloc: std.mem.Allocator, parts: []const template_mod.ContentPar
 fn imageDataUriAlloc(alloc: std.mem.Allocator, mime_type: []const u8, data: []const u8) ![]u8 {
     const encoded_len = std.base64.standard.Encoder.calcSize(data.len);
     const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, data);
     return try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime_type, encoded });
+}
+
+fn bedrockImageDataUri(alloc: std.mem.Allocator, url: []const u8) !template_mod.ContentPart.BinaryContent {
+    if (!std.mem.startsWith(u8, url, "data:")) return error.RemoteMediaRequired;
+    const after_data = url[5..];
+    const base64_marker = ";base64,";
+    const sep_idx = std.mem.indexOf(u8, after_data, base64_marker) orelse return error.InvalidDataURI;
+    const mime_type_slice = after_data[0..sep_idx];
+    if (!std.mem.startsWith(u8, mime_type_slice, "image/")) return error.UnsupportedMediaType;
+
+    const mime_type = try alloc.dupe(u8, mime_type_slice);
+    errdefer alloc.free(mime_type);
+
+    const encoded = after_data[sep_idx + base64_marker.len ..];
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidDataURI;
+    const data = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(data);
+    std.base64.standard.Decoder.decode(data, encoded) catch return error.InvalidDataURI;
+
+    return .{ .mime_type = mime_type, .data = data };
 }
 
 fn flattenPartsToText(alloc: std.mem.Allocator, parts: []const template_mod.ContentPart) ![]u8 {
@@ -961,6 +995,17 @@ pub fn testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages() !void {
     }, 0));
 }
 
+pub fn testTitanMultimodalBodyAcceptsDataUriAndRejectsRemoteUrl() !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const body = try titanMultimodalBody(arena, &.{.{ .media_url = "data:image/png;base64,AQID" }}, 0);
+    try std.testing.expect(body.get("inputText") == null);
+    try std.testing.expectEqualStrings("AQID", body.get("inputImage").?.string);
+    try std.testing.expectError(error.RemoteMediaRequired, titanMultimodalBody(arena, &.{.{ .media_url = "https://example.com/image.png" }}, 0));
+}
+
 pub fn testCohereV4BodyUsesBedrockImageUrlDataUri() !void {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -976,6 +1021,20 @@ pub fn testCohereV4BodyUsesBedrockImageUrlDataUri() !void {
     try std.testing.expectEqualStrings("image_url", image_part.get("type").?.string);
     try std.testing.expectEqualStrings("data:image/png;base64,YWJj", image_part.get("image_url").?.object.get("url").?.string);
     try std.testing.expectEqual(@as(i64, 512), body.get("output_dimension").?.integer);
+}
+
+pub fn testCohereV4BodyAcceptsDataUriAndRejectsRemoteUrl() !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const body = try cohereV4Body(arena, &.{.{ .media_url = "data:image/png;base64,AQID" }}, "search_document", "", 0);
+    const inputs = body.get("inputs").?.array.items;
+    const content = inputs[0].object.get("content").?.array.items;
+    const image_part = content[0].object;
+    try std.testing.expectEqualStrings("image_url", image_part.get("type").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,AQID", image_part.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectError(error.RemoteMediaRequired, cohereV4Body(arena, &.{.{ .media_url = "https://example.com/image.png" }}, "search_document", "", 0));
 }
 
 pub fn testSharedCredentialsProfileParser() !void {
@@ -1089,6 +1148,14 @@ test "titan multimodal body omits empty inputText" {
 
 test "cohere v4 body uses bedrock image_url data uri" {
     try testCohereV4BodyUsesBedrockImageUrlDataUri();
+}
+
+test "titan multimodal body accepts data URI and rejects remote URL" {
+    try testTitanMultimodalBodyAcceptsDataUriAndRejectsRemoteUrl();
+}
+
+test "cohere v4 body accepts data URI and rejects remote URL" {
+    try testCohereV4BodyAcceptsDataUriAndRejectsRemoteUrl();
 }
 
 test "titan multimodal body combines text and rejects multiple images" {

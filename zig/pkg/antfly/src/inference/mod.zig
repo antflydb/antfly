@@ -46,7 +46,9 @@ test "inference module compiles" {
 test "bedrock provider request helpers" {
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
     try bedrock.testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages();
+    try bedrock.testTitanMultimodalBodyAcceptsDataUriAndRejectsRemoteUrl();
     try bedrock.testCohereV4BodyUsesBedrockImageUrlDataUri();
+    try bedrock.testCohereV4BodyAcceptsDataUriAndRejectsRemoteUrl();
     try bedrock.testSharedCredentialsProfileParser();
     try bedrock.testMetadataCredentialParsers();
     try bedrock.testCredentialUrlEncoding();

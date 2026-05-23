@@ -28,6 +28,7 @@ import (
 	"github.com/antflydb/antfly/lib/template"
 	libtermite "github.com/antflydb/antfly/lib/termite"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
+	libscraping "github.com/antflydb/antfly/pkg/libaf/scraping"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
@@ -519,9 +520,17 @@ func (l *BedrockImpl) titanMultimodalBody(parts []ai.ContentPart) (map[string]an
 			}
 			image = p.Data
 		case ai.ImageURLContent:
-			if text == "" {
-				text = p.URL
+			_, data, err := bedrockImageDataURI(p.URL)
+			if err != nil {
+				return nil, err
 			}
+			if len(data) == 0 {
+				continue
+			}
+			if len(image) > 0 {
+				return nil, errors.New("titan multimodal supports one image per embedding request")
+			}
+			image = data
 		}
 	}
 	body := map[string]any{}
@@ -578,7 +587,8 @@ func (l *BedrockImpl) cohereSupportsMixedInputs(contents [][]ai.ContentPart) boo
 	}
 	for _, parts := range contents {
 		for _, part := range parts {
-			if _, ok := part.(ai.BinaryContent); ok {
+			switch part.(type) {
+			case ai.BinaryContent, ai.ImageURLContent:
 				return true
 			}
 		}
@@ -676,8 +686,15 @@ func cohereV4Input(parts []ai.ContentPart, stripNewLines bool) (map[string]any, 
 				"image_url": map[string]any{"url": imageURL},
 			})
 		case ai.ImageURLContent:
-			if p.URL != "" {
-				content = append(content, map[string]any{"type": "text", "text": p.URL})
+			imageURL, _, err := bedrockImageDataURI(p.URL)
+			if err != nil {
+				return nil, err
+			}
+			if imageURL != "" {
+				content = append(content, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": imageURL},
+				})
 			}
 		}
 	}
@@ -685,6 +702,25 @@ func cohereV4Input(parts []ai.ContentPart, stripNewLines bool) (map[string]any, 
 		return nil, errors.New("cohere v4 embedding requires non-empty text or image content")
 	}
 	return map[string]any{"content": content}, nil
+}
+
+func bedrockImageDataURI(rawURL string) (string, []byte, error) {
+	url := strings.TrimSpace(rawURL)
+	if url == "" {
+		return "", nil, nil
+	}
+	if !strings.HasPrefix(url, "data:") {
+		return "", nil, errors.New("bedrock multimodal image URL content requires a data URI or binary content; use remoteMedia to fetch remote URLs")
+	}
+	mimeType, data, err := libscraping.ParseDataURI(url)
+	if err != nil {
+		return "", nil, fmt.Errorf("parsing bedrock image data URI: %w", err)
+	}
+	if !strings.HasPrefix(mimeType, "image/") {
+		return "", nil, fmt.Errorf("bedrock multimodal only supports image data URIs, got %s", mimeType)
+	}
+	dataURI := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return dataURI, data, nil
 }
 
 func (l *BedrockImpl) invokeEmbedding(ctx context.Context, body map[string]any) ([]float32, error) {
