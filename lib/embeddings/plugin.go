@@ -25,9 +25,11 @@ import (
 
 	"github.com/antflydb/antfly/lib/ai"
 	"github.com/antflydb/antfly/lib/schema"
+	"github.com/antflydb/antfly/lib/scraping"
 	"github.com/antflydb/antfly/lib/template"
 	libtermite "github.com/antflydb/antfly/lib/termite"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
+	libscraping "github.com/antflydb/antfly/pkg/libaf/scraping"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
@@ -473,14 +475,13 @@ func (l *BedrockImpl) embedText(ctx context.Context, contents [][]ai.ContentPart
 }
 
 // embedMultimodal generates embeddings via Bedrock Titan Multimodal G1 for
-// mixed text/image content. Each input item may contain a TextContent, a
-// BinaryContent, or both — when both are present in the same item, Titan G1
-// returns a single fused embedding in the shared text/image semantic space.
-// See https://docs.aws.amazon.com/bedrock/latest/userguide/titan-multiemb-models.html
+// text and/or image input. ImageURLContent is fetched client-side via
+// lib/scraping (data:, http://, https://, file://, s3:// — same path as
+// Termite). See https://docs.aws.amazon.com/bedrock/latest/userguide/titan-multiemb-models.html
 func (l *BedrockImpl) embedMultimodal(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
 	results := make([][]float32, 0, len(contents))
 	for i, parts := range contents {
-		body, err := buildTitanMultimodalBody(parts)
+		body, err := buildTitanMultimodalBody(ctx, parts)
 		if err != nil {
 			return nil, fmt.Errorf("building multimodal request for item %d: %w", i, err)
 		}
@@ -506,11 +507,16 @@ func (l *BedrockImpl) embedMultimodal(ctx context.Context, contents [][]ai.Conte
 }
 
 // buildTitanMultimodalBody serializes a single item's content parts into the
-// Titan Multimodal G1 request body. Returns an error if neither a non-empty
-// text part nor a non-empty binary part is present (Titan G1 requires at
-// least one).
-func buildTitanMultimodalBody(parts []ai.ContentPart) ([]byte, error) {
+// Titan Multimodal G1 request body.
+func buildTitanMultimodalBody(ctx context.Context, parts []ai.ContentPart) ([]byte, error) {
 	body := map[string]any{}
+	setImage := func(data []byte) error {
+		if _, exists := body["inputImage"]; exists {
+			return errors.New("only one image per embedding item is supported by Titan Multimodal G1")
+		}
+		body["inputImage"] = base64.StdEncoding.EncodeToString(data)
+		return nil
+	}
 	for _, part := range parts {
 		switch p := part.(type) {
 		case ai.TextContent:
@@ -518,14 +524,32 @@ func buildTitanMultimodalBody(parts []ai.ContentPart) ([]byte, error) {
 				body["inputText"] = p.Text
 			}
 		case ai.BinaryContent:
-			if len(p.Data) > 0 {
-				body["inputImage"] = base64.StdEncoding.EncodeToString(p.Data)
+			if len(p.Data) == 0 {
+				continue
+			}
+			if err := setImage(p.Data); err != nil {
+				return nil, err
+			}
+		case ai.ImageURLContent:
+			if p.URL == "" {
+				continue
+			}
+			_, data, err := libscraping.DownloadContent(
+				ctx, p.URL,
+				scraping.GetDefaultSecurityConfig(),
+				scraping.GetDefaultS3Credentials(),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("downloading image: %w", err)
+			}
+			if err := setImage(data); err != nil {
+				return nil, err
 			}
 		}
 	}
 	if len(body) == 0 {
 		return nil, errors.New(
-			"multimodal embedding requires at least one non-empty TextContent or BinaryContent")
+			"multimodal embedding requires at least one non-empty text or image part")
 	}
 	return json.Marshal(body)
 }
