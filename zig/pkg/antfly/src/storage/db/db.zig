@@ -8018,7 +8018,6 @@ pub const DB = struct {
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
-            .lookup_vector_ids = denseVectorIdsCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8041,7 +8040,6 @@ pub const DB = struct {
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
-            .lookup_vector_ids = denseVectorIdsCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8308,16 +8306,6 @@ pub const DB = struct {
     ) anyerror!?u64 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.index_manager.lookupDenseVectorId(self.core.store, index_name, doc_key);
-    }
-
-    fn denseVectorIdsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        index_name: []const u8,
-        doc_keys: []const []const u8,
-    ) anyerror![]u64 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupDenseVectorIdsAlloc(alloc, self.core.store, index_name, doc_keys);
     }
 
     fn sparseIndexCallback(
@@ -26505,7 +26493,7 @@ test "db prefix wildcard and regexp queries use text dictionary filters" {
     try std.testing.expectEqual(@as(u32, 2), regexp.total_hits);
 }
 
-test "db search_as_you_type schema emits 2gram field variants" {
+test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -26563,12 +26551,14 @@ test "db search_as_you_type schema emits 2gram field variants" {
     });
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "name__2gram", "sm"));
-    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name__2gram", "iph"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._2gram", "smartphone apple"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._3gram", "smartphone apple iphone"));
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "sm"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "iph"));
 
     var ng_results = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "name__2gram", .term = "sm" } },
+        .query = .{ .term = .{ .field = "name._index_prefix", .term = "sm" } },
         .limit = 10,
     });
     defer ng_results.deinit();
@@ -26689,14 +26679,14 @@ test "db versioned full text indexes reload matching schema mappings after reope
         const text_v0 = db.core.index_manager.textIndex("full_text_index_v0").?;
         const text_v1 = db.core.index_manager.textIndex("full_text_index_v1").?;
 
-        try std.testing.expectEqual(@as(u32, 2), try text_v0.snapshot().termDocFreq(alloc, "name__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 0), try text_v0.snapshot().termDocFreq(alloc, "title__2gram", "br"));
-        try std.testing.expectEqual(@as(u32, 1), try text_v1.snapshot().termDocFreq(alloc, "title__2gram", "br"));
-        try std.testing.expectEqual(@as(u32, 0), try text_v1.snapshot().termDocFreq(alloc, "name__2gram", "ga"));
+        try std.testing.expectEqual(@as(u32, 2), try text_v0.snapshot().termDocFreq(alloc, "name._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 0), try text_v0.snapshot().termDocFreq(alloc, "title._index_prefix", "br"));
+        try std.testing.expectEqual(@as(u32, 1), try text_v1.snapshot().termDocFreq(alloc, "title._index_prefix", "br"));
+        try std.testing.expectEqual(@as(u32, 0), try text_v1.snapshot().termDocFreq(alloc, "name._index_prefix", "ga"));
 
         var old_index_result = try db.search(alloc, .{
             .index_name = "full_text_index_v0",
-            .query = .{ .term = .{ .field = "name__2gram", .term = "ga" } },
+            .query = .{ .term = .{ .field = "name._index_prefix", .term = "ga" } },
             .limit = 10,
         });
         defer old_index_result.deinit();
@@ -26704,7 +26694,7 @@ test "db versioned full text indexes reload matching schema mappings after reope
 
         var new_index_result = try db.search(alloc, .{
             .index_name = "full_text_index_v1",
-            .query = .{ .term = .{ .field = "title__2gram", .term = "br" } },
+            .query = .{ .term = .{ .field = "title._index_prefix", .term = "br" } },
             .limit = 10,
         });
         defer new_index_result.deinit();
@@ -27068,8 +27058,8 @@ test "db patternProperties text fields survive reopen" {
         });
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title__2gram", "no"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title._index_prefix", "no"));
     }
 
     {
@@ -27084,13 +27074,13 @@ test "db patternProperties text fields survive reopen" {
         });
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_green.title__2gram", "de"));
-        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title__2gram", "na"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_green.title._index_prefix", "de"));
+        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title._index_prefix", "na"));
 
         var result = try db.search(alloc, .{
             .index_name = "ft_v1",
-            .query = .{ .term = .{ .field = "meta.tag_green.title__2gram", .term = "de" } },
+            .query = .{ .term = .{ .field = "meta.tag_green.title._index_prefix", .term = "de" } },
             .limit = 10,
         });
         defer result.deinit();
@@ -27273,7 +27263,7 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
 
     var explicit_ngram = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "explicit__2gram", .term = "sm" } },
+        .query = .{ .term = .{ .field = "explicit._index_prefix", .term = "sm" } },
         .limit = 10,
     });
     defer explicit_ngram.deinit();
@@ -27291,7 +27281,7 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
 
     var pattern_ngram = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "patterns.tag_blue.title__2gram", .term = "bl" } },
+        .query = .{ .term = .{ .field = "patterns.tag_blue.title._index_prefix", .term = "bl" } },
         .limit = 10,
     });
     defer pattern_ngram.deinit();

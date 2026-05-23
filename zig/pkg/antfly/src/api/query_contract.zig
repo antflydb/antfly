@@ -1783,6 +1783,15 @@ pub fn parseQueryRequest(
     };
 }
 
+pub fn parsePublicQueryRequest(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?SemanticResolver,
+    table_name: []const u8,
+    body: []const u8,
+) !OwnedQueryRequest {
+    return try parseQueryRequest(alloc, semantic_resolver, table_name, body);
+}
+
 pub fn preflightGraphSearchesAlloc(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryRequest,

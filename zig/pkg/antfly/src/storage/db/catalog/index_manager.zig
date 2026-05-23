@@ -5860,18 +5860,6 @@ pub const IndexManager = struct {
         return vector_id;
     }
 
-    pub fn lookupDenseVectorIdsAlloc(self: *IndexManager, alloc: Allocator, store: anytype, index_name: []const u8, doc_keys: []const []const u8) ![]u64 {
-        _ = store;
-        _ = self.denseIndex(index_name) orelse return &.{};
-
-        var out = std.ArrayListUnmanaged(u64).empty;
-        errdefer out.deinit(alloc);
-        for (doc_keys) |doc_key| {
-            try out.append(alloc, deterministicDenseVectorId(doc_key));
-        }
-        return try out.toOwnedSlice(alloc);
-    }
-
     fn lookupDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
         var mutable_txn = txn;
         const key = try denseDocMappingKey(self.alloc, index_name, doc_key);
