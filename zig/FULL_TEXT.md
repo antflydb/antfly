@@ -37,9 +37,13 @@ that the Zig implementation is still prerelease.
 
 - Exact string companions use `.keyword`.
 - `search_as_you_type` emits `._2gram`, `._3gram`, and `._index_prefix`.
-- Prefix/autocomplete matching should target `._index_prefix`; the `._2gram`
-  and `._3gram` fields are shingle fields for multi-token search-as-you-type
-  matching.
+- `._2gram` and `._3gram` are shingle fields for multi-token
+  search-as-you-type matching.
+- `._index_prefix` is phrase-prefix oriented: it indexes edge n-grams over
+  one-, two-, and three-token shingles so prefixes such as `brown f` and
+  `quick brown f` can match without scanning stored documents. This is closer
+  to Elasticsearch's `search_as_you_type` prefix behavior than plain per-token
+  edge n-grams.
 - Schema-less string indexing emits both the analyzed field and a bounded
   `.keyword` companion so term/terms filters can use postings without widening
   vector queries through stored-document scans.
@@ -53,6 +57,62 @@ and from the Go/Bleve naming. The benefit is that the public query surface,
 schema-derived fields, dynamic-template variants, and schema-less exact fields
 all use one familiar subfield convention before compatibility constraints make
 the layout expensive to change.
+
+## Search-As-You-Type Design
+
+The JSON Schema surface should remain valid JSON Schema. Do not overload the
+standard `type` field with Elasticsearch field types inside this schema format.
+The current shorthand remains:
+
+```json
+{
+  "type": "string",
+  "x-antfly-types": ["search_as_you_type"]
+}
+```
+
+When configuration is needed, prefer a separate extension object instead of a
+list of typed objects inside `x-antfly-types`:
+
+```json
+{
+  "type": "string",
+  "x-antfly-field": {
+    "type": "search_as_you_type",
+    "analyzer": "standard",
+    "max_shingle_size": 3,
+    "fields": {
+      "keyword": { "type": "keyword" }
+    }
+  }
+}
+```
+
+`x-antfly-types` should stay a compact compatibility shorthand that can desugar
+to `x-antfly-field` defaults. A list of objects inside `x-antfly-types` would
+turn the extension into a second mapping DSL and make validation, schema diffing,
+dynamic templates, and compatibility harder.
+
+For now, `search_as_you_type` uses the Elasticsearch default
+`max_shingle_size = 3` internally and does not expose a public knob. When exposed,
+valid values should be `2..4`, matching Elasticsearch, and the generated fields
+should be `._2gram` through `._{max_shingle_size}gram` plus `._index_prefix`.
+
+The query surface should eventually expose a first-class bool-prefix mode:
+
+```json
+{
+  "full_text_search": {
+    "field": "name",
+    "query": "quick brown f",
+    "type": "bool_prefix"
+  }
+}
+```
+
+Internally that should expand over the root field and the shingle fields, with
+the final partial phrase satisfied by `._index_prefix`. Users should not have to
+manually query generated subfields for the normal autocomplete path.
 
 ## Task List
 

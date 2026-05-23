@@ -26557,6 +26557,8 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._3gram", "smartphone apple iphone"));
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "sm"));
     try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "iph"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "apple ip"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "smartphone apple ip"));
 
     var ng_results = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -26565,6 +26567,15 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     });
     defer ng_results.deinit();
     try std.testing.expectEqual(@as(u32, 3), ng_results.total_hits);
+
+    var phrase_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .term = .{ .field = "name._index_prefix", .term = "apple ip" } },
+        .limit = 10,
+    });
+    defer phrase_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 1), phrase_prefix_results.total_hits);
+    try std.testing.expectEqualStrings("doc:1", phrase_prefix_results.hits[0].id);
 
     var prefix_results = try db.search(alloc, .{
         .index_name = "ft_v1",
