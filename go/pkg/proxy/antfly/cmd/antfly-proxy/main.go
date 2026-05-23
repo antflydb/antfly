@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"os"
 
-	proxy "github.com/antflydb/antfly/pkg/antfly-proxy"
+	proxy "github.com/antflydb/antfly/go/pkg/proxy/antfly"
 )
 
 func main() {

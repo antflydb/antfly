@@ -22,9 +22,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/proxy/termite"
 	"github.com/antflydb/antfly/pkg/libaf/healthserver"
 	"github.com/antflydb/antfly/pkg/libaf/logging"
-	"github.com/antflydb/antfly/pkg/termite-proxy"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"

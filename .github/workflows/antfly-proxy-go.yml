@@ -8,14 +8,14 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "pkg/antfly-proxy/**"
-      - "pkg/termite-proxy/**"
+      - "go/pkg/proxy/antfly/**"
+      - "go/pkg/proxy/termite/**"
       - ".github/workflows/antfly-proxy-go.yml"
   pull_request:
     branches: ["main"]
     paths:
-      - "pkg/antfly-proxy/**"
-      - "pkg/termite-proxy/**"
+      - "go/pkg/proxy/antfly/**"
+      - "go/pkg/proxy/termite/**"
       - ".github/workflows/antfly-proxy-go.yml"
   workflow_dispatch:
 
@@ -38,19 +38,19 @@ jobs:
           cache: false
 
       - name: Test antfly-proxy
-        run: cd pkg/antfly-proxy && GOWORK=off go test ./...
+        run: cd go/pkg/proxy/antfly && GOWORK=off go test ./...
 
       - name: Build antfly-proxy
-        run: cd pkg/antfly-proxy && GOWORK=off go build -v -o ../../antfly-proxy ./cmd/antfly-proxy
+        run: cd go/pkg/proxy/antfly && GOWORK=off go build -v -o ../../../../antfly-proxy ./cmd/antfly-proxy
 
       - name: Smoke test antfly-proxy
         run: timeout 2 ./antfly-proxy || [ $? -eq 124 ]
 
       - name: Test termite-proxy
-        run: cd pkg/termite-proxy && GOWORK=off go test ./...
+        run: cd go/pkg/proxy/termite && GOWORK=off go test ./...
 
       - name: Build termite-proxy
-        run: cd pkg/termite-proxy && GOWORK=off go build -v -o ../../termite-proxy ./cmd/termite-proxy
+        run: cd go/pkg/proxy/termite && GOWORK=off go build -v -o ../../../../termite-proxy ./cmd/termite-proxy
 
       - name: Smoke test termite-proxy
         run: timeout 2 ./termite-proxy || [ $? -eq 124 ]

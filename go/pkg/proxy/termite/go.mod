@@ -1,4 +1,4 @@
-module github.com/antflydb/antfly/pkg/termite-proxy
+module github.com/antflydb/antfly/go/pkg/proxy/termite
 
 go 1.26.0
 

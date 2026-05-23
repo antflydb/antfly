@@ -11,7 +11,8 @@ GO := GOWORK=off GOEXPERIMENT=simd go
 GO_SUBMODULES := \
 	./go/e2e \
 	./go/pkg/sdk \
-	./pkg/antfly-proxy \
+	./go/pkg/proxy/antfly \
+	./go/pkg/proxy/termite \
 	./pkg/libaf \
 	./pkg/operator \
 	./pkg/docsaf \
@@ -20,8 +21,7 @@ GO_SUBMODULES := \
 	./pkg/evalaf/plugins/antfly \
 	./pkg/genkit/antfly \
 	./pkg/genkit/openrouter \
-	./pkg/termite \
-	./pkg/termite-proxy
+	./pkg/termite
 
 # ====================================================================================
 # General Commands
@@ -506,7 +506,7 @@ operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./Dockerfile.antfly-operator .
 
 termite-proxy-build: ## Build the termite-proxy binary
-	(cd ./pkg/termite-proxy && $(GO) build -o ../../termite-proxy ./cmd/termite-proxy)
+	(cd ./go/pkg/proxy/termite && $(GO) build -o ../../../../termite-proxy ./cmd/termite-proxy)
 
 termite-build: ## Build the termite binary (pure Go)
 	(cd ./pkg/termite && $(GO) build -o ../../termite ./cmd)
