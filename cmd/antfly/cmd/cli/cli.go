@@ -135,7 +135,7 @@ func resolveURL(cmd *cobra.Command) string {
 	return url
 }
 
-// resolveToken returns the bearer token from command flags or ANTFLY_TOKEN.
+// resolveToken returns the token from command flags or ANTFLY_TOKEN.
 func resolveToken(cmd *cobra.Command) string {
 	token, _ := cmd.Flags().GetString("token")
 	if !cmd.Flags().Changed("token") {
@@ -168,7 +168,7 @@ func RegisterCommands(parent *cobra.Command) {
 		parent.PersistentFlags().String("url", "http://localhost:8080", "Antfly server URL")
 	}
 	if parent.PersistentFlags().Lookup("token") == nil {
-		parent.PersistentFlags().String("token", "", "Bearer token for authentication")
+		parent.PersistentFlags().String("token", "", "Token for authentication")
 	}
 
 	// Chain client init onto parent's PersistentPreRunE, but only

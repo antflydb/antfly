@@ -69,7 +69,7 @@ describe("AntflyClient", () => {
       );
     });
 
-    it("should configure token auth as a bearer token", () => {
+    it("should configure token auth", () => {
       new AntflyClient({
         baseUrl: "https://platform.antfly.io/cloud/v1/instance",
         auth: { type: "token", token: "antflydb_test" },

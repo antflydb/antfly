@@ -46,7 +46,7 @@ func NewAntflyClient(baseURL string, httpClient *http.Client) (*AntflyClient, er
 }
 
 // NewAntflyClientWithOptions creates a new Antfly client with variadic options.
-// Use with WithBasicAuth, WithApiKey, or WithBearerToken for authentication.
+// Use with WithBasicAuth, WithApiKey, or WithToken for authentication.
 func NewAntflyClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*AntflyClient, error) {
 	client, err := oapi.NewClient(NormalizeBaseURL(baseURL), opts...)
 	if err != nil {
@@ -76,20 +76,12 @@ func WithApiKey(keyID, keySecret string) oapi.RequestEditorFn {
 	}
 }
 
-// WithBearerToken returns a RequestEditorFn that adds Bearer token authentication.
-// The token should be base64(keyID:keySecret) for Antfly API keys, or an opaque token
-// from a proxy.
-func WithBearerToken(token string) oapi.RequestEditorFn {
+// WithToken returns a RequestEditorFn that adds token authentication.
+func WithToken(token string) oapi.RequestEditorFn {
 	return func(_ context.Context, req *http.Request) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 		return nil
 	}
-}
-
-// WithToken returns a RequestEditorFn that adds Bearer token authentication.
-// Use this for CloudAF instance tokens and other bearer-style credentials.
-func WithToken(token string) oapi.RequestEditorFn {
-	return WithBearerToken(token)
 }
 
 // APIError represents a structured error response from the Antfly API.

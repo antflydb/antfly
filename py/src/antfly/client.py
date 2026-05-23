@@ -42,7 +42,6 @@ class AntflyClient:
         password: Optional[str] = None,
         api_key: Optional[tuple[str, str]] = None,
         token: Optional[str] = None,
-        bearer_token: Optional[str] = None,
         timeout: float = 30.0,
     ):
         """
@@ -51,21 +50,16 @@ class AntflyClient:
         Supports three authentication methods (mutually exclusive):
         - Basic auth: provide ``username`` and ``password``
         - API key: provide ``api_key`` as ``(key_id, key_secret)``
-        - Bearer token: provide ``token``
+        - Token: provide ``token``
 
         Args:
             base_url: Base URL of the Antfly server or CloudAF proxy
             username: Username for basic authentication (optional)
             password: Password for basic authentication (optional)
             api_key: Tuple of (key_id, key_secret) for API key authentication (optional)
-            token: Bearer token string for token authentication (optional)
+            token: Token string for token authentication (optional)
             timeout: Request timeout in seconds
         """
-        if token is not None and bearer_token is not None:
-            raise ValueError("provide only one of token or bearer_token")
-        if token is None:
-            token = bearer_token
-
         self.base_url = normalize_base_url(base_url)
 
         httpx_args: dict[str, Any] = {}

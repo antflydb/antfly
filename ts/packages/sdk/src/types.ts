@@ -241,7 +241,6 @@ export type AntflyAuth =
   | { type: "basic"; username: string; password: string }
   | { type: "apiKey"; keyId: string; keySecret: string }
   | { type: "token"; token: string }
-  | { type: "bearer"; token: string }
   | { username: string; password: string }; // backwards compat (no 'type' field)
 
 // Configuration types for the client

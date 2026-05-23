@@ -85,6 +85,9 @@ func NewAntflyClient(baseURL string, token string, httpClient *http.Client) (*An
 
 	// Initialize internal admin client using the same base URL and HTTP client
 	internalClient := admin.NewInternalClient(antfly.NormalizeServerURL(baseURL), httpClient)
+	if token != "" {
+		internalClient.WithToken(token)
+	}
 
 	return &AntflyClient{
 		AntflyClient:   client,

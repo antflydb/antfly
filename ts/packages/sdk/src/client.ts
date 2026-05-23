@@ -60,8 +60,6 @@ export class AntflyClient {
           return `ApiKey ${btoa(`${auth.keyId}:${auth.keySecret}`)}`;
         case "token":
           return `Bearer ${auth.token}`;
-        case "bearer":
-          return `Bearer ${auth.token}`;
       }
     }
 
@@ -97,7 +95,7 @@ export class AntflyClient {
 
   /**
    * Update authentication credentials.
-   * Accepts any auth type: basic (username/password), apiKey, or bearer.
+   * Accepts any auth type: basic (username/password), apiKey, or token.
    * For backwards compat, calling setAuth(username, password) still works.
    */
   setAuth(auth: AntflyAuth): void;
