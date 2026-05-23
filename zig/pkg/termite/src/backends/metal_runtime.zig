@@ -5015,6 +5015,10 @@ pub const RawRuntimeMemoryStats = extern struct {
     mps_dense_linear_standalone_wait_nanos: u64 = 0,
     mps_dense_linear_standalone_gpu_nanos: u64 = 0,
     last_frame_mps_dense_linear_count: u64 = 0,
+    dense_qkv_packed_calls: u64 = 0,
+    dense_qkv_packed_fallbacks: u64 = 0,
+    dense_pair_packed_calls: u64 = 0,
+    dense_pair_packed_fallbacks: u64 = 0,
     deberta_ffn_fused_calls: u64 = 0,
     deberta_ffn_fused_mps_matmuls: u64 = 0,
     deberta_ffn_fused_fallbacks: u64 = 0,
@@ -10478,6 +10482,7 @@ pub fn tryApplyDenseRuntimeLinearPair(
                     .second = second,
                 };
             }
+            return null;
         }
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
         var first_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
@@ -10627,6 +10632,7 @@ pub fn tryApplyDenseRuntimeLinearQkv(
                     .third = v,
                 };
             }
+            return null;
         }
         var q_device = (try tryApplyDenseRuntimeLinear(self, q_slot, input, rows, in_dim, q_out_dim)) orelse return null;
         errdefer q_device.deinit();

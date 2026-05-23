@@ -94,6 +94,8 @@ pub const models = struct {
 };
 pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
+    pub const gpu_hosted_store = @import("ops/gpu_hosted_store.zig");
+    pub const metal = if (build_options.enable_metal) @import("ops/metal_compute.zig") else struct {};
     pub const blas = @import("ops/blas_compute.zig");
     pub const mlx = if (build_options.enable_mlx) @import("ops/mlx_compute.zig") else struct {};
     pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};

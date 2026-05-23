@@ -6076,16 +6076,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (mask_mt) |*tensor| tensor.deinit();
             if (mask.len > 0) {
                 if (mask.len < batch * seq_len) break :resident_path;
-                const mask_values = try self.allocator.alloc(f32, batch * seq_len);
-                defer self.allocator.free(mask_values);
-                for (mask_values, 0..) |*value, i| value.* = if (mask[i] != 0) 1.0 else 0.0;
-                const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
-                const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
-                var device_mask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mask_values.len * @sizeOf(f32), uploadStorageMode(mask_values.len * @sizeOf(f32)), &mask_shape);
-                errdefer device_mask.deinit();
-                const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
-                try host_mask.copyInto(&device_mask);
-                mask_mt = device_mask;
+                var has_padding = false;
+                for (mask[0 .. batch * seq_len]) |value| {
+                    if (value == 0) {
+                        has_padding = true;
+                        break;
+                    }
+                }
+                if (has_padding) {
+                    const mask_values = try self.allocator.alloc(f32, batch * seq_len);
+                    defer self.allocator.free(mask_values);
+                    for (mask_values, 0..) |*value, i| value.* = if (mask[i] != 0) 1.0 else 0.0;
+                    const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
+                    const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
+                    var device_mask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mask_values.len * @sizeOf(f32), uploadStorageMode(mask_values.len * @sizeOf(f32)), &mask_shape);
+                    errdefer device_mask.deinit();
+                    const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
+                    try host_mask.copyInto(&device_mask);
+                    mask_mt = device_mask;
+                }
             }
 
             if (try metal_runtime.decoderRuntimeDisentangledRelativeAttentionF32Device(self.provider_impl, .{
@@ -6812,10 +6821,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(request.input);
         if (input_buf.quantized_storage == null and input_buf.runtime_quantized_storage == null and input_buf.owned_quantized_storage == null) {
             const shape = input_buf.logical_shape orelse return null;
-            if (shape.len == 2 and @as(usize, @intCast(shape[1])) == request.dim) {
-                const source_rows: usize = @intCast(shape[0]);
+            const source_rows: ?usize = if (shape.len == 2 and @as(usize, @intCast(shape[1])) == request.dim)
+                @intCast(shape[0])
+            else if (shape.len == 3 and @as(usize, @intCast(shape[2])) == request.dim)
+                try std.math.mul(usize, @intCast(shape[0]), @intCast(shape[1]))
+            else
+                null;
+            if (source_rows) |rows_available| {
                 for (request.row_ids) |row_id| {
-                    if (row_id >= source_rows) return error.InvalidTensorShape;
+                    if (row_id >= rows_available) return error.InvalidTensorShape;
                 }
                 var input_mt = try self.ownedDeviceMetalTensorFromCt(request.input);
                 defer input_mt.deinit();
@@ -6833,7 +6847,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         self.provider_impl,
                         input_mt,
                         ids_mt,
-                        source_rows,
+                        rows_available,
                         request.dim,
                         request.rows,
                         &out_shape,
@@ -16598,7 +16612,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .input = request.relative_embeddings,
             .in_dim = request.hidden_size,
             .out_dim = request.hidden_size,
-        })) orelse return null;
+        })) orelse {
+            self.timing_stats.metal_runtime_deberta_relative_qk_pair_fallbacks += 1;
+            return null;
+        };
+        self.timing_stats.metal_runtime_deberta_relative_qk_pair_calls += 1;
         var q_r = rel_qk.first;
         var k_r = rel_qk.second;
         defer freeOp(ctx, q_r);
@@ -17263,6 +17281,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_mps_dense_linear_standalone_wait_nanos = runtime_stats.mps_dense_linear_standalone_wait_nanos;
         stats.metal_runtime_mps_dense_linear_standalone_gpu_nanos = runtime_stats.mps_dense_linear_standalone_gpu_nanos;
         stats.metal_runtime_last_frame_mps_dense_linear_count = runtime_stats.last_frame_mps_dense_linear_count;
+        stats.metal_runtime_dense_qkv_packed_calls += runtime_stats.dense_qkv_packed_calls;
+        stats.metal_runtime_dense_qkv_packed_fallbacks += runtime_stats.dense_qkv_packed_fallbacks;
+        stats.metal_runtime_dense_pair_packed_calls += runtime_stats.dense_pair_packed_calls;
+        stats.metal_runtime_dense_pair_packed_fallbacks += runtime_stats.dense_pair_packed_fallbacks;
         stats.metal_runtime_deberta_ffn_fused_calls = runtime_stats.deberta_ffn_fused_calls;
         stats.metal_runtime_deberta_ffn_fused_mps_matmuls = runtime_stats.deberta_ffn_fused_mps_matmuls;
         stats.metal_runtime_deberta_ffn_fused_fallbacks = runtime_stats.deberta_ffn_fused_fallbacks;
@@ -17864,6 +17886,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer input.deinit();
         const rows: usize = @intCast(input.dim(0));
+        const dense_active_frame_pair = rows > 1 and input.isDevice() and
+            metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
+            self.provider_impl.raw_linear_slot_kinds[request.slot_a] == .dense and
+            self.provider_impl.raw_linear_slot_kinds[request.slot_b] == .dense;
         if (try metal_runtime.tryApplyQuantizedRuntimeLinearPair(
             self.provider_impl,
             request.slot_a,
@@ -17891,6 +17917,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .first = try self.ctFromOwnedMetalTensor(pair.first),
                 .second = try self.ctFromOwnedMetalTensor(pair.second),
             };
+        }
+        if (dense_active_frame_pair) {
+            self.timing_stats.metal_runtime_dense_pair_packed_fallbacks += 1;
+            return null;
         }
 
         const first = (try decoderRuntimeApplyLinearOp(ctx, &.{
@@ -17922,6 +17952,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer linear_input.deinit();
         const rows: usize = @intCast(linear_input.dim(0));
+        const dense_active_frame_qkv = rows > 1 and linear_input.isDevice() and
+            metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
+            self.provider_impl.raw_linear_slot_kinds[request.q_slot] == .dense and
+            self.provider_impl.raw_linear_slot_kinds[request.k_slot] == .dense and
+            self.provider_impl.raw_linear_slot_kinds[request.v_slot] == .dense;
         if (rows > 1 and metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
             if (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvScratch(
                 self.provider_impl,
@@ -17974,6 +18009,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .second = try self.ctFromOwnedMetalTensor(triple.second),
                 .third = try self.ctFromOwnedMetalTensor(triple.third),
             };
+        }
+        if (dense_active_frame_qkv) {
+            self.timing_stats.metal_runtime_dense_qkv_packed_fallbacks += 1;
+            return null;
         }
         if (try metal_runtime.tryApplyDenseRuntimeLinear(
             self.provider_impl,

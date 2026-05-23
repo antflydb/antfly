@@ -733,6 +733,10 @@ typedef struct termite_metal_decode_runtime {
     uint64_t mps_dense_linear_active_frame_calls;
     uint64_t mps_dense_linear_standalone_wait_nanos;
     uint64_t mps_dense_linear_standalone_gpu_nanos;
+    uint64_t dense_qkv_packed_calls;
+    uint64_t dense_qkv_packed_fallbacks;
+    uint64_t dense_pair_packed_calls;
+    uint64_t dense_pair_packed_fallbacks;
     uint64_t deberta_ffn_fused_calls;
     uint64_t deberta_ffn_fused_mps_matmuls;
     uint64_t deberta_ffn_fused_fallbacks;
@@ -890,6 +894,10 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t mps_dense_linear_standalone_wait_nanos;
     uint64_t mps_dense_linear_standalone_gpu_nanos;
     uint64_t last_frame_mps_dense_linear_count;
+    uint64_t dense_qkv_packed_calls;
+    uint64_t dense_qkv_packed_fallbacks;
+    uint64_t dense_pair_packed_calls;
+    uint64_t dense_pair_packed_fallbacks;
     uint64_t deberta_ffn_fused_calls;
     uint64_t deberta_ffn_fused_mps_matmuls;
     uint64_t deberta_ffn_fused_fallbacks;
@@ -3579,19 +3587,24 @@ static NSString *termite_metal_shader_source(void) {
            "    if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u) return;\n"
            "    uint qi = tg.x; uint h = tg.y; uint b = tg.z; if (qi >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
            "    uint hidden = p.num_heads * p.head_dim; uint head_off = h * p.head_dim; uint q_base = (b * p.seq_len + qi) * hidden + head_off; float scale = rsqrt(float(p.head_dim) * 3.0f);\n"
-           "    threadgroup float *scores = scratch; threadgroup float *partials = scratch + p.seq_len;\n"
-           "    float best = -3.402823466e+38f;\n"
-           "    for (uint ki = 0u; ki < p.seq_len; ++ki) {\n"
-           "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; uint k_base = (b * p.seq_len + ki) * hidden + head_off; uint rel_idx = qi + p.seq_len - 1u - ki; uint rel_base = rel_idx * hidden + head_off; float acc = 0.0f;\n"
-           "        if (allowed) { for (uint x = tid; x < p.head_dim; x += tpg.x) acc += q[q_base + x] * k[k_base + x] + q[q_base + x] * k_r[rel_base + x] + q_r[rel_base + x] * k[k_base + x]; }\n"
-           "        partials[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint stride = tpg.x >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
-           "        if (tid == 0u) { float score = allowed ? partials[0] * scale : -3.402823466e+38f; scores[ki] = score; best = max(best, score); }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    uint lid = uint(tid); uint width = uint(tpg.x); threadgroup float *scores = scratch; threadgroup float *partials = scratch + p.seq_len;\n"
+           "    float local_best = -3.402823466e+38f;\n"
+           "    for (uint ki = lid; ki < p.seq_len; ki += width) {\n"
+           "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; float score = -3.402823466e+38f;\n"
+           "        if (allowed) { uint k_base = (b * p.seq_len + ki) * hidden + head_off; uint rel_idx = qi + p.seq_len - 1u - ki; uint rel_base = rel_idx * hidden + head_off; float acc = 0.0f;\n"
+           "            for (uint x = 0u; x < p.head_dim; ++x) { float qx = q[q_base + x]; acc += qx * k[k_base + x] + qx * k_r[rel_base + x] + q_r[rel_base + x] * k[k_base + x]; }\n"
+           "            score = acc * scale; local_best = max(local_best, score); }\n"
+           "        scores[ki] = score;\n"
            "    }\n"
-           "    if (tid == 0u) { float denom = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { float s = scores[ki]; if (s > -3.0e38f) denom += exp(s - best); } partials[0] = denom > 0.0f ? 1.0f / denom : 0.0f; partials[1] = best; }\n"
-           "    threadgroup_barrier(mem_flags::mem_threadgroup); float inv_sum = partials[0]; float local_best = partials[1];\n"
-           "    for (uint d = tid; d < p.head_dim; d += tpg.x) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { float s = scores[ki]; if (s > -3.0e38f) { uint k_base = (b * p.seq_len + ki) * hidden + head_off; float w = exp(s - local_best) * inv_sum; accum += w * v[k_base + d]; } } output[(b * p.seq_len + qi) * hidden + head_off + d] = accum; }\n"
+           "    partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    float best = partials[0]; float local_sum = 0.0f;\n"
+           "    for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); }\n"
+           "    partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
+           "    for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint k_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[ki] * v[k_base + d]; } output[(b * p.seq_len + qi) * hidden + head_off + d] = accum; }\n"
            "}\n"
            "kernel void termite_transpose_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_transpose_f32_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.total || p.rank == 0u || p.rank > 8u) return;\n"
@@ -18127,6 +18140,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
             *q_output_handle = (__bridge void *)q_output_buffer;
             *k_output_handle = (__bridge void *)k_output_buffer;
             *v_output_handle = (__bridge void *)v_output_buffer;
+            runtime->dense_qkv_packed_calls += 1;
             return 0;
         }
         if (termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
@@ -18196,6 +18210,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
         *q_output_handle = (__bridge void *)q_output_buffer;
         *k_output_handle = (__bridge void *)k_output_buffer;
         *v_output_handle = (__bridge void *)v_output_buffer;
+        runtime->dense_qkv_packed_calls += 1;
         return 0;
     }
 }
@@ -18341,6 +18356,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
 
             *a_output_handle = (__bridge void *)a_output_buffer;
             *b_output_handle = (__bridge void *)b_output_buffer;
+            runtime->dense_pair_packed_calls += 1;
             return 0;
         }
         if (termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
@@ -18393,6 +18409,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
 
         *a_output_handle = (__bridge void *)a_output_buffer;
         *b_output_handle = (__bridge void *)b_output_buffer;
+        runtime->dense_pair_packed_calls += 1;
         return 0;
     }
 }
@@ -21298,7 +21315,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         }
         if (getenv("TERMITE_METAL_DISABLE_DEBERTA_TG_ATTENTION") == NULL &&
             runtime->disentangled_relative_attention_f32_tg_pipeline != nil &&
-            seq_len <= 256 &&
+            seq_len <= 512 &&
             head_dim <= 256)
         {
             BOOL tg_encoder_owned = YES;
@@ -21313,7 +21330,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
             [tg_encoder setBuffer:mask_buffer offset:mask_offset atIndex:5];
             [tg_encoder setBuffer:output_buffer offset:output_offset atIndex:6];
             [tg_encoder setBytes:&params length:sizeof(params) atIndex:7];
-            const NSUInteger tg_width = 128u;
+            const NSUInteger tg_width = 64u;
             [tg_encoder setThreadgroupMemoryLength:(seq_len + tg_width) * sizeof(float) atIndex:0];
             [tg_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
                        threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
@@ -32265,6 +32282,10 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->mps_dense_linear_standalone_wait_nanos = runtime->mps_dense_linear_standalone_wait_nanos;
     snapshot->mps_dense_linear_standalone_gpu_nanos = runtime->mps_dense_linear_standalone_gpu_nanos;
     snapshot->last_frame_mps_dense_linear_count = runtime->last_frame_mps_dense_linear_count;
+    snapshot->dense_qkv_packed_calls = runtime->dense_qkv_packed_calls;
+    snapshot->dense_qkv_packed_fallbacks = runtime->dense_qkv_packed_fallbacks;
+    snapshot->dense_pair_packed_calls = runtime->dense_pair_packed_calls;
+    snapshot->dense_pair_packed_fallbacks = runtime->dense_pair_packed_fallbacks;
     snapshot->deberta_ffn_fused_calls = runtime->deberta_ffn_fused_calls;
     snapshot->deberta_ffn_fused_mps_matmuls = runtime->deberta_ffn_fused_mps_matmuls;
     snapshot->deberta_ffn_fused_fallbacks = runtime->deberta_ffn_fused_fallbacks;

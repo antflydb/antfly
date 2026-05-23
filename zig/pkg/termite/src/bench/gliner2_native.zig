@@ -38,11 +38,14 @@ const gliner_head = termite_internal.architectures.gliner_head;
 const native_compute = termite_internal.native_compute.native;
 const NativeCompute = termite_internal.native_compute.native.NativeCompute;
 const cuda_compute = if (build_options.enable_cuda) termite_internal.native_compute.cuda else struct {};
+const metal_compute = termite_internal.native_compute.metal;
+const gpu_hosted_store = termite_internal.native_compute.gpu_hosted_store;
 const WeightStore = termite_internal.native_compute.native.WeightStore;
 const LoadedWeight = termite_internal.models.weight_source.LoadedWeight;
 const QuantizedStorage = termite_internal.models.weight_source.QuantizedStorage;
 const Tensor = termite_internal.backends.Tensor;
 const quant_codec = termite_internal.gguf.quant_codec;
+const ops = termite_internal.ops;
 const tensor_types = termite_internal.gguf.tensor_types;
 
 const QuantMode = enum {
@@ -64,7 +67,13 @@ const QuantMode = enum {
 
 const BackendMode = enum {
     native,
+    metal,
     cuda,
+};
+
+const OutputFormat = enum {
+    text,
+    csv,
 };
 
 const BenchConfig = struct {
@@ -86,6 +95,8 @@ const BenchConfig = struct {
     /// scales always stay f32.
     quant: QuantMode = .none,
     backend: BackendMode = .native,
+    matrix: bool = false,
+    format: OutputFormat = .text,
 };
 
 fn parseArgs(init: std.process.Init) !BenchConfig {
@@ -124,10 +135,23 @@ fn parseArgs(init: std.process.Init) !BenchConfig {
             const value = args_iter.next() orelse return error.MissingValue;
             if (std.ascii.eqlIgnoreCase(value, "native")) {
                 cfg.backend = .native;
+            } else if (std.ascii.eqlIgnoreCase(value, "metal")) {
+                cfg.backend = .metal;
             } else if (std.ascii.eqlIgnoreCase(value, "cuda")) {
                 cfg.backend = .cuda;
             } else {
                 return error.InvalidBackend;
+            }
+        } else if (std.mem.eql(u8, arg, "--matrix")) {
+            cfg.matrix = true;
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            const value = args_iter.next() orelse return error.MissingValue;
+            if (std.ascii.eqlIgnoreCase(value, "text")) {
+                cfg.format = .text;
+            } else if (std.ascii.eqlIgnoreCase(value, "csv")) {
+                cfg.format = .csv;
+            } else {
+                return error.InvalidFormat;
             }
         }
     }
@@ -411,6 +435,70 @@ fn deinitWeightStore(allocator: std.mem.Allocator, store: *WeightStore) void {
     store.resident_weights.deinit(allocator);
 }
 
+fn initMetalWeightStore(allocator: std.mem.Allocator) gpu_hosted_store.WeightStore {
+    if (comptime build_options.enable_mlx) {
+        return .{
+            .allocator = allocator,
+            .resident_weights = .{},
+            .stream = .{},
+            .prefix = "",
+            .lazy_weights = .empty,
+        };
+    }
+    return .{
+        .allocator = allocator,
+        .resident_weights = {},
+        .stream = {},
+        .prefix = "",
+        .lazy_weights = .empty,
+    };
+}
+
+fn populateMetalWeightsFromNative(
+    allocator: std.mem.Allocator,
+    metal_store: *gpu_hosted_store.WeightStore,
+    native_store: *WeightStore,
+) !void {
+    var it = native_store.resident_weights.iterator();
+    while (it.next()) |entry| {
+        const loaded = entry.value_ptr;
+        if (loaded.quantized or loaded.quantized_storage != null) return error.MetalSyntheticBenchOnlySupportsDenseFp32;
+        if (loaded.tensor.dtype != .f32) return error.MetalSyntheticBenchOnlySupportsDenseFp32;
+
+        const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(owned_key);
+
+        const tensor = try Tensor.initFloat32(allocator, owned_key, loaded.tensor.shape, loaded.tensor.asFloat32());
+        errdefer {
+            var tensor_copy = tensor;
+            tensor_copy.deinit();
+        }
+
+        try metal_store.lazy_weights.put(allocator, owned_key, .{
+            .tensor_ref = .{ .name = &.{} },
+            .host_loaded = .{ .tensor = tensor },
+            .active_tier = .host,
+            .loaded_bytes = tensor.data.len,
+        });
+    }
+}
+
+fn deinitMetalWeightStore(allocator: std.mem.Allocator, store: *gpu_hosted_store.WeightStore) void {
+    if (comptime build_options.enable_metal) {
+        metal_compute.stopPrefetchWorker(store);
+        metal_compute.deinitPrefetchQueue(store);
+        metal_compute.deinitSharedNativeProvider(store);
+        metal_compute.deinitPackedExpertViews(store, allocator);
+    }
+    var it = store.lazy_weights.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.host_loaded) |*loaded| loaded.deinit();
+        if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
+        allocator.free(entry.key_ptr.*);
+    }
+    store.lazy_weights.deinit(allocator);
+}
+
 fn populateCudaWeights(
     allocator: std.mem.Allocator,
     cuda: anytype,
@@ -541,14 +629,202 @@ fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1.0e6;
 }
 
+fn yesNo(value: bool) []const u8 {
+    return if (value) "yes" else "no";
+}
+
+fn deltaU64(after: u64, before: u64) u64 {
+    return if (after >= before) after - before else 0;
+}
+
+fn perIter(count: u64, iters: usize) u64 {
+    if (iters == 0) return count;
+    return count / @as(u64, @intCast(iters));
+}
+
+const MetalAudit = struct {
+    resident_frame: bool = false,
+    interpreter_fallbacks: u64 = 0,
+    host_downloads: u64 = 0,
+    host_download_device_calls: u64 = 0,
+    host_downloads_total: u64 = 0,
+    host_download_device_calls_total: u64 = 0,
+    host_download_bytes: u64 = 0,
+    mps_standalone: u64 = 0,
+    mps_active: u64 = 0,
+    mpsgraph: u64 = 0,
+    planned_layers: u64 = 0,
+    layer_count: u64 = 0,
+    fused_ffn: u64 = 0,
+    packed_qkv: u64 = 0,
+    packed_qkv_fallbacks: u64 = 0,
+    relative_qk_pair: u64 = 0,
+    relative_qk_pair_fallbacks: u64 = 0,
+    command_plan_reused: bool = false,
+    frame_gpu_ms: f64 = 0.0,
+    frame_wait_ms: f64 = 0.0,
+    graph_plan_reuses: u64 = 0,
+    graph_plan_count: u64 = 0,
+    graph_plan_slots: u64 = 0,
+    graph_plan_bytes: u64 = 0,
+    frame_begins: u64 = 0,
+    frame_submits: u64 = 0,
+    plan_successes: u64 = 0,
+    plan_failures: u64 = 0,
+    embedding_successes: u64 = 0,
+    embedding_fallbacks: u64 = 0,
+    layer_successes_total: u64 = 0,
+    layer_fallbacks: u64 = 0,
+    ffn_fused_total: u64 = 0,
+    ffn_fallbacks: u64 = 0,
+    compute_encoders: u64 = 0,
+    last_frame_compute_encoders: u64 = 0,
+    last_frame_mps: u64 = 0,
+};
+
+fn buildMetalAudit(cfg: BenchConfig, before: ops.BackendDebugTimingSnapshot, after: ops.BackendDebugTimingSnapshot) MetalAudit {
+    if (cfg.backend != .metal) return .{};
+
+    const b = before.provider;
+    const a = after.provider;
+    const frame_begins = deltaU64(a.decoder_runtime_frame_begins, b.decoder_runtime_frame_begins);
+    const frame_submits = deltaU64(a.decoder_runtime_frame_submits, b.decoder_runtime_frame_submits);
+    const host_download_device_calls_total = deltaU64(a.metal_tensor_to_host_device_calls, b.metal_tensor_to_host_device_calls);
+    const layer_successes_total = deltaU64(a.metal_runtime_deberta_encoder_layer_successes, b.metal_runtime_deberta_encoder_layer_successes);
+    const ffn_fused_total = deltaU64(a.metal_runtime_deberta_ffn_fused_calls, b.metal_runtime_deberta_ffn_fused_calls);
+    const packed_qkv_total = deltaU64(a.metal_runtime_dense_qkv_packed_calls, b.metal_runtime_dense_qkv_packed_calls);
+    const relative_qk_pair_total = deltaU64(a.metal_runtime_deberta_relative_qk_pair_calls, b.metal_runtime_deberta_relative_qk_pair_calls);
+    const layer_count: u64 = @intCast(cfg.num_layers);
+
+    return .{
+        .resident_frame = frame_begins == cfg.measure_iters and frame_submits == cfg.measure_iters,
+        .host_downloads = perIter(host_download_device_calls_total, cfg.measure_iters),
+        .host_download_device_calls = perIter(host_download_device_calls_total, cfg.measure_iters),
+        .host_downloads_total = host_download_device_calls_total,
+        .host_download_device_calls_total = host_download_device_calls_total,
+        .host_download_bytes = deltaU64(a.metal_tensor_host_mirror_download_bytes, b.metal_tensor_host_mirror_download_bytes),
+        .mps_standalone = deltaU64(a.metal_runtime_mps_dense_linear_standalone_calls, b.metal_runtime_mps_dense_linear_standalone_calls),
+        .mps_active = deltaU64(a.metal_runtime_mps_dense_linear_active_frame_calls, b.metal_runtime_mps_dense_linear_active_frame_calls),
+        .mpsgraph = deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls),
+        .planned_layers = perIter(layer_successes_total, cfg.measure_iters),
+        .layer_count = layer_count,
+        .fused_ffn = perIter(ffn_fused_total, cfg.measure_iters),
+        .packed_qkv = perIter(packed_qkv_total, cfg.measure_iters),
+        .packed_qkv_fallbacks = deltaU64(a.metal_runtime_dense_qkv_packed_fallbacks, b.metal_runtime_dense_qkv_packed_fallbacks),
+        .relative_qk_pair = perIter(relative_qk_pair_total, cfg.measure_iters),
+        .relative_qk_pair_fallbacks = deltaU64(a.metal_runtime_deberta_relative_qk_pair_fallbacks, b.metal_runtime_deberta_relative_qk_pair_fallbacks),
+        .command_plan_reused = deltaU64(a.metal_runtime_graph_plan_reuses, b.metal_runtime_graph_plan_reuses) > 0,
+        .frame_gpu_ms = nsToMs(perIter(deltaU64(@intCast(a.decoder_runtime_frame_gpu_nanos), @intCast(b.decoder_runtime_frame_gpu_nanos)), cfg.measure_iters)),
+        .frame_wait_ms = nsToMs(perIter(deltaU64(@intCast(a.decoder_runtime_frame_wait_nanos), @intCast(b.decoder_runtime_frame_wait_nanos)), cfg.measure_iters)),
+        .graph_plan_reuses = deltaU64(a.metal_runtime_graph_plan_reuses, b.metal_runtime_graph_plan_reuses),
+        .graph_plan_count = deltaU64(a.metal_runtime_graph_plan_count, b.metal_runtime_graph_plan_count),
+        .graph_plan_slots = a.metal_runtime_graph_plan_slots,
+        .graph_plan_bytes = a.metal_runtime_graph_plan_bytes,
+        .frame_begins = frame_begins,
+        .frame_submits = frame_submits,
+        .plan_successes = deltaU64(a.metal_runtime_deberta_encoder_frame_plan_successes, b.metal_runtime_deberta_encoder_frame_plan_successes),
+        .plan_failures = deltaU64(a.metal_runtime_deberta_encoder_frame_plan_failures, b.metal_runtime_deberta_encoder_frame_plan_failures),
+        .embedding_successes = deltaU64(a.metal_runtime_deberta_embeddings_successes, b.metal_runtime_deberta_embeddings_successes),
+        .embedding_fallbacks = deltaU64(a.metal_runtime_deberta_embeddings_fallbacks, b.metal_runtime_deberta_embeddings_fallbacks),
+        .layer_successes_total = layer_successes_total,
+        .layer_fallbacks = deltaU64(a.metal_runtime_deberta_encoder_layer_fallbacks, b.metal_runtime_deberta_encoder_layer_fallbacks),
+        .ffn_fused_total = ffn_fused_total,
+        .ffn_fallbacks = deltaU64(a.metal_runtime_deberta_ffn_fused_fallbacks, b.metal_runtime_deberta_ffn_fused_fallbacks),
+        .compute_encoders = deltaU64(a.metal_runtime_compute_encoder_count, b.metal_runtime_compute_encoder_count),
+        .last_frame_compute_encoders = a.metal_runtime_last_frame_compute_encoder_count,
+        .last_frame_mps = a.metal_runtime_last_frame_mps_dense_linear_count,
+    };
+}
+
+test "metal audit reports packed qkv and frame timing gates" {
+    const before = ops.BackendDebugTimingSnapshot{};
+    var after = ops.BackendDebugTimingSnapshot{};
+    const cfg = BenchConfig{ .backend = .metal, .num_layers = 2, .measure_iters = 2 };
+
+    after.provider.decoder_runtime_frame_begins = 2;
+    after.provider.decoder_runtime_frame_submits = 2;
+    after.provider.decoder_runtime_frame_gpu_nanos = 2_000_000;
+    after.provider.decoder_runtime_frame_wait_nanos = 3_000_000;
+    after.provider.metal_tensor_to_host_device_calls = 2;
+    after.provider.metal_runtime_deberta_encoder_layer_successes = 4;
+    after.provider.metal_runtime_deberta_ffn_fused_calls = 4;
+    after.provider.metal_runtime_dense_qkv_packed_calls = 4;
+    after.provider.metal_runtime_deberta_relative_qk_pair_calls = 4;
+    after.provider.metal_runtime_graph_plan_reuses = 1;
+
+    const audit = buildMetalAudit(cfg, before, after);
+    try std.testing.expect(audit.resident_frame);
+    try std.testing.expect(audit.command_plan_reused);
+    try std.testing.expectEqual(@as(u64, 2), audit.packed_qkv);
+    try std.testing.expectEqual(@as(u64, 0), audit.packed_qkv_fallbacks);
+    try std.testing.expectEqual(@as(u64, 2), audit.relative_qk_pair);
+    try std.testing.expectEqual(@as(u64, 0), audit.relative_qk_pair_fallbacks);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), audit.frame_gpu_ms, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), audit.frame_wait_ms, 0.001);
+}
+
+const metal_graph_plan_hot_hidden_slot_base: usize = 17;
+const metal_graph_plan_hot_intermediate_slot_base: usize = 21;
+
+fn glinerSessionScratchBytes(cfg: BenchConfig, span_idx: []const i64) ?struct {
+    encoder_hidden: usize,
+    projection_hidden: usize,
+    hot_hidden: usize,
+    hot_intermediate: usize,
+} {
+    const encoder_rows = std.math.mul(usize, cfg.batch, cfg.seq_len) catch return null;
+    const span_rows = span_idx.len / 2;
+    const projection_rows = @max(encoder_rows, span_rows);
+    const hot_rows = projection_rows;
+    const encoder_hidden_elems = std.math.mul(usize, encoder_rows, cfg.hidden_size) catch return null;
+    const projection_hidden_elems = std.math.mul(usize, projection_rows, cfg.hidden_size) catch return null;
+    const hot_hidden_elems = std.math.mul(usize, hot_rows, cfg.hidden_size) catch return null;
+    const hot_intermediate_elems = std.math.mul(usize, hot_rows, cfg.intermediate_size) catch return null;
+    return .{
+        .encoder_hidden = std.math.mul(usize, encoder_hidden_elems, @sizeOf(f32)) catch return null,
+        .projection_hidden = std.math.mul(usize, projection_hidden_elems, @sizeOf(f32)) catch return null,
+        .hot_hidden = std.math.mul(usize, hot_hidden_elems, @sizeOf(f32)) catch return null,
+        .hot_intermediate = std.math.mul(usize, hot_intermediate_elems, @sizeOf(f32)) catch return null,
+    };
+}
+
+fn reserveBenchmarkGlinerSessionScratch(cb: *const ops.ComputeBackend, cfg: BenchConfig, span_idx: []const i64) bool {
+    const bytes = glinerSessionScratchBytes(cfg, span_idx) orelse return false;
+    var slots: [15]ops.GraphPlanSlot = undefined;
+    for (0..3) |i| {
+        slots[i] = .{ .slot = i, .bytes = bytes.projection_hidden };
+    }
+    slots[3] = .{ .slot = 3, .bytes = bytes.projection_hidden * 3 };
+    for (0..2) |i| {
+        slots[4 + i] = .{ .slot = 4 + i, .bytes = bytes.projection_hidden };
+    }
+    for (0..4) |i| {
+        slots[6 + i] = .{ .slot = metal_graph_plan_hot_hidden_slot_base + i, .bytes = bytes.hot_hidden };
+    }
+    for (0..5) |i| {
+        slots[10 + i] = .{ .slot = metal_graph_plan_hot_intermediate_slot_base + i, .bytes = bytes.hot_intermediate };
+    }
+    return cb.reserveGraphPlanSlots(&slots) catch false;
+}
+
 fn runForwardTimed(
     allocator: std.mem.Allocator,
-    cb: anytype,
+    cb: *const ops.ComputeBackend,
     cfg: BenchConfig,
     inputs: anytype,
     deberta_cfg: deberta_config_mod.Config,
 ) !ForwardRun {
     const total_start = nowNs();
+
+    var session_frame_active = false;
+    if (cb.kind() == .metal) {
+        _ = try deberta_arch.preplanMetalDebertaEncoderFrame(cb, allocator, deberta_cfg, cfg.batch, cfg.seq_len);
+        _ = reserveBenchmarkGlinerSessionScratch(cb, cfg, inputs.span_idx);
+        if (!cb.decoderRuntimeHasActiveFrame()) {
+            session_frame_active = try cb.decoderRuntimeBeginFrame();
+        }
+    }
+    errdefer if (session_frame_active) cb.decoderRuntimeCancelFrame() catch {};
 
     var timing = ForwardTiming{};
     var start = nowNs();
@@ -594,6 +870,11 @@ fn runForwardTimed(
     timing.head_ns = nowNs() - start;
     timing.head_profile = head_profile;
 
+    if (session_frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        session_frame_active = false;
+    }
+
     start = nowNs();
     const logits = if (head_result.num_labels == 0)
         try allocator.alloc(f32, 0)
@@ -610,7 +891,7 @@ fn runForwardTimed(
 
 fn runBenchmark(
     allocator: std.mem.Allocator,
-    cb: anytype,
+    cb: *const ops.ComputeBackend,
     cfg: BenchConfig,
     inputs: anytype,
     maybe_weight_store: ?*WeightStore,
@@ -628,10 +909,12 @@ fn runBenchmark(
         .num_labels = cfg.num_labels,
     };
 
-    std.debug.print(
-        "config: backend={s} batch={} seq_len={} layers={} heads={} hidden={} intermediate={} num_labels={} quant={s}\n",
-        .{ @tagName(cfg.backend), cfg.batch, cfg.seq_len, cfg.num_layers, cfg.num_heads, cfg.hidden_size, cfg.intermediate_size, cfg.num_labels, @tagName(cfg.quant) },
-    );
+    if (cfg.format == .text) {
+        std.debug.print(
+            "config: backend={s} batch={} seq_len={} layers={} heads={} hidden={} intermediate={} num_labels={} quant={s}\n",
+            .{ @tagName(cfg.backend), cfg.batch, cfg.seq_len, cfg.num_layers, cfg.num_heads, cfg.hidden_size, cfg.intermediate_size, cfg.num_labels, @tagName(cfg.quant) },
+        );
+    }
 
     // Warmup + sanity-check the first iteration's output is finite.  Random
     // weights produce random logits, but quantization-induced overflow would
@@ -649,10 +932,12 @@ fn runBenchmark(
             if (std.math.isInf(v)) inf_count += 1;
             if (@abs(v) > max_abs) max_abs = @abs(v);
         }
-        std.debug.print(
-            "warmup: {d:.3} ms, logits_count={}, nan={}, inf={}, max_abs={d:.3}\n",
-            .{ nsToMs(warmup.timing.total_ns), warmup.logits.len, nan_count, inf_count, max_abs },
-        );
+        if (cfg.format == .text) {
+            std.debug.print(
+                "warmup: {d:.3} ms, logits_count={}, nan={}, inf={}, max_abs={d:.3}\n",
+                .{ nsToMs(warmup.timing.total_ns), warmup.logits.len, nan_count, inf_count, max_abs },
+            );
+        }
     }
     // Extra warmup iterations beyond the sanity check.
     if (cfg.warmup_iters > 1) {
@@ -661,6 +946,9 @@ fn runBenchmark(
             allocator.free(warmup.logits);
         }
     }
+
+    cb.resetDebugTimingStats();
+    const audit_before = cb.debugTimingSnapshot();
 
     // Measure
     if (maybe_weight_store != null) {
@@ -674,6 +962,9 @@ fn runBenchmark(
         total_timing.add(run.timing);
         if (run.timing.total_ns < min_ns) min_ns = run.timing.total_ns;
     }
+    const audit_after = cb.debugTimingSnapshot();
+    const metal_audit = buildMetalAudit(cfg, audit_before, audit_after);
+
     const avg_ns = total_timing.total_ns / cfg.measure_iters;
     const avg_encoder_ns = total_timing.encoder_ns / cfg.measure_iters;
     const avg_head_ns = total_timing.head_ns / cfg.measure_iters;
@@ -709,6 +1000,59 @@ fn runBenchmark(
         .label_projection_ns = total_timing.head_profile.label_projection_ns / cfg.measure_iters,
         .logits_ns = total_timing.head_profile.logits_ns / cfg.measure_iters,
     };
+
+    if (cfg.format == .csv) {
+        std.debug.print(
+            "{s},{s},{},{},{},{},{},{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{s},{},{},{},{},{},{},{},{}",
+            .{
+                @tagName(cfg.backend),
+                @tagName(cfg.quant),
+                cfg.batch,
+                cfg.seq_len,
+                cfg.num_labels,
+                cfg.num_layers,
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                cfg.warmup_iters,
+                cfg.measure_iters,
+                nsToMs(avg_ns),
+                nsToMs(min_ns),
+                nsToMs(avg_encoder_ns),
+                nsToMs(avg_head_ns),
+                nsToMs(avg_logits_to_f32_ns),
+                yesNo(metal_audit.resident_frame),
+                metal_audit.interpreter_fallbacks,
+                metal_audit.host_downloads,
+                metal_audit.mps_standalone,
+                metal_audit.mps_active,
+                metal_audit.mpsgraph,
+                metal_audit.planned_layers,
+                metal_audit.layer_count,
+                metal_audit.fused_ffn,
+            },
+        );
+        std.debug.print(
+            ",{},{},{},{},{s},{d:.3},{d:.3},{},{},{},{},{},{},{},{}\n",
+            .{
+                metal_audit.packed_qkv,
+                metal_audit.packed_qkv_fallbacks,
+                metal_audit.relative_qk_pair,
+                metal_audit.relative_qk_pair_fallbacks,
+                yesNo(metal_audit.command_plan_reused),
+                metal_audit.frame_gpu_ms,
+                metal_audit.frame_wait_ms,
+                metal_audit.graph_plan_reuses,
+                metal_audit.frame_begins,
+                metal_audit.frame_submits,
+                metal_audit.host_downloads_total,
+                metal_audit.layer_fallbacks,
+                metal_audit.ffn_fallbacks,
+                metal_audit.plan_successes,
+                metal_audit.plan_failures,
+            },
+        );
+        return;
+    }
 
     std.debug.print(
         "gliner2_e2e_avg_ms={d:.3} gliner2_e2e_min_ms={d:.3} iters={}\n",
@@ -765,6 +1109,55 @@ fn runBenchmark(
             nsToMs(avg_profile.span_out_project_second_linear_ns),
         },
     );
+    if (cfg.backend == .metal) {
+        std.debug.print(
+            "gliner2_metal_audit resident_frame={s} interpreter_fallbacks={} host_downloads={} mps_standalone={} mps_active={} mpsgraph={} planned_layers={} layer_count={} fused_ffn={} packed_qkv={} packed_qkv_fallbacks={} relative_qk_pair={} relative_qk_pair_fallbacks={} command_plan_reused={s} graph_plan_reuses={} frame_begins={} frame_submits={} frame_gpu_ms={d:.3} frame_wait_ms={d:.3}\n",
+            .{
+                yesNo(metal_audit.resident_frame),
+                metal_audit.interpreter_fallbacks,
+                metal_audit.host_downloads,
+                metal_audit.mps_standalone,
+                metal_audit.mps_active,
+                metal_audit.mpsgraph,
+                metal_audit.planned_layers,
+                metal_audit.layer_count,
+                metal_audit.fused_ffn,
+                metal_audit.packed_qkv,
+                metal_audit.packed_qkv_fallbacks,
+                metal_audit.relative_qk_pair,
+                metal_audit.relative_qk_pair_fallbacks,
+                yesNo(metal_audit.command_plan_reused),
+                metal_audit.graph_plan_reuses,
+                metal_audit.frame_begins,
+                metal_audit.frame_submits,
+                metal_audit.frame_gpu_ms,
+                metal_audit.frame_wait_ms,
+            },
+        );
+        std.debug.print(
+            "gliner2_metal_audit_detail host_downloads_total={} host_download_device_calls_total={} host_download_bytes={} graph_plan_count={} graph_plan_slots={} graph_plan_bytes={} plan_successes={} plan_failures={} embedding_successes={} embedding_fallbacks={} layer_successes_total={} layer_fallbacks={} ffn_fused_total={} ffn_fallbacks={} compute_encoders={} last_frame_compute_encoders={} last_frame_mps={}\n",
+            .{
+                metal_audit.host_downloads_total,
+                metal_audit.host_download_device_calls_total,
+                metal_audit.host_download_bytes,
+                metal_audit.graph_plan_count,
+                metal_audit.graph_plan_slots,
+                metal_audit.graph_plan_bytes,
+                metal_audit.plan_successes,
+                metal_audit.plan_failures,
+                metal_audit.embedding_successes,
+                metal_audit.embedding_fallbacks,
+                metal_audit.layer_successes_total,
+                metal_audit.layer_fallbacks,
+                metal_audit.ffn_fused_total,
+                metal_audit.ffn_fallbacks,
+                metal_audit.compute_encoders,
+                metal_audit.last_frame_compute_encoders,
+                metal_audit.last_frame_mps,
+            },
+        );
+    }
+
     if (maybe_weight_store) |weight_store| {
         const cache_stats = native_compute.quantDequantCacheStats(weight_store);
         std.debug.print(
@@ -786,10 +1179,7 @@ fn runBenchmark(
     }
 }
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = std.heap.page_allocator;
-    const cfg = try parseArgs(init);
-
+fn runScenario(allocator: std.mem.Allocator, cfg: BenchConfig) !void {
     var weight_store = WeightStore{
         .allocator = allocator,
         .resident_weights = .{},
@@ -817,6 +1207,18 @@ pub fn main(init: std.process.Init) !void {
             const cb = compute.computeBackend();
             try runBenchmark(allocator, &cb, cfg, inputs, &weight_store);
         },
+        .metal => {
+            if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+            if (cfg.quant != .none) return error.MetalSyntheticBenchOnlySupportsDenseFp32;
+            var metal_store = initMetalWeightStore(allocator);
+            defer deinitMetalWeightStore(allocator, &metal_store);
+            try populateMetalWeightsFromNative(allocator, &metal_store, &weight_store);
+            metal_compute.initPrefetchQueue(&metal_store, allocator);
+            var compute = try metal_compute.MetalCompute.init(allocator, &metal_store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            try runBenchmark(allocator, &cb, cfg, inputs, null);
+        },
         .cuda => {
             if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
             var compute = try cuda_compute.CudaCompute.init(allocator);
@@ -825,5 +1227,39 @@ pub fn main(init: std.process.Init) !void {
             const cb = compute.computeBackend();
             try runBenchmark(allocator, &cb, cfg, inputs, null);
         },
+    }
+}
+
+fn printCsvHeader() void {
+    std.debug.print(
+        "backend,quant,batch,seq_len,num_labels,layers,hidden,intermediate,warmup_iters,measure_iters,avg_ms,min_ms,encoder_ms,head_ms,logits_to_f32_ms,resident_frame,interpreter_fallbacks,host_downloads,mps_standalone,mps_active,mpsgraph,planned_layers,layer_count,fused_ffn,packed_qkv,packed_qkv_fallbacks,relative_qk_pair,relative_qk_pair_fallbacks,command_plan_reused,frame_gpu_ms,frame_wait_ms,graph_plan_reuses,frame_begins,frame_submits,host_downloads_total,layer_fallbacks,ffn_fallbacks,plan_successes,plan_failures\n",
+        .{},
+    );
+}
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = std.heap.page_allocator;
+    const cfg = try parseArgs(init);
+
+    if (cfg.format == .csv) printCsvHeader();
+
+    if (!cfg.matrix) {
+        try runScenario(allocator, cfg);
+        return;
+    }
+
+    const batches = [_]usize{ 1, 2, 4, 8, 16 };
+    const seq_lens = [_]usize{ 128, 256, 512 };
+    const labels = [_]u32{ 8, 32 };
+    for (seq_lens) |seq_len| {
+        for (labels) |num_labels| {
+            for (batches) |batch| {
+                var scenario = cfg;
+                scenario.seq_len = seq_len;
+                scenario.num_labels = num_labels;
+                scenario.batch = batch;
+                try runScenario(allocator, scenario);
+            }
+        }
     }
 }
