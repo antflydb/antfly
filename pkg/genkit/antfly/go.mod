@@ -3,12 +3,12 @@ module github.com/antflydb/antfly/pkg/genkit/antfly
 go 1.26
 
 replace (
-	github.com/antflydb/antfly/pkg/client => ../../client
+	github.com/antflydb/antfly/go/pkg/sdk => ../../../go/pkg/sdk
 	github.com/antflydb/antfly/pkg/libaf => ../../libaf
 )
 
 require (
-	github.com/antflydb/antfly/pkg/client v0.0.1
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/firebase/genkit/go v1.5.0
 	github.com/stretchr/testify v1.11.1

@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/lib/schema"
-	"github.com/antflydb/antfly/pkg/termite-client"
+	client "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 type TermiteReranker struct {

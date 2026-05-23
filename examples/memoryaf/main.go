@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/pkg/client"
+	client "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/pkg/docsaf"
 	"github.com/antflydb/antfly/pkg/libaf/s3"
 	"github.com/antflydb/antfly/pkg/memoryaf"

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/antflydb/antfly/pkg/client"
+	client "github.com/antflydb/antfly/go/pkg/sdk"
 	"go.uber.org/zap"
 )
 

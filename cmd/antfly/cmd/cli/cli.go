@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/blevesearch/bleve/v2/search/query"
 	"github.com/spf13/cobra"

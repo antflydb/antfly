@@ -116,7 +116,7 @@ tags:
       Antfly provides auto-generated SDKs from the OpenAPI specification:
 
 
-      - **Go**: `github.com/antflydb/antfly/pkg/client`
+      - **Go**: `github.com/antflydb/antfly/go/pkg/sdk/antfly`
 
       - **TypeScript**: `@antflydb/antfly-ts` (npm)
 
@@ -265,10 +265,10 @@ tags:
 
       - **Single type**: `"x-antfly-types": ["text"]` - Creates standard text field
 
-      - **Multiple types**: `"x-antfly-types": ["text", "keyword"]` - Creates `fieldName` (text) and `fieldName__keyword`
+      - **Multiple types**: `"x-antfly-types": ["text", "keyword"]` - Creates `fieldName` (text) and `fieldName.keyword`
 
       - **With search-as-you-type**: `"x-antfly-types": ["text", "search_as_you_type"]` - Creates `fieldName`
-      (text) and `fieldName__2gram`
+      (text), `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
 
 
       **Type Combination Rules**:
@@ -304,7 +304,7 @@ tags:
       ```
 
       Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `link`) are included, and
-      only the primary field (not `__keyword` or `__2gram` variants).
+      only the primary field (not `.keyword`, `._2gram`, `._3gram`, or `._index_prefix` variants).
 
 
       ## Antfly Types
@@ -319,7 +319,8 @@ tags:
 
       - `keyword` - Exact-match strings (not analyzed). Use for IDs, tags, categories, filters.
 
-      - `search_as_you_type` - Edge n-gram analyzer for autocomplete. Creates `fieldName__2gram` mapping.
+      - `search_as_you_type` - Search-as-you-type mappings for autocomplete. Creates `fieldName._2gram`,
+      `fieldName._3gram`, and `fieldName._index_prefix` mappings.
 
       - `link` - URL/link field (keyword analyzer).
 
@@ -379,18 +380,22 @@ tags:
 
       - **Primary field** (`text` or `html`): Uses original field name
 
-      - **Keyword variant**: `fieldName__keyword`
+      - **Keyword variant**: `fieldName.keyword`
 
-      - **Search-as-you-type**: `fieldName__2gram`
+      - **Search-as-you-type**: `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
 
 
       Example: `"x-antfly-types": ["text", "keyword", "search_as_you_type"]` creates:
 
       - `title` (text analyzer)
 
-      - `title__keyword` (keyword analyzer)
+      - `title.keyword` (keyword analyzer)
 
-      - `title__2gram` (edge n-gram analyzer)
+      - `title._2gram` (2-token shingle analyzer)
+
+      - `title._3gram` (3-token shingle analyzer)
+
+      - `title._index_prefix` (edge n-gram prefix analyzer)
 
 
       ## Best Practices
@@ -1658,22 +1663,26 @@ tags:
       ```
 
 
-      **3. Query the __2gram field:**
+      **3. Query with bool-prefix multi-match:**
 
       ```json
 
       {
         "full_text_search": {
-          "query": "name__2gram:lap"
+          "multi_match": {
+            "query": "lap",
+            "type": "bool_prefix",
+            "fields": ["name"]
+          }
         }
       }
 
       ```
 
 
-      The `search_as_you_type` type creates an edge n-gram indexed field (suffixed with `__2gram`)
+      The `search_as_you_type` type creates shingle and prefix subfields that match partial input
 
-      that matches partial input as users type. For example, "lap" matches "laptop", "lapel", etc.
+      as users type. For example, "lap" matches "laptop", "lapel", etc.
 
 
       ## Reindexing Data
@@ -2148,6 +2157,9 @@ tags:
   - name: RowFilter
     x-displayName: Row Filter
     description: Operations related to row-level security filters
+  - name: Role
+    x-displayName: Role
+    description: Operations related to Casbin role and group membership
 paths:
   /status:
     get:
@@ -2359,9 +2371,9 @@ paths:
         If all versions match, writes are executed atomically via 2PC.
 
 
-        **No server-side state**: There is no "begin transaction" endpoint.
+        Stateless clients manage their own read set. For server-managed
 
-        The client manages its own read set.
+        read-modify-write workflows, use the transaction session endpoints.
       requestBody:
         required: true
         content:
@@ -2841,7 +2853,7 @@ paths:
               schema:
                 type: string
                 description: >
-                  Server-Sent Events stream. See SSEEventType enum for
+                  Server-Sent Events stream. See SSEEvent enum for
 
                   all event types and their corresponding schemas.
             application/json:
@@ -3588,7 +3600,366 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/me:
+  /transactions:
+    get:
+      summary: List transaction sessions
+      tags:
+        - data_operations
+      operationId: listTransactionSessions
+      responses:
+        '200':
+          description: Active transaction sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionListResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/cleanup:
+    post:
+      summary: Clean up expired transaction sessions
+      tags:
+        - data_operations
+      operationId: cleanupTransactionSessions
+      parameters:
+        - name: cutoff_ns
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cleanup result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCleanupResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/begin:
+    post:
+      summary: Begin a transaction session
+      tags:
+        - data_operations
+      operationId: beginTransaction
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionBeginRequest'
+      responses:
+        '201':
+          description: Transaction session started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionBeginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}:
+    get:
+      summary: Get transaction session details
+      tags:
+        - data_operations
+      operationId: getTransactionSession
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Transaction session details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionDetailsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/stage:
+    post:
+      summary: Stage a transaction commit request
+      tags:
+        - data_operations
+      operationId: stageTransactionSession
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionCommitRequest'
+      responses:
+        '200':
+          description: Staged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/read:
+    post:
+      summary: Stage a transaction read version
+      tags:
+        - data_operations
+      operationId: stageTransactionRead
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionStageReadRequest'
+      responses:
+        '200':
+          description: Read staged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionStageReadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Version conflict or lease conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/write:
+    post:
+      summary: Stage a transaction write
+      tags:
+        - data_operations
+      operationId: stageTransactionWrite
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionStageWriteRequest'
+      responses:
+        '200':
+          description: Write staged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/delete:
+    post:
+      summary: Stage a transaction delete
+      tags:
+        - data_operations
+      operationId: stageTransactionDelete
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionStageDeleteRequest'
+      responses:
+        '200':
+          description: Delete staged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/savepoints:
+    post:
+      summary: Create a transaction savepoint
+      tags:
+        - data_operations
+      operationId: createTransactionSavepoint
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Savepoint created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSavepointResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/savepoints/{savepoint_id}/rollback:
+    post:
+      summary: Roll back a transaction session to a savepoint
+      tags:
+        - data_operations
+      operationId: rollbackTransactionSavepoint
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+        - name: savepoint_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Rolled back
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSavepointResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/commit:
+    post:
+      summary: Commit a transaction session
+      tags:
+        - data_operations
+      operationId: commitTransactionSession
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionCommitRequest'
+      responses:
+        '200':
+          description: Session committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Session commit conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /transactions/{transaction_id}/abort:
+    post:
+      summary: Abort a transaction session
+      tags:
+        - data_operations
+      operationId: abortTransactionSession
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Session aborted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /auth/v1/me:
     get:
       tags:
         - User
@@ -3610,6 +3981,10 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Permission'
+                  metadata:
+                    type: object
+                    additionalProperties: {}
+                    nullable: true
         '401':
           description: Unauthorized
           content:
@@ -3626,7 +4001,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users:
+  /auth/v1/users:
     get:
       tags:
         - User
@@ -3668,7 +4043,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/{userName}:
+  /auth/v1/users/{userName}:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
     post:
@@ -3779,7 +4154,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/{userName}/password:
+  /auth/v1/users/{userName}/password:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
     put:
@@ -3824,7 +4199,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/{userName}/permissions:
+  /auth/v1/users/{userName}/permissions:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
     get:
@@ -3951,7 +4326,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/{userName}/row-filters:
+  /auth/v1/users/{userName}/row-filters:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
     get:
@@ -3985,7 +4360,279 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/{userName}/row-filters/{table}:
+  /auth/v1/users/{userName}/roles:
+    parameters:
+      - $ref: '#/components/parameters/UserNamePathParameter'
+    get:
+      tags:
+        - Role
+      summary: List user roles
+      description: Returns inherited role and group subjects for a user.
+      operationId: listUserRoles
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      tags:
+        - Role
+      summary: Add role to user
+      description: Adds a direct role or group membership for a user.
+      operationId: addRoleToUser
+      requestBody:
+        description: Role or group subject to assign
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleAssignment'
+      responses:
+        '201':
+          description: Role added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+        '400':
+          description: Bad Request (e.g., invalid role)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      tags:
+        - Role
+      summary: Remove role from user
+      description: Removes a direct role or group membership from a user.
+      operationId: removeRoleFromUser
+      parameters:
+        - name: role
+          in: query
+          required: true
+          description: Role or group subject to remove.
+          schema:
+            type: string
+            example: role:tenant_reader
+      responses:
+        '204':
+          description: Role removed successfully
+        '400':
+          description: Bad Request (e.g., missing role)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User or role not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /auth/v1/subjects:
+    get:
+      tags:
+        - Role
+      summary: List auth subjects
+      description: Returns unique subjects derived from users and Casbin permission, row-filter, and grouping
+        policies.
+      operationId: listAuthSubjects
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuthSubject'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /auth/v1/subjects/{subject}/row-filters:
+    parameters:
+      - $ref: '#/components/parameters/SubjectPathParameter'
+    get:
+      tags:
+        - RowFilter
+      summary: List row filters for an auth subject
+      description: Returns row filter policies directly attached to a Casbin subject such as a role or
+        group.
+      operationId: listSubjectRowFilters
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RowFilterEntry'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /auth/v1/subjects/{subject}/row-filters/{table}:
+    parameters:
+      - $ref: '#/components/parameters/SubjectPathParameter'
+      - name: table
+        in: path
+        required: true
+        description: Table name (or '*' for all tables).
+        schema:
+          type: string
+          example: orders
+    get:
+      tags:
+        - RowFilter
+      summary: Get row filter for an auth subject on a table
+      description: Returns the row filter policy directly attached to the specified subject and table.
+      operationId: getSubjectRowFilter
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowFilterEntry'
+        '404':
+          description: Row filter not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - RowFilter
+      summary: Set row filter for an auth subject on a table
+      description: Sets or replaces a row filter policy for a role, group, or other Casbin subject.
+      operationId: setSubjectRowFilter
+      requestBody:
+        description: Bleve query JSON for filtering documents
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: {}
+      responses:
+        '200':
+          description: Row filter set successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowFilterEntry'
+        '400':
+          description: Bad Request (e.g., invalid filter JSON)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      tags:
+        - RowFilter
+      summary: Remove row filter for an auth subject on a table
+      description: Removes a row filter policy directly attached to the specified subject and table.
+      operationId: removeSubjectRowFilter
+      responses:
+        '204':
+          description: Row filter removed successfully
+        '404':
+          description: Row filter not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /auth/v1/users/{userName}/row-filters/{table}:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
       - name: table
@@ -4093,7 +4740,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/{userName}/api-keys:
+  /auth/v1/users/{userName}/api-keys:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
     get:
@@ -4182,7 +4829,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /users/{userName}/api-keys/{keyId}:
+  /auth/v1/users/{userName}/api-keys/{keyId}:
     parameters:
       - $ref: '#/components/parameters/UserNamePathParameter'
       - $ref: '#/components/parameters/KeyIdPathParameter'
@@ -4224,6 +4871,37 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
+  parameters:
+    UserNamePathParameter:
+      name: userName
+      in: path
+      required: true
+      description: The username.
+      schema:
+        type: string
+        example: johndoe
+    KeyIdPathParameter:
+      name: keyId
+      in: path
+      required: true
+      description: The API key ID.
+      schema:
+        type: string
+        example: aBcDeFgHiJkLmNoPqRsT
+    TransactionId:
+      name: transaction_id
+      in: path
+      required: true
+      schema:
+        type: string
+    SubjectPathParameter:
+      name: subject
+      in: path
+      required: true
+      description: Casbin subject name, such as role:tenant_reader or group:eng.
+      schema:
+        type: string
+        example: role:tenant_reader
   schemas:
     Error:
       type: object
@@ -4277,6 +4955,8 @@ components:
           type: boolean
           description: Indicates whether the cluster is running in single-node swarm mode
           x-omitzero: false
+        secret_store:
+          $ref: '#/components/schemas/SecretStoreStatus'
     SecretStatus:
       type: string
       enum:
@@ -4336,6 +5016,7 @@ components:
         - full_text
         - enrichments
         - aknn
+        - full_index
       default: propose
       description: >
         Synchronization level for batch operations:
@@ -4350,6 +5031,8 @@ components:
 
         - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async
         on timeout, slowest, most durable)
+
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
     ShardConfig:
       type: object
       required:
@@ -4697,13 +5380,19 @@ components:
       type: object
       required:
         - type
-        - field
       properties:
         type:
           $ref: '#/components/schemas/AggregationType'
         field:
           type: string
-          description: Field to aggregate on
+          description: Field to aggregate on. Required unless `fields` is supplied for a multi-field terms
+            aggregation.
+        fields:
+          type: array
+          items:
+            type: string
+          description: Ordered field list for multi-field terms aggregations. Bucket keys are returned
+            as JSON arrays in the same order.
         size:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -4760,14 +5449,15 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
           description: Background filter for significant_terms aggregations
         algorithm:
           x-go-type-skip-optional-pointer: false
           allOf:
             - $ref: '#/components/schemas/SignificanceAlgorithm'
           description: Significance algorithm for significant_terms aggregations
+        algebraic_join:
+          $ref: '#/components/schemas/AlgebraicAggregationJoin'
+          description: Algebraic join descriptor for bounded cross-table aggregation planning
         sub_aggregations:
           type: object
           additionalProperties:
@@ -5052,8 +5742,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
           description: >
             Bleve query to filter documents. Only documents matching this query
 
@@ -5725,6 +6413,34 @@ components:
             - content
             - status
             - published_at
+        mode:
+          type: string
+          description: >
+            Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`,
+
+            `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for
+
+            forward compatibility and may fall back to `auto`.
+          example: auto
+        output:
+          type: string
+          description: >
+            Preferred output artifact. Suggested values are `query_request`, `bleve`, and
+
+            `filter_query`. The compatibility `query` field is still returned for existing clients.
+          example: query_request
+        constraints:
+          type: object
+          additionalProperties: true
+          description: >
+            Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`,
+
+            `prefer_indexes`, and `require_executable`.
+          example:
+            limit: 10
+            require_executable: true
+            prefer_indexes:
+              - body_embedding
         generator:
           $ref: '#/components/schemas/GeneratorConfig'
     QueryBuilderResult:
@@ -5773,6 +6489,29 @@ components:
                 field: content
               - term: published
                 field: status
+        query_request:
+          $ref: '#/components/schemas/QueryRequest'
+          description: >
+            Antfly query request assembled by the coordinator. New clients should prefer this
+
+            field when they want an executable Antfly query object.
+        retrieval_query_request:
+          $ref: '#/components/schemas/RetrievalQueryRequest'
+          description: >
+            Antfly retrieval query assembled by the coordinator when the requested artifact
+
+            needs retrieval-only features such as tree_search. This is additive to
+
+            query_request for clients that execute through the retrieval agent pipeline.
+        specialist:
+          type: string
+          description: Specialist or strategy used to build the query, such as `full_text`, `filter`,
+            or `hybrid`.
+          example: full_text
+        plan:
+          type: object
+          additionalProperties: true
+          description: Optional machine-readable coordination plan for observability.
         explanation:
           type: string
           description: Human-readable explanation of what the query does and why it was structured this
@@ -6617,12 +7356,45 @@ components:
           type: string
           description: Name of the table to query. Optional for global queries.
           example: wikipedia
+        query:
+          x-go-type: json.RawMessage
+          type: object
+          additionalProperties: true
+          description: >
+            Canonical public query AST. Prefer this field for new clients.
+
+
+            Boolean clauses are normalized before planning:
+
+            - `bool.must` is scoring query input.
+
+            - `bool.filter` is a non-scoring structured filter.
+
+            - `bool.must_not` is a structured exclusion filter.
+
+
+            The same AST accepts direct structured filters using `field` or JSON-pointer
+
+            `path`, scalar `term` values, multi-value `terms`, and `exists`.
+
+            Query-string objects remain supported as a full-text escape hatch.
+          example:
+            bool:
+              must:
+                - match:
+                    field: body
+                    text: computer
+              filter:
+                - term:
+                    path: /tenant
+                    value: acme
+              must_not:
+                - exists:
+                    path: /deleted_at
         full_text_search:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
               type: object
               additionalProperties: true
           description: >
@@ -6722,8 +7494,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
           description: >
             Bleve query applied as an AND condition. Documents must match both the main query
 
@@ -6747,8 +7517,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
           description: >
             Bleve query applied as a NOT condition. Documents matching this query are excluded
 
@@ -7358,8 +8126,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
           description: Bleve query to filter rows before joining.
         filter_prefix:
           type: string
@@ -8259,8 +9025,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
           description: >
             Bleve-style filter query that gets translated to SQL and applied as a
 
@@ -8305,6 +9069,16 @@ components:
               where:
                 term: free
                 field: tier
+        require_exact_cutover:
+          type: boolean
+          description: >
+            When true, indicates this source was reseeded with exact cutover mode
+
+            and must replay from a consistent snapshot before streaming.
+        status:
+          $ref: '#/components/schemas/ReplicationSourceStatus'
+        action_hint:
+          $ref: '#/components/schemas/ReplicationSourceActionHint'
     ReplicationRoute:
       type: object
       required:
@@ -8321,8 +9095,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-              x-go-type-import:
-                path: encoding/json
           description: >
             Bleve-style filter query evaluated against each CDC row. Only rows
 
@@ -11128,22 +11900,36 @@ components:
         Configuration for the AWS Bedrock embedding provider.
 
 
-        Uses AWS credentials from environment or IAM roles.
+        Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task
+        roles, and EC2 instance roles.
 
 
-        **Example Models:** cohere.embed-english-v4, amazon.titan-embed-text-v2:0
+        **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
 
 
         **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
       properties:
         model:
           type: string
-          description: The Bedrock model ID to use (e.g., 'cohere.embed-english-v4', 'amazon.titan-embed-text-v2:0').
-          example: cohere.embed-english-v4
+          description: The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+          example: cohere.embed-v4
         region:
           type: string
           description: The AWS region for the Bedrock service (e.g., 'us-east-1').
           example: us-east-1
+        dimension:
+          type: integer
+          description: Output dimension for Bedrock embedding models that support configurable dimensions.
+        dimensions:
+          type: integer
+          description: Alias for output dimension when using OpenAI-compatible configuration fields.
+        input_type:
+          type: string
+          description: Cohere Bedrock input type, such as search_document, search_query, classification,
+            or clustering.
+        truncate:
+          type: string
+          description: Cohere Bedrock truncate behavior.
         strip_new_lines:
           type: boolean
           description: Whether to strip new lines from the input text before embedding.
@@ -11156,7 +11942,7 @@ components:
         - model
       example:
         provider: bedrock
-        model: cohere.embed-english-v4
+        model: cohere.embed-v4
         region: us-east-1
     CohereEmbedderConfig:
       type: object
@@ -12411,6 +13197,15 @@ components:
           format: byte
           description: Base64 encoded password hash. Exposing this is a security risk.
           example: JGFyZ29uMm...
+        metadata:
+          type: object
+          additionalProperties: {}
+          nullable: true
+          description: Server-side auth metadata available to stored row-filter policies through $auth
+            metadata paths.
+          example:
+            tenant_id: acme
+            department: eng
       required:
         - username
         - password_hash
@@ -12463,6 +13258,13 @@ components:
             $ref: '#/components/schemas/Permission'
           nullable: true
           description: Optional list of initial permissions for the user.
+        metadata:
+          type: object
+          additionalProperties: {}
+          nullable: true
+          description: Auth metadata available to stored row-filter policies.
+          example:
+            tenant_id: acme
       required:
         - password
     UpdatePasswordRequest:
@@ -12507,8 +13309,9 @@ components:
           additionalProperties: {}
           nullable: true
           description: >
-            Per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query
-            JSON objects. Documents must match this query to be visible through this API key.
+            Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve
+            query JSON objects. API keys inherit the owner's effective row filters; key-local filters
+            are applied as additional narrowing.
         created_at:
           type: string
           format: date-time
@@ -12582,8 +13385,9 @@ components:
           additionalProperties: {}
           nullable: true
           description: >
-            Per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query
-            JSON objects. Documents must match this query to be visible through this API key.
+            Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve
+            query JSON objects. API keys inherit the owner's effective row filters; key-local filters
+            are applied as additional narrowing.
       required:
         - name
     MultiMatchBody:
@@ -12613,6 +13417,368 @@ components:
           $ref: '#/components/schemas/MultiMatchBody'
       required:
         - multi_match
+    SecretStoreStatus:
+      type: object
+      description: Non-secret status for the local secrets file store, when one is available.
+      properties:
+        stale:
+          type: boolean
+          description: Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
+          x-omitzero: false
+    AlgebraicAggregationJoin:
+      type: object
+      required:
+        - name
+        - group_side
+        - measure_side
+      properties:
+        name:
+          type: string
+          description: Algebraic join materialization or capability name
+        kind:
+          type: string
+          enum:
+            - none
+            - bucket
+            - window
+            - bucket_window
+          x-go-type-skip-optional-pointer: false
+          description: Temporal join mode for the algebraic materialization
+        group_side:
+          type: string
+          description: Join side that supplies grouping bucket values
+        measure_side:
+          type: string
+          description: Join side that supplies metric values
+    TransactionBeginRequest:
+      type: object
+      properties:
+        sync_level:
+          $ref: '#/components/schemas/SyncLevel'
+    TransactionBeginResponse:
+      type: object
+      required:
+        - transaction_id
+        - begin_timestamp
+        - sync_level
+      properties:
+        transaction_id:
+          type: string
+        begin_timestamp:
+          type: integer
+          format: int64
+        sync_level:
+          type: string
+    TransactionStatusResponse:
+      type: object
+      required:
+        - status
+        - transaction_id
+      properties:
+        status:
+          type: string
+        transaction_id:
+          type: string
+    TransactionSavepointResponse:
+      type: object
+      required:
+        - status
+        - transaction_id
+        - savepoint_id
+      properties:
+        status:
+          type: string
+        transaction_id:
+          type: string
+        savepoint_id:
+          type: integer
+          format: int64
+    TransactionStageReadRequest:
+      type: object
+      required:
+        - table
+        - key
+        - version
+      properties:
+        table:
+          type: string
+        key:
+          type: string
+        version:
+          type: string
+    TransactionStageWriteRequest:
+      type: object
+      required:
+        - table
+        - key
+        - document
+      properties:
+        table:
+          type: string
+        key:
+          type: string
+        document:
+          type: object
+          additionalProperties: true
+    TransactionStageDeleteRequest:
+      type: object
+      required:
+        - table
+        - key
+      properties:
+        table:
+          type: string
+        key:
+          type: string
+    TransactionStageReadSnapshot:
+      type: object
+      required:
+        - table
+        - key
+        - version
+        - document
+      properties:
+        table:
+          type: string
+        key:
+          type: string
+        version:
+          type: string
+        document:
+          nullable: true
+    TransactionStageReadResponse:
+      type: object
+      required:
+        - status
+        - transaction_id
+        - snapshot
+      properties:
+        status:
+          type: string
+        transaction_id:
+          type: string
+        snapshot:
+          $ref: '#/components/schemas/TransactionStageReadSnapshot'
+    TransactionSessionCommitResponse:
+      allOf:
+        - $ref: '#/components/schemas/TransactionCommitResponse'
+        - type: object
+          required:
+            - transaction_id
+          properties:
+            transaction_id:
+              type: string
+    TransactionSessionStatus:
+      type: object
+      required:
+        - transaction_id
+        - owner_node_id
+        - begin_timestamp
+        - last_touched_timestamp
+        - lease_expires_at
+        - lease_state
+        - sync_level
+        - staged_table_count
+        - staged_read_count
+        - staged_write_count
+        - staged_delete_count
+        - read_snapshot_count
+        - savepoint_count
+        - durable
+      properties:
+        transaction_id:
+          type: string
+        owner_node_id:
+          type: integer
+          format: int64
+        begin_timestamp:
+          type: integer
+          format: int64
+        last_touched_timestamp:
+          type: integer
+          format: int64
+        lease_expires_at:
+          type: integer
+          format: int64
+        lease_state:
+          type: string
+        sync_level:
+          type: string
+        staged_table_count:
+          type: integer
+        staged_read_count:
+          type: integer
+        staged_write_count:
+          type: integer
+        staged_delete_count:
+          type: integer
+        read_snapshot_count:
+          type: integer
+        savepoint_count:
+          type: integer
+        savepoint_limit:
+          type: integer
+          nullable: true
+        remaining_savepoints:
+          type: integer
+          nullable: true
+        durable:
+          type: boolean
+    TransactionSessionTableDetail:
+      type: object
+      properties:
+        table:
+          type: string
+        staged_read_count:
+          type: integer
+        staged_write_count:
+          type: integer
+        staged_delete_count:
+          type: integer
+        staged_predicate_count:
+          type: integer
+    TransactionSessionReadSnapshot:
+      type: object
+      properties:
+        table:
+          type: string
+        key:
+          type: string
+        version:
+          type: integer
+          format: int64
+        document:
+          nullable: true
+    TransactionSessionDetailsResponse:
+      allOf:
+        - $ref: '#/components/schemas/TransactionSessionStatus'
+        - type: object
+          properties:
+            tables:
+              type: array
+              items:
+                $ref: '#/components/schemas/TransactionSessionTableDetail'
+            read_snapshots:
+              type: array
+              items:
+                $ref: '#/components/schemas/TransactionSessionReadSnapshot'
+            savepoint_ids:
+              type: array
+              items:
+                type: integer
+                format: int64
+    TransactionSessionListResponse:
+      type: object
+      properties:
+        session_count:
+          type: integer
+        lease_held_count:
+          type: integer
+        lease_expired_count:
+          type: integer
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionSessionStatus'
+    TransactionSessionCleanupResponse:
+      type: object
+      properties:
+        removed:
+          type: integer
+        cutoff_ns:
+          type: integer
+          format: int64
+    ReplicationSourceStatus:
+      type: object
+      readOnly: true
+      description: >
+        Runtime status of this replication source. Present only in GET table
+
+        detail responses, not in create/update requests.
+      properties:
+        source_kind:
+          type: string
+        external_table:
+          type: string
+        cutover_mode:
+          type: string
+        slot_name:
+          type: string
+        publication_name:
+          type: string
+        phase:
+          type: string
+        checkpoint:
+          type: string
+        snapshot_offset:
+          type: integer
+        prepared_checkpoint:
+          type: string
+        stream_checkpoint:
+          type: string
+        last_error:
+          type: string
+        failure_class:
+          type: string
+        lag_records:
+          type: integer
+        lag_millis:
+          type: integer
+        consecutive_failures:
+          type: integer
+        last_source_commit_at_ms:
+          type: integer
+        last_success_at_ms:
+          type: integer
+        last_change_applied_at_ms:
+          type: integer
+        updated_at_ms:
+          type: integer
+    ReplicationSourceActionHint:
+      type: object
+      readOnly: true
+      description: >
+        Action hint for this replication source when remediation is recommended.
+
+        Present only in GET table detail responses.
+      properties:
+        action:
+          type: string
+          description: Recommended action (e.g., "reseed_exact_cutover").
+        reason:
+          type: string
+          description: Human-readable reason for the recommendation.
+        reseed_exact_cutover_path:
+          type: string
+          description: API path to trigger a reseed exact cutover, if applicable.
+    RoleAssignment:
+      type: object
+      properties:
+        role:
+          type: string
+          description: 'Role or group subject to assign, usually prefixed with role: or group:.'
+          example: role:tenant_reader
+      required:
+        - role
+    AuthSubject:
+      type: object
+      properties:
+        subject:
+          type: string
+          description: Casbin subject name.
+          example: role:tenant_reader
+        kind:
+          type: string
+          enum:
+            - user
+            - role
+            - group
+            - subject
+          description: Conservative subject classification inferred from user records and subject prefixes.
+          example: role
+      required:
+        - subject
+        - kind
   responses:
     BadRequest:
       description: Bad request
@@ -12644,23 +13810,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-  parameters:
-    UserNamePathParameter:
-      name: userName
-      in: path
-      required: true
-      description: The username.
-      schema:
-        type: string
-        example: johndoe
-    KeyIdPathParameter:
-      name: keyId
-      in: path
-      required: true
-      description: The API key ID.
-      schema:
-        type: string
-        example: aBcDeFgHiJkLmNoPqRsT
+    Conflict:
+      description: Request conflicts with the current resource state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
 x-tagGroups:
   - name: Antfly Public API
     tags:

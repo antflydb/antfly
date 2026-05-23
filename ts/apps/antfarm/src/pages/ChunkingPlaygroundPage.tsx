@@ -23,7 +23,7 @@ import {
   Skeleton,
   Textarea,
 } from "@antfly/design-system";
-import { type Chunk, type ChunkResponse, TermiteClient } from "@antfly/termite-sdk";
+import { type Chunk, type ChunkResponse, TermiteClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Database, Hash, RotateCcw, Scissors, Zap } from "lucide-react";
 import type React from "react";

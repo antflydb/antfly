@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-package client
+package sdk
 
 import (
 	"errors"

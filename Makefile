@@ -5,12 +5,12 @@ ZIG_BUILD_FLAGS ?=
 # Go Version Configuration
 # ====================================================================================
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
-GO := GOEXPERIMENT=simd go
+GO := GOWORK=off GOEXPERIMENT=simd go
 
 # Go modules outside of root
 GO_SUBMODULES := \
-	./e2e \
-	./pkg/client \
+	./go/e2e \
+	./go/pkg/sdk \
 	./pkg/antfly-proxy \
 	./pkg/libaf \
 	./pkg/operator \
@@ -21,7 +21,6 @@ GO_SUBMODULES := \
 	./pkg/genkit/antfly \
 	./pkg/genkit/openrouter \
 	./pkg/termite \
-	./pkg/termite-client \
 	./pkg/termite-proxy
 
 # ====================================================================================
@@ -107,17 +106,18 @@ build-go: build-antfarm generate
 	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
 
 build-docs:
-	uv run --project zig/scripts --locked python scripts/join_openapi.py openapi.yaml
+	uv run --project scripts --locked python scripts/join_openapi.py specs/openapi/antfly/public.yaml
+	uv run --project scripts --locked python scripts/join_public_openapi.py
+	uv run --project scripts --locked python scripts/join_openapi.py openapi.yaml
 
 generate: build-docs tidy
 	$(GO) generate ./...
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Generating in $$mod"; \
-		(cd $$mod && go generate ./...) || exit 1; \
+		(cd $$mod && $(GO) generate ./...) || exit 1; \
 	done
 	cd ts && pnpm --filter @antfly/sdk generate
-	cd ts && pnpm --filter @antfly/termite-sdk generate
-	$(MAKE) -C ./py generate
+	$(MAKE) -C ./py/packages/sdk generate
 
 license-headers: ## Add ELv2 license headers to core files missing them
 	$(GO) run github.com/google/addlicense@latest \
@@ -204,9 +204,9 @@ lint:
 	$(GO) run github.com/Antonboom/testifylint@latest --fix ./...
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Linting $$mod"; \
-		(cd $$mod && go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...) && \
-		(cd $$mod && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...) && \
-		(cd $$mod && go run github.com/Antonboom/testifylint@latest --fix ./...) || exit 1; \
+		(cd $$mod && $(GO) run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...) && \
+		(cd $$mod && $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...) && \
+		(cd $$mod && $(GO) run github.com/Antonboom/testifylint@latest --fix ./...) || exit 1; \
 	done
 	cd ts && pnpm run lint
 
@@ -264,14 +264,14 @@ tidy:
 	$(GO) mod tidy
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Tidying $$mod"; \
-		(cd $$mod && go mod tidy) || exit 1; \
+		(cd $$mod && $(GO) mod tidy) || exit 1; \
 	done
 
 tidy-check:
 	$(GO) mod tidy -diff
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Checking tidy in $$mod"; \
-		(cd $$mod && go mod tidy -diff) || exit 1; \
+		(cd $$mod && $(GO) mod tidy -diff) || exit 1; \
 	done
 
 install-git-hooks:
@@ -282,7 +282,7 @@ update-deps:
 	$(GO) get -u ./...
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Updating deps in $$mod"; \
-		(cd $$mod && go get -u ./...) || exit 1; \
+		(cd $$mod && $(GO) get -u ./...) || exit 1; \
 	done
 	$(MAKE) tidy
 
@@ -355,7 +355,7 @@ endif
 	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
 	export RUN_EVAL_TESTS=true && \
 	export E2E_PROVIDER=termite && \
-	cd e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
+	cd go/e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
 
 
 # ====================================================================================
@@ -518,10 +518,10 @@ termite-lint: ## Run linter on termite
 	(cd ./pkg/termite && $(GO) vet ./...)
 
 termite-client-test: ## Run termite-client tests
-	(cd ./pkg/termite-client && $(GO) test ./...)
+	(cd ./go/pkg/sdk && $(GO) test ./...)
 
 termite-client-lint: ## Run linter on termite-client
-	(cd ./pkg/termite-client && $(GO) vet ./...)
+	(cd ./go/pkg/sdk && $(GO) vet ./...)
 
 
 # ====================================================================================

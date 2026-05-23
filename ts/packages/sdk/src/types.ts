@@ -3,7 +3,7 @@
  * Re-exports commonly used types from the generated OpenAPI types
  */
 
-import type { components, operations } from "./antfly-api.js";
+import type { components, operations } from "./public-api.js";
 import type { components as BleveComponents } from "./bleve-query.js";
 
 // Bleve Query type for type-safe query construction

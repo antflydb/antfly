@@ -21,7 +21,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 )
 

@@ -22,7 +22,7 @@ import {
   Separator,
   Textarea,
 } from "@antfly/design-system";
-import { type Chunk, type ChunkResponse, TermiteClient } from "@antfly/termite-sdk";
+import { type Chunk, type ChunkResponse, TermiteClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ClipboardCopy,

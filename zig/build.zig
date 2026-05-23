@@ -82,7 +82,7 @@ fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const
         "uv",
         "run",
         "--project",
-        "scripts",
+        "../scripts",
         "--locked",
         "python",
     });
@@ -678,7 +678,7 @@ fn addOpenApiModuleFromYamlPath(
     _ = target;
     _ = optimize;
 
-    const convert = addScriptsPythonCommand(b, "scripts/yaml_to_json.py", &.{});
+    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
     const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
 
@@ -724,13 +724,13 @@ fn addYamlOpenApiModule(
 }
 
 fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
-    const check = addScriptsPythonCommand(b, "scripts/join_openapi.py", &.{"--compare"});
+    const check = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--compare"});
     check.addFileArg(b.path("openapi.yaml"));
     return check;
 }
 
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
-    const join = addScriptsPythonCommand(b, "scripts/join_openapi.py", &.{"--joined-only"});
+    const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
     return join.addOutputFileArg("openapi.public.joined.yaml");
 }
 
@@ -806,7 +806,7 @@ fn addOpenApiModuleWithHttpxFromYamlPath(
     _ = target;
     _ = optimize;
 
-    const convert = addScriptsPythonCommand(b, "scripts/yaml_to_json.py", &.{});
+    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
     const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
 
@@ -891,7 +891,7 @@ fn addOpenApiRegenRun(
     generate_what: []const u8,
     import_mappings: []const [2][]const u8,
 ) *std.Build.Step.Run {
-    const convert = addScriptsPythonCommand(b, "scripts/yaml_to_json.py", &.{});
+    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
     const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{package_name}));
 
@@ -948,16 +948,16 @@ fn addOpenApiRegenStep(
             .{ "../../../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../bleve-query-openapi.yaml"), "antfly_bleve_query_openapi", antfly_generated_root ++ "/antfly_bleve_query_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("pkg/antfly/src/usermgr/openapi.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("pkg/antfly/src/metadata/openapi.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
-            .{ "../usermgr/openapi.yaml", "antfly_usermgr_openapi" },
-            .{ "../../antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../../antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "../../antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "../../antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "../../antfly/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../../antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../../antfly/bleve-query-openapi.yaml", "antfly_bleve_query_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/usermgr.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
+            .{ "usermgr.yaml", "antfly_usermgr_openapi" },
+            .{ "../../../src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "../../../lib/schema/openapi.yaml", "antfly_schema_openapi" },
+            .{ "../../../lib/ai/openapi.yaml", "antfly_ai_openapi" },
+            .{ "../../../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
+            .{ "../../../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "../../../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "../../../bleve-query-openapi.yaml", "antfly_bleve_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../pkg/libaf/logging/openapi.yaml"), "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../lib/audio/openapi.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
@@ -995,7 +995,7 @@ fn addOpenApiRegenStep(
             .{ "../../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../websearch/openapi.yaml", "antfly_websearch_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("pkg/termite/src/api/openapi.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
     };
 

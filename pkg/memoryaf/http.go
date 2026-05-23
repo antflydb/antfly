@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/antflydb/antfly/pkg/client/query"
+	"github.com/antflydb/antfly/go/pkg/sdk/query"
 )
 
 const (

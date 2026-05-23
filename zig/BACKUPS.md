@@ -20,7 +20,7 @@ The public contract target is the finished Go implementation:
   - `/backups`
   - `/tables/{tableName}/backup`
   - `/tables/{tableName}/restore`
-- [../antfly/e2e/backup_restore_test.go](/Users/ajroetker/go/src/github.com/antflydb/antfly/e2e/backup_restore_test.go)
+- [../antfly/go/e2e/backup_restore_test.go](/Users/ajroetker/go/src/github.com/antflydb/antfly/go/e2e/backup_restore_test.go)
 
 ## Current State
 

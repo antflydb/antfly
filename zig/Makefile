@@ -3,7 +3,7 @@ SHELL := /bin/bash
 ZIG ?= zig
 ZIG_BUILD_FLAGS ?=
 UV ?= uv
-SCRIPTS_PY := $(UV) run --project scripts --locked python
+SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 TERMITE_BIN ?= ./pkg/termite/zig-out/bin/termite
 
 # ====================================================================================
@@ -59,13 +59,15 @@ generate: openapi-generate snowball-generate ## Regenerate checked-in generated 
 generated-check: openapi-check snowball-check ## Check all checked-in generated sources are current.
 
 openapi-generate:
-	$(SCRIPTS_PY) scripts/join_openapi.py openapi.yaml
+	$(SCRIPTS_PY) ../scripts/join_openapi.py ../specs/openapi/antfly/public.yaml
+	$(SCRIPTS_PY) ../scripts/join_openapi.py openapi.yaml
 	$(ZIG) build regen-openapi
 
 openapi-check:
-	$(SCRIPTS_PY) scripts/join_openapi.py --compare openapi.yaml
+	$(SCRIPTS_PY) ../scripts/join_openapi.py --compare ../specs/openapi/antfly/public.yaml
+	$(SCRIPTS_PY) ../scripts/join_openapi.py --compare openapi.yaml
 	$(ZIG) build regen-openapi
-	test -z "$$(git status --porcelain -- openapi.yaml pkg/antfly/src/openapi/generated pkg/termite/src/api/generated)"
+	test -z "$$(git status --porcelain -- ../specs/openapi/antfly/public.yaml openapi.yaml pkg/antfly/src/openapi/generated pkg/termite/src/api/generated)"
 
 snowball-generate:
 	$(ZIG) build regen-snowball
@@ -74,40 +76,40 @@ snowball-check:
 	$(ZIG) build check-snowball
 
 license-headers: ## Add license headers to first-party source files.
-	$(SCRIPTS_PY) scripts/license_headers.py
+	$(SCRIPTS_PY) ../scripts/license_headers.py
 
 license-check: ## Check first-party source files have license headers.
-	$(SCRIPTS_PY) scripts/license_headers.py --check
+	$(SCRIPTS_PY) ../scripts/license_headers.py --check
 
 tla-tools:
-	@bash scripts/tla-tools.sh
+	@bash ../scripts/tla-tools.sh
 
 tla-check: tla-check-txn tla-check-split tla-check-snap tla-check-lsm
 
 tla-check-txn: tla-tools
 	@echo "==> Model checking transaction spec..."
-	source scripts/tla-tools.sh && \
+	source ../scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflyTransaction.cfg specs/tla/MC.tla \
 	  -workers auto -deadlock
 
 tla-check-split: tla-tools
 	@echo "==> Model checking shard split spec..."
-	source scripts/tla-tools.sh && \
+	source ../scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflyShardSplit.cfg specs/tla/ShardSplitMC.tla \
 	  -workers auto -deadlock
 
 tla-check-snap: tla-tools
 	@echo "==> Model checking snapshot transfer spec (safety only, ~90s)..."
-	source scripts/tla-tools.sh && \
+	source ../scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \
 	  -workers auto -deadlock
 
 tla-check-lsm: tla-tools
 	@echo "==> Model checking LSM lifecycle OOM safety..."
-	source scripts/tla-tools.sh && \
+	source ../scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflyLsmLifecycle.cfg specs/tla/AntflyLsmLifecycle.tla \
 	  -workers auto -deadlock
@@ -120,11 +122,11 @@ endif
 	segdir=$$(mktemp -d); \
 	trap 'rm -rf "$$segdir"' EXIT; \
 	for f in $(TRACE_FILES); do \
-	  python3 scripts/tla-segment-raft-trace.py "$$f" "$$segdir"; \
+	  python3 ../scripts/tla-segment-raft-trace.py "$$f" "$$segdir"; \
 	done; \
 	segments=$$(find "$$segdir" -name '*.ndjson' -size +0c | sort); \
 	if [ -n "$$segments" ]; then \
-	  bash scripts/tla-validate-trace.sh -S \
+	  bash ../scripts/tla-validate-trace.sh -S \
 	    -s specs/tla/Traceetcdraft.tla \
 	    -c specs/tla/Traceetcdraft.cfg \
 	    $$segments; \
@@ -144,9 +146,9 @@ endif
 	for f in $(TRACE_FILES); do \
 	  filtered=$$(mktemp); \
 	  tmpfiles="$$tmpfiles $$filtered"; \
-	  python3 scripts/tla-filter-txn-trace.py < "$$f" > "$$filtered"; \
+	  python3 ../scripts/tla-filter-txn-trace.py < "$$f" > "$$filtered"; \
 	  if [ -s "$$filtered" ]; then \
-	    bash scripts/tla-validate-trace.sh -S \
+	    bash ../scripts/tla-validate-trace.sh -S \
 	      -s specs/tla/TraceAntflyTransaction.tla \
 	      -c specs/tla/TraceAntflyTransaction.cfg \
 	      "$$filtered"; \

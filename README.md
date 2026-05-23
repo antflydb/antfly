@@ -48,9 +48,9 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 
 | Language | Package | Source |
 |----------|---------|--------|
-| Go | `github.com/antflydb/antfly/pkg/client` | [`pkg/client`](pkg/client) |
-| TypeScript | `@antfly/sdk` | [`ts/packages/sdk`](ts/packages/sdk) |
-| Python | `antfly` | [`py/`](py/) |
+| Go | `github.com/antflydb/antfly/go/pkg/sdk/antfly` | [`go/pkg/sdk/antfly`](go/pkg/sdk/antfly) |
+| TypeScript | `@antfly/sdk` | [`ts/sdk/antfly`](ts/sdk/antfly) |
+| Python | `antfly` | [`py/sdk/antfly`](py/sdk/antfly) |
 | React | `@antfly/components` | [`ts/packages/components`](ts/packages/components) |
 | PostgreSQL | `pgaf` extension | [`rs/pgaf`](rs/pgaf) |
 
@@ -88,7 +88,7 @@ Antfly uses a multi-raft design with separate consensus groups:
 - **Metadata raft** — table schemas, shard assignments, cluster topology
 - **Storage rafts** — one per shard, handling data, indexes, and queries
 
-End-to-end [chaos tests](e2e/) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
+End-to-end [chaos tests](go/e2e/) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
 
 Critical distributed protocols are formally specified and model-checked with [TLA+](specs/tla):
 
@@ -105,4 +105,4 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. Everything else — the [SDKs](pkg/client), [React components](ts/packages/components), [Termite](termite/), [pgaf](rs/pgaf), [docsaf](pkg/docsaf), [evalaf](pkg/evalaf) — is Apache 2.0. We tried to keep as much as possible under a permissive license.
+The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. Everything else — the [SDKs](go/pkg/sdk/antfly), [React components](ts/packages/components), [Termite](pkg/termite), [pgaf](rs/pgaf), [docsaf](pkg/docsaf), [evalaf](pkg/evalaf) — is Apache 2.0. We tried to keep as much as possible under a permissive license.

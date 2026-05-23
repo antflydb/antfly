@@ -28,7 +28,7 @@ import (
 	"time"
 
 	"github.com/ajroetker/pdf"
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/pkg/docsaf"
 	generatingreading "github.com/antflydb/antfly/pkg/generating/reading"
 	libai "github.com/antflydb/antfly/pkg/libaf/ai"

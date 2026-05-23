@@ -11,7 +11,7 @@ import (
 
 	"github.com/antflydb/antfly/pkg/docsaf"
 	docsafentity "github.com/antflydb/antfly/pkg/docsaf/entity"
-	termiteclient "github.com/antflydb/antfly/pkg/termite-client"
+	termiteclient "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 const defaultTermiteURL = "http://localhost:8088"

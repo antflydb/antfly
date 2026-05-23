@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"net/http"
 
+	client "github.com/antflydb/antfly/go/pkg/sdk"
 	libtermite "github.com/antflydb/antfly/lib/termite"
-	"github.com/antflydb/antfly/pkg/termite-client"
 )
 
 func init() {
@@ -90,10 +90,13 @@ func (s *TermiteSTT) Transcribe(ctx context.Context, req TranscribeRequest) (*Tr
 	if err != nil {
 		return nil, fmt.Errorf("transcribing: %w", err)
 	}
+	if len(resp.Data) == 0 {
+		return &TranscribeResponse{}, nil
+	}
 
 	return &TranscribeResponse{
-		Text:     resp.Text,
-		Language: resp.Language,
+		Text:     resp.Data[0].Text,
+		Language: resp.Data[0].Language,
 	}, nil
 }
 

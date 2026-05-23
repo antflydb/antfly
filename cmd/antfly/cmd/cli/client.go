@@ -32,9 +32,9 @@ import (
 	"text/template"
 	"time"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/client/admin"
-	"github.com/antflydb/antfly/pkg/client/query"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/admin"
+	"github.com/antflydb/antfly/go/pkg/sdk/query"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 	blevequery "github.com/blevesearch/bleve/v2/search/query"
 	"github.com/cespare/xxhash/v2"

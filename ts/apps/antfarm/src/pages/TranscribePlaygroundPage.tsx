@@ -21,7 +21,7 @@ import {
   SelectValue,
   Switch,
 } from "@antfly/design-system";
-import { TermiteClient } from "@antfly/termite-sdk";
+import { TermiteClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   AudioLines,

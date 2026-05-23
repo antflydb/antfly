@@ -21,7 +21,7 @@ import {
   SelectValue,
   Textarea,
 } from "@antfly/design-system";
-import { type EmbedResponse, TermiteClient } from "@antfly/termite-sdk";
+import { type EmbedResponse, TermiteClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,

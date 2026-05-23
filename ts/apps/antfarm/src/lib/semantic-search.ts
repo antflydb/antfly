@@ -3,7 +3,7 @@
  * Uses pre-computed embeddings and Termite's /api/embed for query embedding.
  */
 
-import type { TermiteClient } from "@antfly/termite-sdk";
+import type { TermiteClient } from "@antfly/sdk";
 import commandIndex from "@/data/command-index.json";
 
 export interface CommandItem {

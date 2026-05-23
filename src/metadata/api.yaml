@@ -67,7 +67,7 @@ tags:
 
       Antfly provides auto-generated SDKs from the OpenAPI specification:
 
-      - **Go**: `github.com/antflydb/antfly/pkg/client`
+      - **Go**: `github.com/antflydb/antfly/go/pkg/sdk/antfly`
       - **TypeScript**: `@antflydb/antfly-ts` (npm)
       - **Python**: `antfly-python` (PyPI)
 

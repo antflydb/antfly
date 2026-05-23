@@ -12,7 +12,7 @@ import (
 	"time"
 
 	exampleentity "github.com/antflydb/antfly/examples/docsaf/entity"
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/pkg/docsaf"
 )
 

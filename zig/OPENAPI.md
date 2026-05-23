@@ -28,10 +28,11 @@ zig build regen-openapi
 
 Repo-local specs:
 
-- `openapi.yaml`: bundled public Antfly API spec
-- `pkg/antfly/src/metadata/openapi.yaml`: Antfly metadata/table API
-- `pkg/antfly/src/usermgr/openapi.yaml`: Antfly user-management API
-- `pkg/termite/src/api/openapi.yaml`: Termite public API
+- `../specs/openapi/antfly/public.yaml`: bundled public Antfly API spec
+- `../specs/openapi/antfly/metadata.yaml`: Antfly metadata/table API
+- `../specs/openapi/antfly/usermgr.yaml`: Antfly user-management API
+- `../specs/openapi/termite/api.yaml`: Termite public API
+- `openapi.yaml`: compatibility copy of the bundled public Antfly API spec
 - `specs/openai-openapi.yaml`: vendored OpenAI API schema used for types
 
 Some shared provider/config schemas are still read from the sibling
@@ -73,7 +74,7 @@ default. For experiments, the old dynamic codegen path remains available:
 
 ```sh
 cd pkg/termite
-zig build -Dtermite-openapi-spec=src/api/openapi.yaml
+zig build -Dtermite-openapi-spec=../../../specs/openapi/termite/api.yaml
 ```
 
 ## Updating An API

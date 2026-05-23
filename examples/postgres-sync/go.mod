@@ -3,12 +3,12 @@ module github.com/antflydb/antfly/examples/postgres-sync
 go 1.26
 
 replace (
-	github.com/antflydb/antfly/pkg/client => ../../pkg/client
+	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
 	github.com/antflydb/antfly/pkg/libaf => ../../pkg/libaf
 )
 
 require (
-	github.com/antflydb/antfly/pkg/client v0.0.0-20260207183149-045031239f8a
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260207183149-045031239f8a
 	github.com/jackc/pgx/v5 v5.9.2
 )
 

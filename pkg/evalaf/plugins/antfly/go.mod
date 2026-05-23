@@ -3,7 +3,7 @@ module github.com/antflydb/antfly/pkg/evalaf/plugins/antfly
 go 1.26
 
 require (
-	github.com/antflydb/antfly/pkg/client v0.0.1
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
 	github.com/antflydb/antfly/pkg/evalaf v0.0.0
 	github.com/firebase/genkit/go v1.5.0
 )
@@ -54,7 +54,7 @@ require (
 )
 
 replace (
-	github.com/antflydb/antfly/pkg/client => ../../../client
+	github.com/antflydb/antfly/go/pkg/sdk => ../../../../go/pkg/sdk
 	github.com/antflydb/antfly/pkg/evalaf => ../..
 	github.com/antflydb/antfly/pkg/libaf => ../../../libaf
 )

@@ -5,12 +5,12 @@ on:
     branches: [main]
     paths:
       - 'openapi.yaml'
+      - 'specs/openapi/**'
       - 'CHANGELOG.md'
       - 'examples/**'
       - 'docs/**'
       - 'src/common/openapi.yaml'
       - 'pkg/operator/docs/**'
-      - 'pkg/termite/openapi.yaml'
       - 'pkg/termite/registry/index.json'
 
 jobs:

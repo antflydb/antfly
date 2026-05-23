@@ -20,7 +20,7 @@ import (
 	"os"
 	"strings"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/spf13/cobra"
 )
 

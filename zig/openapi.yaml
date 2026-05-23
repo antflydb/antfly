@@ -125,7 +125,7 @@ tags:
     Antfly provides auto-generated SDKs from the OpenAPI specification:
 
 
-    - **Go**: `github.com/antflydb/antfly/pkg/client`
+    - **Go**: `github.com/antflydb/antfly/go/pkg/sdk`
 
     - **TypeScript**: `@antflydb/antfly-ts` (npm)
 
@@ -1054,19 +1054,20 @@ components:
             '
     AntflyType:
       type: string
+      description: Field type annotations for schema fields
       enum:
-      - search_as_you_type
-      - keyword
       - text
       - html
+      - keyword
       - numeric
-      - datetime
       - boolean
-      - link
+      - datetime
       - geopoint
       - geoshape
       - embedding
       - blob
+      - link
+      - search_as_you_type
     Table:
       type: object
       required:
@@ -1353,8 +1354,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
           description: Background filter for significant_terms aggregations
         algorithm:
           x-go-type-skip-optional-pointer: false
@@ -1661,8 +1660,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
           description: 'Bleve query to filter documents. Only documents matching this
             query
 
@@ -3660,8 +3657,6 @@ components:
           example: wikipedia
         query:
           x-go-type: json.RawMessage
-          x-go-type-import:
-            path: encoding/json
           type: object
           additionalProperties: true
           description: 'Canonical public query AST. Prefer this field for new clients.
@@ -3700,8 +3695,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
             type: object
             additionalProperties: true
           description: 'Bleve query for full-text search. Supports all Bleve query
@@ -3817,8 +3810,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
           description: 'Bleve query applied as an AND condition. Documents must match
             both the main query
 
@@ -3844,8 +3835,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
           description: 'Bleve query applied as a NOT condition. Documents matching
             this query are excluded
 
@@ -4301,8 +4290,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
           description: Bleve query to filter rows before joining.
         filter_prefix:
           type: string
@@ -5242,8 +5229,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
           description: 'Bleve-style filter query that gets translated to SQL and applied
             as a
 
@@ -5388,8 +5373,6 @@ components:
           allOf:
           - $ref: '#/components/schemas/Query'
           - x-go-type: json.RawMessage
-            x-go-type-import:
-              path: encoding/json
           description: 'Bleve-style filter query evaluated against each CDC row. Only
             rows
 
@@ -5934,23 +5917,38 @@ components:
       description: 'Configuration for the AWS Bedrock embedding provider.
 
 
-        Uses AWS credentials from environment or IAM roles.
+        Uses the AWS credential chain: environment variables, web identity, shared
+        credentials, ECS task roles, and EC2 instance roles.
 
 
-        **Example Models:** cohere.embed-english-v4, amazon.titan-embed-text-v2:0
+        **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
 
 
         **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html'
       properties:
         model:
           type: string
-          description: The Bedrock model ID to use (e.g., 'cohere.embed-english-v4',
-            'amazon.titan-embed-text-v2:0').
-          example: cohere.embed-english-v4
+          description: The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+          example: cohere.embed-v4
         region:
           type: string
           description: The AWS region for the Bedrock service (e.g., 'us-east-1').
           example: us-east-1
+        dimension:
+          type: integer
+          description: Output dimension for Bedrock embedding models that support
+            configurable dimensions.
+        dimensions:
+          type: integer
+          description: Alias for output dimension when using OpenAI-compatible configuration
+            fields.
+        input_type:
+          type: string
+          description: Cohere Bedrock input type, such as search_document, search_query,
+            classification, or clustering.
+        truncate:
+          type: string
+          description: Cohere Bedrock truncate behavior.
         strip_new_lines:
           type: boolean
           description: Whether to strip new lines from the input text before embedding.
@@ -5963,7 +5961,7 @@ components:
       - model
       example:
         provider: bedrock
-        model: cohere.embed-english-v4
+        model: cohere.embed-v4
         region: us-east-1
     CohereEmbedderConfig:
       type: object
@@ -7026,28 +7024,12 @@ components:
             This is used to infer indexing rules and field types.
 
             '
-    schemas-AntflyType:
-      type: string
-      description: Field type annotations for schema fields
-      enum:
-      - text
-      - html
-      - keyword
-      - numeric
-      - boolean
-      - datetime
-      - geopoint
-      - geoshape
-      - embedding
-      - blob
-      - link
-      - search_as_you_type
     TemplateFieldMapping:
       type: object
       description: Field mapping to apply when a dynamic template matches
       properties:
         type:
-          $ref: '#/components/schemas/schemas-AntflyType'
+          $ref: '#/components/schemas/AntflyType'
         analyzer:
           type: string
           description: 'Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer").
@@ -9724,6 +9706,12 @@ components:
             $ref: '#/components/schemas/Error'
     NotFound:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Request conflicts with the current resource state
       content:
         application/json:
           schema:

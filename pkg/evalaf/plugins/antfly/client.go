@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/pkg/evalaf/eval"
 )
 

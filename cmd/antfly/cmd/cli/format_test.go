@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 func TestFormatTable(t *testing.T) {

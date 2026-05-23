@@ -3,7 +3,7 @@ package memoryaf
 import (
 	"context"
 
-	"github.com/antflydb/antfly/pkg/client"
+	client "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 // Client is the minimal Antfly client interface required by memoryaf.

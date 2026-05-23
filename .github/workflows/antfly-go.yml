@@ -83,6 +83,9 @@ jobs:
           go-version: "1.26"
           cache: false
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
       - name: Set Go experiment
         run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
 
@@ -99,6 +102,19 @@ jobs:
 
       - name: Verify Go modules
         run: go mod download
+
+      - name: Verify generated OpenAPI clients
+        run: |
+          make build-docs
+          (cd go/pkg/sdk && GOWORK=off go generate ./...)
+          status="$(git status --porcelain -- \
+            openapi.yaml \
+            specs/openapi/public.yaml \
+            go/pkg/sdk/oapi/client.gen.go)"
+          if [ -n "$status" ]; then
+            echo "$status"
+            exit 1
+          fi
 
       - name: Build Antfly
         run: go build -v -o antfly ./cmd/antfly
@@ -160,7 +176,7 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: |
-          for mod in pkg/termite pkg/termite-client; do
+          for mod in pkg/termite go/pkg/sdk; do
             (cd $mod && GOWORK=off go build -v ./...)
           done
 
@@ -168,7 +184,7 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: |
-          for mod in pkg/termite pkg/termite-client; do
+          for mod in pkg/termite go/pkg/sdk; do
             (cd $mod && GOWORK=off go test -v ./...)
           done
 

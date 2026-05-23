@@ -161,7 +161,7 @@ curl http://localhost:8080/api/models
 - `src/pipelines/generation.zig`
 - `src/pipelines/onnx_decoder_only_vlm.zig`
 - `src/server/server.zig`
-- `src/api/openapi.yaml`
+- `../../../specs/openapi/termite/api.yaml`
 - `../../e2e/termite/test_generate.py`
 - `../../e2e/termite/test_models.py`
 - `../../e2e/termite/test_chat.py`

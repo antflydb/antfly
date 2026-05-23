@@ -197,7 +197,7 @@ client.create_table(
 import (
 	"context"
 	"log"
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 client, err := antfly.NewAntflyClient("http://localhost:8080")
@@ -233,7 +233,7 @@ _, err = client.CreateTableWithResponse(
 
   <TabsContent value="rust">
 ```rust
-use antfly_client::Client;
+use antfly_sdk::Client;
 use serde_json::json;
 
 let client = Client::new("http://localhost:8080");
@@ -380,7 +380,7 @@ _, err = client.BatchTableWithResponse(
   <TabsContent value="rust">
 ```rust
 // Using client from above
-use antfly_client::types::BatchTableBody;
+use antfly_sdk::types::BatchTableBody;
 use std::collections::HashMap;
 
 let mut inserts = HashMap::new();
@@ -520,7 +520,7 @@ for _, hit := range resp.JSON200.Hits {
 
   <TabsContent value="rust">
 ```rust
-use antfly_client::types::{GlobalQueryBody, FullTextSearch};
+use antfly_sdk::types::{GlobalQueryBody, FullTextSearch};
 
 let resp = client
     .global_query(&GlobalQueryBody {

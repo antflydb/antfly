@@ -34,7 +34,7 @@
     {
       "name": "getting_started",
       "x-displayName": "Getting Started",
-      "description": "Quick introduction to using the Antfly API.\n\n## Client Libraries\n\nAntfly provides auto-generated SDKs from the OpenAPI specification:\n\n- **Go**: `github.com/antflydb/antfly/pkg/client`\n- **TypeScript**: `@antflydb/antfly-ts` (npm)\n- **Python**: `antfly-python` (PyPI)\n\nAll SDKs are type-safe and kept in sync with the API through code generation.\n\nFor architectural overview, feature comparisons, and use case guidance, see the [main documentation](https://antfly.io/docs)\n",
+      "description": "Quick introduction to using the Antfly API.\n\n## Client Libraries\n\nAntfly provides auto-generated SDKs from the OpenAPI specification:\n\n- **Go**: `github.com/antflydb/antfly/go/pkg/sdk`\n- **TypeScript**: `@antflydb/antfly-ts` (npm)\n- **Python**: `antfly-python` (PyPI)\n\nAll SDKs are type-safe and kept in sync with the API through code generation.\n\nFor architectural overview, feature comparisons, and use case guidance, see the [main documentation](https://antfly.io/docs)\n",
       "x-docsaf-questions": [
         "Which SDK should I use for my project?",
         "How do I authenticate with the API?",

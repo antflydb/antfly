@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/client/query"
+	client "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/query"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
