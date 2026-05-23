@@ -410,6 +410,11 @@ pub const TextBoolQuery = struct {
     boost: f32 = 1.0,
 };
 
+pub const TextMultiMatchField = struct {
+    field: []const u8,
+    boost: f32 = 1.0,
+};
+
 pub const TextQuery = union(enum) {
     match_none: void,
     match_all: void,
@@ -436,6 +441,11 @@ pub const TextQuery = union(enum) {
         field: []const u8,
         text: []const u8,
         analyzer: ?[]const u8 = null,
+        boost: f32 = 1.0,
+    },
+    multi_match_bool_prefix: struct {
+        query: []const u8,
+        fields: []const TextMultiMatchField,
         boost: f32 = 1.0,
     },
     match_phrase: struct {
@@ -554,6 +564,11 @@ pub const TextQuery = union(enum) {
                 alloc.free(match.field);
                 alloc.free(match.text);
                 if (match.analyzer) |analyzer| alloc.free(analyzer);
+            },
+            .multi_match_bool_prefix => |multi_match| {
+                alloc.free(multi_match.query);
+                for (multi_match.fields) |field| alloc.free(field.field);
+                if (multi_match.fields.len > 0) alloc.free(multi_match.fields);
             },
             .match_phrase => |phrase| {
                 alloc.free(phrase.field);

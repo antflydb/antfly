@@ -3762,6 +3762,13 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: bleve_openapi.
             .analyzer = if (match.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
             .boost = if (match.boost) |boost| @floatCast(boost) else 1.0,
         } },
+        .multi_match_query => |multi_match| try public_text_query_mod.parseMultiMatchBoolPrefixQueryAlloc(
+            alloc,
+            multi_match.multi_match.query,
+            multi_match.multi_match.type,
+            multi_match.multi_match.fields,
+            if (multi_match.multi_match.boost) |boost| @floatCast(boost) else 1.0,
+        ),
         .match_phrase_query => |phrase| blk: {
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             break :blk .{ .match_phrase = .{
@@ -4659,6 +4666,11 @@ fn freeTextQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) void {
             alloc.free(match.text);
             if (match.analyzer) |analyzer| alloc.free(analyzer);
         },
+        .multi_match_bool_prefix => |multi_match| {
+            alloc.free(multi_match.query);
+            for (multi_match.fields) |field| alloc.free(field.field);
+            if (multi_match.fields.len > 0) alloc.free(multi_match.fields);
+        },
         .doc_id => |doc_id| {
             for (doc_id.ids) |id| alloc.free(id);
             if (doc_id.ids.len > 0) alloc.free(doc_id.ids);
@@ -4924,6 +4936,21 @@ test "api query contract includes stored source when fields are omitted" {
     try std.testing.expect(parsed.req.include_stored);
     try std.testing.expect(!parsed.req.defer_stored_projection);
     try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
+}
+
+test "api query contract accepts multi_match bool_prefix full text" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"]}}}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.full_text.? == .multi_match_bool_prefix);
+    try std.testing.expectEqualStrings("quick brown f", parsed.req.full_text.?.multi_match_bool_prefix.query);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text.?.multi_match_bool_prefix.fields.len);
+    try std.testing.expectEqualStrings("title", parsed.req.full_text.?.multi_match_bool_prefix.fields[0].field);
 }
 
 test "api query contract projects stored source when explicit fields are supplied" {

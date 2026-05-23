@@ -131,6 +131,45 @@ func TestPrepareHybridFullTextAfterToRemoteIndexQuery(t *testing.T) {
 	})
 }
 
+func TestQueryRequestRejectsUnsupportedMultiMatchInGoRuntime(t *testing.T) {
+	queryJSON := []byte(`{"multi_match":{"query":"smartphone apple ip","type":"bool_prefix","fields":["name","name._2gram","name._3gram"]}}`)
+
+	t.Run("full_text_search", func(t *testing.T) {
+		req := &QueryRequest{
+			Table:          "docs",
+			FullTextSearch: queryJSON,
+			Limit:          10,
+		}
+
+		_, err := req.ToRemoteIndexQuery()
+		require.ErrorContains(t, err, "full_text_search: multi_match bool_prefix queries are only supported by the Zig antfly runtime")
+	})
+
+	t.Run("filter_query", func(t *testing.T) {
+		req := &QueryRequest{
+			Table:          "docs",
+			FilterQuery:    queryJSON,
+			SemanticSearch: "phone",
+			Limit:          10,
+		}
+
+		_, err := req.ToRemoteIndexQuery()
+		require.ErrorContains(t, err, "filter_query: multi_match bool_prefix queries are only supported by the Zig antfly runtime")
+	})
+
+	t.Run("nested_exclusion_query", func(t *testing.T) {
+		req := &QueryRequest{
+			Table:          "docs",
+			FullTextSearch: []byte(`{"match_all":{}}`),
+			ExclusionQuery: []byte(`{"disjuncts":[{"term":"archived","field":"status"},` + string(queryJSON) + `]}`),
+			Limit:          10,
+		}
+
+		_, err := req.ToRemoteIndexQuery()
+		require.ErrorContains(t, err, "exclusion_query: multi_match bool_prefix queries are only supported by the Zig antfly runtime")
+	})
+}
+
 func TestRunQuery_MatchAllHybridDoesNotFallbackWhenPrunerRemovesSemanticHits(t *testing.T) {
 	var requestCount atomic.Int32
 

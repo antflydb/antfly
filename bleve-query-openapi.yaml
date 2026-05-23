@@ -63,6 +63,33 @@ components:
             - and
       required:
         - match
+    MultiMatchBody:
+      type: object
+      properties:
+        query:
+          type: string
+        fields:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        type:
+          type: string
+          enum:
+            - bool_prefix
+        boost:
+          $ref: "#/components/schemas/Boost"
+      required:
+        - query
+        - fields
+        - type
+    MultiMatchQuery:
+      type: object
+      properties:
+        multi_match:
+          $ref: "#/components/schemas/MultiMatchBody"
+      required:
+        - multi_match
     MatchPhraseQuery:
       type: object
       properties:
@@ -439,6 +466,7 @@ components:
       oneOf:
         - $ref: "#/components/schemas/TermQuery"
         - $ref: "#/components/schemas/MatchQuery"
+        - $ref: "#/components/schemas/MultiMatchQuery"
         - $ref: "#/components/schemas/MatchPhraseQuery"
         - $ref: "#/components/schemas/PhraseQuery"
         - $ref: "#/components/schemas/MultiPhraseQuery"

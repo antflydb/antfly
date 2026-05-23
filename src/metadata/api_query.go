@@ -68,6 +68,49 @@ func injectRowFilter(qr *QueryRequest, resolve RowFilterResolver) {
 	}
 }
 
+func parseGoRuntimeBleveQuery(field string, raw json.RawMessage) (query.Query, error) {
+	if err := rejectUnsupportedGoRuntimeBleveQuery(raw); err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	q, err := query.ParseQuery(raw)
+	if err != nil {
+		return nil, err
+	}
+	return q, nil
+}
+
+func rejectUnsupportedGoRuntimeBleveQuery(raw json.RawMessage) error {
+	var node any
+	if err := json.Unmarshal(raw, &node); err != nil {
+		return err
+	}
+	if containsUnsupportedGoRuntimeBleveQuery(node) {
+		return errors.New("multi_match bool_prefix queries are only supported by the Zig antfly runtime")
+	}
+	return nil
+}
+
+func containsUnsupportedGoRuntimeBleveQuery(node any) bool {
+	switch value := node.(type) {
+	case map[string]any:
+		if _, ok := value["multi_match"]; ok {
+			return true
+		}
+		for _, child := range value {
+			if containsUnsupportedGoRuntimeBleveQuery(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if containsUnsupportedGoRuntimeBleveQuery(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (t *TableApi) executeHybridFullTextFallback(
 	ctx context.Context,
 	shardIndexes indexes.ShardIndexes,
@@ -170,13 +213,13 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 	}
 	// Parse the native Bleve query JSON into a Bleve query object.
 	if hasFullText {
-		rq.FullTextSearch, err = query.ParseQuery(q.FullTextSearch)
+		rq.FullTextSearch, err = parseGoRuntimeBleveQuery("full_text_search", q.FullTextSearch)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if hasFilter {
-		rq.FilterQuery, err = query.ParseQuery(q.FilterQuery)
+		rq.FilterQuery, err = parseGoRuntimeBleveQuery("filter_query", q.FilterQuery)
 		if err != nil {
 			return nil, err
 		}
@@ -185,7 +228,7 @@ func (q *QueryRequest) ToRemoteIndexQuery() (*indexes.Query, error) {
 	}
 	hasExclusion := len(q.ExclusionQuery) > 0 && !bytes.Equal(q.ExclusionQuery, []byte("null"))
 	if hasExclusion {
-		rq.ExclusionQuery, err = query.ParseQuery(q.ExclusionQuery)
+		rq.ExclusionQuery, err = parseGoRuntimeBleveQuery("exclusion_query", q.ExclusionQuery)
 		if err != nil {
 			return nil, err
 		}

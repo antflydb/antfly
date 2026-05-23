@@ -72,6 +72,7 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
     boost: f32,
 ) anyerror!?db_types.TextQuery {
     if (value != .object) return null;
+    if (try parseStatefulDirectTextMultiMatchQueryAlloc(alloc, value, boost)) |query| return query;
     if (try directStringOperatorValue(value, "term", &.{ "term", "value" }, true)) |parsed| {
         return .{ .term = .{
             .field = try alloc.dupe(u8, parsed.field),
@@ -133,6 +134,87 @@ pub fn parseStatefulDirectTextRangeQueryAlloc(
     boost: f32,
 ) anyerror!?db_types.TextQuery {
     return try directRangeQueryAlloc(alloc, value, boost);
+}
+
+fn parseStatefulDirectTextMultiMatchQueryAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    boost: f32,
+) anyerror!?db_types.TextQuery {
+    if (value != .object) return null;
+    const multi_match = value.object.get("multi_match") orelse return null;
+    if (multi_match != .object) return error.UnsupportedQueryRequest;
+
+    const query_value = multi_match.object.get("query") orelse multi_match.object.get("text") orelse multi_match.object.get("match") orelse multi_match.object.get("value") orelse return error.UnsupportedQueryRequest;
+    const query_text = try directNonBlankString(query_value);
+
+    const type_value = multi_match.object.get("type") orelse return error.UnsupportedQueryRequest;
+    if (type_value != .string or !std.mem.eql(u8, type_value.string, "bool_prefix")) return error.UnsupportedQueryRequest;
+
+    const fields_value = multi_match.object.get("fields") orelse return error.UnsupportedQueryRequest;
+    if (fields_value != .array or fields_value.array.items.len == 0) return error.UnsupportedQueryRequest;
+    const query_boost: f32 = if (multi_match.object.get("boost")) |boost_value|
+        @floatCast(try directNumber(boost_value))
+    else
+        boost;
+
+    var field_specs = try alloc.alloc([]const u8, fields_value.array.items.len);
+    defer alloc.free(field_specs);
+    for (fields_value.array.items, 0..) |field_value, i| {
+        if (field_value != .string) return error.UnsupportedQueryRequest;
+        field_specs[i] = field_value.string;
+    }
+
+    return try parseMultiMatchBoolPrefixQueryAlloc(alloc, query_text, type_value.string, field_specs, query_boost);
+}
+
+pub fn parseMultiMatchBoolPrefixQueryAlloc(
+    alloc: std.mem.Allocator,
+    query_text: []const u8,
+    query_type: []const u8,
+    field_specs: []const []const u8,
+    boost: f32,
+) !db_types.TextQuery {
+    if (std.mem.trim(u8, query_text, &std.ascii.whitespace).len == 0) return error.InvalidQueryRequest;
+    if (!std.mem.eql(u8, query_type, "bool_prefix")) return error.UnsupportedQueryRequest;
+    if (field_specs.len == 0) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(boost) or boost <= 0) return error.UnsupportedQueryRequest;
+
+    var fields = try alloc.alloc(db_types.TextMultiMatchField, field_specs.len);
+    errdefer alloc.free(fields);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |field| alloc.free(field.field);
+    }
+    for (field_specs, 0..) |field_spec, i| {
+        const parsed = try parseMultiMatchFieldSpec(field_spec);
+        fields[i] = .{
+            .field = try alloc.dupe(u8, parsed.field),
+            .boost = parsed.boost,
+        };
+        initialized += 1;
+    }
+
+    return .{ .multi_match_bool_prefix = .{
+        .query = try alloc.dupe(u8, query_text),
+        .fields = fields,
+        .boost = boost,
+    } };
+}
+
+const ParsedMultiMatchField = struct {
+    field: []const u8,
+    boost: f32,
+};
+
+fn parseMultiMatchFieldSpec(field_spec: []const u8) !ParsedMultiMatchField {
+    if (field_spec.len == 0) return error.UnsupportedQueryRequest;
+    const boost_sep = std.mem.lastIndexOfScalar(u8, field_spec, '^') orelse return .{ .field = field_spec, .boost = 1.0 };
+    if (boost_sep == 0 or boost_sep + 1 >= field_spec.len) return error.UnsupportedQueryRequest;
+    const field = field_spec[0..boost_sep];
+    const boost = std.fmt.parseFloat(f32, field_spec[boost_sep + 1 ..]) catch return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(boost) or boost <= 0) return error.UnsupportedQueryRequest;
+    return .{ .field = field, .boost = boost };
 }
 
 fn parseMatchLikeSpecAlloc(
@@ -432,6 +514,24 @@ test "public direct text parser accepts query dsl fields" {
     try std.testing.expect(query == .match);
     try std.testing.expectEqualStrings("title", query.match.field);
     try std.testing.expectEqualStrings("hello", query.match.text);
+}
+
+test "public direct text parser lowers multi_match bool_prefix" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"multi_match":{"query":"Quick Brown F","type":"bool_prefix","fields":["title"]}}
+    , .{});
+    defer parsed.deinit();
+
+    const maybe_direct = try parseStatefulDirectTextQueryAlloc(alloc, parsed.value, 1.0);
+    try std.testing.expect(maybe_direct != null);
+    var query = maybe_direct.?;
+    defer query.deinit(alloc);
+
+    try std.testing.expect(query == .multi_match_bool_prefix);
+    try std.testing.expectEqualStrings("Quick Brown F", query.multi_match_bool_prefix.query);
+    try std.testing.expectEqual(@as(usize, 1), query.multi_match_bool_prefix.fields.len);
+    try std.testing.expectEqualStrings("title", query.multi_match_bool_prefix.fields[0].field);
 }
 
 test "public direct text parser emits stateful match phrase" {

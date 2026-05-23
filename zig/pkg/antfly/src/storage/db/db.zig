@@ -7727,6 +7727,9 @@ pub const DB = struct {
         switch (text_query) {
             .term => |term| try self.proveTextFieldAccessPath(index_name, term.field, null, .slice),
             .match => |match| try self.proveTextFieldAccessPath(index_name, match.field, match.analyzer, .slice),
+            .multi_match_bool_prefix => |multi_match| {
+                for (multi_match.fields) |field| try self.proveMultiMatchBoolPrefixAccessPaths(index_name, field.field);
+            },
             .prefix => |prefix| try self.proveTextFieldAccessPath(index_name, prefix.field, null, .automaton_select),
             .wildcard => |wildcard| try self.proveTextFieldAccessPath(index_name, wildcard.field, null, .automaton_select),
             .regexp => |regexp| try self.proveTextFieldAccessPath(index_name, regexp.field, null, .automaton_select),
@@ -7742,6 +7745,42 @@ pub const DB = struct {
 
     fn proveTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, analyzer: ?[]const u8, fragment: algebraic_mod.ir.TensorFragment) !void {
         _ = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, analyzer, fragment) orelse return error.IndexNotFound;
+    }
+
+    fn proveOptionalTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, fragment: algebraic_mod.ir.TensorFragment) !bool {
+        const plan = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, null, fragment);
+        return plan != null;
+    }
+
+    fn proveMultiMatchBoolPrefixAccessPaths(self: *DB, index_name: ?[]const u8, field: []const u8) !void {
+        if (std.mem.endsWith(u8, field, "._index_prefix")) {
+            try self.proveTextFieldAccessPath(index_name, field, null, .slice);
+            return;
+        }
+
+        try self.proveTextFieldAccessPath(index_name, field, null, .slice);
+        try self.proveTextFieldAccessPath(index_name, field, null, .automaton_select);
+        if (isSearchAsYouTypeGeneratedFieldName(field)) return;
+
+        const two_gram = try std.fmt.allocPrint(self.alloc, "{s}._2gram", .{field});
+        defer self.alloc.free(two_gram);
+        const has_two_gram = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .slice);
+        if (has_two_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .automaton_select);
+
+        const three_gram = try std.fmt.allocPrint(self.alloc, "{s}._3gram", .{field});
+        defer self.alloc.free(three_gram);
+        const has_three_gram = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .slice);
+        if (has_three_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .automaton_select);
+
+        const index_prefix = try std.fmt.allocPrint(self.alloc, "{s}._index_prefix", .{field});
+        defer self.alloc.free(index_prefix);
+        _ = try self.proveOptionalTextFieldAccessPath(index_name, index_prefix, .slice);
+    }
+
+    fn isSearchAsYouTypeGeneratedFieldName(field: []const u8) bool {
+        return std.mem.endsWith(u8, field, "._2gram") or
+            std.mem.endsWith(u8, field, "._3gram") or
+            std.mem.endsWith(u8, field, "._index_prefix");
     }
 
     fn textQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
@@ -26584,6 +26623,21 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     });
     defer prefix_results.deinit();
     try std.testing.expectEqual(@as(u32, 3), prefix_results.total_hits);
+
+    const multi_match_fields = [_]types.TextMultiMatchField{
+        .{ .field = "name" },
+    };
+    var bool_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "smartphone apple ip",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer bool_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 1), bool_prefix_results.total_hits);
+    try std.testing.expectEqualStrings("doc:1", bool_prefix_results.hits[0].id);
 }
 
 test "db versioned full text indexes reload matching schema mappings after reopen" {

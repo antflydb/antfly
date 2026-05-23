@@ -98,21 +98,45 @@ For now, `search_as_you_type` uses the Elasticsearch default
 valid values should be `2..4`, matching Elasticsearch, and the generated fields
 should be `._2gram` through `._{max_shingle_size}gram` plus `._index_prefix`.
 
-The query surface should eventually expose a first-class bool-prefix mode:
+The query surface should use an Elasticsearch-style `multi_match` query with
+`type: "bool_prefix"` rather than an Antfly-only standalone bool-prefix
+operator:
 
 ```json
 {
   "full_text_search": {
-    "field": "name",
-    "query": "quick brown f",
-    "type": "bool_prefix"
+    "multi_match": {
+      "query": "quick brown f",
+      "type": "bool_prefix",
+      "fields": ["name"]
+    }
   }
 }
 ```
 
-Internally that should expand over the root field and the shingle fields, with
-the final partial phrase satisfied by `._index_prefix`. Users should not have to
-manually query generated subfields for the normal autocomplete path.
+For `search_as_you_type` root fields, Antfly should expand the root field to the
+generated autocomplete fields:
+
+```json
+{
+  "full_text_search": {
+    "multi_match": {
+      "query": "quick brown f",
+      "type": "bool_prefix",
+      "fields": ["name", "name._2gram", "name._3gram"]
+    }
+  }
+}
+```
+
+The explicit generated-field form should also be accepted for Elasticsearch
+familiarity and advanced scoring control. The shorthand `fields: ["name"]`
+should remain the normal Antfly path so users do not have to manually list
+generated subfields for autocomplete.
+
+Internally this should lower to the existing boolean, term, and prefix query
+machinery. Completed terms match the root and shingle fields, and the final
+partial phrase is satisfied through `._index_prefix`.
 
 ## Task List
 

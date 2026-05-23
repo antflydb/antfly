@@ -38,6 +38,11 @@ const (
 	MatchQueryOperatorOr  MatchQueryOperator = "or"
 )
 
+// Defines values for MultiMatchBodyType.
+const (
+	MultiMatchBodyTypeBoolPrefix MultiMatchBodyType = "bool_prefix"
+)
+
 // BoolFieldQuery defines model for BoolFieldQuery.
 type BoolFieldQuery struct {
 	Bool bool `json:"bool"`
@@ -233,6 +238,23 @@ type MatchQuery struct {
 // MatchQueryOperator defines model for MatchQuery.Operator.
 type MatchQueryOperator string
 
+// MultiMatchBody defines model for MultiMatchBody.
+type MultiMatchBody struct {
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost  Boost              `json:"boost,omitzero"`
+	Fields []string           `json:"fields"`
+	Query  string             `json:"query"`
+	Type   MultiMatchBodyType `json:"type"`
+}
+
+// MultiMatchBodyType defines model for MultiMatchBody.Type.
+type MultiMatchBodyType string
+
+// MultiMatchQuery defines model for MultiMatchQuery.
+type MultiMatchQuery struct {
+	MultiMatch MultiMatchBody `json:"multi_match"`
+}
+
 // MultiPhraseQuery defines model for MultiPhraseQuery.
 type MultiPhraseQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
@@ -425,6 +447,32 @@ func (t *Query) FromMatchQuery(v MatchQuery) error {
 
 // MergeMatchQuery performs a merge with any union data inside the Query, using the provided MatchQuery
 func (t *Query) MergeMatchQuery(v MatchQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsMultiMatchQuery returns the union data inside the Query as a MultiMatchQuery
+func (t Query) AsMultiMatchQuery() (MultiMatchQuery, error) {
+	var body MultiMatchQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromMultiMatchQuery overwrites any union data inside the Query as the provided MultiMatchQuery
+func (t *Query) FromMultiMatchQuery(v MultiMatchQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeMultiMatchQuery performs a merge with any union data inside the Query, using the provided MultiMatchQuery
+func (t *Query) MergeMultiMatchQuery(v MultiMatchQuery) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -1166,29 +1214,30 @@ type ClientWithResponsesInterface interface {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
