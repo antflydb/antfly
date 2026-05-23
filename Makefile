@@ -14,7 +14,7 @@ GO_SUBMODULES := \
 	./go/pkg/proxy/antfly \
 	./go/pkg/proxy/termite \
 	./pkg/libaf \
-	./pkg/operator \
+	./go/pkg/operator \
 	./pkg/docsaf \
 	./pkg/generating \
 	./pkg/evalaf \
@@ -493,16 +493,16 @@ show-ingress:
         termite-client-test termite-client-lint
 
 operator-build: ## Build the antfly-operator binary
-	(cd ./pkg/operator && $(MAKE) build)
+	(cd ./go/pkg/operator && $(MAKE) build)
 
 operator-test: ## Run antfly-operator tests
-	(cd ./pkg/operator && $(MAKE) test)
+	(cd ./go/pkg/operator && $(MAKE) test)
 
 operator-lint: ## Run linter on antfly-operator
-	(cd ./pkg/operator && $(MAKE) lint)
+	(cd ./go/pkg/operator && $(MAKE) lint)
 
 operator-docker-build: ## Build antfly-operator Docker image
-	docker build -t antfly-operator:latest -f ./Dockerfile.antfly-operator .
+	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
 
 termite-build: ## Build the termite binary (pure Go)
 	(cd ./pkg/termite && $(GO) build -o ../../termite ./cmd)

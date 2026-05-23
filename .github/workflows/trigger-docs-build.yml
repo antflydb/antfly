@@ -10,7 +10,7 @@ on:
       - 'examples/**'
       - 'docs/**'
       - 'src/common/openapi.yaml'
-      - 'pkg/operator/docs/**'
+      - 'go/pkg/operator/docs/**'
       - 'pkg/termite/registry/index.json'
 
 jobs:
