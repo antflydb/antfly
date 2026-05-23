@@ -16,6 +16,7 @@ package embeddings
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"github.com/antflydb/antfly/lib/template"
 	libtermite "github.com/antflydb/antfly/lib/termite"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
+	libscraping "github.com/antflydb/antfly/pkg/libaf/scraping"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
@@ -234,12 +236,13 @@ func init() {
 // depending on tier. The enricher env var ANTFLY_ENRICHER_RATE_LIMIT
 // can override these.
 const (
-	OpenAIDefaultRPS     = 50  // ~3000 RPM
-	VertexDefaultRPS     = 10  // ~600 RPM
-	GeminiDefaultRPS     = 25  // ~1500 RPM
-	CohereDefaultRPS     = 100 // ~6000 RPM (production key)
-	OpenRouterDefaultRPS = 50
-	BedrockDefaultRPS    = 50
+	OpenAIDefaultRPS          = 50  // ~3000 RPM
+	VertexDefaultRPS          = 10  // ~600 RPM
+	GeminiDefaultRPS          = 25  // ~1500 RPM
+	CohereDefaultRPS          = 100 // ~6000 RPM (production key)
+	OpenRouterDefaultRPS      = 50
+	BedrockDefaultRPS         = 50
+	BedrockCohereMaxBatchSize = 96
 )
 
 type OpenAIImpl struct {
@@ -249,12 +252,19 @@ type OpenAIImpl struct {
 	limiter *rate.Limiter
 }
 type BedrockImpl struct {
-	client        *bedrockruntime.Client
+	client        bedrockRuntimeClient
 	model         string
 	stripNewLines bool
 	batchSize     int
+	dimension     int
+	inputType     string
+	truncate      string
 	caps          EmbedderCapabilities
 	limiter       *rate.Limiter
+}
+
+type bedrockRuntimeClient interface {
+	InvokeModel(context.Context, *bedrockruntime.InvokeModelInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.InvokeModelOutput, error)
 }
 
 func NewOpenAIImpl(config EmbedderConfig) (Embedder, error) {
@@ -365,8 +375,25 @@ func NewBedrockImpl(cfg EmbedderConfig) (Embedder, error) {
 	}
 
 	batchSize := 100 // default
-	if c.BatchSize != nil {
+	if c.BatchSize != nil && *c.BatchSize > 0 {
 		batchSize = *c.BatchSize
+	}
+	dimension := 0
+	if c.Dimension != nil {
+		dimension = *c.Dimension
+	} else if c.Dimensions != nil {
+		dimension = *c.Dimensions
+	}
+	inputType := ""
+	if c.InputType != nil {
+		inputType = *c.InputType
+	}
+	if strings.HasPrefix(c.Model, "cohere.embed-") && inputType == "" {
+		inputType = "search_document"
+	}
+	truncate := ""
+	if c.Truncate != nil {
+		truncate = *c.Truncate
 	}
 
 	return &BedrockImpl{
@@ -374,6 +401,9 @@ func NewBedrockImpl(cfg EmbedderConfig) (Embedder, error) {
 		model:         string(c.Model),
 		stripNewLines: stripNewLines,
 		batchSize:     batchSize,
+		dimension:     dimension,
+		inputType:     inputType,
+		truncate:      truncate,
 		caps:          ResolveCapabilities(c.Model, cfg.GetConfigCapabilities()),
 		limiter:       rate.NewLimiter(BedrockDefaultRPS, BedrockDefaultRPS),
 	}, nil
@@ -390,6 +420,13 @@ func (l *BedrockImpl) RateLimiter() *rate.Limiter {
 func (l *BedrockImpl) Embed(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
 	if len(contents) == 0 {
 		return [][]float32{}, nil
+	}
+
+	if strings.HasPrefix(l.model, "amazon.titan-embed-image") {
+		return l.embedTitanMultimodal(ctx, contents)
+	}
+	if strings.HasPrefix(l.model, "cohere.embed-") {
+		return l.embedCohere(ctx, contents)
 	}
 
 	// Bedrock text embeddings: extract text from content parts
@@ -411,10 +448,7 @@ func (l *BedrockImpl) Embed(ctx context.Context, contents [][]ai.ContentPart) ([
 		// Call Bedrock API for each text in batch
 		for _, text := range batch {
 			// Format depends on model - Titan models use this format
-			body := map[string]any{
-				"inputText": text,
-			}
-			bodyBytes, err := json.Marshal(body)
+			bodyBytes, err := json.Marshal(l.titanTextBody(text))
 			if err != nil {
 				return nil, fmt.Errorf("marshaling request body: %w", err)
 			}
@@ -440,6 +474,311 @@ func (l *BedrockImpl) Embed(ctx context.Context, contents [][]ai.ContentPart) ([
 	}
 
 	return results, nil
+}
+
+func (l *BedrockImpl) titanTextBody(text string) map[string]any {
+	body := map[string]any{"inputText": text}
+	if l.dimension > 0 {
+		body["dimensions"] = l.dimension
+	}
+	return body
+}
+
+func (l *BedrockImpl) embedTitanMultimodal(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
+	results := make([][]float32, 0, len(contents))
+	for i, parts := range contents {
+		body, err := l.titanMultimodalBody(parts)
+		if err != nil {
+			return nil, fmt.Errorf("building titan multimodal request for input %d: %w", i, err)
+		}
+		embedding, err := l.invokeEmbedding(ctx, body)
+		if err != nil {
+			return nil, fmt.Errorf("embedding titan multimodal input %d: %w", i, err)
+		}
+		results = append(results, embedding)
+	}
+	return results, nil
+}
+
+func (l *BedrockImpl) titanMultimodalBody(parts []ai.ContentPart) (map[string]any, error) {
+	var text string
+	var image []byte
+	for _, part := range parts {
+		switch p := part.(type) {
+		case ai.TextContent:
+			if text == "" {
+				text = p.Text
+			} else if p.Text != "" {
+				text += " " + p.Text
+			}
+		case ai.BinaryContent:
+			if !strings.HasPrefix(p.MIMEType, "image/") {
+				return nil, fmt.Errorf("titan multimodal only supports image binary content, got %s", p.MIMEType)
+			}
+			if len(image) > 0 {
+				return nil, errors.New("titan multimodal supports one image per embedding request")
+			}
+			image = p.Data
+		case ai.ImageURLContent:
+			_, data, err := bedrockImageDataURI(p.URL)
+			if err != nil {
+				return nil, err
+			}
+			if len(data) == 0 {
+				continue
+			}
+			if len(image) > 0 {
+				return nil, errors.New("titan multimodal supports one image per embedding request")
+			}
+			image = data
+		}
+	}
+	body := map[string]any{}
+	if strings.TrimSpace(text) != "" {
+		body["inputText"] = text
+	}
+	if len(image) > 0 {
+		body["inputImage"] = base64.StdEncoding.EncodeToString(image)
+	}
+	if len(body) == 0 {
+		return nil, errors.New("titan multimodal requires non-empty text or image content")
+	}
+	if l.dimension > 0 {
+		body["embeddingConfig"] = map[string]any{
+			"outputEmbeddingLength": l.dimension,
+		}
+	}
+	return body, nil
+}
+
+func (l *BedrockImpl) embedCohere(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
+	if l.cohereSupportsMixedInputs(contents) {
+		return l.embedCohereV4(ctx, contents)
+	}
+
+	texts := ExtractText(contents)
+	for i, text := range texts {
+		if l.stripNewLines {
+			text = strings.ReplaceAll(text, "\n", " ")
+			texts[i] = text
+		}
+		if strings.TrimSpace(text) == "" {
+			return nil, fmt.Errorf("cohere bedrock text embedding input %d is empty; use a Cohere v4 multimodal model for image content", i)
+		}
+	}
+
+	results := make([][]float32, 0, len(texts))
+	batchSize := l.cohereBatchSize()
+	for start := 0; start < len(texts); start += batchSize {
+		end := min(start+batchSize, len(texts))
+		body := l.cohereTextBody(texts[start:end])
+		embeddings, err := l.invokeEmbeddings(ctx, body)
+		if err != nil {
+			return nil, fmt.Errorf("embedding cohere text batch %d:%d: %w", start, end, err)
+		}
+		results = append(results, embeddings...)
+	}
+	return results, nil
+}
+
+func (l *BedrockImpl) cohereSupportsMixedInputs(contents [][]ai.ContentPart) bool {
+	if !l.isCohereV4() {
+		return false
+	}
+	for _, parts := range contents {
+		for _, part := range parts {
+			switch part.(type) {
+			case ai.BinaryContent, ai.ImageURLContent:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (l *BedrockImpl) isCohereV4() bool {
+	return strings.HasPrefix(l.model, "cohere.embed-v4")
+}
+
+func (l *BedrockImpl) cohereBatchSize() int {
+	batchSize := l.batchSize
+	if batchSize <= 0 || batchSize > BedrockCohereMaxBatchSize {
+		batchSize = BedrockCohereMaxBatchSize
+	}
+	return batchSize
+}
+
+func (l *BedrockImpl) cohereTextBody(texts []string) map[string]any {
+	body := map[string]any{
+		"texts": texts,
+	}
+	if l.inputType != "" {
+		body["input_type"] = l.inputType
+	}
+	if l.dimension > 0 && l.isCohereV4() {
+		body["output_dimension"] = l.dimension
+	}
+	if l.truncate != "" {
+		body["truncate"] = l.truncate
+	}
+	return body
+}
+
+func (l *BedrockImpl) embedCohereV4(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error) {
+	results := make([][]float32, 0, len(contents))
+	batchSize := l.cohereBatchSize()
+	for start := 0; start < len(contents); start += batchSize {
+		end := min(start+batchSize, len(contents))
+		inputs := make([]any, 0, end-start)
+		for i, parts := range contents[start:end] {
+			input, err := cohereV4Input(parts, l.stripNewLines)
+			if err != nil {
+				return nil, fmt.Errorf("building cohere v4 request for input %d: %w", start+i, err)
+			}
+			inputs = append(inputs, input)
+		}
+		body := l.cohereV4Body(inputs)
+		embeddings, err := l.invokeEmbeddings(ctx, body)
+		if err != nil {
+			return nil, fmt.Errorf("embedding cohere v4 batch %d:%d: %w", start, end, err)
+		}
+		results = append(results, embeddings...)
+	}
+	return results, nil
+}
+
+func (l *BedrockImpl) cohereV4Body(inputs []any) map[string]any {
+	body := map[string]any{
+		"inputs":          inputs,
+		"embedding_types": []string{"float"},
+	}
+	if l.inputType != "" {
+		body["input_type"] = l.inputType
+	}
+	if l.dimension > 0 {
+		body["output_dimension"] = l.dimension
+	}
+	if l.truncate != "" {
+		body["truncate"] = l.truncate
+	}
+	return body
+}
+
+func cohereV4Input(parts []ai.ContentPart, stripNewLines bool) (map[string]any, error) {
+	content := make([]any, 0, len(parts))
+	for _, part := range parts {
+		switch p := part.(type) {
+		case ai.TextContent:
+			text := p.Text
+			if stripNewLines {
+				text = strings.ReplaceAll(text, "\n", " ")
+			}
+			if text != "" {
+				content = append(content, map[string]any{"type": "text", "text": text})
+			}
+		case ai.BinaryContent:
+			if !strings.HasPrefix(p.MIMEType, "image/") {
+				return nil, fmt.Errorf("cohere v4 bedrock only supports image binary content, got %s", p.MIMEType)
+			}
+			imageURL := "data:" + p.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(p.Data)
+			content = append(content, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": imageURL},
+			})
+		case ai.ImageURLContent:
+			imageURL, _, err := bedrockImageDataURI(p.URL)
+			if err != nil {
+				return nil, err
+			}
+			if imageURL != "" {
+				content = append(content, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": imageURL},
+				})
+			}
+		}
+	}
+	if len(content) == 0 {
+		return nil, errors.New("cohere v4 embedding requires non-empty text or image content")
+	}
+	return map[string]any{"content": content}, nil
+}
+
+func bedrockImageDataURI(rawURL string) (string, []byte, error) {
+	url := strings.TrimSpace(rawURL)
+	if url == "" {
+		return "", nil, nil
+	}
+	if !strings.HasPrefix(url, "data:") {
+		return "", nil, errors.New("bedrock multimodal image URL content requires a data URI or binary content; use remoteMedia to fetch remote URLs")
+	}
+	mimeType, data, err := libscraping.ParseDataURI(url)
+	if err != nil {
+		return "", nil, fmt.Errorf("parsing bedrock image data URI: %w", err)
+	}
+	if !strings.HasPrefix(mimeType, "image/") {
+		return "", nil, fmt.Errorf("bedrock multimodal only supports image data URIs, got %s", mimeType)
+	}
+	dataURI := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return dataURI, data, nil
+}
+
+func (l *BedrockImpl) invokeEmbedding(ctx context.Context, body map[string]any) ([]float32, error) {
+	embeddings, err := l.invokeEmbeddings(ctx, body)
+	if err != nil {
+		return nil, err
+	}
+	if len(embeddings) == 0 {
+		return nil, errors.New("bedrock returned no embeddings")
+	}
+	return embeddings[0], nil
+}
+
+func (l *BedrockImpl) invokeEmbeddings(ctx context.Context, body map[string]any) ([][]float32, error) {
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request body: %w", err)
+	}
+	resp, err := l.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
+		ModelId:     &l.model,
+		Body:        bodyBytes,
+		ContentType: aws.String("application/json"),
+		Accept:      aws.String("application/json"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("invoking bedrock model: %w", err)
+	}
+	return parseBedrockEmbeddings(resp.Body)
+}
+
+func parseBedrockEmbeddings(body []byte) ([][]float32, error) {
+	var raw struct {
+		Embedding  []float32       `json:"embedding"`
+		Embeddings json.RawMessage `json:"embeddings"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("unmarshaling response: %w", err)
+	}
+	if len(raw.Embedding) > 0 {
+		return [][]float32{raw.Embedding}, nil
+	}
+	if len(raw.Embeddings) == 0 {
+		return nil, errors.New("bedrock response did not include embeddings")
+	}
+	var vectors [][]float32
+	if err := json.Unmarshal(raw.Embeddings, &vectors); err == nil {
+		return vectors, nil
+	}
+	var typed struct {
+		Float [][]float32 `json:"float"`
+	}
+	if err := json.Unmarshal(raw.Embeddings, &typed); err != nil {
+		return nil, fmt.Errorf("unmarshaling embeddings response: %w", err)
+	}
+	if len(typed.Float) == 0 {
+		return nil, errors.New("bedrock response did not include float embeddings")
+	}
+	return typed.Float, nil
 }
 
 // NewEmbedderConfigFromJSON creates an EmbedderConfig from raw JSON. Mostly useful for testing.

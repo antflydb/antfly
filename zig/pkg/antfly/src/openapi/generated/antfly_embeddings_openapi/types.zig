@@ -103,12 +103,20 @@ pub const OpenAIEmbedderConfig = struct {
     dimensions: ?i64 = null,
 };
 
-/// Configuration for the AWS Bedrock embedding provider. Uses AWS credentials from environment or IAM roles. **Example Models:** cohere.embed-english-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+/// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 pub const BedrockEmbedderConfig = struct {
-    /// The Bedrock model ID to use (e.g., 'cohere.embed-english-v4', 'amazon.titan-embed-text-v2:0').
+    /// The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
     model: []const u8,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
+    /// Output dimension for Bedrock embedding models that support configurable dimensions.
+    dimension: ?i64 = null,
+    /// Alias for output dimension when using OpenAI-compatible configuration fields.
+    dimensions: ?i64 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
     /// Whether to strip new lines from the input text before embedding.
     strip_new_lines: ?bool = null,
     /// The batch size for embedding requests to optimize throughput.
