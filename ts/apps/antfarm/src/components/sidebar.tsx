@@ -55,6 +55,7 @@ import type { ProductId } from "@/config/products";
 import { useAuth } from "@/hooks/use-auth";
 import { useTable } from "@/hooks/use-table";
 import { cn } from "@/lib/utils";
+import { isExternalAuthMode } from "@/runtime-config";
 
 interface AppSidebarProps extends React.ComponentProps<typeof Sidebar> {
   currentSection?: string;
@@ -75,6 +76,7 @@ export function AppSidebar({
   const { state: sidebarState, toggleSidebar, isMobile } = useSidebar();
   const { hasPermission } = useAuth();
   const { tables, selectedTable, setSelectedTable } = useTable();
+  const showLocalAdminRoutes = !isExternalAuthMode();
 
   const [comboboxOpen, setComboboxOpen] = React.useState(false);
   const [tooltipOpen, setTooltipOpen] = React.useState(false);
@@ -198,7 +200,7 @@ export function AppSidebar({
                 </SidebarMenuItem>
 
                 {/* Users Link - only show if user has admin permission */}
-                {hasPermission("*", "*", "admin") && (
+                {showLocalAdminRoutes && hasPermission("*", "*", "admin") && (
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
@@ -220,7 +222,7 @@ export function AppSidebar({
                 )}
 
                 {/* Secrets Link - only show if user has admin permission */}
-                {hasPermission("*", "*", "admin") && (
+                {showLocalAdminRoutes && hasPermission("*", "*", "admin") && (
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild

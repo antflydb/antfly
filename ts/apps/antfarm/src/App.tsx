@@ -19,6 +19,7 @@ import {
   productForPath,
 } from "@/config/products";
 import { ThemeProvider } from "@/hooks/use-theme";
+import { isExternalAuthMode } from "@/runtime-config";
 import AntflyChunkingPlaygroundPage from "./pages/AntflyChunkingPlaygroundPage";
 import AntflyEmbeddingPlaygroundPage from "./pages/AntflyEmbeddingPlaygroundPage";
 import AntflyRerankingPlaygroundPage from "./pages/AntflyRerankingPlaygroundPage";
@@ -46,6 +47,7 @@ function AppContent() {
   const [currentSection, setCurrentSection] = useState("indexes");
   const [currentProduct, setCurrentProduct] = useState<ProductId>(defaultProduct);
   const location = useLocation();
+  const showLocalAdminRoutes = !isExternalAuthMode();
 
   // Sync currentProduct with the current route so direct navigation
   // (bookmarks, refresh, shared links) shows the correct sidebar.
@@ -84,8 +86,10 @@ function AppContent() {
                           path="/tables/:tableName"
                           element={<TableDetailsPage currentSection={currentSection} />}
                         />
-                        <Route path="/users" element={<UsersPage />} />
-                        <Route path="/secrets" element={<SecretsPage />} />
+                        {showLocalAdminRoutes && <Route path="/users" element={<UsersPage />} />}
+                        {showLocalAdminRoutes && (
+                          <Route path="/secrets" element={<SecretsPage />} />
+                        )}
                         <Route path="/cluster" element={<ClusterPage />} />
                         <Route path="/playground/evals" element={<EvalsPlaygroundPage />} />
                         <Route path="/playground/rag" element={<RagPlaygroundPage />} />
