@@ -32,6 +32,7 @@ import { useNavigate } from "react-router-dom";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTheme } from "@/hooks/use-theme";
 import { type SemanticResult, semanticSearch } from "@/lib/semantic-search";
+import { isExternalAuthMode } from "@/runtime-config";
 
 // Map icon names to components
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -95,12 +96,17 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     return () => document.removeEventListener("keydown", down);
   }, [toggle]);
 
-  const navigationCommands = [
-    { icon: Table, label: "Tables", href: "/" },
-    { icon: Plus, label: "Create Table", href: "/create" },
-    { icon: Library, label: "Models", href: "/models" },
-    { icon: Users, label: "Users", href: "/users" },
-  ];
+  const navigationCommands = React.useMemo(() => {
+    const commands = [
+      { icon: Table, label: "Tables", href: "/" },
+      { icon: Plus, label: "Create Table", href: "/create" },
+      { icon: Library, label: "Models", href: "/models" },
+    ];
+    if (!isExternalAuthMode()) {
+      commands.push({ icon: Users, label: "Users", href: "/users" });
+    }
+    return commands;
+  }, []);
 
   const playgroundCommands = [
     { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
@@ -120,7 +126,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
       ...playgroundCommands.map((c) => c.label),
       ...quickActionCommands.map((c) => c.label),
     ],
-    [navigationCommands.map, playgroundCommands.map, quickActionCommands.map]
+    [navigationCommands, playgroundCommands, quickActionCommands]
   );
 
   // Check if cmdk's string filter would find any matches
