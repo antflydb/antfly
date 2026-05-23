@@ -119,16 +119,22 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     return commands;
   }, [showLocalAdminRoutes]);
 
-  const playgroundCommands = [
-    { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
-    { icon: Tag, label: "Recognize Playground", href: "/playground/recognize" },
-    { icon: Repeat2, label: "Rewriting Playground", href: "/playground/rewrite" },
-    { icon: ArrowUpDown, label: "Reranking Playground", href: "/playground/rerank" },
-    { icon: Network, label: "Knowledge Graph", href: "/playground/kg" },
-    { icon: ClipboardCheck, label: "Evals", href: "/playground/evals" },
-  ];
+  const playgroundCommands = React.useMemo(
+    () => [
+      { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
+      { icon: Tag, label: "Recognize Playground", href: "/playground/recognize" },
+      { icon: Repeat2, label: "Rewriting Playground", href: "/playground/rewrite" },
+      { icon: ArrowUpDown, label: "Reranking Playground", href: "/playground/rerank" },
+      { icon: Network, label: "Knowledge Graph", href: "/playground/kg" },
+      { icon: ClipboardCheck, label: "Evals", href: "/playground/evals" },
+    ],
+    []
+  );
 
-  const quickActionCommands = [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }];
+  const quickActionCommands = React.useMemo(
+    () => [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }],
+    []
+  );
 
   // All command items for string matching check
   const allItems = React.useMemo(
