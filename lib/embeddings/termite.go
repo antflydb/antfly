@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/lib/ai"
-	"github.com/antflydb/antfly/pkg/termite-client"
+	client "github.com/antflydb/antfly/pkg/termite-client"
 	"github.com/antflydb/antfly/pkg/termite-client/oapi"
 	"golang.org/x/time/rate"
 )
