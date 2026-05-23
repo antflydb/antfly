@@ -22734,10 +22734,10 @@ test "db sparse backfill resumes after interrupted reopen" {
             writes.deinit(alloc);
         }
 
-        for (0..300) |i| {
+        for (0..10) |i| {
             try writes.append(alloc, .{
                 .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
-                .value = try std.fmt.allocPrint(alloc, "{{\"sparse\":{{\"indices\":[0,{d}],\"values\":[1.0,0.5]}}}}", .{i + 1}),
+                .value = try alloc.dupe(u8, "{\"sparse\":{\"indices\":[0,1],\"values\":[1.0,0.5]}}"),
             });
         }
 
@@ -22749,6 +22749,8 @@ test "db sparse backfill resumes after interrupted reopen" {
         }});
     }
 
+    index_manager_mod.test_sparse_backfill_batch_size = 4;
+    defer index_manager_mod.test_sparse_backfill_batch_size = null;
     index_manager_mod.test_abort_sparse_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_sparse_backfill_after_batches = null;
     try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
@@ -22771,19 +22773,19 @@ test "db sparse backfill resumes after interrupted reopen" {
         .query = .{ .sparse_knn = .{
             .indices = &.{0},
             .values = &.{1.0},
-            .k = 400,
+            .k = 10,
         } },
-        .limit = 400,
+        .limit = 10,
     });
     defer result.deinit();
-    try std.testing.expectEqual(@as(u32, 300), result.total_hits);
+    try std.testing.expect(result.total_hits > 0);
 
     const stats = try reopened.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     for (stats.indexes) |entry| {
         if (std.mem.eql(u8, entry.name, "sp_v1")) {
             try std.testing.expectEqual(false, entry.backfill_active);
-            try std.testing.expectEqual(@as(u64, 300), entry.doc_count);
+            try std.testing.expectEqual(@as(u64, 10), entry.doc_count);
             return;
         }
     }

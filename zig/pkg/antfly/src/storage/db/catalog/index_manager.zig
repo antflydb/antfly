@@ -91,6 +91,7 @@ const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
 const sparse_backfill_batch_size: usize = 1024;
+pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 
 pub const ManagedIndexRef = struct {
@@ -5539,7 +5540,7 @@ pub const IndexManager = struct {
         }
 
         var flushed_batches: usize = 0;
-        var backfilled_doc_count: u64 = 0;
+        var backfilled_doc_count: u64 = entry.index.doc_count;
         var saw_visible_doc = false;
         var max_flushed_key: ?[]const u8 = null;
 
@@ -5575,6 +5576,7 @@ pub const IndexManager = struct {
             }
         }.run;
 
+        const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
         for (docs) |doc| {
             if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
             if (resume_from) |resume_key| {
@@ -5584,7 +5586,8 @@ pub const IndexManager = struct {
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, doc.value, entry.field_name)) orelse continue;
-            errdefer sparse_vec.deinit(self.alloc);
+            var sparse_vec_owned = true;
+            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
             saw_visible_doc = true;
             if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
                 max_flushed_key = doc.key;
@@ -5596,7 +5599,8 @@ pub const IndexManager = struct {
                     .values = sparse_vec.values,
                 },
             });
-            if (writes.items.len >= sparse_backfill_batch_size) {
+            sparse_vec_owned = false;
+            if (writes.items.len >= backfill_batch_size) {
                 try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
             }
         }
@@ -6179,7 +6183,8 @@ pub const IndexManager = struct {
             }
             const extract_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, write.value, entry.field_name)) orelse continue;
-            errdefer sparse_vec.deinit(self.alloc);
+            var sparse_vec_owned = true;
+            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
             if (profile_enabled) {
                 profile.extract_ns += platform_time.monotonicNs() - extract_start_ns;
                 profile.extracted += 1;
@@ -6193,6 +6198,7 @@ pub const IndexManager = struct {
                     .values = sparse_vec.values,
                 },
             });
+            sparse_vec_owned = false;
             if (profile_enabled) profile.append_ns += platform_time.monotonicNs() - append_start_ns;
         }
         if (profile_enabled) profile.scan_ns = platform_time.monotonicNs() - scan_start_ns -| profile.extract_ns -| profile.append_ns;

@@ -11296,7 +11296,7 @@ test "api http server serves runtime schema debug on table and index detail" {
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_index.value.debug.binding.index_name);
     try std.testing.expectEqualStrings("read", parsed_index.value.debug.binding.schema_slot.?);
     try std.testing.expect(parsed_index.value.debug.binding.runtime_schema != null);
-    try std.testing.expect(Helpers.hasAnalyzer(parsed_index.value.debug.binding.runtime_schema.?, "search_as_you_type"));
+    try std.testing.expect(Helpers.hasAnalyzer(parsed_index.value.debug.binding.runtime_schema.?, "search_as_you_type_index_prefix"));
 }
 
 test "api http server serves table index metadata routes" {
