@@ -45,6 +45,7 @@ pub fn makeRootBuildOptions(
     with_tla: bool,
     link_libc: bool,
     swarm_runtime_focused_test: bool,
+    antfly_version: []const u8,
 ) *std.Build.Step.Options {
     const options = b.addOptions();
     options.addOption([]const u8, "lmdb_backend", @tagName(backend));
@@ -54,6 +55,7 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "link_libc", link_libc);
     options.addOption(bool, "swarm_runtime_focused_test", swarm_runtime_focused_test);
     options.addOption(bool, "bench_minimal_deps", false);
+    options.addOption([]const u8, "antfly_version", antfly_version);
     return options;
 }
 
