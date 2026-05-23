@@ -1784,18 +1784,16 @@ pub fn parseQueryRequest(
         }
     }
 
-    var parse_options: std.json.ParseOptions = .{};
     const has_internal_shard_fields = try queryBodyHasInternalShardFields(alloc, body);
     const has_public_doc_filter_bindings = try queryBodyHasPublicDocFilterBindings(alloc, body);
-    if (has_internal_shard_fields or has_public_doc_filter_bindings) {
-        // Internal shard fanout forwards precomputed execution hints outside the
-        // public OpenAPI contract; ignore just enough schema strictness to accept
-        // those fields. Public document-set bindings are parsed from the raw
-        // body below because `with` is not in the generated OpenAPI struct yet.
-        parse_options.ignore_unknown_fields = true;
-    }
+    const contract_body = try queryBodyForGeneratedContractAlloc(alloc, body, .{
+        .strip_internal_shard_fields = has_internal_shard_fields,
+        .strip_public_doc_filter_bindings = has_public_doc_filter_bindings,
+    });
+    defer if (contract_body) |owned| alloc.free(owned);
+    const body_for_contract = contract_body orelse body;
 
-    var parsed = ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, parse_options) catch return error.InvalidQueryRequest;
+    var parsed = ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body_for_contract, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     const request = parsed.value;
 
@@ -4565,6 +4563,32 @@ fn queryBodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !
     return objectHasInternalShardField(parsed.value.object);
 }
 
+const QueryContractStripOptions = struct {
+    strip_internal_shard_fields: bool = false,
+    strip_public_doc_filter_bindings: bool = false,
+};
+
+fn queryBodyForGeneratedContractAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    options: QueryContractStripOptions,
+) !?[]u8 {
+    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings) return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+
+    if (options.strip_public_doc_filter_bindings) {
+        _ = parsed.value.object.orderedRemove("with");
+    }
+    if (options.strip_internal_shard_fields) {
+        removeInternalShardFields(&parsed.value.object);
+    }
+
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
 fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
     const internal_fields = [_][]const u8{
         "_distributed_text_stats",
@@ -4581,6 +4605,23 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
         if (object.get(field) != null) return true;
     }
     return false;
+}
+
+fn removeInternalShardFields(object: *std.json.ObjectMap) void {
+    const internal_fields = [_][]const u8{
+        "_distributed_text_stats",
+        "native_doc_id_constraints",
+        "_filter_query_json",
+        "_exclusion_query_json",
+        "_identity_read_generation",
+        db_mod.doc_filter_wire.field_name,
+        "_filter_doc_ids",
+        "_filter_doc_ids_positive",
+        "_exclude_doc_ids",
+    };
+    inline for (internal_fields) |field| {
+        _ = object.orderedRemove(field);
+    }
 }
 
 fn parsePublicDocFilterBindingsAlloc(
@@ -5156,8 +5197,17 @@ test "api query contract parses public with document filter bindings" {
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
 }
 
-test "api query contract rejects doc identity control fields when with relaxes schema" {
+test "api query contract keeps generated schema strict when with is present" {
     const alloc = std.testing.allocator;
+    const unknown_body =
+        \\{
+        \\  "with": {"visible": {"match_all": {}}},
+        \\  "not_a_query_field": true,
+        \\  "query": {"match_all": {}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unknown_body));
+
     const generation_body =
         \\{
         \\  "with": {"visible": {"match_all": {}}},
@@ -5200,6 +5250,19 @@ test "api query contract public parser rejects internal shard doc identity contr
     try std.testing.expectEqual(@as(usize, 1), internal.req.filter_doc_ids.len);
     try std.testing.expectEqualStrings("doc:a", internal.req.filter_doc_ids[0]);
     try std.testing.expectEqual(@as(?u64, 7), internal.req.identity_read_generation);
+
+    const internal_unknown_body =
+        \\{
+        \\  "query": {"match_all": {}},
+        \\  "native_doc_id_constraints": {
+        \\    "positive_filter": true,
+        \\    "include_doc_ids": ["doc:a"],
+        \\    "exclude_doc_ids": []
+        \\  },
+        \\  "not_a_query_field": true
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", internal_unknown_body));
 
     const resolved_filter_body =
         \\{

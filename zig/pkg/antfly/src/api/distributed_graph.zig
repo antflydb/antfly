@@ -2023,15 +2023,13 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
     errdefer if (parsed_filter) |*filter| filter.deinit(alloc);
     if (parsed.value._resolved_doc_filter) |value| {
         parsed_filter = try db_mod.doc_filter_wire.parseFilterEnvelopeAlloc(alloc, value);
-        if (parsed.value.identity_read_generation) |generation| {
-            if (generation != parsed_filter.?.context.identity_read_generation) return error.InvalidQueryRequest;
-        }
     }
+    const identity_read_generation = try identityGenerationFromResolvedFilterEnvelope(parsed.value.identity_read_generation, if (parsed_filter) |*filter| filter else null);
 
     const out = GraphHydrateRequest{
         .keys = try dupKeys(alloc, parsed.value.keys),
         .topology_epoch = parsed.value.topology_epoch,
-        .identity_read_generation = parsed.value.identity_read_generation,
+        .identity_read_generation = identity_read_generation,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
         .resolved_doc_filter_owned = parsed_filter != null,
         .resolved_doc_filter_wire_context = if (parsed_filter) |filter| filter.context else null,
@@ -2055,6 +2053,18 @@ pub fn parseGraphHydrateResponse(alloc: std.mem.Allocator, body: []const u8) !Gr
         else
             @constCast((&[_]db_mod.types.SearchHit{})[0..]),
     };
+}
+
+fn identityGenerationFromResolvedFilterEnvelope(
+    explicit_generation: ?u64,
+    parsed_filter: ?*const db_mod.doc_filter_wire.ParsedResolvedDocFilter,
+) !?u64 {
+    const filter = parsed_filter orelse return explicit_generation;
+    if (explicit_generation) |generation| {
+        if (generation != filter.context.identity_read_generation) return error.InvalidQueryRequest;
+        return generation;
+    }
+    return filter.context.identity_read_generation;
 }
 
 pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest) ![]u8 {
@@ -3105,10 +3115,8 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
     errdefer if (parsed_filter) |*filter| filter.deinit(alloc);
     if (parsed.value._resolved_doc_filter) |value| {
         parsed_filter = try db_mod.doc_filter_wire.parseFilterEnvelopeAlloc(alloc, value);
-        if (parsed.value.identity_read_generation) |generation| {
-            if (generation != parsed_filter.?.context.identity_read_generation) return error.InvalidQueryRequest;
-        }
     }
+    const identity_read_generation = try identityGenerationFromResolvedFilterEnvelope(parsed.value.identity_read_generation, if (parsed_filter) |*filter| filter else null);
 
     const out = GraphExpandRequest{
         .name = try alloc.dupe(u8, parsed.value.name),
@@ -3118,7 +3126,7 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
         .exclude_edges = try dupKeys(alloc, parsed.value.exclude_edges),
         .target_constraint_keys = target_constraint_keys,
         .topology_epoch = parsed.value.topology_epoch,
-        .identity_read_generation = parsed.value.identity_read_generation,
+        .identity_read_generation = identity_read_generation,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
         .resolved_doc_filter_owned = parsed_filter != null,
         .resolved_doc_filter_wire_context = if (parsed_filter) |filter| filter.context else null,
@@ -4165,6 +4173,22 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expectEqual(@as(f64, 9.5), search_req.graph_queries[0].query.params.max_weight);
     try std.testing.expect(search_req.graph_queries[0].query.params.algebraic_semiring);
 
+    const generation_field = "\"identity_read_generation\":12345,";
+    const expand_generation_pos = std.mem.indexOf(u8, encoded, generation_field) orelse return error.TestUnexpectedResult;
+    const expand_without_top_generation = try alloc.alloc(u8, encoded.len - generation_field.len);
+    defer alloc.free(expand_without_top_generation);
+    @memcpy(expand_without_top_generation[0..expand_generation_pos], encoded[0..expand_generation_pos]);
+    @memcpy(expand_without_top_generation[expand_generation_pos..], encoded[expand_generation_pos + generation_field.len ..]);
+    var parsed_expand_from_envelope = try parseGraphExpandRequest(alloc, expand_without_top_generation);
+    defer parsed_expand_from_envelope.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 12345), parsed_expand_from_envelope.identity_read_generation);
+
+    const mismatch_pos = std.mem.indexOf(u8, encoded, "\"identity_read_generation\":12345") orelse return error.TestUnexpectedResult;
+    const mismatched_expand = try alloc.dupe(u8, encoded);
+    defer alloc.free(mismatched_expand);
+    mismatched_expand[mismatch_pos + "\"identity_read_generation\":1234".len] = '6';
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphExpandRequest(alloc, mismatched_expand));
+
     var hydrate_req = GraphHydrateRequest{
         .keys = try dupKeys(alloc, &.{"doc:b"}),
         .topology_epoch = 11,
@@ -4181,6 +4205,22 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(parsed_hydrate.resolved_doc_filter != null);
     try std.testing.expect(parsed_hydrate.resolved_doc_filter_owned);
     try std.testing.expect(parsed_hydrate.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
+    try std.testing.expectEqual(@as(?u64, 12345), parsed_hydrate.identity_read_generation);
+
+    const hydrate_generation_pos = std.mem.indexOf(u8, hydrate_encoded, generation_field) orelse return error.TestUnexpectedResult;
+    const hydrate_without_top_generation = try alloc.alloc(u8, hydrate_encoded.len - generation_field.len);
+    defer alloc.free(hydrate_without_top_generation);
+    @memcpy(hydrate_without_top_generation[0..hydrate_generation_pos], hydrate_encoded[0..hydrate_generation_pos]);
+    @memcpy(hydrate_without_top_generation[hydrate_generation_pos..], hydrate_encoded[hydrate_generation_pos + generation_field.len ..]);
+    var parsed_hydrate_from_envelope = try parseGraphHydrateRequest(alloc, hydrate_without_top_generation);
+    defer parsed_hydrate_from_envelope.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 12345), parsed_hydrate_from_envelope.identity_read_generation);
+
+    const mismatched_hydrate_pos = std.mem.indexOf(u8, hydrate_encoded, "\"identity_read_generation\":12345") orelse return error.TestUnexpectedResult;
+    const mismatched_hydrate = try alloc.dupe(u8, hydrate_encoded);
+    defer alloc.free(mismatched_hydrate);
+    mismatched_hydrate[mismatched_hydrate_pos + "\"identity_read_generation\":1234".len] = '6';
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphHydrateRequest(alloc, mismatched_hydrate));
 
     parsed.tensor_access_path.?.law_ids[0] = .count;
     try std.testing.expectError(error.InvalidQueryRequest, validateGraphExpandTensorAccessPath(alloc, parsed));

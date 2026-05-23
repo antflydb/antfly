@@ -9893,6 +9893,7 @@ fn parseTextStatsRequest(
         else
             null;
         errdefer if (resolved_doc_filter) |*filter| filter.deinit(alloc);
+        const identity_read_generation = try identityGenerationFromTextStatsResolvedFilter(parsed.value._identity_read_generation, if (resolved_doc_filter) |*filter| filter else null);
         const items = try alloc.alloc(OwnedTextStatsFieldRequest, fields_value.len);
         var initialized: usize = 0;
         errdefer {
@@ -9918,7 +9919,7 @@ fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .explicit_fields = .{
-            .identity_read_generation = parsed.value._identity_read_generation,
+            .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
         } };
@@ -9929,6 +9930,7 @@ fn parseTextStatsRequest(
         else
             null;
         errdefer if (resolved_doc_filter) |*filter| filter.deinit(alloc);
+        const identity_read_generation = try identityGenerationFromTextStatsResolvedFilter(parsed.value._identity_read_generation, if (resolved_doc_filter) |*filter| filter else null);
         const items = try alloc.alloc(OwnedBackgroundTextStatsFieldRequest, fields_value.len);
         var initialized: usize = 0;
         errdefer {
@@ -9956,12 +9958,24 @@ fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .background_fields = .{
-            .identity_read_generation = parsed.value._identity_read_generation,
+            .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
         } };
     }
     return error.InvalidQueryRequest;
+}
+
+fn identityGenerationFromTextStatsResolvedFilter(
+    explicit_generation: ?u64,
+    resolved_doc_filter: ?*const db_mod.doc_filter_wire.ParsedResolvedDocFilter,
+) !?u64 {
+    const filter = resolved_doc_filter orelse return explicit_generation;
+    if (explicit_generation) |generation| {
+        if (generation != filter.context.identity_read_generation) return error.InvalidQueryRequest;
+        return generation;
+    }
+    return filter.context.identity_read_generation;
 }
 
 fn parseAlgebraicPartialsRequest(
@@ -15223,6 +15237,62 @@ test "explicit text stats requests preserve identity generation" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    const envelope_only_explicit =
+        \\{
+        \\  "_resolved_doc_filter": {
+        \\    "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+        \\    "identity_read_generation": 44,
+        \\    "include": {"kind": "ordinals", "values": [1]},
+        \\    "exclude": {"kind": "none"}
+        \\  },
+        \\  "fields": [{"index_name":"text_v1","field":"body","terms":["alpha"]}]
+        \\}
+    ;
+    var parsed_envelope_only_explicit = try parseTextStatsRequest(alloc, "docs", envelope_only_explicit);
+    defer parsed_envelope_only_explicit.deinit(alloc);
+    switch (parsed_envelope_only_explicit) {
+        .explicit_fields => |parsed| {
+            try std.testing.expectEqual(@as(?u64, 44), parsed.identity_read_generation);
+            try std.testing.expect(parsed.resolved_doc_filter != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const envelope_only_background =
+        \\{
+        \\  "_resolved_doc_filter": {
+        \\    "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+        \\    "identity_read_generation": 45,
+        \\    "include": {"kind": "ordinals", "values": [1]},
+        \\    "exclude": {"kind": "none"}
+        \\  },
+        \\  "background_fields": [{"aggregation_name":"sig","index_name":"text_v1","field":"body","terms":["alpha"],"background_query":{"match_all":{}}}]
+        \\}
+    ;
+    var parsed_envelope_only_background = try parseTextStatsRequest(alloc, "docs", envelope_only_background);
+    defer parsed_envelope_only_background.deinit(alloc);
+    switch (parsed_envelope_only_background) {
+        .background_fields => |parsed| {
+            try std.testing.expectEqual(@as(?u64, 45), parsed.identity_read_generation);
+            try std.testing.expect(parsed.resolved_doc_filter != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const mismatched_envelope_generation =
+        \\{
+        \\  "_identity_read_generation": 46,
+        \\  "_resolved_doc_filter": {
+        \\    "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+        \\    "identity_read_generation": 47,
+        \\    "include": {"kind": "ordinals", "values": [1]},
+        \\    "exclude": {"kind": "none"}
+        \\  },
+        \\  "fields": [{"index_name":"text_v1","field":"body","terms":["alpha"]}]
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(alloc, "docs", mismatched_envelope_generation));
 }
 
 test "explicit text stats requests carry resolved doc filters and apply exact projection" {
