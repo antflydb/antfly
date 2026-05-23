@@ -403,6 +403,12 @@ pub const IndexSnapshot = struct {
     }
 
     pub fn docNumsForOrdinalsAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: []const u32) ![]u32 {
+        if (ordinals.len == 0) return try alloc.alloc(u32, 0);
+        const sorted_ordinals = try alloc.dupe(u32, ordinals);
+        defer alloc.free(sorted_ordinals);
+        std.mem.sort(u32, sorted_ordinals, {}, u32LessThan);
+        const unique_ordinals = sorted_ordinals[0..uniqueSortedU32(sorted_ordinals)];
+
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
 
@@ -414,9 +420,9 @@ pub const IndexSnapshot = struct {
                     if (deleted.contains(local_doc)) continue;
                 }
                 const ordinal = (try seg.reader.docOrdinal(local_doc)) orelse continue;
-                if (!containsOrdinal(ordinals, ordinal)) continue;
+                if (!containsSortedU32(unique_ordinals, ordinal)) continue;
                 const global_doc = doc_offset + local_doc;
-                if (!containsDocNum(out.items, global_doc)) try out.append(alloc, global_doc);
+                try out.append(alloc, global_doc);
             }
             doc_offset += seg.reader.doc_count;
         }
@@ -430,7 +436,7 @@ pub const IndexSnapshot = struct {
 
         for (doc_nums) |doc_num| {
             const ordinal = (try self.docOrdinal(doc_num)) orelse return null;
-            if (!containsOrdinal(out.items, ordinal)) try out.append(alloc, ordinal);
+            try out.append(alloc, ordinal);
         }
 
         return try out.toOwnedSlice(alloc);
@@ -522,11 +528,27 @@ fn containsOrdinal(ordinals: []const u32, expected: u32) bool {
     return false;
 }
 
-fn containsDocNum(doc_nums: []const u32, expected: u32) bool {
-    for (doc_nums) |doc_num| {
-        if (doc_num == expected) return true;
+fn u32LessThan(_: void, left: u32, right: u32) bool {
+    return left < right;
+}
+
+fn uniqueSortedU32(values: []u32) usize {
+    if (values.len == 0) return 0;
+    var out: usize = 1;
+    for (values[1..]) |value| {
+        if (value == values[out - 1]) continue;
+        values[out] = value;
+        out += 1;
     }
-    return false;
+    return out;
+}
+
+fn containsSortedU32(values: []const u32, expected: u32) bool {
+    return std.sort.binarySearch(u32, values, expected, compareU32) != null;
+}
+
+fn compareU32(expected: u32, item: u32) std.math.Order {
+    return std.math.order(expected, item);
 }
 
 /// Coordinates writes and maintains the current snapshot.

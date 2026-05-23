@@ -957,6 +957,7 @@ fn runHandlerBench(
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, handler_stats);
+    try enforceSymbolicResultFillGuardrail(cfg, handler_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
     const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
 
@@ -1147,6 +1148,7 @@ fn runLocalBench(
     std.debug.print("public-query guardrail stage=http-query\n", .{});
     const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, http_stats);
+    try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
     const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
@@ -1969,6 +1971,28 @@ fn accumulateParsedResponseNoProfile(parsed: QueryResponseWire, raw_body: []cons
     }
 }
 
+fn enforceSymbolicResultFillGuardrail(cfg: Config, stats: QueryBenchStats) !void {
+    if (!cfg.query_shape.usesFilter()) return;
+    if (cfg.k == 0 or cfg.queries == 0 or cfg.repeats == 0) return;
+    const expected = expectedSymbolicMatchStats(cfg);
+    if (expected.min < cfg.k) return;
+
+    const expected_returned: u64 = @intCast(cfg.queries * cfg.repeats * cfg.k);
+    if (stats.response_hit_count >= expected_returned) return;
+
+    std.debug.print(
+        "public-query guardrail failed: symbolic result underfilled query_shape={s} returned={d} expected_at_least={d} expected_match_min={d} k={d}\n",
+        .{
+            cfg.query_shape.text(),
+            stats.response_hit_count,
+            expected_returned,
+            expected.min,
+            cfg.k,
+        },
+    );
+    return error.SymbolicResultFillGuardrailFailed;
+}
+
 fn enforceGuardrails(cfg: Config, polls: PollStats) !void {
     const health_ms = @divTrunc(polls.health_max_latency_ns, std.time.ns_per_ms);
     const metrics_ms = @divTrunc(polls.metrics_max_latency_ns, std.time.ns_per_ms);
@@ -2108,6 +2132,7 @@ fn runSwarmBench(
     std.debug.print("public-query guardrail stage=http-query\n", .{});
     const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, http_stats);
+    try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
     const concurrent = try benchConcurrentHttpWithPolling(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, index_status_uri, cfg, child.id);
     try maybeRunHttpSearchThreadSweep(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, index_status_uri, cfg, child.id);

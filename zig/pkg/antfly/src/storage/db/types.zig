@@ -939,6 +939,9 @@ pub const SearchRequest = struct {
     // Internal execution hook. Public callers should use raw document IDs,
     // filter JSON, or named bindings instead of constructing this pointer.
     resolved_doc_filter: ?*const anyopaque = null,
+    // Internal text-index execution hook. This is request-local state used to
+    // avoid converting text-native doc nums through shard ordinals and back.
+    resolved_text_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     identity_read_generation: ?u64 = null,

@@ -79,6 +79,14 @@ pub const Stats = struct {
     complete: bool = false,
 };
 
+const VisibilitySummary = struct {
+    live_ordinals: u64 = 0,
+    tombstone_ordinals: u64 = 0,
+    max_created_generation: u64 = 0,
+    min_deleted_generation: u64 = 0,
+    max_deleted_generation: u64 = 0,
+};
+
 pub fn canonicalDocId(table_id: u64, shard_id: u64, doc_id: []const u8) u64 {
     return canonicalDocIdForNamespace(.{ .table_id = table_id, .shard_id = shard_id }, doc_id);
 }
@@ -191,6 +199,36 @@ fn decodeNamespace(raw: []const u8) !Namespace {
         .shard_id = std.mem.readInt(u64, raw[8..16], .big),
         .range_id = if (raw.len == 24) std.mem.readInt(u64, raw[16..24], .big) else 0,
     };
+}
+
+fn encodeVisibilitySummary(summary: VisibilitySummary) [40]u8 {
+    var buf: [40]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], summary.live_ordinals, .big);
+    std.mem.writeInt(u64, buf[8..16], summary.tombstone_ordinals, .big);
+    std.mem.writeInt(u64, buf[16..24], summary.max_created_generation, .big);
+    std.mem.writeInt(u64, buf[24..32], summary.min_deleted_generation, .big);
+    std.mem.writeInt(u64, buf[32..40], summary.max_deleted_generation, .big);
+    return buf;
+}
+
+fn decodeVisibilitySummary(raw: []const u8) !VisibilitySummary {
+    if (raw.len != 40) return error.InvalidDocIdentity;
+    return .{
+        .live_ordinals = std.mem.readInt(u64, raw[0..8], .big),
+        .tombstone_ordinals = std.mem.readInt(u64, raw[8..16], .big),
+        .max_created_generation = std.mem.readInt(u64, raw[16..24], .big),
+        .min_deleted_generation = std.mem.readInt(u64, raw[24..32], .big),
+        .max_deleted_generation = std.mem.readInt(u64, raw[32..40], .big),
+    };
+}
+
+fn readVisibilitySummaryTxn(txn: anytype) !?VisibilitySummary {
+    const mutable_txn = txn;
+    const raw = mutable_txn.get(internal_keys.identity_visibility_summary_key[0..]) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try decodeVisibilitySummary(raw);
 }
 
 pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
@@ -310,6 +348,15 @@ pub fn ensureOrdinalForNamespaceTxn(
             .created_generation = generation,
         };
         if (existing_state == null or state.deleted_generation != null) {
+            if (try readVisibilitySummaryTxn(mutable_txn)) |summary_before| {
+                var summary = summary_before;
+                if (state.deleted_generation != null) {
+                    noteSummaryResurrect(&summary, generation);
+                } else {
+                    noteSummaryLiveCreate(&summary, generation);
+                }
+                try writeVisibilitySummaryTxn(mutable_txn, summary);
+            }
             state.created_generation = generation;
             state.deleted_generation = null;
             try writeOrdinalStateTxn(mutable_txn, ordinal, state);
@@ -334,6 +381,11 @@ pub fn ensureOrdinalForNamespaceTxn(
     try writeOrdinalDocMappingTxn(mutable_txn, ordinal, doc_id);
     try writeOrdinalStateTxn(mutable_txn, ordinal, state);
     try writeCanonicalOrdinalMappingTxn(mutable_txn, state.canonical_doc_id, ordinal);
+    if (try readVisibilitySummaryTxn(mutable_txn)) |summary_before| {
+        var summary = summary_before;
+        noteSummaryLiveCreate(&summary, generation);
+        try writeVisibilitySummaryTxn(mutable_txn, summary);
+    }
     return .{
         .ordinal = ordinal,
         .canonical_doc_id = state.canonical_doc_id,
@@ -346,6 +398,11 @@ pub fn markDeletedTxn(alloc: Allocator, txn: anytype, generation: u64, doc_id: [
     const ordinal = (try lookupOrdinalTxn(alloc, mutable_txn, doc_id)) orelse return;
     var state = (try lookupStateTxn(mutable_txn, ordinal)) orelse return;
     if (state.deleted_generation == null) {
+        if (try readVisibilitySummaryTxn(mutable_txn)) |summary_before| {
+            var summary = summary_before;
+            noteSummaryDelete(&summary, generation);
+            try writeVisibilitySummaryTxn(mutable_txn, summary);
+        }
         state.deleted_generation = generation;
         try writeOrdinalStateTxn(mutable_txn, ordinal, state);
     }
@@ -401,6 +458,17 @@ pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {
         .next_ordinal = next,
         .allocated_ordinals = if (next > 0) next - 1 else 0,
     };
+}
+
+pub fn allVisibleFromSummaryFast(store: *docstore_mod.DocStore, generation: ?u64) !?bool {
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const summary = (try readVisibilitySummaryTxn(&txn)) orelse return null;
+    if (summary.tombstone_ordinals != 0) return false;
+    if (generation) |at| {
+        if (summary.max_created_generation > at) return false;
+    }
+    return true;
 }
 
 pub fn fullStatsFromStore(store: *docstore_mod.DocStore) !Stats {
@@ -862,11 +930,17 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
     var txn = try store.beginProbeTxn();
     defer txn.abort();
 
-    if (try loadNamespaceTxn(&txn)) |stored_namespace| {
-        if (!stored_namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
-    } else {
+    const missing_namespace = blk: {
+        if (try loadNamespaceTxn(&txn)) |stored_namespace| {
+            if (!stored_namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+            break :blk false;
+        }
         try appendNamespaceWrite(alloc, out, namespace);
-    }
+        break :blk true;
+    };
+
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    var visibility_summary_dirty = visibility_summary != null and missing_namespace;
 
     var seen_upserts = std.StringHashMapUnmanaged(void).empty;
     defer seen_upserts.deinit(alloc);
@@ -888,6 +962,14 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
                 .created_generation = generation,
             };
             if (existing_state == null or state.deleted_generation != null) {
+                if (visibility_summary) |*summary| {
+                    if (state.deleted_generation != null) {
+                        noteSummaryResurrect(summary, generation);
+                    } else {
+                        noteSummaryLiveCreate(summary, generation);
+                    }
+                    visibility_summary_dirty = true;
+                }
                 state.created_generation = generation;
                 state.deleted_generation = null;
                 try appendOrdinalStateWrite(alloc, out, ordinal, state);
@@ -911,6 +993,10 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
             .canonical_doc_id = canonical_doc_id,
             .created_generation = generation,
         };
+        if (visibility_summary) |*summary| {
+            noteSummaryLiveCreate(summary, generation);
+            visibility_summary_dirty = true;
+        }
         try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
         try upsert_states.put(alloc, ordinal, state);
     }
@@ -927,6 +1013,10 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
             .created_generation = generation,
         };
         if (state.deleted_generation == null) {
+            if (visibility_summary) |*summary| {
+                noteSummaryDelete(summary, generation);
+                visibility_summary_dirty = true;
+            }
             state.deleted_generation = generation;
             try appendOrdinalStateWrite(alloc, out, ordinal, state);
         }
@@ -934,6 +1024,9 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
 
     if (reserved_new_ordinal) {
         try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    }
+    if (visibility_summary_dirty) {
+        try appendVisibilitySummaryWrite(alloc, out, visibility_summary.?);
     }
 }
 
@@ -995,6 +1088,7 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     if (identityLookupsContainDuplicateKeys(canonical_lookups)) return false;
     if (!missing_namespace and try anyIdentityLookupExists(alloc, &txn, canonical_lookups)) return false;
 
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
     if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
     var next_ordinal = try readNextOrdinalTxn(&txn);
     const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
@@ -1005,9 +1099,11 @@ fn appendBatchIdentityMetadataAllNewFastPath(
             .canonical_doc_id = canonicalDocIdForNamespace(namespace, doc_id),
             .created_generation = generation,
         };
+        if (visibility_summary) |*summary| noteSummaryLiveCreate(summary, generation);
         try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
     }
     try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    if (visibility_summary) |summary| try appendVisibilitySummaryWrite(alloc, out, summary);
     return true;
 }
 
@@ -1133,6 +1229,25 @@ fn appendIdentityWritesForLiveDoc(
     try appendCanonicalOrdinalWrite(alloc, writes, state.canonical_doc_id, ordinal);
 }
 
+fn noteSummaryLiveCreate(summary: *VisibilitySummary, generation: u64) void {
+    summary.live_ordinals += 1;
+    summary.max_created_generation = @max(summary.max_created_generation, generation);
+}
+
+fn noteSummaryResurrect(summary: *VisibilitySummary, generation: u64) void {
+    noteSummaryLiveCreate(summary, generation);
+    if (summary.tombstone_ordinals > 0) summary.tombstone_ordinals -= 1;
+}
+
+fn noteSummaryDelete(summary: *VisibilitySummary, generation: u64) void {
+    if (summary.live_ordinals > 0) summary.live_ordinals -= 1;
+    summary.tombstone_ordinals += 1;
+    if (summary.min_deleted_generation == 0 or generation < summary.min_deleted_generation) {
+        summary.min_deleted_generation = generation;
+    }
+    summary.max_deleted_generation = @max(summary.max_deleted_generation, generation);
+}
+
 fn appendOrdinalStateWrite(
     alloc: Allocator,
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -1160,6 +1275,24 @@ fn appendCanonicalOrdinalWrite(
         .key = try alloc.dupe(u8, canonical_key[0..]),
         .value = value,
     });
+}
+
+fn appendVisibilitySummaryWrite(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    summary: VisibilitySummary,
+) !void {
+    const encoded_summary = encodeVisibilitySummary(summary);
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, internal_keys.identity_visibility_summary_key[0..]),
+        .value = try alloc.dupe(u8, encoded_summary[0..]),
+    });
+}
+
+fn writeVisibilitySummaryTxn(txn: anytype, summary: VisibilitySummary) !void {
+    const mutable_txn = txn;
+    const encoded_summary = encodeVisibilitySummary(summary);
+    try mutable_txn.put(internal_keys.identity_visibility_summary_key[0..], encoded_summary[0..]);
 }
 
 fn appendNextOrdinalWrite(
@@ -1453,6 +1586,10 @@ test "batch identity metadata persists ordinal mappings and delete generations" 
     );
     try store.putBatchWithReplay(null, first_writes.items, &.{}, null);
 
+    try std.testing.expectEqual(@as(?bool, true), try allVisibleFromSummaryFast(&store, null));
+    try std.testing.expectEqual(@as(?bool, true), try allVisibleFromSummaryFast(&store, 10));
+    try std.testing.expectEqual(@as(?bool, false), try allVisibleFromSummaryFast(&store, 9));
+
     {
         var txn = try store.beginProbeTxn();
         defer txn.abort();
@@ -1474,6 +1611,8 @@ test "batch identity metadata persists ordinal mappings and delete generations" 
         &.{"doc\x00b"},
     );
     try store.putBatchWithReplay(null, second_writes.items, &.{}, null);
+
+    try std.testing.expectEqual(@as(?bool, false), try allVisibleFromSummaryFast(&store, null));
 
     var verify_txn = try store.beginProbeTxn();
     defer verify_txn.abort();

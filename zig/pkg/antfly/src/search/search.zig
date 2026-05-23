@@ -141,6 +141,9 @@ pub const SearchRequest = struct {
     graph_searches: []const NamedGraphQuery = &.{},
     expand_strategy: graph_query.ExpandStrategy = .@"union",
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    filter_doc_nums_positive: bool = false,
+    exclude_doc_nums: []const u32 = &.{},
 };
 
 pub const SearchQuery = union(enum) {
@@ -1237,6 +1240,9 @@ const FastTermState = struct {
 const FastTopK = struct {
     alloc: Allocator,
     k: u32,
+    filter_doc_nums: []const u32 = &.{},
+    filter_doc_nums_positive: bool = false,
+    exclude_doc_nums: []const u32 = &.{},
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
     total_count: u32 = 0,
 
@@ -1245,8 +1251,15 @@ const FastTopK = struct {
     }
 
     fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
+        if (!self.allows(doc_id)) return;
         self.total_count += 1;
         try scorer_mod.insertTopK(self.alloc, &self.hits, self.k, .{ .doc_id = doc_id, .score = score });
+    }
+
+    fn allows(self: *const FastTopK, doc_id: u32) bool {
+        if (self.filter_doc_nums_positive and !containsSortedU32(self.filter_doc_nums, doc_id)) return false;
+        if (containsSortedU32(self.exclude_doc_nums, doc_id)) return false;
+        return true;
     }
 
     fn finish(self: *FastTopK) ![]scorer_mod.ScoredHit {
@@ -1254,6 +1267,14 @@ const FastTopK = struct {
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
 };
+
+fn containsSortedU32(items: []const u32, value: u32) bool {
+    return std.sort.binarySearch(u32, items, value, compareU32) != null;
+}
+
+fn compareU32(expected: u32, item: u32) std.math.Order {
+    return std.math.order(expected, item);
+}
 
 fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTextTerm), query: SearchQuery) !bool {
     switch (query) {
@@ -1527,7 +1548,13 @@ fn executeSimpleTextBool(
         return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
     }
 
-    var collector = FastTopK{ .alloc = alloc, .k = effectiveK(request, snap) };
+    var collector = FastTopK{
+        .alloc = alloc,
+        .k = effectiveK(request, snap),
+        .filter_doc_nums = request.filter_doc_nums,
+        .filter_doc_nums_positive = request.filter_doc_nums_positive,
+        .exclude_doc_nums = request.exclude_doc_nums,
+    };
     defer collector.deinit();
 
     const avg_dl = snap.textAvgDocLen(text_field);

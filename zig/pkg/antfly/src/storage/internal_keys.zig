@@ -38,6 +38,7 @@ pub const identity_ordinal_state_kind: u8 = 0x03;
 pub const identity_canonical_to_ordinal_kind: u8 = 0x04;
 pub const identity_namespace_key = [_]u8{ identity_namespace, 0xff, 0x00 };
 pub const identity_next_ordinal_key = [_]u8{ identity_namespace, 0xff, 0x01 };
+pub const identity_visibility_summary_key = [_]u8{ identity_namespace, 0xff, 0x02 };
 
 pub fn isInternalMetadataKey(key: []const u8) bool {
     if (key.len == 0) return false;

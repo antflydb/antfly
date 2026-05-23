@@ -8256,6 +8256,8 @@ pub const DB = struct {
         _ = exec_ctx;
         return try db_query_search.searchComposed(alloc, req, .{
             .ctx = self,
+            .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
+            .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
             .search_text_query = searchTextQueryCallback,
             .search_text = searchTextComposedCallback,
             .search_dense = searchDenseComposedCallback,
@@ -8264,6 +8266,41 @@ pub const DB = struct {
             .fuse_named_sets = fuseNamedSetsCallback,
             .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
+        });
+    }
+
+    fn resolveStructuredDocFilterForComposedCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) anyerror!?doc_set.ResolvedDocFilter {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = req.identity_read_generation,
+        });
+    }
+
+    fn resolveStructuredTextDocFilterForComposedCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) anyerror!?db_query_search.ResolvedTextDocNumFilter {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .all_docs_visible = allDocsVisibleCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = req.identity_read_generation,
         });
     }
 
@@ -8608,15 +8645,41 @@ pub const DB = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try self.allDocsVisibleAtGeneration(generation)) {
+            return try doc_set.cloneAlloc(alloc, set);
+        }
         if (set.* == .all) {
-            const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
-            const generation_covers_all_creates = if (generation) |at|
-                identity_stats.max_created_generation <= at
-            else
-                true;
-            if (identity_stats.complete and identity_stats.tombstone_ordinals == 0 and generation_covers_all_creates) return .all;
+            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
         }
         return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+    }
+
+    fn allDocsVisibleCallback(
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.allDocsVisibleAtGeneration(generation);
+    }
+
+    fn allDocsVisibleFastCallback(
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return (try doc_identity.allVisibleFromSummaryFast(self.core.store, generation)) orelse false;
+    }
+
+    fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
+        if (try doc_identity.allVisibleFromSummaryFast(self.core.store, generation)) |all_visible| {
+            if (all_visible) return true;
+        }
+        const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
+        const generation_covers_all_creates = if (generation) |at|
+            identity_stats.max_created_generation <= at
+        else
+            true;
+        return identity_stats.complete and identity_stats.tombstone_ordinals == 0 and generation_covers_all_creates;
     }
 
     fn denseVectorIdsForOrdinalsCallback(
@@ -8649,6 +8712,7 @@ pub const DB = struct {
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
+            .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
@@ -8683,6 +8747,7 @@ pub const DB = struct {
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
+            .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,

@@ -269,6 +269,10 @@ pub const DenseSearchExecutor = struct {
         index_name: []const u8,
         ordinals: []const u32,
     ) anyerror![]u64 = null,
+    all_docs_visible_fast: ?*const fn (
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool = null,
     lookup_doc_ordinal: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -337,6 +341,7 @@ pub const DenseSearchProfile = struct {
 
     total_ns: u64 = 0,
     index_lookup_ns: u64 = 0,
+    constraint_ns: u64 = 0,
     hbc_search_ns: u64 = 0,
     hbc_runtime_txn_ns: u64 = 0,
     hbc_scratch_acquire_ns: u64 = 0,
@@ -531,6 +536,16 @@ pub const MatchAllCandidateCollector = struct {
 
 pub const ComposedSearchExecutor = struct {
     ctx: ?*anyopaque,
+    resolve_structured_doc_filter: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) anyerror!?doc_set.ResolvedDocFilter = null,
+    resolve_structured_text_doc_filter: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) anyerror!?ResolvedTextDocNumFilter = null,
     search_text_query: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -579,6 +594,31 @@ pub const ComposedSearchExecutor = struct {
         base: *types.SearchResult,
         named_sets: []const graph_exec.NamedResultSet,
     ) anyerror!void,
+};
+
+const TextDocNumSet = union(enum) {
+    all,
+    none,
+    doc_nums: []const u32,
+
+    fn deinit(self: *TextDocNumSet, alloc: Allocator) void {
+        switch (self.*) {
+            .doc_nums => |items| if (items.len > 0) alloc.free(@constCast(items)),
+            .all, .none => {},
+        }
+        self.* = .none;
+    }
+};
+
+pub const ResolvedTextDocNumFilter = struct {
+    include: TextDocNumSet = .all,
+    exclude: TextDocNumSet = .none,
+
+    pub fn deinit(self: *ResolvedTextDocNumFilter, alloc: Allocator) void {
+        self.include.deinit(alloc);
+        self.exclude.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub fn searchLookupOptions(req: types.SearchRequest) types.LookupOptions {
@@ -819,6 +859,13 @@ pub fn searchComposed(
     req: types.SearchRequest,
     executor: ComposedSearchExecutor,
 ) !types.SearchResult {
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const composed_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    var text_ns: u64 = 0;
+    var dense_ns: u64 = 0;
+    var sparse_ns: u64 = 0;
+    var fuse_ns: u64 = 0;
+    var graph_ns: u64 = 0;
     var named_sets = std.ArrayListUnmanaged(graph_exec.NamedResultSet).empty;
     defer named_sets.deinit(alloc);
     var owned_results = std.ArrayListUnmanaged(types.SearchResult).empty;
@@ -834,11 +881,34 @@ pub fn searchComposed(
         }
         owned_resolved_sets.deinit(alloc);
     }
+    var shared_filter: ?doc_set.ResolvedDocFilter = if (executor.resolve_structured_doc_filter) |resolve|
+        try resolve(executor.ctx, alloc, req)
+    else
+        null;
+    defer if (shared_filter) |*filter| filter.deinit(alloc);
+    var shared_text_filter: ?ResolvedTextDocNumFilter = if (executor.resolve_structured_text_doc_filter) |resolve|
+        try resolve(executor.ctx, alloc, req)
+    else
+        null;
+    defer if (shared_text_filter) |*filter| filter.deinit(alloc);
 
-    if (req.full_text_queries.len == 0) {
-        if (req.full_text) |text| {
-            const text_result = try executor.search_text_query(executor.ctx, alloc, req, text);
-            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, text_result.hits);
+    var shared_req = req;
+    if (shared_filter) |*filter| {
+        shared_req.resolved_doc_filter = filter;
+        shared_req.resolved_doc_filter_owned = false;
+        shared_req.filter_query_json = "";
+        shared_req.exclusion_query_json = "";
+    }
+    if (shared_text_filter) |*filter| {
+        shared_req.resolved_text_doc_filter = filter;
+    }
+
+    if (shared_req.full_text_queries.len == 0) {
+        if (shared_req.full_text) |text| {
+            const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+            const text_result = try executor.search_text_query(executor.ctx, alloc, shared_req, text);
+            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = "$full_text_results",
                 .hits = text_result.hits,
@@ -846,9 +916,11 @@ pub fn searchComposed(
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
-        } else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) {
-            const text_result = try executor.search_text(executor.ctx, alloc, req);
-            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, text_result.hits);
+        } else if (!isDefaultMatchAll(shared_req.query) and isTextQuery(shared_req.query)) {
+            const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+            const text_result = try executor.search_text(executor.ctx, alloc, shared_req);
+            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = "$full_text_results",
                 .hits = text_result.hits,
@@ -858,11 +930,13 @@ pub fn searchComposed(
             try owned_results.append(alloc, text_result);
         }
     } else {
-        for (req.full_text_queries) |full_text_query| {
-            var text_req = req;
+        for (shared_req.full_text_queries) |full_text_query| {
+            var text_req = shared_req;
             text_req.index_name = full_text_query.index_name;
+            const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
-            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, text_result.hits);
+            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = full_text_query.name,
                 .hits = text_result.hits,
@@ -873,22 +947,29 @@ pub fn searchComposed(
         }
     }
 
-    if (req.dense_queries.len == 0 and req.dense != null) {
-        const dense_result = try executor.search_dense(executor.ctx, alloc, req, req.dense.?);
-        const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, dense_result.hits);
+    var vector_req = shared_req;
+    vector_req.full_text = null;
+
+    if (vector_req.dense_queries.len == 0 and vector_req.dense != null) {
+        const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        const dense_result = try executor.search_dense(executor.ctx, alloc, vector_req, vector_req.dense.?);
+        if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+        const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
         try named_sets.append(alloc, .{
-            .name = if (req.sparse == null) "$embeddings_results" else "dense",
+            .name = if (vector_req.sparse == null) "$embeddings_results" else "dense",
             .hits = dense_result.hits,
             .total_hits = dense_result.total_hits,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, dense_result);
     } else {
-        for (req.dense_queries) |dense_query| {
-            var dense_req = req;
+        for (vector_req.dense_queries) |dense_query| {
+            var dense_req = vector_req;
             dense_req.index_name = dense_query.index_name;
+            const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const dense_result = try executor.search_dense(executor.ctx, alloc, dense_req, dense_query.query);
-            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, dense_result.hits);
+            if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
             try named_sets.append(alloc, .{
                 .name = dense_query.name,
                 .hits = dense_result.hits,
@@ -899,22 +980,26 @@ pub fn searchComposed(
         }
     }
 
-    if (req.sparse_queries.len == 0 and req.sparse != null) {
-        const sparse_result = try executor.search_sparse(executor.ctx, alloc, req, req.sparse.?);
-        const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, sparse_result.hits);
+    if (vector_req.sparse_queries.len == 0 and vector_req.sparse != null) {
+        const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        const sparse_result = try executor.search_sparse(executor.ctx, alloc, vector_req, vector_req.sparse.?);
+        if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+        const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
         try named_sets.append(alloc, .{
-            .name = if (req.dense == null) "$embeddings_results" else "sparse",
+            .name = if (vector_req.dense == null) "$embeddings_results" else "sparse",
             .hits = sparse_result.hits,
             .total_hits = sparse_result.total_hits,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, sparse_result);
     } else {
-        for (req.sparse_queries) |sparse_query| {
-            var sparse_req = req;
+        for (vector_req.sparse_queries) |sparse_query| {
+            var sparse_req = vector_req;
             sparse_req.index_name = sparse_query.index_name;
+            const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const sparse_result = try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
-            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, sparse_result.hits);
+            if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+            const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
             try named_sets.append(alloc, .{
                 .name = sparse_query.name,
                 .hits = sparse_result.hits,
@@ -925,15 +1010,17 @@ pub fn searchComposed(
         }
     }
 
+    const fuse_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
-    else if (named_sets.items.len == 1 and req.merge_config == null)
-        try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], req.include_stored)
+    else if (named_sets.items.len == 1 and shared_req.merge_config == null)
+        try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], shared_req.include_stored)
     else
-        try executor.fuse_named_sets(executor.ctx, alloc, req, named_sets.items);
+        try executor.fuse_named_sets(executor.ctx, alloc, shared_req, named_sets.items);
+    if (bench_query_profile) fuse_ns = platform_time.monotonicNs() - fuse_start_ns;
     errdefer base.deinit();
 
-    const fused_resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, &owned_resolved_sets, base.hits);
+    const fused_resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, base.hits);
     try named_sets.append(alloc, .{
         .name = "$fused_results",
         .hits = base.hits,
@@ -941,10 +1028,28 @@ pub fn searchComposed(
         .resolved_doc_set = fused_resolved_doc_set,
     });
 
-    try appendEmbeddingsResultAlias(alloc, req, executor, &named_sets, &owned_results, &owned_resolved_sets);
+    try appendEmbeddingsResultAlias(alloc, shared_req, executor, &named_sets, &owned_results, &owned_resolved_sets);
 
-    if (req.graph_queries.len > 0) {
-        try executor.attach_graph_results(executor.ctx, alloc, req, &base, named_sets.items);
+    if (shared_req.graph_queries.len > 0) {
+        const graph_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        try executor.attach_graph_results(executor.ctx, alloc, shared_req, &base, named_sets.items);
+        if (bench_query_profile) graph_ns = platform_time.monotonicNs() - graph_start_ns;
+    }
+    if (bench_query_profile) {
+        std.log.info(
+            "antfly_bench_composed_query text_us={d} dense_us={d} sparse_us={d} fuse_us={d} graph_us={d} total_us={d} named_sets={d} hits={d} total_hits={d}",
+            .{
+                nsToUs(text_ns),
+                nsToUs(dense_ns),
+                nsToUs(sparse_ns),
+                nsToUs(fuse_ns),
+                nsToUs(graph_ns),
+                nsToUs(platform_time.monotonicNs() - composed_start_ns),
+                named_sets.items.len,
+                base.hits.len,
+                base.total_hits,
+            },
+        );
     }
     return base;
 }
@@ -1110,7 +1215,7 @@ const NativeDocIdConstraints = struct {
     }
 };
 
-const StructuredFilterResolverExecutor = struct {
+pub const StructuredFilterResolverExecutor = struct {
     ctx: ?*anyopaque,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
@@ -1134,6 +1239,10 @@ const StructuredFilterResolverExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    all_docs_visible: ?*const fn (
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool = null,
     lookup_doc_nums_for_ordinals: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1147,6 +1256,83 @@ const StructuredFilterResolverExecutor = struct {
     apply_live_all_docs: bool = false,
     identity_read_generation: ?u64 = null,
 };
+
+pub fn resolveStructuredDocFilterForComposedAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+) !?doc_set.ResolvedDocFilter {
+    if (req.resolved_doc_filter != null) return null;
+    if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return null;
+
+    var active_executor = executor;
+    if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
+    var cache = StructuredFilterDocSetCache{};
+    defer cache.deinit(alloc);
+
+    var out = doc_set.ResolvedDocFilter{};
+    errdefer out.deinit(alloc);
+    var changed = false;
+
+    if (req.filter_query_json.len > 0) {
+        var include = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.filter_query_json)) orelse return null;
+        defer include.deinit(alloc);
+        var next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
+        errdefer next_include.deinit(alloc);
+        out.include.deinit(alloc);
+        out.include = next_include;
+        changed = true;
+    }
+
+    if (req.exclusion_query_json.len > 0) {
+        var exclude = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.exclusion_query_json)) orelse return null;
+        defer exclude.deinit(alloc);
+        var next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
+        errdefer next_exclude.deinit(alloc);
+        out.exclude.deinit(alloc);
+        out.exclude = next_exclude;
+        changed = true;
+    }
+
+    return if (changed) out else null;
+}
+
+pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+) !?ResolvedTextDocNumFilter {
+    if (req.resolved_doc_filter != null) return null;
+    if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return null;
+
+    var active_executor = executor;
+    if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
+    const all_visible = if (active_executor.all_docs_visible) |visible|
+        try visible(active_executor.ctx, active_executor.identity_read_generation)
+    else
+        false;
+    if (!all_visible) return null;
+
+    var out = ResolvedTextDocNumFilter{};
+    errdefer out.deinit(alloc);
+    var changed = false;
+
+    if (req.filter_query_json.len > 0) {
+        const include = (try collectStructuredFilterTextDocNumsAlloc(alloc, req, active_executor, req.filter_query_json)) orelse return null;
+        out.include.deinit(alloc);
+        out.include = include;
+        changed = true;
+    }
+
+    if (req.exclusion_query_json.len > 0) {
+        const exclude = (try collectStructuredFilterTextDocNumsAlloc(alloc, req, active_executor, req.exclusion_query_json)) orelse return null;
+        out.exclude.deinit(alloc);
+        out.exclude = exclude;
+        changed = true;
+    }
+
+    return if (changed) out else null;
+}
 
 const StructuredFilterDocSetCache = struct {
     const Entry = struct {
@@ -1305,6 +1491,10 @@ fn deriveNativeDocIdConstraintsAlloc(
     req: types.SearchRequest,
     executor: StructuredFilterResolverExecutor,
 ) !NativeDocIdConstraints {
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const total_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    var filter_json_ns: u64 = 0;
+    var exclusion_json_ns: u64 = 0;
     var active_executor = executor;
     if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
     var out = NativeDocIdConstraints{};
@@ -1384,6 +1574,7 @@ fn deriveNativeDocIdConstraintsAlloc(
     }
 
     if (req.filter_query_json.len > 0) {
+        const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         if (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &structured_filter_doc_sets, req.filter_query_json)) |resolved| {
             var owned_resolved = resolved;
             defer owned_resolved.deinit(alloc);
@@ -1449,9 +1640,11 @@ fn deriveNativeDocIdConstraintsAlloc(
                 out.exclude_doc_ids_owned = true;
             }
         }
+        if (bench_query_profile) filter_json_ns += platform_time.monotonicNs() - phase_start_ns;
     }
 
     if (req.exclusion_query_json.len > 0) {
+        const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         if (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &structured_filter_doc_sets, req.exclusion_query_json)) |resolved| {
             var owned_resolved = resolved;
             defer owned_resolved.deinit(alloc);
@@ -1493,12 +1686,28 @@ fn deriveNativeDocIdConstraintsAlloc(
                 }
             }
         }
+        if (bench_query_profile) exclusion_json_ns += platform_time.monotonicNs() - phase_start_ns;
     }
 
     if (active_executor.apply_live_all_docs and !out.positive_filter) {
         try applyLiveAllDocFilterToNativeConstraintsAlloc(alloc, &out, active_executor);
     }
 
+    if (bench_query_profile) {
+        std.log.info(
+            "antfly_bench_doc_constraints total_us={d} filter_json_us={d} exclusion_json_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} exclude_doc_nums={d} exclude_doc_ids={d}",
+            .{
+                nsToUs(platform_time.monotonicNs() - total_start_ns),
+                nsToUs(filter_json_ns),
+                nsToUs(exclusion_json_ns),
+                out.positive_filter,
+                out.filter_doc_nums.len,
+                out.filter_doc_ids.len,
+                out.exclude_doc_nums.len,
+                out.exclude_doc_ids.len,
+            },
+        );
+    }
     return out;
 }
 
@@ -1521,6 +1730,64 @@ fn collectFullTextResolvedDocSetAlloc(
 fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
     const ptr = req.resolved_doc_filter orelse return null;
     return @ptrCast(@alignCast(ptr));
+}
+
+fn resolvedTextDocNumFilterFromRequest(req: types.SearchRequest) ?*const ResolvedTextDocNumFilter {
+    const ptr = req.resolved_text_doc_filter orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn applyResolvedTextDocNumFilterAlloc(
+    alloc: Allocator,
+    out: *NativeDocIdConstraints,
+    filter: *const ResolvedTextDocNumFilter,
+) !void {
+    switch (filter.exclude) {
+        .all => {
+            markNativeDocIdConstraintsEmpty(out, alloc);
+            return;
+        },
+        .none => {},
+        .doc_nums => {},
+    }
+    switch (filter.include) {
+        .none => {
+            markNativeDocIdConstraintsEmpty(out, alloc);
+            return;
+        },
+        .all => {},
+        .doc_nums => |doc_nums| {
+            const owned = try alloc.dupe(u32, doc_nums);
+            if (out.positive_filter and out.filter_doc_nums.len > 0) {
+                const intersected = try intersectDocNumsAlloc(alloc, out.filter_doc_nums, owned);
+                if (out.filter_doc_nums_owned and out.filter_doc_nums.len > 0) alloc.free(@constCast(out.filter_doc_nums));
+                alloc.free(owned);
+                out.filter_doc_nums = intersected;
+            } else {
+                out.filter_doc_nums = owned;
+            }
+            out.filter_doc_nums_owned = true;
+            out.positive_filter = true;
+            out.resolved_stored_filters = true;
+        },
+    }
+
+    switch (filter.exclude) {
+        .all, .none => {},
+        .doc_nums => |doc_nums| {
+            const owned = try alloc.dupe(u32, doc_nums);
+            if (out.exclude_doc_nums.len > 0) {
+                const merged = try unionDocNumsAlloc(alloc, out.exclude_doc_nums, owned);
+                if (out.exclude_doc_nums_owned and out.exclude_doc_nums.len > 0) alloc.free(@constCast(out.exclude_doc_nums));
+                alloc.free(owned);
+                out.exclude_doc_nums = merged;
+            } else {
+                out.exclude_doc_nums = owned;
+            }
+            out.exclude_doc_nums_owned = true;
+            out.resolved_stored_filters = true;
+        },
+    }
 }
 
 fn applyResolvedDocFilterAlloc(
@@ -1910,6 +2177,37 @@ fn collectSearchQueryResolvedDocSetAlloc(
     return try resolve(executor.ctx, alloc, doc_ids.items, executor.identity_read_generation);
 }
 
+fn collectStructuredFilterTextDocNumsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    filter_query_json: []const u8,
+) !?TextDocNumSet {
+    const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
+
+    const snapshot = text_entry.persistent.snapshot();
+    if (!(try searchQueryCanUseSnapshot(
+        snapshot,
+        search_query,
+        text_entry.text_analysis,
+        text_entry.runtime_schema,
+    ))) return null;
+
+    const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
+    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    if (doc_nums.len == 0) {
+        alloc.free(doc_nums);
+        return .none;
+    }
+    return .{ .doc_nums = doc_nums };
+}
+
 fn resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(
     alloc: Allocator,
     snapshot: *const index_mod.IndexSnapshot,
@@ -1929,17 +2227,11 @@ fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
     doc_nums: []const u32,
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocSet {
+    _ = executor;
     const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums)) orelse return null;
     defer alloc.free(ordinals);
     if (ordinals.len == 0) return null;
-
-    var resolved = try doc_set.fromOrdinalsAlloc(alloc, ordinals);
-    errdefer resolved.deinit(alloc);
-    if (executor.live_filter_doc_set) |live_filter| {
-        defer resolved.deinit(alloc);
-        return try live_filter(executor.ctx, alloc, &resolved, executor.identity_read_generation);
-    }
-    return resolved;
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
 }
 
 fn collectStructuredFilterResolvedDocSetCachedAlloc(
@@ -2099,21 +2391,56 @@ fn intersectDocIdsAlloc(alloc: Allocator, left: []const []const u8, right: []con
 }
 
 fn unionDocNumsAlloc(alloc: Allocator, left: []const u32, right: []const u32) ![]const u32 {
-    var out = std.ArrayListUnmanaged(u32).empty;
-    errdefer out.deinit(alloc);
-    for (left) |doc_num| try appendDocNum(alloc, &out, doc_num);
-    for (right) |doc_num| try appendDocNum(alloc, &out, doc_num);
-    return try out.toOwnedSlice(alloc);
+    var out = try alloc.alloc(u32, left.len + right.len);
+    errdefer alloc.free(out);
+    @memcpy(out[0..left.len], left);
+    @memcpy(out[left.len..], right);
+    std.mem.sort(u32, out, {}, u32LessThan);
+    const unique_len = uniqueSortedU32(out);
+    return try alloc.realloc(out, unique_len);
 }
 
 fn intersectDocNumsAlloc(alloc: Allocator, left: []const u32, right: []const u32) ![]const u32 {
+    if (left.len == 0 or right.len == 0) return try alloc.alloc(u32, 0);
+    var sorted_right = try alloc.dupe(u32, right);
+    defer alloc.free(sorted_right);
+    std.mem.sort(u32, sorted_right, {}, u32LessThan);
+    const unique_right = sorted_right[0..uniqueSortedU32(sorted_right)];
+
+    var sorted_left = try alloc.dupe(u32, left);
+    defer alloc.free(sorted_left);
+    std.mem.sort(u32, sorted_left, {}, u32LessThan);
+    const unique_left = sorted_left[0..uniqueSortedU32(sorted_left)];
+
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
-    for (left) |doc_num| {
-        if (!containsDocNum(right, doc_num)) continue;
-        try appendDocNum(alloc, &out, doc_num);
+    for (unique_left) |doc_num| {
+        if (containsSortedU32(unique_right, doc_num)) try out.append(alloc, doc_num);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn u32LessThan(_: void, left: u32, right: u32) bool {
+    return left < right;
+}
+
+fn uniqueSortedU32(values: []u32) usize {
+    if (values.len == 0) return 0;
+    var out: usize = 1;
+    for (values[1..]) |value| {
+        if (value == values[out - 1]) continue;
+        values[out] = value;
+        out += 1;
+    }
+    return out;
+}
+
+fn containsSortedU32(values: []const u32, expected: u32) bool {
+    return std.sort.binarySearch(u32, values, expected, compareU32) != null;
+}
+
+fn compareU32(expected: u32, item: u32) std.math.Order {
+    return std.math.order(expected, item);
 }
 
 fn appendDocNum(alloc: Allocator, out: *std.ArrayListUnmanaged(u32), doc_num: u32) !void {
@@ -2548,6 +2875,8 @@ fn deriveNativeDenseConstraintsAlloc(
         out.filter_ids = req.filter_ids;
     }
 
+    const apply_broad_live_docs = apply_live_all_docs and
+        !(try canSkipBroadLiveDenseConstraint(req, executor));
     var doc_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -2555,7 +2884,7 @@ fn deriveNativeDenseConstraintsAlloc(
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
-        .apply_live_all_docs = apply_live_all_docs,
+        .apply_live_all_docs = apply_broad_live_docs,
     });
     defer doc_constraints.deinit(alloc);
 
@@ -2604,6 +2933,15 @@ fn deriveNativeDenseConstraintsAlloc(
     }
     out.resolved_stored_filters = doc_constraints.resolved_stored_filters;
     return out;
+}
+
+fn canSkipBroadLiveDenseConstraint(req: types.SearchRequest, executor: DenseSearchExecutor) !bool {
+    _ = executor;
+    if (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) return false;
+    if (req.resolved_doc_filter != null) return false;
+    if (req.filter_doc_ids.len != 0 or req.exclude_doc_ids.len != 0) return false;
+    if (req.filter_ids.len != 0 or req.exclude_ids.len != 0 or req.filter_doc_ids_positive) return false;
+    return true;
 }
 
 fn mergeNativeExcludeIds(
@@ -2744,25 +3082,61 @@ fn denseVectorIdsForDocNumsAlloc(
 }
 
 fn intersectVectorIdsAlloc(alloc: Allocator, left: []const u64, right: []const u64) ![]u64 {
+    if (left.len == 0 or right.len == 0) return try alloc.alloc(u64, 0);
+    var sorted_right = try alloc.dupe(u64, right);
+    defer alloc.free(sorted_right);
+    std.mem.sort(u64, sorted_right, {}, u64LessThan);
+    const unique_right = sorted_right[0..uniqueSortedU64(sorted_right)];
+
+    var sorted_left = try alloc.dupe(u64, left);
+    defer alloc.free(sorted_left);
+    std.mem.sort(u64, sorted_left, {}, u64LessThan);
+    const unique_left = sorted_left[0..uniqueSortedU64(sorted_left)];
+
     var out = std.ArrayListUnmanaged(u64).empty;
     errdefer out.deinit(alloc);
-    for (left) |id| {
-        if (containsVectorId(right, id) and !containsVectorId(out.items, id)) try out.append(alloc, id);
+    for (unique_left) |id| {
+        if (containsSortedU64(unique_right, id)) try out.append(alloc, id);
     }
     return try out.toOwnedSlice(alloc);
 }
 
 fn unionVectorIdsAlloc(alloc: Allocator, left: []const u64, right: []const u64) ![]u64 {
-    var out = std.ArrayListUnmanaged(u64).empty;
-    errdefer out.deinit(alloc);
-    for (left) |id| if (!containsVectorId(out.items, id)) try out.append(alloc, id);
-    for (right) |id| if (!containsVectorId(out.items, id)) try out.append(alloc, id);
-    return try out.toOwnedSlice(alloc);
+    var out = try alloc.alloc(u64, left.len + right.len);
+    errdefer alloc.free(out);
+    @memcpy(out[0..left.len], left);
+    @memcpy(out[left.len..], right);
+    std.mem.sort(u64, out, {}, u64LessThan);
+    const unique_len = uniqueSortedU64(out);
+    return try alloc.realloc(out, unique_len);
 }
 
 fn containsVectorId(items: []const u64, id: u64) bool {
     for (items) |item| if (item == id) return true;
     return false;
+}
+
+fn u64LessThan(_: void, left: u64, right: u64) bool {
+    return left < right;
+}
+
+fn uniqueSortedU64(values: []u64) usize {
+    if (values.len == 0) return 0;
+    var out: usize = 1;
+    for (values[1..]) |value| {
+        if (value == values[out - 1]) continue;
+        values[out] = value;
+        out += 1;
+    }
+    return out;
+}
+
+fn containsSortedU64(values: []const u64, expected: u64) bool {
+    return std.sort.binarySearch(u64, values, expected, compareU64) != null;
+}
+
+fn compareU64(expected: u64, item: u64) std.math.Order {
+    return std.math.order(expected, item);
 }
 
 pub fn shouldGroupChunkParents(req: types.SearchRequest, is_chunk_backed: bool) bool {
@@ -2902,6 +3276,8 @@ pub fn searchTextQuery(
     text_query: types.TextQuery,
     executor: SearchTextQueryExecutor,
 ) !types.SearchResult {
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const total_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return switch (text_query) {
         .match_all => executor.search_match_all(executor.ctx, alloc, req),
         else => error.IndexNotFound,
@@ -2916,8 +3292,10 @@ pub fn searchTextQuery(
     const arena_alloc = arena.allocator();
     const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
     const snapshot = text_index.snapshot();
+    const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = req;
     constraint_req.resolved_doc_filter = null;
+    constraint_req.full_text = null;
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -2929,9 +3307,13 @@ pub fn searchTextQuery(
         .apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage(),
     });
     defer native_constraints.deinit(alloc);
+    const derive_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - constraints_start_ns else 0;
 
     const collect_all_hits = group_chunk_parents;
-    if (resolvedDocFilterFromRequest(req)) |filter| {
+    const resolved_filter_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    if (resolvedTextDocNumFilterFromRequest(req)) |filter| {
+        try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
+    } else if (resolvedDocFilterFromRequest(req)) |filter| {
         try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, filter, .{
             .ctx = executor.ctx,
             .text_index_entry = executor.text_index_entry,
@@ -2942,7 +3324,11 @@ pub fn searchTextQuery(
             .identity_read_generation = req.identity_read_generation,
         });
     }
+    const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
+    const convert_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     try convertNativeDocIdsToTextDocNumsAlloc(alloc, snapshot, &native_constraints);
+    try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
+    const convert_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - convert_start_ns else 0;
 
     if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
         return executor.postprocess(executor.ctx, alloc, req, .{
@@ -2952,8 +3338,9 @@ pub fn searchTextQuery(
             .graph_results = &.{},
         }, chunk_backed);
     }
-    const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints);
+    const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, req.count_only);
 
+    const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var result = if (req.count_only)
         try search_mod.executeCountCandidates(alloc, snapshot, search_query)
     else
@@ -2963,9 +3350,14 @@ pub fn searchTextQuery(
             .offset = if (collect_all_hits) 0 else paging.offset,
             .include_stored = req.include_stored,
             .distributed_text_stats = req.distributed_text_stats,
+            .filter_doc_nums = native_constraints.filter_doc_nums,
+            .filter_doc_nums_positive = native_constraints.positive_filter,
+            .exclude_doc_nums = native_constraints.exclude_doc_nums,
         });
     defer result.deinit();
+    const execute_ns = if (bench_query_profile) platform_time.monotonicNs() - execute_start_ns else 0;
 
+    const hits_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var hits = try alloc.alloc(types.SearchHit, result.hits.len);
     var initialized: usize = 0;
     var owns_hits = true;
@@ -3001,9 +3393,11 @@ pub fn searchTextQuery(
         };
         initialized += 1;
     }
+    const hits_ns = if (bench_query_profile) platform_time.monotonicNs() - hits_start_ns else 0;
 
     owns_hits = false;
-    return try executor.postprocess(executor.ctx, alloc, req, .{
+    const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    const out = try executor.postprocess(executor.ctx, alloc, req, .{
         .alloc = alloc,
         .hits = hits,
         .total_hits = result.total_hits,
@@ -3013,20 +3407,48 @@ pub fn searchTextQuery(
         },
         .graph_results = &.{},
     }, chunk_backed);
+    if (bench_query_profile) {
+        const postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
+        std.log.info(
+            "antfly_bench_text_query index={s} total_us={d} derive_constraints_us={d} apply_resolved_us={d} convert_constraints_us={d} execute_us={d} hits_us={d} postprocess_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} exclude_doc_nums={d} exclude_doc_ids={d} snapshot_docs={d} hits={d} total_hits={d}",
+            .{
+                req.index_name orelse "",
+                nsToUs(platform_time.monotonicNs() - total_start_ns),
+                nsToUs(derive_constraints_ns),
+                nsToUs(resolved_filter_ns),
+                nsToUs(convert_constraints_ns),
+                nsToUs(execute_ns),
+                nsToUs(hits_ns),
+                nsToUs(postprocess_ns),
+                native_constraints.positive_filter,
+                native_constraints.filter_doc_nums.len,
+                native_constraints.filter_doc_ids.len,
+                native_constraints.exclude_doc_nums.len,
+                native_constraints.exclude_doc_ids.len,
+                snapshot.global_doc_count,
+                out.hits.len,
+                out.total_hits,
+            },
+        );
+    }
+    return out;
 }
 
 fn textSearchQueryWithNativeDocIdsAlloc(
     alloc: Allocator,
     base: search_mod.SearchQuery,
     constraints: NativeDocIdConstraints,
+    include_doc_nums: bool,
 ) !search_mod.SearchQuery {
     const has_include_doc_ids = constraints.positive_filter and constraints.filter_doc_ids.len > 0;
-    const has_include_doc_nums = constraints.positive_filter and constraints.filter_doc_nums.len > 0;
+    const has_include_doc_nums = include_doc_nums and constraints.positive_filter and constraints.filter_doc_nums.len > 0;
     const has_exclude_doc_ids = constraints.exclude_doc_ids.len > 0;
-    const has_exclude_doc_nums = constraints.exclude_doc_nums.len > 0;
+    const has_exclude_doc_nums = include_doc_nums and constraints.exclude_doc_nums.len > 0;
+    const has_native_doc_nums = !include_doc_nums and
+        ((constraints.positive_filter and constraints.filter_doc_nums.len > 0) or constraints.exclude_doc_nums.len > 0);
     const has_include = has_include_doc_ids or has_include_doc_nums;
     const has_exclude = has_exclude_doc_ids or has_exclude_doc_nums;
-    if (!has_include and !has_exclude) return base;
+    if (!has_include and !has_exclude and !has_native_doc_nums) return base;
 
     const must_len: usize = 1 +
         @as(usize, if (has_include_doc_ids) 1 else 0) +
@@ -3102,6 +3524,35 @@ fn convertNativeDocIdsToTextDocNumsAlloc(
         if (constraints.exclude_doc_ids_owned) freeDocIdSlice(alloc, constraints.exclude_doc_ids);
         constraints.exclude_doc_ids = &.{};
         constraints.exclude_doc_ids_owned = false;
+    }
+}
+
+fn normalizeNativeDocNumConstraintsAlloc(
+    alloc: Allocator,
+    constraints: *NativeDocIdConstraints,
+) !void {
+    try normalizeNativeDocNumSliceAlloc(alloc, &constraints.filter_doc_nums, &constraints.filter_doc_nums_owned);
+    try normalizeNativeDocNumSliceAlloc(alloc, &constraints.exclude_doc_nums, &constraints.exclude_doc_nums_owned);
+}
+
+fn normalizeNativeDocNumSliceAlloc(
+    alloc: Allocator,
+    items: *[]const u32,
+    owned: *bool,
+) !void {
+    if (items.*.len == 0) return;
+    const mutable = if (owned.*)
+        @constCast(items.*)
+    else blk: {
+        const copy = try alloc.dupe(u32, items.*);
+        items.* = copy;
+        owned.* = true;
+        break :blk copy;
+    };
+    std.mem.sort(u32, mutable, {}, u32LessThan);
+    const unique_len = uniqueSortedU32(mutable);
+    if (unique_len != mutable.len) {
+        items.* = try alloc.realloc(mutable, unique_len);
     }
 }
 
@@ -3722,7 +4173,9 @@ fn searchDenseInternal(
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
     const paging = componentPaging(req);
     const index_stats = entry.index.stats();
+    const constraint_start = platform_time.monotonicNs();
     var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, req, executor, req.index_name orelse entry.config.name, true);
+    profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     defer native_constraints.deinit(alloc);
     const unresolved_stored_filters = hasStoredPatternFilters(req) and !native_constraints.resolved_stored_filters;
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
@@ -3996,7 +4449,7 @@ fn logBenchDenseQueryProfile(
 ) void {
     const estimated_leaves = estimateLeafCount(index_stats);
     std.log.info(
-        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} hbc_us={d} doc_key_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
+        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} constraint_us={d} hbc_us={d} doc_key_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
         .{
             req.index_name orelse "",
             req.primary_text_index_name orelse "",
@@ -4015,6 +4468,7 @@ fn logBenchDenseQueryProfile(
             profile.resolved_epsilon,
             nsToUs(profile.total_ns),
             nsToUs(profile.index_lookup_ns),
+            nsToUs(profile.constraint_ns),
             nsToUs(profile.hbc_search_ns),
             nsToUs(profile.doc_key_resolve_ns),
             nsToUs(profile.load_projected_document_ns),

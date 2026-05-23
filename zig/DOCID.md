@@ -1999,7 +1999,29 @@ Status as of 2026-05-19:
   dense/sparse native constraint path has the same representation check: a
   resolved ordinal include or exclusion must either lower to native document
   numbers or project back to public document IDs at the stamped generation, and
-  unsupported projections fail closed instead of widening the request. Graph
+  unsupported projections fail closed instead of widening the request. Composed
+  structured filters now additionally carry a request-local
+  text-doc-number sidecar for the full-text branch when the identity view is
+  known to be all-visible, avoiding a
+  text-doc-number -> shard-ordinal -> text-doc-number round trip while still
+  passing the shard-local `ResolvedDocFilter` to vector and graph consumers.
+  Dense primary indexes now also maintain an in-memory ordinal -> dense vector
+  ID cache populated only after successful mapping commits and cleared on
+  rebuild/reset. The persistent ordinal mapping remains the source of truth for
+  cold or reopened indexes, but hot composed filters can project ordinal
+  constraints to vector IDs without issuing tens of thousands of mapping reads.
+  The full-text scorer also accepts sorted native doc-number include/exclude
+  constraints on the request, so common term/match bool queries can stay on the
+  fast postings collector instead of compiling broad `doc_num` clauses into the
+  query tree. Dense standalone searches without explicit document filters no
+  longer pre-materialize a broad all-live-doc vector-ID filter; visibility is
+  left to normal result postprocessing unless the caller supplied a real
+  document constraint.
+  In the 100k `public-query-guardrail --mode handler
+  --query-shape hybrid-filter-exclude-project` profile, these changes moved the
+  handler path from roughly 570ms before this pass to roughly 55ms while
+  preserving the filled `k=20` correctness guardrail.
+  Graph
   `result_ref` projection from complete resolved document sets now carries the
   same stamped generation when translating ordinals back to graph document keys,
   and the DB projection helper fails closed if an ordinal is not visible at that
