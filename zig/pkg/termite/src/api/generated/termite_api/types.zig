@@ -137,11 +137,19 @@ pub const DocumentClassificationRequest = struct {
     /// Absolute or server-local path to the page image
     image_path: []const u8,
     /// Number of OCR/text tokens associated with the page
-    num_tokens: i64,
-    /// Labels in the same order expected by the checkpoint output head
-    labels: []const []const u8,
+    num_tokens: ?i64 = null,
+    /// OCR tokens and layout boxes used by full LayoutLMv3 inference. If omitted, the endpoint uses the legacy compact LayoutDoc head path.
+    tokens: ?[]const DocumentTokenBox = null,
+    /// Labels in the same order expected by the checkpoint output head. Full LayoutLMv3 bundles can omit this when label metadata is present.
+    labels: ?[]const []const u8 = null,
     /// Optional tensor prefix inside the safetensors checkpoint
     prefix: ?[]const u8 = null,
+    /// Inference mode: "auto", "layoutlmv3", or "layoutdoc_head".
+    mode: ?[]const u8 = null,
+    /// Backend preference for full LayoutLMv3 inference: "auto", "native", "metal", or "mlx".
+    backend: ?[]const u8 = null,
+    /// Optional max-length override for LayoutLMv3 preprocessing.
+    max_length: ?i64 = null,
 };
 
 pub const DocumentClassificationFeatures = struct {
@@ -599,6 +607,11 @@ pub const DocumentClassificationObject = struct {
     index: i64,
     checkpoint_path: []const u8,
     prefix: []const u8,
+    mode: ?[]const u8 = null,
+    backend: ?[]const u8 = null,
+    label_source: ?[]const u8 = null,
+    wordpiece_token_count: ?i64 = null,
+    truncated_token_count: ?i64 = null,
     input: std.json.Value,
     features: DocumentClassificationFeatures,
     best: ?std.json.Value = null,
@@ -608,11 +621,19 @@ pub const DocumentClassificationObject = struct {
 pub const DocumentTokenClassificationRequest = struct {
     /// Name or path of the document token classification model directory or checkpoint
     model: []const u8,
-    /// Labels in the same order expected by the checkpoint output head
-    labels: []const []const u8,
+    /// Absolute or server-local path to the page image. Required for full LayoutLMv3 mode.
+    image_path: ?[]const u8 = null,
+    /// Labels in the same order expected by the checkpoint output head. Full LayoutLMv3 bundles can omit this when label metadata is present.
+    labels: ?[]const []const u8 = null,
     tokens: []const DocumentTokenBox,
     /// Optional tensor prefix inside the safetensors checkpoint
     prefix: ?[]const u8 = null,
+    /// Inference mode: "auto", "layoutlmv3", or "layoutdoc_head".
+    mode: ?[]const u8 = null,
+    /// Backend preference for full LayoutLMv3 inference: "auto", "native", "metal", or "mlx".
+    backend: ?[]const u8 = null,
+    /// Optional max-length override for LayoutLMv3 preprocessing.
+    max_length: ?i64 = null,
 };
 
 pub const DocumentTokenClassificationPrediction = struct {
@@ -888,6 +909,11 @@ pub const DocumentTokenClassificationObject = struct {
     index: i64,
     checkpoint_path: []const u8,
     prefix: []const u8,
+    mode: ?[]const u8 = null,
+    backend: ?[]const u8 = null,
+    label_source: ?[]const u8 = null,
+    wordpiece_token_count: ?i64 = null,
+    truncated_token_count: ?i64 = null,
     num_tokens: i64,
     /// Each result is an array of ClassifyResult sorted by score descending.
     predictions: []const DocumentTokenClassificationPrediction,

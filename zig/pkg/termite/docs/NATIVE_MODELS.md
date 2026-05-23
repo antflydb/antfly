@@ -65,17 +65,26 @@ MLX_HOSTFILE=<path>
 
 ---
 
-## LayoutDoc Runtime
+## LayoutLMv3 / LayoutDoc Runtime
 
-The native LayoutDoc runtime loads `gopeft-zig` `layoutdoc_sequence_head.safetensors` and `layoutdoc_token_head.safetensors` artifacts and serves document classification over HTTP.
+The production document path is native LayoutLMv3 inference: image pixels, OCR
+tokens, and normalized bounding boxes are prepared in Zig and executed through
+the native session backend. The older `layoutdoc_sequence_head.safetensors` and
+`layoutdoc_token_head.safetensors` compact heads remain available as
+compatibility mode.
 
 ### What Is Implemented
 
+- Native LayoutLMv3 preprocessing from local image path, OCR tokens, and bboxes
+- Native LayoutLMv3 sequence-classification session execution
+- Native LayoutLMv3 token-classification session execution
+- Label discovery from `sequence_head_config.json`, `token_head_config.json`,
+  `id2label`, or `label2id`
 - Native `layoutdoc_sequence_head` checkpoint loading
 - Native `layoutdoc_token_head` checkpoint loading
-- Exact feature shape parity with `gopeft-zig`
-- Image-driven visual stats for the sequence head
-- OCR-token bbox feature reconstruction for the token head
+- Legacy compact-head feature shape parity with `gopeft-zig`
+- Legacy image-driven visual stats for the sequence head
+- Legacy OCR-token bbox feature reconstruction for the token head
 - JPEG and PNG image-path support
 
 ### HTTP API
@@ -87,14 +96,20 @@ The native LayoutDoc runtime loads `gopeft-zig` `layoutdoc_sequence_head.safeten
 Request:
 ```json
 {
-  "model": "acme/layoutdoc-invoice-sequence",
+  "model": "acme/layoutlmv3-invoice-sequence",
+  "mode": "layoutlmv3",
   "image_path": "/tmp/page.png",
-  "num_tokens": 42,
-  "labels": ["invoice", "form", "email"]
+  "tokens": [
+    { "text": "Invoice", "bbox": [0, 0, 120, 24] },
+    { "text": "Total", "bbox": [0, 40, 80, 64] }
+  ]
 }
 ```
 
-Response includes: resolved checkpoint path, extracted document classification features, best label, full score list.
+Response includes: resolved model path, preprocessing metadata, best label, and full score list.
+
+For legacy compact-head compatibility, use `mode: "layoutdoc_head"` and pass
+`num_tokens` plus labels in checkpoint output order.
 
 **Token classification:**
 
@@ -103,8 +118,9 @@ Response includes: resolved checkpoint path, extracted document classification f
 Request:
 ```json
 {
-  "model": "acme/layoutdoc-token-tags",
-  "labels": ["O", "B-KEY", "I-KEY"],
+  "model": "acme/layoutlmv3-token-tags",
+  "mode": "layoutlmv3",
+  "image_path": "/tmp/page.png",
   "tokens": [
     { "text": "Invoice", "bbox": [0, 0, 120, 24] },
     { "text": "Total", "bbox": [0, 40, 80, 64] }
@@ -112,68 +128,47 @@ Request:
 }
 ```
 
-Response includes: resolved checkpoint path, one prediction block per token, reconstructed token features, best label and full score list per token.
+Response includes: resolved model path and one prediction block per OCR token.
+
+For legacy compact-head compatibility, use `mode: "layoutdoc_head"` and pass
+labels in checkpoint output order.
 
 **Current endpoint constraints:**
-- Labels are caller-provided (the `gopeft-zig` checkpoint does not store the label vocabulary)
-- The sequence endpoint accepts a local `image_path`, not uploaded bytes
-- Token classification requires caller-provided OCR tokens and boxes
+- Full LayoutLMv3 mode requires caller-provided OCR tokens and boxes
+- Endpoints accept local `image_path`, not uploaded bytes
+- Legacy compact-head checkpoints still require caller-provided labels
 
-### Probe CLIs
-
-`probe-layoutdoc-sequence` and `probe-layoutdoc-token`
-
-Build:
+### Local Verification
 
 ```bash
-zigup run master build probe-layoutdoc-sequence
+zig build test-layoutlmv3-finetune -Donnx=false -Dmlx=false -Dsystem-blas=false
+zig build test -Donnx=false -Dmlx=false -Dsystem-blas=false
 ```
 
-Run:
+Inspect runtime bundle readiness:
 
 ```bash
-./zig-out/bin/probe-layoutdoc-sequence \
-  /tmp/layoutdoc_sequence_run \
-  /tmp/page.png \
-  42 \
-  invoice,form,email
+zig build finetune -- adapter inspect layoutlmv3-bundle \
+  /path/to/layoutlmv3_bundle \
+  /tmp/layoutlmv3_runtime_report.json
 ```
 
-Positional arguments:
-1. `model_dir_or_checkpoint`
-2. `image_path`
-3. `num_tokens`
-4. `label1,label2,...`
-5. `prefix` (optional; defaults to `layoutdoc_sequence_head`)
-
-The probe prints JSON with: resolved checkpoint path, extracted LayoutDoc features, best label, full score list.
-
-### Parity Fixtures
-
-Generate real parity fixtures from `gopeft-zig` checkpoints and local LayoutDoc data:
+Generate Hugging Face golden outputs for a real parity fixture:
 
 ```bash
-bash ./scripts/prepare_layoutdoc_parity.sh
+python3 scripts/generate_layoutlmv3_hf_parity.py \
+  --model-dir /path/to/layoutlmv3_bundle \
+  --image /tmp/page.png \
+  --tokens-json /tmp/page_tokens.json \
+  --task token \
+  --output /tmp/layoutlmv3_hf_golden.json
 ```
-
-That script:
-- Trains tiny real `gopeft-zig` LayoutDoc sequence and token heads when needed
-- Extracts one real sequence example and one real token example
-- Writes termite-compatible request fixtures under `/tmp/layoutdoc_termite_parity`
-- Attempts to run `probe-layoutdoc-sequence` and `probe-layoutdoc-token` if the `termite-zig` build is healthy
-
-Generated files:
-- `/tmp/layoutdoc_termite_parity/sequence_request.json`
-- `/tmp/layoutdoc_termite_parity/token_request.json`
-- `/tmp/layoutdoc_termite_parity/token_probe_tokens.json`
-- `/tmp/layoutdoc_termite_parity/parity_summary.json`
-- Optional probe outputs when the local `termite-zig` build succeeds
 
 ### Remaining Work
 
-1. Add parity fixtures using real `gopeft-zig` checkpoints and example pages
-2. Decide whether to keep the path-based sequence endpoint or add image-byte/content-part input
-3. Add OCR extraction / bbox-producing flow that can feed `classify_tokens` directly
+1. Check in small real Hugging Face parity fixture outputs for preprocessing and logits
+2. Add image-byte/content-part input
+3. Add OCR extraction / bbox-producing flow that can feed full LayoutLMv3 directly
 ```
 
 ---

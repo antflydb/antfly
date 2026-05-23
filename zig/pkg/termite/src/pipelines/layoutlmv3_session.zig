@@ -28,6 +28,7 @@ pub const SequenceResult = struct {
 
 pub const TokenPrediction = struct {
     token_index: usize,
+    source_token_index: ?usize = null,
     label: []const u8,
     score: f32,
     bbox: [4]i32,
@@ -140,6 +141,7 @@ pub fn classifyTokenPrepared(
         const base = idx * 4;
         predictions[out_idx] = .{
             .token_index = idx,
+            .source_token_index = if (prepared.source_token_indices[idx] >= 0) @intCast(prepared.source_token_indices[idx]) else null,
             .label = labels[best_idx],
             .score = best_score,
             .bbox = .{
@@ -555,12 +557,15 @@ fn fakePrepared(allocator: std.mem.Allocator) !document_prep.PreparedInputs {
             0, 0, 0, 0,
             0, 0, 0, 0,
         }),
+        .source_token_indices = try allocator.dupe(i32, &.{ -1, 0, 1, -1, -1, -1, -1, -1 }),
         .pixel_values = try allocator.alloc(f32, 3 * 224 * 224),
         .source_width = 224,
         .source_height = 224,
         .input_width = 224,
         .input_height = 224,
         .token_count = 2,
+        .consumed_source_token_count = 2,
+        .truncated_source_token_count = 0,
         .wordpiece_token_count = 4,
         .special_token_count = 6,
         .cls_token_id = 101,

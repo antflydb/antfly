@@ -16,6 +16,7 @@ const std = @import("std");
 const compat = @import("../../io/compat.zig");
 const manifest_mod = @import("../../models/manifest.zig");
 const c_file = @import("../../util/c_file.zig");
+const layoutlmv3_document = @import("../../pipelines/layoutlmv3_document.zig");
 
 const ConfigSummary = struct {
     model_type: ?[]const u8 = null,
@@ -72,6 +73,8 @@ pub fn main(init: std.process.Init) !void {
     const config = try loadOptionalJson(ConfigSummary, arena_alloc, model_dir, "config.json");
     const preprocessor = try loadOptionalJson(PreprocessorSummary, arena_alloc, model_dir, "preprocessor_config.json");
     const tokenizer = try loadOptionalJson(TokenizerSummary, arena_alloc, model_dir, "tokenizer_config.json");
+    var runtime_report = try layoutlmv3_document.inspectRuntimeBundle(allocator, model_dir);
+    defer runtime_report.deinit(allocator);
 
     const report = .{
         .task = "inspect_layoutlmv3_bundle",
@@ -106,6 +109,13 @@ pub fn main(init: std.process.Init) !void {
         .padding_side = if (tokenizer) |value| value.padding_side else null,
         .has_tokenizer = manifest.tokenizer_type != null,
         .has_merged_weights = manifest.safetensors_path != null or manifest.safetensors_index_path != null,
+        .runtime_ready = runtime_report.looks_like_full_bundle,
+        .runtime_has_preprocessor = runtime_report.has_preprocessor,
+        .runtime_has_sequence_labels = runtime_report.has_sequence_labels,
+        .runtime_has_token_labels = runtime_report.has_token_labels,
+        .runtime_label_source_sequence = runtime_report.label_source_sequence,
+        .runtime_label_source_token = runtime_report.label_source_token,
+        .runtime_missing_required = runtime_report.missing_required,
     };
 
     if (report_path) |path| {

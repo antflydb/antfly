@@ -42,6 +42,7 @@ const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
 const document_classification = @import("../pipelines/document_classification.zig");
 const document_token_classification = @import("../pipelines/document_token_classification.zig");
+const layoutlmv3_document = @import("../pipelines/layoutlmv3_document.zig");
 const graph_mod = @import("../graph/root.zig");
 const gliner_mod = @import("../pipelines/gliner.zig");
 const grammar_mod = @import("../pipelines/grammar.zig");
@@ -179,6 +180,52 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
     const now = embedTimingNowNs();
     const elapsed_us = if (now > start_ns) @divTrunc(now - start_ns, 1000) else 0;
     std.log.info("termite embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
+}
+
+const DocumentInferenceMode = enum {
+    auto,
+    layoutlmv3,
+    layoutdoc_head,
+};
+
+fn parseDocumentInferenceMode(value: ?[]const u8) ?DocumentInferenceMode {
+    const raw = value orelse return .auto;
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "layoutlmv3")) return .layoutlmv3;
+    if (std.mem.eql(u8, raw, "layoutdoc_head")) return .layoutdoc_head;
+    return null;
+}
+
+fn parseDocumentBackendChoice(value: ?[]const u8) ?native_backend_choice.Choice {
+    const choice = native_backend_choice.parse(value orelse "auto") orelse return null;
+    return switch (choice) {
+        .auto, .native, .metal, .mlx => choice,
+        .onnx, .cuda, .xla, .webgpu => null,
+    };
+}
+
+fn documentMaxLength(value: ?i64) !?usize {
+    const raw = value orelse return null;
+    if (raw <= 0) return error.InvalidMaxLength;
+    return std.math.cast(usize, raw) orelse error.InvalidMaxLength;
+}
+
+fn allocDocumentTokens(
+    allocator: std.mem.Allocator,
+    tokens: []const api.DocumentTokenBox,
+) ![]layoutlmv3_document.OcrToken {
+    const out = try allocator.alloc(layoutlmv3_document.OcrToken, tokens.len);
+    errdefer allocator.free(out);
+    for (tokens, 0..) |tok, idx| {
+        if (tok.bbox.len != 4) return error.InvalidBoundingBox;
+        var bbox: [4]i32 = undefined;
+        for (tok.bbox, 0..) |coord, ci| {
+            if (coord < 0 or coord > 1000) return error.InvalidBoundingBox;
+            bbox[ci] = std.math.cast(i32, coord) orelse return error.InvalidBoundingBox;
+        }
+        out[idx] = .{ .text = tok.text, .bbox = bbox };
+    }
+    return out;
 }
 
 fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
@@ -3208,6 +3255,108 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "classifiers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
+        const mode = parseDocumentInferenceMode(body.mode) orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mode must be auto, layoutlmv3, or layoutdoc_head" });
+        const use_layoutlmv3 = mode == .layoutlmv3 or
+            (mode == .auto and body.tokens != null and layoutlmv3_document.looksLikeFullBundle(ctx.allocator, model_path));
+        if (use_layoutlmv3) {
+            const request_tokens = body.tokens orelse
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "tokens are required for full LayoutLMv3 document classification" });
+            const tokens = allocDocumentTokens(ctx.allocator, request_tokens) catch |err| switch (err) {
+                error.InvalidBoundingBox => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "each token bbox must contain 4 integers in the 0..1000 range" }),
+                else => return ctx.status(500).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            };
+            defer ctx.allocator.free(tokens);
+            const max_length = documentMaxLength(body.max_length) catch
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "max_length must be a positive integer" });
+            const backend_choice = parseDocumentBackendChoice(body.backend) orelse
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "backend must be auto, native, metal, or mlx" });
+            native_backend_choice.validate(backend_choice) catch |err|
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
+
+            const model = if (backend_choice != .auto) blk: {
+                var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                native_backend_choice.configureSessionPreference(&request_session_manager, backend_choice);
+                break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            } else self.model_manager.loadFromDir(model_path) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+
+            var output = layoutlmv3_document.classifySequence(
+                ctx.allocator,
+                model.session,
+                model_path,
+                body.image_path,
+                tokens,
+                body.labels,
+                max_length,
+            ) catch |err| switch (err) {
+                error.NoLabelsProvided => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "labels are required when the LayoutLMv3 bundle does not provide label metadata" }),
+                error.LabelCountMismatch => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "label count does not match model output width" }),
+                error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            };
+            defer output.deinit();
+
+            var input_obj: std.json.ObjectMap = .empty;
+            defer input_obj.deinit(ctx.allocator);
+            try input_obj.put(ctx.allocator, "image_path", .{ .string = body.image_path });
+            try input_obj.put(ctx.allocator, "num_tokens", .{ .integer = @intCast(output.prepared.token_count) });
+            try input_obj.put(ctx.allocator, "wordpiece_token_count", .{ .integer = @intCast(output.prepared.wordpiece_token_count) });
+            try input_obj.put(ctx.allocator, "max_length", .{ .integer = @intCast(output.prepared.max_length) });
+            try input_obj.put(ctx.allocator, "mode", .{ .string = "layoutlmv3" });
+            try input_obj.put(ctx.allocator, "backend", .{ .string = @tagName(model.session.backend()) });
+
+            var best_obj: std.json.ObjectMap = .empty;
+            defer best_obj.deinit(ctx.allocator);
+            const best_value: ?std.json.Value = if (output.results.len > 0) blk: {
+                try best_obj.put(ctx.allocator, "label", .{ .string = output.results[0].label });
+                try best_obj.put(ctx.allocator, "score", .{ .float = output.results[0].score });
+                break :blk .{ .object = best_obj };
+            } else null;
+
+            const api_scores = try ctx.allocator.alloc(api.DocumentClassificationResult, output.results.len);
+            defer ctx.allocator.free(api_scores);
+            for (output.results, 0..) |result, idx| {
+                api_scores[idx] = .{ .label = result.label, .score = result.score };
+            }
+
+            const data = [_]api.DocumentClassificationObject{.{
+                .object = "document.classification",
+                .index = 0,
+                .checkpoint_path = model_path,
+                .prefix = "layoutlmv3",
+                .mode = "layoutlmv3",
+                .backend = @tagName(model.session.backend()),
+                .label_source = @tagName(output.labels.source),
+                .wordpiece_token_count = @intCast(output.prepared.wordpiece_token_count),
+                .truncated_token_count = @intCast(output.prepared.truncated_source_token_count),
+                .input = .{ .object = input_obj },
+                .features = .{
+                    .num_tokens = @intCast(output.prepared.token_count),
+                    .image_width = @intCast(output.prepared.source_width),
+                    .image_height = @intCast(output.prepared.source_height),
+                    .image_components = 3,
+                    .mean_darkness = 0,
+                    .std_darkness = 0,
+                    .top_darkness = 0,
+                    .bottom_darkness = 0,
+                    .left_darkness = 0,
+                    .right_darkness = 0,
+                    .center_darkness = 0,
+                },
+                .best = best_value,
+                .scores = api_scores,
+            }};
+
+            return ctx.json(api.DocumentClassificationResponse{
+                .object = "list",
+                .data = &data,
+                .model = body.model,
+                .usage = tokenUsage(@intCast(output.prepared.token_count), 0),
+            });
+        }
+
         const prefix = body.prefix orelse document_classification.default_prefix;
         const checkpoint_path = document_classification.resolveCheckpointPath(ctx.allocator, model_path) catch |err| switch (err) {
             error.CheckpointNotFound => return ctx.status(404).json(.{
@@ -3222,7 +3371,11 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         defer head.deinit();
 
-        const num_tokens: usize = std.math.cast(usize, body.num_tokens) orelse
+        const raw_num_tokens = body.num_tokens orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "num_tokens is required for layoutdoc_head mode" });
+        const labels = body.labels orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "labels are required for layoutdoc_head mode" });
+        const num_tokens: usize = std.math.cast(usize, raw_num_tokens) orelse
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "num_tokens out of range" });
 
         const input = document_classification.ExampleInput{
@@ -3235,7 +3388,7 @@ pub const Node = struct {
             else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
         };
 
-        const results = document_classification.classifyWithHead(ctx.allocator, &head, body.labels, input) catch |err| switch (err) {
+        const results = document_classification.classifyWithHead(ctx.allocator, &head, labels, input) catch |err| switch (err) {
             error.LabelCountMismatch => return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "label count does not match checkpoint output width",
@@ -3309,6 +3462,169 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "classifiers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
+        const mode = parseDocumentInferenceMode(body.mode) orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mode must be auto, layoutlmv3, or layoutdoc_head" });
+        const use_layoutlmv3 = mode == .layoutlmv3 or
+            (mode == .auto and body.image_path != null and layoutlmv3_document.looksLikeFullBundle(ctx.allocator, model_path));
+        if (use_layoutlmv3) {
+            const image_path = body.image_path orelse
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image_path is required for full LayoutLMv3 token classification" });
+            const tokens = allocDocumentTokens(ctx.allocator, body.tokens) catch |err| switch (err) {
+                error.InvalidBoundingBox => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "each token bbox must contain 4 integers in the 0..1000 range" }),
+                else => return ctx.status(500).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            };
+            defer ctx.allocator.free(tokens);
+            const max_length = documentMaxLength(body.max_length) catch
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "max_length must be a positive integer" });
+            const backend_choice = parseDocumentBackendChoice(body.backend) orelse
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "backend must be auto, native, metal, or mlx" });
+            native_backend_choice.validate(backend_choice) catch |err|
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
+
+            const model = if (backend_choice != .auto) blk: {
+                var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                native_backend_choice.configureSessionPreference(&request_session_manager, backend_choice);
+                break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            } else self.model_manager.loadFromDir(model_path) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+
+            var output = layoutlmv3_document.classifyTokens(
+                ctx.allocator,
+                model.session,
+                model_path,
+                image_path,
+                tokens,
+                body.labels,
+                max_length,
+            ) catch |err| switch (err) {
+                error.NoLabelsProvided => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "labels are required when the LayoutLMv3 bundle does not provide label metadata" }),
+                error.LabelCountMismatch => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "label count does not match model output width" }),
+                error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            };
+            defer output.deinit();
+
+            const token_features = document_token_classification.extractFeatures(ctx.allocator, tokens) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            defer ctx.allocator.free(token_features);
+
+            const BestToken = struct {
+                set: bool = false,
+                label: []const u8 = "",
+                score: f32 = 0,
+                bbox: [4]i32 = .{ 0, 0, 0, 0 },
+            };
+            var best_by_source = try ctx.allocator.alloc(BestToken, body.tokens.len);
+            defer ctx.allocator.free(best_by_source);
+            @memset(best_by_source, .{});
+            for (output.predictions) |pred| {
+                const source_idx = pred.source_token_index orelse continue;
+                if (source_idx >= best_by_source.len) continue;
+                if (!best_by_source[source_idx].set or pred.score > best_by_source[source_idx].score) {
+                    best_by_source[source_idx] = .{
+                        .set = true,
+                        .label = pred.label,
+                        .score = pred.score,
+                        .bbox = pred.bbox,
+                    };
+                }
+            }
+            var prediction_count: usize = 0;
+            for (best_by_source) |best| {
+                if (best.set) prediction_count += 1;
+            }
+
+            const api_predictions = try ctx.allocator.alloc(api.DocumentTokenClassificationPrediction, prediction_count);
+            defer ctx.allocator.free(api_predictions);
+            var bbox_bufs = std.ArrayListUnmanaged([]i64).empty;
+            defer {
+                for (bbox_bufs.items) |b| ctx.allocator.free(b);
+                bbox_bufs.deinit(ctx.allocator);
+            }
+            var feat_bbox_bufs = std.ArrayListUnmanaged([]i64).empty;
+            defer {
+                for (feat_bbox_bufs.items) |b| ctx.allocator.free(b);
+                feat_bbox_bufs.deinit(ctx.allocator);
+            }
+            var score_bufs = std.ArrayListUnmanaged([]api.DocumentTokenClassificationResult).empty;
+            defer {
+                for (score_bufs.items) |s| ctx.allocator.free(s);
+                score_bufs.deinit(ctx.allocator);
+            }
+            var best_objs = std.ArrayListUnmanaged(*std.json.ObjectMap).empty;
+            defer {
+                for (best_objs.items) |o| {
+                    o.deinit(ctx.allocator);
+                    ctx.allocator.destroy(o);
+                }
+                best_objs.deinit(ctx.allocator);
+            }
+
+            var out_idx: usize = 0;
+            for (best_by_source, 0..) |best, token_idx| {
+                if (!best.set) continue;
+                const bbox_slice = try ctx.allocator.alloc(i64, 4);
+                for (best.bbox, 0..) |coord, ci| bbox_slice[ci] = coord;
+                try bbox_bufs.append(ctx.allocator, bbox_slice);
+
+                const feat = token_features[token_idx];
+                const feat_bbox_slice = try ctx.allocator.alloc(i64, 4);
+                for (feat.bbox, 0..) |coord, ci| feat_bbox_slice[ci] = coord;
+                try feat_bbox_bufs.append(ctx.allocator, feat_bbox_slice);
+
+                const api_scores = try ctx.allocator.alloc(api.DocumentTokenClassificationResult, 1);
+                api_scores[0] = .{ .label = best.label, .score = best.score };
+                try score_bufs.append(ctx.allocator, api_scores);
+
+                const obj = try ctx.allocator.create(std.json.ObjectMap);
+                obj.* = .empty;
+                try best_objs.append(ctx.allocator, obj);
+                try obj.put(ctx.allocator, "label", .{ .string = best.label });
+                try obj.put(ctx.allocator, "score", .{ .float = best.score });
+
+                api_predictions[out_idx] = .{
+                    .token_index = @intCast(token_idx),
+                    .text = body.tokens[token_idx].text,
+                    .bbox = bbox_slice,
+                    .features = .{
+                        .text_length = @intCast(feat.text_length),
+                        .bbox = feat_bbox_slice,
+                        .width = feat.width,
+                        .height = feat.height,
+                        .relative_position = feat.relative_position,
+                        .bbox_phase_sin = feat.bbox_phase_sin,
+                    },
+                    .best = .{ .object = obj.* },
+                    .scores = api_scores,
+                };
+                out_idx += 1;
+            }
+
+            const data = [_]api.DocumentTokenClassificationObject{.{
+                .object = "document.token_classification",
+                .index = 0,
+                .checkpoint_path = model_path,
+                .prefix = "layoutlmv3",
+                .mode = "layoutlmv3",
+                .backend = @tagName(model.session.backend()),
+                .label_source = @tagName(output.labels.source),
+                .wordpiece_token_count = @intCast(output.prepared.wordpiece_token_count),
+                .truncated_token_count = @intCast(output.prepared.truncated_source_token_count),
+                .num_tokens = @intCast(api_predictions.len),
+                .predictions = api_predictions,
+            }};
+
+            return ctx.json(api.DocumentTokenClassificationResponse{
+                .object = "list",
+                .data = &data,
+                .model = body.model,
+                .usage = tokenUsage(body.tokens.len, 0),
+            });
+        }
+
+        const labels = body.labels orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "labels are required for layoutdoc_head mode" });
         const prefix = body.prefix orelse document_token_classification.default_prefix;
         const checkpoint_path = document_token_classification.resolveCheckpointPath(ctx.allocator, model_path) catch |err| switch (err) {
             error.CheckpointNotFound => return ctx.status(404).json(.{
@@ -3340,7 +3656,7 @@ pub const Node = struct {
             };
         }
 
-        const predictions = document_token_classification.classifyWithHead(ctx.allocator, &head, body.labels, tokens) catch |err| switch (err) {
+        const predictions = document_token_classification.classifyWithHead(ctx.allocator, &head, labels, tokens) catch |err| switch (err) {
             error.LabelCountMismatch => return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "label count does not match checkpoint output width",

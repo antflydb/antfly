@@ -487,24 +487,25 @@ paths:
     post:
       summary: Document classification
       description: |
-        Runs a native document classification head against a document image.
+        Runs full native LayoutLMv3 document classification when OCR tokens are supplied,
+        otherwise falls back to the legacy compact LayoutDoc sequence head.
 
-        This endpoint serves `layoutdoc_sequence_head.safetensors` artifacts produced by
-        the Zig finetuning stack. It currently reconstructs the same compact visual/layout
-        feature vector used by the training code and applies the saved sequence head.
+        Full LayoutLMv3 mode prepares image pixels, OCR token IDs, attention masks, and
+        normalized layout boxes before executing the model session. Legacy compatibility
+        mode serves `layoutdoc_sequence_head.safetensors` artifacts produced by the Zig
+        finetuning stack.
 
         ## Current Scope
 
-        - Native `layoutdoc_sequence_head` checkpoints only
-        - Local image path input only
-        - Caller must supply labels in model output order
-        - Supports JPEG, PNG, and JPEG2000 image files
+        - Full LayoutLMv3 `model.safetensors` bundles with tokenizer/preprocessor files
+        - Legacy native `layoutdoc_sequence_head` checkpoints
+        - Local image path input
+        - Caller-supplied labels, or label discovery from full LayoutLMv3 metadata
 
         ## Not Yet Included
 
-        - Served `layoutdoc_token_head`
-        - OCR token / bbox request shapes
-        - Label vocab discovery from checkpoint artifacts
+        - OCR extraction inside this endpoint
+        - Uploaded image bytes/content parts
       operationId: classifyDocument
       requestBody:
         required: true
@@ -542,23 +543,26 @@ paths:
     post:
       summary: Document token classification
       description: |
-        Runs a native document token classification head against caller-provided OCR tokens and bounding boxes.
+        Runs full native LayoutLMv3 token classification when an image path is supplied,
+        otherwise falls back to the legacy compact LayoutDoc token head.
 
-        This endpoint serves `layoutdoc_token_head.safetensors` artifacts produced by the
-        Zig finetuning stack. It reconstructs the same compact 6-dimensional token feature
-        vector used by the training code for each OCR token.
+        Full LayoutLMv3 mode prepares image pixels, OCR token IDs, attention masks, and
+        normalized layout boxes before executing the model session. Legacy compatibility
+        mode serves `layoutdoc_token_head.safetensors` artifacts produced by the Zig
+        finetuning stack.
 
         ## Current Scope
 
-        - Native `layoutdoc_token_head` checkpoints only
+        - Full LayoutLMv3 `model.safetensors` bundles with tokenizer/preprocessor files
+        - Legacy native `layoutdoc_token_head` checkpoints
         - Caller-provided OCR token text and bboxes
-        - Caller must supply labels in model output order
+        - Caller-supplied labels, or label discovery from full LayoutLMv3 metadata
 
         ## Not Yet Included
 
         - OCR extraction inside this endpoint
-        - Sequence-head image features
-        - Label vocab discovery from checkpoint artifacts
+        - OCR extraction inside this endpoint
+        - Uploaded image bytes/content parts
       operationId: classifyDocumentTokens
       requestBody:
         required: true
@@ -1766,8 +1770,6 @@ components:
       required:
         - model
         - image_path
-        - num_tokens
-        - labels
       properties:
         model:
           type: string
@@ -1780,13 +1782,18 @@ components:
         num_tokens:
           type: integer
           minimum: 0
-          description: Number of OCR/text tokens associated with the page
+          description: Number of OCR/text tokens associated with the page. Required only for legacy layoutdoc_head mode.
           example: 42
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentTokenBox'
+          description: OCR tokens and layout boxes used by full LayoutLMv3 inference.
         labels:
           type: array
           items:
             type: string
-          description: Labels in the same order expected by the checkpoint output head
+          description: Labels in model output order. Full LayoutLMv3 bundles may omit this when label metadata is present.
           example:
             - invoice
             - form
@@ -1796,6 +1803,20 @@ components:
           description: Optional tensor prefix inside the safetensors checkpoint
           default: layoutdoc_sequence_head
           example: layoutdoc_sequence_head
+        mode:
+          type: string
+          enum: [auto, layoutlmv3, layoutdoc_head]
+          default: auto
+          description: Inference mode. Auto uses full LayoutLMv3 when tokens and a full bundle are present.
+        backend:
+          type: string
+          enum: [auto, native, metal, mlx]
+          default: auto
+          description: Backend preference for full LayoutLMv3 inference.
+        max_length:
+          type: integer
+          minimum: 1
+          description: Optional max-length override for LayoutLMv3 preprocessing.
     DocumentClassificationFeatures:
       type: object
       required:
@@ -1893,6 +1914,26 @@ components:
           type: string
         prefix:
           type: string
+        mode:
+          type: string
+          nullable: true
+          description: Actual inference mode used.
+        backend:
+          type: string
+          nullable: true
+          description: Backend used for full LayoutLMv3 inference.
+        label_source:
+          type: string
+          nullable: true
+          description: Source of label vocabulary: request, sequence_head_config, token_head_config, or config.
+        wordpiece_token_count:
+          type: integer
+          nullable: true
+          description: Number of active LayoutLMv3 wordpiece positions including special tokens.
+        truncated_token_count:
+          type: integer
+          nullable: true
+          description: Number of OCR tokens omitted by max-length truncation.
         input:
           type: object
           required:
@@ -1933,18 +1974,21 @@ components:
       type: object
       required:
         - model
-        - labels
         - tokens
       properties:
         model:
           type: string
           description: Name or path of the document token classification model directory or checkpoint
           example: acme/layoutdoc-token-tags
+        image_path:
+          type: string
+          description: Absolute or server-local path to the page image. Required for full LayoutLMv3 mode.
+          example: /tmp/page.png
         labels:
           type: array
           items:
             type: string
-          description: Labels in the same order expected by the checkpoint output head
+          description: Labels in model output order. Full LayoutLMv3 bundles may omit this when label metadata is present.
           example:
             - O
             - B-KEY
@@ -1958,6 +2002,20 @@ components:
           description: Optional tensor prefix inside the safetensors checkpoint
           default: layoutdoc_token_head
           example: layoutdoc_token_head
+        mode:
+          type: string
+          enum: [auto, layoutlmv3, layoutdoc_head]
+          default: auto
+          description: Inference mode. Auto uses full LayoutLMv3 when image_path and a full bundle are present.
+        backend:
+          type: string
+          enum: [auto, native, metal, mlx]
+          default: auto
+          description: Backend preference for full LayoutLMv3 inference.
+        max_length:
+          type: integer
+          minimum: 1
+          description: Optional max-length override for LayoutLMv3 preprocessing.
     DocumentTokenClassificationFeatures:
       type: object
       required:
@@ -2069,6 +2127,26 @@ components:
           type: string
         prefix:
           type: string
+        mode:
+          type: string
+          nullable: true
+          description: Actual inference mode used.
+        backend:
+          type: string
+          nullable: true
+          description: Backend used for full LayoutLMv3 inference.
+        label_source:
+          type: string
+          nullable: true
+          description: Source of label vocabulary: request, sequence_head_config, token_head_config, or config.
+        wordpiece_token_count:
+          type: integer
+          nullable: true
+          description: Number of active LayoutLMv3 wordpiece positions including special tokens.
+        truncated_token_count:
+          type: integer
+          nullable: true
+          description: Number of OCR tokens omitted by max-length truncation.
         num_tokens:
           type: integer
         predictions:

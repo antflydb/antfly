@@ -629,7 +629,7 @@ Local verification:
 ```bash
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache \
 ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache \
-zigup run master build test-layoutlmv3-finetune -Dblas=false -Donnx=false -Dmlx=false
+zigup run master build test-layoutlmv3-finetune -Dsystem-blas=false -Donnx=false -Dmlx=false
 ```
 
 ### Expected Inputs
@@ -655,7 +655,8 @@ Each token: `{ "text": "...", "bbox": [x0, y0, x1, y1] }`. Bbox values must be w
 Bootstrap a LoRA bundle:
 
 ```bash
-zigup run master build bootstrap-layoutlmv3-lora -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build finetune -Dsystem-blas=false -Donnx=false -Dmlx=false -- \
+  adapter bootstrap layoutlmv3 \
   /path/to/layoutlmv3_base \
   /path/to/bootstrap_dir \
   8 \
@@ -665,16 +666,27 @@ zigup run master build bootstrap-layoutlmv3-lora -Dblas=false -Donnx=false -Dmlx
 Inspect a bundle:
 
 ```bash
-zigup run master build inspect-layoutlmv3-lora-bundle -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build finetune -Dsystem-blas=false -Donnx=false -Dmlx=false -- \
+  adapter inspect layoutlmv3 \
   /path/to/layoutlmv3_base \
   /path/to/adapter_dir \
   /tmp/layoutlmv3_lora_inspect.json
 ```
 
+Inspect a runtime-ready full LayoutLMv3 bundle:
+
+```bash
+zigup run master build finetune -- \
+  adapter inspect layoutlmv3-bundle \
+  /path/to/materialized_dir \
+  /tmp/layoutlmv3_runtime_inspect.json
+```
+
 Materialize a merged checkpoint:
 
 ```bash
-zigup run master build materialize-layoutlmv3-checkpoint -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build finetune -Dsystem-blas=false -Donnx=false -Dmlx=false -- \
+  adapter materialize layoutlmv3 \
   /path/to/layoutlmv3_base \
   /path/to/trained_adapter_dir \
   sequence \
@@ -685,7 +697,8 @@ zigup run master build materialize-layoutlmv3-checkpoint -Dblas=false -Donnx=fal
 Run bounded sequence training:
 
 ```bash
-zigup run master build train-eval-layoutlmv3-lora-sequence -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build finetune -Dsystem-blas=false -Donnx=false -Dmlx=false -- \
+  train run layoutlmv3-lora-sequence \
   /path/to/layoutlmv3_base \
   /path/to/bootstrap_dir \
   /path/to/train.jsonl \
@@ -701,7 +714,8 @@ zigup run master build train-eval-layoutlmv3-lora-sequence -Dblas=false -Donnx=f
 Run bounded token training:
 
 ```bash
-zigup run master build train-eval-layoutlmv3-lora-token -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build finetune -Dsystem-blas=false -Donnx=false -Dmlx=false -- \
+  train run layoutlmv3-lora-token \
   /path/to/layoutlmv3_base \
   /path/to/bootstrap_dir \
   /path/to/train.jsonl \
@@ -719,7 +733,8 @@ zigup run master build train-eval-layoutlmv3-lora-token -Dblas=false -Donnx=fals
 The smoke workflow chains bootstrap, train, inspect, and materialize in one command:
 
 ```bash
-zigup run master build run-layoutlmv3-lora-smoke-workflow -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build finetune -Dsystem-blas=false -Donnx=false -Dmlx=false -- \
+  workflow run layoutlmv3-lora-smoke \
   /path/to/layoutlmv3_base \
   /path/to/train.jsonl \
   /path/to/val.jsonl \

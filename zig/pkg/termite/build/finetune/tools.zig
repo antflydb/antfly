@@ -25,6 +25,7 @@ const commands = [_]common.CommandSpec{
         .name = "inspect-layoutlmv3-bundle",
         .root_source_file = "src/finetune/tools/inspect_layoutlmv3_bundle.zig",
         .description = "Inspect a LayoutLMv3 runtime bundle",
+        .imports = &.{ .build_options, .termite_hf_tokenizer },
     },
     .{
         .name = "compose-lora-adapters",

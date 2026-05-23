@@ -19,6 +19,7 @@ pub const multimodal_reranker = @import("multimodal_reranker.zig");
 pub const classification = @import("classification.zig");
 pub const document_classification = @import("document_classification.zig");
 pub const document_token_classification = @import("document_token_classification.zig");
+pub const layoutlmv3_document = @import("layoutlmv3_document.zig");
 pub const ner = @import("ner.zig");
 pub const generation = @import("generation.zig");
 pub const encoder_decoder = @import("encoder_decoder.zig");
@@ -35,6 +36,7 @@ test {
     _ = classification;
     _ = document_classification;
     _ = document_token_classification;
+    _ = layoutlmv3_document;
     _ = ner;
     _ = generation;
     _ = encoder_decoder;

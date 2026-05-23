@@ -28,12 +28,15 @@ pub const PreparedInputs = struct {
     input_ids: []i32,
     attention_mask: []i32,
     bbox: []i32,
+    source_token_indices: []i32,
     pixel_values: []f32,
     source_width: usize,
     source_height: usize,
     input_width: usize,
     input_height: usize,
     token_count: usize,
+    consumed_source_token_count: usize,
+    truncated_source_token_count: usize,
     wordpiece_token_count: usize,
     special_token_count: usize,
     cls_token_id: i32,
@@ -45,6 +48,7 @@ pub const PreparedInputs = struct {
         self.allocator.free(self.input_ids);
         self.allocator.free(self.attention_mask);
         self.allocator.free(self.bbox);
+        self.allocator.free(self.source_token_indices);
         self.allocator.free(self.pixel_values);
     }
 };
@@ -110,6 +114,8 @@ pub fn prepareFromFiles(
     errdefer allocator.free(attention_mask);
     const bbox = encoded.bbox;
     errdefer allocator.free(bbox);
+    const source_token_indices = encoded.source_token_indices;
+    errdefer allocator.free(source_token_indices);
 
     const image_bytes = try c_file.readFile(allocator, image_path);
     defer allocator.free(image_bytes);
@@ -136,12 +142,15 @@ pub fn prepareFromFiles(
         .input_ids = input_ids,
         .attention_mask = attention_mask,
         .bbox = bbox,
+        .source_token_indices = source_token_indices,
         .pixel_values = pixel_values,
         .source_width = decoded.width,
         .source_height = decoded.height,
         .input_width = preprocessor.input_width,
         .input_height = preprocessor.input_height,
         .token_count = tokens.len,
+        .consumed_source_token_count = encoded.consumed_source_token_count,
+        .truncated_source_token_count = tokens.len - encoded.consumed_source_token_count,
         .wordpiece_token_count = encoded.wordpiece_token_count,
         .special_token_count = encoded.special_token_count,
         .cls_token_id = special.cls_id,
@@ -309,8 +318,10 @@ fn encodeTokensForLayoutLMv3(
     input_ids: []i32,
     attention_mask: []i32,
     bbox: []i32,
+    source_token_indices: []i32,
     wordpiece_token_count: usize,
     special_token_count: usize,
+    consumed_source_token_count: usize,
 } {
     const special = tokenizer.specialTokens();
     const input_ids = try allocator.alloc(i32, max_length);
@@ -319,10 +330,13 @@ fn encodeTokensForLayoutLMv3(
     errdefer allocator.free(attention_mask);
     const bbox = try allocator.alloc(i32, max_length * 4);
     errdefer allocator.free(bbox);
+    const source_token_indices = try allocator.alloc(i32, max_length);
+    errdefer allocator.free(source_token_indices);
 
     for (0..max_length) |idx| {
         input_ids[idx] = special.pad_id;
         attention_mask[idx] = 0;
+        source_token_indices[idx] = -1;
         const base = idx * 4;
         bbox[base + 0] = 0;
         bbox[base + 1] = 0;
@@ -335,8 +349,10 @@ fn encodeTokensForLayoutLMv3(
             .input_ids = input_ids,
             .attention_mask = attention_mask,
             .bbox = bbox,
+            .source_token_indices = source_token_indices,
             .wordpiece_token_count = 0,
             .special_token_count = 0,
+            .consumed_source_token_count = 0,
         };
     }
 
@@ -346,10 +362,12 @@ fn encodeTokensForLayoutLMv3(
     write_idx += 1;
 
     var wordpiece_token_count: usize = 1;
-    for (tokens) |tok| {
+    var consumed_source_token_count: usize = 0;
+    for (tokens, 0..) |tok, token_idx| {
         if (write_idx + 1 >= max_length) break;
         const ids = try tokenizer.encode(allocator, tok.text);
         defer allocator.free(ids);
+        var emitted_for_token = false;
         for (ids) |id| {
             if (write_idx + 1 >= max_length) break;
             input_ids[write_idx] = id;
@@ -359,8 +377,13 @@ fn encodeTokensForLayoutLMv3(
             bbox[base + 1] = tok.bbox[1];
             bbox[base + 2] = tok.bbox[2];
             bbox[base + 3] = tok.bbox[3];
+            source_token_indices[write_idx] = @intCast(token_idx);
             write_idx += 1;
             wordpiece_token_count += 1;
+            emitted_for_token = true;
+        }
+        if (emitted_for_token) {
+            consumed_source_token_count = token_idx + 1;
         }
     }
 
@@ -376,8 +399,10 @@ fn encodeTokensForLayoutLMv3(
         .input_ids = input_ids,
         .attention_mask = attention_mask,
         .bbox = bbox,
+        .source_token_indices = source_token_indices,
         .wordpiece_token_count = wordpiece_token_count,
         .special_token_count = 1 + sep_count + (max_length - write_idx),
+        .consumed_source_token_count = consumed_source_token_count,
     };
 }
 
@@ -410,6 +435,7 @@ test "encode tokens for layoutlmv3 expands per-token boxes across wordpieces" {
     defer alloc.free(encoded.input_ids);
     defer alloc.free(encoded.attention_mask);
     defer alloc.free(encoded.bbox);
+    defer alloc.free(encoded.source_token_indices);
 
     try std.testing.expectEqual(@as(i32, 101), encoded.input_ids[0]);
     try std.testing.expectEqual(@as(i32, 200), encoded.input_ids[1]);
@@ -417,4 +443,8 @@ test "encode tokens for layoutlmv3 expands per-token boxes across wordpieces" {
     try std.testing.expectEqual(@as(i32, 102), encoded.input_ids[3]);
     try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4 }, encoded.bbox[4..8]);
     try std.testing.expectEqualSlices(i32, &.{ 5, 6, 7, 8 }, encoded.bbox[8..12]);
+    try std.testing.expectEqual(@as(i32, -1), encoded.source_token_indices[0]);
+    try std.testing.expectEqual(@as(i32, 0), encoded.source_token_indices[1]);
+    try std.testing.expectEqual(@as(i32, 1), encoded.source_token_indices[2]);
+    try std.testing.expectEqual(@as(i32, -1), encoded.source_token_indices[3]);
 }
