@@ -32,6 +32,7 @@ import { useNavigate } from "react-router-dom";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTheme } from "@/hooks/use-theme";
 import { type SemanticResult, semanticSearch } from "@/lib/semantic-search";
+import { isExternalAuthMode } from "@/runtime-config";
 
 // Map icon names to components
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -67,11 +68,22 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
   const { theme, setTheme } = useTheme();
   const { termiteApiUrl } = useApiConfig();
+  const showLocalAdminRoutes = !isExternalAuthMode();
 
   // Create TermiteClient for semantic search
   const termiteClient = React.useMemo(
     () => new TermiteClient({ baseUrl: termiteApiUrl }),
     [termiteApiUrl]
+  );
+
+  const isCommandAvailable = React.useCallback(
+    (item: { href?: string }) => {
+      if (showLocalAdminRoutes) {
+        return true;
+      }
+      return item.href !== "/users" && item.href !== "/secrets";
+    },
+    [showLocalAdminRoutes]
   );
 
   React.useEffect(() => {
@@ -95,23 +107,34 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     return () => document.removeEventListener("keydown", down);
   }, [toggle]);
 
-  const navigationCommands = [
-    { icon: Table, label: "Tables", href: "/" },
-    { icon: Plus, label: "Create Table", href: "/create" },
-    { icon: Library, label: "Models", href: "/models" },
-    { icon: Users, label: "Users", href: "/users" },
-  ];
+  const navigationCommands = React.useMemo(() => {
+    const commands = [
+      { icon: Table, label: "Tables", href: "/" },
+      { icon: Plus, label: "Create Table", href: "/create" },
+      { icon: Library, label: "Models", href: "/models" },
+    ];
+    if (showLocalAdminRoutes) {
+      commands.push({ icon: Users, label: "Users", href: "/users" });
+    }
+    return commands;
+  }, [showLocalAdminRoutes]);
 
-  const playgroundCommands = [
-    { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
-    { icon: Tag, label: "Recognize Playground", href: "/playground/recognize" },
-    { icon: Repeat2, label: "Rewriting Playground", href: "/playground/rewrite" },
-    { icon: ArrowUpDown, label: "Reranking Playground", href: "/playground/rerank" },
-    { icon: Network, label: "Knowledge Graph", href: "/playground/kg" },
-    { icon: ClipboardCheck, label: "Evals", href: "/playground/evals" },
-  ];
+  const playgroundCommands = React.useMemo(
+    () => [
+      { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
+      { icon: Tag, label: "Recognize Playground", href: "/playground/recognize" },
+      { icon: Repeat2, label: "Rewriting Playground", href: "/playground/rewrite" },
+      { icon: ArrowUpDown, label: "Reranking Playground", href: "/playground/rerank" },
+      { icon: Network, label: "Knowledge Graph", href: "/playground/kg" },
+      { icon: ClipboardCheck, label: "Evals", href: "/playground/evals" },
+    ],
+    []
+  );
 
-  const quickActionCommands = [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }];
+  const quickActionCommands = React.useMemo(
+    () => [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }],
+    []
+  );
 
   // All command items for string matching check
   const allItems = React.useMemo(
@@ -120,7 +143,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
       ...playgroundCommands.map((c) => c.label),
       ...quickActionCommands.map((c) => c.label),
     ],
-    [navigationCommands.map, playgroundCommands.map, quickActionCommands.map]
+    [navigationCommands, playgroundCommands, quickActionCommands]
   );
 
   // Check if cmdk's string filter would find any matches
@@ -141,7 +164,8 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     const timer = setTimeout(async () => {
       try {
         const results = await semanticSearch(searchValue, termiteClient);
-        setSemanticResults(results);
+        const filteredResults = results.filter((result) => isCommandAvailable(result.item));
+        setSemanticResults(filteredResults);
       } catch (e) {
         console.error("Semantic search failed:", e);
         setSemanticResults([]);
@@ -150,7 +174,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     }, 300);
 
     return () => clearTimeout(timer);
-  }, [searchValue, hasStringMatches, termiteClient]);
+  }, [searchValue, hasStringMatches, termiteClient, isCommandAvailable]);
 
   // Reset search state when dialog closes
   React.useEffect(() => {

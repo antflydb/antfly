@@ -78,6 +78,24 @@ func TestRouterResolve(t *testing.T) {
 			want: BackendServerless,
 		},
 		{
+			name: "admin mutations prefer stateful when available",
+			req: RequestContext{
+				Tenant:    "t1",
+				Table:     "docs",
+				Operation: OperationAdmin,
+			},
+			want: BackendStateful,
+		},
+		{
+			name: "admin mutations use serverless api when stateful is unavailable",
+			req: RequestContext{
+				Tenant:    "t1",
+				Table:     "logs",
+				Operation: OperationAdmin,
+			},
+			want: BackendServerless,
+		},
+		{
 			name: "graph reads prefer serverless when allowed",
 			req: RequestContext{
 				Tenant:       "t1",

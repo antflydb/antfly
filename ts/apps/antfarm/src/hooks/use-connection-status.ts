@@ -14,31 +14,34 @@ const CHECK_INTERVAL_DISCONNECTED = 30000; // 30 seconds when disconnected
 const CONNECTION_CHECK_TIMEOUT = 5000; // 5 seconds timeout for health checks
 
 export function useConnectionStatus(): ConnectionStatus {
-  const { termiteApiUrl } = useApiConfig();
+  const { apiUrl, termiteApiUrl } = useApiConfig();
   const [antflyStatus, setAntflyStatus] = useState<ServerStatus>("checking");
   const [termiteStatus, setTermiteStatus] = useState<ServerStatus>("checking");
   const isMountedRef = useRef(true);
 
-  const checkAntfly = useCallback(async (signal?: AbortSignal) => {
-    if (!isProductEnabled("antfly")) {
-      setAntflyStatus("connected"); // Skip check if product disabled
-      return;
-    }
+  const checkAntfly = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!isProductEnabled("antfly")) {
+        setAntflyStatus("connected"); // Skip check if product disabled
+        return;
+      }
 
-    try {
-      const response = await fetch("/api/v1/status", {
-        method: "GET",
-        signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
-      });
-      if (isMountedRef.current) {
-        setAntflyStatus(response.ok ? "connected" : "disconnected");
+      try {
+        const response = await fetch(`${apiUrl}/status`, {
+          method: "GET",
+          signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
+        });
+        if (isMountedRef.current) {
+          setAntflyStatus(response.ok ? "connected" : "disconnected");
+        }
+      } catch {
+        if (isMountedRef.current) {
+          setAntflyStatus("disconnected");
+        }
       }
-    } catch {
-      if (isMountedRef.current) {
-        setAntflyStatus("disconnected");
-      }
-    }
-  }, []);
+    },
+    [apiUrl]
+  );
 
   const checkTermite = useCallback(
     async (signal?: AbortSignal) => {
