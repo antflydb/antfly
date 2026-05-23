@@ -65,12 +65,12 @@ jobs:
           if [[ "$VERSION" == *-* ]]; then
             ALIAS_TAG=__skip_alias__
           fi
-          submit_cloud_build zig \
+          submit_cloud_build . \
             --project="${GCP_PROJECT}" \
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_DOCKERFILE=Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=zig-${VERSION},_CACHE_TAG=zig-buildcache,_DESCRIPTION=AntflyDB Zig runtime image"
+            --substitutions="_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=zig-${VERSION},_CACHE_TAG=zig-buildcache,_DESCRIPTION=AntflyDB Zig runtime image"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
