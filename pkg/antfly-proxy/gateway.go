@@ -260,22 +260,11 @@ func requestContextFromHTTP(r *http.Request) (RequestContext, error) {
 	}
 
 	operationHint := firstNonEmpty(r.Header.Get("X-Antfly-Operation"), r.URL.Query().Get("operation"))
-	switch strings.ToLower(operationHint) {
-	case "", "read":
-		if inferred := inferOperationFromBackendPath(req.BackendPath); inferred != "" {
-			req.Operation = inferred
-		} else if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete {
-			req.Operation = OperationWrite
-		} else {
-			req.Operation = OperationRead
-		}
-	case "write":
-		req.Operation = OperationWrite
-	case "admin":
-		req.Operation = OperationAdmin
-	default:
-		return RequestContext{}, fmt.Errorf("unsupported operation %q", firstNonEmpty(r.Header.Get("X-Antfly-Operation"), r.URL.Query().Get("operation")))
+	operation, err := resolveRequestOperation(r.Method, req.BackendPath, operationHint)
+	if err != nil {
+		return RequestContext{}, err
 	}
+	req.Operation = operation
 
 	if req.Tenant == "" || req.ResourceName() == "" {
 		return RequestContext{}, fmt.Errorf("tenant and table are required")
@@ -309,14 +298,68 @@ func parsePublicAPIPath(path string) (tenant string, table string, backendPath s
 	return tenant, table, canonicalPublicBackendPath(suffix)
 }
 
-func inferOperationFromBackendPath(path string) OperationKind {
+func resolveRequestOperation(method, path, hint string) (OperationKind, error) {
+	if inferred := inferOperationFromBackendPath(method, path); inferred != "" {
+		return inferred, nil
+	}
+	required := inferOperationFromMethod(method)
+	if strings.TrimSpace(hint) == "" {
+		return required, nil
+	}
+	hinted, err := parseOperationHint(hint)
+	if err != nil {
+		return "", err
+	}
+	if operationRank(hinted) < operationRank(required) {
+		return required, nil
+	}
+	return hinted, nil
+}
+
+func parseOperationHint(raw string) (OperationKind, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "read":
+		return OperationRead, nil
+	case "write":
+		return OperationWrite, nil
+	case "admin":
+		return OperationAdmin, nil
+	default:
+		return "", fmt.Errorf("unsupported operation %q", raw)
+	}
+}
+
+func inferOperationFromMethod(method string) OperationKind {
+	if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete {
+		return OperationWrite
+	}
+	return OperationRead
+}
+
+func inferOperationFromBackendPath(method, path string) OperationKind {
+	path = canonicalPublicBackendPath(path)
 	switch {
+	case path == "/" && (method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete):
+		return OperationAdmin
 	case strings.HasPrefix(path, "/query"), strings.HasPrefix(path, "/graph"), strings.HasPrefix(path, "/versions/"):
 		return OperationRead
 	case strings.HasPrefix(path, "/admin"):
 		return OperationAdmin
 	default:
 		return ""
+	}
+}
+
+func operationRank(operation OperationKind) int {
+	switch operation {
+	case OperationRead:
+		return 1
+	case OperationWrite:
+		return 2
+	case OperationAdmin:
+		return 3
+	default:
+		return 0
 	}
 }
 

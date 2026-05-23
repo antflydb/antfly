@@ -299,6 +299,20 @@ var KnownModelCapabilities = map[string]EmbedderCapabilities{
 		DefaultDimension:   1024,
 		MaxBatchSize:       96,
 	},
+	"cohere.embed-v4": {
+		SupportedMIMETypes: []MIMETypeSupport{
+			{MIMEType: "text/plain"},
+			{MIMEType: "image/png", MaxSizeBytes: 5 * 1024 * 1024},
+			{MIMEType: "image/jpeg", MaxSizeBytes: 5 * 1024 * 1024},
+			{MIMEType: "image/jpg", MaxSizeBytes: 5 * 1024 * 1024},
+			{MIMEType: "image/gif", MaxSizeBytes: 5 * 1024 * 1024},
+			{MIMEType: "image/webp", MaxSizeBytes: 5 * 1024 * 1024},
+		},
+		Dimensions:       []int{256, 512, 1024, 1536},
+		DefaultDimension: 1536,
+		MaxBatchSize:     96,
+		SupportsFusion:   true,
+	},
 
 	// Antfly clipclap (multimodal: text + image + audio, CLIP-compatible shared space)
 	"clipclap": {

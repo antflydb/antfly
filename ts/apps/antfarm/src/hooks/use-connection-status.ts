@@ -19,26 +19,29 @@ export function useConnectionStatus(): ConnectionStatus {
   const [termiteStatus, setTermiteStatus] = useState<ServerStatus>("checking");
   const isMountedRef = useRef(true);
 
-  const checkAntfly = useCallback(async (signal?: AbortSignal) => {
-    if (!isProductEnabled("antfly")) {
-      setAntflyStatus("connected"); // Skip check if product disabled
-      return;
-    }
+  const checkAntfly = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!isProductEnabled("antfly")) {
+        setAntflyStatus("connected"); // Skip check if product disabled
+        return;
+      }
 
-    try {
-      const response = await fetch(`${apiUrl}/status`, {
-        method: "GET",
-        signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
-      });
-      if (isMountedRef.current) {
-        setAntflyStatus(response.ok ? "connected" : "disconnected");
+      try {
+        const response = await fetch(`${apiUrl}/status`, {
+          method: "GET",
+          signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
+        });
+        if (isMountedRef.current) {
+          setAntflyStatus(response.ok ? "connected" : "disconnected");
+        }
+      } catch {
+        if (isMountedRef.current) {
+          setAntflyStatus("disconnected");
+        }
       }
-    } catch {
-      if (isMountedRef.current) {
-        setAntflyStatus("disconnected");
-      }
-    }
-  }, [apiUrl]);
+    },
+    [apiUrl]
+  );
 
   const checkTermite = useCallback(
     async (signal?: AbortSignal) => {

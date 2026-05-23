@@ -46,11 +46,11 @@ steps:
 options:
   logging: CLOUD_LOGGING_ONLY
 
-timeout: 2400s
+timeout: 7200s
 
 substitutions:
   _IMAGE_NAME: antfly
-  _DOCKERFILE: Dockerfile
+  _DOCKERFILE: zig/Dockerfile
   _CONTEXT: "."
   _ALIAS_TAG: zig
   _VERSION_TAG: zig-latest
