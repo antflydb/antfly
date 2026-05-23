@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 from helpers import wait_until
@@ -54,7 +55,10 @@ def test_schema_migration_full_text_rebuild(stateful_api):
         lambda: _ready_index(stateful_api, table_name, "full_text_index_v0", expected_docs=num_docs),
         timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
     )
-    assert initial_index is not None, "full_text_index_v0 did not finish rebuilding in time"
+    assert initial_index is not None, (
+        "full_text_index_v0 did not finish rebuilding in time\n"
+        + _schema_migration_diagnostics(stateful_api, table_name, "full_text_index_v0")
+    )
 
     updated = stateful_api.update_schema(
         table_name,
@@ -101,14 +105,20 @@ def test_schema_migration_full_text_rebuild(stateful_api):
         lambda: _ready_index(stateful_api, table_name, "full_text_index_v1", expected_docs=num_docs),
         timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
     )
-    assert rebuilt_index is not None, "full_text_index_v1 did not finish rebuilding in time"
+    assert rebuilt_index is not None, (
+        "full_text_index_v1 did not finish rebuilding in time\n"
+        + _schema_migration_diagnostics(stateful_api, table_name, "full_text_index_v1")
+    )
 
     stable_table = wait_until(
         lambda: _stable_table(stateful_api, table_name, expected_version=1),
         timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
         interval_s=2.0,
     )
-    assert stable_table is not None, "schema migration did not reach a stable table state"
+    assert stable_table is not None, (
+        "schema migration did not reach a stable table state\n"
+        + _schema_migration_diagnostics(stateful_api, table_name, "full_text_index_v1")
+    )
 
     stable_indexes = _index_names(stateful_api.list_indexes(table_name))
     assert "full_text_index_v0" not in stable_indexes
@@ -144,3 +154,23 @@ def _stable_table(stateful_api, table_name: str, *, expected_version: int) -> di
     if table["schema"]["version"] != expected_version:
         return None
     return table
+
+
+def _schema_migration_diagnostics(stateful_api, table_name: str, index_name: str) -> str:
+    return json.dumps(
+        {
+            "index": _safe_api_call(lambda: stateful_api.get_index(table_name, index_name)),
+            "indexes": _safe_api_call(lambda: stateful_api.list_indexes(table_name)),
+            "table": _safe_api_call(lambda: stateful_api.get_table(table_name)),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _safe_api_call(fn) -> dict:
+    try:
+        return fn()
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        return {"error": message[:4000]}
