@@ -68,11 +68,22 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
   const { theme, setTheme } = useTheme();
   const { termiteApiUrl } = useApiConfig();
+  const showLocalAdminRoutes = !isExternalAuthMode();
 
   // Create TermiteClient for semantic search
   const termiteClient = React.useMemo(
     () => new TermiteClient({ baseUrl: termiteApiUrl }),
     [termiteApiUrl]
+  );
+
+  const isCommandAvailable = React.useCallback(
+    (item: { href?: string }) => {
+      if (showLocalAdminRoutes) {
+        return true;
+      }
+      return item.href !== "/users" && item.href !== "/secrets";
+    },
+    [showLocalAdminRoutes]
   );
 
   React.useEffect(() => {
@@ -102,11 +113,11 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
       { icon: Plus, label: "Create Table", href: "/create" },
       { icon: Library, label: "Models", href: "/models" },
     ];
-    if (!isExternalAuthMode()) {
+    if (showLocalAdminRoutes) {
       commands.push({ icon: Users, label: "Users", href: "/users" });
     }
     return commands;
-  }, []);
+  }, [showLocalAdminRoutes]);
 
   const playgroundCommands = [
     { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
@@ -147,7 +158,8 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     const timer = setTimeout(async () => {
       try {
         const results = await semanticSearch(searchValue, termiteClient);
-        setSemanticResults(results);
+        const filteredResults = results.filter((result) => isCommandAvailable(result.item));
+        setSemanticResults(filteredResults);
       } catch (e) {
         console.error("Semantic search failed:", e);
         setSemanticResults([]);
@@ -156,7 +168,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     }, 300);
 
     return () => clearTimeout(timer);
-  }, [searchValue, hasStringMatches, termiteClient]);
+  }, [searchValue, hasStringMatches, termiteClient, isCommandAvailable]);
 
   // Reset search state when dialog closes
   React.useEffect(() => {
