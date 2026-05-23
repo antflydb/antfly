@@ -2227,11 +2227,15 @@ fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
     doc_nums: []const u32,
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocSet {
-    _ = executor;
     const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums)) orelse return null;
     defer alloc.free(ordinals);
     if (ordinals.len == 0) return null;
-    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+    var resolved = try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+    errdefer resolved.deinit(alloc);
+    const live_filter = executor.live_filter_doc_set orelse return resolved;
+    const live = try live_filter(executor.ctx, alloc, &resolved, executor.identity_read_generation);
+    resolved.deinit(alloc);
+    return live;
 }
 
 fn collectStructuredFilterResolvedDocSetCachedAlloc(
@@ -2936,12 +2940,12 @@ fn deriveNativeDenseConstraintsAlloc(
 }
 
 fn canSkipBroadLiveDenseConstraint(req: types.SearchRequest, executor: DenseSearchExecutor) !bool {
-    _ = executor;
     if (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) return false;
     if (req.resolved_doc_filter != null) return false;
     if (req.filter_doc_ids.len != 0 or req.exclude_doc_ids.len != 0) return false;
     if (req.filter_ids.len != 0 or req.exclude_ids.len != 0 or req.filter_doc_ids_positive) return false;
-    return true;
+    const visible = executor.all_docs_visible_fast orelse return false;
+    return try visible(executor.ctx, req.identity_read_generation);
 }
 
 fn mergeNativeExcludeIds(
@@ -6255,7 +6259,7 @@ test "text search query pushes native doc id constraints into bool query" {
         .positive_filter = true,
         .filter_doc_ids = &.{ "doc:b", "doc:c" },
         .exclude_doc_ids = &.{"doc:c"},
-    });
+    }, false);
 
     switch (query) {
         .bool_query => |bool_query| {
@@ -6282,7 +6286,7 @@ test "text search query pushes native doc num constraints into bool query" {
         .positive_filter = true,
         .filter_doc_nums = &.{ 1, 3 },
         .exclude_doc_nums = &.{2},
-    });
+    }, true);
 
     switch (query) {
         .bool_query => |bool_query| {

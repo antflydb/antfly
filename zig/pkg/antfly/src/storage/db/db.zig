@@ -3125,6 +3125,16 @@ pub const DB = struct {
             for (owned_store_keys.items) |key| self.alloc.free(key);
             owned_store_keys.deinit(self.alloc);
         }
+        var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_values.items) |value| self.alloc.free(value);
+            owned_store_values.deinit(self.alloc);
+        }
+        const vector_store_field_names = try self.core.index_manager.vectorStoreFieldNamesAlloc(self.alloc);
+        defer {
+            for (vector_store_field_names) |field| self.alloc.free(field);
+            if (vector_store_field_names.len > 0) self.alloc.free(vector_store_field_names);
+        }
         var timestamp_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer {
             for (timestamp_writes.items) |item| {
@@ -3203,6 +3213,7 @@ pub const DB = struct {
             }
             extracted[i] = try mapper.extractWrite(self.alloc, write.key, write.value);
             try augmentExtractedWriteWithGraphFieldEdges(self, self.alloc, write.key, write.value, &extracted[i]);
+            try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(self.alloc, write.key, write.value, &extracted[i]);
             extracted_initialized += 1;
             for (extracted[i].dense_embeddings) |*embedding| {
                 if (embedding.artifact_key != null) continue;
@@ -3240,6 +3251,12 @@ pub const DB = struct {
                 });
             }
             if (extracted[i].cleaned_value) |cleaned| {
+                const store_value = try strippedStoredDocumentValueAlloc(
+                    self.alloc,
+                    cleaned,
+                    vector_store_field_names,
+                    &owned_store_values,
+                );
                 const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
                 try owned_store_keys.append(self.alloc, store_key);
                 try overwrite_probe_entries.append(self.alloc, .{
@@ -3248,7 +3265,7 @@ pub const DB = struct {
                 });
                 try store_writes.append(self.alloc, .{
                     .key = store_key,
-                    .value = cleaned,
+                    .value = store_value,
                 });
                 try identity_upsert_keys.append(self.alloc, write.key);
                 if (shouldWriteTimestamp(write.key)) {
@@ -10416,6 +10433,19 @@ fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), k
         if (std.mem.eql(u8, existing, key)) return;
     }
     try list.append(alloc, try alloc.dupe(u8, key));
+}
+
+fn strippedStoredDocumentValueAlloc(
+    alloc: Allocator,
+    cleaned: []const u8,
+    vector_store_field_names: []const []const u8,
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    if (vector_store_field_names.len == 0) return cleaned;
+    const stripped = (try mapper.stripTopLevelFieldsAlloc(alloc, cleaned, vector_store_field_names)) orelse try alloc.dupe(u8, "{}");
+    errdefer alloc.free(stripped);
+    try owned_values.append(alloc, stripped);
+    return stripped;
 }
 
 fn containsOwnedKey(list: []const []u8, key: []const u8) bool {
@@ -27078,7 +27108,7 @@ test "db document _embeddings update vector index and strip stored special field
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
-test "db dense and sparse field-backed vector indexes preserve vector fields without embedding artifacts" {
+test "db dense and sparse field-backed vector indexes strip vector fields and persist embedding artifacts" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -27111,21 +27141,21 @@ test "db dense and sparse field-backed vector indexes preserve vector fields wit
     const stored = (try db.get(alloc, "doc:a")).?;
     defer alloc.free(stored);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"title\":\"alpha\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stored, "\"embedding\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stored, "\"sparse\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"embedding\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"sparse\"") == null);
 
     const vector_only_stored = (try db.get(alloc, "doc:c")).?;
     defer alloc.free(vector_only_stored);
-    try std.testing.expect(std.mem.indexOf(u8, vector_only_stored, "\"embedding\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, vector_only_stored, "\"sparse\"") != null);
-    try std.testing.expect(!std.mem.eql(u8, vector_only_stored, "{}"));
+    try std.testing.expectEqualStrings("{}", vector_only_stored);
 
     const dense_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(dense_artifact_key);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, dense_artifact_key));
+    const dense_artifact = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(dense_artifact);
     const sparse_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
     defer alloc.free(sparse_artifact_key);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, sparse_artifact_key));
+    const sparse_artifact = try db.core.store.get(alloc, sparse_artifact_key);
+    defer alloc.free(sparse_artifact);
 
     var dense = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -27159,9 +27189,11 @@ test "db dense and sparse field-backed vector indexes preserve vector fields wit
 
     const updated = (try db.get(alloc, "doc:a")).?;
     defer alloc.free(updated);
-    try std.testing.expect(std.mem.indexOf(u8, updated, "\"embedding\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, updated, "\"sparse\"") != null);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, dense_artifact_key));
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"title\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"embedding\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"sparse\"") == null);
+    const updated_dense_artifact = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(updated_dense_artifact);
 
     var dense_after = try db.search(alloc, .{
         .index_name = "dv_v1",

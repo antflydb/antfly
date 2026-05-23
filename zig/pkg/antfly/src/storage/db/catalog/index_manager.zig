@@ -2462,6 +2462,71 @@ pub const IndexManager = struct {
         return try requests.toOwnedSlice(alloc);
     }
 
+    pub fn appendIndexFieldEmbeddingsToExtractedWrite(
+        self: *const IndexManager,
+        alloc: Allocator,
+        doc_key: []const u8,
+        doc_value: []const u8,
+        extracted: *mapper.ExtractedWrite,
+    ) !void {
+        for (self.dense_indexes.items) |entry| {
+            if (hasExplicitDenseEmbedding(extracted.dense_embeddings, entry.config.name)) continue;
+            const vector = (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) orelse continue;
+            var vector_owned = true;
+            errdefer if (vector_owned) alloc.free(vector);
+            var index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer if (index_name.len > 0) alloc.free(index_name);
+            var owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer if (owned_doc_key.len > 0) alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+            index_name = &.{};
+            owned_doc_key = &.{};
+            vector_owned = false;
+        }
+
+        for (self.sparse_indexes.items) |entry| {
+            if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, entry.config.name)) continue;
+            var sparse_vec = (try mapper.extractSparseVectorField(alloc, doc_value, entry.field_name)) orelse continue;
+            errdefer sparse_vec.deinit(alloc);
+            var index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer if (index_name.len > 0) alloc.free(index_name);
+            var owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer if (owned_doc_key.len > 0) alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
+            index_name = &.{};
+            owned_doc_key = &.{};
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+    }
+
+    pub fn vectorStoreFieldNamesAlloc(self: *const IndexManager, alloc: Allocator) ![][]u8 {
+        var fields = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (fields.items) |field| alloc.free(field);
+            fields.deinit(alloc);
+        }
+
+        for (self.dense_indexes.items) |entry| {
+            if (containsOwnedString(fields.items, entry.field_name)) continue;
+            try fields.append(alloc, try alloc.dupe(u8, entry.field_name));
+        }
+        for (self.sparse_indexes.items) |entry| {
+            if (containsOwnedString(fields.items, entry.field_name)) continue;
+            try fields.append(alloc, try alloc.dupe(u8, entry.field_name));
+        }
+        return try fields.toOwnedSlice(alloc);
+    }
+
     pub fn textIndex(self: *IndexManager, name: ?[]const u8) ?*persistent_mod.PersistentIndex {
         if (name) |index_name| {
             for (self.text_indexes.items) |*entry| {
@@ -9772,6 +9837,39 @@ fn hasExplicitDenseEmbedding(embeddings: []const mapper.DenseEmbeddingWrite, ind
 fn hasExplicitSparseEmbedding(embeddings: []const mapper.SparseEmbeddingWrite, index_name: []const u8) bool {
     for (embeddings) |embedding| {
         if (std.mem.eql(u8, embedding.index_name, index_name)) return true;
+    }
+    return false;
+}
+
+fn appendDenseEmbeddingToExtractedWrite(
+    alloc: Allocator,
+    extracted: *mapper.ExtractedWrite,
+    embedding: mapper.DenseEmbeddingWrite,
+) !void {
+    const old = extracted.dense_embeddings;
+    const next = try alloc.alloc(mapper.DenseEmbeddingWrite, old.len + 1);
+    @memcpy(next[0..old.len], old);
+    next[old.len] = embedding;
+    if (old.len > 0) alloc.free(old);
+    extracted.dense_embeddings = next;
+}
+
+fn appendSparseEmbeddingToExtractedWrite(
+    alloc: Allocator,
+    extracted: *mapper.ExtractedWrite,
+    embedding: mapper.SparseEmbeddingWrite,
+) !void {
+    const old = extracted.sparse_embeddings;
+    const next = try alloc.alloc(mapper.SparseEmbeddingWrite, old.len + 1);
+    @memcpy(next[0..old.len], old);
+    next[old.len] = embedding;
+    if (old.len > 0) alloc.free(old);
+    extracted.sparse_embeddings = next;
+}
+
+fn containsOwnedString(items: []const []const u8, value: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, value)) return true;
     }
     return false;
 }

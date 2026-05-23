@@ -1742,6 +1742,7 @@ fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]
 
 fn canUseSchemaLessRawTextFastPath(data: []const u8, opts: TextProjectionOptions) bool {
     if (opts.strip_numeric_array_heuristic) return false;
+    if (rawJsonMayContainTypedField(data)) return false;
     // Raw strings are borrowed from the document. Escapes require JSON string
     // decoding, so keep those on the full parser path.
     if (std.mem.indexOfScalar(u8, data, '\\') != null) return false;
@@ -1753,6 +1754,26 @@ fn canUseSchemaLessRawTextFastPath(data: []const u8, opts: TextProjectionOptions
         if (rawJsonObjectMayContainField(data, first)) return false;
     }
     return true;
+}
+
+fn rawJsonMayContainTypedField(data: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < data.len) : (pos += 1) {
+        if (data[pos] != ':') continue;
+        pos += 1;
+        while (pos < data.len and std.ascii.isWhitespace(data[pos])) : (pos += 1) {}
+        if (pos >= data.len) return false;
+        switch (data[pos]) {
+            '-', '0'...'9', 't', 'f', 'n' => return true,
+            '[' => {
+                var scan = pos + 1;
+                while (scan < data.len and std.ascii.isWhitespace(data[scan])) : (scan += 1) {}
+                if (scan < data.len and data[scan] != '"' and data[scan] != ']') return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn firstProjectionPathSegment(path: []const u8) []const u8 {
@@ -2615,7 +2636,7 @@ test "document mapper schema-less fast projection indexes nested string fields" 
     const arena = arena_state.allocator();
 
     const source_batch = try buildTextProjectionSourceBatchWithOptions(arena, &.{
-        .{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"meta\":{\"summary\":\"beta gamma\",\"tags\":[\"delta\"]},\"count\":1}" },
+        .{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"meta\":{\"summary\":\"beta gamma\",\"tags\":[\"delta\"]}}" },
     }, .{
         .strip_numeric_array_heuristic = false,
         .schema_less_fast_projection = true,
@@ -2635,7 +2656,6 @@ test "document mapper schema-less fast projection indexes nested string fields" 
     try std.testing.expect((try reader.invertedIndex("meta.summary.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.tags.keyword")) != null);
-    try std.testing.expect((try reader.invertedIndex("count")) == null);
 }
 
 test "document mapper schema-less projection indexes exact fields with embeddings stripped" {
