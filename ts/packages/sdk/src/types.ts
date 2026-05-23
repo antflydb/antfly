@@ -240,6 +240,7 @@ export type ResponseData<T extends keyof operations> = operations[T]["responses"
 export type AntflyAuth =
   | { type: "basic"; username: string; password: string }
   | { type: "apiKey"; keyId: string; keySecret: string }
+  | { type: "token"; token: string }
   | { type: "bearer"; token: string }
   | { username: string; password: string }; // backwards compat (no 'type' field)
 

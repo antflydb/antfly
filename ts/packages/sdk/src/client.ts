@@ -37,7 +37,10 @@ export class AntflyClient {
   private config: AntflyConfig;
 
   constructor(config: AntflyConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      baseUrl: normalizeBaseUrl(config.baseUrl),
+    };
     this.client = this.buildClient();
   }
 
@@ -55,6 +58,8 @@ export class AntflyClient {
           return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
         case "apiKey":
           return `ApiKey ${btoa(`${auth.keyId}:${auth.keySecret}`)}`;
+        case "token":
+          return `Bearer ${auth.token}`;
         case "bearer":
           return `Bearer ${auth.token}`;
       }
@@ -882,4 +887,12 @@ export class AntflyClient {
   getRawClient() {
     return this.client;
   }
+}
+
+export function normalizeBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  if (trimmed.endsWith("/api/v1")) {
+    return trimmed;
+  }
+  return `${trimmed}/api/v1`;
 }

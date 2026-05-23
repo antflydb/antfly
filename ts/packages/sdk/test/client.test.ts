@@ -28,6 +28,8 @@ vi.mock("openapi-fetch", () => ({
 
 // Import client after mocking
 const { AntflyClient } = await import("../src/client.js");
+const { normalizeBaseUrl } = await import("../src/client.js");
+const { default: createClient } = await import("openapi-fetch");
 
 describe("AntflyClient", () => {
   let client: AntflyClient;
@@ -53,6 +55,34 @@ describe("AntflyClient", () => {
 
     it("should have access to raw client", () => {
       expect(client.getRawClient()).toBeDefined();
+    });
+
+    it("should normalize local and CloudAF base URLs", () => {
+      expect(normalizeBaseUrl("http://localhost:8080")).toBe("http://localhost:8080/api/v1");
+      expect(normalizeBaseUrl("http://localhost:8080/")).toBe("http://localhost:8080/api/v1");
+      expect(normalizeBaseUrl("http://localhost:8080/api/v1")).toBe("http://localhost:8080/api/v1");
+      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance")).toBe(
+        "https://platform.antfly.io/cloud/v1/instance/api/v1"
+      );
+      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance/api/v1")).toBe(
+        "https://platform.antfly.io/cloud/v1/instance/api/v1"
+      );
+    });
+
+    it("should configure token auth as a bearer token", () => {
+      new AntflyClient({
+        baseUrl: "https://platform.antfly.io/cloud/v1/instance",
+        auth: { type: "token", token: "antflydb_test" },
+      });
+
+      expect(createClient).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          baseUrl: "https://platform.antfly.io/cloud/v1/instance/api/v1",
+          headers: expect.objectContaining({
+            Authorization: "Bearer antflydb_test",
+          }),
+        })
+      );
     });
   });
 
@@ -329,7 +359,7 @@ describe("AntflyClient", () => {
       expect(results[2]).toEqual({ _key: "user:3", name: "Charlie" });
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/tables/users/lookup",
+        "http://localhost:8080/api/v1/tables/users/lookup",
         expect.objectContaining({
           method: "POST",
           body: "{}",
@@ -362,7 +392,7 @@ describe("AntflyClient", () => {
       expect(results).toHaveLength(2);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/tables/users/lookup",
+        "http://localhost:8080/api/v1/tables/users/lookup",
         expect.objectContaining({
           method: "POST",
           body: JSON.stringify({

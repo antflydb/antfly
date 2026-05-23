@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
-    // Read global config from env vars (ANTFLY_URL, ANTFLY_BEARER)
+    // Read global config from env vars (ANTFLY_URL, ANTFLY_TOKEN)
     const config = cmd.cli.parseGlobalFlags();
 
     // Initialize IO and HTTP client

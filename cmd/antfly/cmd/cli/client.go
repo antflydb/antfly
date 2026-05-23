@@ -34,6 +34,7 @@ import (
 
 	antfly "github.com/antflydb/antfly/pkg/client"
 	"github.com/antflydb/antfly/pkg/client/admin"
+	"github.com/antflydb/antfly/pkg/client/oapi"
 	"github.com/antflydb/antfly/pkg/client/query"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 	blevequery "github.com/blevesearch/bleve/v2/search/query"
@@ -72,14 +73,18 @@ type AntflyClient struct {
 }
 
 // NewAntflyClient creates a new Antfly client
-func NewAntflyClient(baseURL string, httpClient *http.Client) (*AntflyClient, error) {
-	client, err := antfly.NewAntflyClient(strings.TrimRight(baseURL, "/")+"/api/v1", httpClient)
+func NewAntflyClient(baseURL string, token string, httpClient *http.Client) (*AntflyClient, error) {
+	opts := []oapi.ClientOption{oapi.WithHTTPClient(httpClient)}
+	if token != "" {
+		opts = append(opts, oapi.WithRequestEditorFn(antfly.WithToken(token)))
+	}
+	client, err := antfly.NewAntflyClientWithOptions(baseURL, opts...)
 	if err != nil {
 		return nil, err
 	}
 
 	// Initialize internal admin client using the same base URL and HTTP client
-	internalClient := admin.NewInternalClient(strings.TrimRight(baseURL, "/"), httpClient)
+	internalClient := admin.NewInternalClient(antfly.NormalizeServerURL(baseURL), httpClient)
 
 	return &AntflyClient{
 		AntflyClient:   client,

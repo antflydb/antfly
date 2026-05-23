@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -126,13 +127,29 @@ func parseOptionalPruner(prunerStr string) (antfly.Pruner, error) {
 // The default is set on the persistent flag definition.
 func resolveURL(cmd *cobra.Command) string {
 	url, _ := cmd.Flags().GetString("url")
+	if !cmd.Flags().Changed("url") {
+		if envURL := os.Getenv("ANTFLY_URL"); envURL != "" {
+			return envURL
+		}
+	}
 	return url
+}
+
+// resolveToken returns the bearer token from command flags or ANTFLY_TOKEN.
+func resolveToken(cmd *cobra.Command) string {
+	token, _ := cmd.Flags().GetString("token")
+	if !cmd.Flags().Changed("token") {
+		if envToken := os.Getenv("ANTFLY_TOKEN"); envToken != "" {
+			return envToken
+		}
+	}
+	return token
 }
 
 // initClient initializes the global antflyClient with the given HTTP client.
 func initClient(cmd *cobra.Command, httpClient *http.Client) error {
 	var err error
-	antflyClient, err = NewAntflyClient(resolveURL(cmd), httpClient)
+	antflyClient, err = NewAntflyClient(resolveURL(cmd), resolveToken(cmd), httpClient)
 	return err
 }
 
@@ -149,6 +166,9 @@ var cliCommandNames = map[string]bool{
 func RegisterCommands(parent *cobra.Command) {
 	if parent.PersistentFlags().Lookup("url") == nil {
 		parent.PersistentFlags().String("url", "http://localhost:8080", "Antfly server URL")
+	}
+	if parent.PersistentFlags().Lookup("token") == nil {
+		parent.PersistentFlags().String("token", "", "Bearer token for authentication")
 	}
 
 	// Chain client init onto parent's PersistentPreRunE, but only
