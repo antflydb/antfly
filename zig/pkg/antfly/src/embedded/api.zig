@@ -121,7 +121,7 @@ pub const Api = struct {
     }
 
     pub fn searchJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
-        var owned = try query_api.parseQueryRequest(
+        var owned = try query_api.parsePublicQueryRequest(
             alloc,
             self.semantic_resolver,
             self.table_name,

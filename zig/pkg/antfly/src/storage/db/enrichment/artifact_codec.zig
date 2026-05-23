@@ -146,6 +146,11 @@ pub const SparseEmbedding = struct {
     }
 };
 
+pub const SparseEmbeddingView = struct {
+    indices: []const u32,
+    values: []const f32,
+};
+
 pub const GraphEdge = struct {
     weight: f64,
     created_at: u64,
@@ -186,14 +191,8 @@ pub fn encodeSparseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, indices: 
 }
 
 pub fn decodeSparseEmbeddingAlloc(alloc: Allocator, data: []const u8) !SparseEmbedding {
-    const header = try decodeHeader(data);
-    if (header.kind != .sparse_embedding) return error.InvalidArtifactKind;
-    if (header.payload_len < @sizeOf(u32)) return error.InvalidArtifactPayload;
-
-    const payload = data[header_len..][0..header.payload_len];
+    const payload = try sparseEmbeddingPayload(data);
     const count = std.mem.readInt(u32, payload[0..4], .little);
-    const pair_bytes = payload.len - @sizeOf(u32);
-    if (pair_bytes != @as(usize, count) * (@sizeOf(u32) + @sizeOf(u32))) return error.InvalidSparseEmbedding;
 
     const indices = try alloc.alloc(u32, count);
     errdefer alloc.free(indices);
@@ -208,6 +207,26 @@ pub fn decodeSparseEmbeddingAlloc(alloc: Allocator, data: []const u8) !SparseEmb
         pos += @sizeOf(u32);
     }
     return .{ .indices = indices, .values = values };
+}
+
+pub fn sparseEmbeddingVectorView(data: []const u8) !?SparseEmbeddingView {
+    _ = try sparseEmbeddingPayload(data);
+    // v1 sparse embeddings are interleaved index/value pairs. That layout
+    // cannot produce two independent contiguous views, and there is no header
+    // bit to distinguish it from a future split-array layout.
+    return null;
+}
+
+fn sparseEmbeddingPayload(data: []const u8) ![]const u8 {
+    const header = try decodeHeader(data);
+    if (header.kind != .sparse_embedding) return error.InvalidArtifactKind;
+    if (header.payload_len < @sizeOf(u32)) return error.InvalidArtifactPayload;
+
+    const payload = data[header_len..][0..header.payload_len];
+    const count = std.mem.readInt(u32, payload[0..4], .little);
+    const pair_bytes = payload.len - @sizeOf(u32);
+    if (pair_bytes != @as(usize, count) * (@sizeOf(u32) + @sizeOf(u32))) return error.InvalidSparseEmbedding;
+    return payload;
 }
 
 pub fn encodeGraphEdgeAlloc(
@@ -394,12 +413,36 @@ test "artifact codec encodes sparse embedding with version and source hash" {
     try std.testing.expect(header.flags.has_source_hash);
     try std.testing.expectEqual(hash, header.source_hash);
     try std.testing.expectEqual(@as(?u64, hash), try sourceHash(encoded));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, encoded[header_len..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, encoded[header_len + 4 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 0.25))), std.mem.readInt(u32, encoded[header_len + 8 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, encoded[header_len + 12 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.5))), std.mem.readInt(u32, encoded[header_len + 16 ..][0..4], .little));
 
     var decoded = try decodeSparseEmbeddingAlloc(alloc, encoded);
     defer decoded.deinit(alloc);
     try std.testing.expectEqualSlices(u32, &.{ 3, 9 }, decoded.indices);
     try std.testing.expectEqual(@as(f32, 0.25), decoded.values[0]);
     try std.testing.expectEqual(@as(f32, 1.5), decoded.values[1]);
+    try std.testing.expectEqual(@as(?SparseEmbeddingView, null), try sparseEmbeddingVectorView(encoded));
+}
+
+test "artifact codec sparse embedding decoder accepts v1 interleaved payloads" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSparseEmbeddingAlloc(alloc, null, &.{ 1, 2, 3 }, &.{ 0.5, 0.25, 0.125 });
+    defer alloc.free(encoded);
+
+    const unaligned_storage = try alloc.alloc(u8, encoded.len + 1);
+    defer alloc.free(unaligned_storage);
+    @memcpy(unaligned_storage[1..], encoded);
+    const unaligned = unaligned_storage[1..];
+
+    try std.testing.expectEqual(@as(?SparseEmbeddingView, null), try sparseEmbeddingVectorView(unaligned));
+
+    var decoded = try decodeSparseEmbeddingAlloc(alloc, unaligned);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, decoded.indices);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25, 0.125 }, decoded.values);
 }
 
 test "artifact codec encodes graph edge with version and source hash" {

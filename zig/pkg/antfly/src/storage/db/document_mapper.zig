@@ -22,6 +22,9 @@ const schema_api = @import("../../schema/mod.zig");
 const runtime_schema = @import("../schema.zig");
 const types = @import("types.zig");
 
+pub const schema_less_exact_field_suffix = ".keyword";
+pub const schema_less_exact_max_bytes: usize = 1024;
+
 pub const MapperDoc = struct {
     key: []const u8,
     value: []const u8,
@@ -519,6 +522,321 @@ pub fn extractSparseVectorField(
     data: []const u8,
     field_name: []const u8,
 ) !?SparseVectorData {
+    return extractSparseVectorFieldRawFast(alloc, data, field_name) catch |raw_err| switch (raw_err) {
+        error.UnsupportedSparseFastPath => return extractSparseVectorFieldFast(alloc, data, field_name) catch |err| switch (err) {
+            error.UnsupportedSparseFastPath => return extractSparseVectorFieldSlow(alloc, data, field_name),
+            else => return err,
+        },
+        else => return raw_err,
+    };
+}
+
+fn extractSparseVectorFieldRawFast(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
+    var pos: usize = 0;
+    skipJsonWhitespace(data, &pos);
+    if (pos >= data.len or data[pos] != '{') return null;
+    pos += 1;
+
+    while (true) {
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == '}') return null;
+        const key = try parseRawJsonString(data, &pos);
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len or data[pos] != ':') return error.SyntaxError;
+        pos += 1;
+        skipJsonWhitespace(data, &pos);
+        if (std.mem.eql(u8, key, field_name)) {
+            if (pos >= data.len or data[pos] != '{') return null;
+            return try parseSparseVectorObjectRawFast(alloc, data, &pos);
+        }
+        try skipRawJsonValue(data, &pos);
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == ',') {
+            pos += 1;
+            continue;
+        }
+        if (data[pos] == '}') return null;
+        return error.SyntaxError;
+    }
+}
+
+fn parseSparseVectorObjectRawFast(alloc: Allocator, data: []const u8, pos: *usize) !SparseVectorData {
+    if (pos.* >= data.len or data[pos.*] != '{') return error.SyntaxError;
+    pos.* += 1;
+
+    var indices: ?[]u32 = null;
+    var values: ?[]f32 = null;
+    var saw_supported_field = false;
+    errdefer {
+        if (indices) |items| alloc.free(items);
+        if (values) |items| alloc.free(items);
+    }
+
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == '}') {
+            pos.* += 1;
+            break;
+        }
+        const key = try parseRawJsonString(data, pos);
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len or data[pos.*] != ':') return error.SyntaxError;
+        pos.* += 1;
+        skipJsonWhitespace(data, pos);
+
+        if (std.mem.eql(u8, key, "indices")) {
+            if (indices != null) return error.InvalidSparseVector;
+            indices = try parseRawU32Array(alloc, data, pos);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "values")) {
+            if (values != null) return error.InvalidSparseVector;
+            values = try parseRawF32Array(alloc, data, pos);
+            saw_supported_field = true;
+        } else if (saw_supported_field) {
+            try skipRawJsonValue(data, pos);
+        } else {
+            return error.UnsupportedSparseFastPath;
+        }
+
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ',') {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == '}') {
+            pos.* += 1;
+            break;
+        }
+        return error.SyntaxError;
+    }
+
+    const out_indices = indices orelse return error.UnsupportedSparseFastPath;
+    const out_values = values orelse return error.InvalidSparseVector;
+    if (out_indices.len != out_values.len) return error.InvalidSparseVector;
+    indices = null;
+    values = null;
+    return .{
+        .indices = out_indices,
+        .values = out_values,
+    };
+}
+
+fn parseRawU32Array(alloc: Allocator, data: []const u8, pos: *usize) ![]u32 {
+    if (pos.* >= data.len or data[pos.*] != '[') return error.InvalidSparseVector;
+    pos.* += 1;
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        const raw = try parseRawJsonNumber(data, pos);
+        try out.append(alloc, try std.fmt.parseInt(u32, raw, 10));
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ',') {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        return error.SyntaxError;
+    }
+}
+
+fn parseRawF32Array(alloc: Allocator, data: []const u8, pos: *usize) ![]f32 {
+    if (pos.* >= data.len or data[pos.*] != '[') return error.InvalidSparseVector;
+    pos.* += 1;
+    var out = std.ArrayListUnmanaged(f32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        const raw = try parseRawJsonNumber(data, pos);
+        try out.append(alloc, try std.fmt.parseFloat(f32, raw));
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ',') {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        return error.SyntaxError;
+    }
+}
+
+fn parseRawJsonNumber(data: []const u8, pos: *usize) ![]const u8 {
+    const start = pos.*;
+    if (pos.* < data.len and (data[pos.*] == '-' or data[pos.*] == '+')) pos.* += 1;
+    var saw_digit = false;
+    while (pos.* < data.len and std.ascii.isDigit(data[pos.*])) : (pos.* += 1) saw_digit = true;
+    if (pos.* < data.len and data[pos.*] == '.') {
+        pos.* += 1;
+        while (pos.* < data.len and std.ascii.isDigit(data[pos.*])) : (pos.* += 1) saw_digit = true;
+    }
+    if (!saw_digit) return error.InvalidSparseVector;
+    if (pos.* < data.len and (data[pos.*] == 'e' or data[pos.*] == 'E')) {
+        pos.* += 1;
+        if (pos.* < data.len and (data[pos.*] == '-' or data[pos.*] == '+')) pos.* += 1;
+        var saw_exponent_digit = false;
+        while (pos.* < data.len and std.ascii.isDigit(data[pos.*])) : (pos.* += 1) saw_exponent_digit = true;
+        if (!saw_exponent_digit) return error.InvalidSparseVector;
+    }
+    return data[start..pos.*];
+}
+
+fn parseRawJsonString(data: []const u8, pos: *usize) ![]const u8 {
+    if (pos.* >= data.len or data[pos.*] != '"') return error.SyntaxError;
+    pos.* += 1;
+    const start = pos.*;
+    while (pos.* < data.len) : (pos.* += 1) {
+        switch (data[pos.*]) {
+            '"' => {
+                const out = data[start..pos.*];
+                pos.* += 1;
+                return out;
+            },
+            '\\' => return error.UnsupportedSparseFastPath,
+            else => {},
+        }
+    }
+    return error.SyntaxError;
+}
+
+fn skipJsonWhitespace(data: []const u8, pos: *usize) void {
+    while (pos.* < data.len) : (pos.* += 1) {
+        switch (data[pos.*]) {
+            ' ', '\n', '\r', '\t' => {},
+            else => return,
+        }
+    }
+}
+
+fn skipRawJsonValue(data: []const u8, pos: *usize) !void {
+    skipJsonWhitespace(data, pos);
+    if (pos.* >= data.len) return error.SyntaxError;
+    switch (data[pos.*]) {
+        '"' => {
+            _ = try parseRawJsonStringAllowEscapes(data, pos);
+            return;
+        },
+        '{', '[' => {},
+        else => {
+            while (pos.* < data.len) : (pos.* += 1) {
+                switch (data[pos.*]) {
+                    ',', '}', ']', ' ', '\n', '\r', '\t' => return,
+                    else => {},
+                }
+            }
+            return;
+        },
+    }
+
+    var depth: usize = 0;
+    while (pos.* < data.len) {
+        switch (data[pos.*]) {
+            '"' => {
+                _ = try parseRawJsonStringAllowEscapes(data, pos);
+                continue;
+            },
+            '{', '[' => {
+                depth += 1;
+                pos.* += 1;
+            },
+            '}', ']' => {
+                if (depth == 0) return error.SyntaxError;
+                depth -= 1;
+                pos.* += 1;
+                if (depth == 0) return;
+            },
+            else => pos.* += 1,
+        }
+    }
+    return error.SyntaxError;
+}
+
+fn parseRawJsonStringAllowEscapes(data: []const u8, pos: *usize) !void {
+    if (pos.* >= data.len or data[pos.*] != '"') return error.SyntaxError;
+    pos.* += 1;
+    while (pos.* < data.len) : (pos.* += 1) {
+        switch (data[pos.*]) {
+            '"' => {
+                pos.* += 1;
+                return;
+            },
+            '\\' => {
+                pos.* += 1;
+                if (pos.* >= data.len) return error.SyntaxError;
+            },
+            else => {},
+        }
+    }
+    return error.SyntaxError;
+}
+
+fn extractSparseVectorFieldFast(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
+    var scanner = std.json.Scanner.initCompleteInput(alloc, data);
+    defer scanner.deinit();
+
+    switch (try scanner.next()) {
+        .object_begin => {},
+        else => return null,
+    }
+
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .object_end => {
+                _ = try scanner.next();
+                return null;
+            },
+            .string => {},
+            else => return null,
+        }
+
+        const key_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, key_token);
+        const key = jsonTokenSlice(key_token) orelse return error.InvalidSparseVector;
+        if (!std.mem.eql(u8, key, field_name)) {
+            try scanner.skipValue();
+            continue;
+        }
+
+        switch (try scanner.peekNextTokenType()) {
+            .object_begin => return try parseSparseVectorObjectFast(alloc, &scanner),
+            else => return null,
+        }
+    }
+}
+
+fn extractSparseVectorFieldSlow(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
     defer parsed.deinit();
     const root = parsed.value;
@@ -548,6 +866,144 @@ pub fn extractSparseVectorField(
         .indices = indices,
         .values = values,
     };
+}
+
+fn parseSparseVectorObjectFast(alloc: Allocator, scanner: *std.json.Scanner) !SparseVectorData {
+    switch (try scanner.next()) {
+        .object_begin => {},
+        else => return error.InvalidSparseVector,
+    }
+
+    var indices: ?[]u32 = null;
+    var values: ?[]f32 = null;
+    var packed_indices: ?[]u8 = null;
+    var packed_values: ?[]u8 = null;
+    var saw_supported_field = false;
+    errdefer {
+        if (indices) |items| alloc.free(items);
+        if (values) |items| alloc.free(items);
+        if (packed_indices) |items| alloc.free(items);
+        if (packed_values) |items| alloc.free(items);
+    }
+
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .object_end => {
+                _ = try scanner.next();
+                break;
+            },
+            .string => {},
+            else => return error.InvalidSparseVector,
+        }
+
+        const key_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, key_token);
+        const key = jsonTokenSlice(key_token) orelse return error.InvalidSparseVector;
+        if (std.mem.eql(u8, key, "indices")) {
+            if (indices != null) return error.InvalidSparseVector;
+            indices = try parseSparseU32ArrayFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "values")) {
+            if (values != null) return error.InvalidSparseVector;
+            values = try parseSparseF32ArrayFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "packed_indices")) {
+            if (packed_indices != null) return error.InvalidSparseVector;
+            packed_indices = try parseSparseStringDupFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "packed_values")) {
+            if (packed_values != null) return error.InvalidSparseVector;
+            packed_values = try parseSparseStringDupFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (saw_supported_field) {
+            try scanner.skipValue();
+        } else {
+            return error.UnsupportedSparseFastPath;
+        }
+    }
+
+    if (packed_indices != null or packed_values != null) {
+        const raw_indices = packed_indices orelse return error.InvalidSparseVector;
+        const raw_values = packed_values orelse return error.InvalidSparseVector;
+        var sparse = vector_codec.decodePackedSparseBase64Alloc(alloc, raw_indices, raw_values) catch return error.InvalidSparseVector;
+        errdefer sparse.deinit(alloc);
+        alloc.free(raw_indices);
+        packed_indices = null;
+        alloc.free(raw_values);
+        packed_values = null;
+        return .{
+            .indices = sparse.indices,
+            .values = sparse.values,
+        };
+    }
+
+    const out_indices = indices orelse return error.UnsupportedSparseFastPath;
+    const out_values = values orelse return error.InvalidSparseVector;
+    if (out_indices.len != out_values.len) return error.InvalidSparseVector;
+    indices = null;
+    values = null;
+    return .{
+        .indices = out_indices,
+        .values = out_values,
+    };
+}
+
+fn parseSparseU32ArrayFast(alloc: Allocator, scanner: *std.json.Scanner) ![]u32 {
+    switch (try scanner.next()) {
+        .array_begin => {},
+        else => return error.InvalidSparseVector,
+    }
+
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .array_end => {
+                _ = try scanner.next();
+                return try out.toOwnedSlice(alloc);
+            },
+            .number => {},
+            else => return error.InvalidSparseVector,
+        }
+        const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, token);
+        const raw = jsonTokenSlice(token) orelse return error.InvalidSparseVector;
+        try out.append(alloc, try std.fmt.parseInt(u32, raw, 10));
+    }
+}
+
+fn parseSparseF32ArrayFast(alloc: Allocator, scanner: *std.json.Scanner) ![]f32 {
+    switch (try scanner.next()) {
+        .array_begin => {},
+        else => return error.InvalidSparseVector,
+    }
+
+    var out = std.ArrayListUnmanaged(f32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .array_end => {
+                _ = try scanner.next();
+                return try out.toOwnedSlice(alloc);
+            },
+            .number => {},
+            else => return error.InvalidSparseVector,
+        }
+        const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, token);
+        const raw = jsonTokenSlice(token) orelse return error.InvalidSparseVector;
+        try out.append(alloc, try std.fmt.parseFloat(f32, raw));
+    }
+}
+
+fn parseSparseStringDupFast(alloc: Allocator, scanner: *std.json.Scanner) ![]u8 {
+    const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+    defer freeJsonAllocatedToken(alloc, token);
+    const raw = switch (token) {
+        .string, .allocated_string => jsonTokenSlice(token) orelse return error.InvalidSparseVector,
+        else => return error.InvalidSparseVector,
+    };
+    return try alloc.dupe(u8, raw);
 }
 
 pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !ExtractedWrite {
@@ -581,6 +1037,7 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
             .summaries = &.{},
         };
     }
+    if (root.object.contains("_summaries")) return error.UnsupportedSummaryField;
 
     var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
@@ -614,16 +1071,6 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         }
         sparse_embeddings.deinit(alloc);
     }
-    var summaries = std.ArrayListUnmanaged(SummaryWrite).empty;
-    errdefer {
-        for (summaries.items) |summary| {
-            alloc.free(summary.index_name);
-            alloc.free(summary.doc_key);
-            alloc.free(summary.text);
-        }
-        summaries.deinit(alloc);
-    }
-
     var mentioned_indexes = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (mentioned_indexes.items) |index_name| alloc.free(index_name);
@@ -710,24 +1157,7 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         }
     }
 
-    if (root.object.get("_summaries")) |summaries_field| {
-        if (summaries_field != .object) return error.InvalidSummaryField;
-
-        var summary_it = summaries_field.object.iterator();
-        while (summary_it.next()) |summary_entry| {
-            const index_name = summary_entry.key_ptr.*;
-            const summary_value = summary_entry.value_ptr.*;
-            if (summary_value != .string) return error.InvalidSummaryField;
-
-            try summaries.append(alloc, .{
-                .index_name = try alloc.dupe(u8, index_name),
-                .doc_key = try alloc.dupe(u8, key),
-                .text = try alloc.dupe(u8, summary_value.string),
-            });
-        }
-    }
-
-    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings") or root.object.contains("_summaries");
+    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings");
     const has_non_special_fields = hasNonSpecialFields(root);
     const cleaned_value = if (has_special_fields) blk: {
         if (!has_non_special_fields) break :blk null;
@@ -742,7 +1172,7 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         .mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-        .summaries = try summaries.toOwnedSlice(alloc),
+        .summaries = &.{},
     };
 }
 
@@ -796,7 +1226,8 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
             saw_embeddings = true;
             continue;
         }
-        if (std.mem.eql(u8, field_name, "_edges") or std.mem.eql(u8, field_name, "_summaries")) return null;
+        if (std.mem.eql(u8, field_name, "_summaries")) return error.UnsupportedSummaryField;
+        if (std.mem.eql(u8, field_name, "_edges")) return null;
         if (!(try appendFastScalarField(alloc, &scanner, field_name, &json_writer))) return null;
         has_non_special_fields = true;
     }
@@ -1123,11 +1554,11 @@ fn collectDynamicSchemaTextFields(
             }
             if (document_schema) |resolved| {
                 if (pathFallsUnderInferTypeDynamicPath(resolved, path)) {
-                    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+                    try appendDynamicSchemaLessStringTextFields(alloc, fields, path, text, text_analysis, observed_field_analyzers);
                     return;
                 }
                 if (pathFallsUnderOpenDynamicPath(resolved, path)) {
-                    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+                    try appendDynamicSchemaLessStringTextFields(alloc, fields, path, text, text_analysis, observed_field_analyzers);
                 }
             }
         },
@@ -1254,6 +1685,28 @@ fn appendNamedTextField(
     }
 }
 
+fn appendDynamicSchemaLessStringTextFields(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    path: []const u8,
+    text: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+) !void {
+    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+    if (observed_field_analyzers) |collector| {
+        try appendObservedFieldAnalyzer(alloc, collector, path, "standard");
+    }
+    if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
+
+    const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
+    defer alloc.free(exact_field);
+    try appendNamedTextField(alloc, fields, exact_field, text, "keyword", false, text_analysis);
+    if (observed_field_analyzers) |collector| {
+        try appendObservedFieldAnalyzer(alloc, collector, exact_field, "keyword");
+    }
+}
+
 fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]introducer_mod.TextField {
     var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
     defer fields.deinit(alloc);
@@ -1291,9 +1744,20 @@ fn collectStringFieldsNoSchema(
                 .field_name = try alloc.dupe(u8, path),
                 .text = text,
             });
+            if (text.len <= schema_less_exact_max_bytes and !std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) {
+                try fields.append(alloc, .{
+                    .field_name = try schemaLessExactFieldNameAlloc(alloc, path),
+                    .text = text,
+                    .analyzer = &analysis_mod.keyword_analyzer,
+                });
+            }
         },
         else => {},
     }
+}
+
+fn schemaLessExactFieldNameAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ path, schema_less_exact_field_suffix });
 }
 
 fn resolveFullTextDocument(schema: runtime_schema.TableSchema, root: std.json.ObjectMap) ?runtime_schema.FullTextDocument {
@@ -1730,8 +2194,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 
 fn isSpecialField(field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "_edges") or
-        std.mem.eql(u8, field_name, "_embeddings") or
-        std.mem.eql(u8, field_name, "_summaries");
+        std.mem.eql(u8, field_name, "_embeddings");
 }
 
 fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), value: []const u8) !void {
@@ -1877,13 +2340,13 @@ test "document mapper emits schema-driven search_as_you_type variants" {
                     },
                     .{
                         .path = "name",
-                        .emitted_name = "name__keyword",
+                        .emitted_name = "name.keyword",
                         .analyzer = "keyword",
                     },
                     .{
                         .path = "name",
-                        .emitted_name = "name__2gram",
-                        .analyzer = "search_as_you_type",
+                        .emitted_name = "name._index_prefix",
+                        .analyzer = "search_as_you_type_index_prefix",
                     },
                 },
             },
@@ -1899,8 +2362,8 @@ test "document mapper emits schema-driven search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("name")) != null);
-    try std.testing.expect((try reader.invertedIndex("name__keyword")) != null);
-    try std.testing.expect((try reader.invertedIndex("name__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("name.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("name._index_prefix")) != null);
 }
 
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
@@ -1916,7 +2379,7 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
                 .path_match = "meta.*",
                 .mapping = .{
                     .field_type = .search_as_you_type,
-                    .analyzer = "search_as_you_type",
+                    .analyzer = "search_as_you_type_index_prefix",
                 },
             },
         },
@@ -1931,7 +2394,7 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.nickname")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.nickname__2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._index_prefix")) == null);
 }
 
 test "document mapper honors dynamic-template exclusions and mapping type" {
@@ -2032,8 +2495,8 @@ test "document mapper emits additional-properties search_as_you_type variants" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2051,7 +2514,7 @@ test "document mapper emits additional-properties search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.nickname")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.nickname__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._index_prefix")) != null);
 }
 
 test "document mapper emits nested additional-properties search_as_you_type variants" {
@@ -2074,8 +2537,8 @@ test "document mapper emits nested additional-properties search_as_you_type vari
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2093,7 +2556,7 @@ test "document mapper emits nested additional-properties search_as_you_type vari
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.foo.title")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.foo.title__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.foo.title._index_prefix")) != null);
 }
 
 test "document mapper emits pattern-properties search_as_you_type variants" {
@@ -2117,8 +2580,8 @@ test "document mapper emits pattern-properties search_as_you_type variants" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2136,9 +2599,9 @@ test "document mapper emits pattern-properties search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title._index_prefix")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.skip.title")) == null);
-    try std.testing.expect((try reader.invertedIndex("meta.skip.title__2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.skip.title._index_prefix")) == null);
 }
 
 test "document mapper emits additionalProperties true fallback text fields" {

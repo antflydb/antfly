@@ -320,7 +320,7 @@ fn deriveRuntimeFullTextLeaf(
 
     if (has_keyword) {
         const emitted_name = if (has_primary or has_search_as_you_type)
-            try std.fmt.allocPrint(alloc, "{s}__keyword", .{path})
+            try std.fmt.allocPrint(alloc, "{s}.keyword", .{path})
         else
             try alloc.dupe(u8, path);
         defer alloc.free(emitted_name);
@@ -329,9 +329,17 @@ fn deriveRuntimeFullTextLeaf(
     }
 
     if (has_search_as_you_type) {
-        const emitted_name = try std.fmt.allocPrint(alloc, "{s}__2gram", .{path});
-        defer alloc.free(emitted_name);
-        try appendFullTextField(alloc, fields, path, emitted_name, "search_as_you_type", false);
+        const emitted_2gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{path});
+        defer alloc.free(emitted_2gram);
+        try appendFullTextField(alloc, fields, path, emitted_2gram, "search_as_you_type_2gram", false);
+
+        const emitted_3gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{path});
+        defer alloc.free(emitted_3gram);
+        try appendFullTextField(alloc, fields, path, emitted_3gram, "search_as_you_type_3gram", false);
+
+        const emitted_index_prefix = try std.fmt.allocPrint(alloc, "{s}._index_prefix", .{path});
+        defer alloc.free(emitted_index_prefix);
+        try appendFullTextField(alloc, fields, path, emitted_index_prefix, "search_as_you_type_index_prefix", false);
     }
 }
 
@@ -548,12 +556,14 @@ fn appendDynamicLeafRule(
     }
 
     if (has_keyword) {
-        const suffix = if (has_primary or has_search_as_you_type) "__keyword" else "";
+        const suffix = if (has_primary or has_search_as_you_type) ".keyword" else "";
         try appendDynamicVariant(alloc, &variants, suffix, "keyword", false);
     }
 
     if (has_search_as_you_type) {
-        try appendDynamicVariant(alloc, &variants, "__2gram", "search_as_you_type", false);
+        try appendDynamicVariant(alloc, &variants, "._2gram", "search_as_you_type_2gram", false);
+        try appendDynamicVariant(alloc, &variants, "._3gram", "search_as_you_type_3gram", false);
+        try appendDynamicVariant(alloc, &variants, "._index_prefix", "search_as_you_type_index_prefix", false);
     }
 
     if (variants.items.len == 0) return;

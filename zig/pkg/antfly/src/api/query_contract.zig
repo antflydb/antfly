@@ -1712,7 +1712,7 @@ pub fn parseQueryRequest(
 
     // Packed dense requests are benchmark-oriented and unusual in production.
     // Skip the extra JSON parse unless the request even mentions embeddings.
-    if (std.mem.indexOf(u8, body, "\"embeddings\"") != null) {
+    if (std.mem.indexOf(u8, body, "\"embeddings\"") != null and fastDensePublicQueryMayApply(body)) {
         if (try tryParseFastDensePublicQueryRequest(alloc, body)) |fast| {
             return fast;
         }
@@ -1781,6 +1781,15 @@ pub fn parseQueryRequest(
         .fields = fields,
         .req = req,
     };
+}
+
+pub fn parsePublicQueryRequest(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?SemanticResolver,
+    table_name: []const u8,
+    body: []const u8,
+) !OwnedQueryRequest {
+    return try parseQueryRequest(alloc, semantic_resolver, table_name, body);
 }
 
 pub fn preflightGraphSearchesAlloc(
@@ -1968,6 +1977,29 @@ const FastDensePublicQueryRequest = struct {
     distance_over: ?f32 = null,
     distance_under: ?f32 = null,
 };
+
+fn fastDensePublicQueryMayApply(body: []const u8) bool {
+    const disallowed = [_][]const u8{
+        "\"query\"",
+        "\"full_text_search\"",
+        "\"filter_query\"",
+        "\"exclusion_query\"",
+        "\"merge_config\"",
+        "\"reranker\"",
+        "\"pruner\"",
+        "\"semantic_search\"",
+        "\"sparse\"",
+        "\"graph\"",
+        "\"join\"",
+        "\"with\"",
+        "\"_filter_query_json\"",
+        "\"_exclusion_query_json\"",
+    };
+    for (disallowed) |needle| {
+        if (std.mem.indexOf(u8, body, needle) != null) return false;
+    }
+    return true;
+}
 
 fn tryParseFastDensePublicQueryRequest(
     alloc: std.mem.Allocator,
@@ -3730,6 +3762,13 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: bleve_openapi.
             .analyzer = if (match.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
             .boost = if (match.boost) |boost| @floatCast(boost) else 1.0,
         } },
+        .multi_match_query => |multi_match| try public_text_query_mod.parseMultiMatchBoolPrefixQueryAlloc(
+            alloc,
+            multi_match.multi_match.query,
+            multi_match.multi_match.type,
+            multi_match.multi_match.fields,
+            if (multi_match.multi_match.boost) |boost| @floatCast(boost) else 1.0,
+        ),
         .match_phrase_query => |phrase| blk: {
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             break :blk .{ .match_phrase = .{
@@ -4627,6 +4666,11 @@ fn freeTextQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) void {
             alloc.free(match.text);
             if (match.analyzer) |analyzer| alloc.free(analyzer);
         },
+        .multi_match_bool_prefix => |multi_match| {
+            alloc.free(multi_match.query);
+            for (multi_match.fields) |field| alloc.free(field.field);
+            if (multi_match.fields.len > 0) alloc.free(multi_match.fields);
+        },
         .doc_id => |doc_id| {
             for (doc_id.ids) |id| alloc.free(id);
             if (doc_id.ids.len > 0) alloc.free(doc_id.ids);
@@ -4894,6 +4938,21 @@ test "api query contract includes stored source when fields are omitted" {
     try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
 }
 
+test "api query contract accepts multi_match bool_prefix full text" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"]}}}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.full_text.? == .multi_match_bool_prefix);
+    try std.testing.expectEqualStrings("quick brown f", parsed.req.full_text.?.multi_match_bool_prefix.query);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text.?.multi_match_bool_prefix.fields.len);
+    try std.testing.expectEqualStrings("title", parsed.req.full_text.?.multi_match_bool_prefix.fields[0].field);
+}
+
 test "api query contract projects stored source when explicit fields are supplied" {
     const alloc = std.testing.allocator;
     const body =
@@ -5071,6 +5130,21 @@ test "api query contract parses packed dense embeddings via antfly-json" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), parsed.req.dense_queries[0].query.vector[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), parsed.req.dense_queries[0].query.vector[1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), parsed.req.dense_queries[0].query.vector[2], 0.0001);
+}
+
+test "api query contract does not use dense fast path for composed vector requests" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"full_text_search":{"match":"alpha","field":"body"},"filter_query":{"term":{"status":"active"}},"exclusion_query":{"term":{"category":"archived"}},"limit":3}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
+    try std.testing.expect(parsed.req.full_text != null);
+    try std.testing.expect(parsed.req.filter_query_json.len > 0);
+    try std.testing.expect(parsed.req.exclusion_query_json.len > 0);
 }
 
 test "api query contract parses packed sparse embeddings via antfly-json" {

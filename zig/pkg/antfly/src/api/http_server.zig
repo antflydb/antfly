@@ -116,7 +116,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         var semantic_resolver = SemanticStatusResolver{ .source = self.server.source, .local_termite_provider = self.server.local_termite_provider };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
-        var parsed = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
+        var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try std.fmt.allocPrint(alloc, "query_request failed runtime parse: {s}", .{@errorName(err)}),
             else => return err,
         };
@@ -146,7 +146,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         var semantic_resolver = SemanticStatusResolver{ .source = self.server.source, .local_termite_provider = self.server.local_termite_provider };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
-        var parsed = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
+        var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return null,
             else => return err,
         };
@@ -2523,7 +2523,7 @@ pub const ApiHttpServer = struct {
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 var semantic_resolver = SemanticStatusResolver{ .source = runner.server.source, .local_termite_provider = runner.server.local_termite_provider };
-                var query_req = query_api.parseQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
+                var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
@@ -4662,7 +4662,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
     ) !query_api.QueryResponse {
         var semantic_resolver = SemanticStatusResolver{ .source = self.source, .local_termite_provider = self.local_termite_provider };
-        var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
+        var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
             std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
             return error.InvalidQueryRequest;
         };
@@ -4706,7 +4706,7 @@ pub const ApiHttpServer = struct {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
         var semantic_resolver = SemanticStatusResolver{ .source = self.source, .local_termite_provider = self.local_termite_provider };
-        var owned = try query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
+        var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
         return owned;
@@ -11296,7 +11296,7 @@ test "api http server serves runtime schema debug on table and index detail" {
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_index.value.debug.binding.index_name);
     try std.testing.expectEqualStrings("read", parsed_index.value.debug.binding.schema_slot.?);
     try std.testing.expect(parsed_index.value.debug.binding.runtime_schema != null);
-    try std.testing.expect(Helpers.hasAnalyzer(parsed_index.value.debug.binding.runtime_schema.?, "search_as_you_type"));
+    try std.testing.expect(Helpers.hasAnalyzer(parsed_index.value.debug.binding.runtime_schema.?, "search_as_you_type_index_prefix"));
 }
 
 test "api http server serves table index metadata routes" {

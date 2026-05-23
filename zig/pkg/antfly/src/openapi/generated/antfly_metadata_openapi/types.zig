@@ -51,6 +51,12 @@ pub const ClusterHealth = enum {
     }
 };
 
+/// Non-secret status for the local secrets file store, when one is available.
+pub const SecretStoreStatus = struct {
+    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
+    stale: ?bool = null,
+};
+
 /// Source of the secret configuration
 pub const SecretStatus = enum {
     configured_keystore,
@@ -1211,12 +1217,6 @@ pub const ClusterStatus = struct {
     /// Indicates whether the cluster is running in single-node swarm mode
     swarm_mode: ?bool = null,
     secret_store: ?SecretStoreStatus = null,
-};
-
-/// Non-secret status for the local secrets file store, when one is available.
-pub const SecretStoreStatus = struct {
-    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
-    stale: ?bool = null,
 };
 
 pub const SecretEntry = struct {

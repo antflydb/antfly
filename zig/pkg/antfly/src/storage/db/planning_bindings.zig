@@ -183,6 +183,9 @@ fn validateTextQueryAgainstIndex(
         .multi_phrase => |value| try validateTextFieldAgainstIndex(entry, value.field),
         .term => |value| try validateTextFieldAgainstIndex(entry, value.field),
         .match => |value| try validateTextFieldAgainstIndex(entry, value.field),
+        .multi_match_bool_prefix => |value| {
+            for (value.fields) |field| try validateTextFieldAgainstIndex(entry, field.field);
+        },
         .match_phrase => |value| try validateTextFieldAgainstIndex(entry, value.field),
         .fuzzy => |value| try validateTextFieldAgainstIndex(entry, value.field),
         .numeric_range => |value| try validateTextFieldAgainstIndex(entry, value.field),

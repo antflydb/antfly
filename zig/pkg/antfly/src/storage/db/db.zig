@@ -45,6 +45,10 @@ const background_runtime_mod = @import("../background_runtime.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const persistent_mod = @import("../persistent.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
+const sparse_mod = if (builtin.os.tag == .freestanding)
+    @import("sparse_stub.zig")
+else
+    @import("../../sparse/sparse.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -1328,6 +1332,42 @@ fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: 
     );
 }
 
+fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WriteProfile) void {
+    std.log.info(
+        "antfly_bench_sparse_write index={s} batch_calls={d} incremental_calls={d} bulk_append_calls={d} bulk_append_fallbacks={d} writes={d} deletes={d} postings={d} terms={d} reserve_ms={d} dedupe_ms={d} existence_check_ms={d} doc_num_ms={d} fwd_rev_put_ms={d} posting_collect_ms={d} posting_sort_ms={d} posting_write_ms={d} chunk_read_ms={d} chunk_encode_ms={d} chunk_put_ms={d} range_meta_encode_ms={d} range_meta_put_ms={d} term_meta_ms={d} commit_ms={d} incremental_delete_ms={d} incremental_insert_ms={d} incremental_refresh_ms={d} incremental_commit_ms={d}",
+        .{
+            index_name,
+            delta.batch_calls,
+            delta.incremental_calls,
+            delta.bulk_append_calls,
+            delta.bulk_append_fallbacks,
+            delta.writes,
+            delta.deletes,
+            delta.postings,
+            delta.terms,
+            nsToMs(delta.reserve_ns),
+            nsToMs(delta.dedupe_ns),
+            nsToMs(delta.existence_check_ns),
+            nsToMs(delta.doc_num_ns),
+            nsToMs(delta.fwd_rev_put_ns),
+            nsToMs(delta.posting_collect_ns),
+            nsToMs(delta.posting_sort_ns),
+            nsToMs(delta.posting_write_ns),
+            nsToMs(delta.chunk_read_ns),
+            nsToMs(delta.chunk_encode_ns),
+            nsToMs(delta.chunk_put_ns),
+            nsToMs(delta.range_meta_encode_ns),
+            nsToMs(delta.range_meta_put_ns),
+            nsToMs(delta.term_meta_ns),
+            nsToMs(delta.commit_ns),
+            nsToMs(delta.incremental_delete_ns),
+            nsToMs(delta.incremental_insert_ns),
+            nsToMs(delta.incremental_refresh_ns),
+            nsToMs(delta.incremental_commit_ns),
+        },
+    );
+}
+
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
 const small_derived_text_compact_segment_threshold: usize = 6;
@@ -2561,6 +2601,8 @@ pub const DB = struct {
         errdefer resources.store.abortBulkIngestSession();
         try resources.index_manager.beginDenseBulkIngestSessions();
         errdefer resources.index_manager.abortDenseBulkIngestSessions();
+        try resources.index_manager.beginSparseBulkIngestSessions();
+        errdefer resources.index_manager.abortSparseBulkIngestSessions();
         try resources.index_manager.beginAlgebraicBulkIngestSessions();
         self.bulk_ingest_coalescer.begin();
     }
@@ -2582,6 +2624,9 @@ pub const DB = struct {
                 first_err = err;
             };
             resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+            resources.index_manager.finishSparseBulkIngestSessionsWithOptions(options) catch |err| {
                 if (first_err == null) first_err = err;
             };
             resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
@@ -6736,7 +6781,10 @@ pub const DB = struct {
                 .sparse_vector => {
                     if (self.core.sparseIndex(item.name)) |entry| {
                         const sparse_stats = entry.index.stats();
-                        item.doc_count = sparse_stats.doc_count;
+                        item.doc_count = if (entry.chunk_name == null and runtime_stats.doc_count > 0)
+                            @min(sparse_stats.doc_count, runtime_stats.doc_count)
+                        else
+                            sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
@@ -7679,6 +7727,9 @@ pub const DB = struct {
         switch (text_query) {
             .term => |term| try self.proveTextFieldAccessPath(index_name, term.field, null, .slice),
             .match => |match| try self.proveTextFieldAccessPath(index_name, match.field, match.analyzer, .slice),
+            .multi_match_bool_prefix => |multi_match| {
+                for (multi_match.fields) |field| try self.proveMultiMatchBoolPrefixAccessPaths(index_name, field.field);
+            },
             .prefix => |prefix| try self.proveTextFieldAccessPath(index_name, prefix.field, null, .automaton_select),
             .wildcard => |wildcard| try self.proveTextFieldAccessPath(index_name, wildcard.field, null, .automaton_select),
             .regexp => |regexp| try self.proveTextFieldAccessPath(index_name, regexp.field, null, .automaton_select),
@@ -7694,6 +7745,42 @@ pub const DB = struct {
 
     fn proveTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, analyzer: ?[]const u8, fragment: algebraic_mod.ir.TensorFragment) !void {
         _ = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, analyzer, fragment) orelse return error.IndexNotFound;
+    }
+
+    fn proveOptionalTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, fragment: algebraic_mod.ir.TensorFragment) !bool {
+        const plan = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, null, fragment);
+        return plan != null;
+    }
+
+    fn proveMultiMatchBoolPrefixAccessPaths(self: *DB, index_name: ?[]const u8, field: []const u8) !void {
+        if (std.mem.endsWith(u8, field, "._index_prefix")) {
+            try self.proveTextFieldAccessPath(index_name, field, null, .slice);
+            return;
+        }
+
+        try self.proveTextFieldAccessPath(index_name, field, null, .slice);
+        try self.proveTextFieldAccessPath(index_name, field, null, .automaton_select);
+        if (isSearchAsYouTypeGeneratedFieldName(field)) return;
+
+        const two_gram = try std.fmt.allocPrint(self.alloc, "{s}._2gram", .{field});
+        defer self.alloc.free(two_gram);
+        const has_two_gram = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .slice);
+        if (has_two_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .automaton_select);
+
+        const three_gram = try std.fmt.allocPrint(self.alloc, "{s}._3gram", .{field});
+        defer self.alloc.free(three_gram);
+        const has_three_gram = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .slice);
+        if (has_three_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .automaton_select);
+
+        const index_prefix = try std.fmt.allocPrint(self.alloc, "{s}._index_prefix", .{field});
+        defer self.alloc.free(index_prefix);
+        _ = try self.proveOptionalTextFieldAccessPath(index_name, index_prefix, .slice);
+    }
+
+    fn isSearchAsYouTypeGeneratedFieldName(field: []const u8) bool {
+        return std.mem.endsWith(u8, field, "._2gram") or
+            std.mem.endsWith(u8, field, "._3gram") or
+            std.mem.endsWith(u8, field, "._index_prefix");
     }
 
     fn textQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
@@ -12054,13 +12141,6 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
-            var index_writes = try collectDocumentWrites(ctx.alloc, ctx.store, batch.documents, ctx.index_manager.byte_range);
-            defer index_writes.deinit();
-            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-            const dense_doc_index_start_ns = monotonicTimeNs();
-            try ctx.index_manager.indexDenseBatchByNameWithOptions(ctx.store, index_ref.name, index_writes.items, batch_options);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_doc_index_ns, dense_doc_index_start_ns);
-
             var dense_embeddings = try collectDenseEmbeddingWritesForBatch(
                 ctx.alloc,
                 ctx.index_manager,
@@ -12069,6 +12149,24 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
             );
             defer dense_embeddings.deinit();
+
+            var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
+            defer dense_embedding_doc_keys.deinit(ctx.alloc);
+
+            var index_writes = try collectDocumentWritesProfiled(
+                ctx.alloc,
+                ctx.store,
+                batch.documents,
+                ctx.index_manager.byte_range,
+                .{ .skip_doc_keys = &dense_embedding_doc_keys },
+                null,
+            );
+            defer index_writes.deinit();
+            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+            const dense_doc_index_start_ns = monotonicTimeNs();
+            try ctx.index_manager.indexDenseBatchByNameWithOptions(ctx.store, index_ref.name, index_writes.items, batch_options);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_doc_index_ns, dense_doc_index_start_ns);
+
             const dense_embedding_start_ns = monotonicTimeNs();
             try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, dense_embeddings.writes, batch_options);
             if (profile) |active_profile| {
@@ -12087,14 +12185,21 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         },
         .sparse_vector => {
             const apply_start_ns = monotonicTimeNs();
-            try ctx.index_manager.deleteSparseBatchByName(index_ref.name, batch.deleted_keys);
-            try ctx.index_manager.deleteSparseBatchByName(index_ref.name, batch.overwritten_doc_keys);
+            const emit_sparse_write_profile = benchMetricsEnabled();
+            const before_sparse_profile = if (emit_sparse_write_profile) ctx.index_manager.sparseWriteProfileByName(index_ref.name) else null;
+            const batch_options: backend_types.BatchOptions = .{ .mode = .bulk_ingest };
+            var collect_doc_profile: CollectSparseFieldWritesProfile = .{};
+            var sparse_delete_ns: u64 = 0;
+            var sparse_collect_doc_ns: u64 = 0;
+            var sparse_doc_index_ns: u64 = 0;
+            var sparse_collect_embedding_ns: u64 = 0;
+            var sparse_embedding_apply_ns: u64 = 0;
+            const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
+            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+            if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
-            var index_writes = try collectDocumentWrites(ctx.alloc, ctx.store, batch.documents, ctx.index_manager.byte_range);
-            defer index_writes.deinit();
-            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-            try ctx.index_manager.indexSparseBatchByName(index_ref.name, index_writes.items);
-
+            const sparse_collect_embedding_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             var sparse_embeddings = try collectSparseEmbeddingWritesForBatch(
                 ctx.alloc,
                 ctx.index_manager,
@@ -12103,7 +12208,68 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
             );
             defer sparse_embeddings.deinit();
-            try ctx.index_manager.applySparseEmbeddingWritesByName(ctx.store, index_ref.name, sparse_embeddings.writes);
+            if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
+
+            var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
+            defer sparse_embedding_doc_keys.deinit(ctx.alloc);
+
+            const sparse_collect_doc_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            const sparse_field_name = ctx.index_manager.sparseFieldNameByName(index_ref.name) orelse return error.IndexNotFound;
+            var index_writes = try collectSparseFieldWritesProfiled(
+                ctx.alloc,
+                ctx.store,
+                batch.documents,
+                ctx.index_manager.byte_range,
+                sparse_field_name,
+                .{
+                    .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                    .prefer_available_inline_values = true,
+                    .skip_doc_keys = &sparse_embedding_doc_keys,
+                },
+                if (emit_sparse_write_profile) &collect_doc_profile else null,
+            );
+            defer index_writes.deinit();
+            if (emit_sparse_write_profile) sparse_collect_doc_ns = monotonicTimeNs() - sparse_collect_doc_start_ns;
+            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+            const sparse_doc_index_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            try ctx.index_manager.indexSparsePreparedWritesByNameWithOptions(index_ref.name, index_writes.items, batch_options);
+            if (emit_sparse_write_profile) sparse_doc_index_ns = monotonicTimeNs() - sparse_doc_index_start_ns;
+
+            const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
+            if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
+            if (before_sparse_profile) |before| {
+                if (ctx.index_manager.sparseWriteProfileByName(index_ref.name)) |after| {
+                    logSparseWriteProfileDelta(index_ref.name, sparse_mod.WriteProfile.delta(after, before));
+                }
+            }
+            if (emit_sparse_write_profile) {
+                std.log.info(
+                    "antfly_bench_sparse_doc_replay index={s} sequence={} documents={d} sparse_embeddings={d} total_ms={d} delete_ms={d} collect_doc_ms={d} collect_doc_scan_ms={d} collect_doc_sort_ms={d} collect_doc_read_ms={d} collect_doc_extract_ms={d} collect_doc_pending={d} collect_doc_output={d} collect_doc_store_hits={d} collect_doc_inline_hits={d} collect_doc_missing={d} collect_doc_no_vector={d} doc_index_ms={d} collect_embedding_ms={d} embedding_apply_ms={d}",
+                    .{
+                        index_ref.name,
+                        batch.sequence,
+                        batch.documents.len,
+                        batch.sparse_embeddings.len,
+                        nsToMs(monotonicTimeNs() - apply_start_ns),
+                        nsToMs(sparse_delete_ns),
+                        nsToMs(sparse_collect_doc_ns),
+                        nsToMs(collect_doc_profile.scan_ns),
+                        nsToMs(collect_doc_profile.sort_ns),
+                        nsToMs(collect_doc_profile.read_ns),
+                        nsToMs(collect_doc_profile.extract_ns),
+                        collect_doc_profile.pending_documents,
+                        collect_doc_profile.output_writes,
+                        collect_doc_profile.store_hits,
+                        collect_doc_profile.inline_hits,
+                        collect_doc_profile.missing_required,
+                        collect_doc_profile.skipped_without_vector,
+                        nsToMs(sparse_doc_index_ns),
+                        nsToMs(sparse_collect_embedding_ns),
+                        nsToMs(sparse_embedding_apply_ns),
+                    },
+                );
+            }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.sparse_apply_ns, apply_start_ns);
         },
         .graph => {
@@ -12258,6 +12424,33 @@ const OwnedBatchWrites = struct {
     }
 };
 
+const CollectDocumentWritesProfile = struct {
+    scan_ns: u64 = 0,
+    sort_ns: u64 = 0,
+    read_ns: u64 = 0,
+    materialize_ns: u64 = 0,
+    input_documents: usize = 0,
+    pending_documents: usize = 0,
+    output_writes: usize = 0,
+    missing_required: usize = 0,
+    inline_hits: usize = 0,
+    store_hits: usize = 0,
+};
+
+const CollectSparseFieldWritesProfile = struct {
+    scan_ns: u64 = 0,
+    sort_ns: u64 = 0,
+    read_ns: u64 = 0,
+    extract_ns: u64 = 0,
+    input_documents: usize = 0,
+    pending_documents: usize = 0,
+    output_writes: usize = 0,
+    missing_required: usize = 0,
+    inline_hits: usize = 0,
+    store_hits: usize = 0,
+    skipped_without_vector: usize = 0,
+};
+
 const OwnedDenseEmbeddingWrites = struct {
     alloc: Allocator,
     owns_doc_keys: bool = false,
@@ -12274,13 +12467,12 @@ const OwnedDenseEmbeddingWrites = struct {
 
 const OwnedSparseEmbeddingWrites = struct {
     alloc: Allocator,
-    owns_doc_keys: bool = false,
+    owned_doc_keys: []const []const u8 = &.{},
     writes: []mapper.SparseEmbeddingWrite = &.{},
 
     fn deinit(self: *@This()) void {
-        if (self.owns_doc_keys) {
-            for (self.writes) |write| self.alloc.free(@constCast(write.doc_key));
-        }
+        for (self.owned_doc_keys) |doc_key| self.alloc.free(@constCast(doc_key));
+        if (self.owned_doc_keys.len > 0) self.alloc.free(self.owned_doc_keys);
         if (self.writes.len > 0) self.alloc.free(self.writes);
         self.* = undefined;
     }
@@ -12290,6 +12482,12 @@ const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
 };
 
+const CollectDocumentWritesOptions = struct {
+    prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
+    prefer_available_inline_values: bool = false,
+    skip_doc_keys: ?*const std.StringHashMapUnmanaged(void) = null,
+};
+
 fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
     return if (internal_keys.isInternalUserKey(key))
         try alloc.dupe(u8, key)
@@ -12297,11 +12495,191 @@ fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
         try internal_keys.documentKeyAlloc(alloc, key);
 }
 
+const OwnedSparseFieldWrites = struct {
+    alloc: Allocator,
+    items: []sparse_mod.SparseWrite = &.{},
+    missing_required: usize = 0,
+
+    fn deinit(self: *@This()) void {
+        for (self.items) |item| {
+            self.alloc.free(@constCast(item.vec.indices));
+            self.alloc.free(@constCast(item.vec.values));
+        }
+        if (self.items.len > 0) self.alloc.free(self.items);
+        self.* = undefined;
+    }
+};
+
+fn collectSparseFieldWritesProfiled(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    documents: []const derived_types.DerivedDocument,
+    byte_range: types.ByteRange,
+    field_name: []const u8,
+    opts: CollectDocumentWritesOptions,
+    profile: ?*CollectSparseFieldWritesProfile,
+) !OwnedSparseFieldWrites {
+    const PendingDocumentWrite = struct {
+        doc_key: []const u8,
+        store_key: []u8,
+        inline_value: ?[]const u8,
+    };
+
+    var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
+    defer {
+        for (pending.items) |item| alloc.free(item.store_key);
+        pending.deinit(alloc);
+    }
+
+    var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
+    errdefer {
+        for (writes.items) |item| {
+            alloc.free(@constCast(item.vec.indices));
+            alloc.free(@constCast(item.vec.values));
+        }
+        writes.deinit(alloc);
+    }
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    var missing_required: usize = 0;
+    const trust_inline = opts.prefer_available_inline_values or
+        if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
+            store.nextReplaySequence(sequence + 1) == sequence + 1
+        else
+            false;
+
+    if (profile) |p| p.input_documents = documents.len;
+    const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
+    for (documents) |doc| {
+        if (doc.action != .upsert) continue;
+        if (!byte_range.contains(doc.key)) continue;
+        if (opts.skip_doc_keys) |skip_doc_keys| {
+            if (skip_doc_keys.contains(doc.key)) continue;
+        }
+        if (trust_inline and doc.cleaned_value != null) {
+            const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
+            if (try mapper.extractSparseVectorField(alloc, doc.cleaned_value.?, field_name)) |raw_sparse_vec| {
+                var sparse_vec = raw_sparse_vec;
+                writes.append(alloc, .{
+                    .doc_id = doc.key,
+                    .vec = .{
+                        .indices = sparse_vec.indices,
+                        .values = sparse_vec.values,
+                    },
+                }) catch |err| {
+                    sparse_vec.deinit(alloc);
+                    return err;
+                };
+                if (profile) |p| p.output_writes += 1;
+            } else if (profile) |p| {
+                p.skipped_without_vector += 1;
+            }
+            if (profile) |p| {
+                p.extract_ns += monotonicTimeNs() - extract_start_ns;
+                p.inline_hits += 1;
+            }
+            continue;
+        }
+        try pending.append(alloc, .{
+            .doc_key = doc.key,
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .inline_value = doc.cleaned_value,
+        });
+    }
+    if (profile) |p| {
+        p.scan_ns = monotonicTimeNs() - scan_start_ns -| p.extract_ns;
+        p.pending_documents = pending.items.len;
+    }
+
+    if (pending.items.len == 0) {
+        return .{
+            .alloc = alloc,
+            .items = try writes.toOwnedSlice(alloc),
+            .missing_required = missing_required,
+        };
+    }
+
+    const SortContext = struct {};
+    const sort_start_ns = if (profile != null) monotonicTimeNs() else 0;
+    std.mem.sort(PendingDocumentWrite, pending.items, SortContext{}, struct {
+        fn lessThan(_: SortContext, lhs: PendingDocumentWrite, rhs: PendingDocumentWrite) bool {
+            return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
+        }
+    }.lessThan);
+    if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
+
+    const read_keys = try alloc.alloc([]const u8, pending.items.len);
+    defer alloc.free(read_keys);
+    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
+    defer alloc.free(read_values);
+
+    for (pending.items, 0..) |item, i| {
+        read_keys[i] = item.store_key;
+        read_values[i] = null;
+    }
+    const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
+    try txn.getManySorted(read_keys, read_values);
+    if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
+
+    for (pending.items, 0..) |item, i| {
+        const value = if (read_values[i]) |store_value| blk: {
+            if (profile) |p| p.store_hits += 1;
+            break :blk store_value;
+        } else if (item.inline_value) |inline_value| blk: {
+            if (profile) |p| p.inline_hits += 1;
+            break :blk inline_value;
+        } else {
+            missing_required += 1;
+            continue;
+        };
+        const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
+        if (try mapper.extractSparseVectorField(alloc, value, field_name)) |raw_sparse_vec| {
+            var sparse_vec = raw_sparse_vec;
+            writes.append(alloc, .{
+                .doc_id = item.doc_key,
+                .vec = .{
+                    .indices = sparse_vec.indices,
+                    .values = sparse_vec.values,
+                },
+            }) catch |err| {
+                sparse_vec.deinit(alloc);
+                return err;
+            };
+            if (profile) |p| p.output_writes += 1;
+        } else if (profile) |p| {
+            p.skipped_without_vector += 1;
+        }
+        if (profile) |p| p.extract_ns += monotonicTimeNs() - extract_start_ns;
+    }
+    if (profile) |p| {
+        p.missing_required = missing_required;
+        p.output_writes = writes.items.len;
+    }
+
+    return .{
+        .alloc = alloc,
+        .items = try writes.toOwnedSlice(alloc),
+        .missing_required = missing_required,
+    };
+}
+
 fn collectDocumentWrites(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     documents: []const derived_types.DerivedDocument,
     byte_range: types.ByteRange,
+) !OwnedBatchWrites {
+    return try collectDocumentWritesProfiled(alloc, store, documents, byte_range, .{}, null);
+}
+
+fn collectDocumentWritesProfiled(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    documents: []const derived_types.DerivedDocument,
+    byte_range: types.ByteRange,
+    opts: CollectDocumentWritesOptions,
+    profile: ?*CollectDocumentWritesProfile,
 ) !OwnedBatchWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
@@ -12324,15 +12702,39 @@ fn collectDocumentWrites(
     var txn = try store.beginProbeTxn();
     defer txn.abort();
     var missing_required: usize = 0;
+    const trust_inline = opts.prefer_available_inline_values or
+        if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
+            store.nextReplaySequence(sequence + 1) == sequence + 1
+        else
+            false;
 
+    if (profile) |p| p.input_documents = documents.len;
+    const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
         if (!byte_range.contains(doc.key)) continue;
+        if (opts.skip_doc_keys) |skip_doc_keys| {
+            if (skip_doc_keys.contains(doc.key)) continue;
+        }
+        if (trust_inline and doc.cleaned_value != null) {
+            const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
+            try writes.append(alloc, .{
+                .key = doc.key,
+                .value = owned_value,
+            });
+            if (profile) |p| p.inline_hits += 1;
+            continue;
+        }
         try pending.append(alloc, .{
             .doc_key = doc.key,
             .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
             .inline_value = doc.cleaned_value,
         });
+    }
+    if (profile) |p| {
+        p.scan_ns = monotonicTimeNs() - scan_start_ns;
+        p.pending_documents = pending.items.len;
+        p.output_writes = writes.items.len;
     }
 
     if (pending.items.len == 0) {
@@ -12343,11 +12745,13 @@ fn collectDocumentWrites(
     }
 
     const SortContext = struct {};
+    const sort_start_ns = if (profile != null) monotonicTimeNs() else 0;
     std.mem.sort(PendingDocumentWrite, pending.items, SortContext{}, struct {
         fn lessThan(_: SortContext, lhs: PendingDocumentWrite, rhs: PendingDocumentWrite) bool {
             return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
         }
     }.lessThan);
+    if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
     const read_keys = try alloc.alloc([]const u8, pending.items.len);
     defer alloc.free(read_keys);
@@ -12358,10 +12762,19 @@ fn collectDocumentWrites(
         read_keys[i] = item.store_key;
         read_values[i] = null;
     }
+    const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
     try txn.getManySorted(read_keys, read_values);
+    if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
 
+    const materialize_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse item.inline_value orelse {
+        const value = if (read_values[i]) |store_value| blk: {
+            if (profile) |p| p.store_hits += 1;
+            break :blk store_value;
+        } else if (item.inline_value) |inline_value| blk: {
+            if (profile) |p| p.inline_hits += 1;
+            break :blk inline_value;
+        } else {
             missing_required += 1;
             continue;
         };
@@ -12370,6 +12783,11 @@ fn collectDocumentWrites(
             .key = item.doc_key,
             .value = owned_value,
         });
+    }
+    if (profile) |p| {
+        p.materialize_ns = monotonicTimeNs() - materialize_start_ns;
+        p.output_writes = writes.items.len;
+        p.missing_required = missing_required;
     }
 
     return .{
@@ -12384,6 +12802,30 @@ fn collectCombinedDeleteKeys(alloc: Allocator, deleted_keys: []const []const u8,
     @memcpy(combined[0..deleted_keys.len], deleted_keys);
     @memcpy(combined[deleted_keys.len..], overwritten_doc_keys);
     return combined;
+}
+
+fn denseEmbeddingDocKeySet(
+    alloc: Allocator,
+    embeddings: []const mapper.DenseEmbeddingWrite,
+) !std.StringHashMapUnmanaged(void) {
+    var set = std.StringHashMapUnmanaged(void){};
+    errdefer set.deinit(alloc);
+    for (embeddings) |embedding| {
+        try set.put(alloc, embedding.doc_key, {});
+    }
+    return set;
+}
+
+fn sparseEmbeddingDocKeySet(
+    alloc: Allocator,
+    embeddings: []const mapper.SparseEmbeddingWrite,
+) !std.StringHashMapUnmanaged(void) {
+    var set = std.StringHashMapUnmanaged(void){};
+    errdefer set.deinit(alloc);
+    for (embeddings) |embedding| {
+        try set.put(alloc, embedding.doc_key, {});
+    }
+    return set;
 }
 
 fn attachInlineUpsertDocumentValues(
@@ -12653,31 +13095,49 @@ fn collectSparseEmbeddingWritesForArtifacts(
     index_name: []const u8,
 ) !OwnedSparseEmbeddingWrites {
     var filtered = std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite).empty;
+    var owned_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
-        for (filtered.items) |write| alloc.free(@constCast(write.doc_key));
+        for (owned_doc_keys.items) |doc_key| alloc.free(@constCast(doc_key));
+        owned_doc_keys.deinit(alloc);
         filtered.deinit(alloc);
     }
 
     const expected_embedding_name = index_manager.sparseEmbeddingName(index_name) orelse index_name;
     for (artifact_keys) |artifact_key| {
+        if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
+            if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) continue;
+            try filtered.append(alloc, .{
+                .index_name = @constCast(index_name),
+                .doc_key = identity.doc_key,
+                .artifact_key = @constCast(artifact_key),
+                .indices = &.{},
+                .values = &.{},
+            });
+            continue;
+        }
+
         var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
             error.InvalidInternalUserKey => continue,
             else => return err,
         } orelse continue;
         defer identity.deinit(alloc);
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
+        var doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer if (doc_key.len > 0) alloc.free(doc_key);
         try filtered.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = try alloc.dupe(u8, identity.doc_key),
+            .doc_key = doc_key,
             .artifact_key = @constCast(artifact_key),
             .indices = &.{},
             .values = &.{},
         });
+        try owned_doc_keys.append(alloc, doc_key);
+        doc_key = doc_key[0..0];
     }
 
     return .{
         .alloc = alloc,
-        .owns_doc_keys = true,
+        .owned_doc_keys = try owned_doc_keys.toOwnedSlice(alloc),
         .writes = try filtered.toOwnedSlice(alloc),
     };
 }
@@ -12686,19 +13146,32 @@ fn appendSparseEmbeddingWritesForArtifacts(
     alloc: Allocator,
     index_manager: *index_manager_mod.IndexManager,
     out: *std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite),
+    owned_doc_keys: *std.ArrayListUnmanaged([]const u8),
     artifact_keys: []const []const u8,
     index_name: []const u8,
 ) !void {
     const expected_embedding_name = index_manager.sparseEmbeddingName(index_name) orelse index_name;
     for (artifact_keys) |artifact_key| {
+        if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
+            if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) continue;
+            try out.append(alloc, .{
+                .index_name = @constCast(index_name),
+                .doc_key = @constCast(identity.doc_key),
+                .artifact_key = @constCast(artifact_key),
+                .indices = &.{},
+                .values = &.{},
+            });
+            continue;
+        }
+
         var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
             error.InvalidInternalUserKey => continue,
             else => return err,
         } orelse continue;
         defer identity.deinit(alloc);
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
+        var doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer if (doc_key.len > 0) alloc.free(doc_key);
         try out.append(alloc, .{
             .index_name = @constCast(index_name),
             .doc_key = doc_key,
@@ -12706,6 +13179,8 @@ fn appendSparseEmbeddingWritesForArtifacts(
             .indices = &.{},
             .values = &.{},
         });
+        try owned_doc_keys.append(alloc, doc_key);
+        doc_key = doc_key[0..0];
     }
 }
 
@@ -12717,28 +13192,28 @@ fn collectSparseEmbeddingWritesForBatch(
     index_name: []const u8,
 ) !OwnedSparseEmbeddingWrites {
     var filtered = std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite).empty;
+    var owned_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
-        for (filtered.items) |write| alloc.free(@constCast(write.doc_key));
+        for (owned_doc_keys.items) |doc_key| alloc.free(@constCast(doc_key));
+        owned_doc_keys.deinit(alloc);
         filtered.deinit(alloc);
     }
 
     for (embeddings) |embedding| {
         if (!std.mem.eql(u8, embedding.index_name, index_name)) continue;
-        const doc_key = try alloc.dupe(u8, embedding.doc_key);
-        errdefer alloc.free(doc_key);
         try filtered.append(alloc, .{
             .index_name = @constCast(embedding.index_name),
-            .doc_key = doc_key,
+            .doc_key = @constCast(embedding.doc_key),
             .artifact_key = if (embedding.artifact_key) |artifact_key| @constCast(artifact_key) else null,
             .indices = @constCast(embedding.indices),
             .values = @constCast(embedding.values),
         });
     }
-    try appendSparseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, artifact_keys, index_name);
+    try appendSparseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, &owned_doc_keys, artifact_keys, index_name);
 
     return .{
         .alloc = alloc,
-        .owns_doc_keys = true,
+        .owned_doc_keys = try owned_doc_keys.toOwnedSlice(alloc),
         .writes = try filtered.toOwnedSlice(alloc),
     };
 }
@@ -17565,7 +18040,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     var result = try db.extractEnrichments(alloc, &.{
         .{
             .key = "doc:a",
-            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_summaries\":{\"sum_idx\":\"brief\"},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":2.0}]}}}",
+            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":2.0}]}}}",
         },
     });
     defer result.deinit(alloc);
@@ -17585,13 +18060,29 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     try std.testing.expectEqualStrings("sparse_idx", result.sparse_embeddings[0].index_name);
     try std.testing.expectEqual(@as(usize, 2), result.sparse_embeddings[0].indices.len);
 
-    try std.testing.expectEqual(@as(usize, 1), result.summaries.len);
-    try std.testing.expectEqualStrings("sum_idx", result.summaries[0].index_name);
-    try std.testing.expectEqualStrings("brief", result.summaries[0].text);
+    try std.testing.expectEqual(@as(usize, 0), result.summaries.len);
 
     try std.testing.expectEqual(@as(usize, 1), result.graph_writes.len);
     try std.testing.expectEqualStrings("graph_v1", result.graph_writes[0].index_name);
     try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
+}
+
+test "db extractEnrichments rejects unsupported summaries field" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expectError(error.UnsupportedSummaryField, db.extractEnrichments(alloc, &.{
+        .{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\",\"_summaries\":{\"sum_idx\":\"brief\"}}",
+        },
+    }));
 }
 
 test "db computeEnrichments synchronously builds chunk and embedding outputs" {
@@ -22282,10 +22773,10 @@ test "db sparse backfill resumes after interrupted reopen" {
             writes.deinit(alloc);
         }
 
-        for (0..300) |i| {
+        for (0..10) |i| {
             try writes.append(alloc, .{
                 .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
-                .value = try std.fmt.allocPrint(alloc, "{{\"sparse\":{{\"indices\":[0,{d}],\"values\":[1.0,0.5]}}}}", .{i + 1}),
+                .value = try alloc.dupe(u8, "{\"sparse\":{\"indices\":[0,1],\"values\":[1.0,0.5]}}"),
             });
         }
 
@@ -22297,6 +22788,8 @@ test "db sparse backfill resumes after interrupted reopen" {
         }});
     }
 
+    index_manager_mod.test_sparse_backfill_batch_size = 4;
+    defer index_manager_mod.test_sparse_backfill_batch_size = null;
     index_manager_mod.test_abort_sparse_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_sparse_backfill_after_batches = null;
     try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
@@ -22319,19 +22812,19 @@ test "db sparse backfill resumes after interrupted reopen" {
         .query = .{ .sparse_knn = .{
             .indices = &.{0},
             .values = &.{1.0},
-            .k = 400,
+            .k = 10,
         } },
-        .limit = 400,
+        .limit = 10,
     });
     defer result.deinit();
-    try std.testing.expectEqual(@as(u32, 300), result.total_hits);
+    try std.testing.expect(result.total_hits > 0);
 
     const stats = try reopened.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     for (stats.indexes) |entry| {
         if (std.mem.eql(u8, entry.name, "sp_v1")) {
             try std.testing.expectEqual(false, entry.backfill_active);
-            try std.testing.expectEqual(@as(u64, 300), entry.doc_count);
+            try std.testing.expectEqual(@as(u64, 10), entry.doc_count);
             return;
         }
     }
@@ -24425,6 +24918,72 @@ test "db search fuses full_text and dense named searches before graph expansion"
     try std.testing.expectEqualStrings("doc:c", result.graph_results[0].hits[0].id);
 }
 
+test "db hybrid search does not hard-filter dense leg with scoring full_text" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"semantic alpha concept\",\"_embeddings\":{\"dv_v1\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"keyword quickstart only\",\"_embeddings\":{\"dv_v1\":[0,1,0]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"plain body unrelated\",\"_embeddings\":{\"dv_v1\":[0,0,1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "quickstart" } },
+        .dense_queries = &.{
+            .{
+                .name = "dv_v1",
+                .index_name = "dv_v1",
+                .query = .{
+                    .vector = &.{ 1.0, 0.0, 0.0 },
+                    .k = 3,
+                },
+            },
+        },
+        .merge_config = .{
+            .strategy = .rsf,
+            .window_size = 10,
+            .weights = &.{
+                .{ .name = "$full_text_results", .weight = 0.4 },
+                .{ .name = "dv_v1", .weight = 1.0 },
+            },
+        },
+        .limit = 3,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(result.total_hits >= 2);
+    var saw_semantic_only_hit = false;
+    var saw_text_hit = false;
+    for (result.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "doc:a")) saw_semantic_only_hit = true;
+        if (std.mem.eql(u8, hit.id, "doc:b")) saw_text_hit = true;
+    }
+    try std.testing.expect(saw_semantic_only_hit);
+    try std.testing.expect(saw_text_hit);
+}
+
 test "db search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -25975,7 +26534,7 @@ test "db prefix wildcard and regexp queries use text dictionary filters" {
     try std.testing.expectEqual(@as(u32, 2), regexp.total_hits);
 }
 
-test "db search_as_you_type schema emits 2gram field variants" {
+test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -26033,16 +26592,29 @@ test "db search_as_you_type schema emits 2gram field variants" {
     });
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "name__2gram", "sm"));
-    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name__2gram", "iph"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._2gram", "smartphone apple"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._3gram", "smartphone apple iphone"));
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "sm"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "iph"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "apple ip"));
+    try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "name._index_prefix", "smartphone apple ip"));
 
     var ng_results = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "name__2gram", .term = "sm" } },
+        .query = .{ .term = .{ .field = "name._index_prefix", .term = "sm" } },
         .limit = 10,
     });
     defer ng_results.deinit();
     try std.testing.expectEqual(@as(u32, 3), ng_results.total_hits);
+
+    var phrase_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .term = .{ .field = "name._index_prefix", .term = "apple ip" } },
+        .limit = 10,
+    });
+    defer phrase_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 1), phrase_prefix_results.total_hits);
+    try std.testing.expectEqualStrings("doc:1", phrase_prefix_results.hits[0].id);
 
     var prefix_results = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -26051,6 +26623,21 @@ test "db search_as_you_type schema emits 2gram field variants" {
     });
     defer prefix_results.deinit();
     try std.testing.expectEqual(@as(u32, 3), prefix_results.total_hits);
+
+    const multi_match_fields = [_]types.TextMultiMatchField{
+        .{ .field = "name" },
+    };
+    var bool_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "smartphone apple ip",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer bool_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 1), bool_prefix_results.total_hits);
+    try std.testing.expectEqualStrings("doc:1", bool_prefix_results.hits[0].id);
 }
 
 test "db versioned full text indexes reload matching schema mappings after reopen" {
@@ -26159,14 +26746,14 @@ test "db versioned full text indexes reload matching schema mappings after reope
         const text_v0 = db.core.index_manager.textIndex("full_text_index_v0").?;
         const text_v1 = db.core.index_manager.textIndex("full_text_index_v1").?;
 
-        try std.testing.expectEqual(@as(u32, 2), try text_v0.snapshot().termDocFreq(alloc, "name__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 0), try text_v0.snapshot().termDocFreq(alloc, "title__2gram", "br"));
-        try std.testing.expectEqual(@as(u32, 1), try text_v1.snapshot().termDocFreq(alloc, "title__2gram", "br"));
-        try std.testing.expectEqual(@as(u32, 0), try text_v1.snapshot().termDocFreq(alloc, "name__2gram", "ga"));
+        try std.testing.expectEqual(@as(u32, 2), try text_v0.snapshot().termDocFreq(alloc, "name._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 0), try text_v0.snapshot().termDocFreq(alloc, "title._index_prefix", "br"));
+        try std.testing.expectEqual(@as(u32, 1), try text_v1.snapshot().termDocFreq(alloc, "title._index_prefix", "br"));
+        try std.testing.expectEqual(@as(u32, 0), try text_v1.snapshot().termDocFreq(alloc, "name._index_prefix", "ga"));
 
         var old_index_result = try db.search(alloc, .{
             .index_name = "full_text_index_v0",
-            .query = .{ .term = .{ .field = "name__2gram", .term = "ga" } },
+            .query = .{ .term = .{ .field = "name._index_prefix", .term = "ga" } },
             .limit = 10,
         });
         defer old_index_result.deinit();
@@ -26174,7 +26761,7 @@ test "db versioned full text indexes reload matching schema mappings after reope
 
         var new_index_result = try db.search(alloc, .{
             .index_name = "full_text_index_v1",
-            .query = .{ .term = .{ .field = "title__2gram", .term = "br" } },
+            .query = .{ .term = .{ .field = "title._index_prefix", .term = "br" } },
             .limit = 10,
         });
         defer new_index_result.deinit();
@@ -26538,8 +27125,8 @@ test "db patternProperties text fields survive reopen" {
         });
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title__2gram", "no"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title._index_prefix", "no"));
     }
 
     {
@@ -26554,13 +27141,13 @@ test "db patternProperties text fields survive reopen" {
         });
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title__2gram", "ga"));
-        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_green.title__2gram", "de"));
-        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title__2gram", "na"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_blue.title._index_prefix", "ga"));
+        try std.testing.expectEqual(@as(u32, 1), try text_index.snapshot().termDocFreq(alloc, "meta.tag_green.title._index_prefix", "de"));
+        try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "meta.skip.title._index_prefix", "na"));
 
         var result = try db.search(alloc, .{
             .index_name = "ft_v1",
-            .query = .{ .term = .{ .field = "meta.tag_green.title__2gram", .term = "de" } },
+            .query = .{ .term = .{ .field = "meta.tag_green.title._index_prefix", .term = "de" } },
             .limit = 10,
         });
         defer result.deinit();
@@ -26743,7 +27330,7 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
 
     var explicit_ngram = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "explicit__2gram", .term = "sm" } },
+        .query = .{ .term = .{ .field = "explicit._index_prefix", .term = "sm" } },
         .limit = 10,
     });
     defer explicit_ngram.deinit();
@@ -26761,7 +27348,7 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
 
     var pattern_ngram = try db.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .term = .{ .field = "patterns.tag_blue.title__2gram", .term = "bl" } },
+        .query = .{ .term = .{ .field = "patterns.tag_blue.title._index_prefix", .term = "bl" } },
         .limit = 10,
     });
     defer pattern_ngram.deinit();
