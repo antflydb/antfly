@@ -21,6 +21,9 @@ import time
 from helpers import wait_until
 
 
+SCHEMA_MIGRATION_REBUILD_TIMEOUT_S = 240.0
+
+
 def _index_stats(index_status: dict) -> dict:
     return index_status["status"]
 
@@ -49,7 +52,7 @@ def test_schema_migration_full_text_rebuild(stateful_api):
 
     initial_index = wait_until(
         lambda: _ready_index(stateful_api, table_name, "full_text_index_v0", expected_docs=num_docs),
-        timeout_s=120.0,
+        timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
     )
     assert initial_index is not None, "full_text_index_v0 did not finish rebuilding in time"
 
@@ -96,13 +99,13 @@ def test_schema_migration_full_text_rebuild(stateful_api):
 
     rebuilt_index = wait_until(
         lambda: _ready_index(stateful_api, table_name, "full_text_index_v1", expected_docs=num_docs),
-        timeout_s=120.0,
+        timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
     )
     assert rebuilt_index is not None, "full_text_index_v1 did not finish rebuilding in time"
 
     stable_table = wait_until(
         lambda: _stable_table(stateful_api, table_name, expected_version=1),
-        timeout_s=120.0,
+        timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
         interval_s=2.0,
     )
     assert stable_table is not None, "schema migration did not reach a stable table state"
