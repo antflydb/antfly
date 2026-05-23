@@ -23,6 +23,7 @@ pub const QueryResponseMeta = query_contract.QueryResponseMeta;
 pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
+pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parseAggregationRequestsJson = query_contract.parseAggregationRequestsJson;
 pub const freeAggregationRequests = query_contract.freeAggregationRequests;
 pub const encodeQueryResponses = query_contract.encodeQueryResponses;
@@ -551,6 +552,16 @@ test "query parser preserves filter and exclusion request JSON" {
     try std.testing.expect(owned.req.full_text.? == .match);
     try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"term\":{\"status\":\"published\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, owned.req.exclusion_query_json, "\"term\":{\"status\":\"draft\"}") != null);
+}
+
+test "query parser does not use dense fast path when public filters are present" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"embeddings":{"dense_idx":[0.1,0.2]},"indexes":["dense_idx"],"filter_query":{"term":{"status":"published"}},"exclusion_query":{"term":{"status":"draft"}},"limit":5}
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+    try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"status\":\"published\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owned.req.exclusion_query_json, "\"status\":\"draft\"") != null);
 }
 
 test "query parser accepts typed bleve leaf queries through db full_text" {
