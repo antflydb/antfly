@@ -2814,8 +2814,7 @@ while [ $timeout -gt 0 ]; do
             echo "No existing data - fresh cluster"
         fi
         marker=/antflydb/.antflydb-storage-prepared
-        echo "Preparing PVC directories for antfly runtime user %d:%d"
-        mkdir -p /antflydb/metadata /antflydb/store
+        echo "Preparing PVC root for antfly runtime user %d:%d"
         if [ ! -f "$marker" ]; then
             chown -R %d:%d /antflydb
             chmod -R ug+rwX /antflydb
@@ -2823,8 +2822,8 @@ while [ $timeout -gt 0 ]; do
             chown %d:%d "$marker"
             chmod ug+rw "$marker"
         else
-            chown %d:%d /antflydb /antflydb/metadata /antflydb/store
-            chmod ug+rwX /antflydb /antflydb/metadata /antflydb/store
+            chown %d:%d /antflydb
+            chmod ug+rwX /antflydb
         fi
         exit 0
     fi

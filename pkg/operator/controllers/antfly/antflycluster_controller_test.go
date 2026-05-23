@@ -2731,7 +2731,7 @@ func TestMetadataStatefulSetPreparesPersistentStorageForNonRootRuntime(t *testin
 	g.Expect(initContainer.SecurityContext.RunAsUser).NotTo(BeNil())
 	g.Expect(*initContainer.SecurityContext.RunAsUser).To(Equal(int64(0)))
 	g.Expect(initContainer.Args).To(HaveLen(1))
-	g.Expect(initContainer.Args[0]).To(ContainSubstring("mkdir -p /antflydb/metadata /antflydb/store"))
+	g.Expect(initContainer.Args[0]).NotTo(ContainSubstring("mkdir -p /antflydb/metadata /antflydb/store"))
 	g.Expect(initContainer.Args[0]).To(ContainSubstring("chown -R 10001:10001 /antflydb"))
 	g.Expect(initContainer.Args[0]).To(ContainSubstring("chmod -R ug+rwX /antflydb"))
 }
