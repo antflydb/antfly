@@ -639,6 +639,7 @@ pub const IndexManager = struct {
         index: hbc_mod.HBCIndex,
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
+        vector_ordinals: std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal) = .empty,
     };
 
     const DenseVectorLoadContext = struct {
@@ -653,8 +654,14 @@ pub const IndexManager = struct {
     };
 
     const DenseVectorLoadSession = struct {
+        const ReadTxnKind = enum {
+            probe,
+            snapshot,
+        };
+
         context: *DenseVectorLoadContext,
         read_txn: ?docstore_mod.DocStore.Txn = null,
+        read_txn_kind: ReadTxnKind = .probe,
         txn_override: ?docstore_mod.DocStore.Batch.BatchTxn = null,
         raw_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
         vector_cache: std.AutoHashMapUnmanaged(u64, []f32) = .empty,
@@ -742,7 +749,12 @@ pub const IndexManager = struct {
         }
 
         fn getTxn(self: *@This(), store: *docstore_mod.DocStore) !*docstore_mod.DocStore.Txn {
-            if (self.read_txn == null) self.read_txn = try store.beginProbeTxn();
+            if (self.read_txn == null) {
+                self.read_txn = switch (self.read_txn_kind) {
+                    .probe => try store.beginProbeTxn(),
+                    .snapshot => try store.beginReadTxn(),
+                };
+            }
             return &self.read_txn.?;
         }
 
@@ -812,10 +824,41 @@ pub const IndexManager = struct {
 
             const miss_values = try self.context.manager.alloc.alloc(?[]const u8, miss_count);
             defer self.context.manager.alloc.free(miss_values);
+            const debug_timing = getenv("ANTFLY_DEBUG_DENSE_VECTOR_LOAD_SESSION") != null;
+            const txn_start_ns = if (debug_timing) platform_time.monotonicNs() else 0;
+            var txn_opened = false;
             if (self.txn_override) |txn| {
+                if (debug_timing) txn_opened = false;
+                const read_start_ns = if (debug_timing) platform_time.monotonicNs() else 0;
                 try txn.getManySorted(miss_keys[0..miss_count], miss_values);
+                if (debug_timing and miss_count >= 32) {
+                    std.log.debug(
+                        "dense vector load batch index={s} keys={} txn_opened={} txn_us={} read_us={} kind=batch",
+                        .{ self.context.index_name, miss_count, txn_opened, (read_start_ns - txn_start_ns) / 1000, (platform_time.monotonicNs() - read_start_ns) / 1000 },
+                    );
+                }
             } else {
-                try (try self.getTxn(store)).getManySorted(miss_keys[0..miss_count], miss_values);
+                const had_txn = self.read_txn != null;
+                const txn = try self.getTxn(store);
+                txn_opened = !had_txn;
+                const read_start_ns = if (debug_timing) platform_time.monotonicNs() else 0;
+                try txn.getManySorted(miss_keys[0..miss_count], miss_values);
+                if (debug_timing and miss_count >= 32) {
+                    std.log.debug(
+                        "dense vector load batch index={s} keys={} txn_opened={} txn_us={} read_us={} kind={s}",
+                        .{
+                            self.context.index_name,
+                            miss_count,
+                            txn_opened,
+                            (read_start_ns - txn_start_ns) / 1000,
+                            (platform_time.monotonicNs() - read_start_ns) / 1000,
+                            switch (self.read_txn_kind) {
+                                .probe => "probe",
+                                .snapshot => "snapshot",
+                            },
+                        },
+                    );
+                }
             }
             for (miss_values[0..miss_count], 0..) |maybe_value, i| {
                 const out_index = miss_indexes[i];
@@ -1149,6 +1192,7 @@ pub const IndexManager = struct {
         self.destroyIndexApplyMutex(entry.apply_mutex);
         if (entry.vector_loader_context) |ctx| ctx.deinit(self.alloc);
         entry.ordinal_vector_ids.deinit(self.alloc);
+        entry.vector_ordinals.deinit(self.alloc);
         self.alloc.free(entry.field_name);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         if (entry.embedding_name) |embedding_name| self.alloc.free(embedding_name);
@@ -1233,6 +1277,7 @@ pub const IndexManager = struct {
 
         deleteIndexDirIfPresent(path);
         entry.ordinal_vector_ids.clearRetainingCapacity();
+        entry.vector_ordinals.clearRetainingCapacity();
         try self.reopenDenseIndexStorage(entry, path);
     }
 
@@ -3467,7 +3512,6 @@ pub const IndexManager = struct {
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
-                .cache_vectors = false,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -3493,7 +3537,6 @@ pub const IndexManager = struct {
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
-                .cache_vectors = false,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -6277,9 +6320,11 @@ pub const IndexManager = struct {
             if (profile_enabled) analyzer_merge_ns = platform_time.monotonicNs() - analyzer_merge_start_ns;
         }
 
+        var text_build_profile = introducer_mod.BuildTextProfile{};
         const segment_build_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         const segments = try mapper.buildTextSegmentsFromProjectionBatch(self.alloc, projection_batch, entry.text_analysis, .{
             .target_segment_bytes = @intCast(default_merge_policy.max_segment_size),
+            .profile = if (profile_enabled) &text_build_profile else null,
         });
         var segments_owned = true;
         defer self.alloc.free(segments);
@@ -6309,7 +6354,7 @@ pub const IndexManager = struct {
         if (profile_enabled) {
             index_segment_ns = platform_time.monotonicNs() - index_segment_start_ns;
             std.log.info(
-                "antfly_bench_text_index index={s} source_docs={d} projection_docs={d} observed_analyzers={d} segments={d} segment_bytes={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d}",
+                "antfly_bench_text_index index={s} source_docs={d} projection_docs={d} observed_analyzers={d} segments={d} segment_bytes={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d} text_docs={d} text_fields={d} tokens={d} term_hits={d} typed_values={d} analyzer_ms={d} term_accum_ms={d} hit_materialize_ms={d} typed_collect_ms={d} typed_build_ms={d} stored_attach_ms={d} section_attach_ms={d} stored_compress_ms={d} segment_assembly_ms={d} segment_encode_ms={d}",
                 .{
                     entry.config.name,
                     source_docs.len,
@@ -6323,6 +6368,21 @@ pub const IndexManager = struct {
                     nsToMs(analyzer_merge_ns),
                     nsToMs(segment_build_ns),
                     nsToMs(index_segment_ns),
+                    text_build_profile.doc_count,
+                    text_build_profile.text_field_count,
+                    text_build_profile.token_count,
+                    text_build_profile.term_hit_count,
+                    text_build_profile.typed_value_count,
+                    nsToMs(text_build_profile.analyzer_ns),
+                    nsToMs(text_build_profile.term_accum_ns),
+                    nsToMs(text_build_profile.hit_materialize_ns),
+                    nsToMs(text_build_profile.typed_collect_ns),
+                    nsToMs(text_build_profile.typed_build_ns),
+                    nsToMs(text_build_profile.stored_doc_attach_ns),
+                    nsToMs(text_build_profile.section_attach_ns),
+                    nsToMs(text_build_profile.stored_compress_ns),
+                    nsToMs(text_build_profile.segment_assembly_ns),
+                    nsToMs(text_build_profile.segment_encode_ns),
                 },
             );
         }
@@ -6496,15 +6556,18 @@ pub const IndexManager = struct {
         const store_txn = store_batch.asTxn();
         var vector_ids = std.ArrayListUnmanaged(u64).empty;
         defer vector_ids.deinit(self.alloc);
-        var removed_ordinals = std.ArrayListUnmanaged(doc_identity.DocOrdinal).empty;
-        defer removed_ordinals.deinit(self.alloc);
+        var removed_ordinal_vectors = std.ArrayListUnmanaged(DenseOrdinalVectorCacheUpdate).empty;
+        defer removed_ordinal_vectors.deinit(self.alloc);
 
         for (keys) |key| {
             const vector_id = (try self.resolveDenseVectorIdForDeleteTxn(store_txn, entry.config.name, key)) orelse continue;
             try vector_ids.append(self.alloc, vector_id);
             if (entry.chunk_name == null) {
                 if (try doc_identity.lookupOrdinalTxn(self.alloc, store_txn, key)) |ordinal| {
-                    try removed_ordinals.append(self.alloc, ordinal);
+                    try removed_ordinal_vectors.append(self.alloc, .{
+                        .ordinal = ordinal,
+                        .vector_id = vector_id,
+                    });
                 }
             }
             try self.clearDenseVectorMappingTxn(store_txn, entry.config.name, key, vector_id);
@@ -6515,8 +6578,9 @@ pub const IndexManager = struct {
             else => return err,
         };
         try store_batch.commit();
-        for (removed_ordinals.items) |ordinal| {
-            _ = entry.ordinal_vector_ids.remove(ordinal);
+        for (removed_ordinal_vectors.items) |removed| {
+            _ = entry.ordinal_vector_ids.remove(removed.ordinal);
+            _ = entry.vector_ordinals.remove(removed.vector_id);
         }
     }
 
@@ -6997,9 +7061,12 @@ pub const IndexManager = struct {
             const before_profile = entry.index.getWriteProfile();
             const before_lsm_stats = entry.index.snapshotLsmWriteStats();
             const started = platform_time.monotonicNs();
+            const skip_vector_store = entry.index.hasExternalVectorLoader();
+            if (skip_vector_store) entry.index.setBypassExternalVectorCache(true);
+            defer if (skip_vector_store) entry.index.setBypassExternalVectorCache(false);
             try entry.index.batchInsertWithMetadataOptions(
                 items.items.items,
-                denseHbcBatchOptions(batch_options, all_vector_ids_new, entry.index.hasExternalVectorLoader()),
+                denseHbcBatchOptions(batch_options, all_vector_ids_new, skip_vector_store),
             );
             logBenchHbcWrite(self.alloc, "explicit_empty_batch_insert", entry, items.items.items.len, batch_options, all_vector_ids_new, before_stats, before_profile, before_lsm_stats, started);
         } else {
@@ -7400,6 +7467,13 @@ pub const IndexManager = struct {
         if (entry.chunk_name != null) return;
         for (updates) |update| {
             try entry.ordinal_vector_ids.put(self.alloc, update.ordinal, update.vector_id);
+            try entry.vector_ordinals.put(self.alloc, update.vector_id, update.ordinal);
+        }
+        if (benchMetricsEnabled()) {
+            std.log.info(
+                "antfly_bench_dense_ordinal_cache index={s} updates={d} ordinal_cache={d} vector_cache={d}",
+                .{ entry.config.name, updates.len, entry.ordinal_vector_ids.count(), entry.vector_ordinals.count() },
+            );
         }
     }
 
@@ -8150,6 +8224,23 @@ pub const IndexManager = struct {
         }
 
         for (metadata, 0..) |maybe_doc_key, i| {
+            if (load_session) |session| {
+                if (session.getVector(vector_ids[i])) |cached| {
+                    if (cached.len != dims) return error.InvalidVectorDimensions;
+                    vector_views[i] = cached;
+                    continue;
+                }
+            }
+            if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const cached = handle.view();
+                if (cached.len != dims) return error.InvalidVectorDimensions;
+                const scratch = batch_scratch[i * dims ..][0..dims];
+                @memcpy(scratch, cached);
+                vector_views[i] = scratch;
+                continue;
+            }
             const doc_key = maybe_doc_key orelse continue;
             const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
@@ -8172,7 +8263,7 @@ pub const IndexManager = struct {
         } else {
             var runtime_store = try initRuntimeStore(manager.alloc, store);
             defer runtime_store.deinit();
-            var txn = try runtime_store.store.beginProbe();
+            var txn = try runtime_store.store.beginRead();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
         }
@@ -8187,6 +8278,7 @@ pub const IndexManager = struct {
             };
             if (vector.len != dims) return error.InvalidVectorDimensions;
             vector_views[slot] = vector;
+            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
         }
     }
 
@@ -8227,6 +8319,25 @@ pub const IndexManager = struct {
         }
 
         for (metadata, 0..) |maybe_doc_key, i| {
+            const matrix_pos = matrix_positions[i];
+            const matrix_start = std.math.mul(usize, matrix_pos, dims) catch return error.BufferTooSmall;
+            const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
+            if (matrix_end > matrix.len) return error.BufferTooSmall;
+            if (load_session) |session| {
+                if (session.getVector(vector_ids[i])) |cached| {
+                    if (cached.len != dims) return error.InvalidVectorDimensions;
+                    _ = transform(index, cached, matrix[matrix_start..matrix_end]);
+                    continue;
+                }
+            }
+            if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const cached = handle.view();
+                if (cached.len != dims) return error.InvalidVectorDimensions;
+                _ = transform(index, cached, matrix[matrix_start..matrix_end]);
+                continue;
+            }
             const doc_key = maybe_doc_key orelse return error.NotFound;
             const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
@@ -8249,7 +8360,7 @@ pub const IndexManager = struct {
         } else {
             var runtime_store = try initRuntimeStore(manager.alloc, store);
             defer runtime_store.deinit();
-            var txn = try runtime_store.store.beginProbe();
+            var txn = try runtime_store.store.beginRead();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
         }
@@ -8267,6 +8378,7 @@ pub const IndexManager = struct {
             const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
             if (matrix_end > matrix.len) return error.BufferTooSmall;
             _ = transform(index, vector, matrix[matrix_start..matrix_end]);
+            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
         }
     }
 
@@ -8310,6 +8422,33 @@ pub const IndexManager = struct {
         const artifact_reads = try key_alloc.alloc(DenseArtifactReadKey, vector_ids.len);
         var key_count: usize = 0;
         for (metadata, 0..) |maybe_doc_key, i| {
+            if (load_session) |session| {
+                if (session.getVector(vector_ids[i])) |cached| {
+                    if (cached.len != dims) return error.InvalidVectorDimensions;
+                    const distance_start = platform_time.monotonicNs();
+                    distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
+                    if (profile) |p| {
+                        const elapsed = platform_time.monotonicNs() - distance_start;
+                        p.rerank_artifact_distance_ns += elapsed;
+                        p.rerank_distance_ns += elapsed;
+                    }
+                    continue;
+                }
+            }
+            if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const cached = handle.view();
+                if (cached.len != dims) return error.InvalidVectorDimensions;
+                const distance_start = platform_time.monotonicNs();
+                distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
+                if (profile) |p| {
+                    const elapsed = platform_time.monotonicNs() - distance_start;
+                    p.rerank_artifact_distance_ns += elapsed;
+                    p.rerank_distance_ns += elapsed;
+                }
+                continue;
+            }
             const doc_key = maybe_doc_key orelse continue;
             const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
@@ -8333,7 +8472,7 @@ pub const IndexManager = struct {
         } else {
             var runtime_store = try initRuntimeStore(manager.alloc, store);
             defer runtime_store.deinit();
-            var txn = try runtime_store.store.beginProbe();
+            var txn = try runtime_store.store.beginRead();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
         }
@@ -8369,6 +8508,8 @@ pub const IndexManager = struct {
             };
             if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
             if (vector.len != dims) return error.InvalidVectorDimensions;
+            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
+            _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
             const distance_start = platform_time.monotonicNs();
             distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
             if (profile) |p| {
@@ -8730,7 +8871,10 @@ pub const IndexManager = struct {
         try self.clearDenseVectorMappingTxn(txn, index_name, doc_key, vector_id);
         try batch.commit();
         if (ordinal) |doc_ordinal| {
-            if (self.denseIndex(index_name)) |entry| _ = entry.ordinal_vector_ids.remove(doc_ordinal);
+            if (self.denseIndex(index_name)) |entry| {
+                _ = entry.ordinal_vector_ids.remove(doc_ordinal);
+                _ = entry.vector_ordinals.remove(vector_id);
+            }
         }
     }
 
@@ -8830,6 +8974,14 @@ pub const IndexManager = struct {
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]u64 {
+        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null else false;
+        if (prefer_primary_mapping) {
+            const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
+            if (try self.lookupPrimaryDenseCachedVectorIdsForOrdinalsAlloc(alloc, entry, ordinals)) |cached| {
+                return cached;
+            }
+        }
+
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -8838,7 +8990,6 @@ pub const IndexManager = struct {
 
         var out = std.ArrayListUnmanaged(u64).empty;
         errdefer out.deinit(alloc);
-        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null else false;
         if (prefer_primary_mapping) {
             const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
             return try self.lookupPrimaryDenseVectorIdsForOrdinalsAlloc(alloc, &txn, entry, index_name, ordinals);
@@ -8853,6 +9004,75 @@ pub const IndexManager = struct {
                 break :fallback (try self.lookupDenseVectorIdForDocKeyTxn(&txn, index_name, doc_key)) orelse continue;
             };
             if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn lookupDenseOrdinalsForVectorIdsAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: anytype,
+        index_name: []const u8,
+        vector_ids: []const u64,
+    ) ![]?doc_identity.DocOrdinal {
+        const out = try alloc.alloc(?doc_identity.DocOrdinal, vector_ids.len);
+        errdefer alloc.free(out);
+        @memset(out, null);
+        if (vector_ids.len == 0) return out;
+
+        const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
+        var missing = std.ArrayListUnmanaged(struct {
+            source_index: usize,
+            vector_id: u64,
+        }).empty;
+        defer missing.deinit(alloc);
+
+        for (vector_ids, 0..) |vector_id, i| {
+            if (entry.vector_ordinals.get(vector_id)) |ordinal| {
+                out[i] = ordinal;
+            } else {
+                try missing.append(alloc, .{ .source_index = i, .vector_id = vector_id });
+            }
+        }
+        if (missing.items.len == 0) return out;
+
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+        for (missing.items) |item| {
+            const ordinal = (try self.lookupDenseVectorOrdinalTxn(&txn, index_name, item.vector_id)) orelse continue;
+            out[item.source_index] = ordinal;
+            if (entry.chunk_name == null) {
+                try entry.vector_ordinals.put(self.alloc, item.vector_id, ordinal);
+                try entry.ordinal_vector_ids.put(self.alloc, ordinal, item.vector_id);
+            }
+        }
+        return out;
+    }
+
+    fn lookupPrimaryDenseCachedVectorIdsForOrdinalsAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        entry: *DenseIndex,
+        ordinals: []const doc_identity.DocOrdinal,
+    ) !?[]u64 {
+        _ = self;
+        if (ordinals.len == 0) return try alloc.alloc(u64, 0);
+
+        var sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
+        defer alloc.free(sorted_ordinals);
+        std.mem.sort(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+        const unique_ordinals = sorted_ordinals[0..uniqueSortedDocOrdinals(sorted_ordinals)];
+
+        var out = try std.ArrayListUnmanaged(u64).initCapacity(alloc, unique_ordinals.len);
+        errdefer out.deinit(alloc);
+        for (unique_ordinals) |ordinal| {
+            const vector_id = entry.ordinal_vector_ids.get(ordinal) orelse {
+                out.deinit(alloc);
+                return null;
+            };
+            out.appendAssumeCapacity(vector_id);
         }
         return try out.toOwnedSlice(alloc);
     }
@@ -12592,6 +12812,101 @@ test "dense bulk-ingest uses recursive bulk build for large empty index batch" {
     try std.testing.expectEqual(before_profile.insert_calls, after_profile.insert_calls);
 }
 
+test "dense bulk-ingest populates primary ordinal vector cache before first lookup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"embedding_name\":\"dv_v1\",\"external\":true}",
+        },
+    });
+
+    const doc_ids = [_][]const u8{ "doc:a", "doc:b", "doc:c" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_ids[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
+    const dense_index_name = try alloc.dupe(u8, "dv_v1");
+    defer alloc.free(dense_index_name);
+    const doc_a = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(doc_a);
+    const doc_b = try alloc.dupe(u8, "doc:b");
+    defer alloc.free(doc_b);
+    const doc_c = try alloc.dupe(u8, "doc:c");
+    defer alloc.free(doc_c);
+    var vector_a = [_]f32{ 1.0, 0.0 };
+    var vector_b = [_]f32{ 0.0, 1.0 };
+    var vector_c = [_]f32{ 1.0, 1.0 };
+
+    const writes = [_]mapper.DenseEmbeddingWrite{
+        .{
+            .index_name = dense_index_name,
+            .doc_key = doc_a,
+            .vector = vector_a[0..],
+            .artifact_key = null,
+        },
+        .{
+            .index_name = dense_index_name,
+            .doc_key = doc_b,
+            .vector = vector_b[0..],
+            .artifact_key = null,
+        },
+        .{
+            .index_name = dense_index_name,
+            .doc_key = doc_c,
+            .vector = vector_c[0..],
+            .artifact_key = null,
+        },
+    };
+
+    try manager.beginDenseBulkIngestSessionByName("dv_v1");
+    var session_open = true;
+    errdefer if (session_open) manager.abortDenseBulkIngestSessionByName("dv_v1");
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "dv_v1", &writes, .{ .mode = .bulk_ingest });
+    try manager.finishDenseBulkIngestSessionByNameWithOptions("dv_v1", .{});
+    session_open = false;
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try std.testing.expectEqual(@as(usize, doc_ids.len), entry.ordinal_vector_ids.count());
+    try std.testing.expectEqual(@as(usize, doc_ids.len), entry.vector_ordinals.count());
+    try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
+    try std.testing.expectEqual(@as(?u64, deterministicDenseVectorId("doc:a")), entry.ordinal_vector_ids.get(1));
+    try std.testing.expectEqual(@as(?u64, deterministicDenseVectorId("doc:b")), entry.ordinal_vector_ids.get(2));
+    try std.testing.expectEqual(@as(?u64, deterministicDenseVectorId("doc:c")), entry.ordinal_vector_ids.get(3));
+}
+
 test "dense embedding writes prefer inline vectors over artifact reloads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -12641,6 +12956,7 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
 
     const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
 
     const vector_id = deterministicDenseVectorId("doc:inline");
     const metadata = (try entry.index.getMetadata(vector_id)) orelse return error.TestUnexpectedResult;

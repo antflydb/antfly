@@ -26,6 +26,7 @@ const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
+const platform_time = @import("platform/time.zig");
 
 /// A batch of documents to index.
 pub const Batch = struct {
@@ -78,7 +79,7 @@ fn buildSegmentWithExtraSections(
 
     for (batch.docs, 0..) |doc, doc_idx| {
         // Store the document
-        try seg_writer.addStoredDoc(doc.id, doc.stored_data);
+        try seg_writer.addStoredDocBorrowed(doc.id, doc.stored_data);
 
         // Process each field's term hits
         for (doc.fields) |field| {
@@ -111,12 +112,15 @@ fn buildSegmentWithExtraSections(
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
         const inv_data = try entry.value_ptr.build();
-        defer alloc.free(inv_data);
+        errdefer alloc.free(inv_data);
 
-        if (inv_data.len == 0) continue;
+        if (inv_data.len == 0) {
+            alloc.free(inv_data);
+            continue;
+        }
 
         const field_idx = field_indices.get(field_name).?;
-        try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+        try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
     }
 
     // Attach any additional field sections, such as typed doc values.
@@ -179,6 +183,26 @@ pub const TextField = struct {
 pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    profile: ?*BuildTextProfile = null,
+};
+
+pub const BuildTextProfile = struct {
+    doc_count: u64 = 0,
+    text_field_count: u64 = 0,
+    token_count: u64 = 0,
+    term_hit_count: u64 = 0,
+    typed_value_count: u64 = 0,
+    segment_bytes: u64 = 0,
+    analyzer_ns: u64 = 0,
+    term_accum_ns: u64 = 0,
+    hit_materialize_ns: u64 = 0,
+    typed_collect_ns: u64 = 0,
+    typed_build_ns: u64 = 0,
+    section_attach_ns: u64 = 0,
+    stored_doc_attach_ns: u64 = 0,
+    stored_compress_ns: u64 = 0,
+    segment_assembly_ns: u64 = 0,
+    segment_encode_ns: u64 = 0,
 };
 
 /// Build a segment from text documents, analyzing each text field.
@@ -212,42 +236,33 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     text_analysis: TextAnalysisConfig,
     options: BuildTextOptions,
 ) ![]u8 {
-    // Track all allocations for cleanup after buildSegment
-    var field_name_strings = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (field_name_strings.items) |s| alloc.free(s);
-        field_name_strings.deinit(alloc);
+    const profile = options.profile;
+    if (profile) |p| {
+        p.doc_count +|= @intCast(docs.len);
     }
 
-    // Track all allocations for cleanup after buildSegment
-    var term_strings = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (term_strings.items) |s| alloc.free(s);
-        term_strings.deinit(alloc);
-    }
-    var position_slices = std.ArrayListUnmanaged([]u32).empty;
-    defer {
-        for (position_slices.items) |s| alloc.free(s);
-        position_slices.deinit(alloc);
-    }
-    var hit_slices = std.ArrayListUnmanaged([]inverted.InvertedIndexBuilder.TermHit).empty;
-    defer {
-        for (hit_slices.items) |s| alloc.free(s);
-        hit_slices.deinit(alloc);
-    }
-    var field_slices = std.ArrayListUnmanaged([]Batch.FieldTerms).empty;
-    defer {
-        for (field_slices.items) |s| alloc.free(s);
-        field_slices.deinit(alloc);
-    }
     var typed_sections = std.ArrayListUnmanaged(ExtraSection).empty;
     defer {
         for (typed_sections.items) |section| alloc.free(@constCast(section.data));
         typed_sections.deinit(alloc);
     }
 
-    var batch_docs = std.ArrayListUnmanaged(Batch.Document).empty;
-    defer batch_docs.deinit(alloc);
+    var field_builders = std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder).empty;
+    defer {
+        var it = field_builders.valueIterator();
+        while (it.next()) |b| b.deinit();
+        field_builders.deinit(alloc);
+    }
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+
+    var field_indices = std.StringHashMapUnmanaged(u16).empty;
+    defer field_indices.deinit(alloc);
+
+    var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
+    defer doc_ordinals.deinit(alloc);
+    var has_doc_ordinal = false;
 
     var typed_fields = std.StringHashMapUnmanaged(TypedFieldCollector).empty;
     defer {
@@ -261,8 +276,19 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     }
 
     for (docs, 0..) |text_doc, doc_idx| {
-        var fields = std.ArrayListUnmanaged(Batch.FieldTerms).empty;
-        defer fields.deinit(alloc);
+        const stored_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
+        if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
+
+        const doc_ordinal = text_doc.doc_ordinal orelse 0;
+        has_doc_ordinal = has_doc_ordinal or doc_ordinal != 0;
+        try doc_ordinals.append(alloc, doc_ordinal);
+
+        var token_batches = std.ArrayListUnmanaged([]analysis_mod.Token).empty;
+        defer {
+            for (token_batches.items) |tokens| analysis_mod.Analyzer.freeTokens(alloc, tokens);
+            token_batches.deinit(alloc);
+        }
 
         var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
         defer {
@@ -276,15 +302,27 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         }
 
         for (text_doc.text_fields) |tf| {
+            if (profile) |p| p.text_field_count +|= 1;
             const analyzer = tf.analyzer orelse resolveFieldAnalyzer(tf.field_name, text_analysis) orelse default_analyzer;
+            const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
             const tokens = try analyzer.analyze(alloc, tf.text);
-            defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+            if (profile) |p| {
+                p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+                p.token_count +|= @intCast(tokens.len);
+            }
+            if (tokens.len == 0) {
+                analysis_mod.Analyzer.freeTokens(alloc, tokens);
+                continue;
+            }
+            token_batches.append(alloc, tokens) catch |err| {
+                analysis_mod.Analyzer.freeTokens(alloc, tokens);
+                return err;
+            };
 
+            const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
             const field_gop = try field_maps.getOrPut(alloc, tf.field_name);
             if (!field_gop.found_existing) {
-                const owned_field_name = try alloc.dupe(u8, tf.field_name);
-                try field_name_strings.append(alloc, owned_field_name);
-                field_gop.key_ptr.* = owned_field_name;
+                field_gop.key_ptr.* = tf.field_name;
                 field_gop.value_ptr.* = .{};
             }
             const base_position = field_gop.value_ptr.token_offset;
@@ -292,17 +330,17 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
             for (tokens) |tok| {
                 const gop = try field_gop.value_ptr.term_map.getOrPut(alloc, tok.term);
                 if (!gop.found_existing) {
-                    const owned = try alloc.dupe(u8, tok.term);
-                    try term_strings.append(alloc, owned);
-                    gop.key_ptr.* = owned;
+                    gop.key_ptr.* = tok.term;
                     gop.value_ptr.* = .{ .freq = 0, .positions = .empty };
                 }
                 gop.value_ptr.freq += 1;
                 try gop.value_ptr.positions.append(alloc, base_position + tok.position);
             }
             field_gop.value_ptr.token_offset += @intCast(tokens.len);
+            if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
         }
 
+        const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
         var field_it = field_maps.iterator();
         while (field_it.next()) |field_entry| {
             // Convert to TermHit slice
@@ -311,55 +349,55 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
 
             var it = field_entry.value_ptr.term_map.iterator();
             while (it.next()) |entry| {
-                const positions = try alloc.dupe(u32, entry.value_ptr.positions.items);
-                try position_slices.append(alloc, positions);
                 try hits.append(alloc, .{
                     .term = entry.key_ptr.*,
                     .freq = entry.value_ptr.freq,
                     .norm = field_entry.value_ptr.token_offset,
-                    .positions = positions,
+                    .positions = entry.value_ptr.positions.items,
                 });
+                if (profile) |p| p.term_hit_count +|= 1;
             }
 
-            const hits_owned = try alloc.dupe(inverted.InvertedIndexBuilder.TermHit, hits.items);
-            try hit_slices.append(alloc, hits_owned);
-            try fields.append(alloc, .{
-                .field_name = field_entry.key_ptr.*,
-                .hits = hits_owned,
-            });
+            if (hits.items.len == 0) continue;
+
+            const field_name = field_entry.key_ptr.*;
+            const builder_gop = try field_builders.getOrPut(alloc, field_name);
+            if (!builder_gop.found_existing) {
+                builder_gop.key_ptr.* = field_name;
+                builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
+            }
+            try builder_gop.value_ptr.addDocument(@intCast(doc_idx), hits.items);
+
+            const field_index_gop = try field_indices.getOrPut(alloc, field_name);
+            if (!field_index_gop.found_existing) {
+                field_index_gop.key_ptr.* = field_name;
+                field_index_gop.value_ptr.* = try seg_writer.addField(field_name);
+            }
         }
+        if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
 
         var doc_options = options;
         doc_options.recursive_typed_fields = doc_options.recursive_typed_fields or text_doc.recursive_typed_fields;
         if (text_doc.infer_type_dynamic_paths.len > 0) {
             doc_options.infer_type_dynamic_paths = text_doc.infer_type_dynamic_paths;
         }
+        const typed_collect_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
         if (text_doc.typed_fields) |projected_typed_fields| {
             for (projected_typed_fields) |field| {
                 try appendTypedFieldValue(alloc, &typed_fields, field.field_name, @intCast(doc_idx), .{
                     .value_type = field.value_type,
                     .value = field.value,
-                });
+                }, profile);
             }
         } else if (text_doc.typed_source) |typed_source| {
             try collectTypedFieldValuesFromValue(alloc, typed_source, @intCast(doc_idx), &typed_fields, text_analysis, doc_options);
         } else {
             try collectTypedFieldValues(alloc, text_doc.stored_data, @intCast(doc_idx), &typed_fields, text_analysis, doc_options);
         }
-
-        const fields_owned = try alloc.dupe(Batch.FieldTerms, fields.items);
-        try field_slices.append(alloc, fields_owned);
-        try batch_docs.append(alloc, .{
-            .id = text_doc.id,
-            .stored_data = text_doc.stored_data,
-            .fields = fields_owned,
-            .doc_ordinal = text_doc.doc_ordinal,
-        });
+        if (profile) |p| p.typed_collect_ns +|= platform_time.monotonicNs() - typed_collect_start_ns;
     }
 
-    const docs_slice = try alloc.dupe(Batch.Document, batch_docs.items);
-    defer alloc.free(docs_slice);
-
+    const typed_build_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     var typed_it = typed_fields.iterator();
     while (typed_it.next()) |entry| {
         if (entry.value_ptr.conflicted or entry.value_ptr.writer == null) continue;
@@ -372,8 +410,48 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
             .data = section_data,
         });
     }
+    if (profile) |p| p.typed_build_ns +|= platform_time.monotonicNs() - typed_build_start_ns;
 
-    return buildSegmentWithExtraSections(alloc, .{ .docs = docs_slice }, typed_sections.items);
+    const segment_encode_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+
+    const section_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    var fit = field_builders.iterator();
+    while (fit.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        const inv_data = try entry.value_ptr.build();
+        errdefer alloc.free(inv_data);
+
+        if (inv_data.len == 0) {
+            alloc.free(inv_data);
+            continue;
+        }
+
+        const field_idx = field_indices.get(field_name).?;
+        try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
+    }
+
+    for (typed_sections.items) |*section| {
+        const gop = try field_indices.getOrPut(alloc, section.field_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = section.field_name;
+            gop.value_ptr.* = try seg_writer.addField(section.field_name);
+        }
+        const owned = @constCast(section.data);
+        try seg_writer.addSectionOwned(gop.value_ptr.*, section.section_type, owned);
+        section.data = &.{};
+    }
+    if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+
+    const segment_assembly_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const segment = try seg_writer.build();
+    if (profile) |p| {
+        p.segment_assembly_ns +|= platform_time.monotonicNs() - segment_assembly_start_ns;
+        p.stored_compress_ns +|= seg_writer.last_stored_compress_ns;
+        p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
+        p.segment_bytes +|= @intCast(segment.len);
+    }
+    return segment;
 }
 
 const TermAcc = struct {
@@ -451,11 +529,11 @@ fn collectTypedFieldValuesFromValue(
     if (value != .object) return;
 
     if (options.recursive_typed_fields) {
-        try collectTypedFieldValuesRecursive(alloc, value, "", doc_id, typed_fields, text_analysis);
+        try collectTypedFieldValuesRecursive(alloc, value, "", doc_id, typed_fields, text_analysis, options.profile);
         return;
     }
     if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths);
+        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths, options.profile);
         return;
     }
 
@@ -465,7 +543,7 @@ fn collectTypedFieldValuesFromValue(
         if (field_name.len > 0 and field_name[0] == '_') continue;
 
         const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
-        try appendTypedFieldValue(alloc, typed_fields, field_name, doc_id, detected);
+        try appendTypedFieldValue(alloc, typed_fields, field_name, doc_id, detected, options.profile);
     }
 }
 
@@ -572,10 +650,11 @@ fn collectTypedFieldValuesRecursive(
     doc_id: u32,
     typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector),
     text_analysis: TextAnalysisConfig,
+    profile: ?*BuildTextProfile,
 ) !void {
     if (path.len > 0) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected);
+            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile);
             if (value == .object and detected.value_type == .geo_point) return;
         }
     }
@@ -590,12 +669,12 @@ fn collectTypedFieldValuesRecursive(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursive(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis);
+                try collectTypedFieldValuesRecursive(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, profile);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldValuesRecursive(alloc, item, path, doc_id, typed_fields, text_analysis);
+                try collectTypedFieldValuesRecursive(alloc, item, path, doc_id, typed_fields, text_analysis, profile);
             }
         },
         else => {},
@@ -610,10 +689,11 @@ fn collectTypedFieldValuesRecursiveScoped(
     typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector),
     text_analysis: TextAnalysisConfig,
     scoped_paths: []const []const u8,
+    profile: ?*BuildTextProfile,
 ) !void {
     if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected);
+            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile);
             if (value == .object and detected.value_type == .geo_point) return;
         }
     }
@@ -628,12 +708,12 @@ fn collectTypedFieldValuesRecursiveScoped(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths);
+                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths);
+                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
             }
         },
         else => {},
@@ -656,6 +736,7 @@ fn appendTypedFieldValue(
     field_name: []const u8,
     doc_id: u32,
     detected: DetectedTypedValue,
+    profile: ?*BuildTextProfile,
 ) !void {
     const gop = try typed_fields.getOrPut(alloc, field_name);
     if (!gop.found_existing) {
@@ -675,6 +756,7 @@ fn appendTypedFieldValue(
     }
 
     try gop.value_ptr.writer.?.add(doc_id, detected.value);
+    if (profile) |p| p.typed_value_count +|= 1;
 }
 
 const FieldDateTimeParser = struct {
@@ -1692,6 +1774,28 @@ test "buildSegmentFromText analyzes and indexes text" {
     const stop_results = try snap.search(alloc, "title", &.{"the"}, 10);
     defer alloc.free(stop_results.hits);
     try std.testing.expectEqual(@as(usize, 0), stop_results.hits.len);
+}
+
+test "buildSegmentFromTextWithAnalysisOptions records build profile" {
+    const alloc = std.testing.allocator;
+
+    var profile = BuildTextProfile{};
+    const seg_bytes = try buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"title\":\"alpha beta\",\"price\":42}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha beta" }},
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .profile = &profile,
+    });
+    defer alloc.free(seg_bytes);
+
+    try std.testing.expectEqual(@as(u64, 1), profile.doc_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.text_field_count);
+    try std.testing.expect(profile.token_count > 0);
+    try std.testing.expect(profile.term_hit_count > 0);
+    try std.testing.expect(profile.segment_bytes > 0);
 }
 
 test "buildSegmentFromText omits empty inverted sections" {

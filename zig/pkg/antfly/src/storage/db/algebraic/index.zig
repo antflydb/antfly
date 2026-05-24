@@ -5561,6 +5561,18 @@ pub const Index = struct {
         return filter;
     }
 
+    pub fn resolvedDocFilterForFilterJsonUncheckedAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        filter_json: []const u8,
+        bindings: []const ResolvedFilterBinding,
+    ) !?doc_set.ResolvedDocFilter {
+        if (filter_json.len == 0) return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{}) catch return null;
+        defer parsed.deinit();
+        return try self.resolvedDocFilterForFilterValueAlloc(store, parsed.value, null, bindings);
+    }
+
     fn resolvedDocFilterForFilterValueAlloc(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -5715,10 +5727,8 @@ pub const Index = struct {
         for (array.items) |item| {
             var raw_item_filter = (try self.resolvedDocFilterForFilterValueAlloc(store, item, generation, bindings)) orelse return null;
             defer raw_item_filter.deinit(self.alloc);
-            var item_filter = try self.visibleFilteredResolvedDocFilterAlloc(store, &raw_item_filter, generation);
-            defer item_filter.deinit(self.alloc);
             if (out) |*current| {
-                const maybe_next = try doc_set.intersectFiltersAlloc(self.alloc, current, &item_filter);
+                const maybe_next = try doc_set.intersectFiltersAlloc(self.alloc, current, &raw_item_filter);
                 const next = maybe_next orelse {
                     current.deinit(self.alloc);
                     out = null;
@@ -5727,7 +5737,7 @@ pub const Index = struct {
                 current.deinit(self.alloc);
                 out = next;
             } else {
-                out = try cloneResolvedDocFilterAlloc(self.alloc, &item_filter);
+                out = try cloneResolvedDocFilterAlloc(self.alloc, &raw_item_filter);
             }
         }
         return out;
@@ -5754,10 +5764,8 @@ pub const Index = struct {
         for (array.items) |item| {
             var raw_item_set = (try self.resolvedDocSetForFilterValueAlloc(store, item, generation, bindings)) orelse return null;
             defer raw_item_set.deinit(self.alloc);
-            var item_set = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &raw_item_set, generation);
-            defer item_set.deinit(self.alloc);
             if (out) |*current| {
-                const maybe_next = try doc_set.intersectAlloc(self.alloc, current, &item_set);
+                const maybe_next = try doc_set.intersectAlloc(self.alloc, current, &raw_item_set);
                 const next = maybe_next orelse {
                     current.deinit(self.alloc);
                     out = null;
@@ -5766,7 +5774,7 @@ pub const Index = struct {
                 current.deinit(self.alloc);
                 out = next;
             } else {
-                out = try doc_set.cloneAlloc(self.alloc, &item_set);
+                out = try doc_set.cloneAlloc(self.alloc, &raw_item_set);
             }
         }
         return out;
@@ -5793,9 +5801,7 @@ pub const Index = struct {
         for (array.items) |item| {
             var raw_item_set = (try self.resolvedDocSetForFilterValueAlloc(store, item, generation, bindings)) orelse return null;
             defer raw_item_set.deinit(self.alloc);
-            var item_set = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &raw_item_set, generation);
-            defer item_set.deinit(self.alloc);
-            const maybe_next = try doc_set.unionAlloc(self.alloc, &out, &item_set);
+            const maybe_next = try doc_set.unionAlloc(self.alloc, &out, &raw_item_set);
             const next = maybe_next orelse {
                 out.deinit(self.alloc);
                 out = .none;
@@ -7310,6 +7316,16 @@ pub const Index = struct {
             defer predicate.deinit(self.alloc);
             return try self.resolvedDocSetForPathTermAlloc(store, predicate.path, predicate.kind, predicate.scalar);
         }
+        if (object.get("field") == null and object.get("path") == null and object.get("value") == null and object.get("role") == null and object.count() == 1) {
+            var it = object.iterator();
+            const entry = it.next() orelse return null;
+            const spec = self.scalarFieldSpec(entry.key_ptr.*, null) orelse return null;
+            const scalar = (try jsonScalarToStringAlloc(self.alloc, entry.value_ptr.*)) orelse return null;
+            defer self.alloc.free(scalar);
+            const encoded = try token.scalarTokenFromFieldTextAlloc(self.alloc, spec.type, scalar);
+            defer self.alloc.free(encoded);
+            return try self.resolvedDocSetForScalarFactAlloc(store, spec.role, spec.field, encoded);
+        }
         const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
         const spec = self.scalarFieldSpec(field_name, object.get("role")) orelse return null;
         const scalar = (try jsonScalarToStringAlloc(self.alloc, object.get("value") orelse return null)) orelse return null;
@@ -7595,11 +7611,13 @@ pub const Index = struct {
     }
 
     fn resolvedDocSetForScalarFactAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8, scalar_token: []const u8) !?doc_set.ResolvedDocSet {
-        const legacy_count = try self.countRowsWithPrefix(store, try self.docFactScalarPrefixAlloc(role, field, scalar_token));
         const ordinals = try self.ordinalPostingsForPrefixAlloc(store, try self.docFactScalarOrdinalPrefixAlloc(role, field, scalar_token));
         defer if (ordinals.len > 0) self.alloc.free(ordinals);
+        if (ordinals.len > 0) {
+            return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals);
+        }
+        const legacy_count = try self.countRowsWithPrefix(store, try self.docFactScalarPrefixAlloc(role, field, scalar_token));
         if (ordinals.len == 0 and legacy_count > 0) return null;
-        if (legacy_count != ordinals.len) return null;
         return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals);
     }
 
@@ -9759,7 +9777,6 @@ pub const Index = struct {
             const ordinal_component = token.componentAt(entry.key, owned_prefix.len) catch continue;
             if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
             const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
-            if (containsOrdinal(out.items, ordinal)) continue;
             try out.append(self.alloc, ordinal);
         }
         return try out.toOwnedSlice(self.alloc);
@@ -9812,10 +9829,17 @@ pub const Index = struct {
     fn unionDocIdsAlloc(self: *Index, left: [][]u8, right: [][]u8) ![][]u8 {
         var out = std.ArrayListUnmanaged([]u8).empty;
         errdefer freeDocIdList(self.alloc, &out);
-        for (left) |doc_id| try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
-        for (right) |doc_id| {
-            if (containsDocId(out.items, doc_id)) continue;
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        for (left) |doc_id| {
+            if (seen.contains(doc_id)) continue;
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
+            try seen.put(self.alloc, out.items[out.items.len - 1], {});
+        }
+        for (right) |doc_id| {
+            if (seen.contains(doc_id)) continue;
+            try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
+            try seen.put(self.alloc, out.items[out.items.len - 1], {});
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -9830,9 +9854,16 @@ pub const Index = struct {
     fn intersectDocIdsAlloc(self: *Index, left: [][]u8, right: [][]u8) ![][]u8 {
         var out = std.ArrayListUnmanaged([]u8).empty;
         errdefer freeDocIdList(self.alloc, &out);
+        var right_set = std.StringHashMapUnmanaged(void).empty;
+        defer right_set.deinit(self.alloc);
+        try right_set.ensureTotalCapacity(self.alloc, @intCast(right.len));
+        for (right) |doc_id| try right_set.put(self.alloc, doc_id, {});
+        var emitted = std.StringHashMapUnmanaged(void).empty;
+        defer emitted.deinit(self.alloc);
         for (left) |doc_id| {
-            if (!containsDocId(right, doc_id)) continue;
+            if (!right_set.contains(doc_id) or emitted.contains(doc_id)) continue;
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
+            try emitted.put(self.alloc, out.items[out.items.len - 1], {});
         }
         return try out.toOwnedSlice(self.alloc);
     }

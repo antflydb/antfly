@@ -133,6 +133,7 @@ pub const default_text_segment_target_bytes: usize = 256 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
     target_segment_bytes: usize = default_text_segment_target_bytes,
+    profile: ?*introducer_mod.BuildTextProfile = null,
 };
 
 pub const BuildTextSegmentsResult = struct {
@@ -369,13 +370,8 @@ pub fn buildTextProjectionBatchFromSource(
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
-            .typed_fields = if (doc.typed_source) |typed_source|
-                try introducer_mod.collectTypedFieldProjection(arena, typed_source, text_analysis, .{
-                    .recursive_typed_fields = extracted.recursive_typed_fields,
-                    .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
-                })
-            else
-                &.{},
+            .typed_fields = if (doc.typed_source == null) &.{} else null,
+            .typed_source = doc.typed_source,
         });
     }
 
@@ -391,7 +387,19 @@ pub fn buildTextSegmentFromProjectionBatch(
     text_analysis: introducer_mod.TextAnalysisConfig,
 ) !?[]u8 {
     if (projection_batch.docs.len == 0) return null;
-    return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{});
+    return try buildTextSegmentFromProjectionBatchWithProfile(alloc, projection_batch, text_analysis, null);
+}
+
+fn buildTextSegmentFromProjectionBatchWithProfile(
+    alloc: Allocator,
+    projection_batch: TextProjectionBatch,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    profile: ?*introducer_mod.BuildTextProfile,
+) !?[]u8 {
+    if (projection_batch.docs.len == 0) return null;
+    return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
+        .profile = profile,
+    });
 }
 
 pub fn buildTextSegmentsFromProjectionBatch(
@@ -416,7 +424,7 @@ pub fn buildTextSegmentsFromProjectionBatch(
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
         };
-        if (try buildTextSegmentFromProjectionBatch(alloc, chunk, text_analysis)) |segment| {
+        if (try buildTextSegmentFromProjectionBatchWithProfile(alloc, chunk, text_analysis, options.profile)) |segment| {
             try segments.append(alloc, segment);
         }
         start = end;

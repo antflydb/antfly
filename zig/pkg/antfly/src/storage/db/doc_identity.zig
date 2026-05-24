@@ -470,11 +470,26 @@ pub fn allVisibleFromSummaryFast(store: *docstore_mod.DocStore, generation: ?u64
     var txn = try store.beginProbeTxn();
     defer txn.abort();
     const summary = (try readVisibilitySummaryTxn(&txn)) orelse return null;
+    return allVisibleFromSummary(summary, generation);
+}
+
+pub fn allVisibleFromSummary(summary: VisibilitySummary, generation: ?u64) bool {
     if (summary.tombstone_ordinals != 0) return false;
     if (generation) |at| {
         if (summary.max_created_generation > at) return false;
     }
     return true;
+}
+
+pub fn visibilitySummaryFromWrites(writes: []const docstore_mod.KVPair) !?VisibilitySummary {
+    var idx = writes.len;
+    while (idx > 0) {
+        idx -= 1;
+        const write = writes[idx];
+        if (!std.mem.eql(u8, write.key, internal_keys.identity_visibility_summary_key[0..])) continue;
+        return try decodeVisibilitySummary(write.value);
+    }
+    return null;
 }
 
 pub fn fullStatsFromStore(store: *docstore_mod.DocStore) !Stats {
@@ -1716,6 +1731,9 @@ test "batch identity metadata persists ordinal mappings and delete generations" 
         &.{ "doc:a", "doc\x00b" },
         &.{},
     );
+    const first_summary = (try visibilitySummaryFromWrites(first_writes.items)).?;
+    try std.testing.expect(allVisibleFromSummary(first_summary, 10));
+    try std.testing.expect(!allVisibleFromSummary(first_summary, 9));
     try store.putBatchWithReplay(null, first_writes.items, &.{}, null);
 
     try std.testing.expectEqual(@as(?bool, true), try allVisibleFromSummaryFast(&store, null));
@@ -1742,6 +1760,8 @@ test "batch identity metadata persists ordinal mappings and delete generations" 
         &.{"doc:a"},
         &.{"doc\x00b"},
     );
+    const second_summary = (try visibilitySummaryFromWrites(second_writes.items)).?;
+    try std.testing.expect(!allVisibleFromSummary(second_summary, null));
     try store.putBatchWithReplay(null, second_writes.items, &.{}, null);
 
     try std.testing.expectEqual(@as(?bool, false), try allVisibleFromSummaryFast(&store, null));

@@ -21,6 +21,7 @@ const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const doc_set = @import("../doc_set.zig");
+const doc_identity = @import("../doc_identity.zig");
 const graph_exec = @import("graph_exec.zig");
 const search_mod = @import("../../../search/search.zig");
 const index_mod = @import("../../../index.zig");
@@ -279,6 +280,19 @@ pub const DenseSearchExecutor = struct {
         doc_id: []const u8,
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal = null,
+    lookup_doc_ordinals: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror![]?doc_set.DocOrdinal = null,
+    lookup_doc_ordinals_for_vector_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        vector_ids: []const u64,
+        generation: ?u64,
+    ) anyerror![]?doc_set.DocOrdinal = null,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -387,6 +401,7 @@ pub const DenseSearchProfile = struct {
     hbc_rerank_lsm_cache_misses: u64 = 0,
     hbc_rerank_distance_ns: u64 = 0,
     doc_key_resolve_ns: u64 = 0,
+    doc_ordinal_lookup_ns: u64 = 0,
     load_projected_document_ns: u64 = 0,
     postprocess_ns: u64 = 0,
     raw_hit_count: u32 = 0,
@@ -1179,6 +1194,14 @@ fn hasStoredPatternFilters(req: types.SearchRequest) bool {
     return req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0;
 }
 
+fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
+    if (!filter_query_json_resolved and !exclusion_query_json_resolved) return req;
+    var next = req;
+    if (filter_query_json_resolved) next.filter_query_json = "";
+    if (exclusion_query_json_resolved) next.exclusion_query_json = "";
+    return next;
+}
+
 const NativeDenseConstraints = struct {
     positive_filter: bool = false,
     filter_ids: []const u64 = &.{},
@@ -1186,6 +1209,8 @@ const NativeDenseConstraints = struct {
     exclude_ids: []const u64 = &.{},
     exclude_ids_owned: bool = false,
     resolved_stored_filters: bool = false,
+    filter_query_json_resolved: bool = false,
+    exclusion_query_json_resolved: bool = false,
 
     fn deinit(self: *NativeDenseConstraints, alloc: Allocator) void {
         if (self.filter_ids_owned and self.filter_ids.len > 0) alloc.free(@constCast(self.filter_ids));
@@ -1205,6 +1230,8 @@ const NativeDocIdConstraints = struct {
     filter_doc_nums_owned: bool = false,
     exclude_doc_nums_owned: bool = false,
     resolved_stored_filters: bool = false,
+    filter_query_json_resolved: bool = false,
+    exclusion_query_json_resolved: bool = false,
 
     fn deinit(self: *NativeDocIdConstraints, alloc: Allocator) void {
         if (self.filter_doc_ids_owned) freeDocIdSlice(alloc, self.filter_doc_ids);
@@ -1337,7 +1364,7 @@ pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
 const StructuredFilterDocSetCache = struct {
     const Entry = struct {
         filter_query_json: []u8,
-        identity_namespace_tag: ?u64,
+        identity_namespace: ?doc_identity.Namespace,
         identity_read_generation: ?u64,
         set: doc_set.ResolvedDocSet,
     };
@@ -1364,20 +1391,20 @@ const StructuredFilterDocSetCache = struct {
     fn getShared(
         self: *const StructuredFilterDocSetCache,
         filter_query_json: []const u8,
-        identity_namespace_tag: u64,
+        identity_namespace: doc_identity.Namespace,
         identity_read_generation: u64,
     ) ?*const doc_set.ResolvedDocSet {
-        return self.getWithNamespace(filter_query_json, identity_namespace_tag, identity_read_generation);
+        return self.getWithNamespace(filter_query_json, identity_namespace, identity_read_generation);
     }
 
     fn getWithNamespace(
         self: *const StructuredFilterDocSetCache,
         filter_query_json: []const u8,
-        identity_namespace_tag: ?u64,
+        identity_namespace: ?doc_identity.Namespace,
         identity_read_generation: ?u64,
     ) ?*const doc_set.ResolvedDocSet {
         for (self.entries.items) |*entry| {
-            if (entry.identity_namespace_tag == identity_namespace_tag and
+            if (optionalIdentityNamespaceEql(entry.identity_namespace, identity_namespace) and
                 entry.identity_read_generation == identity_read_generation and
                 std.mem.eql(u8, entry.filter_query_json, filter_query_json))
             {
@@ -1401,18 +1428,18 @@ const StructuredFilterDocSetCache = struct {
         self: *StructuredFilterDocSetCache,
         alloc: Allocator,
         filter_query_json: []const u8,
-        identity_namespace_tag: u64,
+        identity_namespace: doc_identity.Namespace,
         identity_read_generation: u64,
         set: *const doc_set.ResolvedDocSet,
     ) !void {
-        return try self.putCloneWithNamespaceAlloc(alloc, filter_query_json, identity_namespace_tag, identity_read_generation, set);
+        return try self.putCloneWithNamespaceAlloc(alloc, filter_query_json, identity_namespace, identity_read_generation, set);
     }
 
     fn putCloneWithNamespaceAlloc(
         self: *StructuredFilterDocSetCache,
         alloc: Allocator,
         filter_query_json: []const u8,
-        identity_namespace_tag: ?u64,
+        identity_namespace: ?doc_identity.Namespace,
         identity_read_generation: ?u64,
         set: *const doc_set.ResolvedDocSet,
     ) !void {
@@ -1422,13 +1449,21 @@ const StructuredFilterDocSetCache = struct {
         errdefer owned_set.deinit(alloc);
         try self.entries.append(alloc, .{
             .filter_query_json = owned_query,
-            .identity_namespace_tag = identity_namespace_tag,
+            .identity_namespace = identity_namespace,
             .identity_read_generation = identity_read_generation,
             .set = owned_set,
         });
         owned_set = .none;
     }
 };
+
+fn optionalIdentityNamespaceEql(a: ?doc_identity.Namespace, b: ?doc_identity.Namespace) bool {
+    if (a) |left| {
+        if (b) |right| return left.eql(right);
+        return false;
+    }
+    return b == null;
+}
 
 fn deriveNativeDocIdConstraintsArena(
     alloc: Allocator,
@@ -1583,6 +1618,7 @@ fn deriveNativeDocIdConstraintsAlloc(
                 .exclude = .none,
             };
             try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+            out.filter_query_json_resolved = true;
         } else if (try collectStructuredFilterDocIdsAlloc(alloc, req, active_executor, req.filter_query_json)) |doc_ids| {
             if (out.positive_filter) {
                 const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, doc_ids);
@@ -1595,6 +1631,7 @@ fn deriveNativeDocIdConstraintsAlloc(
             out.filter_doc_ids_owned = true;
             out.positive_filter = true;
             out.resolved_stored_filters = true;
+            out.filter_query_json_resolved = true;
         } else {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -1653,6 +1690,7 @@ fn deriveNativeDocIdConstraintsAlloc(
                 .exclude = owned_resolved,
             };
             try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+            out.exclusion_query_json_resolved = true;
         } else if (try collectStructuredFilterDocIdsAlloc(alloc, req, active_executor, req.exclusion_query_json)) |doc_ids| {
             if (out.exclude_doc_ids.len > 0) {
                 const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, doc_ids);
@@ -1664,6 +1702,7 @@ fn deriveNativeDocIdConstraintsAlloc(
             }
             out.exclude_doc_ids_owned = true;
             out.resolved_stored_filters = true;
+            out.exclusion_query_json_resolved = true;
         } else {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -1683,6 +1722,8 @@ fn deriveNativeDocIdConstraintsAlloc(
                         out.exclude_doc_ids = owned_excludes;
                     }
                     out.exclude_doc_ids_owned = true;
+                    out.exclusion_query_json_resolved = true;
+                    out.resolved_stored_filters = true;
                 }
             }
         }
@@ -2871,6 +2912,14 @@ fn deriveNativeDenseConstraintsAlloc(
     index_name: []const u8,
     apply_live_all_docs: bool,
 ) !NativeDenseConstraints {
+    const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+    const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    var doc_constraints_ns: u64 = 0;
+    var filter_doc_nums_ns: u64 = 0;
+    var filter_doc_ids_ns: u64 = 0;
+    var filter_intersect_ns: u64 = 0;
+    var exclude_doc_nums_ns: u64 = 0;
+    var exclude_doc_ids_ns: u64 = 0;
     var out = NativeDenseConstraints{};
     errdefer out.deinit(alloc);
 
@@ -2881,6 +2930,7 @@ fn deriveNativeDenseConstraintsAlloc(
 
     const apply_broad_live_docs = apply_live_all_docs and
         !(try canSkipBroadLiveDenseConstraint(req, executor));
+    const doc_constraints_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     var doc_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -2890,19 +2940,26 @@ fn deriveNativeDenseConstraintsAlloc(
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = apply_broad_live_docs,
     });
+    if (bench_profile) doc_constraints_ns = platform_time.monotonicNs() - doc_constraints_start_ns;
     defer doc_constraints.deinit(alloc);
 
     if (doc_constraints.positive_filter) {
         var mapped: []u64 = &.{};
         var mapped_owned = false;
         if (doc_constraints.filter_doc_nums.len > 0) {
+            const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             mapped = try denseVectorIdsForDocNumsAlloc(alloc, doc_constraints.filter_doc_nums, executor, index_name);
+            if (bench_profile) filter_doc_nums_ns += platform_time.monotonicNs() - phase_start_ns;
             mapped_owned = true;
         }
         if (doc_constraints.filter_doc_ids.len > 0) {
+            const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             const mapped_doc_ids = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
+            if (bench_profile) filter_doc_ids_ns += platform_time.monotonicNs() - phase_start_ns;
             if (mapped_owned) {
+                const intersect_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
                 const intersected = try intersectVectorIdsAlloc(alloc, mapped, mapped_doc_ids);
+                if (bench_profile) filter_intersect_ns += platform_time.monotonicNs() - intersect_start_ns;
                 alloc.free(mapped);
                 alloc.free(mapped_doc_ids);
                 mapped = intersected;
@@ -2912,7 +2969,9 @@ fn deriveNativeDenseConstraintsAlloc(
             mapped_owned = true;
         }
         if (out.positive_filter) {
+            const intersect_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             const intersected = try intersectVectorIdsAlloc(alloc, out.filter_ids, mapped);
+            if (bench_profile) filter_intersect_ns += platform_time.monotonicNs() - intersect_start_ns;
             if (mapped_owned) alloc.free(mapped);
             if (out.filter_ids_owned and out.filter_ids.len > 0) alloc.free(@constCast(out.filter_ids));
             out.filter_ids = intersected;
@@ -2925,17 +2984,44 @@ fn deriveNativeDenseConstraintsAlloc(
     }
 
     if (doc_constraints.exclude_doc_nums.len > 0) {
+        const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const mapped_excludes = try denseVectorIdsForDocNumsAlloc(alloc, doc_constraints.exclude_doc_nums, executor, index_name);
+        if (bench_profile) exclude_doc_nums_ns += platform_time.monotonicNs() - phase_start_ns;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
     }
     if (doc_constraints.exclude_doc_ids.len > 0) {
+        const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const mapped_excludes = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
+        if (bench_profile) exclude_doc_ids_ns += platform_time.monotonicNs() - phase_start_ns;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
     }
     if (out.exclude_ids.len == 0 and req.exclude_ids.len > 0) {
         out.exclude_ids = req.exclude_ids;
     }
     out.resolved_stored_filters = doc_constraints.resolved_stored_filters;
+    out.filter_query_json_resolved = doc_constraints.filter_query_json_resolved;
+    out.exclusion_query_json_resolved = doc_constraints.exclusion_query_json_resolved;
+    if (bench_profile) {
+        std.log.info(
+            "antfly_bench_dense_constraints total_us={d} doc_constraints_us={d} filter_doc_nums_us={d} filter_doc_ids_us={d} filter_intersect_us={d} exclude_doc_nums_us={d} exclude_doc_ids_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} out_filter_ids={d} exclude_doc_nums={d} exclude_doc_ids={d} out_exclude_ids={d}",
+            .{
+                nsToUs(platform_time.monotonicNs() - total_start_ns),
+                nsToUs(doc_constraints_ns),
+                nsToUs(filter_doc_nums_ns),
+                nsToUs(filter_doc_ids_ns),
+                nsToUs(filter_intersect_ns),
+                nsToUs(exclude_doc_nums_ns),
+                nsToUs(exclude_doc_ids_ns),
+                doc_constraints.positive_filter,
+                doc_constraints.filter_doc_nums.len,
+                doc_constraints.filter_doc_ids.len,
+                out.filter_ids.len,
+                doc_constraints.exclude_doc_nums.len,
+                doc_constraints.exclude_doc_ids.len,
+                out.exclude_ids.len,
+            },
+        );
+    }
     return out;
 }
 
@@ -3286,10 +3372,12 @@ pub fn searchTextQuery(
         .match_all => executor.search_match_all(executor.ctx, alloc, req),
         else => error.IndexNotFound,
     };
+    var effective_req = req;
+    if (effective_req.index_name == null) effective_req.index_name = text_entry.config.name;
     const text_index = &text_entry.persistent;
-    const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, req.index_name);
-    const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
-    const paging = componentPaging(req);
+    const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, effective_req.index_name);
+    const group_chunk_parents = shouldGroupChunkParents(effective_req, chunk_backed);
+    const paging = componentPaging(effective_req);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -3297,7 +3385,7 @@ pub fn searchTextQuery(
     const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
     const snapshot = text_index.snapshot();
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var constraint_req = req;
+    var constraint_req = effective_req;
     constraint_req.resolved_doc_filter = null;
     constraint_req.full_text = null;
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
@@ -3315,9 +3403,9 @@ pub fn searchTextQuery(
 
     const collect_all_hits = group_chunk_parents;
     const resolved_filter_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    if (resolvedTextDocNumFilterFromRequest(req)) |filter| {
+    if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
         try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
-    } else if (resolvedDocFilterFromRequest(req)) |filter| {
+    } else if (resolvedDocFilterFromRequest(effective_req)) |filter| {
         try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, filter, .{
             .ctx = executor.ctx,
             .text_index_entry = executor.text_index_entry,
@@ -3325,7 +3413,7 @@ pub fn searchTextQuery(
             .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
             .live_filter_doc_set = executor.live_filter_doc_set,
             .project_ordinals_to_doc_ids = false,
-            .identity_read_generation = req.identity_read_generation,
+            .identity_read_generation = effective_req.identity_read_generation,
         });
     }
     const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
@@ -3335,25 +3423,25 @@ pub fn searchTextQuery(
     const convert_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - convert_start_ns else 0;
 
     if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
-        return executor.postprocess(executor.ctx, alloc, req, .{
+        return executor.postprocess(executor.ctx, alloc, effective_req, .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = 0,
             .graph_results = &.{},
         }, chunk_backed);
     }
-    const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, req.count_only);
+    const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
 
     const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var result = if (req.count_only)
+    var result = if (effective_req.count_only)
         try search_mod.executeCountCandidates(alloc, snapshot, search_query)
     else
         try search_mod.execute(alloc, snapshot, .{
             .query = search_query,
             .k = if (collect_all_hits) @intCast(snapshot.global_doc_count) else paging.limit,
             .offset = if (collect_all_hits) 0 else paging.offset,
-            .include_stored = req.include_stored,
-            .distributed_text_stats = req.distributed_text_stats,
+            .include_stored = effective_req.include_stored,
+            .distributed_text_stats = effective_req.distributed_text_stats,
             .filter_doc_nums = native_constraints.filter_doc_nums,
             .filter_doc_nums_positive = native_constraints.positive_filter,
             .exclude_doc_nums = native_constraints.exclude_doc_nums,
@@ -3390,8 +3478,8 @@ pub fn searchTextQuery(
             .id = try alloc.dupe(u8, id),
             .doc_ordinal = doc_ordinal,
             .score = hit.score,
-            .stored_data = if (req.include_stored and hit.stored_data != null)
-                try executor.project_stored_search(executor.ctx, alloc, req, id, hit.stored_data.?)
+            .stored_data = if (effective_req.include_stored and hit.stored_data != null)
+                try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
             else
                 null,
         };
@@ -3401,7 +3489,7 @@ pub fn searchTextQuery(
 
     owns_hits = false;
     const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    const out = try executor.postprocess(executor.ctx, alloc, req, .{
+    const out = try executor.postprocess(executor.ctx, alloc, effective_req, .{
         .alloc = alloc,
         .hits = hits,
         .total_hits = result.total_hits,
@@ -3416,7 +3504,7 @@ pub fn searchTextQuery(
         std.log.info(
             "antfly_bench_text_query index={s} total_us={d} derive_constraints_us={d} apply_resolved_us={d} convert_constraints_us={d} execute_us={d} hits_us={d} postprocess_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} exclude_doc_nums={d} exclude_doc_ids={d} snapshot_docs={d} hits={d} total_hits={d}",
             .{
-                req.index_name orelse "",
+                effective_req.index_name orelse "",
                 nsToUs(platform_time.monotonicNs() - total_start_ns),
                 nsToUs(derive_constraints_ns),
                 nsToUs(resolved_filter_ns),
@@ -4181,7 +4269,14 @@ fn searchDenseInternal(
     var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, req, executor, req.index_name orelse entry.config.name, true);
     profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     defer native_constraints.deinit(alloc);
-    const unresolved_stored_filters = hasStoredPatternFilters(req) and !native_constraints.resolved_stored_filters;
+    const unresolved_stored_filters =
+        (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
+        (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
+    const postprocess_req = requestWithoutResolvedStoredFilters(
+        req,
+        native_constraints.filter_query_json_resolved,
+        native_constraints.exclusion_query_json_resolved,
+    );
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
     const effective_k: u32 = if (full_candidate_window)
         @intCast(index_stats.active_count)
@@ -4221,6 +4316,7 @@ fn searchDenseInternal(
     const hbc_req: vectorindex_mod.SearchRequest = .{
         .query = dense.vector,
         .k = hbc_effective_k,
+        .rerank_k = if (full_candidate_window) @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k))) else null,
         .search_width = resolved_search_width,
         .epsilon = resolved_epsilon,
         .filter_prefix = req.filter_prefix,
@@ -4311,6 +4407,8 @@ fn searchDenseInternal(
     const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
 
     var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
+    var hit_vector_ids = std.ArrayListUnmanaged(u64).empty;
+    defer hit_vector_ids.deinit(alloc);
     errdefer {
         for (hits.items) |*hit| hit.deinit(alloc);
         hits.deinit(alloc);
@@ -4347,34 +4445,46 @@ fn searchDenseInternal(
         errdefer if (stored_data_owned) {
             if (stored_data) |data| alloc.free(data);
         };
-        if (req.include_stored and !(chunk_backed and group_chunk_parents)) {
+        const load_stored_before_postprocess = postprocess_req.include_stored and
+            !(chunk_backed and group_chunk_parents) and
+            !unresolved_stored_filters;
+        if (load_stored_before_postprocess) {
             const load_start = platform_time.monotonicNs();
-            stored_data = try executor.load_projected_document(executor.ctx, alloc, req, doc_key);
+            stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
             stored_data_owned = true;
             profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
         }
+        try hit_vector_ids.append(alloc, hit.vector_id);
         try hits.append(alloc, .{
             .id = doc_key,
-            .doc_ordinal = try lookupDenseHitDocOrdinal(alloc, req, executor, doc_key),
+            .doc_ordinal = null,
             .score = hit.distance,
             .stored_data = stored_data,
         });
         doc_key_owned = false;
         stored_data_owned = false;
     }
+    const ordinal_lookup_start = platform_time.monotonicNs();
+    try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
+    profile.doc_ordinal_lookup_ns = platform_time.monotonicNs() - ordinal_lookup_start;
 
     const postprocess_start = platform_time.monotonicNs();
-    var result = try executor.postprocess(executor.ctx, alloc, req, .{
+    var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
         .alloc = alloc,
         .hits = try hits.toOwnedSlice(alloc),
         .total_hits = @intCast(hits.items.len),
         .graph_results = &.{},
     }, chunk_backed);
     errdefer result.deinit();
-    if (hasStoredPatternFilters(req)) {
+    if (unresolved_stored_filters) {
         result = try pageSearchResultInPlace(alloc, result, paging);
     }
     profile.postprocess_ns = platform_time.monotonicNs() - postprocess_start;
+    if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
+        const load_start = platform_time.monotonicNs();
+        try loadMissingProjectedDenseHitDocuments(alloc, postprocess_req, executor, result.hits);
+        profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
+    }
     profile.returned_hit_count = result.total_hits;
     profile.total_ns = platform_time.monotonicNs() - total_start;
     if (bench_query_profile) logBenchDenseQueryProfile(req, dense, index_stats, profile);
@@ -4432,6 +4542,62 @@ fn lookupDenseHitDocOrdinal(
     return try lookup(executor.ctx, alloc, doc_key, req.identity_read_generation);
 }
 
+fn loadMissingProjectedDenseHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: DenseSearchExecutor,
+    hits: []types.SearchHit,
+) !void {
+    for (hits) |*hit| {
+        if (hit.stored_data != null) continue;
+        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+    }
+}
+
+fn lookupDenseHitDocOrdinals(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: DenseSearchExecutor,
+    vector_ids: []const u64,
+    hits: []types.SearchHit,
+) !void {
+    if (!denseHitPageNeedsDocOrdinals(req) or hits.len == 0) return;
+    if (executor.lookup_doc_ordinals_for_vector_ids) |lookup_for_vector_ids| {
+        if (req.index_name) |index_name| {
+            const ordinals = try lookup_for_vector_ids(executor.ctx, alloc, index_name, vector_ids, req.identity_read_generation);
+            defer alloc.free(ordinals);
+            if (ordinals.len != hits.len) return error.InvalidDocIdentity;
+            var missing_count: usize = 0;
+            for (hits, 0..) |*hit, i| {
+                hit.doc_ordinal = ordinals[i];
+                if (ordinals[i] == null) missing_count += 1;
+            }
+            if (missing_count == 0) return;
+        }
+    }
+    if (executor.lookup_doc_ordinals) |lookup_many| {
+        var doc_ids = try std.ArrayListUnmanaged([]const u8).initCapacity(alloc, hits.len);
+        defer doc_ids.deinit(alloc);
+        var hit_indexes = try std.ArrayListUnmanaged(usize).initCapacity(alloc, hits.len);
+        defer hit_indexes.deinit(alloc);
+        for (hits, 0..) |hit, i| {
+            if (hit.doc_ordinal != null) continue;
+            doc_ids.appendAssumeCapacity(hit.id);
+            hit_indexes.appendAssumeCapacity(i);
+        }
+        if (doc_ids.items.len == 0) return;
+        const ordinals = try lookup_many(executor.ctx, alloc, doc_ids.items, req.identity_read_generation);
+        defer alloc.free(ordinals);
+        if (ordinals.len != doc_ids.items.len) return error.InvalidDocIdentity;
+        for (hit_indexes.items, 0..) |hit_index, i| hits[hit_index].doc_ordinal = ordinals[i];
+        return;
+    }
+    for (hits) |*hit| {
+        if (hit.doc_ordinal != null) continue;
+        hit.doc_ordinal = try lookupDenseHitDocOrdinal(alloc, req, executor, hit.id);
+    }
+}
+
 fn denseHitPageNeedsDocOrdinals(req: types.SearchRequest) bool {
     return req.resolved_doc_filter != null or
         req.graph_queries.len != 0 or
@@ -4453,7 +4619,7 @@ fn logBenchDenseQueryProfile(
 ) void {
     const estimated_leaves = estimateLeafCount(index_stats);
     std.log.info(
-        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} constraint_us={d} hbc_us={d} doc_key_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
+        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} constraint_us={d} hbc_us={d} doc_key_us={d} doc_ordinal_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
         .{
             req.index_name orelse "",
             req.primary_text_index_name orelse "",
@@ -4475,6 +4641,7 @@ fn logBenchDenseQueryProfile(
             nsToUs(profile.constraint_ns),
             nsToUs(profile.hbc_search_ns),
             nsToUs(profile.doc_key_resolve_ns),
+            nsToUs(profile.doc_ordinal_lookup_ns),
             nsToUs(profile.load_projected_document_ns),
             nsToUs(profile.postprocess_ns),
             profile.raw_hit_count,
@@ -4635,7 +4802,14 @@ pub fn searchSparse(
         .apply_live_all_docs = true,
     });
     defer native_constraints.deinit(alloc);
-    const unresolved_stored_filters = hasStoredPatternFilters(req) and !native_constraints.resolved_stored_filters;
+    const unresolved_stored_filters =
+        (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
+        (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
+    const postprocess_req = requestWithoutResolvedStoredFilters(
+        req,
+        native_constraints.filter_query_json_resolved,
+        native_constraints.exclusion_query_json_resolved,
+    );
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
     const effective_k: u32 = if (full_candidate_window)
         @intCast(entry.index.next_doc_num)
@@ -4682,8 +4856,8 @@ pub fn searchSparse(
             else
                 try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
             .score = hit.score,
-            .stored_data = if (req.include_stored and !(chunk_backed and group_chunk_parents))
-                try executor.load_projected_document(executor.ctx, alloc, req, hit.doc_id)
+            .stored_data = if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents) and !unresolved_stored_filters)
+                try executor.load_projected_document(executor.ctx, alloc, postprocess_req, hit.doc_id)
             else
                 null,
         };
@@ -4691,14 +4865,14 @@ pub fn searchSparse(
     }
 
     owns_hits = false;
-    var result = try executor.postprocess(executor.ctx, alloc, req, .{
+    var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
         .alloc = alloc,
         .hits = hits,
         .total_hits = @intCast(raw_hits.len),
         .graph_results = &.{},
     }, chunk_backed);
     errdefer result.deinit();
-    if (hasStoredPatternFilters(req)) {
+    if (unresolved_stored_filters) {
         result = try pageSearchResultInPlace(alloc, result, paging);
     }
     return result;
@@ -6614,12 +6788,16 @@ test "structured filter doc set cache separates shared namespace generation keys
 
     var source = try doc_set.fromOrdinalsAlloc(alloc, &.{ 9, 10 });
     defer source.deinit(alloc);
-    try cache.putSharedCloneAlloc(alloc, "{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 111, 7, &source);
+    const namespace_a = doc_identity.Namespace{ .table_id = 1, .shard_id = 11, .range_id = 111 };
+    const namespace_b = doc_identity.Namespace{ .table_id = 1, .shard_id = 11, .range_id = 112 };
+    const namespace_same_tag_different_tuple = doc_identity.Namespace{ .table_id = 111, .shard_id = 0, .range_id = 0 };
+    try cache.putSharedCloneAlloc(alloc, "{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 7, &source);
 
     try std.testing.expect(cache.get("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 7) == null);
-    try std.testing.expect(cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 112, 7) == null);
-    try std.testing.expect(cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 111, 8) == null);
-    const cached = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", 111, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_b, 7) == null);
+    try std.testing.expect(cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_same_tag_different_tuple, 7) == null);
+    try std.testing.expect(cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 8) == null);
+    const cached = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 7) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cached.containsOrdinal(9));
     try std.testing.expect(cached.containsOrdinal(10));
 }

@@ -4604,6 +4604,7 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_rerank_lsm_cache_misses = profile.hbc_rerank_lsm_cache_misses,
         .hbc_rerank_distance_ns = profile.hbc_rerank_distance_ns,
         .doc_key_resolve_ns = profile.doc_key_resolve_ns,
+        .doc_ordinal_lookup_ns = profile.doc_ordinal_lookup_ns,
         .load_projected_document_ns = profile.load_projected_document_ns,
         .postprocess_ns = profile.postprocess_ns,
         .raw_hit_count = profile.raw_hit_count,

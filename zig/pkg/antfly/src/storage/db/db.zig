@@ -2235,6 +2235,7 @@ pub const DB = struct {
     flushing_bulk_ingest_coalescer: bool = false,
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
+    identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
 
@@ -3535,6 +3536,7 @@ pub const DB = struct {
             recordProfileNs(profile, &active_profile.identity_metadata_ns, identity_metadata_start_ns);
             active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
         }
+        const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
         try store_writes.appendSlice(self.alloc, identity_writes.items);
         const build_derived_start_ns = monotonicTimeNs();
         const replay_payload = if (use_thin_replay_fast_path)
@@ -3591,6 +3593,9 @@ pub const DB = struct {
             },
             store_batch_options,
         );
+        if (pending_identity_visibility_summary) |summary| {
+            self.identity_visibility_summary_cache = summary;
+        }
         if (profile) |active_profile| {
             recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
             active_profile.store_write_count += @intCast(store_writes.items.len);
@@ -3673,6 +3678,7 @@ pub const DB = struct {
         if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
         if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
             self.bulk_ingest_identity_state = state;
+            self.identity_visibility_summary_cache = state.visibility_summary;
             self.bulk_ingest_identity_all_new = true;
         }
     }
@@ -4869,9 +4875,13 @@ pub const DB = struct {
             );
         }
 
+        const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
         try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
             .writes = identity_writes.items,
         });
+        if (pending_identity_visibility_summary) |summary| {
+            self.identity_visibility_summary_cache = summary;
+        }
     }
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
@@ -8387,24 +8397,25 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
-        if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0 or req.merge_config != null) {
-            var composed = try self.searchComposed(alloc, req, exec_ctx);
+        const execution_req = directSingleVectorRequest(req) orelse req;
+        if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
+            var composed = try self.searchComposed(alloc, execution_req, exec_ctx);
             errdefer composed.deinit();
             try externalizeSearchResultArtifactIds(alloc, &composed);
             return composed;
         }
 
-        const has_primary = req.full_text != null or req.dense != null or req.sparse != null or !db_query_search.isDefaultMatchAll(req.query) or req.graph_queries.len == 0;
+        const has_primary = execution_req.full_text != null or execution_req.dense != null or execution_req.sparse != null or !db_query_search.isDefaultMatchAll(execution_req.query) or execution_req.graph_queries.len == 0;
 
-        var base = if (!has_primary and req.graph_queries.len > 0)
+        var base = if (!has_primary and execution_req.graph_queries.len > 0)
             try db_query_search.emptySearchResult(alloc)
-        else if (req.full_text) |text|
-            try self.searchTextQuery(alloc, req, text)
-        else if (req.dense) |dense|
-            try self.searchDense(alloc, req, dense)
-        else if (req.sparse) |sparse|
-            try self.searchSparse(alloc, req, sparse)
-        else switch (req.query) {
+        else if (execution_req.full_text) |text|
+            try self.searchTextQuery(alloc, execution_req, text)
+        else if (execution_req.dense) |dense|
+            try self.searchDense(alloc, execution_req, dense)
+        else if (execution_req.sparse) |sparse|
+            try self.searchSparse(alloc, execution_req, sparse)
+        else switch (execution_req.query) {
             .match_none,
             .match_all,
             .phrase,
@@ -8425,22 +8436,51 @@ pub const DB = struct {
             .prefix,
             .wildcard,
             .regexp,
-            => try self.searchText(alloc, req),
-            .dense_knn => |dense| try self.searchDense(alloc, req, dense),
-            .sparse_knn => |sparse| try self.searchSparse(alloc, req, sparse),
-            .graph => |graph| try self.searchGraph(alloc, req, graph, null),
+            => try self.searchText(alloc, execution_req),
+            .dense_knn => |dense| try self.searchDense(alloc, execution_req, dense),
+            .sparse_knn => |sparse| try self.searchSparse(alloc, execution_req, sparse),
+            .graph => |graph| try self.searchGraph(alloc, execution_req, graph, null),
         };
         errdefer base.deinit();
 
-        if (req.graph_queries.len == 0) {
+        if (execution_req.graph_queries.len == 0) {
             try externalizeSearchResultArtifactIds(alloc, &base);
             return base;
         }
 
-        base.graph_results = try self.executeGraphQueries(alloc, req, req.graph_queries, base.hits, base.total_hits);
-        try self.applyGraphExpandStrategy(alloc, &base, req.expand_strategy);
+        base.graph_results = try self.executeGraphQueries(alloc, execution_req, execution_req.graph_queries, base.hits, base.total_hits);
+        try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
         try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
+    }
+
+    fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
+        if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
+        if (req.full_text_queries.len != 0) return null;
+        if (req.full_text) |text| switch (text) {
+            .match_all => {},
+            else => return null,
+        };
+        if (!db_query_search.isDefaultMatchAll(req.query)) return null;
+        if (req.graph_queries.len != 0 or req.expand_strategy != null) return null;
+        if (req.dense != null or req.sparse != null) return null;
+        if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
+            var next = req;
+            next.index_name = req.dense_queries[0].index_name;
+            next.full_text = null;
+            next.dense = req.dense_queries[0].query;
+            next.dense_queries = &.{};
+            return next;
+        }
+        if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
+            var next = req;
+            next.index_name = req.sparse_queries[0].index_name;
+            next.full_text = null;
+            next.sparse = req.sparse_queries[0].query;
+            next.sparse_queries = &.{};
+            return next;
+        }
+        return null;
     }
 
     fn searchComposed(
@@ -8902,11 +8942,11 @@ pub const DB = struct {
         generation: ?u64,
     ) anyerror!bool {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return (try doc_identity.allVisibleFromSummaryFast(self.core.store, generation)) orelse false;
+        return try self.allDocsVisibleSummaryFast(generation);
     }
 
     fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
-        if (try doc_identity.allVisibleFromSummaryFast(self.core.store, generation)) |all_visible| {
+        if (try self.allDocsVisibleSummaryFastMaybe(generation)) |all_visible| {
             if (all_visible) return true;
         }
         const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
@@ -8915,6 +8955,18 @@ pub const DB = struct {
         else
             true;
         return identity_stats.complete and identity_stats.tombstone_ordinals == 0 and generation_covers_all_creates;
+    }
+
+    fn allDocsVisibleSummaryFast(self: *DB, generation: ?u64) !bool {
+        return (try self.allDocsVisibleSummaryFastMaybe(generation)) orelse false;
+    }
+
+    fn allDocsVisibleSummaryFastMaybe(self: *DB, generation: ?u64) !?bool {
+        if (self.identity_visibility_summary_cache) |summary| {
+            const cached = doc_identity.allVisibleFromSummary(summary, generation);
+            if (!cached) return false;
+        }
+        return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
     }
 
     fn denseVectorIdsForOrdinalsCallback(
@@ -8930,6 +8982,38 @@ pub const DB = struct {
             index_name,
             ordinals,
         );
+    }
+
+    fn denseOrdinalsForVectorIdsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        vector_ids: []const u64,
+        generation: ?u64,
+    ) anyerror![]?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const ordinals = try self.core.index_manager.lookupDenseOrdinalsForVectorIdsAlloc(
+            alloc,
+            self.core.store,
+            index_name,
+            vector_ids,
+        );
+        errdefer alloc.free(ordinals);
+        const all_visible = try self.allDocsVisibleSummaryFast(generation);
+        if (all_visible) return ordinals;
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (ordinals) |*maybe_ordinal| {
+            const ordinal = maybe_ordinal.* orelse continue;
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                maybe_ordinal.* = null;
+                continue;
+            };
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            if (!visible) maybe_ordinal.* = null;
+        }
+        return ordinals;
     }
 
     fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
@@ -8949,6 +9033,8 @@ pub const DB = struct {
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
+            .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
@@ -8984,6 +9070,8 @@ pub const DB = struct {
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
+            .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
@@ -9224,6 +9312,11 @@ pub const DB = struct {
     }
 
     fn searchRequestWithDirectAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest, index: *@import("algebraic/index.zig").Index) !?AlgebraicDocFilterRequest {
+        // Search requests are normalized to the current identity generation before
+        // reaching this path. Algebraic ordinal postings represent the current
+        // live row set, so using them directly avoids a broad identity-state scan
+        // before every vector filter query.
+        const algebraic_filter_rows_are_visible = true;
         var resolved_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.ResolvedFilterBinding).empty;
         defer {
             for (resolved_bindings.items) |*binding| binding.filter.deinit(index.alloc);
@@ -9234,12 +9327,19 @@ pub const DB = struct {
             for (resolved_bindings.items) |existing| {
                 if (std.mem.eql(u8, existing.name, binding.name)) return error.InvalidArgument;
             }
-            var binding_filter = (try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
-                self.core.store,
-                binding.filter_query_json,
-                req.identity_read_generation,
-                resolved_bindings.items,
-            )) orelse return null;
+            var binding_filter = (if (algebraic_filter_rows_are_visible)
+                try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                    self.core.store,
+                    binding.filter_query_json,
+                    resolved_bindings.items,
+                )
+            else
+                try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                    self.core.store,
+                    binding.filter_query_json,
+                    req.identity_read_generation,
+                    resolved_bindings.items,
+                )) orelse return null;
             errdefer binding_filter.deinit(index.alloc);
             try resolved_bindings.append(index.alloc, .{
                 .name = binding.name,
@@ -9262,21 +9362,23 @@ pub const DB = struct {
         }
 
         if (req.filter_query_json.len > 0) {
-            var query_filter = if (resolved_bindings.items.len > 0) blk: {
-                break :blk (try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+            var query_filter = (if (algebraic_filter_rows_are_visible)
+                try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                    self.core.store,
+                    req.filter_query_json,
+                    resolved_bindings.items,
+                )
+            else if (resolved_bindings.items.len > 0)
+                try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
                     self.core.store,
                     req.filter_query_json,
                     req.identity_read_generation,
                     resolved_bindings.items,
-                )) orelse {
-                    filter.deinit(index.alloc);
-                    return null;
-                };
-            } else blk: {
-                break :blk (try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.filter_query_json, req.identity_read_generation)) orelse {
-                    filter.deinit(index.alloc);
-                    return null;
-                };
+                )
+            else
+                try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.filter_query_json, req.identity_read_generation)) orelse {
+                filter.deinit(index.alloc);
+                return null;
             };
             defer query_filter.deinit(index.alloc);
             if (!(try applyResolvedFilterIncludeAlloc(index.alloc, &filter, &query_filter))) {
@@ -9287,21 +9389,23 @@ pub const DB = struct {
             filter_json_resolved = true;
         }
         if (req.exclusion_query_json.len > 0) {
-            var exclusion = if (resolved_bindings.items.len > 0) blk: {
-                break :blk (try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+            var exclusion = (if (algebraic_filter_rows_are_visible)
+                try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                    self.core.store,
+                    req.exclusion_query_json,
+                    resolved_bindings.items,
+                )
+            else if (resolved_bindings.items.len > 0)
+                try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
                     self.core.store,
                     req.exclusion_query_json,
                     req.identity_read_generation,
                     resolved_bindings.items,
-                )) orelse {
-                    filter.deinit(index.alloc);
-                    return null;
-                };
-            } else blk: {
-                break :blk (try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.exclusion_query_json, req.identity_read_generation)) orelse {
-                    filter.deinit(index.alloc);
-                    return null;
-                };
+                )
+            else
+                try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.exclusion_query_json, req.identity_read_generation)) orelse {
+                filter.deinit(index.alloc);
+                return null;
             };
             defer exclusion.deinit(index.alloc);
 
@@ -9626,7 +9730,7 @@ pub const DB = struct {
             alloc,
             req,
             key,
-            (try self.get(alloc, key)) orelse return error.StoredDocMissing,
+            (try self.loadStoredSearchDocumentProbe(alloc, key)) orelse return error.StoredDocMissing,
         );
     }
 
@@ -9698,6 +9802,43 @@ pub const DB = struct {
     ) anyerror!?doc_set.DocOrdinal {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+    }
+
+    fn lookupLiveDocOrdinalsNoLockCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror![]?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.lookupLiveDocOrdinalsNoLock(alloc, doc_ids, generation);
+    }
+
+    fn lookupLiveDocOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) ![]?doc_set.DocOrdinal {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+
+        const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(alloc, &txn, doc_ids);
+        errdefer alloc.free(ordinals);
+
+        const all_visible = try self.allDocsVisibleSummaryFast(generation);
+        if (all_visible) return ordinals;
+
+        for (ordinals) |*maybe_ordinal| {
+            const ordinal = maybe_ordinal.* orelse continue;
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                maybe_ordinal.* = null;
+                continue;
+            };
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            if (!visible) maybe_ordinal.* = null;
+        }
+        return ordinals;
     }
 
     fn lookupLiveDocOrdinalNoLock(
@@ -9911,7 +10052,7 @@ pub const DB = struct {
         key: []const u8,
     ) anyerror!?[]u8 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return if (try self.get(alloc, key)) |stored|
+        return if (try self.loadStoredSearchDocumentProbe(alloc, key)) |stored|
             try projectLookupStoredBytes(self, alloc, key, stored, .{
                 .fields = query.fields,
                 .include_all_fields = query.include_all_fields,
@@ -9983,10 +10124,22 @@ pub const DB = struct {
         key: []const u8,
     ) anyerror!?[]u8 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return if (try self.get(alloc, key)) |stored|
+        return if (try self.loadStoredSearchDocumentProbe(alloc, key)) |stored|
             try projectOwnedStoredBytesForSearch(self, alloc, req, key, stored)
         else
             null;
+    }
+
+    fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
+        defer alloc.free(store_key);
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const raw = txn.get(store_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try alloc.dupe(u8, raw);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -10288,7 +10441,7 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
 
     for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
 
-    var txn = try self.core.store.beginReadTxn();
+    var txn = try self.core.store.beginProbeTxn();
     defer txn.abort();
     try txn.getManySorted(read_keys, read_values);
 
@@ -12069,7 +12222,7 @@ fn loadParentStoredForSearchCallback(
     parent_id: []const u8,
 ) anyerror!?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return if (try self.get(alloc, parent_id)) |stored|
+    return if (try self.loadStoredSearchDocumentProbe(alloc, parent_id)) |stored|
         try projectOwnedStoredBytesForSearch(self, alloc, req, parent_id, stored)
     else
         null;
@@ -12091,7 +12244,7 @@ fn loadStoredForHitCallback(
     key: []const u8,
 ) anyerror!?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return try self.get(alloc, key);
+    return try self.loadStoredSearchDocumentProbe(alloc, key);
 }
 
 fn isExpiredDocumentKeyCallback(
@@ -18511,6 +18664,34 @@ test "db can reassign identity namespace for rebuild" {
     try std.testing.expectEqual(new_namespace.shard_id, stats.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(new_namespace.range_id, stats.doc_identity.namespace_range_id);
     try std.testing.expect(!stats.doc_identity.rebuild_required);
+
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = old_namespace,
+            .identity_read_generation = generation,
+        },
+    }));
+
+    var ok = try db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = new_namespace,
+            .identity_read_generation = generation,
+        },
+    });
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ok.total_hits);
 }
 
 test "db strict namespace reopen recovers after identity reassignment repair" {
@@ -18918,6 +19099,31 @@ test "db search requests default to current identity generation snapshot" {
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 5), stats.doc_set_planning.stale_identity_generation_rejection_count);
+}
+
+test "db caches identity visibility summary after local writes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
+
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+    });
+    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(!(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
 }
 
 test "db validates internal resolved doc filter wire namespace and generation" {
@@ -37303,7 +37509,7 @@ fn loadStoredSearchDocumentCallback(
     key: []const u8,
 ) anyerror!?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return try self.get(alloc, key);
+    return try self.loadStoredSearchDocumentProbe(alloc, key);
 }
 
 fn loadStoredSearchDocumentManyCallback(

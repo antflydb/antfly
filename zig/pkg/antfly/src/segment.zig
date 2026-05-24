@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const platform_time = @import("platform/time.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const snappy = @import("encoding/snappy.zig");
@@ -76,6 +77,7 @@ pub const SegmentWriter = struct {
     stored_fields: std.ArrayListUnmanaged(StoredDoc),
     compression_bytes: std.ArrayListUnmanaged(u8),
     doc_count: u32 = 0,
+    last_stored_compress_ns: u64 = 0,
 
     pub fn init(alloc: Allocator) SegmentWriter {
         return .{
@@ -91,7 +93,7 @@ pub const SegmentWriter = struct {
         self.fields.deinit(self.alloc);
         for (self.stored_fields.items) |*s| {
             self.alloc.free(s.id);
-            self.alloc.free(s.data);
+            if (s.owns_data) self.alloc.free(@constCast(s.data));
         }
         self.stored_fields.deinit(self.alloc);
         self.compression_bytes.deinit(self.alloc);
@@ -109,28 +111,61 @@ pub const SegmentWriter = struct {
 
     /// Attach a section to a field.
     pub fn addSection(self: *SegmentWriter, field_idx: u16, section_type: SectionType, data: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, data);
+        errdefer self.alloc.free(owned);
+        try self.addSectionOwned(field_idx, section_type, owned);
+    }
+
+    /// Attach an owned section buffer to a field.
+    ///
+    /// On success ownership of `data` transfers to the writer and it will be
+    /// freed by `deinit`. On error, the caller still owns `data`.
+    pub fn addSectionOwned(self: *SegmentWriter, field_idx: u16, section_type: SectionType, data: []u8) !void {
         try self.fields.items[field_idx].sections.append(self.alloc, .{
             .section_type = section_type,
-            .data = try self.alloc.dupe(u8, data),
+            .data = data,
         });
     }
 
     /// Store a document's raw data.
     pub fn addStoredDoc(self: *SegmentWriter, doc_id: []const u8, data: []const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, doc_id);
+        errdefer self.alloc.free(owned_id);
+        const owned_data = try self.alloc.dupe(u8, data);
+        errdefer self.alloc.free(owned_data);
         try self.stored_fields.append(self.alloc, .{
-            .id = try self.alloc.dupe(u8, doc_id),
-            .data = try self.alloc.dupe(u8, data),
+            .id = owned_id,
+            .data = owned_data,
             .is_compressed = false,
+            .owns_data = true,
+        });
+        self.doc_count += 1;
+    }
+
+    /// Store a document while borrowing raw data until `build` completes.
+    pub fn addStoredDocBorrowed(self: *SegmentWriter, doc_id: []const u8, data: []const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, doc_id);
+        errdefer self.alloc.free(owned_id);
+        try self.stored_fields.append(self.alloc, .{
+            .id = owned_id,
+            .data = data,
+            .is_compressed = false,
+            .owns_data = false,
         });
         self.doc_count += 1;
     }
 
     /// Store a document with Snappy-compressed data already prepared.
     pub fn addStoredDocCompressed(self: *SegmentWriter, doc_id: []const u8, compressed_data: []const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, doc_id);
+        errdefer self.alloc.free(owned_id);
+        const owned_data = try self.alloc.dupe(u8, compressed_data);
+        errdefer self.alloc.free(owned_data);
         try self.stored_fields.append(self.alloc, .{
-            .id = try self.alloc.dupe(u8, doc_id),
-            .data = try self.alloc.dupe(u8, compressed_data),
+            .id = owned_id,
+            .data = owned_data,
             .is_compressed = true,
+            .owns_data = true,
         });
         self.doc_count += 1;
     }
@@ -138,11 +173,14 @@ pub const SegmentWriter = struct {
     pub fn addDocOrdinals(self: *SegmentWriter, ordinals: []const u32) !void {
         if (ordinals.len != self.doc_count) return error.InvalidSegment;
         const data = try encodeDocOrdinalsAlloc(self.alloc, ordinals);
-        defer self.alloc.free(data);
-        if (data.len == 0) return;
+        errdefer self.alloc.free(data);
+        if (data.len == 0) {
+            self.alloc.free(data);
+            return;
+        }
 
         const field_idx = try self.addField(doc_ordinals_field);
-        try self.addSection(field_idx, .doc_ordinals, data);
+        try self.addSectionOwned(field_idx, .doc_ordinals, data);
     }
 
     /// Build the final segment file bytes. Caller owns result.
@@ -211,6 +249,7 @@ pub const SegmentWriter = struct {
 
         // Write version
         try out.append(self.alloc, 2);
+        self.last_stored_compress_ns = 0;
 
         // Write num_docs
         try appendU32LE(self.alloc, out, num_docs);
@@ -237,7 +276,9 @@ pub const SegmentWriter = struct {
                 try appendU32LE(self.alloc, out, @intCast(doc.data.len));
                 try out.appendSlice(self.alloc, doc.data);
             } else {
+                const compress_start = platform_time.monotonicNs();
                 const compressed = try snappy.encodeInto(self.alloc, &self.compression_bytes, doc.data);
+                self.last_stored_compress_ns +|= platform_time.monotonicNs() - compress_start;
                 try appendU32LE(self.alloc, out, @intCast(compressed.len));
                 try out.appendSlice(self.alloc, compressed);
             }
@@ -281,8 +322,9 @@ pub const SegmentWriter = struct {
 
     const StoredDoc = struct {
         id: []u8,
-        data: []u8,
+        data: []const u8,
         is_compressed: bool,
+        owns_data: bool,
     };
 
     const SectionData = struct {

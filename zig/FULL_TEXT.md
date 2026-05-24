@@ -158,3 +158,40 @@ partial phrase is satisfied through `._index_prefix`.
   hammer.
 - Consider a first-class chunked full-text generator path instead of piggybacking
   on dense-generator config for `generated_chunked_full_text`.
+
+## Segment Build Profiling
+
+Deferred full-text catch-up now reports segment-builder internals through the
+existing `antfly_bench_text_index` benchmark log when `ANTFLY_BENCH_METRICS=1`
+is enabled. The log includes analyzer time, term accumulation, term-hit
+materialization, typed-field collection/build, segment encoding, token counts,
+term-hit counts, and emitted segment bytes.
+
+The segment builder writes stored docs, ordinal sidecars, inverted sections, and
+typed doc values directly. It does not retain a full intermediate `Batch`.
+Temporary per-document term maps borrow analyzer token slices until the document
+has been added to each field's inverted builder; the inverted builder then
+re-keys terms into its own arena for segment lifetime ownership.
+
+When the mapper has already parsed and sanitized a document for full-text
+projection, it passes that parsed typed source into the segment builder instead
+of materializing an intermediate typed-field array. Raw schemaless fast-path
+documents explicitly skip typed collection.
+
+Built per-field inverted sections are now transferred into the segment writer
+without a second section-buffer copy. Stored JSON is borrowed by the segment
+writer until `build()` finishes, then compressed into the final segment. The
+segment file format is unchanged; this is an ownership/lifetime optimization in
+the builder.
+
+The same benchmark log now separates section attachment, stored-doc attachment,
+stored-doc compression, and final segment assembly from the broader
+`segment_encode_ms` bucket.
+
+Use this breakdown before changing analyzer or segment layout code. The intended
+optimization order is:
+
+1. remove duplicated typed-field work and stored-JSON reparsing
+2. reduce analyzer token allocation/copying
+3. reduce per-document term-map churn
+4. improve segment encoding pre-sizing and remaining final-output copy behavior

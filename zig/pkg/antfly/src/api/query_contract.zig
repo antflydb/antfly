@@ -134,6 +134,7 @@ pub const QueryResponseMeta = struct {
         hbc_rerank_lsm_cache_misses: u64 = 0,
         hbc_rerank_distance_ns: u64 = 0,
         doc_key_resolve_ns: u64 = 0,
+        doc_ordinal_lookup_ns: u64 = 0,
         load_projected_document_ns: u64 = 0,
         postprocess_ns: u64 = 0,
         raw_hit_count: u32 = 0,

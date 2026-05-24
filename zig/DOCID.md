@@ -221,6 +221,45 @@ Encoding rules should be internal to the storage layer:
 - scan APIs that expose user IDs decode before returning them
 - internal comparisons on user IDs should compare raw IDs, not encoded slices
 
+## Implemented Runtime Identity Notes
+
+The current Zig implementation has a shard-local ordinal identity layer in
+addition to the binary key layout work described above. The long-term invariant
+is:
+
+```text
+ordinal identity is valid only for:
+  namespace(table_id, shard_id, range_id) + identity_read_generation
+```
+
+Internal `ShardDocSet` / resolved-doc-filter envelopes must carry both values.
+Consumers must reject a resolved ordinal set when either the namespace or the
+generation differs from the target DB. This is intentionally fail-closed because
+ordinal values are compact physical IDs, not public document IDs.
+
+Operationally:
+
+- split cutover must give child ranges their own namespace/generation boundary
+  and must invalidate parent-range resolved-filter caches
+- merge cutover must mint a new merged-range namespace/generation boundary and
+  reject cached child-range ordinal sets
+- reassignment must be treated like an ownership identity change, even when the
+  byte range is unchanged
+- rebuilds that regenerate ordinal mappings must bump the identity generation
+  before new ordinal-backed filters are accepted
+- cache keys for resolved filters, ordinal bitmaps, and ordinal-to-vector
+  projections must include namespace and `identity_read_generation`
+- public APIs must keep rejecting internal resolved-doc-filter envelopes
+
+The in-process structured-filter cache now keys shared entries by the full
+`Namespace{table_id, shard_id, range_id}` plus generation, not by a compressed
+tag. This prevents a stale ordinal set from being reused across two ranges that
+would collide under a lossy namespace identifier.
+
+Near the ordinal limit, allocation must fail with `DocOrdinalExhausted` before
+wrapping. Ordinal `0` remains reserved as "missing", so `maxInt(u32)` is not an
+allocatable live ordinal.
+
 ## Canonical Document Identity
 
 The binary key codec fixes how user document IDs are stored. It does not, by
@@ -788,9 +827,9 @@ Status as of 2026-05-19:
 - Structured full-text filter doc-set caching keys entries by both filter JSON
   and identity read generation, preventing a cached ordinal list/bitmap resolved
   at one generation from being reused for the same JSON at another generation.
-  The cache entry shape also carries an optional namespace tag for any future
-  shared/global doc-set cache: request-local entries continue to use the
-  request generation, while shared entries must match both namespace tag and
+  The cache entry shape also carries an optional full identity namespace for any
+  future shared/global doc-set cache: request-local entries continue to use the
+  request generation, while shared entries must match both namespace and
   generation before reusing a bitmap/list. The focused DOCID gate now includes
   request-local and shared-key cache regressions so bitmap cache invalidation
   remains tied to the stamped identity snapshot.
@@ -932,7 +971,12 @@ Status as of 2026-05-19:
   resurrecting a tombstoned document advances the ordinal state's create
   generation, and an upsert/delete pair for the same document in one committed
   batch leaves the ordinal tombstoned instead of accidentally reviving it from
-  stale pre-batch state.
+  stale pre-batch state. DB-owned write paths now cache the committed identity
+  visibility summary after the primary store commit succeeds, so immediate
+  post-load query planning can prove all-live visibility without cold-reading
+  the summary key from the primary LSM. Cold/reopened stores still fall back to
+  the persisted summary and then full identity stats when no in-process summary
+  is available.
 - Portable AFB backup/restore now has a dedicated doc-identity KV batch block.
   Export includes every internal identity-table row, and import restores those
   rows verbatim after validating that the block only targets the identity
