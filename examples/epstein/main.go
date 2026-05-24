@@ -191,6 +191,8 @@ var templatesFS embed.FS
 const (
 	DefaultAntflyURL       = "http://localhost:8080/api/v1"
 	DefaultTermiteURL      = "http://localhost:8080"
+	DefaultFullTextIndex   = "full_text_index_v0"
+	DefaultEmbeddingIndex  = "embeddings"
 	DefaultEmbeddingModel  = "antflydb/clipclap"
 	DefaultEmbeddingPull   = "antflydb/clipclap:gguf:Q4_K"
 	DefaultChunkerModel    = "fixed-bert-tokenizer"
@@ -255,6 +257,27 @@ func envDefault(name, fallback string) string {
 
 func defaultTermiteURL() string {
 	return envDefault("ANTFLY_TERMITE_URL", DefaultTermiteURL)
+}
+
+func termiteMLBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("termite URL is required")
+	}
+	if strings.HasSuffix(trimmed, "/ml/v1") {
+		return trimmed, nil
+	}
+	if strings.HasSuffix(trimmed, "/api") {
+		return "", fmt.Errorf("legacy Termite /api URLs are unsupported; use the Antfly root URL or a /ml/v1 URL")
+	}
+	root := strings.TrimRight(antfly.NormalizeBaseURL(trimmed), "/")
+	if root == "" {
+		return "", fmt.Errorf("termite URL is required")
+	}
+	if strings.HasSuffix(root, "/ml/v1") {
+		return root, nil
+	}
+	return root + "/ml/v1", nil
 }
 
 func splitCSV(value string) []string {
@@ -1404,12 +1427,14 @@ func loadCmd(args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index config: %w", err)
 		}
+		indexes, err := createSearchTableIndexes(*embeddingIndex)
+		if err != nil {
+			return fmt.Errorf("failed to create search index config: %w", err)
+		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
-			Indexes: map[string]antfly.IndexConfig{
-				"embeddings": *embeddingIndex,
-			},
+			Indexes:   indexes,
 		})
 		if err != nil {
 			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
@@ -1503,12 +1528,14 @@ func syncCmd(args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index: %w", err)
 		}
+		indexes, err := createSearchTableIndexes(*embeddingIndex)
+		if err != nil {
+			return fmt.Errorf("failed to create search index config: %w", err)
+		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
-			Indexes: map[string]antfly.IndexConfig{
-				"embeddings": *embeddingIndex,
-			},
+			Indexes:   indexes,
 		})
 		if err != nil {
 			log.Printf("Warning: %v\n", err)
@@ -1755,7 +1782,7 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.client.Query(ctx, antfly.QueryRequest{
 		Table:          s.tableName,
 		SemanticSearch: query,
-		Indexes:        []string{"full_text_index", "embeddings"},
+		Indexes:        searchIndexNames(),
 		Limit:          20,
 	})
 
@@ -1816,7 +1843,7 @@ func (s *SearchServer) handleAPISearch(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.client.Query(ctx, antfly.QueryRequest{
 		Table:          s.tableName,
 		SemanticSearch: query,
-		Indexes:        []string{"full_text_index", "embeddings"},
+		Indexes:        searchIndexNames(),
 		Limit:          20,
 	})
 
@@ -1866,7 +1893,7 @@ func extractEntityChips(value any, limit int) []EntityChip {
 
 func createEmbeddingIndex(embeddingModel, termiteURL, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
 	embeddingIndexConfig := antfly.IndexConfig{
-		Name: "embeddings",
+		Name: DefaultEmbeddingIndex,
 		Type: antfly.IndexTypeEmbeddings,
 	}
 
@@ -1877,9 +1904,14 @@ func createEmbeddingIndex(embeddingModel, termiteURL, chunkerModel string, targe
 		return nil, fmt.Errorf("failed to configure embedder: %w", err)
 	}
 
+	chunkerURL, err := termiteMLBaseURL(termiteURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure chunker URL: %w", err)
+	}
+
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
-		ApiUrl: termiteURL,
+		ApiUrl: chunkerURL,
 		Model:  chunkerModel,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  targetTokens,
@@ -1900,6 +1932,32 @@ func createEmbeddingIndex(embeddingModel, termiteURL, chunkerModel string, targe
 	}
 
 	return &embeddingIndexConfig, nil
+}
+
+func createFullTextIndex() (antfly.IndexConfig, error) {
+	idx := antfly.IndexConfig{
+		Name: DefaultFullTextIndex,
+		Type: antfly.IndexTypeFullText,
+	}
+	if err := idx.FromFullTextIndexConfig(antfly.FullTextIndexConfig{}); err != nil {
+		return antfly.IndexConfig{}, fmt.Errorf("failed to configure full-text index: %w", err)
+	}
+	return idx, nil
+}
+
+func createSearchTableIndexes(embeddingIndex antfly.IndexConfig) (map[string]antfly.IndexConfig, error) {
+	fullTextIndex, err := createFullTextIndex()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]antfly.IndexConfig{
+		DefaultFullTextIndex:  fullTextIndex,
+		DefaultEmbeddingIndex: embeddingIndex,
+	}, nil
+}
+
+func searchIndexNames() []string {
+	return []string{DefaultFullTextIndex, DefaultEmbeddingIndex}
 }
 
 // truncateContent truncates content at a natural boundary (paragraph or sentence)

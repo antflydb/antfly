@@ -141,8 +141,58 @@ func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AsTermiteChunkerConfig failed: %v", err)
 	}
-	if chunker.ApiUrl != DefaultTermiteURL {
-		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, DefaultTermiteURL)
+	wantChunkerURL := DefaultTermiteURL + "/ml/v1"
+	if chunker.ApiUrl != wantChunkerURL {
+		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, wantChunkerURL)
+	}
+}
+
+func TestTermiteMLBaseURLNormalizesRoots(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "root", in: "http://localhost:8080", want: "http://localhost:8080/ml/v1"},
+		{name: "api root", in: "http://localhost:8080/api/v1", want: "http://localhost:8080/ml/v1"},
+		{name: "already ml", in: "http://localhost:8080/ml/v1/", want: "http://localhost:8080/ml/v1"},
+		{name: "cloud root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance/ml/v1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := termiteMLBaseURL(tt.in)
+			if err != nil {
+				t.Fatalf("termiteMLBaseURL failed: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("termiteMLBaseURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTermiteMLBaseURLRejectsLegacyAPI(t *testing.T) {
+	if _, err := termiteMLBaseURL("http://localhost:8082/api"); err == nil {
+		t.Fatalf("termiteMLBaseURL accepted legacy /api URL")
+	}
+}
+
+func TestCreateSearchTableIndexesIncludesQueriedIndexes(t *testing.T) {
+	embeddingIndex, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultTermiteURL, DefaultChunkerModel, 512, 50)
+	if err != nil {
+		t.Fatalf("createEmbeddingIndex failed: %v", err)
+	}
+	indexes, err := createSearchTableIndexes(*embeddingIndex)
+	if err != nil {
+		t.Fatalf("createSearchTableIndexes failed: %v", err)
+	}
+	for _, name := range searchIndexNames() {
+		if _, ok := indexes[name]; !ok {
+			t.Fatalf("search index %q missing from created table indexes: %#v", name, indexes)
+		}
+	}
+	if indexes[DefaultFullTextIndex].Type != antfly.IndexTypeFullText {
+		t.Fatalf("full-text index type = %q, want %q", indexes[DefaultFullTextIndex].Type, antfly.IndexTypeFullText)
 	}
 }
 

@@ -160,7 +160,7 @@ Flags:
   --dry-run         Preview changes without applying
   --num-shards      Number of shards (default: 1)
   --batch-size      Batch size for linear merge (default: 25)
-  --termite-url     Termite URL for chunking (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --termite-url     Termite root URL for chunking; table config stores its /ml/v1 route (default: ANTFLY_TERMITE_URL or http://localhost:8080)
   --embedding-model Embedding model (default: antflydb/clipclap)
   --chunker-model   Chunker model (default: fixed-bert-tokenizer)
   --target-tokens   Target tokens per chunk (default: 512)
@@ -261,7 +261,7 @@ Documents are indexed with:
 ### Search
 
 The web interface performs hybrid search:
-- Queries both `full_text_index` and `embeddings` indexes
+- Queries both `full_text_index_v0` and `embeddings` indexes
 - Results are ranked by combined relevance score
 - Supports natural language queries
 
@@ -311,7 +311,7 @@ curl "http://localhost:8080/api/v1/tables/epstein_docs/query" \
   -H "Content-Type: application/json" \
   -d '{
     "semantic_search": "flight logs to Little St James",
-    "indexes": ["full_text_index", "embeddings"],
+    "indexes": ["full_text_index_v0", "embeddings"],
     "limit": 10
   }'
 ```
@@ -323,7 +323,7 @@ client, _ := antfly.NewAntflyClient("http://localhost:8080/api/v1", http.Default
 
 resp, _ := client.Query(ctx, "epstein_docs", antfly.QueryRequest{
     SemanticSearch: "flight logs",
-    Indexes:        []string{"full_text_index", "embeddings"},
+    Indexes:        []string{"full_text_index_v0", "embeddings"},
     Limit:          10,
 })
 
