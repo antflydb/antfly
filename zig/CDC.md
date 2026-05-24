@@ -94,7 +94,7 @@ What already exists:
     checkpoints
   - is also wired into metadata service/server `runRound()` on the leader path
     with the same throttled cadence
-- shared Postgres query/aggregate substrate exists in `src/foreign`
+- shared Postgres query/aggregate substrate exists in `go/pkg/antfly/src/foreign`
 - the CDC status model is now richer:
   - slot/publication identity is persisted per source
   - snapshot progress is kept in `snapshot_offset`

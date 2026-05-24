@@ -120,7 +120,7 @@ Raft replicates WAL (fast), leader writes sstables to S3.
 Antfly uses `LeaderFactory` for leader-only work throughout the codebase:
 
 ```go
-// src/raft/raft.go - Raft detects leadership changes
+// go/pkg/antfly/src/raft/raft.go - Raft detects leadership changes
 if rd.RaftState == raft.StateLeader {
     rc.isLeader = true
     rc.startLeader()  // ← Calls LeaderFactory goroutine
@@ -131,15 +131,15 @@ if rd.RaftState == raft.StateLeader {
 ```
 
 **Current uses**:
-- Index enrichers (src/store/db.go:327) - Only leader generates embeddings
-- Metadata reconciliation (src/metadata/runner.go:161) - Only leader rebalances shards
+- Index enrichers (go/pkg/antfly/src/store/db.go:327) - Only leader generates embeddings
+- Metadata reconciliation (go/pkg/antfly/src/metadata/runner.go:161) - Only leader rebalances shards
 
 ### Leadership-Aware S3 Storage Wrapper
 
 We extend this pattern to S3 storage with a wrapper:
 
 ```go
-// src/store/s3storage/leader_aware.go
+// go/pkg/antfly/src/store/s3storage/leader_aware.go
 type LeaderAwareS3Storage struct {
     underlying *S3Storage
     isLeader   *atomic.Bool
@@ -165,7 +165,7 @@ func (s *LeaderAwareS3Storage) ReadObject(ctx context.Context, objectName string
 #### 1. DBImpl Initialization
 
 ```go
-// src/store/db.go
+// go/pkg/antfly/src/store/db.go
 type DBImpl struct {
     // ... existing fields ...
     isLeader   atomic.Bool
@@ -209,7 +209,7 @@ func (db *DBImpl) Open() error {
 #### 2. LeaderFactory Updates Flag
 
 ```go
-// src/store/db.go
+// go/pkg/antfly/src/store/db.go
 func (db *DBImpl) LeaderFactory(ctx context.Context, persistFunc PersistFunc) error {
     // Set leadership flag when we become leader
     db.isLeader.Store(true)
@@ -307,7 +307,7 @@ When creating a checkpoint with S3 storage:
 ### How It Works in Shard Splits
 
 ```go
-// src/store/db.go
+// go/pkg/antfly/src/store/db.go
 func (db *DBImpl) Split(currRange common.Range, splitKey []byte,
                         destDir1, destDir2 string) error {
     secondHalfSpan := pebble.CheckpointSpan{
@@ -398,7 +398,7 @@ pebbleOpts.Experimental.CreateOnShared = remote.CreateOnSharedAll
 Our `LeaderAwareS3Storage` wrapper enforces leader-only deletes:
 
 ```go
-// src/store/s3storage/leader_aware.go
+// go/pkg/antfly/src/store/s3storage/leader_aware.go
 func (s *LeaderAwareS3Storage) Delete(objectName string) error {
     if !s.isLeader.Load() {
         // Not the leader - return error to prevent deletion

@@ -1,7 +1,8 @@
-Termite OpenAPI sources for `termite_api` code generation live here.
+Termite OpenAPI generated sources for `termite_api` live here.
 
 Build behavior:
-- by default, `build.zig` uses `src/api/openapi.yaml`
+- by default, `build.zig` uses the checked-in generated module
+- the source spec is `../../../../../specs/openapi/termite/api.yaml`
 - you can override the source explicitly with `-Dtermite-openapi-spec=...`
 
 Intended use:

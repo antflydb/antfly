@@ -21,7 +21,7 @@ import {
   SelectValue,
   Switch,
 } from "@antfly/design-system";
-import { TermiteClient } from "@antfly/termite-sdk";
+import { TermiteClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   AudioLines,
@@ -372,7 +372,7 @@ const TranscribePlaygroundPage: React.FC = () => {
       const result = await termiteClient.transcribe(audioBase64, langOpts);
       if (signal.aborted) return;
 
-      const rawText = (result.text || "").trim();
+      const rawText = (result.data[0]?.text || "").trim();
 
       if (generatorModel && rawText) {
         updateSegment(index, { rawText, status: "cleaning" });

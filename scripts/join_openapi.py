@@ -26,7 +26,7 @@ from openapi_spec_validator import validate_spec
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SHARED_JOINER = ROOT / "zig/scripts/join_openapi.py"
+SHARED_JOINER = ROOT / "scripts/openapi_joiner.py"
 HTTP_METHODS = {
     "delete",
     "get",
@@ -219,21 +219,27 @@ def load_shared_joiner():
     return module
 
 
-def configure_for_go_repo(module) -> None:
+def configure_for_repo_contracts(module) -> None:
     module.ROOT = ROOT
-    module.METADATA_SPEC = ROOT / "src/metadata/api.yaml"
-    module.USERMGR_SPEC = ROOT / "src/usermgr/api.yaml"
+    module.METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
+    module.USERMGR_SPEC = ROOT / "specs/openapi/antfly/usermgr.yaml"
     module.ROOT_SPEC = ROOT / "openapi.yaml"
-    module.GO_SCHEMA_SPEC = ROOT / "lib/schema/openapi.yaml"
-    module.GO_INDEX_SPEC = ROOT / "src/store/db/indexes/openapi.yaml"
+    module.GO_SCHEMA_SPEC = ROOT / "go/pkg/antfly/lib/schema/openapi.yaml"
+    module.GO_INDEX_SPEC = ROOT / "go/pkg/antfly/src/store/db/indexes/openapi.yaml"
     module.GO_INDEX_REF_PATHS = {
         "../store/db/indexes/openapi.yaml",
+        "../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
     }
     module.PATH_REWRITES = {
+        "usermgr.yaml": "specs/openapi/antfly/usermgr.yaml",
+        "query.yaml": "specs/openapi/antfly/query.yaml",
+        "../../../src/": "go/pkg/antfly/src/",
+        "../../../lib/": "go/pkg/antfly/lib/",
+        "../../../": "",
         "../../": "",
-        "../metadata/": "src/metadata/",
-        "../store/": "src/store/",
-        "../usermgr/": "src/usermgr/",
+        "../metadata/": "go/pkg/antfly/src/metadata",
+        "../store/": "go/pkg/antfly/src/store",
+        "../usermgr/": "go/pkg/antfly/src/usermgr",
     }
 
     def target_schema_name(source_path: Path, schema_name: str) -> str:
@@ -253,7 +259,7 @@ def configure_for_go_repo(module) -> None:
 
 def main(argv: list[str]) -> int:
     joiner = load_shared_joiner()
-    configure_for_go_repo(joiner)
+    configure_for_repo_contracts(joiner)
 
     metadata = joiner.load_yaml(joiner.METADATA_SPEC)
     usermgr = joiner.load_yaml(joiner.USERMGR_SPEC)

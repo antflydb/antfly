@@ -1,0 +1,541 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+package metadata
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/clock"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/middleware"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/multirafthttp/transport"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/workerpool"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
+	antflymcp "github.com/antflydb/antfly/go/pkg/antfly/src/mcp"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata/foreign"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata/kv"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata/reconciler"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/raft"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/tablemgr"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/tracing"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/usermgr"
+	"github.com/jellydator/ttlcache/v3"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"go.uber.org/zap"
+)
+
+const (
+	defaultAdminSeedAttemptTimeout = 10 * time.Second
+	defaultAdminSeedRetryInterval  = 2 * time.Second
+)
+
+// Runtime owns the metadata server's long-lived state without opening any
+// listeners. Bootstrap layers can start Raft and serve the returned handler.
+type Runtime struct {
+	logger *zap.Logger
+	config *common.Config
+	info   *store.StoreInfo
+
+	raft          *raft.MultiRaft
+	metadataStore *kv.MetadataStore
+	node          *MetadataStore
+	tableManager  *tablemgr.TableManager
+	userManager   *usermgr.UserManager
+
+	httpClient       *http.Client
+	httpCloser       io.Closer
+	workerPool       *workerpool.Pool
+	embedCache       *ttlcache.Cache[string, []float32]
+	httpHandler      http.Handler
+	termiteMLHandler http.Handler
+
+	closeOnce   sync.Once
+	closeErr    error
+	raftStarted atomic.Bool
+}
+
+type RuntimeOptions struct {
+	ExecutionProvider ExecutionProvider
+	// TermiteMLHandler is an optional in-process Termite handler. When set, it
+	// is mounted at /ml/v1/ and also handles /ml/v1/generate as exposed by
+	// go/pkg/termite.TermiteNode.APIMLHandler.
+	// When nil and config.Termite.ApiUrl is set, the metadata server instead
+	// reverse-proxies /termite/* to that URL.
+	TermiteMLHandler http.Handler
+}
+
+func NewRuntime(
+	zl *zap.Logger,
+	config *common.Config,
+	conf *store.StoreInfo,
+	peers common.Peers,
+	join bool,
+	cache *pebbleutils.Cache,
+	opts RuntimeOptions,
+) (*Runtime, error) {
+	dataDir := config.GetBaseDir()
+	rs, err := raft.NewMultiRaftServer(zl, dataDir, conf.ID, conf.RaftURL)
+	if err != nil {
+		return nil, fmt.Errorf("creating raft server: %w", err)
+	}
+
+	metadataStore, err := kv.NewMetadataStore(zl, config, rs, conf, peers, join, cache)
+	if err != nil {
+		return nil, fmt.Errorf("creating metadata store: %w", err)
+	}
+
+	httpClient, httpCloser, err := newStoreHTTPClient(config)
+	if err != nil {
+		metadataStore.Close()
+		return nil, fmt.Errorf("creating metadata http client: %w", err)
+	}
+	provider := opts.ExecutionProvider
+	if provider == nil {
+		provider = DefaultExecutionProvider()
+	}
+
+	tm, err := tablemgr.NewTableManager(metadataStore, httpClient, config.MaxShardSizeBytes)
+	if err != nil {
+		metadataStore.Close()
+		if httpCloser != nil {
+			_ = httpCloser.Close()
+		}
+		return nil, fmt.Errorf("creating table manager: %w", err)
+	}
+	tm.SetStoreClientFactory(provider.StoreClientFactory())
+
+	um, err := usermgr.NewUserManager(metadataStore)
+	if err != nil {
+		metadataStore.Close()
+		if httpCloser != nil {
+			_ = httpCloser.Close()
+		}
+		return nil, fmt.Errorf("creating user manager: %w", err)
+	}
+
+	embeddingCache := ttlcache.New(
+		ttlcache.WithTTL[string, []float32](5*time.Minute),
+		ttlcache.WithCapacity[string, []float32](10000),
+	)
+	go embeddingCache.Start()
+
+	pool, err := workerpool.NewPool()
+	if err != nil {
+		embeddingCache.Stop()
+		metadataStore.Close()
+		if httpCloser != nil {
+			_ = httpCloser.Close()
+		}
+		return nil, fmt.Errorf("creating worker pool: %w", err)
+	}
+
+	node := &MetadataStore{
+		logger: zl,
+
+		metadataStore: metadataStore,
+		config:        config,
+		tm:            tm,
+		um:            um,
+		pool:          pool,
+
+		embeddingCache: embeddingCache,
+
+		runHealthCheckC:  make(chan struct{}, 1),
+		reconcileShardsC: make(chan struct{}, 1),
+
+		hlc:   NewHLCWithClock(clock.RealClock{}),
+		clock: clock.RealClock{},
+
+		executionProvider: provider,
+
+		traceWriter: tracing.NewAntflyTraceWriter(zl),
+	}
+
+	shardOps := NewMetadataShardOperations(node)
+	tableOps := NewMetadataTableOperations(node)
+	storeOps := NewMetadataStoreOperations(node)
+
+	reconcilerConfig := reconciler.ReconciliationConfig{
+		ReplicationFactor:        config.ReplicationFactor,
+		MaxShardSizeBytes:        config.MaxShardSizeBytes,
+		MinShardSizeBytes:        config.MinShardSizeBytes,
+		MinShardsPerTable:        config.MinShardsPerTable,
+		MaxShardsPerTable:        config.MaxShardsPerTable,
+		DisableShardAlloc:        config.DisableShardAlloc,
+		ShardCooldownPeriod:      config.ShardCooldownPeriod,
+		SplitTimeout:             config.SplitTimeout,
+		SplitFinalizeGracePeriod: config.SplitFinalizeGracePeriod,
+	}
+
+	node.reconciler = reconciler.NewReconciler(
+		shardOps,
+		tableOps,
+		storeOps,
+		reconcilerConfig,
+		zl,
+	)
+
+	replMgr := foreign.NewReplicationManager(zl.Named("cdc"), node, metadataStore, tm)
+	metadataStore.SetLeaderFactory(newMetadataLeaderFactory(zl, node, metadataStore, replMgr))
+
+	runtime := &Runtime{
+		logger:           zl,
+		config:           config,
+		info:             conf,
+		raft:             rs,
+		metadataStore:    metadataStore,
+		node:             node,
+		tableManager:     tm,
+		userManager:      um,
+		httpClient:       httpClient,
+		httpCloser:       httpCloser,
+		workerPool:       pool,
+		embedCache:       embeddingCache,
+		termiteMLHandler: opts.TermiteMLHandler,
+	}
+	runtime.httpHandler = runtime.newHTTPHandler()
+	return runtime, nil
+}
+
+func (r *Runtime) StartRaft() {
+	if !r.raftStarted.CompareAndSwap(false, true) {
+		return
+	}
+	go r.raft.Start()
+}
+
+func (r *Runtime) StartDefaultAdminSeed(ctx context.Context) {
+	if r == nil || r.config == nil || !r.config.EnableAuth || r.userManager == nil {
+		return
+	}
+	go r.seedDefaultAdminLoop(ctx)
+}
+
+func (r *Runtime) seedDefaultAdminLoop(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		err := r.ensureDefaultAdmin(ctx)
+		if err == nil {
+			r.logger.Info("Default admin user is available")
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		r.logger.Warn("Default admin user seed failed; retrying", zap.Error(err))
+
+		timer := time.NewTimer(defaultAdminSeedRetryInterval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
+}
+
+func (r *Runtime) ensureDefaultAdmin(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := r.userManager.GetUser("admin"); err == nil {
+		return nil
+	} else if !errors.Is(err, usermgr.ErrUserNotFound) {
+		return err
+	}
+
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultAdminSeedAttemptTimeout)
+	defer cancel()
+	_, err := r.userManager.CreateUserWithContext(attemptCtx, "admin", "admin", []usermgr.Permission{{
+		Resource: "*", ResourceType: "*", Type: "*",
+	}})
+	if errors.Is(err, usermgr.ErrUserExists) {
+		return nil
+	}
+	return err
+}
+
+func (r *Runtime) HTTPHandler() http.Handler {
+	return r.httpHandler
+}
+
+func (r *Runtime) Node() *MetadataStore {
+	return r.node
+}
+
+func (r *Runtime) Close() error {
+	r.closeOnce.Do(func() {
+		if r.metadataStore != nil {
+			r.metadataStore.Close()
+		}
+		if r.raft != nil && r.raftStarted.Load() {
+			if err := r.raft.Stop(); err != nil {
+				if r.closeErr == nil {
+					r.closeErr = err
+				}
+				r.logger.Error("failed to stop raft server", zap.Error(err))
+			}
+		}
+		if r.embedCache != nil {
+			r.embedCache.Stop()
+		}
+		if r.workerPool != nil {
+			r.workerPool.Close()
+		}
+		if r.httpCloser != nil {
+			if err := r.httpCloser.Close(); err != nil && r.closeErr == nil {
+				r.closeErr = err
+			}
+		}
+	})
+	return r.closeErr
+}
+
+func newStoreHTTPClient(config *common.Config) (*http.Client, io.Closer, error) {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	t := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		DisableKeepAlives:     false,
+		ForceAttemptHTTP2:     true,
+		ResponseHeaderTimeout: 5 * time.Minute,
+		IdleConnTimeout:       5 * time.Minute,
+		DialContext:           dialer.DialContext,
+	}
+
+	var closer io.Closer
+	if config.Tls.Cert != "" && config.Tls.Key != "" {
+		tlsInfo := transport.TLSInfoSimple{
+			CertFile: config.Tls.Cert,
+			KeyFile:  config.Tls.Key,
+		}
+		tr := &http3.Transport{
+			TLSClientConfig: tlsInfo.ClientConfig(),
+			QUICConfig: &quic.Config{
+				HandshakeIdleTimeout: 10 * time.Second,
+				MaxIdleTimeout:       10 * time.Second,
+				KeepAlivePeriod:      5 * time.Second,
+			},
+		}
+		t.RegisterProtocol("https", tr)
+		closer = tr
+	}
+
+	return &http.Client{
+		Timeout:   time.Second * 540,
+		Transport: t,
+	}, closer, nil
+}
+
+func newMetadataLeaderFactory(
+	zl *zap.Logger,
+	ln *MetadataStore,
+	metadataStore *kv.MetadataStore,
+	replMgr *foreign.ReplicationManager,
+) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		if err := metadataStore.RegisterKeyPattern(
+			"tm:t:{tableName}",
+			func(ctx context.Context, key []byte, value []byte, isDelete bool, params map[string]string) error {
+				tableName := params["tableName"]
+				if isDelete {
+					zl.Info("Table deleted, triggering reconciliation",
+						zap.String("tableName", tableName))
+				} else {
+					zl.Info("Table modified (schema/indexes/shards), triggering reconciliation",
+						zap.String("tableName", tableName))
+				}
+
+				select {
+				case ln.reconcileShardsC <- struct{}{}:
+				default:
+				}
+
+				replMgr.NotifyTableChanged()
+				return nil
+			},
+		); err != nil {
+			zl.Error("Failed to register table pattern listener", zap.Error(err))
+		}
+
+		if err := metadataStore.RegisterKeyPattern(
+			"tm:shs:{shardID}",
+			func(ctx context.Context, key []byte, value []byte, isDelete bool, params map[string]string) error {
+				shardID := params["shardID"]
+				if isDelete {
+					zl.Info("Shard status deleted, triggering reconciliation",
+						zap.String("shardID", shardID))
+				} else {
+					zl.Debug("Shard status updated, triggering reconciliation",
+						zap.String("shardID", shardID))
+				}
+
+				select {
+				case ln.reconcileShardsC <- struct{}{}:
+				default:
+				}
+				return nil
+			},
+		); err != nil {
+			zl.Error("Failed to register shard status pattern listener", zap.Error(err))
+		}
+
+		if err := metadataStore.RegisterKeyPattern(
+			"tm:sts:{storeID}",
+			func(ctx context.Context, key []byte, value []byte, isDelete bool, params map[string]string) error {
+				storeID := params["storeID"]
+				if isDelete {
+					zl.Info("Store status deleted, triggering reconciliation",
+						zap.String("storeID", storeID))
+				} else {
+					zl.Debug("Store status updated",
+						zap.String("storeID", storeID))
+				}
+
+				select {
+				case ln.reconcileShardsC <- struct{}{}:
+				default:
+				}
+				return nil
+			},
+		); err != nil {
+			zl.Error("Failed to register store status pattern listener", zap.Error(err))
+		}
+
+		if err := metadataStore.RegisterKeyPattern(
+			"tm:stb:{storeID}",
+			func(ctx context.Context, key []byte, value []byte, isDelete bool, params map[string]string) error {
+				storeID := params["storeID"]
+				if !isDelete {
+					zl.Warn("Store tombstoned, triggering immediate reconciliation",
+						zap.String("storeID", storeID))
+
+					select {
+					case ln.reconcileShardsC <- struct{}{}:
+					default:
+					}
+				}
+				return nil
+			},
+		); err != nil {
+			zl.Error("Failed to register store tombstone pattern listener", zap.Error(err))
+		}
+
+		metadataStore.RegisterKeyPrefixListener(
+			[]byte("tm:rar:"),
+			func(ctx context.Context, key, value []byte, isDelete bool) error {
+				if !isDelete {
+					zl.Info("Manual table reallocation requested, triggering immediate reconciliation",
+						zap.String("key", types.FormatKey(key)))
+					select {
+					case ln.reconcileShardsC <- struct{}{}:
+					default:
+					}
+				}
+				return nil
+			},
+		)
+
+		go ln.reconcileShards(ctx)
+		go func() {
+			if err := replMgr.Run(ctx); err != nil && ctx.Err() == nil {
+				zl.Error("CDC replication manager exited with error", zap.Error(err))
+			}
+		}()
+
+		return nil
+	}
+}
+
+func (r *Runtime) newHTTPHandler() http.Handler {
+	internalMux := http.NewServeMux()
+	internalMux.HandleFunc("POST /nodes", r.node.handleNodeRegistration)
+	internalMux.HandleFunc("GET /nodes/{node}", r.node.handleNodeRecord)
+	internalMux.HandleFunc("POST /nodes/{node}/status", r.node.handleNodeStatus)
+	internalMux.HandleFunc("PUT /nodes/{node}/shutdown", r.node.handleNodeShutdownRequest)
+	internalMux.HandleFunc("GET /nodes/{node}/shutdown", r.node.handleNodeShutdownStatus)
+	internalMux.HandleFunc("DELETE /nodes/{node}/shutdown", r.node.handleNodeShutdownCancellation)
+	internalMux.HandleFunc("DELETE /nodes/{node}", r.node.handleNodeShutdownFinalization)
+	internalMux.HandleFunc("POST /shard/{shardID}/txn/resolve", r.node.handleForwardResolveIntent)
+
+	api := kv.NewMetadataStoreAPI(r.logger, r.metadataStore)
+	api.AddRoutes(internalMux)
+	internalMux.HandleFunc("POST /reallocate", r.node.handleReallocateShards)
+
+	metadataMux := http.NewServeMux()
+	api.AddMetadataRoutes(metadataMux)
+
+	publicMux := r.node.publicApiRoutes()
+	apiRoutes := http.NewServeMux()
+	apiRoutes.Handle("/metadata/v1/", http.StripPrefix("/metadata/v1", metadataMux))
+	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
+	// Compatibility aliases for clients using the pre-consolidation path scheme.
+	apiRoutes.Handle("/api/v1/", http.StripPrefix("/api/v1", publicMux))
+	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
+	addAntfarmRoutes(apiRoutes)
+
+	if r.termiteMLHandler != nil {
+		// Mount in-process termite handler at /ml/v1/. The handler's own
+		// mux is already registered with /ml/v1/* routes, so we pass the
+		// full path through without stripping.
+		apiRoutes.Handle("/ml/v1/", r.termiteMLHandler)
+		// Also expose the embedded Termite surface under /termite/* so the
+		// Antfly dashboard and existing clients can treat Termite as a stable
+		// sub-service regardless of whether it runs in-process or standalone.
+		apiRoutes.Handle("/termite/", http.StripPrefix("/termite", r.termiteMLHandler))
+		r.logger.Info("In-process Termite ML handler mounted", zap.String("path", "/ml/v1/"))
+	} else if r.config.Termite.ApiUrl != "" {
+		addTermiteProxy(apiRoutes, r.config.Termite.ApiUrl)
+	}
+
+	mcpAdapter := newMCPAdapter(NewTableApi(r.logger, r.node, r.tableManager))
+	mcpServer := antflymcp.NewMCPServer(mcpAdapter)
+	mcpHandler := antflymcp.NewMCPHandler(mcpServer)
+	// Ensure MCP routes receive the same authentication gate as other public APIs.
+	mcpHandler = r.node.authnMiddleware(mcpHandler)
+	apiRoutes.Handle("/mcp/v1/", http.StripPrefix("/mcp/v1", mcpHandler))
+	r.logger.Info("MCP server mounted", zap.String("path", "/mcp/v1/"))
+
+	a2aRoutes := mountA2ARoutes(r.logger, r.node, r.tableManager, r.info.ApiURL)
+	apiRoutes.Handle("/a2a", a2aRoutes.jsonrpcHandler)
+	apiRoutes.Handle("/.well-known/agent.json", a2aRoutes.cardHandler)
+	r.logger.Info("A2A facade mounted", zap.String("path", "/a2a"))
+
+	return middleware.CORSMiddlewareWithConfig(
+		newNotFoundHandler(apiRoutes, r.logger),
+		&r.config.Cors,
+	)
+}

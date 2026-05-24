@@ -46,7 +46,7 @@ Each type has its own schema with specific metadata fields. See `schemas.yaml` f
 1. **Antfly running locally**:
    ```bash
    cd /path/to/antfly
-   go run ./cmd/antfly swarm
+   go run ./go/pkg/antfly/cmd swarm
    ```
 
 2. **Build docsaf** (from antfly root):
@@ -248,7 +248,7 @@ Only the **modified sections** are updated!
 This will process:
 - All markdown files (README.md, work-log/*.md, etc.)
 - MDX documentation
-- OpenAPI specs in `src/metadata/api.yaml` and `src/usermgr/api.yaml`
+- OpenAPI specs in `go/pkg/antfly/src/metadata/api.yaml` and `go/pkg/antfly/src/usermgr/api.yaml`
 
 ### 6. Sync www/ Website Documentation (with Wildcards)
 
@@ -613,7 +613,7 @@ This ensures:
 **Connection refused**:
 ```bash
 # Make sure Antfly is running
-go run ./cmd/antfly swarm
+go run ./go/pkg/antfly/cmd swarm
 ```
 
 **No documents found**:
@@ -646,7 +646,7 @@ go run ./cmd/antfly swarm
 ## API Reference
 
 See the full Linear Merge API documentation:
-- OpenAPI spec: `src/metadata/api.yaml` (search for `LinearMerge`)
+- OpenAPI spec: `go/pkg/antfly/src/metadata/api.yaml` (search for `LinearMerge`)
 - [goldmark documentation](https://github.com/yuin/goldmark)
 - [libopenapi documentation](https://github.com/pb33f/libopenapi)
 - [OpenAPI Specification](https://spec.openapis.org/oas/v3.1.0)

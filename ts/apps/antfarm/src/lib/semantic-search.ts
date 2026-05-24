@@ -3,7 +3,7 @@
  * Uses pre-computed embeddings and Termite's /api/embed for query embedding.
  */
 
-import type { TermiteClient } from "@antfly/termite-sdk";
+import type { TermiteClient } from "@antfly/sdk";
 import commandIndex from "@/data/command-index.json";
 
 export interface CommandItem {
@@ -86,10 +86,10 @@ export async function semanticSearch(
     // Get query embedding from Termite
     // Use the same model as the pre-computed embeddings
     const response = await termiteClient.embed(index.model, query);
-    if (!response.embeddings?.[0]) {
+    const queryVec = response.data[0]?.embedding;
+    if (!Array.isArray(queryVec)) {
       return [];
     }
-    const queryVec = response.embeddings[0];
 
     // Score all commands using cosine similarity
     const scored = index.commands.map((cmd) => ({

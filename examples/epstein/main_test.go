@@ -196,10 +196,10 @@ func TestIterateZipPDFs(t *testing.T) {
 	jpgData := []byte("\xff\xd8\xff fake jpeg")
 
 	zipPath := createTestZip(t, map[string][]byte{
-		"docs/report.pdf":    pdfData,
-		"docs/summary.PDF":   pdfData, // uppercase extension
-		"docs/readme.txt":    txtData,
-		"images/photo.jpg":   jpgData,
+		"docs/report.pdf":     pdfData,
+		"docs/summary.PDF":    pdfData, // uppercase extension
+		"docs/readme.txt":     txtData,
+		"images/photo.jpg":    jpgData,
 		"nested/a/b/deep.pdf": pdfData,
 	})
 
@@ -248,8 +248,8 @@ func TestIterateZipPDFs(t *testing.T) {
 
 func TestIterateZipPDFs_Empty(t *testing.T) {
 	zipPath := createTestZip(t, map[string][]byte{
-		"readme.txt":  []byte("hello"),
-		"data.csv":    []byte("a,b,c"),
+		"readme.txt": []byte("hello"),
+		"data.csv":   []byte("a,b,c"),
 	})
 
 	called := false
@@ -319,8 +319,8 @@ func TestIdentifyEnrichCandidates(t *testing.T) {
 		minContent   int
 		reprocess    bool
 		wantIDs      []string            // expected candidate IDs (order-independent)
-		wantReason   map[string][]string  // id → expected reasons
-		wantCategory map[string]string    // id → expected category
+		wantReason   map[string][]string // id → expected reasons
+		wantCategory map[string]string   // id → expected category
 	}{
 		{
 			name: "short content triggers short_content with ocr category",
@@ -417,7 +417,7 @@ func TestIdentifyEnrichCandidates(t *testing.T) {
 			name: "no page source skipped",
 			records: map[string]map[string]any{
 				"page-1": {
-					"content": "short",
+					"content":  "short",
 					"metadata": map[string]any{},
 				},
 			},

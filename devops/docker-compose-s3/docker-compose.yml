@@ -43,7 +43,7 @@ services:
   antfly:
     build:
       context: ../..
-      dockerfile: Dockerfile
+      dockerfile: go/Dockerfile
     command: ["swarm", "--config", "/config.yaml"]
     ports:
       - "8080:8080"  # Public API port

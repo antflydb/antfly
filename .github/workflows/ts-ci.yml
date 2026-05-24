@@ -5,13 +5,11 @@ on:
     branches: [main]
     paths:
       - "ts/**"
-      - "ts/pnpm-workspace.yaml"
       - ".github/workflows/ts-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "ts/**"
-      - "ts/pnpm-workspace.yaml"
       - ".github/workflows/ts-ci.yml"
 
 concurrency:
@@ -49,6 +47,15 @@ jobs:
 
       - name: Lint and type check
         run: pnpm lint
+
+      - name: Verify generated SDKs
+        run: |
+          pnpm --filter @antfly/sdk generate
+          status="$(git status --porcelain -- packages/sdk/src/public-api.d.ts packages/sdk/src/query.d.ts)"
+          if [ -n "$status" ]; then
+            echo "$status"
+            exit 1
+          fi
 
       - name: Build
         run: pnpm build

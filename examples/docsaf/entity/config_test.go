@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	docsafentity "github.com/antflydb/antfly/pkg/docsaf/entity"
+	docsafentity "github.com/antflydb/antfly/go/pkg/docsaf/entity"
 )
 
 func TestConfigValidateRejectsPromptTextVariable(t *testing.T) {

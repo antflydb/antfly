@@ -154,7 +154,7 @@ Implemented now:
 - `lib-raft-sim-test` is narrowed to quick deterministic Raft smoke/invariant
   scenarios; longer restart, real-HTTP, and multi-transition Raft campaigns are
   reachable through `lib-raft-chaos-test` and `chaos-test`.
-- `lib/raft` runtime scheduling now exposes explicit virtual time:
+- `go/pkg/antfly/lib/raft` runtime scheduling now exposes explicit virtual time:
   `Scheduler.advanceVirtualTime`, `MultiRaft.virtualRound`, and
   `MultiRaft.virtualTimeMs`. `runRound` advances this mocked time and passes it
   to transports that implement `advance_time_ms`.

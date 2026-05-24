@@ -15,7 +15,7 @@ pkg/
   termite/           Termite inference runtime, OpenAPI server, tools, web UI
   termite-client/    Zig Termite client package
 
-lib/
+go/pkg/antfly/lib/
   audio/             Shared audio decode and PCM boundary
   image/             Shared image decode/encode/preprocess boundary
   raft/              Reusable raft library
@@ -44,8 +44,8 @@ testdata/            Shared checked-in fixture data
 
 Root-level Markdown files are design and operating notes for active AntflyDB
 areas. Library-specific design docs live next to their libraries, for example
-`lib/image/IMAGE.md` and `lib/audio/AUDIO.md`. Termite-specific design docs
-currently live under `pkg/termite/` and `pkg/termite/docs/`.
+`go/pkg/antfly/lib/image/IMAGE.md` and `go/pkg/antfly/lib/audio/AUDIO.md`. Termite-specific design docs
+currently live under `go/pkg/termite/` and `go/pkg/termite/docs/`.
 
 ## Build Requirements
 
@@ -79,7 +79,7 @@ zig build termite-bench-audio
 For package-local Termite work:
 
 ```sh
-cd pkg/termite
+cd go/pkg/termite
 zig build -Dshared-lib-root=../..
 zig build test -Dshared-lib-root=../..
 ```
@@ -118,7 +118,7 @@ binary first when running those tests directly:
 
 ```sh
 zig build install-antfly
-(cd pkg/termite && zig build -Dshared-lib-root=../..)
+(cd go/pkg/termite && zig build -Dshared-lib-root=../..)
 ```
 
 Model-backed Termite tests may require local model fixtures or environment
@@ -160,13 +160,13 @@ zig-out/
 .zig-global-cache/
 .pytest_cache/
 e2e/*/.venv/
-pkg/termite/.debug/
+go/pkg/termite/.debug/
 ```
 
 ## Development Notes
 
-- Prefer adding shared, reusable code under `lib/` and product-specific code
-  under `pkg/antfly` or `pkg/termite`.
+- Prefer adding shared, reusable code under `go/pkg/antfly/lib/` and product-specific code
+  under `pkg/antfly` or `go/pkg/termite`.
 - Keep package and library README files local when they explain how to use that
   component directly.
 - Keep long-lived design docs near the subsystem they describe. Move stale

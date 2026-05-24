@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

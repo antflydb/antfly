@@ -21,7 +21,7 @@ pub fn configureModule(
     lmdb_engine_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     public_openapi_mod: *std.Build.Module,
-    bleve_query_openapi_mod: *std.Build.Module,
+    query_openapi_mod: *std.Build.Module,
     indexes_openapi_mod: *std.Build.Module,
     metadata_openapi_mod: *std.Build.Module,
     reranking_mod: *std.Build.Module,
@@ -43,7 +43,7 @@ pub fn configureModule(
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly-json", json_mod);
     mod.addImport("antfly_public_openapi", public_openapi_mod);
-    mod.addImport("antfly_bleve_query_openapi", bleve_query_openapi_mod);
+    mod.addImport("antfly_query_openapi", query_openapi_mod);
     mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
     mod.addImport("antfly_reranking", reranking_mod);

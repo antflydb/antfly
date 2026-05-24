@@ -28,11 +28,11 @@ import (
 	"time"
 
 	"github.com/ajroetker/pdf"
-	antfly "github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/docsaf"
-	generatingreading "github.com/antflydb/antfly/pkg/generating/reading"
-	libai "github.com/antflydb/antfly/pkg/libaf/ai"
-	libreading "github.com/antflydb/antfly/pkg/libaf/reading"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	generatingreading "github.com/antflydb/antfly/go/pkg/generating/reading"
+	libai "github.com/antflydb/antfly/go/pkg/libaf/ai"
+	libreading "github.com/antflydb/antfly/go/pkg/libaf/reading"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -3004,7 +3004,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Florence 2\n")
 		fmt.Fprintf(os.Stderr, "\nQuick Start:\n")
 		fmt.Fprintf(os.Stderr, "  # 1. Start Antfly\n")
-		fmt.Fprintf(os.Stderr, "  go run ./cmd/antfly swarm\n\n")
+		fmt.Fprintf(os.Stderr, "  go run ./go/pkg/antfly/cmd swarm\n\n")
 		fmt.Fprintf(os.Stderr, "  # 2. Download documents (choose dataset)\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset court-2024    # ~23MB, 943 pages\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset doj-complete  # ~4.8GB, 8 datasets (Dec 2025)\n")

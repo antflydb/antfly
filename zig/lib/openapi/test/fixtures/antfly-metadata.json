@@ -34,7 +34,7 @@
     {
       "name": "getting_started",
       "x-displayName": "Getting Started",
-      "description": "Quick introduction to using the Antfly API.\n\n## Client Libraries\n\nAntfly provides auto-generated SDKs from the OpenAPI specification:\n\n- **Go**: `github.com/antflydb/antfly/pkg/client`\n- **TypeScript**: `@antflydb/antfly-ts` (npm)\n- **Python**: `antfly-python` (PyPI)\n\nAll SDKs are type-safe and kept in sync with the API through code generation.\n\nFor architectural overview, feature comparisons, and use case guidance, see the [main documentation](https://antfly.io/docs)\n",
+      "description": "Quick introduction to using the Antfly API.\n\n## Client Libraries\n\nAntfly provides auto-generated SDKs from the OpenAPI specification:\n\n- **Go**: `github.com/antflydb/antfly/go/pkg/sdk`\n- **TypeScript**: `@antflydb/antfly-ts` (npm)\n- **Python**: `antfly-python` (PyPI)\n\nAll SDKs are type-safe and kept in sync with the API through code generation.\n\nFor architectural overview, feature comparisons, and use case guidance, see the [main documentation](https://antfly.io/docs)\n",
       "x-docsaf-questions": [
         "Which SDK should I use for my project?",
         "How do I authenticate with the API?",
@@ -3865,7 +3865,7 @@
                 "additionalProperties": true
               }
             ],
-            "description": "Bleve query for full-text search. Supports all Bleve query types.\n\nSee bleve-query-openapi.yaml for complete type definitions.\n\nExamples:\n- Simple: `{\"query\": \"computer\"}`\n- Field-specific: `{\"query\": \"body:computer\"}`\n- Boolean: `{\"query\": \"+artificial +intelligence\"}`\n- Range: `{\"query\": \"year:>2020\"}`\n- Phrase: `{\"query\": \"\\\"exact phrase\\\"\"}`\n",
+            "description": "Bleve query for full-text search. Supports all Bleve query types.\n\nSee specs/openapi/antfly/query.yaml for complete type definitions.\n\nExamples:\n- Simple: `{\"query\": \"computer\"}`\n- Field-specific: `{\"query\": \"body:computer\"}`\n- Boolean: `{\"query\": \"+artificial +intelligence\"}`\n- Range: `{\"query\": \"year:>2020\"}`\n- Phrase: `{\"query\": \"\\\"exact phrase\\\"\"}`\n",
             "example": {
               "query": "+body:computer +category:technology",
               "boost": 1
@@ -3909,7 +3909,7 @@
                 }
               }
             ],
-            "description": "Bleve query applied as an AND condition. Documents must match both the main query\nand this filter. Applied before scoring for better performance.\n\nSee bleve-query-openapi.yaml for complete type definitions.\n\nUse for:\n- Status filtering: `\"status:published\"`\n- Date ranges: `\"created_at:>2023-01-01\"`\n- Category filtering: `\"+category:technology +language:en\"`\n",
+            "description": "Bleve query applied as an AND condition. Documents must match both the main query\nand this filter. Applied before scoring for better performance.\n\nSee specs/openapi/antfly/query.yaml for complete type definitions.\n\nUse for:\n- Status filtering: `\"status:published\"`\n- Date ranges: `\"created_at:>2023-01-01\"`\n- Category filtering: `\"+category:technology +language:en\"`\n",
             "example": {
               "query": "+category:technology +year:>2020",
               "boost": 1
@@ -3927,7 +3927,7 @@
                 }
               }
             ],
-            "description": "Bleve query applied as a NOT condition. Documents matching this query are excluded\nfrom results. Applied before scoring.\n\nSee bleve-query-openapi.yaml for complete type definitions.\n\nUse for:\n- Excluding drafts: `\"status:draft\"`\n- Removing deprecated content: `\"deprecated:true\"`\n- Filtering out archived items: `\"status:archived\"`\n",
+            "description": "Bleve query applied as a NOT condition. Documents matching this query are excluded\nfrom results. Applied before scoring.\n\nSee specs/openapi/antfly/query.yaml for complete type definitions.\n\nUse for:\n- Excluding drafts: `\"status:draft\"`\n- Removing deprecated content: `\"deprecated:true\"`\n- Filtering out archived items: `\"status:archived\"`\n",
             "example": {
               "query": "category:deprecated OR status:archived",
               "boost": 1
@@ -6231,7 +6231,7 @@
             "x-go-type-skip-optional-pointer": true,
             "type": "object",
             "additionalProperties": true,
-            "description": "Bleve query to filter nodes (same syntax as search filter_query)"
+            "description": "Antfly query to filter nodes (same syntax as search filter_query)"
           },
           "filter_prefix": {
             "x-go-type-skip-optional-pointer": true,

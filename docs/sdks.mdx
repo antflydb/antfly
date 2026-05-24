@@ -9,17 +9,17 @@ Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust.
 
 | Language | Package | Registry | Source |
 |----------|---------|----------|--------|
-| Go | `github.com/antflydb/antfly/pkg/client` | [pkg.go.dev](https://pkg.go.dev/github.com/antflydb/antfly/pkg/client) | [GitHub](https://github.com/antflydb/antfly/tree/main/pkg/client) |
-| TypeScript | `@antfly/sdk` | [npm](https://www.npmjs.com/package/@antfly/sdk) | [GitHub](https://github.com/antflydb/antfly/tree/main/ts) |
-| Python | `antfly-sdk` | [PyPI](https://pypi.org/project/antfly-sdk/) | [GitHub](https://github.com/antflydb/antfly/tree/main/py) |
-| Rust | `antfly-client` | [crates.io](https://crates.io/crates/antfly-client) | [GitHub](https://github.com/antflydb/antfly/tree/main/rs/antfly-client) |
+| Go | `github.com/antflydb/antfly/go/pkg/sdk` | [pkg.go.dev](https://pkg.go.dev/github.com/antflydb/antfly/go/pkg/sdk) | [GitHub](https://github.com/antflydb/antfly/tree/main/go/pkg/sdk) |
+| TypeScript | `@antfly/sdk` | [npm](https://www.npmjs.com/package/@antfly/sdk) | [GitHub](https://github.com/antflydb/antfly/tree/main/ts/packages/sdk) |
+| Python | `antfly-sdk` | [PyPI](https://pypi.org/project/antfly-sdk/) | [GitHub](https://github.com/antflydb/antfly/tree/main/py/packages/sdk) |
+| Rust | `antfly-sdk` | [crates.io](https://crates.io/crates/antfly-sdk) | [GitHub](https://github.com/antflydb/antfly/tree/main/rs/crates/sdk) |
 
 ## Installation
 
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `go get github.com/antflydb/antfly/pkg/client`
+    code: `go get github.com/antflydb/antfly/go/pkg/sdk`
   },
   {
     language: "TypeScript",
@@ -31,20 +31,20 @@ Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust.
   },
   {
     language: "Rust",
-    code: `# Cargo.toml\n[dependencies]\nantfly-client = "0.1"`
+    code: `# Cargo.toml\n[dependencies]\nantfly-sdk = "0.1"`
   }
 ]} />
 
 ## Authentication
 
-All three authentication methods are supported across SDKs: basic auth, API key, and bearer token.
+All three authentication methods are supported across SDKs: basic auth, API key, and token.
 
 ### Basic Auth
 
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `antfly "github.com/antflydb/antfly/pkg/client"\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)`
+    code: `antfly "github.com/antflydb/antfly/go/pkg/sdk"\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)`
   },
   {
     language: "TypeScript",
@@ -56,7 +56,7 @@ All three authentication methods are supported across SDKs: basic auth, API key,
   },
   {
     language: "Rust",
-    code: `use antfly_client::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert(\n                reqwest::header::AUTHORIZATION,\n                reqwest::header::HeaderValue::from_str(\n                    &format!("Basic {}", base64::encode("admin:password"))\n                ).unwrap(),\n            );\n            h\n        })\n        .build()\n        .unwrap(),\n);`
+    code: `use antfly_sdk::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert(\n                reqwest::header::AUTHORIZATION,\n                reqwest::header::HeaderValue::from_str(\n                    &format!("Basic {}", base64::encode("admin:password"))\n                ).unwrap(),\n            );\n            h\n        })\n        .build()\n        .unwrap(),\n);`
   }
 ]} />
 
@@ -77,28 +77,28 @@ All three authentication methods are supported across SDKs: basic auth, API key,
   },
   {
     language: "Rust",
-    code: `use antfly_client::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert("X-Api-Key-Id", "key-id".parse().unwrap());\n            h.insert("X-Api-Key-Secret", "key-secret".parse().unwrap());\n            h\n        })\n        .build()\n        .unwrap(),\n);`
+    code: `use antfly_sdk::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert("X-Api-Key-Id", "key-id".parse().unwrap());\n            h.insert("X-Api-Key-Secret", "key-secret".parse().unwrap());\n            h\n        })\n        .build()\n        .unwrap(),\n);`
   }
 ]} />
 
-### Bearer Token
+### Token
 
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `client, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBearerToken("your-token"),\n)`
+    code: `client, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithToken("your-token"),\n)`
   },
   {
     language: "TypeScript",
-    code: `const client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: {\n    type: 'bearer',\n    token: 'your-token',\n  },\n});`
+    code: `const client = new AntflyClient({\n  baseUrl: 'http://localhost:8080',\n  auth: {\n    type: 'token',\n    token: 'your-token',\n  },\n});`
   },
   {
     language: "Python",
-    code: `client = AntflyClient(\n    base_url='http://localhost:8080',\n    bearer_token='your-token',\n)`
+    code: `client = AntflyClient(\n    base_url='http://localhost:8080',\n    token='your-token',\n)`
   },
   {
     language: "Rust",
-    code: `use antfly_client::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert(\n                reqwest::header::AUTHORIZATION,\n                "Bearer your-token".parse().unwrap(),\n            );\n            h\n        })\n        .build()\n        .unwrap(),\n);`
+    code: `use antfly_sdk::Client;\n\nlet client = Client::new_with_client(\n    "http://localhost:8080",\n    reqwest::Client::builder()\n        .default_headers({\n            let mut h = reqwest::header::HeaderMap::new();\n            h.insert(\n                reqwest::header::AUTHORIZATION,\n                "Bearer your-token".parse().unwrap(),\n            );\n            h\n        })\n        .build()\n        .unwrap(),\n);`
   }
 ]} />
 
@@ -109,7 +109,7 @@ All three authentication methods are supported across SDKs: basic auth, API key,
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `import (\n\t"context"\n\tantfly "github.com/antflydb/antfly/pkg/client"\n)\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)\nif err != nil {\n\tlog.Fatal(err)\n}\n\n// Batch insert documents\nresp, err := client.BatchTableWithResponse(\n\tcontext.Background(),\n\t"products",\n\tantfly.BatchTableJSONRequestBody{\n\t\tInserts: &map[string]interface{}{\n\t\t\t"prod:001": map[string]interface{}{\n\t\t\t\t"name":  "Laptop",\n\t\t\t\t"price": 1299.99,\n\t\t\t},\n\t\t\t"prod:002": map[string]interface{}{\n\t\t\t\t"name":  "Mouse",\n\t\t\t\t"price": 29.99,\n\t\t\t},\n\t\t},\n\t},\n)`
+    code: `import (\n\t"context"\n\tantfly "github.com/antflydb/antfly/go/pkg/sdk"\n)\n\nclient, err := antfly.NewAntflyClientWithOptions(\n\t"http://localhost:8080",\n\tantfly.WithBasicAuth("admin", "password"),\n)\nif err != nil {\n\tlog.Fatal(err)\n}\n\n// Batch insert documents\nresp, err := client.BatchTableWithResponse(\n\tcontext.Background(),\n\t"products",\n\tantfly.BatchTableJSONRequestBody{\n\t\tInserts: &map[string]interface{}{\n\t\t\t"prod:001": map[string]interface{}{\n\t\t\t\t"name":  "Laptop",\n\t\t\t\t"price": 1299.99,\n\t\t\t},\n\t\t\t"prod:002": map[string]interface{}{\n\t\t\t\t"name":  "Mouse",\n\t\t\t\t"price": 29.99,\n\t\t\t},\n\t\t},\n\t},\n)`
   },
   {
     language: "TypeScript",
@@ -121,7 +121,7 @@ All three authentication methods are supported across SDKs: basic auth, API key,
   },
   {
     language: "Rust",
-    code: `use antfly_client::Client;\nuse antfly_client::types::BatchTableBody;\nuse serde_json::json;\nuse std::collections::HashMap;\n\nlet client = Client::new("http://localhost:8080");\n\n// Batch insert documents\nlet mut inserts = HashMap::new();\ninserts.insert(\n    "prod:001".to_string(),\n    json!({"name": "Laptop", "price": 1299.99}),\n);\ninserts.insert(\n    "prod:002".to_string(),\n    json!({"name": "Mouse", "price": 29.99}),\n);\n\nclient\n    .batch_table(\n        "products",\n        &BatchTableBody {\n            inserts: Some(inserts),\n            ..Default::default()\n        },\n    )\n    .await?;`
+    code: `use antfly_sdk::Client;\nuse antfly_sdk::types::BatchTableBody;\nuse serde_json::json;\nuse std::collections::HashMap;\n\nlet client = Client::new("http://localhost:8080");\n\n// Batch insert documents\nlet mut inserts = HashMap::new();\ninserts.insert(\n    "prod:001".to_string(),\n    json!({"name": "Laptop", "price": 1299.99}),\n);\ninserts.insert(\n    "prod:002".to_string(),\n    json!({"name": "Mouse", "price": 29.99}),\n);\n\nclient\n    .batch_table(\n        "products",\n        &BatchTableBody {\n            inserts: Some(inserts),\n            ..Default::default()\n        },\n    )\n    .await?;`
   }
 ]} />
 
@@ -142,7 +142,7 @@ All three authentication methods are supported across SDKs: basic auth, API key,
   },
   {
     language: "Rust",
-    code: `use antfly_client::Client;\nuse antfly_client::types::{GlobalQueryBody, FullTextSearch};\n\nlet client = Client::new("http://localhost:8080");\n\nlet resp = client\n    .global_query(&GlobalQueryBody {\n        table: Some("products".to_string()),\n        full_text_search: Some(FullTextSearch {\n            query: Some("laptop".to_string()),\n            ..Default::default()\n        }),\n        limit: Some(10),\n        ..Default::default()\n    })\n    .await?;\n\nlet results = resp.into_inner();\nfor response in &results.responses {\n    if let Some(hits) = &response.hits {\n        for hit in &hits.hits {\n            println!("{}: {:?}", hit.id, hit.source);\n        }\n    }\n}`
+    code: `use antfly_sdk::Client;\nuse antfly_sdk::types::{GlobalQueryBody, FullTextSearch};\n\nlet client = Client::new("http://localhost:8080");\n\nlet resp = client\n    .global_query(&GlobalQueryBody {\n        table: Some("products".to_string()),\n        full_text_search: Some(FullTextSearch {\n            query: Some("laptop".to_string()),\n            ..Default::default()\n        }),\n        limit: Some(10),\n        ..Default::default()\n    })\n    .await?;\n\nlet results = resp.into_inner();\nfor response in &results.responses {\n    if let Some(hits) = &response.hits {\n        for hit in &hits.hits {\n            println!("{}: {:?}", hit.id, hit.source);\n        }\n    }\n}`
   }
 ]} />
 
