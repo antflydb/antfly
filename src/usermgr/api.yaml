@@ -160,7 +160,7 @@ components:
           nullable: true
           description: >
             Per-table row filter. Keys are table names (or '*' for all tables).
-            Values are bleve query JSON objects. Documents must match this query
+            Values are Antfly query JSON objects. Documents must match this query
             to be visible through this API key.
         created_at:
           type: string
@@ -206,7 +206,7 @@ components:
         filter:
           type: object
           additionalProperties: {}
-          description: "Bleve query JSON that documents must match to be visible."
+          description: "Antfly query JSON that documents must match to be visible."
           example:
             term:
               department: "engineering"
@@ -238,7 +238,7 @@ components:
           nullable: true
           description: >
             Per-table row filter. Keys are table names (or '*' for all tables).
-            Values are bleve query JSON objects. Documents must match this query
+            Values are Antfly query JSON objects. Documents must match this query
             to be visible through this API key.
       required:
         - name
@@ -664,10 +664,10 @@ paths:
       tags:
         - RowFilter
       summary: Set row filter for a user on a table
-      description: Sets or replaces the row filter policy for the specified user and table. The request body is the bleve query JSON.
+      description: Sets or replaces the row filter policy for the specified user and table. The request body is the Antfly query JSON.
       operationId: setRowFilter
       requestBody:
-        description: Bleve query JSON for filtering documents
+        description: Antfly query JSON for filtering documents
         required: true
         content:
           application/json:

@@ -67,7 +67,7 @@ def sync_detailed(
 ) -> Response[Error]:
     """Build a search query from natural language
 
-     Uses an LLM to translate natural language search intent into a structured Bleve query.
+     Uses an LLM to translate natural language search intent into a structured Antfly query.
     The generated query can be used directly in the QueryRequest.full_text_search or filter_query
     fields.
 
@@ -105,7 +105,7 @@ def sync(
 ) -> Error | None:
     """Build a search query from natural language
 
-     Uses an LLM to translate natural language search intent into a structured Bleve query.
+     Uses an LLM to translate natural language search intent into a structured Antfly query.
     The generated query can be used directly in the QueryRequest.full_text_search or filter_query
     fields.
 
@@ -138,7 +138,7 @@ async def asyncio_detailed(
 ) -> Response[Error]:
     """Build a search query from natural language
 
-     Uses an LLM to translate natural language search intent into a structured Bleve query.
+     Uses an LLM to translate natural language search intent into a structured Antfly query.
     The generated query can be used directly in the QueryRequest.full_text_search or filter_query
     fields.
 
@@ -174,7 +174,7 @@ async def asyncio(
 ) -> Error | None:
     """Build a search query from natural language
 
-     Uses an LLM to translate natural language search intent into a structured Bleve query.
+     Uses an LLM to translate natural language search intent into a structured Antfly query.
     The generated query can be used directly in the QueryRequest.full_text_search or filter_query
     fields.
 

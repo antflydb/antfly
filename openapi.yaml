@@ -836,7 +836,7 @@ tags:
 
       ### Full-Text Search
 
-      Uses Bleve query syntax for powerful text searching:
+      Uses Antfly query syntax for powerful text searching:
 
       - Field-specific queries: `body:computer`
 
@@ -894,7 +894,7 @@ tags:
 
       ### Filter Query
 
-      Apply a Bleve query as an AND condition:
+      Apply an Antfly query as an AND condition:
 
       ```json
 
@@ -907,7 +907,7 @@ tags:
 
       ### Exclusion Query
 
-      Exclude documents matching a Bleve query (NOT condition):
+      Exclude documents matching an Antfly query (NOT condition):
 
       ```json
 
@@ -2726,7 +2726,7 @@ paths:
       tags:
         - query_operations
       description: >
-        Uses an LLM to translate natural language search intent into a structured Bleve query.
+        Uses an LLM to translate natural language search intent into a structured Antfly query.
 
         The generated query can be used directly in the QueryRequest.full_text_search or filter_query
         fields.
@@ -4577,7 +4577,7 @@ paths:
       description: Sets or replaces a row filter policy for a role, group, or other Casbin subject.
       operationId: setSubjectRowFilter
       requestBody:
-        description: Bleve query JSON for filtering documents
+        description: Antfly query JSON for filtering documents
         required: true
         content:
           application/json:
@@ -4676,10 +4676,10 @@ paths:
         - RowFilter
       summary: Set row filter for a user on a table
       description: Sets or replaces the row filter policy for the specified user and table. The request
-        body is the bleve query JSON.
+        body is the Antfly query JSON.
       operationId: setRowFilter
       requestBody:
-        description: Bleve query JSON for filtering documents
+        description: Antfly query JSON for filtering documents
         required: true
         content:
           application/json:
@@ -5743,7 +5743,7 @@ components:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
           description: >
-            Bleve query to filter documents. Only documents matching this query
+            Antfly query to filter documents. Only documents matching this query
 
             are included in results. Uses the sear library for efficient per-document
 
@@ -7398,10 +7398,10 @@ components:
               type: object
               additionalProperties: true
           description: >
-            Bleve query for full-text search. Supports all Bleve query types.
+            Antfly query for full-text search. Supports all Antfly query types.
 
 
-            See bleve-query-openapi.yaml for complete type definitions.
+            See specs/openapi/antfly/query.yaml for complete type definitions.
 
 
             Examples:
@@ -7495,12 +7495,12 @@ components:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
           description: >
-            Bleve query applied as an AND condition. Documents must match both the main query
+            Antfly query applied as an AND condition. Documents must match both the main query
 
             and this filter. Applied before scoring for better performance.
 
 
-            See bleve-query-openapi.yaml for complete type definitions.
+            See specs/openapi/antfly/query.yaml for complete type definitions.
 
 
             Use for:
@@ -7518,12 +7518,12 @@ components:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
           description: >
-            Bleve query applied as a NOT condition. Documents matching this query are excluded
+            Antfly query applied as a NOT condition. Documents matching this query are excluded
 
             from results. Applied before scoring.
 
 
-            See bleve-query-openapi.yaml for complete type definitions.
+            See specs/openapi/antfly/query.yaml for complete type definitions.
 
 
             Use for:
@@ -8126,7 +8126,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
-          description: Bleve query to filter rows before joining.
+          description: Antfly query to filter rows before joining.
         filter_prefix:
           type: string
           format: byte
@@ -9817,7 +9817,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties: true
-          description: Bleve query to filter nodes (same syntax as search filter_query)
+          description: Antfly query to filter nodes (same syntax as search filter_query)
         filter_prefix:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -13309,7 +13309,7 @@ components:
           additionalProperties: {}
           nullable: true
           description: >
-            Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve
+            Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly
             query JSON objects. API keys inherit the owner's effective row filters; key-local filters
             are applied as additional narrowing.
         created_at:
@@ -13354,7 +13354,7 @@ components:
         filter:
           type: object
           additionalProperties: {}
-          description: Bleve query JSON that documents must match to be visible.
+          description: Antfly query JSON that documents must match to be visible.
           example:
             term:
               department: engineering
@@ -13385,7 +13385,7 @@ components:
           additionalProperties: {}
           nullable: true
           description: >
-            Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve
+            Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly
             query JSON objects. API keys inherit the owner's effective row filters; key-local filters
             are applied as additional narrowing.
       required:

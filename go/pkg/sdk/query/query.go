@@ -1,9 +1,9 @@
-//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../bleve-query-openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../specs/openapi/antfly/query.yaml
 package query
 
 import "time"
 
-// Builder helpers for creating Bleve queries with convenience functions
+// Builder helpers for creating Antfly queries with convenience functions
 
 // FuzzinessInt creates a Fuzziness from an int32. Panics on error.
 func FuzzinessInt(v int32) Fuzziness {

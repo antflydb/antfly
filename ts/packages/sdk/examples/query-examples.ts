@@ -1,6 +1,6 @@
 /**
- * Examples demonstrating type-safe Bleve query construction
- * This file shows how to use the integrated Bleve query types
+ * Examples demonstrating type-safe Antfly query construction
+ * This file shows how to use the integrated Antfly query types
  */
 
 import type {

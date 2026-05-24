@@ -29,7 +29,7 @@ import (
 	"github.com/antflydb/antfly/src/raft"
 	"github.com/antflydb/antfly/src/snapstore"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/src/store/client"
+	client "github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/raft/v3/raftpb"

@@ -11,7 +11,7 @@ T = TypeVar("T", bound="NodeFilterFilterQuery")
 
 @_attrs_define
 class NodeFilterFilterQuery:
-    """Bleve query to filter nodes (same syntax as search filter_query)"""
+    """Antfly query to filter nodes (same syntax as search filter_query)"""
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

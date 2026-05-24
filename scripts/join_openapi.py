@@ -232,6 +232,7 @@ def configure_for_repo_contracts(module) -> None:
     }
     module.PATH_REWRITES = {
         "usermgr.yaml": "specs/openapi/antfly/usermgr.yaml",
+        "query.yaml": "specs/openapi/antfly/query.yaml",
         "../../../": "",
         "../../": "",
         "../metadata/": "src/metadata/",

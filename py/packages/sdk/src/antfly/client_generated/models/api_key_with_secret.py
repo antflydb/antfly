@@ -34,7 +34,7 @@ class ApiKeyWithSecret:
         permissions (list[Permission] | None | Unset): Optional permission scoping. If empty, inherits owner's full
             permissions.
         row_filter (ApiKeyRowFilterType0 | None | Unset): Optional per-table row filter. Keys are table names (or '*'
-            for all tables). Values are bleve query JSON objects. API keys inherit the owner's effective row filters; key-
+            for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-
             local filters are applied as additional narrowing.
         expires_at (datetime.datetime | None | Unset): When the API key expires. Null means never.
     """

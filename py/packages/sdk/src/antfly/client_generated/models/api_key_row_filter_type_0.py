@@ -11,7 +11,7 @@ T = TypeVar("T", bound="ApiKeyRowFilterType0")
 
 @_attrs_define
 class ApiKeyRowFilterType0:
-    """Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects.
+    """Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects.
     API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
 
     """

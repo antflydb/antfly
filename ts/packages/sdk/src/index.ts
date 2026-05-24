@@ -35,7 +35,7 @@
 
 // Re-export the generated types for advanced users
 export type { components, operations, paths } from "./public-api.js";
-export type { components as bleve_components } from "./bleve-query.js";
+export type { components as query_components } from "./query.js";
 // Main client export
 export { AntflyClient } from "./client.js";
 export { Client, type SDKConfig } from "./sdk.js";

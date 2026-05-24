@@ -39,7 +39,7 @@ import (
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 	"github.com/antflydb/antfly/src/metadata/foreign"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/src/store/client"
+	client "github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/store/storeutils"

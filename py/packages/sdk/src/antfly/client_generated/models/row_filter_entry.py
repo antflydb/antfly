@@ -19,7 +19,7 @@ class RowFilterEntry:
 
     Attributes:
         table (str): Table name (or '*' for all tables). Example: orders.
-        filter_ (RowFilterEntryFilter): Bleve query JSON that documents must match to be visible. Example: {'term':
+        filter_ (RowFilterEntryFilter): Antfly query JSON that documents must match to be visible. Example: {'term':
             {'department': 'engineering'}}.
     """
 

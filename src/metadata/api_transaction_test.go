@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/antflydb/antfly/src/store/client"
+	client "github.com/antflydb/antfly/src/store/client"
 	"github.com/stretchr/testify/assert"
 )
 

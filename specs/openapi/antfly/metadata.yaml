@@ -534,7 +534,7 @@ tags:
       ## Query Types
 
       ### Full-Text Search
-      Uses Bleve query syntax for powerful text searching:
+      Uses Antfly query syntax for powerful text searching:
       - Field-specific queries: `body:computer`
       - Boolean operators: `AND`, `OR`, `NOT`
       - Range queries: `year:>2020`
@@ -568,14 +568,14 @@ tags:
       Returns only keys like "user:123", "user:456"
 
       ### Filter Query
-      Apply a Bleve query as an AND condition:
+      Apply an Antfly query as an AND condition:
       ```json
       {"filter_query": {"query": "+category:technology +year:>2020"}}
       ```
       Documents must match both the main query and filter query.
 
       ### Exclusion Query
-      Exclude documents matching a Bleve query (NOT condition):
+      Exclude documents matching an Antfly query (NOT condition):
       ```json
       {"exclusion_query": {"query": "category:deprecated OR status:archived"}}
       ```
@@ -1914,7 +1914,7 @@ components:
           example: 1
         background_filter:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: Background filter for significant_terms aggregations
         algorithm:
@@ -2187,10 +2187,10 @@ components:
           example: ["title", "author", "metadata.tags"]
         filter_query:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: |
-            Bleve query to filter documents. Only documents matching this query
+            Antfly query to filter documents. Only documents matching this query
             are included in results. Uses the sear library for efficient per-document
             matching without requiring a full index.
 
@@ -3906,14 +3906,14 @@ components:
                     path: /deleted_at
         full_text_search:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
               type: object
               additionalProperties: true
           description: |
-            Bleve query for full-text search. Supports all Bleve query types.
+            Antfly query for full-text search. Supports all Antfly query types.
 
-            See bleve-query-openapi.yaml for complete type definitions.
+            See specs/openapi/antfly/query.yaml for complete type definitions.
 
             Examples:
             - Simple: `{"query": "computer"}`
@@ -3975,13 +3975,13 @@ components:
             - Document type filtering: `"article:"`
         filter_query:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: |
-            Bleve query applied as an AND condition. Documents must match both the main query
+            Antfly query applied as an AND condition. Documents must match both the main query
             and this filter. Applied before scoring for better performance.
 
-            See bleve-query-openapi.yaml for complete type definitions.
+            See specs/openapi/antfly/query.yaml for complete type definitions.
 
             Use for:
             - Status filtering: `"status:published"`
@@ -3992,13 +3992,13 @@ components:
             boost: 1.0
         exclusion_query:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: |
-            Bleve query applied as a NOT condition. Documents matching this query are excluded
+            Antfly query applied as a NOT condition. Documents matching this query are excluded
             from results. Applied before scoring.
 
-            See bleve-query-openapi.yaml for complete type definitions.
+            See specs/openapi/antfly/query.yaml for complete type definitions.
 
             Use for:
             - Excluding drafts: `"status:draft"`
@@ -4451,9 +4451,9 @@ components:
       properties:
         filter_query:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
-          description: Bleve query to filter rows before joining.
+          description: Antfly query to filter rows before joining.
         filter_prefix:
           type: string
           format: byte
@@ -5038,7 +5038,7 @@ components:
             - { op: "$set", path: "active", value: false }
         publication_filter:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: |
             Bleve-style filter query that gets translated to SQL and applied as a
@@ -5151,7 +5151,7 @@ components:
           example: "premium_users"
         where:
           allOf:
-            - $ref: "../../../bleve-query-openapi.yaml#/components/schemas/Query"
+            - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: |
             Bleve-style filter query evaluated against each CDC row. Only rows
@@ -5995,7 +5995,7 @@ paths:
       tags:
         - query_operations
       description: |
-        Uses an LLM to translate natural language search intent into a structured Bleve query.
+        Uses an LLM to translate natural language search intent into a structured Antfly query.
         The generated query can be used directly in the QueryRequest.full_text_search or filter_query fields.
 
         This endpoint is useful for:

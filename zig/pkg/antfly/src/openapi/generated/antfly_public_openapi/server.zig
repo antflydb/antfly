@@ -3,9 +3,6 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const antfly_eval_openapi = @import("antfly_eval_openapi");
-const antfly_schema_openapi = @import("antfly_schema_openapi");
-const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 
 /// --- Extractors (framework-agnostic) ---
 /// Store a secret
@@ -136,8 +133,8 @@ pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std
 }
 
 /// Parse the JSON request body for evaluate.
-pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
-    return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.EvalRequest) {
+    return std.json.parseFromSlice(types.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for queryBuilderAgent.
@@ -242,8 +239,8 @@ pub const UpdateSchemaPathParams = struct {
 };
 
 /// Parse the JSON request body for updateSchema.
-pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
-    return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableSchema) {
+    return std.json.parseFromSlice(types.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Scan keys in a table within a key range
@@ -293,8 +290,8 @@ pub const CreateIndexPathParams = struct {
 };
 
 /// Parse the JSON request body for createIndex.
-pub fn parseCreateIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexConfig) {
-    return std.json.parseFromSlice(antfly_indexes_openapi.IndexConfig, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseCreateIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.IndexConfig) {
+    return std.json.parseFromSlice(types.IndexConfig, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Drop an index from a table

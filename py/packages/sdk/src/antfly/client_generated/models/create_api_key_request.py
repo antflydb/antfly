@@ -27,7 +27,7 @@ class CreateApiKeyRequest:
         permissions (list[Permission] | None | Unset): Optional permission scoping. Each permission must be a subset of
             the creator's permissions.
         row_filter (CreateApiKeyRequestRowFilterType0 | None | Unset): Optional per-table row filter. Keys are table
-            names (or '*' for all tables). Values are bleve query JSON objects. API keys inherit the owner's effective row
+            names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row
             filters; key-local filters are applied as additional narrowing.
     """
 

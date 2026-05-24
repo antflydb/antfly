@@ -1,10 +1,10 @@
 /**
- * Type tests for Bleve query integration
- * These tests verify that the Bleve query types are properly integrated
+ * Type tests for Antfly query integration
+ * These tests verify that the Antfly query types are properly integrated
  */
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type {
-  BleveQuery,
+  AntflyQuery,
   BooleanQuery,
   BoolFieldQuery,
   ConjunctionQuery,
@@ -16,7 +16,7 @@ import type {
   TermQuery,
 } from "../src/types.js";
 
-describe("Bleve Query Type Integration", () => {
+describe("Antfly Query Type Integration", () => {
   describe("QueryRequest type safety", () => {
     it("should accept valid MatchQuery in full_text_search", () => {
       const query: QueryRequest = {
@@ -29,7 +29,7 @@ describe("Bleve Query Type Integration", () => {
       };
 
       expect(query.full_text_search).toBeDefined();
-      expectTypeOf(query.full_text_search).toMatchTypeOf<BleveQuery | undefined>();
+      expectTypeOf(query.full_text_search).toMatchTypeOf<AntflyQuery | undefined>();
     });
 
     it("should accept valid BooleanQuery in full_text_search", () => {
@@ -46,7 +46,7 @@ describe("Bleve Query Type Integration", () => {
       };
 
       expect(query.full_text_search).toBeDefined();
-      expectTypeOf(query.full_text_search).toMatchTypeOf<BleveQuery | undefined>();
+      expectTypeOf(query.full_text_search).toMatchTypeOf<AntflyQuery | undefined>();
     });
 
     it("should accept valid query in filter_query", () => {
@@ -60,7 +60,7 @@ describe("Bleve Query Type Integration", () => {
       };
 
       expect(query.filter_query).toBeDefined();
-      expectTypeOf(query.filter_query).toMatchTypeOf<BleveQuery | undefined>();
+      expectTypeOf(query.filter_query).toMatchTypeOf<AntflyQuery | undefined>();
     });
 
     it("should accept valid query in exclusion_query", () => {
@@ -73,7 +73,7 @@ describe("Bleve Query Type Integration", () => {
       };
 
       expect(query.exclusion_query).toBeDefined();
-      expectTypeOf(query.exclusion_query).toMatchTypeOf<BleveQuery | undefined>();
+      expectTypeOf(query.exclusion_query).toMatchTypeOf<AntflyQuery | undefined>();
     });
   });
 

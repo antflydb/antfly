@@ -15,7 +15,7 @@ export default defineConfig({
         "examples",
         "**/*.d.ts",
         "src/public-api.d.ts",
-        "src/bleve-query.d.ts",
+        "src/query.d.ts",
         "src/antfly.ts",
         "**/*.config.*",
       ],

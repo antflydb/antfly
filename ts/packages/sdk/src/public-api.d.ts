@@ -545,7 +545,7 @@ export interface paths {
         put?: never;
         /**
          * Build a search query from natural language
-         * @description Uses an LLM to translate natural language search intent into a structured Bleve query.
+         * @description Uses an LLM to translate natural language search intent into a structured Antfly query.
          *     The generated query can be used directly in the QueryRequest.full_text_search or filter_query fields.
          *
          *     This endpoint is useful for:
@@ -1257,7 +1257,7 @@ export interface paths {
         get: operations["getRowFilter"];
         /**
          * Set row filter for a user on a table
-         * @description Sets or replaces the row filter policy for the specified user and table. The request body is the bleve query JSON.
+         * @description Sets or replaces the row filter policy for the specified user and table. The request body is the Antfly query JSON.
          */
         put: operations["setRowFilter"];
         post?: never;
@@ -2491,7 +2491,7 @@ export interface components {
              */
             fields?: string[];
             /**
-             * @description Bleve query to filter documents. Only documents matching this query
+             * @description Antfly query to filter documents. Only documents matching this query
              *     are included in results. Uses the sear library for efficient per-document
              *     matching without requiring a full index.
              *
@@ -3786,9 +3786,9 @@ export interface components {
                 [key: string]: unknown;
             };
             /**
-             * @description Bleve query for full-text search. Supports all Bleve query types.
+             * @description Antfly query for full-text search. Supports all Antfly query types.
              *
-             *     See bleve-query-openapi.yaml for complete type definitions.
+             *     See specs/openapi/antfly/query.yaml for complete type definitions.
              *
              *     Examples:
              *     - Simple: `{"query": "computer"}`
@@ -3855,10 +3855,10 @@ export interface components {
              */
             filter_prefix?: string;
             /**
-             * @description Bleve query applied as an AND condition. Documents must match both the main query
+             * @description Antfly query applied as an AND condition. Documents must match both the main query
              *     and this filter. Applied before scoring for better performance.
              *
-             *     See bleve-query-openapi.yaml for complete type definitions.
+             *     See specs/openapi/antfly/query.yaml for complete type definitions.
              *
              *     Use for:
              *     - Status filtering: `"status:published"`
@@ -3871,10 +3871,10 @@ export interface components {
              */
             filter_query?: components["schemas"]["Query"] & unknown;
             /**
-             * @description Bleve query applied as a NOT condition. Documents matching this query are excluded
+             * @description Antfly query applied as a NOT condition. Documents matching this query are excluded
              *     from results. Applied before scoring.
              *
-             *     See bleve-query-openapi.yaml for complete type definitions.
+             *     See specs/openapi/antfly/query.yaml for complete type definitions.
              *
              *     Use for:
              *     - Excluding drafts: `"status:draft"`
@@ -4299,7 +4299,7 @@ export interface components {
         JoinOperator: "eq" | "neq" | "lt" | "lte" | "gt" | "gte";
         /** @description Filters to apply to a table before joining. */
         JoinFilters: {
-            /** @description Bleve query to filter rows before joining. */
+            /** @description Antfly query to filter rows before joining. */
             filter_query?: components["schemas"]["Query"] & unknown;
             /**
              * Format: byte
@@ -5172,7 +5172,7 @@ export interface components {
             username: string;
             /** @description Optional permission scoping. If empty, inherits owner's full permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
-            /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
+            /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
             row_filter?: {
                 [key: string]: unknown;
             } | null;
@@ -5208,7 +5208,7 @@ export interface components {
              */
             table: string;
             /**
-             * @description Bleve query JSON that documents must match to be visible.
+             * @description Antfly query JSON that documents must match to be visible.
              * @example {
              *       "term": {
              *         "department": "engineering"
@@ -5233,7 +5233,7 @@ export interface components {
             expires_in?: string;
             /** @description Optional permission scoping. Each permission must be a subset of the creator's permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
-            /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
+            /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
             row_filter?: {
                 [key: string]: unknown;
             } | null;
@@ -7720,7 +7720,7 @@ export interface components {
         GraphQueryType: "traverse" | "neighbors" | "shortest_path" | "k_shortest_paths" | "pattern";
         /** @description Filter nodes during graph traversal using existing query primitives */
         NodeFilter: {
-            /** @description Bleve query to filter nodes (same syntax as search filter_query) */
+            /** @description Antfly query to filter nodes (same syntax as search filter_query) */
             filter_query?: {
                 [key: string]: unknown;
             };
@@ -11801,7 +11801,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Bleve query JSON for filtering documents */
+        /** @description Antfly query JSON for filtering documents */
         requestBody: {
             content: {
                 "application/json": {
@@ -11935,7 +11935,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Bleve query JSON for filtering documents */
+        /** @description Antfly query JSON for filtering documents */
         requestBody: {
             content: {
                 "application/json": {

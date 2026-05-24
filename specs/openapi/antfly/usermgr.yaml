@@ -204,7 +204,7 @@ components:
           nullable: true
           description: >
             Optional per-table row filter. Keys are table names (or '*' for all tables).
-            Values are bleve query JSON objects. API keys inherit the owner's effective
+            Values are Antfly query JSON objects. API keys inherit the owner's effective
             row filters; key-local filters are applied as additional narrowing.
         created_at:
           type: string
@@ -250,7 +250,7 @@ components:
         filter:
           type: object
           additionalProperties: {}
-          description: "Bleve query JSON that documents must match to be visible."
+          description: "Antfly query JSON that documents must match to be visible."
           example:
             term:
               department: "engineering"
@@ -282,7 +282,7 @@ components:
           nullable: true
           description: >
             Optional per-table row filter. Keys are table names (or '*' for all tables).
-            Values are bleve query JSON objects. API keys inherit the owner's effective
+            Values are Antfly query JSON objects. API keys inherit the owner's effective
             row filters; key-local filters are applied as additional narrowing.
       required:
         - name
@@ -875,7 +875,7 @@ paths:
       description: Sets or replaces a row filter policy for a role, group, or other Casbin subject.
       operationId: setSubjectRowFilter
       requestBody:
-        description: Bleve query JSON for filtering documents
+        description: Antfly query JSON for filtering documents
         required: true
         content:
           application/json:
@@ -962,10 +962,10 @@ paths:
       tags:
         - RowFilter
       summary: Set row filter for a user on a table
-      description: Sets or replaces the row filter policy for the specified user and table. The request body is the bleve query JSON.
+      description: Sets or replaces the row filter policy for the specified user and table. The request body is the Antfly query JSON.
       operationId: setRowFilter
       requestBody:
-        description: Bleve query JSON for filtering documents
+        description: Antfly query JSON for filtering documents
         required: true
         content:
           application/json:

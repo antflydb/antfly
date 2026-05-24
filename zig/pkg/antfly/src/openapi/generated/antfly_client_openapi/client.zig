@@ -4,9 +4,6 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const types = @import("types.zig");
-const antfly_eval_openapi = @import("antfly_eval_openapi");
-const antfly_schema_openapi = @import("antfly_schema_openapi");
-const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 
 pub fn ApiResponse(comptime T: type) type {
     return struct {
@@ -348,13 +345,13 @@ pub const Client = struct {
 
     /// Standalone evaluation endpoint
     /// POST /eval
-    pub fn evaluate(self: *@This(), body: antfly_eval_openapi.EvalRequest) !ApiResponse(antfly_eval_openapi.EvalResult) {
+    pub fn evaluate(self: *@This(), body: types.EvalRequest) !ApiResponse(types.EvalResult) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/eval", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(antfly_eval_openapi.EvalResult).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.EvalResult).fromResponse(self.allocator, &resp);
     }
 
     /// Build a search query from natural language
@@ -494,7 +491,7 @@ pub const Client = struct {
 
     /// Update a table's schema
     /// PUT /tables/{tableName}/schema
-    pub fn updateSchema(self: *@This(), table_name: []const u8, body: antfly_schema_openapi.TableSchema) !ApiResponse(types.Table) {
+    pub fn updateSchema(self: *@This(), table_name: []const u8, body: types.TableSchema) !ApiResponse(types.Table) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/tables/{s}/schema", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
@@ -557,7 +554,7 @@ pub const Client = struct {
 
     /// Add an index to a table
     /// POST /tables/{tableName}/indexes/{indexName}
-    pub fn createIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: antfly_indexes_openapi.IndexConfig) !ApiResponse(std.json.Value) {
+    pub fn createIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexConfig) !ApiResponse(std.json.Value) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/tables/{s}/indexes/{s}", .{ self.base_url, table_name, index_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);

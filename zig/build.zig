@@ -406,7 +406,7 @@ const AntflyRootImports = struct {
     indexes_openapi: *std.Build.Module,
     ai_openapi: *std.Build.Module,
     eval_openapi: *std.Build.Module,
-    bleve_query_openapi: *std.Build.Module,
+    query_openapi: *std.Build.Module,
     metadata_openapi: *std.Build.Module,
     usermgr_openapi: *std.Build.Module,
     logging_openapi: *std.Build.Module,
@@ -463,7 +463,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_indexes_openapi", .field = "indexes_openapi" },
         .{ .name = "antfly_ai_openapi", .field = "ai_openapi" },
         .{ .name = "antfly_eval_openapi", .field = "eval_openapi" },
-        .{ .name = "antfly_bleve_query_openapi", .field = "bleve_query_openapi" },
+        .{ .name = "antfly_query_openapi", .field = "query_openapi" },
         .{ .name = "antfly_metadata_openapi", .field = "metadata_openapi" },
         .{ .name = "antfly_usermgr_openapi", .field = "usermgr_openapi" },
         .{ .name = "antfly_logging_openapi", .field = "logging_openapi" },
@@ -756,7 +756,7 @@ fn addPublicOpenApiModule(
             .{ "../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
             .{ "../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../bleve-query-openapi.yaml", "antfly_bleve_query_openapi" },
+            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         },
     );
 }
@@ -784,7 +784,7 @@ fn addPublicClientOpenApiModule(
             .{ "../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
             .{ "../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../bleve-query-openapi.yaml", "antfly_bleve_query_openapi" },
+            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         },
         httpx_mod,
     );
@@ -924,7 +924,7 @@ fn addOpenApiRegenStep(
             .{ "../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
             .{ "../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../bleve-query-openapi.yaml", "antfly_bleve_query_openapi" },
+            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
             .{ "../lib/schema/openapi.yaml", "antfly_schema_openapi" },
@@ -933,7 +933,7 @@ fn addOpenApiRegenStep(
             .{ "../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
             .{ "../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../bleve-query-openapi.yaml", "antfly_bleve_query_openapi" },
+            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../lib/schema/openapi.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../src/store/db/indexes/openapi.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
@@ -947,7 +947,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../lib/ai/eval/openapi.yaml"), "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi", "types", &.{
             .{ "../../../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../bleve-query-openapi.yaml"), "antfly_bleve_query_openapi", antfly_generated_root ++ "/antfly_bleve_query_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/usermgr.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
             .{ "usermgr.yaml", "antfly_usermgr_openapi" },
@@ -957,7 +957,7 @@ fn addOpenApiRegenStep(
             .{ "../../../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
             .{ "../../../pkg/generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../../../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../../../bleve-query-openapi.yaml", "antfly_bleve_query_openapi" },
+            .{ "query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../pkg/libaf/logging/openapi.yaml"), "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../lib/audio/openapi.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
@@ -1127,7 +1127,7 @@ pub fn build(b: *std.Build) void {
     const indexes_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi");
     const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi");
     const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi");
-    const bleve_query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_bleve_query_openapi", antfly_generated_root ++ "/antfly_bleve_query_openapi");
+    const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi");
     const usermgr_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", httpx_mod);
     const metadata_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", httpx_mod);
     const logging_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi");
@@ -1156,14 +1156,14 @@ pub fn build(b: *std.Build) void {
     public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     public_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    public_openapi_mod.addImport("antfly_bleve_query_openapi", bleve_query_openapi_mod);
+    public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     client_openapi_mod.addImport("antfly_ai_openapi", ai_openapi_mod);
     client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     client_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    client_openapi_mod.addImport("antfly_bleve_query_openapi", bleve_query_openapi_mod);
+    client_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
@@ -1171,7 +1171,7 @@ pub fn build(b: *std.Build) void {
     metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_bleve_query_openapi", bleve_query_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     termite_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -1514,7 +1514,7 @@ pub fn build(b: *std.Build) void {
         .indexes_openapi = indexes_openapi_mod,
         .ai_openapi = ai_openapi_mod,
         .eval_openapi = eval_openapi_mod,
-        .bleve_query_openapi = bleve_query_openapi_mod,
+        .query_openapi = query_openapi_mod,
         .metadata_openapi = metadata_openapi_mod,
         .usermgr_openapi = usermgr_openapi_mod,
         .logging_openapi = logging_openapi_mod,
@@ -1608,7 +1608,7 @@ pub fn build(b: *std.Build) void {
         lmdb_engine_mod,
         json_mod,
         public_openapi_mod,
-        bleve_query_openapi_mod,
+        query_openapi_mod,
         indexes_openapi_mod,
         metadata_openapi_mod,
         reranking_mod,
@@ -1677,7 +1677,7 @@ pub fn build(b: *std.Build) void {
         lmdb_engine_wasm_mod,
         json_mod,
         public_openapi_mod,
-        bleve_query_openapi_mod,
+        query_openapi_mod,
         indexes_openapi_mod,
         metadata_openapi_mod,
         reranking_mod,

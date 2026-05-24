@@ -84,7 +84,7 @@ def sync_detailed(
     """Set row filter for a user on a table
 
      Sets or replaces the row filter policy for the specified user and table. The request body is the
-    bleve query JSON.
+    Antfly query JSON.
 
     Args:
         user_name (str):  Example: johndoe.
@@ -122,7 +122,7 @@ def sync(
     """Set row filter for a user on a table
 
      Sets or replaces the row filter policy for the specified user and table. The request body is the
-    bleve query JSON.
+    Antfly query JSON.
 
     Args:
         user_name (str):  Example: johndoe.
@@ -155,7 +155,7 @@ async def asyncio_detailed(
     """Set row filter for a user on a table
 
      Sets or replaces the row filter policy for the specified user and table. The request body is the
-    bleve query JSON.
+    Antfly query JSON.
 
     Args:
         user_name (str):  Example: johndoe.
@@ -191,7 +191,7 @@ async def asyncio(
     """Set row filter for a user on a table
 
      Sets or replaces the row filter policy for the specified user and table. The request body is the
-    bleve query JSON.
+    Antfly query JSON.
 
     Args:
         user_name (str):  Example: johndoe.

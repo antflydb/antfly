@@ -20,7 +20,7 @@ import (
 
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/src/store/client"
+	client "github.com/antflydb/antfly/src/store/client"
 	db "github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/storeutils"
 	"github.com/antflydb/antfly/src/tablemgr"

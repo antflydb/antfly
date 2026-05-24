@@ -72,7 +72,7 @@ func (p *TermiteClient) Embed(ctx context.Context, contents [][]ai.ContentPart) 
 		return p.client.Embed(ctx, p.model, values)
 	}
 
-	// Multimodal path: convert ai.ContentPart to oapi.ContentPart
+	// Multimodal path: convert ai.ContentPart to oapi.TermiteContentPart
 	parts, err := convertToOAPIContentParts(contents)
 	if err != nil {
 		return nil, fmt.Errorf("converting content parts: %w", err)
@@ -122,11 +122,11 @@ func allText(contents [][]ai.ContentPart) bool {
 	return true
 }
 
-// convertToOAPIContentParts converts internal ai.ContentPart slices to oapi.ContentPart slices.
-// Each input item ([]ai.ContentPart) becomes one oapi.ContentPart. For items with multiple parts,
+// convertToOAPIContentParts converts internal ai.ContentPart slices to oapi.TermiteContentPart slices.
+// Each input item ([]ai.ContentPart) becomes one oapi.TermiteContentPart. For items with multiple parts,
 // the first non-text part is used (text is used as fallback).
-func convertToOAPIContentParts(contents [][]ai.ContentPart) ([]oapi.ContentPart, error) {
-	result := make([]oapi.ContentPart, 0, len(contents))
+func convertToOAPIContentParts(contents [][]ai.ContentPart) ([]oapi.TermiteContentPart, error) {
+	result := make([]oapi.TermiteContentPart, 0, len(contents))
 	for _, parts := range contents {
 		converted, err := convertSingleInput(parts)
 		if err != nil {
@@ -137,17 +137,17 @@ func convertToOAPIContentParts(contents [][]ai.ContentPart) ([]oapi.ContentPart,
 	return result, nil
 }
 
-// convertSingleInput converts a single input's content parts to one oapi.ContentPart.
-func convertSingleInput(parts []ai.ContentPart) (oapi.ContentPart, error) {
-	var out oapi.ContentPart
+// convertSingleInput converts a single input's content parts to one oapi.TermiteContentPart.
+func convertSingleInput(parts []ai.ContentPart) (oapi.TermiteContentPart, error) {
+	var out oapi.TermiteContentPart
 
 	for _, part := range parts {
 		switch p := part.(type) {
 		case ai.BinaryContent:
 			dataURI := "data:" + p.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(p.Data)
-			if err := out.FromImageURLContentPart(oapi.ImageURLContentPart{
-				Type: oapi.ImageURLContentPartTypeImageUrl,
-				ImageUrl: oapi.ImageURL{
+			if err := out.FromTermiteImageURLContentPart(oapi.TermiteImageURLContentPart{
+				Type: oapi.TermiteImageURLContentPartTypeImageUrl,
+				ImageUrl: oapi.TermiteImageURL{
 					Url: dataURI,
 				},
 			}); err != nil {
@@ -156,9 +156,9 @@ func convertSingleInput(parts []ai.ContentPart) (oapi.ContentPart, error) {
 			return out, nil
 
 		case ai.ImageURLContent:
-			if err := out.FromImageURLContentPart(oapi.ImageURLContentPart{
-				Type: oapi.ImageURLContentPartTypeImageUrl,
-				ImageUrl: oapi.ImageURL{
+			if err := out.FromTermiteImageURLContentPart(oapi.TermiteImageURLContentPart{
+				Type: oapi.TermiteImageURLContentPartTypeImageUrl,
+				ImageUrl: oapi.TermiteImageURL{
 					Url: p.URL,
 				},
 			}); err != nil {
@@ -168,8 +168,8 @@ func convertSingleInput(parts []ai.ContentPart) (oapi.ContentPart, error) {
 
 		case ai.TextContent:
 			// Continue looking for non-text parts; use text as fallback
-			if err := out.FromTextContentPart(oapi.TextContentPart{
-				Type: oapi.TextContentPartTypeText,
+			if err := out.FromTermiteTextContentPart(oapi.TermiteTextContentPart{
+				Type: oapi.TermiteTextContentPartTypeText,
 				Text: p.Text,
 			}); err != nil {
 				return out, fmt.Errorf("creating text content part: %w", err)

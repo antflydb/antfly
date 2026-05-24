@@ -55,7 +55,7 @@ jobs:
       - name: Verify generated SDKs
         run: |
           pnpm --filter @antfly/sdk generate
-          status="$(git status --porcelain -- packages/sdk/src/public-api.d.ts packages/sdk/src/bleve-query.d.ts)"
+          status="$(git status --porcelain -- packages/sdk/src/public-api.d.ts packages/sdk/src/query.d.ts)"
           if [ -n "$status" ]; then
             echo "$status"
             exit 1

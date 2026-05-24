@@ -936,7 +936,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties: true
-          description: "Bleve query to filter nodes (same syntax as search filter_query)"
+          description: "Antfly query to filter nodes (same syntax as search filter_query)"
         filter_prefix:
           x-go-type-skip-optional-pointer: true
           type: string

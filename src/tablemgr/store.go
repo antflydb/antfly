@@ -22,7 +22,7 @@ import (
 
 	"github.com/antflydb/antfly/lib/types"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/src/store/client"
+	client "github.com/antflydb/antfly/src/store/client"
 )
 
 func (ns *StoreStatus) IsReachable() bool {

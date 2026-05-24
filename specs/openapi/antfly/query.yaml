@@ -1,8 +1,8 @@
 openapi: 3.0.3
 info:
-  title: Bleve Search Query
+  title: Antfly Query
   version: "1.0.0"
-  description: An OpenAPI specification for Bleve search query objects.
+  description: OpenAPI schemas for Antfly JSON query objects.
 paths: {}
 components:
   schemas:

@@ -20,7 +20,7 @@ class NodeFilter:
     """Filter nodes during graph traversal using existing query primitives
 
     Attributes:
-        filter_query (NodeFilterFilterQuery | Unset): Bleve query to filter nodes (same syntax as search filter_query)
+        filter_query (NodeFilterFilterQuery | Unset): Antfly query to filter nodes (same syntax as search filter_query)
         filter_prefix (str | Unset): Filter by key prefix
     """
 

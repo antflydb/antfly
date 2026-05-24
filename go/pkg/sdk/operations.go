@@ -392,7 +392,7 @@ type RetrievalAgentOptions struct {
 	OnError          func(err *RetrievalAgentError) error
 }
 
-// QueryBuilder generates a structured Bleve query from a natural language intent.
+// QueryBuilder generates a structured Antfly query from a natural language intent.
 func (c *AntflyClient) QueryBuilder(ctx context.Context, req QueryBuilderRequest) (*QueryBuilderResult, error) {
 	reqBody, err := json.Marshal(req)
 	if err != nil {

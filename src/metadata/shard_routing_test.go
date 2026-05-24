@@ -27,7 +27,7 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata/kv"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/src/store/client"
+	client "github.com/antflydb/antfly/src/store/client"
 	storedb "github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/tablemgr"
 	"github.com/cockroachdb/pebble/v2"

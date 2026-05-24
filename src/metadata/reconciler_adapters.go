@@ -25,7 +25,7 @@ import (
 	"github.com/antflydb/antfly/src/common"
 	"github.com/antflydb/antfly/src/metadata/reconciler"
 	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/src/store/client"
+	client "github.com/antflydb/antfly/src/store/client"
 	"github.com/antflydb/antfly/src/store/db"
 	"github.com/antflydb/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/src/tablemgr"

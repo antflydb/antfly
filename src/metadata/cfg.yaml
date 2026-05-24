@@ -22,4 +22,4 @@ import-mapping:
   ../../lib/reranking/openapi.yaml: github.com/antflydb/antfly/lib/reranking
   ../../lib/schema/openapi.yaml: github.com/antflydb/antfly/lib/schema
   ../store/db/indexes/openapi.yaml: github.com/antflydb/antfly/src/store/db/indexes
-  ../../vendor/bleve-query-openapi.yaml: github.com/antflydb/antfly/src/store/db/indexes
+  ../../specs/openapi/antfly/query.yaml: github.com/antflydb/antfly/src/store/db/indexes

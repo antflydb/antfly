@@ -11,7 +11,7 @@ T = TypeVar("T", bound="RowFilterEntryFilter")
 
 @_attrs_define
 class RowFilterEntryFilter:
-    """Bleve query JSON that documents must match to be visible.
+    """Antfly query JSON that documents must match to be visible.
 
     Example:
         {'term': {'department': 'engineering'}}
