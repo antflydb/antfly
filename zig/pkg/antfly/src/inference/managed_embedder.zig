@@ -837,15 +837,13 @@ fn parseManagedEmbeddingEntry(
     defer embedder_cfg.deinit(alloc);
 
     const provider = try parseEmbedderProvider(embedder_cfg);
-    if (embedder_cfg.model.len == 0) return error.InvalidManagedEmbeddingIndex;
     const requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
     const burst = try resolveEmbedderBurst(embedder, provider);
-    const local_termite_provider = if (provider == .antfly)
-        options.local_termite_provider
-    else if (provider == .termite and shouldUseLocalTermite(embedder_cfg, options))
+    const local_termite_provider = if (isTermiteBackedProvider(provider) and shouldUseLocalTermite(embedder_cfg, options))
         options.local_termite_provider
     else
         null;
+    if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidManagedEmbeddingIndex;
     const bedrock_region: []u8 = if (provider == .bedrock) try resolveBedrockRegion(alloc, embedder_cfg) else @constCast("");
     errdefer if (bedrock_region.len > 0) alloc.free(bedrock_region);
     const bedrock_endpoint: []u8 = if (provider == .bedrock) try resolveBedrockEndpoint(alloc, embedder_cfg, bedrock_region) else @constCast("");
@@ -860,11 +858,10 @@ fn parseManagedEmbeddingEntry(
             .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
             .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
             .bedrock => bedrock_endpoint,
-            .termite => if (local_termite_provider != null)
+            .termite, .antfly => if (local_termite_provider != null)
                 try alloc.dupe(u8, "")
             else
                 try resolveTermiteBaseUrl(alloc, embedder_cfg),
-            .antfly => try alloc.dupe(u8, ""),
         },
         .region = bedrock_region,
         .input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else "",
@@ -893,6 +890,10 @@ fn shouldUseLocalTermite(embedder: embeddings_types.Config, options: InitOptions
         return false;
     }
     return true;
+}
+
+fn isTermiteBackedProvider(provider: ProviderKind) bool {
+    return provider == .termite or provider == .antfly;
 }
 
 fn resolveEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig) !u32 {
@@ -1239,8 +1240,8 @@ fn embedWithEntryParts(
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
-    if ((entry.provider == .termite or entry.provider == .antfly) and (entry.multimodal or partsContainMedia(parts))) {
-        if (entry.local_termite_provider != null and entry.provider == .antfly) {
+    if (isTermiteBackedProvider(entry.provider) and (entry.multimodal or partsContainMedia(parts))) {
+        if (entry.local_termite_provider != null) {
             return error.UnsupportedEmbeddingProvider;
         }
         waitForEntryPacer(entry);
@@ -1295,7 +1296,6 @@ fn embedSparseBatchWithEntry(
                 if (embeddings.len == 0) return error.EmptyEmbeddingResponse;
                 return embeddings;
             }
-            if (entry.provider == .antfly) return error.UnsupportedEmbeddingProvider;
             waitForEntryPacer(entry);
             var io_impl = std.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
@@ -1473,7 +1473,6 @@ fn embedBatchWithEntry(
                 }
                 return vectors;
             }
-            if (entry.provider == .antfly) return error.UnsupportedEmbeddingProvider;
             waitForEntryPacer(entry);
             var io_impl = std.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
@@ -2323,6 +2322,180 @@ test "managed embedder routes termite without api_url to local provider" {
     defer std.testing.allocator.free(vector);
     try std.testing.expectEqual(@as(usize, 1), local.calls);
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, vector);
+}
+
+test "managed embedder routes antfly without api_url to local provider" {
+    const Local = struct {
+        calls: usize = 0,
+
+        fn dense(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("", model);
+            const vectors = try alloc.alloc([]f32, texts.len);
+            errdefer alloc.free(vectors);
+            for (texts, 0..) |_, i| {
+                vectors[i] = try alloc.dupe(f32, &.{ 0.5, 0.25, 0.125 });
+            }
+            return vectors;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    var local = Local{};
+    const provider = LocalTermiteProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_sparse_texts = Local.sparse,
+    };
+
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly"}}}
+    ;
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithLocalTermite(std.testing.allocator, indexes_json, provider);
+    defer managed.deinit();
+
+    try std.testing.expectEqualStrings("", managed.entries[0].base_url);
+    const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept");
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25, 0.125 }, vector);
+}
+
+test "managed embedder routes antfly with api_url to termite endpoint" {
+    const Local = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/api/embed"));
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"remote-model\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"input\":[\"alpha concept\"]") != null);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"data":[{"embedding":[0.125,0.25,0.5]}]}
+                ),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    var local = Local{};
+    const provider = LocalTermiteProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_sparse_texts = Local.sparse,
+    };
+
+    const indexes_json = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"antfly","model":"remote-model","api_url":"{s}"}}}}}}
+    , .{base_uri});
+    defer std.testing.allocator.free(indexes_json);
+
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithLocalTermite(std.testing.allocator, indexes_json, provider);
+    defer managed.deinit();
+
+    const expected_base_url = try std.fmt.allocPrint(std.testing.allocator, "{s}/api", .{base_uri});
+    defer std.testing.allocator.free(expected_base_url);
+    try std.testing.expectEqualStrings(expected_base_url, managed.entries[0].base_url);
+
+    const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept");
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+}
+
+test "managed embedder preserves antfly api_url path for shared termite endpoint" {
+    const Local = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/ml/v1/embed"));
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"remote-model\"") != null);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"data":[{"embedding":[0.75,0.5,0.25]}]}
+                ),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+    const shared_termite_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/ml/v1", .{base_uri});
+    defer std.testing.allocator.free(shared_termite_uri);
+
+    var local = Local{};
+    const provider = LocalTermiteProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_sparse_texts = Local.sparse,
+    };
+
+    const indexes_json = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"antfly","model":"remote-model","api_url":"{s}"}}}}}}
+    , .{shared_termite_uri});
+    defer std.testing.allocator.free(indexes_json);
+
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithLocalTermite(std.testing.allocator, indexes_json, provider);
+    defer managed.deinit();
+
+    try std.testing.expectEqualStrings(shared_termite_uri, managed.entries[0].base_url);
+
+    const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept");
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.75, 0.5, 0.25 }, vector);
 }
 
 test "managed embedder query template supports remoteText and surfaces permanent helper failures" {
