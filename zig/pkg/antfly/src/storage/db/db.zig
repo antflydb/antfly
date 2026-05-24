@@ -10393,11 +10393,207 @@ fn loadEmbeddingFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?s
     return .{ .object = embeddings_obj };
 }
 
+fn loadArtifactFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {
+    const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(prefix);
+
+    const artifacts = try self.core.scanStorePrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+    var artifacts_obj = std.json.ObjectMap.empty;
+    errdefer {
+        var it = artifacts_obj.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr);
+        }
+        artifacts_obj.deinit(alloc);
+    }
+
+    var artifact_count: usize = 0;
+    for (artifacts) |entry| {
+        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+        defer artifact_ref.deinit(alloc);
+
+        var artifact_value = try artifactProjectionValue(alloc, artifact_ref, entry.value);
+        errdefer freeJsonValue(alloc, &artifact_value);
+
+        try appendArtifactProjectionValue(alloc, &artifacts_obj, artifact_ref.name, artifact_ref.kind, artifact_value);
+        artifact_count += 1;
+    }
+
+    if (artifact_count == 0) {
+        var empty = std.json.Value{ .object = artifacts_obj };
+        freeJsonValue(alloc, &empty);
+        return null;
+    }
+    return .{ .object = artifacts_obj };
+}
+
+fn artifactProjectionValue(alloc: Allocator, artifact_ref: types.ArtifactRef, raw: []const u8) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    errdefer {
+        var value = std.json.Value{ .object = obj };
+        freeJsonValue(alloc, &value);
+    }
+
+    {
+        const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
+        errdefer alloc.free(artifact_id);
+        try putOwnedValue(alloc, &obj, "artifact_id", .{ .string = artifact_id });
+    }
+
+    {
+        var ref_value = try artifactRefJsonValue(alloc, artifact_ref);
+        errdefer freeJsonValue(alloc, &ref_value);
+        try putOwnedValue(alloc, &obj, "artifact_ref", ref_value);
+    }
+
+    try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+    try putOwnedValue(alloc, &obj, "content_type", .{ .string = try alloc.dupe(u8, artifactContentType(artifact_ref.kind)) });
+    try putOwnedValue(alloc, &obj, "status", .{ .string = try alloc.dupe(u8, "ready") });
+
+    if (enrichment_artifact_codec.sourceHash(raw) catch null) |source_hash| {
+        try putOwnedValue(alloc, &obj, "source_hash", .{ .string = try std.fmt.allocPrint(alloc, "xxh64:{x}", .{source_hash}) });
+    }
+
+    switch (artifact_ref.kind) {
+        .chunk => {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch null;
+            if (parsed) |*owned| {
+                defer owned.deinit();
+                var cloned = try cloneJsonValue(alloc, owned.value);
+                errdefer freeJsonValue(alloc, &cloned);
+                try db_query_projection.normalizeChunkArtifactForQuery(alloc, &cloned);
+                try putOwnedValue(alloc, &obj, "value", cloned);
+            } else {
+                try putOwnedValue(alloc, &obj, "value", .{ .string = try alloc.dupe(u8, raw) });
+            }
+        },
+        .summary => {
+            try putOwnedValue(alloc, &obj, "value", .{ .string = try artifactTextPayloadAlloc(alloc, raw) });
+        },
+        .embedding => {
+            if (enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch null) |dims| {
+                try putOwnedValue(alloc, &obj, "dims", .{ .integer = @intCast(dims) });
+            }
+            try putOwnedValue(alloc, &obj, "value", .null);
+        },
+    }
+
+    return .{ .object = obj };
+}
+
+fn appendArtifactProjectionValue(
+    alloc: Allocator,
+    artifacts_obj: *std.json.ObjectMap,
+    artifact_name: []const u8,
+    artifact_kind: types.ArtifactKind,
+    artifact_value: std.json.Value,
+) !void {
+    if (artifacts_obj.getPtr(artifact_name)) |existing| {
+        if (existing.* == .object) {
+            if (existing.object.getPtr("items")) |items| {
+                if (items.* == .array) {
+                    try items.array.append(artifact_value);
+                    return;
+                }
+            }
+        }
+
+        var first = try cloneJsonValue(alloc, existing.*);
+        var first_moved = false;
+        errdefer if (!first_moved) freeJsonValue(alloc, &first);
+        var items = std.json.Array.init(alloc);
+        errdefer {
+            for (items.items) |*item| freeJsonValue(alloc, item);
+            items.deinit();
+        }
+        try items.append(first);
+        first_moved = true;
+        try items.append(artifact_value);
+
+        var grouped = std.json.ObjectMap.empty;
+        errdefer {
+            var value = std.json.Value{ .object = grouped };
+            freeJsonValue(alloc, &value);
+        }
+        try putOwnedValue(alloc, &grouped, "kind", .{ .string = try alloc.dupe(u8, artifactSetKindText(artifact_kind)) });
+        try putOwnedValue(alloc, &grouped, "status", .{ .string = try alloc.dupe(u8, "ready") });
+        try putOwnedValue(alloc, &grouped, "items", .{ .array = items });
+
+        freeJsonValue(alloc, existing);
+        existing.* = .{ .object = grouped };
+        return;
+    }
+
+    try artifacts_obj.put(alloc, try alloc.dupe(u8, artifact_name), artifact_value);
+}
+
+fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    errdefer {
+        var value = std.json.Value{ .object = obj };
+        freeJsonValue(alloc, &value);
+    }
+    try putOwnedValue(alloc, &obj, "document_id", .{ .string = try alloc.dupe(u8, artifact_ref.document_id) });
+    try putOwnedValue(alloc, &obj, "name", .{ .string = try alloc.dupe(u8, artifact_ref.name) });
+    try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+    if (artifact_ref.chunk_id) |chunk_id| {
+        try putOwnedValue(alloc, &obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
+    }
+    if (artifact_ref.source) |source| {
+        var source_obj = std.json.ObjectMap.empty;
+        errdefer {
+            var value = std.json.Value{ .object = source_obj };
+            freeJsonValue(alloc, &value);
+        }
+        try putOwnedValue(alloc, &source_obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(source.kind)) });
+        try putOwnedValue(alloc, &source_obj, "name", .{ .string = try alloc.dupe(u8, source.name) });
+        if (source.chunk_id) |chunk_id| {
+            try putOwnedValue(alloc, &source_obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
+        }
+        try putOwnedValue(alloc, &obj, "source", .{ .object = source_obj });
+    }
+    return .{ .object = obj };
+}
+
+fn artifactKindText(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "chunk",
+        .summary => "summary",
+        .embedding => "embedding",
+    };
+}
+
+fn artifactSetKindText(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "chunk_set",
+        .summary => "summary_set",
+        .embedding => "embedding_set",
+    };
+}
+
+fn artifactContentType(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "application/json",
+        .summary => "text/plain",
+        .embedding => "application/vnd.antfly.embedding+binary",
+    };
+}
+
+fn artifactTextPayloadAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const header = enrichment_artifact_codec.decodeHeader(raw) catch return try alloc.dupe(u8, raw);
+    if (header.kind != .summary_text) return try alloc.dupe(u8, raw);
+    return try alloc.dupe(u8, raw[enrichment_artifact_codec.header_len..][0..header.payload_len]);
+}
+
 fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
     return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, raw, opts, .{
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
 
@@ -10409,6 +10605,7 @@ fn projectStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchReq
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
 
@@ -10420,6 +10617,7 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
 
@@ -10497,6 +10695,15 @@ fn loadEmbeddingFieldValueCallback(
 ) anyerror!?std.json.Value {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadEmbeddingFieldValue(self, alloc, doc_key);
+}
+
+fn loadArtifactFieldValueCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    doc_key: []const u8,
+) anyerror!?std.json.Value {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return try loadArtifactFieldValue(self, alloc, doc_key);
 }
 
 fn dupeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const []const u8 {
@@ -32277,6 +32484,60 @@ test "db lookup includes chunk artifacts when _chunks is requested" {
     try std.testing.expectEqual(@as(i64, 1), chunks[1].object.get("_chunk_id").?.integer);
 }
 
+test "db lookup includes unified artifact projection when _artifacts is requested" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello world\"}" }},
+    });
+
+    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const chunk_one = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    defer alloc.free(chunk_one);
+    try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5}");
+    try db.core.store.put(chunk_one, "{\"body\":\"world\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":1,\"_start_offset\":6,\"_end_offset\":11}");
+
+    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    defer alloc.free(dense_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 2, 3 });
+
+    var result = (try db.lookup(alloc, "doc:a", .{
+        .fields = &.{ "title", "_artifacts" },
+        .include_all_fields = false,
+    })).?;
+    defer result.deinit(alloc);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("alpha", parsed.value.object.get("title").?.string);
+    const artifacts = parsed.value.object.get("_artifacts").?.object;
+
+    const chunks = artifacts.get("body_chunks_v1").?.object;
+    try std.testing.expectEqualStrings("chunk_set", chunks.get("kind").?.string);
+    const items = chunks.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expect(std.mem.startsWith(u8, items[0].object.get("artifact_id").?.string, "af1:chunk:"));
+    try std.testing.expectEqualStrings("chunk", items[0].object.get("artifact_ref").?.object.get("kind").?.string);
+    try std.testing.expectEqual(@as(i64, 0), items[0].object.get("artifact_ref").?.object.get("chunk_id").?.integer);
+    try std.testing.expectEqualStrings("hello", items[0].object.get("value").?.object.get("_content").?.string);
+
+    const embedding = artifacts.get("body_dense_v1").?.object;
+    try std.testing.expect(std.mem.startsWith(u8, embedding.get("artifact_id").?.string, "af1:embedding:"));
+    try std.testing.expectEqualStrings("embedding", embedding.get("kind").?.string);
+    try std.testing.expectEqualStrings("application/vnd.antfly.embedding+binary", embedding.get("content_type").?.string);
+    try std.testing.expectEqual(@as(i64, 3), embedding.get("dims").?.integer);
+    try std.testing.expect(embedding.get("value").? == .null);
+}
+
 test "db search includes chunk artifacts on hydrated hits when _chunks is requested" {
     const alloc = std.testing.allocator;
 
@@ -32583,27 +32844,48 @@ test "db lookup loads embeddings for _embeddings.* selector and allows nested pr
 
 test "db field selection plan only enables chunk special field for explicit include-all selectors" {
     const none = db_query_projection.buildFieldSelectionPlan(&.{"_chunks.body_chunks_v1.0._content"}, false);
+    try std.testing.expect(!none.special.all_artifacts);
     try std.testing.expect(!none.special.all_chunks);
     try std.testing.expect(!none.special.all_embeddings);
 
+    const artifacts_none = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
+    try std.testing.expect(!artifacts_none.special.all_artifacts);
+    try std.testing.expect(!artifacts_none.special.all_chunks);
+    try std.testing.expect(!artifacts_none.special.all_embeddings);
+
+    const artifacts_plain = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts"}, false);
+    try std.testing.expect(artifacts_plain.special.all_artifacts);
+    try std.testing.expect(!artifacts_plain.special.all_chunks);
+    try std.testing.expect(!artifacts_plain.special.all_embeddings);
+
+    const artifacts_wildcard = db_query_projection.buildFieldSelectionPlan(&.{ "_artifacts.*", "_artifacts.body_chunks_v1.items" }, false);
+    try std.testing.expect(artifacts_wildcard.special.all_artifacts);
+    try std.testing.expect(!artifacts_wildcard.special.all_chunks);
+    try std.testing.expect(!artifacts_wildcard.special.all_embeddings);
+
     const all_plain = db_query_projection.buildFieldSelectionPlan(&.{"_chunks"}, false);
+    try std.testing.expect(!all_plain.special.all_artifacts);
     try std.testing.expect(all_plain.special.all_chunks);
     try std.testing.expect(!all_plain.special.all_embeddings);
 
     const all_wildcard = db_query_projection.buildFieldSelectionPlan(&.{ "_chunks.*", "_chunks.body_chunks_v1.0._content" }, false);
+    try std.testing.expect(!all_wildcard.special.all_artifacts);
     try std.testing.expect(all_wildcard.special.all_chunks);
     try std.testing.expect(!all_wildcard.special.all_embeddings);
     try std.testing.expectEqual(@as(usize, 2), all_wildcard.projection.fields.len);
 
     const embedding_none = db_query_projection.buildFieldSelectionPlan(&.{"_embeddings.body_dense_v1"}, false);
+    try std.testing.expect(!embedding_none.special.all_artifacts);
     try std.testing.expect(!embedding_none.special.all_chunks);
     try std.testing.expect(!embedding_none.special.all_embeddings);
 
     const embedding_plain = db_query_projection.buildFieldSelectionPlan(&.{"_embeddings"}, false);
+    try std.testing.expect(!embedding_plain.special.all_artifacts);
     try std.testing.expect(!embedding_plain.special.all_chunks);
     try std.testing.expect(embedding_plain.special.all_embeddings);
 
     const embedding_wildcard = db_query_projection.buildFieldSelectionPlan(&.{ "_embeddings.*", "_embeddings.body_dense_v1" }, false);
+    try std.testing.expect(!embedding_wildcard.special.all_artifacts);
     try std.testing.expect(!embedding_wildcard.special.all_chunks);
     try std.testing.expect(embedding_wildcard.special.all_embeddings);
     try std.testing.expectEqual(@as(usize, 2), embedding_wildcard.projection.fields.len);
