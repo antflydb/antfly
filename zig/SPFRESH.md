@@ -26,7 +26,7 @@ separated enough that posting updates can stay local.
 Current status:
 
 - Phase 1 is implemented.
-- `lib/vectorindex/src/posting.zig` defines the initial `PostingId`,
+- `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/posting.zig` defines the initial `PostingId`,
   `PostingView`, `PostingStore`, `AssignmentMap`, and `CentroidDirectory`
   names.
 - Existing vector-to-leaf assignment storage now flows through
@@ -313,7 +313,7 @@ search performance alone.
    file:
 
    ```text
-   lib/vectorindex/src/
+   go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/
      hbc_index.zig       # base HBC tree/index mechanics and public facade
      spfresh_index.zig   # SPFresh-style posting maintenance layer
      posting.zig         # shared posting data/state helpers

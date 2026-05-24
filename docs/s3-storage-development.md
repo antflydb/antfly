@@ -16,20 +16,20 @@ This guide is for developers working on Antfly's S3 storage implementation. It c
 ### Component Overview
 
 ```
-src/common/config.go
+go/pkg/antfly/src/common/config.go
   ├─ S3Info struct (configuration)
   └─ Validation logic
 
-src/store/s3storage/
+go/pkg/antfly/src/store/s3storage/
   ├─ s3storage.go (base S3 storage backend)
   └─ leader_aware.go (leadership-aware wrapper)
 
-src/store/db.go
+go/pkg/antfly/src/store/db.go
   ├─ DBImpl struct (isLeader, s3Storage fields)
   ├─ Open() (Pebble initialization with S3)
   └─ LeaderFactory() (leadership state management)
 
-src/raft/raft.go
+go/pkg/antfly/src/raft/raft.go
   └─ Leadership change detection → LeaderFactory
 ```
 
@@ -49,12 +49,12 @@ type Storage interface {
 }
 ```
 
-Our implementation: `src/store/s3storage/s3storage.go`
+Our implementation: `go/pkg/antfly/src/store/s3storage/s3storage.go`
 
 #### 2. LeaderAwareS3Storage Wrapper
 
 ```go
-// src/store/s3storage/leader_aware.go
+// go/pkg/antfly/src/store/s3storage/leader_aware.go
 type LeaderAwareS3Storage struct {
     underlying *S3Storage
     isLeader   *atomic.Bool
@@ -85,7 +85,7 @@ func (s *LeaderAwareS3Storage) Delete(objectName string) error {
 ### Configuration Structure
 
 ```go
-// src/common/config.go
+// go/pkg/antfly/src/common/config.go
 type S3Info struct {
     Enabled          bool   `yaml:"enabled"`
     Endpoint         string `yaml:"endpoint"`         // Required if enabled
@@ -127,7 +127,7 @@ func (s *S3Info) Validate() error {
 #### 1. Struct Fields
 
 ```go
-// src/store/db.go
+// go/pkg/antfly/src/store/db.go
 type DBImpl struct {
     // ... existing fields ...
 
@@ -139,7 +139,7 @@ type DBImpl struct {
 #### 2. Initialization in Open()
 
 ```go
-// src/store/db.go
+// go/pkg/antfly/src/store/db.go
 func (db *DBImpl) Open() error {
     pebbleOpts := &pebble.Options{
         Logger: &logger.NoopLoggerAndTracer{},
@@ -205,7 +205,7 @@ func (db *DBImpl) Open() error {
 #### 3. LeaderFactory Updates
 
 ```go
-// src/store/db.go
+// go/pkg/antfly/src/store/db.go
 func (db *DBImpl) LeaderFactory(
     ctx context.Context,
     persistFunc PersistFunc,
@@ -248,7 +248,7 @@ func (db *DBImpl) LeaderFactory(
 ### S3Storage Implementation
 
 ```go
-// src/store/s3storage/s3storage.go
+// go/pkg/antfly/src/store/s3storage/s3storage.go
 type S3Storage struct {
     client *minio.Client
     bucket string
@@ -374,7 +374,7 @@ func (s *S3Storage) objectPath(name string) string {
 ### ObjectReader Implementation
 
 ```go
-// src/store/s3storage/s3storage.go
+// go/pkg/antfly/src/store/s3storage/s3storage.go
 type s3ObjectReader struct {
     obj  *minio.Object
     size int64
@@ -410,7 +410,7 @@ func (r *s3ObjectReader) NewReadHandle(ctx context.Context) remote.ReadHandle {
 #### 1. S3Storage Tests
 
 ```go
-// src/store/s3storage/s3storage_test.go
+// go/pkg/antfly/src/store/s3storage/s3storage_test.go
 func TestS3Storage_CreateAndRead(t *testing.T) {
     // Setup MinIO client (local or test container)
     client := setupMinioClient(t)
@@ -453,7 +453,7 @@ func TestS3Storage_CreateAndRead(t *testing.T) {
 #### 2. LeaderAwareS3Storage Tests
 
 ```go
-// src/store/s3storage/leader_aware_test.go
+// go/pkg/antfly/src/store/s3storage/leader_aware_test.go
 func TestLeaderAwareS3Storage_OnlyLeaderWrites(t *testing.T) {
     isLeader := &atomic.Bool{}
     baseS3 := setupBaseS3(t)
@@ -497,7 +497,7 @@ func TestLeaderAwareS3Storage_OnlyLeaderWrites(t *testing.T) {
 #### 1. Three-Node Raft Cluster Test
 
 ```go
-// src/store/db_test.go
+// go/pkg/antfly/src/store/db_test.go
 func TestDBImpl_S3Storage_LeaderOnlyWrites(t *testing.T) {
     // Start 3-node Raft cluster with S3 enabled
     nodes := startTestCluster(t, 3, withS3Config(testS3Config))
@@ -544,7 +544,7 @@ func TestDBImpl_S3Storage_LeaderOnlyWrites(t *testing.T) {
 #### 2. Shard Split Test
 
 ```go
-// src/store/db_test.go
+// go/pkg/antfly/src/store/db_test.go
 func TestDBImpl_S3Storage_FastSplits(t *testing.T) {
     db := setupDBWithS3(t)
     defer db.Close()
@@ -589,7 +589,7 @@ func TestDBImpl_S3Storage_FastSplits(t *testing.T) {
 ### Performance Benchmarks
 
 ```go
-// src/store/s3storage/s3storage_bench_test.go
+// go/pkg/antfly/src/store/s3storage/s3storage_bench_test.go
 func BenchmarkS3Storage_Write(b *testing.B) {
     storage := setupS3Storage(b)
     data := make([]byte, 1024*1024) // 1MB
@@ -623,7 +623,7 @@ func BenchmarkS3Storage_Read(b *testing.B) {
 ### Test Setup Helpers
 
 ```go
-// src/store/s3storage/testing.go
+// go/pkg/antfly/src/store/s3storage/testing.go
 func setupMinioClient(t *testing.T) *minio.Client {
     // Use testcontainers or local MinIO
     endpoint := os.Getenv("MINIO_ENDPOINT")
@@ -778,7 +778,7 @@ s3:
 
 For implementing new features:
 
-- [ ] Update configuration structs in `src/common/config.go`
+- [ ] Update configuration structs in `go/pkg/antfly/src/common/config.go`
 - [ ] Modify S3Storage interface implementation
 - [ ] Update LeaderAwareS3Storage wrapper if needed
 - [ ] Add logging for observability

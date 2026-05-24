@@ -83,15 +83,10 @@ jobs:
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
-            ':(glob)zig/**/*.zig' \
-            zig/build.zig \
-            zig/build.zig.zon \
-            zig/deps/snowball \
+            ':(glob)zig/**' \
             Makefile \
-            zig/Makefile \
             .github/workflows/zig-tests.yml \
-            .github/workflows/zig-container.yml \
-            zig/Dockerfile
+            .github/workflows/zig-container.yml
           then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
@@ -99,12 +94,8 @@ jobs:
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
-            ':(glob)zig/**/*.zig' \
-            ':(glob)zig/e2e/**' \
+            ':(glob)zig/**' \
             Makefile \
-            zig/build.zig \
-            zig/build.zig.zon \
-            zig/Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/zig-container.yml
           then
@@ -115,10 +106,9 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
-            ':(glob)zig/scripts/tla-*.sh' \
-            ':(glob)zig/scripts/tla-*.py' \
+            ':(glob)scripts/tla-*.sh' \
+            ':(glob)scripts/tla-*.py' \
             Makefile \
-            zig/Makefile \
             .github/workflows/zig-tests.yml
           then
             echo "model_check=false" >> "$GITHUB_OUTPUT"
@@ -128,14 +118,13 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
-            ':(glob)zig/scripts/tla-*.sh' \
-            ':(glob)zig/scripts/tla-*.py' \
+            ':(glob)scripts/tla-*.sh' \
+            ':(glob)scripts/tla-*.py' \
             ':(glob)zig/pkg/antfly/src/tracing/**' \
             ':(glob)zig/pkg/antfly/src/raft/**' \
             ':(glob)zig/pkg/antfly/src/storage/db/**' \
             ':(glob)zig/lib/raft/**' \
             Makefile \
-            zig/Makefile \
             zig/build.zig \
             .github/workflows/zig-tests.yml
           then
@@ -162,6 +151,9 @@ jobs:
           version: 0.16.0
           use-cache: false
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
       - name: Restore Zig build cache
         id: zig-cache
         uses: actions/cache/restore@v5
@@ -176,6 +168,9 @@ jobs:
 
       - name: Check Snowball generated sources
         run: make zig-snowball-check
+
+      - name: Check OpenAPI generated sources
+        run: make zig-openapi-check
 
   unit:
     needs: changes

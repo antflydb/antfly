@@ -50,8 +50,12 @@ wiki-articles*
 src/metadata/testdata/query_generation_*_results.json
 
 # e2e test results
-e2e/test_results/*.md
-e2e/models/
+go/e2e/test_results/*.md
+go/e2e/models/
+
+# Python SDK local caches
+py/.ruff_cache/
+py/.venv/
 
 # prometheus data
 /data/
@@ -61,7 +65,7 @@ e2e/models/
 *.tar.gz
 *.tar.sz
 *.tar.zst
-e2e/backups/*.afb
+go/e2e/backups/*.afb
 
 !antfly.json
 !antfly.go

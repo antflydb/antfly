@@ -17,7 +17,7 @@ ONNX Runtime is the universal backend (loads `.onnx` directly). MLX and BLAS nee
 
 ## What Stays in Go
 
-- `pkg/operator/` — Kubernetes operator (TermitePool, TermiteRoute CRDs)
+- `go/pkg/operator/` — Kubernetes operator (TermitePool, TermiteRoute CRDs)
 - `pkg/proxy/` — load-balancing proxy with circuit breaker
 - Dashboard HTML/JS serving
 

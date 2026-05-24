@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from attrs import define as _attrs_define
+from attrs import field as _attrs_field
+
+from ..models.termite_generate_response_format_type import TermiteGenerateResponseFormatType
+from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.termite_generate_json_schema_config import TermiteGenerateJsonSchemaConfig
+
+
+T = TypeVar("T", bound="TermiteGenerateResponseFormat")
+
+
+@_attrs_define
+class TermiteGenerateResponseFormat:
+    """
+    Attributes:
+        type_ (TermiteGenerateResponseFormatType): Structured output mode
+        json_schema (TermiteGenerateJsonSchemaConfig | Unset):
+    """
+
+    type_: TermiteGenerateResponseFormatType
+    json_schema: TermiteGenerateJsonSchemaConfig | Unset = UNSET
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        type_ = self.type_.value
+
+        json_schema: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.json_schema, Unset):
+            json_schema = self.json_schema.to_dict()
+
+        field_dict: dict[str, Any] = {}
+        field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "type": type_,
+            }
+        )
+        if json_schema is not UNSET:
+            field_dict["json_schema"] = json_schema
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.termite_generate_json_schema_config import TermiteGenerateJsonSchemaConfig
+
+        d = dict(src_dict)
+        type_ = TermiteGenerateResponseFormatType(d.pop("type"))
+
+        _json_schema = d.pop("json_schema", UNSET)
+        json_schema: TermiteGenerateJsonSchemaConfig | Unset
+        if isinstance(_json_schema, Unset):
+            json_schema = UNSET
+        else:
+            json_schema = TermiteGenerateJsonSchemaConfig.from_dict(_json_schema)
+
+        termite_generate_response_format = cls(
+            type_=type_,
+            json_schema=json_schema,
+        )
+
+        termite_generate_response_format.additional_properties = d
+        return termite_generate_response_format
+
+    @property
+    def additional_keys(self) -> list[str]:
+        return list(self.additional_properties.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        return self.additional_properties[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.additional_properties[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.additional_properties[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.additional_properties

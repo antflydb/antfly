@@ -5,13 +5,13 @@ on:
     branches: ["main"]
     paths:
       - "specs/tla/**"
-      - "src/tracing/**"
+      - "go/pkg/antfly/src/tracing/**"
       - "scripts/tla-*.sh"
   pull_request:
     branches: ["main"]
     paths:
       - "specs/tla/**"
-      - "src/tracing/**"
+      - "go/pkg/antfly/src/tracing/**"
       - "scripts/tla-*.sh"
   workflow_dispatch:
 

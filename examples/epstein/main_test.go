@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
-	termiteoapi "github.com/antflydb/antfly/pkg/termite-client/oapi"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	termiteoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -243,7 +243,7 @@ func TestSplitEntityWindowsRebasesAndOverlaps(t *testing.T) {
 }
 
 func TestOffsetAndDedupeEntities(t *testing.T) {
-	entities := []termiteoapi.RecognizeEntity{
+	entities := []termiteoapi.TermiteRecognizeEntity{
 		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.2},
 		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.9},
 	}
@@ -262,9 +262,9 @@ func TestOffsetAndDedupeEntities(t *testing.T) {
 }
 
 func TestDedupeRelationsKeepsHighestScore(t *testing.T) {
-	head := termiteoapi.RecognizeEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
-	tail := termiteoapi.RecognizeEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
-	relations := dedupeRelations([]termiteoapi.Relation{
+	head := termiteoapi.TermiteRecognizeEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
+	tail := termiteoapi.TermiteRecognizeEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
+	relations := dedupeRelations([]termiteoapi.TermiteRelation{
 		{Head: head, Tail: tail, Label: "worked for", Score: 0.4},
 		{Head: head, Tail: tail, Label: "worked for", Score: 0.8},
 	})

@@ -16,7 +16,7 @@ The common pattern is that dense derived apply is still finalizing too often.
 
 ## Why Not Add Another WAL
 
-The Go repo uses `lib/inflight/WALBuffer` to combine:
+The Go repo uses `go/pkg/antfly/lib/inflight/WALBuffer` to combine:
 
 - durability
 - microbatch scheduling
@@ -32,7 +32,7 @@ So the first inflight step here should only add microbatching. We should not add
 
 ## Placement
 
-This should not live in `lib/inflight/` yet.
+This should not live in `go/pkg/antfly/lib/inflight/` yet.
 
 The batching rules are still tightly coupled to the storage/db pipelines:
 
@@ -45,7 +45,7 @@ So the first reusable shell belongs under storage/db itself:
 - `pkg/antfly/src/storage/db/batcher.zig`
 
 If sparse/full-text/enrichment/graph all converge on a truly generic queue and
-flush contract later, we can promote that smaller core to `lib/`.
+flush contract later, we can promote that smaller core to `go/pkg/antfly/lib/`.
 
 ## First Narrow Implementation
 
@@ -86,7 +86,7 @@ If this first step helps:
 1. Add a longer-lived DB-level dense apply scope so multiple replay flushes share one ingest lifetime.
 2. Reuse the same batching shell for sparse/full-text/graph with index-specific merge behavior.
 3. Add enrichment-side request coalescing on the existing worker path.
-4. Only then consider a shared inflight framework or `lib/` promotion.
+4. Only then consider a shared inflight framework or `go/pkg/antfly/lib/` promotion.
 
 If this first step does not help enough:
 

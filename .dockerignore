@@ -9,7 +9,6 @@
 .aider*
 *aider*
 .dockerignore
-Procfile*
 README*
 
 # Test and example data

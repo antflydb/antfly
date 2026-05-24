@@ -50,7 +50,7 @@ timeout: 2400s
 
 substitutions:
   _IMAGE_NAME: antfly
-  _DOCKERFILE: Dockerfile
+  _DOCKERFILE: go/Dockerfile
   _CONTEXT: "."
   _ALIAS_TAG: latest
   _VERSION_TAG: latest

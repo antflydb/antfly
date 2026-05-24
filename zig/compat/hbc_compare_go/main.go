@@ -26,9 +26,9 @@ import (
 	"runtime/pprof"
 	"time"
 
-	"github.com/antflydb/antfly/lib/pebbleutils"
-	"github.com/antflydb/antfly/lib/vector"
-	"github.com/antflydb/antfly/lib/vectorindex"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/vector"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/vectorindex"
 	"github.com/cockroachdb/pebble/v2"
 )
 

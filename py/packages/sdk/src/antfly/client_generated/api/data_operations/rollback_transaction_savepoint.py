@@ -1,0 +1,190 @@
+from http import HTTPStatus
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from ... import errors
+from ...client import AuthenticatedClient, Client
+from ...models.error import Error
+from ...models.transaction_savepoint_response import TransactionSavepointResponse
+from ...types import Response
+
+
+def _get_kwargs(
+    transaction_id: str,
+    savepoint_id: str,
+) -> dict[str, Any]:
+
+    _kwargs: dict[str, Any] = {
+        "method": "post",
+        "url": "/api/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback".format(
+            transaction_id=quote(str(transaction_id), safe=""),
+            savepoint_id=quote(str(savepoint_id), safe=""),
+        ),
+    }
+
+    return _kwargs
+
+
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Error | TransactionSavepointResponse | None:
+    if response.status_code == 200:
+        response_200 = TransactionSavepointResponse.from_dict(response.json())
+
+        return response_200
+
+    if response.status_code == 400:
+        response_400 = Error.from_dict(response.json())
+
+        return response_400
+
+    if response.status_code == 404:
+        response_404 = Error.from_dict(response.json())
+
+        return response_404
+
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+
+    if response.status_code == 500:
+        response_500 = Error.from_dict(response.json())
+
+        return response_500
+
+    if client.raise_on_unexpected_status:
+        raise errors.UnexpectedStatus(response.status_code, response.content)
+    else:
+        return None
+
+
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Error | TransactionSavepointResponse]:
+    return Response(
+        status_code=HTTPStatus(response.status_code),
+        content=response.content,
+        headers=response.headers,
+        parsed=_parse_response(client=client, response=response),
+    )
+
+
+def sync_detailed(
+    transaction_id: str,
+    savepoint_id: str,
+    *,
+    client: AuthenticatedClient,
+) -> Response[Error | TransactionSavepointResponse]:
+    """Roll back a transaction session to a savepoint
+
+    Args:
+        transaction_id (str):
+        savepoint_id (str):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Error | TransactionSavepointResponse]
+    """
+
+    kwargs = _get_kwargs(
+        transaction_id=transaction_id,
+        savepoint_id=savepoint_id,
+    )
+
+    response = client.get_httpx_client().request(
+        **kwargs,
+    )
+
+    return _build_response(client=client, response=response)
+
+
+def sync(
+    transaction_id: str,
+    savepoint_id: str,
+    *,
+    client: AuthenticatedClient,
+) -> Error | TransactionSavepointResponse | None:
+    """Roll back a transaction session to a savepoint
+
+    Args:
+        transaction_id (str):
+        savepoint_id (str):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Error | TransactionSavepointResponse
+    """
+
+    return sync_detailed(
+        transaction_id=transaction_id,
+        savepoint_id=savepoint_id,
+        client=client,
+    ).parsed
+
+
+async def asyncio_detailed(
+    transaction_id: str,
+    savepoint_id: str,
+    *,
+    client: AuthenticatedClient,
+) -> Response[Error | TransactionSavepointResponse]:
+    """Roll back a transaction session to a savepoint
+
+    Args:
+        transaction_id (str):
+        savepoint_id (str):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Error | TransactionSavepointResponse]
+    """
+
+    kwargs = _get_kwargs(
+        transaction_id=transaction_id,
+        savepoint_id=savepoint_id,
+    )
+
+    response = await client.get_async_httpx_client().request(**kwargs)
+
+    return _build_response(client=client, response=response)
+
+
+async def asyncio(
+    transaction_id: str,
+    savepoint_id: str,
+    *,
+    client: AuthenticatedClient,
+) -> Error | TransactionSavepointResponse | None:
+    """Roll back a transaction session to a savepoint
+
+    Args:
+        transaction_id (str):
+        savepoint_id (str):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Error | TransactionSavepointResponse
+    """
+
+    return (
+        await asyncio_detailed(
+            transaction_id=transaction_id,
+            savepoint_id=savepoint_id,
+            client=client,
+        )
+    ).parsed

@@ -18,7 +18,6 @@
     "@antfly/components": "workspace:*",
     "@antfly/design-system": "workspace:*",
     "@antfly/sdk": "workspace:*",
-    "@antfly/termite-sdk": "workspace:*",
     "@hookform/resolvers": "^5.2.2",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-avatar": "^1.1.11",

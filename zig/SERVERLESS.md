@@ -503,8 +503,8 @@ These parts are good candidates to keep and build on.
 
 - `pkg/antfly/src/index.zig`
 - `pkg/antfly/src/search/*`
-- `lib/vector/src/*`
-- `lib/vectorindex/src/*`
+- `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
+- `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`
 - `pkg/antfly/src/section/*`
 - `pkg/antfly/src/segment.zig`
 - `pkg/antfly/src/columnar.zig`
@@ -747,7 +747,7 @@ Optional GCS settings:
 - `GCS_JSON_API_UPLOAD_ENDPOINT`
 
 The first fully automated path is service-account auth. That now lives in
-`lib/objectstore/src/google_auth.zig` and is specific to the GCS objectstore
+`go/pkg/antfly/lib/objectstore/go/pkg/antfly/src/google_auth.zig` and is specific to the GCS objectstore
 integration rather than a generic repo-wide OAuth framework.
 
 ### Runtime Examples
@@ -1206,7 +1206,7 @@ Suggested responsibilities:
 - integrity metadata
 
 The transport seam beneath this should now be a dedicated
-`lib/objectstore/` package rather than ad hoc `file://` handling. That package
+`go/pkg/antfly/lib/objectstore/` package rather than ad hoc `file://` handling. That package
 needs to cover the MinIO/S3-compatible feature surface already used by the Go
 repository:
 
@@ -1327,8 +1327,8 @@ The existing stateful path remains:
 The shared engine pieces remain reusable:
 
 - `pkg/antfly/src/search/*`
-- `lib/vector/src/*`
-- `lib/vectorindex/src/*`
+- `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
+- `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`
 - `pkg/antfly/src/index.zig`
 - `pkg/antfly/src/segment.zig`
 - `pkg/antfly/src/section/*`
@@ -1479,7 +1479,7 @@ Work:
 - keep objectstore-backed adapters for artifacts, WAL, manifests, and progress
   behind the shared objectstore seam
 - keep `file://` as the initial shared-filesystem backend
-- make serverless remote adapters depend on `lib/objectstore/`
+- make serverless remote adapters depend on `go/pkg/antfly/lib/objectstore/`
 - preserve the current serverless store interfaces above that seam
 
 Acceptance:
@@ -1600,8 +1600,8 @@ proof.
 - make the query runtime reuse:
   - `pkg/antfly/src/index.zig`
   - `pkg/antfly/src/search/*`
-  - `lib/vector/src/*`
-  - `lib/vectorindex/src/*`
+  - `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
+  - `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`
 
 ### Tranche 4: WAL and Builder
 

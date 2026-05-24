@@ -29,13 +29,12 @@ import (
 	"unicode"
 
 	"github.com/ajroetker/pdf"
-	antfly "github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/docsaf"
-	generatingreading "github.com/antflydb/antfly/pkg/generating/reading"
-	libai "github.com/antflydb/antfly/pkg/libaf/ai"
-	libreading "github.com/antflydb/antfly/pkg/libaf/reading"
-	termiteclient "github.com/antflydb/antfly/pkg/termite-client"
-	termiteoapi "github.com/antflydb/antfly/pkg/termite-client/oapi"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	generatingreading "github.com/antflydb/antfly/go/pkg/generating/reading"
+	libai "github.com/antflydb/antfly/go/pkg/libaf/ai"
+	libreading "github.com/antflydb/antfly/go/pkg/libaf/reading"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	termiteoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -3090,8 +3089,8 @@ type entityWindowSpan struct {
 }
 
 type entityAccum struct {
-	entities         []termiteoapi.RecognizeEntity
-	relations        []termiteoapi.Relation
+	entities         []termiteoapi.TermiteRecognizeEntity
+	relations        []termiteoapi.TermiteRelation
 	failed           []entityWindowSpan
 	windows          int
 	errors           int
@@ -3168,7 +3167,7 @@ func entitiesCmd(args []string) error {
 		return writeJSONSorted(outPath, records)
 	}
 
-	client, err := termiteclient.NewTermiteClient(*termiteURL, http.DefaultClient)
+	client, err := antfly.NewTermiteClient(*termiteURL, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("create termite client: %w", err)
 	}
@@ -3437,7 +3436,7 @@ func chooseEntityWindowEnd(runes []rune, start, hardEnd int) int {
 
 func recognizeEntityWindows(
 	ctx context.Context,
-	client *termiteclient.TermiteClient,
+	client *antfly.TermiteClient,
 	model string,
 	labels []string,
 	relationLabels []string,
@@ -3462,7 +3461,7 @@ func recognizeEntityWindows(
 
 func recognizeEntityWindowBatch(
 	ctx context.Context,
-	client *termiteclient.TermiteClient,
+	client *antfly.TermiteClient,
 	model string,
 	labels []string,
 	relationLabels []string,
@@ -3479,7 +3478,7 @@ func recognizeEntityWindowBatch(
 	}
 
 	var (
-		resp *termiteoapi.RecognizeResponse
+		resp *termiteoapi.TermiteRecognizeResponse
 		err  error
 	)
 	if len(relationLabels) > 0 {
@@ -3512,6 +3511,17 @@ func recognizeEntityWindowBatch(
 		usedModel = model
 	}
 
+	resultsByIndex := make(map[int]termiteoapi.TermiteRecognizeObject, len(resp.Data))
+	for resultIdx, result := range resp.Data {
+		idx := result.Index
+		if idx < 0 || idx >= len(windows) {
+			idx = resultIdx
+		}
+		if idx >= 0 && idx < len(windows) {
+			resultsByIndex[idx] = result
+		}
+	}
+
 	for i, window := range windows {
 		a := accum[window.id]
 		if a == nil {
@@ -3519,33 +3529,33 @@ func recognizeEntityWindowBatch(
 		}
 		a.windows++
 
-		if i < len(resp.Entities) {
-			a.entities = append(a.entities, offsetEntities(resp.Entities[i], window.start)...)
+		result, ok := resultsByIndex[i]
+		if !ok {
+			continue
 		}
-		if i < len(resp.Relations) {
-			a.relations = append(a.relations, offsetRelations(resp.Relations[i], window.start)...)
-		}
+		a.entities = append(a.entities, offsetEntities(result.Entities, window.start)...)
+		a.relations = append(a.relations, offsetRelations(result.Relations, window.start)...)
 	}
 
 	return usedModel, len(windows), 0
 }
 
-func offsetEntities(entities []termiteoapi.RecognizeEntity, base int) []termiteoapi.RecognizeEntity {
-	out := make([]termiteoapi.RecognizeEntity, len(entities))
+func offsetEntities(entities []termiteoapi.TermiteRecognizeEntity, base int) []termiteoapi.TermiteRecognizeEntity {
+	out := make([]termiteoapi.TermiteRecognizeEntity, len(entities))
 	for i, entity := range entities {
 		out[i] = offsetEntity(entity, base)
 	}
 	return out
 }
 
-func offsetEntity(entity termiteoapi.RecognizeEntity, base int) termiteoapi.RecognizeEntity {
+func offsetEntity(entity termiteoapi.TermiteRecognizeEntity, base int) termiteoapi.TermiteRecognizeEntity {
 	entity.Start += base
 	entity.End += base
 	return entity
 }
 
-func offsetRelations(relations []termiteoapi.Relation, base int) []termiteoapi.Relation {
-	out := make([]termiteoapi.Relation, len(relations))
+func offsetRelations(relations []termiteoapi.TermiteRelation, base int) []termiteoapi.TermiteRelation {
+	out := make([]termiteoapi.TermiteRelation, len(relations))
 	for i, relation := range relations {
 		relation.Head = offsetEntity(relation.Head, base)
 		relation.Tail = offsetEntity(relation.Tail, base)
@@ -3554,15 +3564,15 @@ func offsetRelations(relations []termiteoapi.Relation, base int) []termiteoapi.R
 	return out
 }
 
-func metadataEntities(value any) []termiteoapi.RecognizeEntity {
+func metadataEntities(value any) []termiteoapi.TermiteRecognizeEntity {
 	items, ok := value.([]any)
 	if !ok {
-		if entities, ok := value.([]termiteoapi.RecognizeEntity); ok {
-			return append([]termiteoapi.RecognizeEntity(nil), entities...)
+		if entities, ok := value.([]termiteoapi.TermiteRecognizeEntity); ok {
+			return append([]termiteoapi.TermiteRecognizeEntity(nil), entities...)
 		}
 		return nil
 	}
-	entities := make([]termiteoapi.RecognizeEntity, 0, len(items))
+	entities := make([]termiteoapi.TermiteRecognizeEntity, 0, len(items))
 	for _, item := range items {
 		entity, ok := metadataEntity(item)
 		if ok {
@@ -3572,15 +3582,15 @@ func metadataEntities(value any) []termiteoapi.RecognizeEntity {
 	return entities
 }
 
-func metadataRelations(value any) []termiteoapi.Relation {
+func metadataRelations(value any) []termiteoapi.TermiteRelation {
 	items, ok := value.([]any)
 	if !ok {
-		if relations, ok := value.([]termiteoapi.Relation); ok {
-			return append([]termiteoapi.Relation(nil), relations...)
+		if relations, ok := value.([]termiteoapi.TermiteRelation); ok {
+			return append([]termiteoapi.TermiteRelation(nil), relations...)
 		}
 		return nil
 	}
-	relations := make([]termiteoapi.Relation, 0, len(items))
+	relations := make([]termiteoapi.TermiteRelation, 0, len(items))
 	for _, item := range items {
 		relation, ok := metadataRelation(item)
 		if ok {
@@ -3590,15 +3600,15 @@ func metadataRelations(value any) []termiteoapi.Relation {
 	return relations
 }
 
-func metadataEntity(value any) (termiteoapi.RecognizeEntity, bool) {
-	if entity, ok := value.(termiteoapi.RecognizeEntity); ok {
+func metadataEntity(value any) (termiteoapi.TermiteRecognizeEntity, bool) {
+	if entity, ok := value.(termiteoapi.TermiteRecognizeEntity); ok {
 		return entity, true
 	}
 	m, ok := value.(map[string]any)
 	if !ok {
-		return termiteoapi.RecognizeEntity{}, false
+		return termiteoapi.TermiteRecognizeEntity{}, false
 	}
-	return termiteoapi.RecognizeEntity{
+	return termiteoapi.TermiteRecognizeEntity{
 		Text:  metadataString(m["text"]),
 		Label: metadataString(m["label"]),
 		Start: metadataInt(m["start"]),
@@ -3607,20 +3617,20 @@ func metadataEntity(value any) (termiteoapi.RecognizeEntity, bool) {
 	}, true
 }
 
-func metadataRelation(value any) (termiteoapi.Relation, bool) {
-	if relation, ok := value.(termiteoapi.Relation); ok {
+func metadataRelation(value any) (termiteoapi.TermiteRelation, bool) {
+	if relation, ok := value.(termiteoapi.TermiteRelation); ok {
 		return relation, true
 	}
 	m, ok := value.(map[string]any)
 	if !ok {
-		return termiteoapi.Relation{}, false
+		return termiteoapi.TermiteRelation{}, false
 	}
 	head, headOK := metadataEntity(m["head"])
 	tail, tailOK := metadataEntity(m["tail"])
 	if !headOK || !tailOK {
-		return termiteoapi.Relation{}, false
+		return termiteoapi.TermiteRelation{}, false
 	}
-	return termiteoapi.Relation{
+	return termiteoapi.TermiteRelation{
 		Head:  head,
 		Label: metadataString(m["label"]),
 		Score: metadataFloat32(m["score"]),
@@ -3692,8 +3702,8 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
-func dedupeEntities(entities []termiteoapi.RecognizeEntity) []termiteoapi.RecognizeEntity {
-	byKey := make(map[string]termiteoapi.RecognizeEntity, len(entities))
+func dedupeEntities(entities []termiteoapi.TermiteRecognizeEntity) []termiteoapi.TermiteRecognizeEntity {
+	byKey := make(map[string]termiteoapi.TermiteRecognizeEntity, len(entities))
 	for _, entity := range entities {
 		key := entityKey(entity)
 		if existing, ok := byKey[key]; !ok || entity.Score > existing.Score {
@@ -3701,11 +3711,11 @@ func dedupeEntities(entities []termiteoapi.RecognizeEntity) []termiteoapi.Recogn
 		}
 	}
 
-	out := make([]termiteoapi.RecognizeEntity, 0, len(byKey))
+	out := make([]termiteoapi.TermiteRecognizeEntity, 0, len(byKey))
 	for _, entity := range byKey {
 		out = append(out, entity)
 	}
-	slices.SortFunc(out, func(a, b termiteoapi.RecognizeEntity) int {
+	slices.SortFunc(out, func(a, b termiteoapi.TermiteRecognizeEntity) int {
 		if a.Start != b.Start {
 			return a.Start - b.Start
 		}
@@ -3720,8 +3730,8 @@ func dedupeEntities(entities []termiteoapi.RecognizeEntity) []termiteoapi.Recogn
 	return out
 }
 
-func dedupeRelations(relations []termiteoapi.Relation) []termiteoapi.Relation {
-	byKey := make(map[string]termiteoapi.Relation, len(relations))
+func dedupeRelations(relations []termiteoapi.TermiteRelation) []termiteoapi.TermiteRelation {
+	byKey := make(map[string]termiteoapi.TermiteRelation, len(relations))
 	for _, relation := range relations {
 		key := relationKey(relation)
 		if existing, ok := byKey[key]; !ok || relation.Score > existing.Score {
@@ -3729,11 +3739,11 @@ func dedupeRelations(relations []termiteoapi.Relation) []termiteoapi.Relation {
 		}
 	}
 
-	out := make([]termiteoapi.Relation, 0, len(byKey))
+	out := make([]termiteoapi.TermiteRelation, 0, len(byKey))
 	for _, relation := range byKey {
 		out = append(out, relation)
 	}
-	slices.SortFunc(out, func(a, b termiteoapi.Relation) int {
+	slices.SortFunc(out, func(a, b termiteoapi.TermiteRelation) int {
 		if a.Head.Start != b.Head.Start {
 			return a.Head.Start - b.Head.Start
 		}
@@ -3751,11 +3761,11 @@ func dedupeRelations(relations []termiteoapi.Relation) []termiteoapi.Relation {
 	return out
 }
 
-func entityKey(entity termiteoapi.RecognizeEntity) string {
+func entityKey(entity termiteoapi.TermiteRecognizeEntity) string {
 	return fmt.Sprintf("%s\x00%s\x00%d\x00%d", entity.Label, entity.Text, entity.Start, entity.End)
 }
 
-func relationKey(relation termiteoapi.Relation) string {
+func relationKey(relation termiteoapi.TermiteRelation) string {
 	return fmt.Sprintf("%s\x00%s\x00%s", relation.Label, entityKey(relation.Head), entityKey(relation.Tail))
 }
 

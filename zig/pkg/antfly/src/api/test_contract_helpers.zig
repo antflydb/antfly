@@ -18,7 +18,7 @@ const embeddings_openapi = @import("antfly_embeddings_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
-const bleve_openapi = @import("antfly_bleve_query_openapi");
+const query_openapi = @import("antfly_query_openapi");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -316,7 +316,7 @@ pub fn encodeMatchQueryRequestWithFlags(
     count: bool,
     profile: bool,
 ) ![]u8 {
-    const full_text_json = try stringifyJsonAlloc(alloc, bleve_openapi.MatchQuery{
+    const full_text_json = try stringifyJsonAlloc(alloc, query_openapi.MatchQuery{
         .match = text,
         .field = field,
     });
@@ -345,7 +345,7 @@ pub fn encodeFilteredQueryRequest(
     fields: []const []const u8,
     limit: i64,
 ) ![]u8 {
-    const full_text_json = try stringifyJsonAlloc(alloc, bleve_openapi.MatchQuery{
+    const full_text_json = try stringifyJsonAlloc(alloc, query_openapi.MatchQuery{
         .match = match_text,
         .field = match_field,
     });
@@ -353,7 +353,7 @@ pub fn encodeFilteredQueryRequest(
     var full_text = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
     defer full_text.deinit();
 
-    const filter_json = try stringifyJsonAlloc(alloc, bleve_openapi.TermQuery{
+    const filter_json = try stringifyJsonAlloc(alloc, query_openapi.TermQuery{
         .term = filter_term,
         .field = filter_field,
     });
@@ -361,7 +361,7 @@ pub fn encodeFilteredQueryRequest(
     var filter = try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{});
     defer filter.deinit();
 
-    const exclusion_json = try stringifyJsonAlloc(alloc, bleve_openapi.TermQuery{
+    const exclusion_json = try stringifyJsonAlloc(alloc, query_openapi.TermQuery{
         .term = exclusion_term,
         .field = exclusion_field,
     });
@@ -378,7 +378,7 @@ pub fn encodeFilteredQueryRequest(
     });
 }
 
-pub fn encodeBleveQueryRequest(
+pub fn encodeQueryRequest(
     alloc: std.mem.Allocator,
     query_value: anytype,
     fields: []const []const u8,
@@ -679,7 +679,7 @@ pub fn encodeMatchGraphTraverseFromResultRefQueryRequest(
     max_depth: i64,
     limit: i64,
 ) ![]u8 {
-    const full_text_json = try stringifyJsonAlloc(alloc, bleve_openapi.MatchQuery{
+    const full_text_json = try stringifyJsonAlloc(alloc, query_openapi.MatchQuery{
         .match = text,
         .field = field,
     });
