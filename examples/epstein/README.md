@@ -207,8 +207,10 @@ Flags:
   --termite-url     Termite URL (default: ANTFLY_TERMITE_URL or http://localhost:8080)
   --model           Recognizer model (default: fastino/gliner2-base-v1)
   --labels          Entity labels to extract
-  --relation-labels Optional relation labels to extract
-  --batch-size      Texts per Termite recognize request (default: 16)
+  --relation-labels Relation labels to extract (default: associated with, communicated with, traveled to, visited, worked for, represented by, mentioned in, located in)
+  --batch-size      Text windows per Termite recognize request (default: 16)
+  --max-chars       Maximum characters per recognizer window (default: 3000)
+  --overlap-chars   Characters of overlap between recognizer windows (default: 300)
   --reprocess       Re-process records that already have entities
 ```
 
@@ -252,6 +254,7 @@ Documents are indexed with:
 3. **Entity Metadata** (optional)
    - `epstein entities` stores recognized entities in `metadata.entities`
    - Optional relations are stored in `metadata.relations`
+   - Long pages are processed as overlapping windows and offsets are rebased to the page
    - The search UI displays entity chips when present
 
 ### Search

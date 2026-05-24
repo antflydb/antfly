@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	termiteoapi "github.com/antflydb/antfly/pkg/termite-client/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -174,6 +175,95 @@ func TestExtractEntityChipsDedupesAndLimits(t *testing.T) {
 	}
 	if chips[1] != (EntityChip{Text: "Acme", Label: "organization"}) {
 		t.Fatalf("chips[1] = %#v", chips[1])
+	}
+}
+
+func TestSplitEntityWindowsRebasesAndOverlaps(t *testing.T) {
+	candidate := entityCandidate{
+		id:      "page-1",
+		content: "Alpha Beta Gamma Delta Epsilon Zeta Eta Theta",
+	}
+	windows := splitEntityWindows(candidate, 20, 5)
+	if len(windows) < 2 {
+		t.Fatalf("len(windows) = %d, want at least 2", len(windows))
+	}
+	if windows[0].id != "page-1" || windows[0].start != 0 {
+		t.Fatalf("first window = %#v", windows[0])
+	}
+	if windows[1].start <= windows[0].start {
+		t.Fatalf("second window start = %d, want > %d", windows[1].start, windows[0].start)
+	}
+	if !strings.Contains(windows[1].content, "Delta") {
+		t.Fatalf("second window content = %q, want overlap around Delta", windows[1].content)
+	}
+}
+
+func TestOffsetAndDedupeEntities(t *testing.T) {
+	entities := []termiteoapi.RecognizeEntity{
+		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.2},
+		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.9},
+	}
+
+	rebased := offsetEntities(entities, 10)
+	deduped := dedupeEntities(rebased)
+	if len(deduped) != 1 {
+		t.Fatalf("len(deduped) = %d, want 1", len(deduped))
+	}
+	if deduped[0].Start != 12 || deduped[0].End != 16 {
+		t.Fatalf("deduped offsets = %d-%d, want 12-16", deduped[0].Start, deduped[0].End)
+	}
+	if deduped[0].Score != 0.9 {
+		t.Fatalf("deduped score = %v, want highest score", deduped[0].Score)
+	}
+}
+
+func TestDedupeRelationsKeepsHighestScore(t *testing.T) {
+	head := termiteoapi.RecognizeEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
+	tail := termiteoapi.RecognizeEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
+	relations := dedupeRelations([]termiteoapi.Relation{
+		{Head: head, Tail: tail, Label: "worked for", Score: 0.4},
+		{Head: head, Tail: tail, Label: "worked for", Score: 0.8},
+	})
+
+	if len(relations) != 1 {
+		t.Fatalf("len(relations) = %d, want 1", len(relations))
+	}
+	if relations[0].Score != 0.8 {
+		t.Fatalf("deduped relation score = %v, want highest score", relations[0].Score)
+	}
+}
+
+func TestClearEntityMetadataRemovesPriorRunFields(t *testing.T) {
+	meta := map[string]any{
+		"entities":              []any{"stale"},
+		"entity_model":          "old",
+		"entity_labels":         []string{"person"},
+		"entity_window_chars":   500,
+		"entity_overlap_chars":  50,
+		"relations":             []any{"stale"},
+		"relation_labels":       []string{"worked for"},
+		"entity_error_windows":  2,
+		"unrelated_page_source": "kept",
+	}
+
+	clearEntityMetadata(meta)
+
+	for _, key := range []string{
+		"entities",
+		"entity_model",
+		"entity_labels",
+		"entity_window_chars",
+		"entity_overlap_chars",
+		"relations",
+		"relation_labels",
+		"entity_error_windows",
+	} {
+		if _, ok := meta[key]; ok {
+			t.Fatalf("metadata key %q was not cleared", key)
+		}
+	}
+	if meta["unrelated_page_source"] != "kept" {
+		t.Fatalf("unrelated metadata was changed: %#v", meta)
 	}
 }
 

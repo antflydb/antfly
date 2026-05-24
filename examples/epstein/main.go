@@ -26,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/ajroetker/pdf"
 	antfly "github.com/antflydb/antfly/pkg/client"
@@ -197,7 +198,9 @@ const (
 	DefaultOCRModel        = "Xenova/trocr-base-printed"
 	DefaultRecognizerModel = "fastino/gliner2-base-v1"
 	DefaultEntityLabels    = "person,organization,location,date,case,document,facility,aircraft"
-	DefaultRelationLabels  = "associated_with,located_in,mentioned_in,employed_by,traveled_to"
+	DefaultRelationLabels  = "associated with,communicated with,traveled to,visited,worked for,represented by,mentioned in,located in"
+	DefaultEntityMaxChars  = 3000
+	DefaultEntityOverlap   = 300
 )
 
 // Archive.org download URLs for Epstein documents
@@ -3073,6 +3076,19 @@ type entityCandidate struct {
 	content string
 }
 
+type entityWindow struct {
+	id      string
+	content string
+	start   int
+}
+
+type entityAccum struct {
+	entities  []termiteoapi.RecognizeEntity
+	relations []termiteoapi.Relation
+	windows   int
+	errors    int
+}
+
 // entitiesCmd enriches prepared page records with NER metadata from Termite.
 func entitiesCmd(args []string) error {
 	fs := flag.NewFlagSet("entities", flag.ExitOnError)
@@ -3081,8 +3097,10 @@ func entitiesCmd(args []string) error {
 	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite service URL")
 	model := fs.String("model", DefaultRecognizerModel, "Recognizer model for entity extraction")
 	labelsCSV := fs.String("labels", DefaultEntityLabels, "Entity labels to extract (comma-separated)")
-	relationLabelsCSV := fs.String("relation-labels", "", "Relation labels to extract (comma-separated; optional)")
-	batchSize := fs.Int("batch-size", 16, "Texts per Termite recognize request")
+	relationLabelsCSV := fs.String("relation-labels", DefaultRelationLabels, "Relation labels to extract (comma-separated; pass an empty value to disable)")
+	batchSize := fs.Int("batch-size", 16, "Text windows per Termite recognize request")
+	maxChars := fs.Int("max-chars", DefaultEntityMaxChars, "Maximum characters per recognizer window")
+	overlapChars := fs.Int("overlap-chars", DefaultEntityOverlap, "Characters of overlap between recognizer windows")
 	dryRun := fs.Bool("dry-run", false, "Report candidates only, don't process")
 	reprocess := fs.Bool("reprocess", false, "Re-process records that already have entity metadata")
 
@@ -3091,6 +3109,15 @@ func entitiesCmd(args []string) error {
 	}
 	if *batchSize <= 0 {
 		return fmt.Errorf("batch-size must be positive")
+	}
+	if *maxChars <= 0 {
+		return fmt.Errorf("max-chars must be positive")
+	}
+	if *overlapChars < 0 {
+		return fmt.Errorf("overlap-chars must be non-negative")
+	}
+	if *overlapChars >= *maxChars {
+		return fmt.Errorf("overlap-chars must be smaller than max-chars")
 	}
 
 	outPath := *outputFile
@@ -3111,6 +3138,7 @@ func entitiesCmd(args []string) error {
 	if len(relationLabels) > 0 {
 		fmt.Printf("Relation labels: %s\n", strings.Join(relationLabels, ", "))
 	}
+	fmt.Printf("Window: %d chars with %d overlap\n", *maxChars, *overlapChars)
 	fmt.Println()
 
 	records, err := readJSONFile[map[string]map[string]any](*inputFile)
@@ -3119,8 +3147,10 @@ func entitiesCmd(args []string) error {
 	}
 
 	candidates := entityCandidates(records, *reprocess)
+	windows := entityWindows(candidates, *maxChars, *overlapChars)
 	fmt.Printf("Total records: %d\n", len(records))
 	fmt.Printf("Entity candidates: %d\n", len(candidates))
+	fmt.Printf("Entity windows: %d\n", len(windows))
 	if *dryRun {
 		fmt.Printf("Dry run complete. Use without -dry-run to process.\n")
 		return nil
@@ -3134,53 +3164,59 @@ func entitiesCmd(args []string) error {
 		return fmt.Errorf("create termite client: %w", err)
 	}
 
-	var processed, entityCount, relationCount int
-	for start := 0; start < len(candidates); start += *batchSize {
-		end := min(start+*batchSize, len(candidates))
-		batch := candidates[start:end]
-		ids := make([]string, len(batch))
-		texts := make([]string, len(batch))
-		for i, candidate := range batch {
-			ids[i] = candidate.id
-			texts[i] = candidate.content
+	accum := make(map[string]*entityAccum, len(candidates))
+	for _, candidate := range candidates {
+		accum[candidate.id] = &entityAccum{}
+	}
+
+	usedModel, processedWindows, failedWindows := recognizeEntityWindows(
+		context.Background(),
+		client,
+		*model,
+		labels,
+		relationLabels,
+		windows,
+		*batchSize,
+		accum,
+	)
+	if usedModel == "" {
+		usedModel = *model
+	}
+
+	var processedRecords, recordsWithErrors, entityCount, relationCount int
+	for _, candidate := range candidates {
+		a := accum[candidate.id]
+		if a == nil {
+			continue
+		}
+		if a.windows == 0 && a.errors == 0 {
+			continue
 		}
 
-		var resp *termiteoapi.RecognizeResponse
-		if len(relationLabels) > 0 {
-			resp, err = client.ExtractRelations(context.Background(), *model, texts, labels, relationLabels)
-		} else {
-			resp, err = client.Recognize(context.Background(), *model, texts, labels)
-		}
-		if err != nil {
-			return fmt.Errorf("recognize batch %d-%d: %w", start+1, end, err)
-		}
+		meta := ensureRecordMetadata(records[candidate.id])
+		clearEntityMetadata(meta)
+		if a.windows > 0 {
+			entities := dedupeEntities(a.entities)
+			relations := dedupeRelations(a.relations)
 
-		usedModel := resp.Model
-		if usedModel == "" {
-			usedModel = *model
-		}
-
-		for i, id := range ids {
-			meta := ensureRecordMetadata(records[id])
-			entities := []termiteoapi.RecognizeEntity(nil)
-			if i < len(resp.Entities) {
-				entities = resp.Entities[i]
-			}
 			meta["entities"] = entities
 			meta["entity_model"] = usedModel
 			meta["entity_labels"] = labels
+			meta["entity_window_chars"] = *maxChars
+			meta["entity_overlap_chars"] = *overlapChars
 			entityCount += len(entities)
+			processedRecords++
 
-			if i < len(resp.Relations) {
-				relations := resp.Relations[i]
+			if len(relationLabels) > 0 {
 				meta["relations"] = relations
 				meta["relation_labels"] = relationLabels
 				relationCount += len(relations)
 			}
 		}
-
-		processed += len(batch)
-		fmt.Printf("  Processed %d/%d records...\n", processed, len(candidates))
+		if a.errors > 0 {
+			meta["entity_error_windows"] = a.errors
+			recordsWithErrors++
+		}
 	}
 
 	if err := writeJSONSorted(outPath, records); err != nil {
@@ -3188,7 +3224,10 @@ func entitiesCmd(args []string) error {
 	}
 
 	fmt.Printf("\n=== Entities Summary ===\n")
-	fmt.Printf("  Records processed: %d\n", processed)
+	fmt.Printf("  Records processed: %d\n", processedRecords)
+	fmt.Printf("  Windows processed: %d\n", processedWindows)
+	fmt.Printf("  Window errors: %d\n", failedWindows)
+	fmt.Printf("  Records with errors: %d\n", recordsWithErrors)
 	fmt.Printf("  Entities extracted: %d\n", entityCount)
 	fmt.Printf("  Relations extracted: %d\n", relationCount)
 	fmt.Printf("\nWrote %s\n", outPath)
@@ -3219,6 +3258,263 @@ func entityCandidates(records map[string]map[string]any, reprocess bool) []entit
 		candidates = append(candidates, entityCandidate{id: id, content: content})
 	}
 	return candidates
+}
+
+func clearEntityMetadata(meta map[string]any) {
+	delete(meta, "entities")
+	delete(meta, "entity_model")
+	delete(meta, "entity_labels")
+	delete(meta, "entity_window_chars")
+	delete(meta, "entity_overlap_chars")
+	delete(meta, "relations")
+	delete(meta, "relation_labels")
+	delete(meta, "entity_error_windows")
+}
+
+func entityWindows(candidates []entityCandidate, maxChars, overlapChars int) []entityWindow {
+	var windows []entityWindow
+	for _, candidate := range candidates {
+		windows = append(windows, splitEntityWindows(candidate, maxChars, overlapChars)...)
+	}
+	return windows
+}
+
+func splitEntityWindows(candidate entityCandidate, maxChars, overlapChars int) []entityWindow {
+	runes := []rune(candidate.content)
+	if len(runes) == 0 {
+		return nil
+	}
+	if maxChars <= 0 || len(runes) <= maxChars {
+		return []entityWindow{{id: candidate.id, content: candidate.content, start: 0}}
+	}
+	if overlapChars < 0 {
+		overlapChars = 0
+	}
+	if overlapChars >= maxChars {
+		overlapChars = maxChars / 4
+	}
+
+	windows := make([]entityWindow, 0, len(runes)/maxChars+1)
+	for start := 0; start < len(runes); {
+		end := min(start+maxChars, len(runes))
+		if end < len(runes) {
+			end = chooseEntityWindowEnd(runes, start, end)
+		}
+
+		content := string(runes[start:end])
+		if strings.TrimSpace(content) != "" {
+			windows = append(windows, entityWindow{
+				id:      candidate.id,
+				content: content,
+				start:   start,
+			})
+		}
+		if end >= len(runes) {
+			break
+		}
+
+		next := end - overlapChars
+		if next <= start {
+			next = end
+		}
+		start = next
+	}
+	return windows
+}
+
+func chooseEntityWindowEnd(runes []rune, start, hardEnd int) int {
+	minEnd := start + ((hardEnd - start) * 2 / 3)
+	for i := hardEnd - 1; i > minEnd; i-- {
+		if unicode.IsSpace(runes[i]) {
+			return i + 1
+		}
+	}
+	return hardEnd
+}
+
+func recognizeEntityWindows(
+	ctx context.Context,
+	client *termiteclient.TermiteClient,
+	model string,
+	labels []string,
+	relationLabels []string,
+	windows []entityWindow,
+	batchSize int,
+	accum map[string]*entityAccum,
+) (string, int, int) {
+	var usedModel string
+	var processed, failed int
+	for start := 0; start < len(windows); start += batchSize {
+		end := min(start+batchSize, len(windows))
+		batchModel, batchProcessed, batchFailed := recognizeEntityWindowBatch(ctx, client, model, labels, relationLabels, windows[start:end], accum)
+		if usedModel == "" {
+			usedModel = batchModel
+		}
+		processed += batchProcessed
+		failed += batchFailed
+		fmt.Printf("  Processed %d/%d windows (%d failed)...\n", processed+failed, len(windows), failed)
+	}
+	return usedModel, processed, failed
+}
+
+func recognizeEntityWindowBatch(
+	ctx context.Context,
+	client *termiteclient.TermiteClient,
+	model string,
+	labels []string,
+	relationLabels []string,
+	windows []entityWindow,
+	accum map[string]*entityAccum,
+) (string, int, int) {
+	if len(windows) == 0 {
+		return "", 0, 0
+	}
+
+	texts := make([]string, len(windows))
+	for i, window := range windows {
+		texts[i] = window.content
+	}
+
+	var (
+		resp *termiteoapi.RecognizeResponse
+		err  error
+	)
+	if len(relationLabels) > 0 {
+		resp, err = client.ExtractRelations(ctx, model, texts, labels, relationLabels)
+	} else {
+		resp, err = client.Recognize(ctx, model, texts, labels)
+	}
+	if err != nil {
+		if len(windows) > 1 {
+			mid := len(windows) / 2
+			leftModel, leftProcessed, leftFailed := recognizeEntityWindowBatch(ctx, client, model, labels, relationLabels, windows[:mid], accum)
+			rightModel, rightProcessed, rightFailed := recognizeEntityWindowBatch(ctx, client, model, labels, relationLabels, windows[mid:], accum)
+			if leftModel != "" {
+				return leftModel, leftProcessed + rightProcessed, leftFailed + rightFailed
+			}
+			return rightModel, leftProcessed + rightProcessed, leftFailed + rightFailed
+		}
+
+		window := windows[0]
+		if a := accum[window.id]; a != nil {
+			a.errors++
+		}
+		log.Printf("Warning: entity recognition failed for %s at char %d: %v", window.id, window.start, err)
+		return "", 0, 1
+	}
+
+	usedModel := resp.Model
+	if usedModel == "" {
+		usedModel = model
+	}
+
+	for i, window := range windows {
+		a := accum[window.id]
+		if a == nil {
+			continue
+		}
+		a.windows++
+
+		if i < len(resp.Entities) {
+			a.entities = append(a.entities, offsetEntities(resp.Entities[i], window.start)...)
+		}
+		if i < len(resp.Relations) {
+			a.relations = append(a.relations, offsetRelations(resp.Relations[i], window.start)...)
+		}
+	}
+
+	return usedModel, len(windows), 0
+}
+
+func offsetEntities(entities []termiteoapi.RecognizeEntity, base int) []termiteoapi.RecognizeEntity {
+	out := make([]termiteoapi.RecognizeEntity, len(entities))
+	for i, entity := range entities {
+		out[i] = offsetEntity(entity, base)
+	}
+	return out
+}
+
+func offsetEntity(entity termiteoapi.RecognizeEntity, base int) termiteoapi.RecognizeEntity {
+	entity.Start += base
+	entity.End += base
+	return entity
+}
+
+func offsetRelations(relations []termiteoapi.Relation, base int) []termiteoapi.Relation {
+	out := make([]termiteoapi.Relation, len(relations))
+	for i, relation := range relations {
+		relation.Head = offsetEntity(relation.Head, base)
+		relation.Tail = offsetEntity(relation.Tail, base)
+		out[i] = relation
+	}
+	return out
+}
+
+func dedupeEntities(entities []termiteoapi.RecognizeEntity) []termiteoapi.RecognizeEntity {
+	byKey := make(map[string]termiteoapi.RecognizeEntity, len(entities))
+	for _, entity := range entities {
+		key := entityKey(entity)
+		if existing, ok := byKey[key]; !ok || entity.Score > existing.Score {
+			byKey[key] = entity
+		}
+	}
+
+	out := make([]termiteoapi.RecognizeEntity, 0, len(byKey))
+	for _, entity := range byKey {
+		out = append(out, entity)
+	}
+	slices.SortFunc(out, func(a, b termiteoapi.RecognizeEntity) int {
+		if a.Start != b.Start {
+			return a.Start - b.Start
+		}
+		if a.End != b.End {
+			return a.End - b.End
+		}
+		if c := strings.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Text, b.Text)
+	})
+	return out
+}
+
+func dedupeRelations(relations []termiteoapi.Relation) []termiteoapi.Relation {
+	byKey := make(map[string]termiteoapi.Relation, len(relations))
+	for _, relation := range relations {
+		key := relationKey(relation)
+		if existing, ok := byKey[key]; !ok || relation.Score > existing.Score {
+			byKey[key] = relation
+		}
+	}
+
+	out := make([]termiteoapi.Relation, 0, len(byKey))
+	for _, relation := range byKey {
+		out = append(out, relation)
+	}
+	slices.SortFunc(out, func(a, b termiteoapi.Relation) int {
+		if a.Head.Start != b.Head.Start {
+			return a.Head.Start - b.Head.Start
+		}
+		if a.Tail.Start != b.Tail.Start {
+			return a.Tail.Start - b.Tail.Start
+		}
+		if c := strings.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Head.Text, b.Head.Text); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Tail.Text, b.Tail.Text)
+	})
+	return out
+}
+
+func entityKey(entity termiteoapi.RecognizeEntity) string {
+	return fmt.Sprintf("%s\x00%s\x00%d\x00%d", entity.Label, entity.Text, entity.Start, entity.End)
+}
+
+func relationKey(relation termiteoapi.Relation) string {
+	return fmt.Sprintf("%s\x00%s\x00%s", relation.Label, entityKey(relation.Head), entityKey(relation.Tail))
 }
 
 func ensureRecordMetadata(rec map[string]any) map[string]any {
