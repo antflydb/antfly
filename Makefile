@@ -106,9 +106,7 @@ build-go: build-antfarm generate
 	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
 
 build-docs:
-	uv run --project scripts --locked python scripts/join_openapi.py specs/openapi/antfly/public.yaml
-	uv run --project scripts --locked python scripts/join_public_openapi.py
-	uv run --project scripts --locked python scripts/join_openapi.py openapi.yaml
+	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
 
 generate: build-docs tidy
 	$(GO) generate ./...

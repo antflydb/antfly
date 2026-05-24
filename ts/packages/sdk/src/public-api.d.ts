@@ -6329,6 +6329,11 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * @description Field type annotations for schema fields
+         * @enum {string}
+         */
+        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
         /** @description Field mapping to apply when a dynamic template matches */
         TemplateFieldMapping: {
             type?: components["schemas"]["AntflyType-2"];
@@ -7960,11 +7965,6 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
-        /**
-         * @description Field type annotations for schema fields
-         * @enum {string}
-         */
-        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
         TermiteError: {
             /** @description Error message */
             error: string;

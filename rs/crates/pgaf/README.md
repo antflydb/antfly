@@ -166,7 +166,7 @@ SELECT antfly_status('http://localhost:8080/api/v1/');
 ## Architecture
 
 pgaf depends on `antfly-sdk`, a sibling crate in the `rs/` workspace that
-generates a typed Rust SDK from `specs/openapi/public.yaml` via [Progenitor](https://github.com/oxidecomputer/progenitor).
+generates a typed Rust SDK from root `openapi.yaml` via [Progenitor](https://github.com/oxidecomputer/progenitor).
 pgaf uses the shared types (e.g. `QueryResponses`, `QueryHit`) for
 deserialization but keeps its own blocking HTTP client (Postgres extensions
 cannot run an async runtime).

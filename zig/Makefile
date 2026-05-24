@@ -59,15 +59,13 @@ generate: openapi-generate snowball-generate ## Regenerate checked-in generated 
 generated-check: openapi-check snowball-check ## Check all checked-in generated sources are current.
 
 openapi-generate:
-	$(SCRIPTS_PY) ../scripts/join_openapi.py ../specs/openapi/antfly/public.yaml
-	$(SCRIPTS_PY) ../scripts/join_openapi.py openapi.yaml
+	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
 	$(ZIG) build regen-openapi
 
 openapi-check:
-	$(SCRIPTS_PY) ../scripts/join_openapi.py --compare ../specs/openapi/antfly/public.yaml
-	$(SCRIPTS_PY) ../scripts/join_openapi.py --compare openapi.yaml
+	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
 	$(ZIG) build regen-openapi
-	test -z "$$(git status --porcelain -- ../specs/openapi/antfly/public.yaml openapi.yaml pkg/antfly/src/openapi/generated pkg/termite/src/api/generated)"
+	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/termite/src/api/generated)"
 
 snowball-generate:
 	$(ZIG) build regen-snowball

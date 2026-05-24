@@ -116,10 +116,10 @@ make cleanup-goreman
 
 ```bash
 # Standard build
-docker build -t antfly .
+docker build -f go/Dockerfile -t antfly .
 
 # Omni build (ONNX + XLA backends)
-docker build -f Dockerfile.omni -t antfly:omni .
+docker build -f go/Dockerfile.omni -t antfly:omni .
 ```
 
 ## Multi-Module Structure

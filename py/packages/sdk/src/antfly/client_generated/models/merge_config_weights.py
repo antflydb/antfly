@@ -16,7 +16,7 @@ class MergeConfigWeights:
     Unspecified indexes default to 1.0. Applied in both RRF and RSF.
 
         Example:
-            {'full_text': 0.3, 'title_embedding': 1}
+            {'full_text': 0.3, 'title_embedding': 1.0}
 
     """
 

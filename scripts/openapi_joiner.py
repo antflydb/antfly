@@ -26,7 +26,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
 USERMGR_SPEC = ROOT / "specs/openapi/antfly/usermgr.yaml"
-ROOT_SPEC = ROOT / "zig/openapi.yaml"
+ROOT_SPEC = ROOT / "openapi.yaml"
 GO_SCHEMA_SPEC = (ROOT / "lib/schema/openapi.yaml").resolve()
 GO_INDEX_SPEC = (ROOT / "src/store/db/indexes/openapi.yaml").resolve()
 GO_INDEX_REF_PATHS = {

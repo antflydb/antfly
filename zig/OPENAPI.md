@@ -28,11 +28,10 @@ zig build regen-openapi
 
 Repo-local specs:
 
-- `../specs/openapi/antfly/public.yaml`: bundled public Antfly API spec
+- `../openapi.yaml`: bundled public Antfly and Termite API spec
 - `../specs/openapi/antfly/metadata.yaml`: Antfly metadata/table API
 - `../specs/openapi/antfly/usermgr.yaml`: Antfly user-management API
 - `../specs/openapi/termite/api.yaml`: Termite public API
-- `openapi.yaml`: compatibility copy of the bundled public Antfly API spec
 - `specs/openai-openapi.yaml`: vendored OpenAI API schema used for types
 
 Some shared provider/config schemas are still read from the sibling
@@ -92,7 +91,7 @@ zig build openapi-root-check
 cd pkg/termite && zig build test
 ```
 
-`openapi-root-check` verifies that the bundled `openapi.yaml` matches the
+`openapi-root-check` verifies that the root `openapi.yaml` matches the
 modular Antfly specs.
 
 ## Runtime Paths

@@ -26,7 +26,7 @@ class Pruner:
                 exceeds this percentage of the total score range (max - min).
                 Detects "elbows" in score distributions regardless of score scale.
                 For example, 30.0 stops when a gap spans 30% of the score range.
-                 Example: 30.
+                 Example: 30.0.
             min_absolute_score (float | Unset): Hard minimum score threshold. Results with scores below this value
                 are excluded regardless of other pruning settings.
                  Example: 0.01.

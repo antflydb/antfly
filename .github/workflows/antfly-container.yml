@@ -78,7 +78,7 @@ jobs:
             --region="${GAR_LOCATION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=AntflyDB - Distributed document database with vector search for AI applications multi-arch image"
+            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=go/Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=AntflyDB - Distributed document database with vector search for AI applications multi-arch image"
 
       - name: Build and push GAR antfly omni image with Cloud Build
         run: |
@@ -106,7 +106,7 @@ jobs:
             --region="${GAR_LOCATION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=Dockerfile.omni,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=omni-${VERSION},_CACHE_TAG=omni-buildcache,_PLATFORMS=linux/amd64,_DESCRIPTION=AntflyDB omni image"
+            --substitutions="_IMAGE_NAME=${GAR_IMAGE},_DOCKERFILE=go/Dockerfile.omni,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=omni-${VERSION},_CACHE_TAG=omni-buildcache,_PLATFORMS=linux/amd64,_DESCRIPTION=AntflyDB omni image"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4

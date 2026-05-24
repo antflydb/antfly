@@ -177,7 +177,7 @@ make docker-build
 
 # Build the Antfly database image (assumes you have the Antfly source)
 # Replace with your actual Antfly build process
-docker build -t antfly:latest /path/to/antfly/source
+docker build -f /path/to/antfly/source/go/Dockerfile -t antfly:latest /path/to/antfly/source
 
 # Load images into minikube
 minikube image load antfly-operator:latest

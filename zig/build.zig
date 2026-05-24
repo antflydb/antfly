@@ -724,8 +724,8 @@ fn addYamlOpenApiModule(
 }
 
 fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
-    const check = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--compare"});
-    check.addFileArg(b.path("openapi.yaml"));
+    const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
+    check.addFileArg(b.path("../openapi.yaml"));
     return check;
 }
 

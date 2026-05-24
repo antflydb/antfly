@@ -1,7 +1,7 @@
 .PHONY: generate clean install test build publish docs fmt check update-deps
 
 generate:
-	uv run openapi-python-client generate --path ../../../specs/openapi/public.yaml --output-path src/antfly --overwrite --config .openapi-generator-config.yaml
+	uv run openapi-python-client generate --path ../../../openapi.yaml --output-path src/antfly --overwrite --config .openapi-generator-config.yaml
 	uv run ruff check src/antfly/client_generated --fix
 	uv run ruff format src/antfly/client_generated
 

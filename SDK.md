@@ -9,20 +9,19 @@ surfaces from one package per language.
   owner:
   - `specs/openapi/antfly/metadata.yaml`
   - `specs/openapi/antfly/usermgr.yaml`
-  - `specs/openapi/antfly/public.yaml`
+  - `specs/openapi/antfly/query.yaml`
   - `specs/openapi/termite/api.yaml`
-- The public SDK contract is `specs/openapi/public.yaml`.
+- The public SDK contract is the root `openapi.yaml`.
 - `scripts/join_openapi.py` builds the Antfly public source contract.
-- `scripts/join_public_openapi.py` joins Antfly and Termite into the public SDK
-  contract.
+- `scripts/join_public_openapi.py` joins Antfly and Termite into `openapi.yaml`.
 - Public route prefixes are part of the joined contract:
   - Antfly data API: `/api/v1`
   - Auth API: `/auth/v1`
   - Termite ML API: `/ml/v1`
 
 Zig remains the owner of the source OpenAPI contracts and generated server/client
-code. Public SDKs must generate from `specs/openapi/public.yaml`, not from the
-split Antfly or Termite source specs.
+code. Public SDKs must generate from root `openapi.yaml`, not from the split
+Antfly or Termite source specs.
 
 ## Package Layout
 
@@ -72,7 +71,7 @@ server root before issuing requests to the joined paths.
 ## Generation Rule
 
 All public SDK generated clients and types must be regenerated from
-`specs/openapi/public.yaml`:
+root `openapi.yaml`:
 
 - Go: `go/pkg/sdk/oapi`
 - TypeScript: `ts/packages/sdk/src/public-api.d.ts`

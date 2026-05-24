@@ -30,7 +30,7 @@ class MergeConfig:
             index;
             embedding index names for vector indexes.
             Unspecified indexes default to 1.0. Applied in both RRF and RSF.
-             Example: {'full_text': 0.3, 'title_embedding': 1}.
+             Example: {'full_text': 0.3, 'title_embedding': 1.0}.
         window_size (int | Unset): RSF normalization window size. Defaults to `limit`.
         rank_constant (float | Unset): RRF k constant (1/(k+rank)). Defaults to 60.0.
     """

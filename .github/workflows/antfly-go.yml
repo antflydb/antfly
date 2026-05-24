@@ -9,7 +9,7 @@ on:
     paths-ignore:
       - "*.md"
       - "docs/**"
-      - "Dockerfile*"
+      - "go/Dockerfile*"
       - "zig/**"
       - "ts/**"
       - "py/**"
@@ -28,7 +28,7 @@ on:
     paths-ignore:
       - "*.md"
       - "docs/**"
-      - "Dockerfile*"
+      - "go/Dockerfile*"
       - "zig/**"
       - "ts/**"
       - "py/**"
@@ -109,7 +109,6 @@ jobs:
           (cd go/pkg/sdk && GOWORK=off go generate ./...)
           status="$(git status --porcelain -- \
             openapi.yaml \
-            specs/openapi/public.yaml \
             go/pkg/sdk/oapi/client.gen.go)"
           if [ -n "$status" ]; then
             echo "$status"

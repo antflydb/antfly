@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ../../../specs/openapi/public.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../openapi.yaml
 
 package sdk
 

@@ -5,7 +5,7 @@
 # Default priority: [onnx, xla, go]
 #
 # Build:
-#   docker build -f Dockerfile.omni -t ghcr.io/antflydb/antfly:omni .
+#   docker build -f go/Dockerfile.omni -t ghcr.io/antflydb/antfly:omni .
 #
 # Build arguments:
 #   --build-arg GO_VERSION=1.26              Override Go version

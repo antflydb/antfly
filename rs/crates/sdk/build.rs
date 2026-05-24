@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    let spec_path = Path::new("../../../specs/openapi/public.yaml");
+    let spec_path = Path::new("../../../openapi.yaml");
     println!("cargo::rerun-if-changed={}", spec_path.display());
 
     let yaml = fs::read_to_string(spec_path).expect("failed to read OpenAPI spec");

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -24,9 +25,9 @@ from openapi_spec_validator import validate_spec
 
 
 ROOT = Path(__file__).resolve().parent.parent
-ANTFLY_SPEC = ROOT / "specs/openapi/antfly/public.yaml"
+JOIN_OPENAPI = ROOT / "scripts/join_openapi.py"
 TERMITE_SPEC = ROOT / "specs/openapi/termite/api.yaml"
-OUTPUT = ROOT / "specs/openapi/public.yaml"
+OUTPUT = ROOT / "openapi.yaml"
 
 
 class Dumper(yaml.SafeDumper):
@@ -52,6 +53,28 @@ def load_yaml(path: Path) -> dict:
     if not isinstance(data, dict):
         raise RuntimeError(f"expected mapping at {path}")
     return data
+
+
+def load_join_openapi():
+    spec = importlib.util.spec_from_file_location("antfly_join_openapi", JOIN_OPENAPI)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load OpenAPI joiner at {JOIN_OPENAPI}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def join_antfly_spec() -> dict:
+    module = load_join_openapi()
+    joiner = module.load_shared_joiner()
+    module.configure_for_repo_contracts(joiner)
+    metadata = joiner.load_yaml(joiner.METADATA_SPEC)
+    usermgr = joiner.load_yaml(joiner.USERMGR_SPEC)
+    module.push_root_security_to_operations(metadata)
+    module.push_root_security_to_operations(usermgr)
+    joined = joiner.bundle_joined_spec(joiner.join_specs(metadata, usermgr))
+    module.add_redocly_tag_groups(joined)
+    return joined
 
 
 def prefixed_path(prefix: str, path: str) -> str:
@@ -123,7 +146,7 @@ def merge_components(antfly: dict, termite: dict) -> dict:
 
 
 def join_specs() -> dict:
-    antfly = load_yaml(ANTFLY_SPEC)
+    antfly = join_antfly_spec()
     termite = load_yaml(TERMITE_SPEC)
 
     paths = {}
@@ -189,8 +212,17 @@ def dump_yaml(data: dict, output: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
-    output = ROOT / argv[0] if argv else OUTPUT
     spec = join_specs()
+    if argv and argv[0] == "--compare":
+        target = ROOT / (argv[1] if len(argv) > 1 else "openapi.yaml")
+        current = load_yaml(target)
+        if current != spec:
+            print(f"{target} differs from joined public OpenAPI contract")
+            return 1
+        print(f"{target} is current")
+        return 0
+
+    output = ROOT / argv[0] if argv else OUTPUT
     dump_yaml(spec, output)
     validate_spec(spec, base_uri=output.resolve().as_uri())
     print(f"wrote {output}")
