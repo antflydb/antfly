@@ -14,20 +14,20 @@ Use it to answer:
 
 The public contract target is the finished Go implementation:
 
-- [../antfly/openapi.yaml](/Users/ajroetker/go/src/github.com/antflydb/antfly/openapi.yaml)
+- [../antfly/openapi.yaml](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly/openapi.yaml)
   - `/backup`
   - `/restore`
   - `/backups`
   - `/tables/{tableName}/backup`
   - `/tables/{tableName}/restore`
-- [../antfly/go/e2e/backup_restore_test.go](/Users/ajroetker/go/src/github.com/antflydb/antfly/go/e2e/backup_restore_test.go)
+- [../antfly/go/e2e/backup_restore_test.go](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly/go/e2e/backup_restore_test.go)
 
 ## Current State
 
 ### Already Exists
 
 Low-level DB snapshot and restore primitives already exist in
-[db.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/src/storage/db/db.zig):
+[db.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/go/pkg/antfly/src/storage/db/db.zig):
 
 - `DB.snapshot(id)`
 - `DB.restoreSnapshotTo(snapshot_root, path, opts)`
@@ -312,9 +312,9 @@ Goal:
 
 Deliverables:
 
-- route match in `src/api/http_routes.zig`
-- handler in `src/api/http_server.zig`
-- backup service module, likely under `src/api` or `src/metadata`
+- route match in `go/pkg/antfly/src/api/http_routes.zig`
+- handler in `go/pkg/antfly/src/api/http_server.zig`
+- backup service module, likely under `go/pkg/antfly/src/api` or `go/pkg/antfly/src/metadata`
 - metadata lookup for the target table
 - per-shard snapshot export using existing `DB.snapshot(...)`
 - manifest + metadata file output under a `file://...` location
@@ -332,8 +332,8 @@ Goal:
 
 Deliverables:
 
-- route match in `src/api/http_routes.zig`
-- handler in `src/api/http_server.zig`
+- route match in `go/pkg/antfly/src/api/http_routes.zig`
+- handler in `go/pkg/antfly/src/api/http_server.zig`
 - restore service module
 - manifest load/validation
 - metadata creation or replacement for the target table

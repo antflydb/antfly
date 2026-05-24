@@ -3,15 +3,15 @@ module github.com/antflydb/antfly/go/e2e
 go 1.26.0
 
 replace (
-	github.com/antflydb/antfly => ../..
+	github.com/antflydb/antfly/go/pkg/antfly => ../pkg/antfly
+	github.com/antflydb/antfly/go/pkg/docsaf => ../pkg/docsaf
+	github.com/antflydb/antfly/go/pkg/evalaf => ../pkg/evalaf
+	github.com/antflydb/antfly/go/pkg/evalaf/plugins/antfly => ../pkg/evalaf/plugins/antfly
+	github.com/antflydb/antfly/go/pkg/generating => ../pkg/generating
+	github.com/antflydb/antfly/go/pkg/genkit/openrouter => ../pkg/genkit/openrouter
+	github.com/antflydb/antfly/go/pkg/libaf => ../pkg/libaf
 	github.com/antflydb/antfly/go/pkg/sdk => ../pkg/sdk
-	github.com/antflydb/antfly/pkg/docsaf => ../../pkg/docsaf
-	github.com/antflydb/antfly/pkg/evalaf => ../../pkg/evalaf
-	github.com/antflydb/antfly/pkg/evalaf/plugins/antfly => ../../pkg/evalaf/plugins/antfly
-	github.com/antflydb/antfly/pkg/generating => ../../pkg/generating
-	github.com/antflydb/antfly/pkg/genkit/openrouter => ../../pkg/genkit/openrouter
-	github.com/antflydb/antfly/pkg/libaf => ../../pkg/libaf
-	github.com/antflydb/antfly/pkg/termite => ../../pkg/termite
+	github.com/antflydb/antfly/go/pkg/termite => ../pkg/termite
 )
 
 replace github.com/danaugrs/go-tsne => github.com/danaugrs/go-tsne/tsne v0.0.0-20220306155740-2250969e057f
@@ -27,11 +27,11 @@ replace (
 )
 
 require (
-	github.com/antflydb/antfly v0.1.0
+	github.com/antflydb/antfly/go/pkg/antfly v0.0.0
+	github.com/antflydb/antfly/go/pkg/docsaf v0.0.0-00010101000000-000000000000
+	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
 	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
-	github.com/antflydb/antfly/pkg/docsaf v0.0.0-00010101000000-000000000000
-	github.com/antflydb/antfly/pkg/libaf v0.0.1
-	github.com/antflydb/antfly/pkg/termite v0.0.0
+	github.com/antflydb/antfly/go/pkg/termite v0.0.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/johannesboyne/gofakes3 v0.0.0-20260208201424-4c385a1f6a73
 	github.com/minio/minio-go/v7 v7.0.99
@@ -72,9 +72,9 @@ require (
 	github.com/antchfx/htmlquery v1.3.6 // indirect
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
-	github.com/antflydb/antfly/pkg/evalaf v0.0.0 // indirect
-	github.com/antflydb/antfly/pkg/generating v0.0.0 // indirect
-	github.com/antflydb/antfly/pkg/genkit/openrouter v0.0.0 // indirect
+	github.com/antflydb/antfly/go/pkg/evalaf v0.0.0 // indirect
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0 // indirect
+	github.com/antflydb/antfly/go/pkg/genkit/openrouter v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.7 // indirect

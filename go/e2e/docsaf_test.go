@@ -33,9 +33,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/docsaf"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/pkg/docsaf"
-	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
+	"github.com/antflydb/antfly/go/pkg/termite/lib/modelregistry"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"

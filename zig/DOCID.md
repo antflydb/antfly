@@ -660,7 +660,7 @@ not silently widen a filter.
 
 Introduce a dedicated codec module, for example:
 
-- `src/storage/key_codec.zig`
+- `go/pkg/antfly/src/storage/key_codec.zig`
 
 Suggested responsibilities:
 
@@ -737,10 +737,10 @@ The change is broader than `DocStore` alone.
 
 Primary places that must move off delimiter semantics:
 
-- `src/storage/docstore.zig`
-- `src/storage/db/db.zig`
-- `src/storage/ttl.zig`
-- `src/storage/db/catalog/index_manager.zig`
+- `go/pkg/antfly/src/storage/docstore.zig`
+- `go/pkg/antfly/src/storage/db/db.zig`
+- `go/pkg/antfly/src/storage/ttl.zig`
+- `go/pkg/antfly/src/storage/db/catalog/index_manager.zig`
 - any enrichment or artifact scan code that currently prefixes on raw `doc_key`
 - any graph-key parser that currently searches for `:i:`, `:out:`, or `:in:`
 

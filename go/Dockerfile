@@ -3,13 +3,9 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
-COPY go/cmd/antfly /app/go/cmd/antfly
-COPY pkg /app/pkg
-
-RUN go mod download
-
 COPY . .
+WORKDIR /app/go/pkg/antfly
+RUN go mod download
 
 # Declare build arguments for multi-arch support (automatically provided by Docker Buildx)
 ARG TARGETOS
@@ -17,7 +13,7 @@ ARG TARGETARCH
 
 # Build the applications as static binaries for the target platform.
 # This makes them portable and suitable for minimal container images.
-RUN GOEXPERIMENT=simd CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o antfly ./go/cmd/antfly
+RUN GOEXPERIMENT=simd CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o antfly ./cmd
 
 # Stage 2: Create the final, minimal image
 FROM --platform=$TARGETPLATFORM alpine:3.21
@@ -34,7 +30,7 @@ RUN addgroup -S -g ${ANTFLY_GID} antfly && \
     adduser -S -u ${ANTFLY_UID} -G antfly -h /home/antfly antfly
 
 # Copy the built binary from the builder stage
-COPY --from=builder /app/antfly /antfly
+COPY --from=builder /app/go/pkg/antfly/antfly /antfly
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

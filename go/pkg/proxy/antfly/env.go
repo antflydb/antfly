@@ -119,13 +119,13 @@ func NewGatewayFromEnv(getenv func(string) string) (*Gateway, error) {
 }
 
 type bearerTokenPrincipal struct {
-	Subject    string                        `json:"subject"`
-	Tenant     string                        `json:"tenant"`
-	Admin      bool                          `json:"admin"`
-	Tables     []string                      `json:"tables"`
-	Namespaces []string                      `json:"namespaces"`
-	Operations []string                      `json:"operations"`
-	RowFilter  map[string]json.RawMessage    `json:"row_filter,omitempty"`
+	Subject    string                     `json:"subject"`
+	Tenant     string                     `json:"tenant"`
+	Admin      bool                       `json:"admin"`
+	Tables     []string                   `json:"tables"`
+	Namespaces []string                   `json:"namespaces"`
+	Operations []string                   `json:"operations"`
+	RowFilter  map[string]json.RawMessage `json:"row_filter,omitempty"`
 }
 
 func parseBearerTokensJSON(raw string) (map[string]Principal, error) {

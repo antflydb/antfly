@@ -25,9 +25,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/pkg/libaf/json"
-	"github.com/antflydb/antfly/src/common"
 	"github.com/stretchr/testify/require"
 )
 

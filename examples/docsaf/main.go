@@ -12,8 +12,8 @@ import (
 	"time"
 
 	exampleentity "github.com/antflydb/antfly/examples/docsaf/entity"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/pkg/docsaf"
 )
 
 // StringSliceFlag allows repeated flags to build a slice

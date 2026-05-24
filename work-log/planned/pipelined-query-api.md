@@ -360,7 +360,7 @@ import (
     "fmt"
     "strings"
 
-    "github.com/antflydb/antfly/src/store/db/indexes"
+    "github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
 )
 
 // StageContext holds results from executed stages

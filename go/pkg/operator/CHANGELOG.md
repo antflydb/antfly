@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidated the previous Antfly and Termite operator modules into
   `go/pkg/operator` with one `cmd/antfly-operator` binary and one operator image.
 - Operator release tags now use `go/pkg/operator/v*`; the previous
-  `pkg/antfly-operator/v*` and `pkg/termite-operator/v*` tag streams are
+  `pkg/antfly-operator/v*` and `go/pkg/termite-operator/v*` tag streams are
   removed.
 
 ### Added

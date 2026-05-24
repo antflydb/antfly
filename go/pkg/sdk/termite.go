@@ -26,8 +26,8 @@ import (
 	"net/http"
 	"strings"
 
+	chunking "github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
-	chunking "github.com/antflydb/antfly/pkg/libaf/chunking"
 )
 
 // NewChatMessage creates a ChatMessage with string content.

@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/antflydb/antfly/pkg/docsaf"
-	docsafentity "github.com/antflydb/antfly/pkg/docsaf/entity"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	docsafentity "github.com/antflydb/antfly/go/pkg/docsaf/entity"
 	termiteclient "github.com/antflydb/antfly/go/pkg/sdk"
 )
 

@@ -101,7 +101,7 @@ jobs:
         run: make tidy-check
 
       - name: Verify Go modules
-        run: go mod download
+        run: cd go/pkg/antfly && GOWORK=off go mod download
 
       - name: Verify generated OpenAPI clients
         run: |
@@ -116,7 +116,7 @@ jobs:
           fi
 
       - name: Build Antfly
-        run: go build -v -o antfly ./go/cmd/antfly
+        run: cd go/pkg/antfly && GOWORK=off go build -v -o ../../../antfly ./cmd
 
       - name: Test swarm startup
         run: |
@@ -165,17 +165,17 @@ jobs:
         run: |
           packages=()
           while IFS= read -r pkg; do
-            if [ "$pkg" != "github.com/antflydb/antfly/src/sim" ]; then
+            if [ "$pkg" != "github.com/antflydb/antfly/go/pkg/antfly/src/sim" ]; then
               packages+=("$pkg")
             fi
-          done < <(go list ./...)
-          go test -v "${packages[@]}"
+          done < <(cd go/pkg/antfly && GOWORK=off go list ./...)
+          (cd go/pkg/antfly && GOWORK=off go test -v "${packages[@]}")
 
       - name: Build termite (pure Go)
         env:
           CGO_ENABLED: "0"
         run: |
-          for mod in pkg/termite go/pkg/sdk; do
+          for mod in go/pkg/termite go/pkg/sdk; do
             (cd $mod && GOWORK=off go build -v ./...)
           done
 
@@ -183,13 +183,13 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: |
-          for mod in pkg/termite go/pkg/sdk; do
+          for mod in go/pkg/termite go/pkg/sdk; do
             (cd $mod && GOWORK=off go test -v ./...)
           done
 
   sim-validate:
     runs-on: arc-antfly-heavy
-    # sim-validate runs `go test ./src/sim` under a wrapper; on the 4-cpu
+    # sim-validate runs `go test ./go/pkg/antfly/src/sim` under a wrapper; on the 4-cpu
     # standard runner with no /mnt/cache, it tipped past the 10Gi ephemeral
     # cap (or hit some pod-level cancel) ~3:30 in. Move it to heavy where
     # GOCACHE/GOMODCACHE land on the 50Gi cache PVC and there's enough CPU
@@ -225,7 +225,7 @@ jobs:
           echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
 
       - name: Verify Go modules
-        run: go mod download
+        run: cd go/pkg/antfly && GOWORK=off go mod download
 
       - name: Simulator Validate
         run: make sim-validate
@@ -300,7 +300,7 @@ jobs:
           pg_isready -h 127.0.0.1 -U antfly -d antfly_test
 
       - name: Verify Go modules
-        run: go mod download
+        run: cd go/pkg/antfly && GOWORK=off go mod download
 
       - name: Disk usage before E2E
         run: |
@@ -399,14 +399,14 @@ jobs:
           echo "GOMLX_BACKEND=xla:cpu" >> $GITHUB_ENV
 
       - name: Download dependencies
-        run: cd pkg/termite && GOWORK=off go mod download
+        run: cd go/pkg/termite && GOWORK=off go mod download
 
       - name: Build termite (omni)
         env:
           CGO_ENABLED: "1"
-        run: cd pkg/termite && GOWORK=off go build -v -tags="onnx,ORT,xla,XLA" ./...
+        run: cd go/pkg/termite && GOWORK=off go build -v -tags="onnx,ORT,xla,XLA" ./...
 
       - name: Test termite (omni)
         env:
           CGO_ENABLED: "1"
-        run: cd pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...
+        run: cd go/pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...

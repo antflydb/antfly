@@ -11,8 +11,8 @@ version: 2
 before:
   hooks:
     - ./scripts/completions.sh
-    - go mod tidy
-    - go generate ./...
+    - sh -c 'cd go/pkg/antfly && go mod tidy'
+    - sh -c 'cd go/pkg/antfly && go generate ./...'
 
 builds:
   # Go fallback build for platforms without the Zig runtime.
@@ -24,7 +24,8 @@ builds:
     goos:
       - windows
     id: "antfly-go-windows"
-    main: ./go/cmd/antfly
+    dir: ./go/pkg/antfly
+    main: ./cmd
     binary: antfly-go
     ignore:
       - goarch: "386"
@@ -91,7 +92,8 @@ builds:
       - linux
     goarch:
       - amd64
-    main: ./go/cmd/antfly
+    dir: ./go/pkg/antfly
+    main: ./cmd
     binary: antfly-go
 
   # Linux ARM64 Go fallback OMNI (ONNX + XLA) (cross-compile)
@@ -117,7 +119,8 @@ builds:
       - linux
     goarch:
       - arm64
-    main: ./go/cmd/antfly
+    dir: ./go/pkg/antfly
+    main: ./cmd
     binary: antfly-go
 
   # macOS ARM64 Go fallback OMNI (ONNX + XLA) (Zig cross-compilation)
@@ -144,7 +147,8 @@ builds:
       - darwin
     goarch:
       - arm64
-    main: ./go/cmd/antfly
+    dir: ./go/pkg/antfly
+    main: ./cmd
     binary: antfly-go
 
 archives:

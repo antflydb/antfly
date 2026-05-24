@@ -27,13 +27,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/antflydb/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/pkg/termite"
-	"github.com/antflydb/antfly/src/common"
-	"github.com/antflydb/antfly/src/metadata"
-	"github.com/antflydb/antfly/src/store"
-	"github.com/antflydb/antfly/src/store/db"
+	"github.com/antflydb/antfly/go/pkg/termite"
 	"go.uber.org/zap"
 )
 

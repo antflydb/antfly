@@ -29,8 +29,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
-	"github.com/antflydb/antfly/pkg/libaf/json"
 )
 
 // readSSEEvents reads SSE events from a reader and yields (eventType, data) pairs.

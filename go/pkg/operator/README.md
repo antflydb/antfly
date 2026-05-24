@@ -693,7 +693,7 @@ This guide primarily focuses on fresh installations. For operator upgrade proced
 
 ### Consolidated Operator Breaking Changes
 
-The standalone `pkg/antfly-operator` and `pkg/termite-operator` Go modules,
+The standalone `pkg/antfly-operator` and `go/pkg/termite-operator` Go modules,
 images, and release tag streams are removed. Operator releases now use
 `go/pkg/operator/v*` tags and the single consolidated operator image. The previous
 standalone Termite operator was not production-supported; existing TermitePool

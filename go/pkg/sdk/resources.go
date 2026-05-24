@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
-	"github.com/antflydb/antfly/pkg/libaf/json"
 )
 
 // CreateTable creates a new table

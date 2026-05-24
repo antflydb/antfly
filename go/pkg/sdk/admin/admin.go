@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/pkg/libaf/json"
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
 )
 
 // InternalClient provides access to internal admin APIs for cluster management

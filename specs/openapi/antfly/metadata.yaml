@@ -67,7 +67,7 @@ tags:
 
       Antfly provides auto-generated SDKs from the OpenAPI specification:
 
-      - **Go**: `github.com/antflydb/antfly/go/pkg/sdk/antfly`
+      - **Go**: `github.com/antflydb/antfly/go/pkg/sdk`
       - **TypeScript**: `@antflydb/antfly-ts` (npm)
       - **Python**: `antfly-python` (PyPI)
 
@@ -2999,7 +2999,7 @@ components:
             require_executable: true
             prefer_indexes: ["body_embedding"]
         generator:
-          $ref: "../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
     QueryBuilderResult:
       type: object
       required:
@@ -3565,12 +3565,12 @@ components:
           default: true
           description: Enable SSE streaming vs JSON response
         generator:
-          $ref: "../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: Generator for the retrieval agent's LLM calls
         chain:
           type: array
           items:
-            $ref: "../../../pkg/generating/openapi.yaml#/components/schemas/ChainLink"
+            $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/ChainLink"
           description: Chain of generators
         steps:
           $ref: "#/components/schemas/RetrievalAgentSteps"
@@ -3743,12 +3743,12 @@ components:
             DEPRECATED: Use stream on RetrievalAgentRequest instead.
             Enable SSE streaming vs JSON response.
         generator:
-          $ref: "../../../pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
           description: Generator for LLM calls
         chain:
           type: array
           items:
-            $ref: "../../../pkg/generating/openapi.yaml#/components/schemas/ChainLink"
+            $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/ChainLink"
           description: Chain of generators
         agent_knowledge:
           type: string

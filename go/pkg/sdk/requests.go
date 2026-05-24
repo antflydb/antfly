@@ -20,9 +20,9 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/antflydb/antfly/go/pkg/sdk/query"
-	"github.com/antflydb/antfly/pkg/libaf/json"
 )
 
 // BatchRequest represents a batch operation request with flexible insert types.

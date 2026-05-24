@@ -62,9 +62,9 @@ func executeSingleRetrievalQuery(
 				Limit:          10,
 			},
 		},
-		Generator:     cfg.generator,
+		Generator:             cfg.generator,
 		MaxInternalIterations: 0, // Pipeline mode: execute queries directly
-		Stream:        false,
+		Stream:                false,
 	}
 
 	resp, err := client.RetrievalAgent(ctx, req)
@@ -238,10 +238,10 @@ func testPipelineRetrieval(t *testing.T, ctx context.Context, client *antfly.Ant
 						Limit:          5,
 					},
 				},
-				Generator:      cfg.generator,
-				AgentKnowledge: cfg.agentKnowledge,
-				MaxInternalIterations:  0, // Pipeline mode
-				Stream:         false,
+				Generator:             cfg.generator,
+				AgentKnowledge:        cfg.agentKnowledge,
+				MaxInternalIterations: 0, // Pipeline mode
+				Stream:                false,
 				Steps: antfly.RetrievalAgentSteps{
 					Generation: antfly.GenerationStepConfig{Enabled: true},
 				},
@@ -312,11 +312,11 @@ func testFullPipeline(t *testing.T, ctx context.Context, client *antfly.AntflyCl
 					Limit:          10,
 				},
 			},
-			Generator:        cfg.generator,
-			AgentKnowledge:   cfg.agentKnowledge,
-			MaxInternalIterations:    0,
-			MaxContextTokens: 2048,
-			Stream:           false,
+			Generator:             cfg.generator,
+			AgentKnowledge:        cfg.agentKnowledge,
+			MaxInternalIterations: 0,
+			MaxContextTokens:      2048,
+			Stream:                false,
 			Steps: antfly.RetrievalAgentSteps{
 				Classification: antfly.ClassificationStepConfig{Enabled: true},
 				Generation:     antfly.GenerationStepConfig{Enabled: true},
@@ -372,9 +372,9 @@ func testStreaming(t *testing.T, ctx context.Context, client *antfly.AntflyClien
 					Limit:          5,
 				},
 			},
-			Generator:     cfg.generator,
+			Generator:             cfg.generator,
 			MaxInternalIterations: 0, // Pipeline mode
-			Stream:        true,
+			Stream:                true,
 		}
 
 		opts := antfly.RetrievalAgentOptions{
@@ -410,10 +410,10 @@ func testStreaming(t *testing.T, ctx context.Context, client *antfly.AntflyClien
 					Limit:          5,
 				},
 			},
-			Generator:      cfg.generator,
-			AgentKnowledge: cfg.agentKnowledge,
-			MaxInternalIterations:  0,
-			Stream:         true,
+			Generator:             cfg.generator,
+			AgentKnowledge:        cfg.agentKnowledge,
+			MaxInternalIterations: 0,
+			Stream:                true,
 			Steps: antfly.RetrievalAgentSteps{
 				Generation: antfly.GenerationStepConfig{Enabled: true},
 			},
@@ -456,10 +456,10 @@ func testAgentic(t *testing.T, ctx context.Context, client *antfly.AntflyClient,
 					SemanticSearch: "raft consensus",
 				},
 			},
-			Generator:      cfg.generator,
-			AgentKnowledge: cfg.agentKnowledge,
-			MaxInternalIterations:  3, // Let LLM call tools up to 3 times
-			Stream:         false,
+			Generator:             cfg.generator,
+			AgentKnowledge:        cfg.agentKnowledge,
+			MaxInternalIterations: 3, // Let LLM call tools up to 3 times
+			Stream:                false,
 		}
 
 		resp, err := client.RetrievalAgent(ctx, req)
@@ -495,10 +495,10 @@ func testAgentic(t *testing.T, ctx context.Context, client *antfly.AntflyClient,
 					SemanticSearch: "termite embedding models",
 				},
 			},
-			Generator:      cfg.generator,
-			AgentKnowledge: cfg.agentKnowledge,
-			MaxInternalIterations:  3,
-			Stream:         true,
+			Generator:             cfg.generator,
+			AgentKnowledge:        cfg.agentKnowledge,
+			MaxInternalIterations: 3,
+			Stream:                true,
 		}
 
 		opts := antfly.RetrievalAgentOptions{
@@ -536,10 +536,10 @@ func testConfidenceAndFollowup(t *testing.T, ctx context.Context, client *antfly
 				Limit:          5,
 			},
 		},
-		Generator:      cfg.generator,
-		AgentKnowledge: cfg.agentKnowledge,
-		MaxInternalIterations:  0,
-		Stream:         false,
+		Generator:             cfg.generator,
+		AgentKnowledge:        cfg.agentKnowledge,
+		MaxInternalIterations: 0,
+		Stream:                false,
 		Steps: antfly.RetrievalAgentSteps{
 			Generation: antfly.GenerationStepConfig{Enabled: true},
 			Confidence: antfly.ConfidenceStepConfig{
@@ -586,10 +586,10 @@ func testInlineEval(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 				Limit:          5,
 			},
 		},
-		Generator:      cfg.generator,
-		AgentKnowledge: cfg.agentKnowledge,
-		MaxInternalIterations:  0,
-		Stream:         false,
+		Generator:             cfg.generator,
+		AgentKnowledge:        cfg.agentKnowledge,
+		MaxInternalIterations: 0,
+		Stream:                false,
 		Steps: antfly.RetrievalAgentSteps{
 			Generation: antfly.GenerationStepConfig{Enabled: true},
 			Eval: antfly.EvalConfig{
@@ -650,9 +650,9 @@ func testBM25Search(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 				Limit: 10,
 			},
 		},
-		Generator:     cfg.generator,
+		Generator:             cfg.generator,
 		MaxInternalIterations: 0,
-		Stream:        false,
+		Stream:                false,
 	}
 
 	resp, err := client.RetrievalAgent(ctx, req)
@@ -699,9 +699,9 @@ func testErrorHandling(t *testing.T, ctx context.Context, client *antfly.AntflyC
 				Limit:          5,
 			},
 		},
-		Generator:     cfg.generator,
+		Generator:             cfg.generator,
 		MaxInternalIterations: 0,
-		Stream:        false,
+		Stream:                false,
 	}
 
 	_, err := client.RetrievalAgent(ctx, req)
@@ -720,9 +720,9 @@ func testErrorHandling(t *testing.T, ctx context.Context, client *antfly.AntflyC
 				Limit:          5,
 			},
 		},
-		Generator:     cfg.generator,
+		Generator:             cfg.generator,
 		MaxInternalIterations: 0,
-		Stream:        false,
+		Stream:                false,
 	}
 
 	respEmpty, err := client.RetrievalAgent(ctx, reqEmpty)
@@ -753,9 +753,9 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 				},
 			},
 		},
-		Generator:     cfg.generator,
+		Generator:             cfg.generator,
 		MaxInternalIterations: 0, // Pipeline mode: execute queries directly
-		Stream:        false,
+		Stream:                false,
 	}
 
 	respFromRoots, err := client.RetrievalAgent(ctx, reqFromRoots)
@@ -793,9 +793,9 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 				},
 			},
 		},
-		Generator:     cfg.generator,
+		Generator:             cfg.generator,
 		MaxInternalIterations: 0, // Pipeline mode: execute queries directly
-		Stream:        false,
+		Stream:                false,
 	}
 
 	respPipeline, err := client.RetrievalAgent(ctx, reqPipeline)
@@ -823,9 +823,9 @@ func testTreeSearch(t *testing.T, ctx context.Context, client *antfly.AntflyClie
 				},
 			},
 		},
-		Generator:     cfg.generator,
+		Generator:             cfg.generator,
 		MaxInternalIterations: 0, // Pipeline mode
-		Stream:        true,
+		Stream:                true,
 	}
 
 	opts := antfly.RetrievalAgentOptions{

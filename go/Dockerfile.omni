@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/go/pkg/antfly/lib/apt/lists/*
 
 # Download ONNX Runtime libraries
 RUN mkdir -p /usr/local/onnxruntime && \
@@ -67,13 +67,9 @@ ENV CGO_LDFLAGS="-L${ONNXRUNTIME_ROOT}/lib -lonnxruntime"
 ENV LD_LIBRARY_PATH="${ONNXRUNTIME_ROOT}/lib:/usr/local/lib"
 
 # Copy module files and local replace targets for dependency caching
-COPY go.mod go.sum ./
-COPY go/cmd/antfly /app/go/cmd/antfly
-COPY pkg /app/pkg
-
-RUN go mod download
-
 COPY . .
+WORKDIR /app/go/pkg/antfly
+RUN go mod download
 
 # Build with both ONNX and XLA tags (omni build)
 # CGO is required for both backends, GOEXPERIMENT=simd enables hardware SIMD acceleration
@@ -82,7 +78,7 @@ RUN GOEXPERIMENT=simd CGO_ENABLED=1 \
     -tags="onnx,ORT,xla,XLA" \
     -ldflags="-s -w" \
     -o /antfly \
-    ./go/cmd/antfly
+    ./cmd
 
 # =============================================================================
 # Stage 2: Runtime
@@ -99,18 +95,18 @@ ARG TARGETARCH
 
 # Install runtime dependencies
 # Retry logic handles transient Debian mirror hash mismatches
-RUN rm -rf /var/lib/apt/lists/* && \
+RUN rm -rf /var/go/pkg/antfly/lib/apt/lists/* && \
     apt-get clean && \
     apt-get -o Acquire::Retries=5 update && \
     for i in 1 2 3 4 5; do \
         apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates curl && break || \
         (echo "Attempt $i failed, cleaning and retrying..." && \
-         rm -rf /var/lib/apt/lists/* && \
+         rm -rf /var/go/pkg/antfly/lib/apt/lists/* && \
          apt-get clean && \
          apt-get -o Acquire::Retries=5 update && \
          sleep 5); \
     done && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/go/pkg/antfly/lib/apt/lists/*
 
 # Download and install ONNX Runtime for runtime
 RUN mkdir -p /usr/local/onnxruntime && \
@@ -130,16 +126,16 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 
 # Download PJRT CPU plugin for XLA (from gomlx/pjrt-cpu-binaries)
 # This provides XLA CPU backend; TPU requires libtpu.so from GKE
-RUN mkdir -p /usr/local/lib/go-xla && \
+RUN mkdir -p /usr/local/go/pkg/antfly/lib/go-xla && \
     ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "arm64" || echo "amd64") && \
     curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/latest/download/pjrt_cpu_linux_${ARCH}.tar.gz" \
-    | tar -xzf - -C /usr/local/lib/go-xla || \
+    | tar -xzf - -C /usr/local/go/pkg/antfly/lib/go-xla || \
     echo "Warning: Could not download PJRT CPU plugin. XLA CPU backend may not be available."
 
 # Download libtpu for TPU support (optional, for GKE TPU environments)
 RUN curl -fsSL "https://storage.googleapis.com/cloud-tpu-tpuvm-artifacts/libtpu/${LIBTPU_VERSION}/libtpu.so" \
-    -o /usr/local/lib/go-xla/libtpu.so && \
-    ln -s /usr/local/lib/go-xla/libtpu.so /usr/local/lib/go-xla/pjrt_plugin_tpu.so || \
+    -o /usr/local/go/pkg/antfly/lib/go-xla/libtpu.so && \
+    ln -s /usr/local/go/pkg/antfly/lib/go-xla/libtpu.so /usr/local/go/pkg/antfly/lib/go-xla/pjrt_plugin_tpu.so || \
     echo "Warning: Could not download libtpu.so. TPU support requires GKE TPU nodes."
 
 # Create non-root user with a stable UID/GID so Kubernetes fsGroup and init
@@ -153,10 +149,10 @@ RUN groupadd --system --gid ${ANTFLY_GID} antfly && \
 COPY --from=builder /antfly /antfly
 
 # Set library paths for both ONNX Runtime and PJRT plugin discovery
-ENV LD_LIBRARY_PATH="/usr/local/onnxruntime/lib:/usr/local/lib/go-xla"
-ENV ORT_DYLIB_PATH="/usr/local/onnxruntime/lib/libonnxruntime.so"
-ENV ORTGENAI_DYLIB_PATH="/usr/local/onnxruntime/lib/libonnxruntime-genai.so"
-ENV PJRT_PLUGIN_LIBRARY_PATH="/usr/local/lib/go-xla"
+ENV LD_LIBRARY_PATH="/usr/local/onnxruntime/lib:/usr/local/go/pkg/antfly/lib/go-xla"
+ENV ORT_DYLIB_PATH="/usr/local/onnxruntime/go/pkg/antfly/lib/libonnxruntime.so"
+ENV ORTGENAI_DYLIB_PATH="/usr/local/onnxruntime/go/pkg/antfly/lib/libonnxruntime-genai.so"
+ENV PJRT_PLUGIN_LIBRARY_PATH="/usr/local/go/pkg/antfly/lib/go-xla"
 
 # Model directory (mounted at runtime, contains embedders/, chunkers/, rerankers/ subdirs)
 ENV ANTFLY_TERMITE_MODELS_DIR="/models"

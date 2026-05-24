@@ -19,7 +19,7 @@ tags:
       Antfly provides auto-generated SDKs from the OpenAPI specification:
 
 
-      - **Go**: `github.com/antflydb/antfly/go/pkg/sdk/antfly`
+      - **Go**: `github.com/antflydb/antfly/go/pkg/sdk`
 
       - **TypeScript**: `@antflydb/antfly-ts` (npm)
 
@@ -13543,7 +13543,7 @@ components:
         Configuration for URL content fetching.
 
 
-        Uses lib/scraping for downloading and processing. Supports:
+        Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports:
 
         - HTTP/HTTPS URLs with security validation
 
@@ -13558,7 +13558,7 @@ components:
         - S3 URLs (requires s3_credentials)
 
 
-        Security features (from lib/scraping.ContentSecurityConfig):
+        Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig):
 
         - Allowed host whitelist
 
@@ -13629,11 +13629,11 @@ components:
           description: >
             Web search provider configuration. Required when websearch tool is enabled.
 
-            See lib/websearch/openapi.yaml for provider-specific options.
+            See go/pkg/antfly/lib/websearch/openapi.yaml for provider-specific options.
         fetch_config:
           $ref: '#/components/schemas/FetchConfig'
           description: >
-            URL fetching configuration. See lib/websearch/openapi.yaml
+            URL fetching configuration. See go/pkg/antfly/lib/websearch/openapi.yaml
 
             for available options and security controls.
         max_tool_iterations:

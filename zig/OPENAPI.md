@@ -72,7 +72,7 @@ Standalone Termite builds also use the checked-in `termite_api` module by
 default. For experiments, the old dynamic codegen path remains available:
 
 ```sh
-cd pkg/termite
+cd go/pkg/termite
 zig build -Dtermite-openapi-spec=../../../specs/openapi/termite/api.yaml
 ```
 
@@ -88,7 +88,7 @@ Useful checks:
 ```sh
 zig build root-test
 zig build openapi-root-check
-cd pkg/termite && zig build test
+cd go/pkg/termite && zig build test
 ```
 
 `openapi-root-check` verifies that the root `openapi.yaml` matches the

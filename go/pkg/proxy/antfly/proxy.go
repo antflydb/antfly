@@ -38,4 +38,3 @@ type NamespaceRoute struct {
 	ServerlessQueryURL string
 	ServerlessAPIURL   string
 }
-

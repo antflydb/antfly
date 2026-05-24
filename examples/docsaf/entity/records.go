@@ -1,8 +1,8 @@
 package entity
 
 import (
-	docsafpkg "github.com/antflydb/antfly/pkg/docsaf"
-	docsafentity "github.com/antflydb/antfly/pkg/docsaf/entity"
+	docsafpkg "github.com/antflydb/antfly/go/pkg/docsaf"
+	docsafentity "github.com/antflydb/antfly/go/pkg/docsaf/entity"
 )
 
 // BuildRecords converts sections to a records map and enriches them with extracted entities.

@@ -21,7 +21,7 @@ import (
 
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/go/pkg/sdk/query"
-	"github.com/antflydb/antfly/pkg/termite/lib/modelregistry"
+	"github.com/antflydb/antfly/go/pkg/termite/lib/modelregistry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

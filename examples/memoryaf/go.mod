@@ -4,9 +4,9 @@ go 1.26.0
 
 require (
 	github.com/antflydb/antfly/go/pkg/sdk v0.0.0
-	github.com/antflydb/antfly/pkg/docsaf v0.0.0
-	github.com/antflydb/antfly/pkg/libaf v0.0.1
-	github.com/antflydb/antfly/pkg/memoryaf v0.0.0
+	github.com/antflydb/antfly/go/pkg/docsaf v0.0.0
+	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
+	github.com/antflydb/antfly/go/pkg/memoryaf v0.0.0
 	github.com/fsnotify/fsnotify v1.9.0
 	go.uber.org/zap v1.27.1
 )
@@ -24,7 +24,7 @@ require (
 	github.com/antchfx/htmlquery v1.3.6 // indirect
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
-	github.com/antflydb/antfly v0.1.0 // indirect
+	github.com/antflydb/antfly/go/pkg/antfly v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
@@ -84,7 +84,7 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/temoto/robotstxt v1.1.2 // indirect
-	github.com/tinylib/msgp v1.6.3 // indirect
+	github.com/tinygo/pkg/antfly/lib/msgp v1.6.3 // indirect
 	github.com/woodsbury/decimal128 v1.4.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/yuin/goldmark v1.7.17 // indirect
@@ -115,7 +115,7 @@ require (
 
 replace (
 	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
-	github.com/antflydb/antfly/pkg/docsaf => ../../pkg/docsaf
-	github.com/antflydb/antfly/pkg/libaf => ../../pkg/libaf
-	github.com/antflydb/antfly/pkg/memoryaf => ../../pkg/memoryaf
+	github.com/antflydb/antfly/go/pkg/docsaf => ../../go/pkg/docsaf
+	github.com/antflydb/antfly/go/pkg/libaf => ../../go/pkg/libaf
+	github.com/antflydb/antfly/go/pkg/memoryaf => ../../go/pkg/memoryaf
 )

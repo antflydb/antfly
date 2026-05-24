@@ -23,7 +23,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/antflydb/antfly/lib/vector"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/vector"
 	"google.golang.org/protobuf/proto"
 )
 

@@ -18,7 +18,7 @@ package oapi
 import (
 	"fmt"
 
-	"github.com/antflydb/antfly/pkg/libaf/json"
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/kaptinlin/jsonschema"
 )
 

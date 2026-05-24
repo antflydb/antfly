@@ -224,20 +224,22 @@ def configure_for_repo_contracts(module) -> None:
     module.METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
     module.USERMGR_SPEC = ROOT / "specs/openapi/antfly/usermgr.yaml"
     module.ROOT_SPEC = ROOT / "openapi.yaml"
-    module.GO_SCHEMA_SPEC = ROOT / "lib/schema/openapi.yaml"
-    module.GO_INDEX_SPEC = ROOT / "src/store/db/indexes/openapi.yaml"
+    module.GO_SCHEMA_SPEC = ROOT / "go/pkg/antfly/lib/schema/openapi.yaml"
+    module.GO_INDEX_SPEC = ROOT / "go/pkg/antfly/src/store/db/indexes/openapi.yaml"
     module.GO_INDEX_REF_PATHS = {
         "../store/db/indexes/openapi.yaml",
-        "../../../src/store/db/indexes/openapi.yaml",
+        "../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
     }
     module.PATH_REWRITES = {
         "usermgr.yaml": "specs/openapi/antfly/usermgr.yaml",
         "query.yaml": "specs/openapi/antfly/query.yaml",
+        "../../../src/": "go/pkg/antfly/src/",
+        "../../../lib/": "go/pkg/antfly/lib/",
         "../../../": "",
         "../../": "",
-        "../metadata/": "src/metadata/",
-        "../store/": "src/store/",
-        "../usermgr/": "src/usermgr/",
+        "../metadata/": "go/pkg/antfly/src/metadata",
+        "../store/": "go/pkg/antfly/src/store",
+        "../usermgr/": "go/pkg/antfly/src/usermgr",
     }
 
     def target_schema_name(source_path: Path, schema_name: str) -> str:

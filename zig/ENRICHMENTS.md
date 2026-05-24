@@ -56,7 +56,7 @@ Lookup rules:
 
 Current helpers:
 
-- `src/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
+- `go/pkg/antfly/src/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
   reconstructs internal keys from `ArtifactRef`.
 - `DB.getArtifact` looks up a stored artifact by public artifact ID.
 - `antfly_db_decode_artifact_id_json` decodes a public artifact ID to

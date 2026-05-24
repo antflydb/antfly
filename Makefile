@@ -7,22 +7,24 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # ====================================================================================
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
+ANTFLY_GO_MODULE := ./go/pkg/antfly
 
-# Go modules outside of root
+# Go modules outside of the Antfly product module
 GO_SUBMODULES := \
 	./go/e2e \
 	./go/pkg/sdk \
 	./go/pkg/proxy/antfly \
 	./go/pkg/proxy/termite \
-	./pkg/libaf \
+	./go/pkg/libaf \
 	./go/pkg/operator \
-	./pkg/docsaf \
-	./pkg/generating \
-	./pkg/evalaf \
-	./pkg/evalaf/plugins/antfly \
-	./pkg/genkit/antfly \
-	./pkg/genkit/openrouter \
-	./pkg/termite
+	./go/pkg/docsaf \
+	./go/pkg/generating \
+	./go/pkg/evalaf \
+	./go/pkg/evalaf/plugins/antfly \
+	./go/pkg/genkit/antfly \
+	./go/pkg/genkit/openrouter \
+	./go/pkg/memoryaf \
+	./go/pkg/termite
 
 # ====================================================================================
 # General Commands
@@ -94,22 +96,22 @@ build-antfarm: build-antfarm-main
 build-antfarm-main:
 	@echo "Building antfarm frontend..."
 	cd ts && pnpm install && pnpm --filter antfarm... build
-	@echo "Copying dist files to src/metadata/antfarm..."
-	rm -rf src/metadata/antfarm/*
-	cp -r ts/apps/antfarm/dist/* src/metadata/antfarm/
+	@echo "Copying dist files to go/pkg/antfly/src/metadata/antfarm..."
+	rm -rf go/pkg/antfly/src/metadata/antfarm/*
+	cp -r ts/apps/antfarm/dist/* go/pkg/antfly/src/metadata/antfarm/
 
 build: build-antfarm
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
 
 build-go: build-antfarm generate
-	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./go/cmd/antfly
+	(cd $(ANTFLY_GO_MODULE) && $(GO) build -tags "afrelease" -ldflags="-s -w" -o ../../../antfly ./cmd)
 
 build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
 
 generate: build-docs tidy
-	$(GO) generate ./...
+	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Generating in $$mod"; \
 		(cd $$mod && $(GO) generate ./...) || exit 1; \
@@ -166,13 +168,13 @@ lint:
 	cd ts && pnpm run lint
 
 sim-validate:
-	$(GO) run ./go/cmd/sim -action validate -scope sim
+	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action validate -scope sim)
 
 sim-validate-repo:
-	$(GO) run ./go/cmd/sim -action validate -scope repo
+	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action validate -scope repo)
 
 sim-soak:
-	$(GO) run ./go/cmd/sim -action soak -json
+	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action soak -json)
 
 
 # ====================================================================================
@@ -216,14 +218,14 @@ force-download-omni-deps: ## Force re-download of ONNX Runtime and PJRT.
 	$(MAKE) download-omni-deps
 
 tidy:
-	$(GO) mod tidy
+	(cd $(ANTFLY_GO_MODULE) && $(GO) mod tidy)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Tidying $$mod"; \
 		(cd $$mod && $(GO) mod tidy) || exit 1; \
 	done
 
 tidy-check:
-	$(GO) mod tidy -diff
+	(cd $(ANTFLY_GO_MODULE) && $(GO) mod tidy -diff)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Checking tidy in $$mod"; \
 		(cd $$mod && $(GO) mod tidy -diff) || exit 1; \
@@ -258,7 +260,7 @@ build-omni: download-omni-deps
 	export LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
 	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
 	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
-	$(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o antfly ./go/cmd/antfly
+	(cd $(ANTFLY_GO_MODULE) && $(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o ../../../antfly ./cmd)
 
 
 # ====================================================================================
@@ -460,13 +462,13 @@ operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
 
 termite-build: ## Build the termite binary (pure Go)
-	(cd ./pkg/termite && $(GO) build -o ../../termite ./cmd)
+	(cd ./go/pkg/termite && $(GO) build -o ../../termite ./cmd)
 
 termite-test: ## Run termite unit tests (pure Go)
-	(cd ./pkg/termite && $(GO) test ./...)
+	(cd ./go/pkg/termite && $(GO) test ./...)
 
 termite-lint: ## Run linter on termite
-	(cd ./pkg/termite && $(GO) vet ./...)
+	(cd ./go/pkg/termite && $(GO) vet ./...)
 
 termite-client-test: ## Run termite-client tests
 	(cd ./go/pkg/sdk && $(GO) test ./...)

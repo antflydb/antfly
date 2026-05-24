@@ -7131,7 +7131,7 @@ export interface components {
         /**
          * @description Configuration for URL content fetching.
          *
-         *     Uses lib/scraping for downloading and processing. Supports:
+         *     Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports:
          *     - HTTP/HTTPS URLs with security validation
          *     - HTML pages (extracts readable text via go-readability)
          *     - PDF files (extracts text)
@@ -7139,7 +7139,7 @@ export interface components {
          *     - Plain text files
          *     - S3 URLs (requires s3_credentials)
          *
-         *     Security features (from lib/scraping.ContentSecurityConfig):
+         *     Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig):
          *     - Allowed host whitelist
          *     - Private IP blocking (SSRF prevention)
          *     - Download size limits
@@ -7196,11 +7196,11 @@ export interface components {
             enabled_tools?: components["schemas"]["ChatToolName"][];
             /**
              * @description Web search provider configuration. Required when websearch tool is enabled.
-             *     See lib/websearch/openapi.yaml for provider-specific options.
+             *     See go/pkg/antfly/lib/websearch/openapi.yaml for provider-specific options.
              */
             websearch_config?: components["schemas"]["WebSearchConfig"];
             /**
-             * @description URL fetching configuration. See lib/websearch/openapi.yaml
+             * @description URL fetching configuration. See go/pkg/antfly/lib/websearch/openapi.yaml
              *     for available options and security controls.
              */
             fetch_config?: components["schemas"]["FetchConfig"];

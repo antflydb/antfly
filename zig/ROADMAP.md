@@ -26,8 +26,8 @@ Detailed execution belongs in subsystem docs:
 - [pkg/antfly/src/api/PLAN.md](pkg/antfly/src/api/PLAN.md)
 - [pkg/antfly/src/raft/RAFT.md](pkg/antfly/src/raft/RAFT.md)
 - [pkg/antfly/src/lmdb/LMDB.md](pkg/antfly/src/lmdb/LMDB.md)
-- [pkg/termite/ROADMAP.md](pkg/termite/ROADMAP.md)
-- [lib/raft/ROADMAP.md](lib/raft/ROADMAP.md)
+- [go/pkg/termite/ROADMAP.md](go/pkg/termite/ROADMAP.md)
+- [go/pkg/antfly/lib/raft/ROADMAP.md](go/pkg/antfly/lib/raft/ROADMAP.md)
 
 ## Test Targets
 
@@ -155,11 +155,11 @@ Near-term goals:
 ### 6. Termite And Shared Libraries
 
 Primary references:
-- [pkg/termite/ROADMAP.md](pkg/termite/ROADMAP.md)
-- [lib/json/JSON.md](lib/json/JSON.md)
-- [lib/regex/REGEX.md](lib/regex/REGEX.md)
-- [lib/image/IMAGE.md](lib/image/IMAGE.md)
-- [lib/audio/AUDIO.md](lib/audio/AUDIO.md)
+- [go/pkg/termite/ROADMAP.md](go/pkg/termite/ROADMAP.md)
+- [go/pkg/antfly/lib/json/JSON.md](go/pkg/antfly/lib/json/JSON.md)
+- [go/pkg/antfly/lib/regex/REGEX.md](go/pkg/antfly/lib/regex/REGEX.md)
+- [go/pkg/antfly/lib/image/IMAGE.md](go/pkg/antfly/lib/image/IMAGE.md)
+- [go/pkg/antfly/lib/audio/AUDIO.md](go/pkg/antfly/lib/audio/AUDIO.md)
 
 Near-term goals:
 - keep reusable libraries documented where their implementation lives
@@ -181,7 +181,7 @@ Near-term goals:
 4. Deepen public query/search/retrieval parity only with matching coverage.
 5. Continue stateful metadata/runtime hardening around split, merge, recovery,
    backup/restore, and remote status propagation.
-6. Keep shared library docs and implementation colocated under `lib/` as those
+6. Keep shared library docs and implementation colocated under `go/pkg/antfly/lib/` as those
    modules become stable user-facing design surfaces.
 
 ## Planning Rules

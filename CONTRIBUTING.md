@@ -3,8 +3,8 @@
 ## Repository Layout
 
 ```
-go/cmd/antfly/          CLI entry point (cobra subcommands: swarm, store, metadata, query, load, etc.)
-src/
+go/pkg/antfly/cmd/          CLI entry point (cobra subcommands: swarm, store, metadata, query, load, etc.)
+go/pkg/antfly/src/
   metadata/          Metadata server (API, Raft, schema management, retrieval agents)
   store/             Storage nodes (shards, indexes, queries, transactions)
   mcp/               MCP server
@@ -12,30 +12,30 @@ src/
   usermgr/           User management and authentication
   raft/              Raft consensus wrapper around etcd/raft
   tablemgr/          Table and shard lifecycle management
-lib/
+go/pkg/antfly/lib/
   multirafthttp/     HTTP transport for multi-raft communication
   ai/                LLM provider abstraction (Ollama, OpenAI, Bedrock, Google, etc.)
   websearch/         Web search providers (Google, Bing, Serper, Tavily)
   types/             Shared types
-pkg/
-  client/            Go SDK
+go/pkg/
+  sdk/               Go SDK
   libaf/             Shared library (JSON, embeddings, reranking, logging, S3)
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
   evalaf/            LLM/RAG evaluation framework
   genkit/            Firebase Genkit plugins (antfly, openrouter)
+  memoryaf/          Memory-focused Antfly helpers
   operator/          Kubernetes operator
+  proxy/             Antfly and Termite proxy packages
+  termite/           ML inference service (Go module)
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
   packages/components/  React component library (@antfly/components)
-  packages/termite-sdk/ Termite TypeScript SDK
   apps/antfarm/      Web dashboard (React + Vite)
-py/                  Python SDK
+py/packages/sdk/     Python SDK
 rs/
   pgaf/              PostgreSQL extension (Rust/pgrx)
-  antfly-client/     Generated Rust SDK (shared types with pgaf)
-pkg/termite/         ML inference service (Go module)
-pkg/termite-client/  Termite Go SDK (generated from openapi.yaml)
-e2e/                 End-to-end tests
+  crates/sdk/        Generated Rust SDK (shared types with pgaf)
+go/e2e/              End-to-end tests
 configs/             Example configuration files
 devops/              Kubernetes manifests (minikube, etc.)
 scripts/             Build and utility scripts
@@ -89,10 +89,11 @@ Run `make help` for the full list. Key targets:
 
 ### Swarm Mode (Single Process)
 
-Runs metadata, storage, and [Termite](pkg/termite) together:
+Runs metadata, storage, and [Termite](go/pkg/termite) together:
 
 ```bash
-go run ./go/cmd/antfly swarm
+cd go/pkg/antfly
+go run ./cmd swarm
 ```
 
 Dashboard at `http://localhost:8080`. Termite auto-discovers models from `~/.termite/models/`.
@@ -113,19 +114,19 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 | Module | Directory |
 |--------|-----------|
-| Root | `.` |
-| E2E tests | `e2e/` |
-| Go SDK | `pkg/client/` |
-| Operator | `pkg/operator/` |
-| libaf | `pkg/libaf/` |
-| docsaf | `pkg/docsaf/` |
-| evalaf | `pkg/evalaf/` |
-| evalaf antfly plugin | `pkg/evalaf/plugins/antfly/` |
-| Genkit plugin | `pkg/genkit/antfly/` |
-| Genkit OpenRouter | `pkg/genkit/openrouter/` |
-| Termite | `pkg/termite/` |
-| Termite Go client | `pkg/termite-client/` |
-| Termite proxy | `pkg/termite-proxy/` |
+| Antfly | `go/pkg/antfly/` |
+| E2E tests | `go/e2e/` |
+| Go SDK | `go/pkg/sdk/` |
+| Operator | `go/pkg/operator/` |
+| Antfly proxy | `go/pkg/proxy/antfly/` |
+| Termite proxy | `go/pkg/proxy/termite/` |
+| libaf | `go/pkg/libaf/` |
+| docsaf | `go/pkg/docsaf/` |
+| evalaf | `go/pkg/evalaf/` |
+| evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
+| Genkit plugin | `go/pkg/genkit/antfly/` |
+| Genkit OpenRouter | `go/pkg/genkit/openrouter/` |
+| Termite | `go/pkg/termite/` |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
 `make tidy` and `make tidy-check` do too.
@@ -145,11 +146,12 @@ That enables `.githooks/pre-push`, which runs `make tidy-check` when pushed chan
 ## Testing
 
 ```bash
-# Unit tests (root module)
+# Unit tests (Antfly module)
+cd go/pkg/antfly
 GOEXPERIMENT=simd go test ./...
 
 # Specific submodule
-cd pkg/client && go test ./...
+cd go/pkg/sdk && go test ./...
 
 # Race detector (redirect output for long runs)
 go test -race -v ./... > /tmp/test.log 2>&1
@@ -161,8 +163,9 @@ make e2e
 make e2e E2E_TEST=TestQuickstart E2E_TIMEOUT=15m
 
 # E2E tests gated behind env vars
-RUN_TXN_TESTS=true go test -v ./e2e -run DistributedTransaction -timeout 5m > /tmp/test.log 2>&1
-RUN_AUTOSCALING_TESTS=true go test -v ./e2e -run Autoscaling -timeout 20m > /tmp/test.log 2>&1
+cd go/e2e
+RUN_TXN_TESTS=true go test -v ./... -run DistributedTransaction -timeout 5m > /tmp/test.log 2>&1
+RUN_AUTOSCALING_TESTS=true go test -v ./... -run Autoscaling -timeout 20m > /tmp/test.log 2>&1
 RUN_EVAL_TESTS=true go test -v ./... -timeout 10m > /tmp/test.log 2>&1
 ```
 
@@ -188,7 +191,7 @@ cd rs/pgaf && make test-e2e   # E2E (requires running Antfly server)
 
 ## Code Generation
 
-After changing OpenAPI specs (`src/metadata/api.yaml`, `src/usermgr/api.yaml`, `src/store/db/indexes/openapi.yaml`) or protobuf definitions:
+After changing OpenAPI specs under `specs/openapi/` or component specs under `go/pkg/antfly/` and `go/pkg/termite/`, or after changing protobuf definitions:
 
 ```bash
 make generate
@@ -198,7 +201,7 @@ This runs:
 1. Redocly join + lint on OpenAPI specs
 2. `go generate ./...` across root and all submodules (oapi-codegen)
 3. Termite code generation
-4. TypeScript SDK generation (`@antfly/sdk`, `@antfly/termite-sdk`)
+4. TypeScript SDK generation (`@antfly/sdk`)
 5. Python SDK generation
 
 Look for `cfg.yaml` next to any `openapi.yaml` for oapi-codegen settings. Key convention: optional fields use `omitzero` instead of pointers.
@@ -219,11 +222,11 @@ Example configs live in `configs/`:
 
 Tags follow Go module conventions and trigger CI:
 
-- `v*` — root module release + container build
-- `pkg/operator/v*` — operator container build
+- `go/pkg/antfly/v*` — Antfly module release + container build
+- `go/pkg/operator/v*` — operator container build
 
-The previous standalone `pkg/antfly-operator/v*` and `pkg/termite-operator/v*`
-tag streams were consolidated into `pkg/operator/v*`.
+The previous standalone operator tag streams were consolidated into
+`go/pkg/operator/v*`.
 
 ```bash
 export GITHUB_TOKEN=...
@@ -234,4 +237,4 @@ go tool goreleaser release --clean
 
 ## License
 
-Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). Packages under `pkg/`, `ts/`, `py/`, and `rs/` are Apache 2.0 — check individual LICENSE files.
+Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). The SDKs, shared libraries, Termite, TypeScript, Python, and Rust packages are Apache 2.0 — check individual LICENSE files.

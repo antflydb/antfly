@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/antflydb/antfly/lib/vector"
-	"github.com/antflydb/antfly/lib/vector/testutils"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/vector"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/vector/testutils"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/stretchr/testify/require"
 )

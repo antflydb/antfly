@@ -28,10 +28,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/antflydb/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
+	"github.com/antflydb/antfly/go/pkg/libaf/logging"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/pkg/libaf/logging"
-	"github.com/antflydb/antfly/src/common"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"

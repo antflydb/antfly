@@ -64,7 +64,7 @@ Run only the Termite package tests:
 zig build termite-test
 ```
 
-`termite-test` delegates to `pkg/termite` by running `zig build test` in that
+`termite-test` delegates to `go/pkg/termite` by running `zig build test` in that
 package with the root build's relevant backend options forwarded.
 
 ## Antfly Tiers

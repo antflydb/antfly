@@ -89,9 +89,9 @@ type (
 	AggregationType    = oapi.AggregationType
 
 	// Embedding types
-	Embedding            = oapi.Embedding
-	DenseEmbedding       = oapi.Embedding0 // []float32
-	SparseEmbedding      = oapi.Embedding1 // {Indices []uint32, Values []float32}
+	Embedding             = oapi.Embedding
+	DenseEmbedding        = oapi.Embedding0 // []float32
+	SparseEmbedding       = oapi.Embedding1 // {Indices []uint32, Values []float32}
 	PackedDenseEmbedding  = oapi.Embedding2 // base64-encoded little-endian float32 bytes
 	PackedSparseEmbedding = oapi.Embedding3 // {PackedIndices, PackedValues} as base64 LE bytes
 

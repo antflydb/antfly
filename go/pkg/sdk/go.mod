@@ -2,7 +2,7 @@ module github.com/antflydb/antfly/go/pkg/sdk
 
 go 1.26
 
-replace github.com/antflydb/antfly/pkg/libaf => ../../../pkg/libaf
+replace github.com/antflydb/antfly/go/pkg/libaf => ../libaf
 
 // Pin deps compatible with oapi-codegen v2.5.1.
 // kin-openapi v0.134.0 breaks oapi-codegen (MappingRef type change) and
@@ -14,7 +14,7 @@ replace (
 )
 
 require (
-	github.com/antflydb/antfly/pkg/libaf v0.0.1
+	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
 	github.com/getkin/kin-openapi v0.133.0
 	github.com/kaptinlin/jsonschema v0.7.6
 	github.com/oapi-codegen/runtime v1.3.0

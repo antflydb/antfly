@@ -27,20 +27,23 @@ ROOT = Path(__file__).resolve().parent.parent
 METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
 USERMGR_SPEC = ROOT / "specs/openapi/antfly/usermgr.yaml"
 ROOT_SPEC = ROOT / "openapi.yaml"
-GO_SCHEMA_SPEC = (ROOT / "lib/schema/openapi.yaml").resolve()
-GO_INDEX_SPEC = (ROOT / "src/store/db/indexes/openapi.yaml").resolve()
+GO_SCHEMA_SPEC = (ROOT / "go/pkg/antfly/lib/schema/openapi.yaml").resolve()
+GO_INDEX_SPEC = (ROOT / "go/pkg/antfly/src/store/db/indexes/openapi.yaml").resolve()
 GO_INDEX_REF_PATHS = {
     "../../antfly/src/store/db/indexes/openapi.yaml",
     "../antfly/src/store/db/indexes/openapi.yaml",
-    "../../../src/store/db/indexes/openapi.yaml",
+    "../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
 }
 PATH_REWRITES = {
     "usermgr.yaml": "specs/openapi/antfly/usermgr.yaml",
+    "query.yaml": "specs/openapi/antfly/query.yaml",
+    "../../../src/": "go/pkg/antfly/src/",
+    "../../../lib/": "go/pkg/antfly/lib/",
     "../../../": "",
     "../../antfly/": "",
     "../antfly/": "",
-    "../metadata/": "zig/pkg/antfly/src/metadata/",
-    "../usermgr/": "zig/pkg/antfly/src/usermgr/",
+    "../metadata/": "go/pkg/antfly/src/metadata/",
+    "../usermgr/": "go/pkg/antfly/src/usermgr/",
 }
 
 

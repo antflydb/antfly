@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	"github.com/antflydb/antfly/go/pkg/libaf/s3"
+	"github.com/antflydb/antfly/go/pkg/memoryaf"
 	client "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/pkg/docsaf"
-	"github.com/antflydb/antfly/pkg/libaf/s3"
-	"github.com/antflydb/antfly/pkg/memoryaf"
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
