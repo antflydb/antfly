@@ -25,7 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
 REPO_ROOT = ROOT
 
 ELV2_ROOTS = (
@@ -144,8 +145,8 @@ def parse_args() -> argparse.Namespace:
 
 def read_header(name: str) -> Header:
     header_path = {
-        "apache": REPO_ROOT / ".license-header-apache.txt",
-        "elv2": REPO_ROOT / ".license-header.txt",
+        "apache": SCRIPT_DIR / "license-header-apache.txt",
+        "elv2": SCRIPT_DIR / "license-header-elv2.txt",
     }[name]
     return Header(name=name, body=header_path.read_text())
 

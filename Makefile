@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 ZIG_MAKE := $(MAKE) -C ./zig
 ZIG_BUILD_FLAGS ?=
+SCRIPTS_PY ?= uv run --project scripts --locked python
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
@@ -116,54 +117,11 @@ generate: build-docs tidy
 	cd ts && pnpm --filter @antfly/sdk generate
 	$(MAKE) -C ./py/packages/sdk generate
 
-license-headers: ## Add ELv2 license headers to core files missing them
-	$(GO) run github.com/google/addlicense@latest \
-		-f .license-header.txt \
-		-ignore 'zig/**' \
-		-ignore 'lib/multirafthttp/**' \
-		-ignore 'lib/types/**' \
-		-ignore 'pkg/**' \
-		-ignore 'ts/**' \
-		-ignore 'py/**' \
-		-ignore 'rs/**' \
-		-ignore 'vendor/**' \
-		-ignore '.github/**' \
-		-ignore 'examples/**' \
-		-ignore 'configs/**' \
-		-ignore 'devops/**' \
-		-ignore 'scripts/**' \
-		-ignore '**/*.pb.go' \
-		-ignore '**/zz_generated*' \
-		-ignore '**/Dockerfile*' \
-		-ignore '**/*.yaml' \
-		-ignore '**/*.yml' \
-		.
-	$(ZIG_MAKE) license-headers
+license-headers: ## Add first-party license headers.
+	$(SCRIPTS_PY) scripts/license_headers.py
 
-license-check: ## Check that all core files have license headers
-	$(GO) run github.com/google/addlicense@latest \
-		-check \
-		-f .license-header.txt \
-		-ignore 'zig/**' \
-		-ignore 'lib/multirafthttp/**' \
-		-ignore 'lib/types/**' \
-		-ignore 'pkg/**' \
-		-ignore 'ts/**' \
-		-ignore 'py/**' \
-		-ignore 'rs/**' \
-		-ignore 'vendor/**' \
-		-ignore '.github/**' \
-		-ignore 'examples/**' \
-		-ignore 'configs/**' \
-		-ignore 'devops/**' \
-		-ignore 'scripts/**' \
-		-ignore '**/*.pb.go' \
-		-ignore '**/zz_generated*' \
-		-ignore '**/Dockerfile*' \
-		-ignore '**/*.yaml' \
-		-ignore '**/*.yml' \
-		.
-	$(ZIG_MAKE) license-check
+license-check: ## Check first-party license headers.
+	$(SCRIPTS_PY) scripts/license_headers.py --check
 
 zig-build:
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"

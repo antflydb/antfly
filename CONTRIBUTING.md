@@ -64,8 +64,8 @@ Run `make help` for the full list. Key targets:
 | `make build-antfarm` | Build the Antfarm dashboard and Termite dashboard |
 | `make build-docs` | Join and lint OpenAPI specs with Redocly |
 | `make update-deps` | Update Go dependencies across all modules |
-| `make license-headers` | Add ELv2 license headers to core files |
-| `make license-check` | Verify license headers are present |
+| `make license-headers` | Add first-party license headers |
+| `make license-check` | Verify first-party license headers are present |
 
 ### Operator targets
 
