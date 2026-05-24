@@ -1,6 +1,6 @@
 # Simulator CLI
 
-`cmd/debugging/sim` is a small entrypoint for running the deterministic simulator without going through individual `go test` invocations.
+`go/cmd/sim` is a small entrypoint for running the deterministic simulator without going through individual `go test` invocations.
 
 It is intended for:
 
@@ -23,10 +23,10 @@ make sim-validate-repo
 Direct CLI usage:
 
 ```bash
-go run ./cmd/debugging/sim -action validate -scope sim
-go run ./cmd/debugging/sim -action validate -scope repo
-go run ./cmd/debugging/sim -action soak -json
-go run ./cmd/debugging/sim -action soak -modes split_failover -seeds 521,523
+go run ./go/cmd/sim -action validate -scope sim
+go run ./go/cmd/sim -action validate -scope repo
+go run ./go/cmd/sim -action soak -json
+go run ./go/cmd/sim -action soak -modes split_failover -seeds 521,523
 ```
 
 ## Actions
@@ -36,7 +36,7 @@ go run ./cmd/debugging/sim -action soak -modes split_failover -seeds 521,523
 Simulator-focused validation:
 
 ```bash
-go run ./cmd/debugging/sim -action validate -scope sim
+go run ./go/cmd/sim -action validate -scope sim
 ```
 
 This runs:
@@ -49,7 +49,7 @@ go test ./src/sim
 Broader repo validation:
 
 ```bash
-go run ./cmd/debugging/sim -action validate -scope repo
+go run ./go/cmd/sim -action validate -scope repo
 ```
 
 This adds:
@@ -63,26 +63,26 @@ go test ./...
 Run seeded randomized simulator scenarios and write JSON artifacts for any failures:
 
 ```bash
-go run ./cmd/debugging/sim -action soak
+go run ./go/cmd/sim -action soak
 ```
 
 Emit the final summary as JSON:
 
 ```bash
-go run ./cmd/debugging/sim -action soak -json
+go run ./go/cmd/sim -action soak -json
 ```
 
 Run only specific modes or seeds:
 
 ```bash
-go run ./cmd/debugging/sim -action soak -modes documents,splits
-go run ./cmd/debugging/sim -action soak -modes split_failover -seeds 521,523,541
+go run ./go/cmd/sim -action soak -modes documents,splits
+go run ./go/cmd/sim -action soak -modes split_failover -seeds 521,523,541
 ```
 
 Override runtime knobs:
 
 ```bash
-go run ./cmd/debugging/sim \
+go run ./go/cmd/sim \
   -action soak \
   -modes transactions \
   -steps 24 \

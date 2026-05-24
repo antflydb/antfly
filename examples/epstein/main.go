@@ -3004,7 +3004,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Florence 2\n")
 		fmt.Fprintf(os.Stderr, "\nQuick Start:\n")
 		fmt.Fprintf(os.Stderr, "  # 1. Start Antfly\n")
-		fmt.Fprintf(os.Stderr, "  go run ./cmd/antfly swarm\n\n")
+		fmt.Fprintf(os.Stderr, "  go run ./go/cmd/antfly swarm\n\n")
 		fmt.Fprintf(os.Stderr, "  # 2. Download documents (choose dataset)\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset court-2024    # ~23MB, 943 pages\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset doj-complete  # ~4.8GB, 8 datasets (Dec 2025)\n")

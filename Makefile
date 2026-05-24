@@ -102,7 +102,7 @@ build: build-antfarm
 	cp zig/zig-out/bin/antfly ./antfly
 
 build-go: build-antfarm generate
-	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
+	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./go/cmd/antfly
 
 build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
@@ -208,13 +208,13 @@ lint:
 	cd ts && pnpm run lint
 
 sim-validate:
-	$(GO) run ./cmd/debugging/sim -action validate -scope sim
+	$(GO) run ./go/cmd/sim -action validate -scope sim
 
 sim-validate-repo:
-	$(GO) run ./cmd/debugging/sim -action validate -scope repo
+	$(GO) run ./go/cmd/sim -action validate -scope repo
 
 sim-soak:
-	$(GO) run ./cmd/debugging/sim -action soak -json
+	$(GO) run ./go/cmd/sim -action soak -json
 
 
 # ====================================================================================
@@ -300,7 +300,7 @@ build-omni: download-omni-deps
 	export LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
 	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
 	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
-	$(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o antfly ./cmd/antfly
+	$(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o antfly ./go/cmd/antfly
 
 
 # ====================================================================================

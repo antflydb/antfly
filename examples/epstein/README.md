@@ -23,7 +23,7 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 
 ```bash
 # From the antfly root directory
-go run ./cmd/antfly swarm
+go run ./go/cmd/antfly swarm
 ```
 
 This starts a single-node Antfly cluster with:

@@ -68,7 +68,7 @@ ENV LD_LIBRARY_PATH="${ONNXRUNTIME_ROOT}/lib:/usr/local/lib"
 
 # Copy module files and local replace targets for dependency caching
 COPY go.mod go.sum ./
-COPY cmd/antfly /app/cmd/antfly
+COPY go/cmd/antfly /app/go/cmd/antfly
 COPY pkg /app/pkg
 
 RUN go mod download
@@ -82,7 +82,7 @@ RUN GOEXPERIMENT=simd CGO_ENABLED=1 \
     -tags="onnx,ORT,xla,XLA" \
     -ldflags="-s -w" \
     -o /antfly \
-    ./cmd/antfly
+    ./go/cmd/antfly
 
 # =============================================================================
 # Stage 2: Runtime

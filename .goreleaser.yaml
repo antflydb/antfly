@@ -24,7 +24,7 @@ builds:
     goos:
       - windows
     id: "antfly-go-windows"
-    main: ./cmd/antfly
+    main: ./go/cmd/antfly
     binary: antfly-go
     ignore:
       - goarch: "386"
@@ -91,7 +91,7 @@ builds:
       - linux
     goarch:
       - amd64
-    main: ./cmd/antfly
+    main: ./go/cmd/antfly
     binary: antfly-go
 
   # Linux ARM64 Go fallback OMNI (ONNX + XLA) (cross-compile)
@@ -117,7 +117,7 @@ builds:
       - linux
     goarch:
       - arm64
-    main: ./cmd/antfly
+    main: ./go/cmd/antfly
     binary: antfly-go
 
   # macOS ARM64 Go fallback OMNI (ONNX + XLA) (Zig cross-compilation)
@@ -144,7 +144,7 @@ builds:
       - darwin
     goarch:
       - arm64
-    main: ./cmd/antfly
+    main: ./go/cmd/antfly
     binary: antfly-go
 
 archives:

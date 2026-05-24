@@ -41,7 +41,7 @@ jobs:
         run: make tla-tools
 
       - name: Build with TLA+ tracing
-        run: go build -tags with_tla ./cmd/antfly
+        run: go build -tags with_tla ./go/cmd/antfly
 
       - name: Run transaction harness once and capture traces
         run: |

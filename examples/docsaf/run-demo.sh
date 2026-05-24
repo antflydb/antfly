@@ -19,7 +19,7 @@ if ! curl -s http://localhost:8080/api/v1/health > /dev/null 2>&1; then
     echo -e "${YELLOW}Warning: Antfly doesn't appear to be running${NC}"
     echo "Please start Antfly first:"
     echo "  cd ../../"
-    echo "  go run ./cmd/antfly swarm"
+    echo "  go run ./go/cmd/antfly swarm"
     echo ""
     read -p "Continue anyway? (y/n) " -n 1 -r
     echo

@@ -77,7 +77,7 @@ go test -race -v ./... > /tmp/test.log 2>&1
 ## Running Antfly
 
 ```bash
-go run ./cmd/antfly swarm              # Single-node dev
+go run ./go/cmd/antfly swarm              # Single-node dev
 ```
 
 **Termite**: ML service for embeddings/chunking/reranking, enabled by default in swarm mode. Models auto-discovered from `./models/`.

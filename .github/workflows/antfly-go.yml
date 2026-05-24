@@ -116,7 +116,7 @@ jobs:
           fi
 
       - name: Build Antfly
-        run: go build -v -o antfly ./cmd/antfly
+        run: go build -v -o antfly ./go/cmd/antfly
 
       - name: Test swarm startup
         run: |

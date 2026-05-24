@@ -3,7 +3,7 @@
 ## Repository Layout
 
 ```
-cmd/antfly/          CLI entry point (cobra subcommands: swarm, store, metadata, query, load, etc.)
+go/cmd/antfly/          CLI entry point (cobra subcommands: swarm, store, metadata, query, load, etc.)
 src/
   metadata/          Metadata server (API, Raft, schema management, retrieval agents)
   store/             Storage nodes (shards, indexes, queries, transactions)
@@ -92,7 +92,7 @@ Run `make help` for the full list. Key targets:
 Runs metadata, storage, and [Termite](pkg/termite) together:
 
 ```bash
-go run ./cmd/antfly swarm
+go run ./go/cmd/antfly swarm
 ```
 
 Dashboard at `http://localhost:8080`. Termite auto-discovers models from `~/.termite/models/`.

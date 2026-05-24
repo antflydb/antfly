@@ -19,7 +19,7 @@ import (
 	"io"
 	"runtime"
 
-	"github.com/antflydb/antfly/cmd/antfly/cmd"
+	"github.com/antflydb/antfly/go/cmd/antfly/cmd"
 	"github.com/antflydb/antfly/lib/utils"
 	json "github.com/antflydb/antfly/pkg/libaf/json"
 	gojson "github.com/goccy/go-json"

@@ -78,7 +78,7 @@ docker run --name postgres-antfly-demo \
 
 ```bash
 cd /path/to/antfly
-go run ./cmd/antfly swarm
+go run ./go/cmd/antfly swarm
 ```
 
 ### 3. Build the sync tool

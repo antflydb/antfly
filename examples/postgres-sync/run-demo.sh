@@ -85,7 +85,7 @@ if [ "$SKIP_ANTFLY_CHECK" = false ]; then
     echo ""
     echo "Start Antfly first:"
     echo "  cd ../../"
-    echo "  go run ./cmd/antfly swarm"
+    echo "  go run ./go/cmd/antfly swarm"
     echo ""
     echo "Or skip this check:"
     echo "  $0 --skip-antfly-check"

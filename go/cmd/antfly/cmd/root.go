@@ -22,7 +22,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/antflydb/antfly/cmd/antfly/cmd/cli"
+	"github.com/antflydb/antfly/go/cmd/antfly/cmd/cli"
 	"github.com/antflydb/antfly/lib/secrets"
 	"github.com/antflydb/antfly/src/common"
 	"github.com/spf13/cobra"

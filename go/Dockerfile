@@ -4,7 +4,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 WORKDIR /app
 
 COPY go.mod go.sum ./
-COPY cmd/antfly /app/cmd/antfly
+COPY go/cmd/antfly /app/go/cmd/antfly
 COPY pkg /app/pkg
 
 RUN go mod download
@@ -17,7 +17,7 @@ ARG TARGETARCH
 
 # Build the applications as static binaries for the target platform.
 # This makes them portable and suitable for minimal container images.
-RUN GOEXPERIMENT=simd CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o antfly ./cmd/antfly
+RUN GOEXPERIMENT=simd CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o antfly ./go/cmd/antfly
 
 # Stage 2: Create the final, minimal image
 FROM --platform=$TARGETPLATFORM alpine:3.21

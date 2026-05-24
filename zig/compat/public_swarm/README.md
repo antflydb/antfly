@@ -43,7 +43,7 @@ Build the sibling Go binary first:
 ```sh
 (cd ~/go/src/github.com/antflydb/antfly && \
   GOEXPERIMENT=simd GOCACHE=/tmp/go-build-cache \
-  go build -o /tmp/antfly-go ./cmd/antfly)
+  go build -o /tmp/antfly-go ./go/cmd/antfly)
 ```
 
 Then run the same harness against Go swarm:

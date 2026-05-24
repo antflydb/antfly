@@ -8,7 +8,7 @@ Antfly is a distributed search engine built on [etcd's raft library](https://git
 
 ```bash
 # Start a single-node cluster with built-in ML inference
-go run ./cmd/antfly swarm
+go run ./go/cmd/antfly swarm
 
 # Or run with Docker
 docker run -p 8080:8080 ghcr.io/antflydb/antfly:omni
