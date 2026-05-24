@@ -7442,7 +7442,7 @@ test "http handler index status exposes chunk preview blocker for chunk-backed f
         },
         "{\"version\":0}",
         "",
-        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4}}}}",
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     const first = [_]api_types.DocumentMutation{
@@ -7532,7 +7532,7 @@ test "http handler index status exposes chunk embeddings blocker for chunked den
         },
         "{\"version\":0}",
         "",
-        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4}}}}",
+        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     const first = [_]api_types.DocumentMutation{
