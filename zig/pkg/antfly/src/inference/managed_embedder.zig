@@ -940,33 +940,44 @@ fn buildManagedEmbeddingEntry(
         options.local_termite_provider
     else
         null;
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const owned_model = try alloc.dupe(u8, embedder_cfg.model);
+    errdefer alloc.free(owned_model);
+
     const bedrock_region: []u8 = if (provider == .bedrock) try resolveBedrockRegion(alloc, embedder_cfg) else @constCast("");
     errdefer if (bedrock_region.len > 0) alloc.free(bedrock_region);
-    const bedrock_endpoint: []u8 = if (provider == .bedrock) try resolveBedrockEndpoint(alloc, embedder_cfg, bedrock_region) else @constCast("");
-    errdefer if (bedrock_endpoint.len > 0) alloc.free(bedrock_endpoint);
+    const base_url = switch (provider) {
+        .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
+        .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
+        .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, bedrock_region),
+        .termite => if (local_termite_provider != null)
+            try alloc.dupe(u8, "")
+        else
+            try resolveTermiteBaseUrl(alloc, embedder_cfg),
+        .antfly => try alloc.dupe(u8, ""),
+    };
+    errdefer alloc.free(base_url);
+    const input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else @constCast("");
+    errdefer if (input_type.len > 0) alloc.free(input_type);
+    const truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else @constCast("");
+    errdefer if (truncate.len > 0) alloc.free(truncate);
+    const api_key = switch (provider) {
+        .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+        .ollama, .bedrock, .termite, .antfly => null,
+    };
+    errdefer if (api_key) |*owned_api_key| owned_api_key.deinit(alloc);
 
     return .{
         .alloc = alloc,
-        .index_name = try alloc.dupe(u8, index_name),
+        .index_name = owned_index_name,
         .provider = provider,
-        .model = try alloc.dupe(u8, embedder_cfg.model),
-        .base_url = switch (provider) {
-            .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
-            .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
-            .bedrock => bedrock_endpoint,
-            .termite => if (local_termite_provider != null)
-                try alloc.dupe(u8, "")
-            else
-                try resolveTermiteBaseUrl(alloc, embedder_cfg),
-            .antfly => try alloc.dupe(u8, ""),
-        },
+        .model = owned_model,
+        .base_url = base_url,
         .region = bedrock_region,
-        .input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else "",
-        .truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else "",
-        .api_key = switch (provider) {
-            .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
-            .ollama, .bedrock, .termite, .antfly => null,
-        },
+        .input_type = input_type,
+        .truncate = truncate,
+        .api_key = api_key,
         .secret_store = options.secret_store,
         .remote_content = options.remote_content,
         .dimensions = dimensions,
