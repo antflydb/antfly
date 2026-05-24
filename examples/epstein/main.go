@@ -33,6 +33,8 @@ import (
 	generatingreading "github.com/antflydb/antfly/pkg/generating/reading"
 	libai "github.com/antflydb/antfly/pkg/libaf/ai"
 	libreading "github.com/antflydb/antfly/pkg/libaf/reading"
+	termiteclient "github.com/antflydb/antfly/pkg/termite-client"
+	termiteoapi "github.com/antflydb/antfly/pkg/termite-client/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -186,6 +188,18 @@ var needsOCRFallback = docsaf.NeedsOCRFallback
 //go:embed templates/*
 var templatesFS embed.FS
 
+const (
+	DefaultAntflyURL       = "http://localhost:8080/api/v1"
+	DefaultTermiteURL      = "http://localhost:8080"
+	DefaultEmbeddingModel  = "antflydb/clipclap"
+	DefaultEmbeddingPull   = "antflydb/clipclap:gguf:Q4_K"
+	DefaultChunkerModel    = "fixed-bert-tokenizer"
+	DefaultOCRModel        = "Xenova/trocr-base-printed"
+	DefaultRecognizerModel = "fastino/gliner2-base-v1"
+	DefaultEntityLabels    = "person,organization,location,date,case,document,facility,aircraft"
+	DefaultRelationLabels  = "associated_with,located_in,mentioned_in,employed_by,traveled_to"
+)
+
 // Archive.org download URLs for Epstein documents
 const (
 	// January 2024 Court Unsealing - Giuffre v. Maxwell (943 pages, ~23MB PDF)
@@ -228,6 +242,28 @@ func (s *StringSliceFlag) String() string {
 func (s *StringSliceFlag) Set(value string) error {
 	*s = append(*s, value)
 	return nil
+}
+
+func envDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func defaultTermiteURL() string {
+	return envDefault("ANTFLY_TERMITE_URL", DefaultTermiteURL)
+}
+
+func splitCSV(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // downloadCmd downloads Epstein documents from archive.org
@@ -863,8 +899,8 @@ func prepareCmd(args []string) error {
 
 	// OCR fallback flags
 	enableOCR := fs.Bool("enable-ocr", false, "Enable OCR fallback when text extraction fails or produces poor results")
-	ocrTermiteURL := fs.String("ocr-url", "http://localhost:8082", "Termite URL for OCR")
-	ocrModels := fs.String("ocr-models", "trocr-base-printed,florence-2", "OCR models to try (comma-separated, in order)")
+	ocrTermiteURL := fs.String("ocr-url", defaultTermiteURL(), "Termite URL for OCR")
+	ocrModels := fs.String("ocr-models", DefaultOCRModel, "OCR models to try (comma-separated, in order)")
 	ocrMinContent := fs.Int("ocr-min-content", 50, "Trigger OCR if extracted content is shorter than this")
 	ocrDPI := fs.Float64("ocr-dpi", 150, "DPI for rendering PDF pages to images for OCR")
 
@@ -909,10 +945,7 @@ func prepareCmd(args []string) error {
 	// Initialize OCR client if enabled
 	var ocrClient *OCRClient
 	if *enableOCR {
-		models := strings.Split(*ocrModels, ",")
-		for i := range models {
-			models[i] = strings.TrimSpace(models[i])
-		}
+		models := splitCSV(*ocrModels)
 		var err error
 		ocrClient, err = NewOCRClient(*ocrTermiteURL, models, *ocrDPI)
 		if err != nil {
@@ -1329,15 +1362,16 @@ func prepareCmd(args []string) error {
 // loadCmd loads prepared JSON data into Antfly
 func loadCmd(args []string) error {
 	fs := flag.NewFlagSet("load", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
+	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed embeddings and chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name to merge into")
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file path")
 	dryRun := fs.Bool("dry-run", false, "Preview changes without applying them")
 	createTable := fs.Bool("create-table", false, "Create table if it doesn't exist")
 	numShards := fs.Int("num-shards", 1, "Number of shards for new table")
 	batchSize := fs.Int("batch-size", 25, "Linear merge batch size")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Embedding model to use")
-	chunkerModel := fs.String("chunker-model", "fixed-bert-tokenizer", "Chunker model")
+	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model to use")
+	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens for chunking")
 
@@ -1355,6 +1389,7 @@ func loadCmd(args []string) error {
 
 	fmt.Printf("=== Epstein Documents Load ===\n")
 	fmt.Printf("Antfly URL: %s\n", *antflyURL)
+	fmt.Printf("Termite URL: %s\n", *termiteURL)
 	fmt.Printf("Table: %s\n", *tableName)
 	fmt.Printf("Input: %s\n", *inputFile)
 	fmt.Printf("Dry run: %v\n\n", *dryRun)
@@ -1363,7 +1398,7 @@ func loadCmd(args []string) error {
 	if *createTable {
 		fmt.Printf("Creating table '%s' with %d shards...\n", *tableName, *numShards)
 
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
+		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *termiteURL, *chunkerModel, *targetTokens, *overlapTokens)
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index config: %w", err)
 		}
@@ -1415,7 +1450,8 @@ func loadCmd(args []string) error {
 // syncCmd combines download, prepare, and load
 func syncCmd(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
+	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed embeddings and chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name")
 	dirPath := fs.String("dir", "./epstein-docs", "Path to PDF directory")
 	baseURL := fs.String("base-url", "", "Base URL for document links")
@@ -1423,8 +1459,8 @@ func syncCmd(args []string) error {
 	createTable := fs.Bool("create-table", false, "Create table if needed")
 	numShards := fs.Int("num-shards", 1, "Number of shards")
 	batchSize := fs.Int("batch-size", 25, "Batch size")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Embedding model")
-	chunkerModel := fs.String("chunker-model", "fixed-bert-tokenizer", "Chunker model")
+	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model")
+	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens")
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster)")
@@ -1445,6 +1481,8 @@ func syncCmd(args []string) error {
 	}
 
 	fmt.Printf("=== Epstein Documents Sync ===\n")
+	fmt.Printf("Antfly URL: %s\n", *antflyURL)
+	fmt.Printf("Termite URL: %s\n", *termiteURL)
 	fmt.Printf("Directory: %s\n", *dirPath)
 	fmt.Printf("Table: %s\n", *tableName)
 	if len(zipPaths) > 0 {
@@ -1459,7 +1497,7 @@ func syncCmd(args []string) error {
 	if *createTable {
 		fmt.Printf("Creating table '%s'...\n", *tableName)
 
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
+		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *termiteURL, *chunkerModel, *targetTokens, *overlapTokens)
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index: %w", err)
 		}
@@ -1680,6 +1718,12 @@ type SearchResult struct {
 	FilePath string
 	PageNum  int
 	URL      string
+	Entities []EntityChip
+}
+
+type EntityChip struct {
+	Text  string
+	Label string
 }
 
 // SearchPageData holds data for the search page template
@@ -1747,6 +1791,7 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 					if pageNum, ok := metadata["page_number"].(float64); ok {
 						result.PageNum = int(pageNum)
 					}
+					result.Entities = extractEntityChips(metadata["entities"], 12)
 				}
 			}
 
@@ -1782,16 +1827,50 @@ func (s *SearchServer) handleAPISearch(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func extractEntityChips(value any, limit int) []EntityChip {
+	items, ok := value.([]any)
+	if !ok || limit <= 0 {
+		return nil
+	}
+
+	seen := map[string]struct{}{}
+	chips := make([]EntityChip, 0, min(limit, len(items)))
+	for _, item := range items {
+		entity, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, _ := entity["text"].(string)
+		label, _ := entity["label"].(string)
+		text = strings.TrimSpace(text)
+		label = strings.TrimSpace(label)
+		if text == "" || label == "" {
+			continue
+		}
+		key := strings.ToLower(label + "\x00" + text)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		chips = append(chips, EntityChip{Text: text, Label: label})
+		if len(chips) >= limit {
+			break
+		}
+	}
+	return chips
+}
+
 // Helper functions
 
-func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
+func createEmbeddingIndex(embeddingModel, termiteURL, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
 	embeddingIndexConfig := antfly.IndexConfig{
 		Name: "embeddings",
 		Type: antfly.IndexTypeEmbeddings,
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.OllamaEmbedderConfig{
-		Model: embeddingModel,
+	embedder, err := antfly.NewEmbedderConfig(antfly.TermiteEmbedderConfig{
+		ApiUrl: termiteURL,
+		Model:  embeddingModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure embedder: %w", err)
@@ -2676,9 +2755,9 @@ func enrichCmd(args []string) error {
 	fs := flag.NewFlagSet("enrich", flag.ExitOnError)
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file from prepare")
 	outputFile := fs.String("output", "", "Output JSON file (default: {input-base}-enriched.json)")
-	termiteURL := fs.String("termite-url", "http://localhost:11433/api", "Termite service URL")
-	model := fs.String("model", "onnx-community/Florence-2-base-ft", "Reader model for OCR")
-	prompt := fs.String("prompt", "<OCR>", "Florence 2 task prompt")
+	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite service URL")
+	model := fs.String("model", DefaultOCRModel, "Reader model for OCR")
+	prompt := fs.String("prompt", "", "Reader prompt")
 	maxTokens := fs.Int("max-tokens", 4096, "Max generation tokens")
 	dpi := fs.Float64("dpi", 150, "Render DPI for page images")
 	minContentLen := fs.Int("min-content", 50, "Short content threshold (chars)")
@@ -2989,6 +3068,168 @@ func enrichCmd(args []string) error {
 	return nil
 }
 
+type entityCandidate struct {
+	id      string
+	content string
+}
+
+// entitiesCmd enriches prepared page records with NER metadata from Termite.
+func entitiesCmd(args []string) error {
+	fs := flag.NewFlagSet("entities", flag.ExitOnError)
+	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file from prepare or enrich")
+	outputFile := fs.String("output", "", "Output JSON file (default: {input-base}-entities.json)")
+	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite service URL")
+	model := fs.String("model", DefaultRecognizerModel, "Recognizer model for entity extraction")
+	labelsCSV := fs.String("labels", DefaultEntityLabels, "Entity labels to extract (comma-separated)")
+	relationLabelsCSV := fs.String("relation-labels", "", "Relation labels to extract (comma-separated; optional)")
+	batchSize := fs.Int("batch-size", 16, "Texts per Termite recognize request")
+	dryRun := fs.Bool("dry-run", false, "Report candidates only, don't process")
+	reprocess := fs.Bool("reprocess", false, "Re-process records that already have entity metadata")
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+	if *batchSize <= 0 {
+		return fmt.Errorf("batch-size must be positive")
+	}
+
+	outPath := *outputFile
+	if outPath == "" {
+		base := strings.TrimSuffix(*inputFile, filepath.Ext(*inputFile))
+		outPath = base + "-entities.json"
+	}
+
+	labels := splitCSV(*labelsCSV)
+	relationLabels := splitCSV(*relationLabelsCSV)
+
+	fmt.Printf("=== Epstein Documents Entities ===\n\n")
+	fmt.Printf("Input:  %s\n", *inputFile)
+	fmt.Printf("Output: %s\n", outPath)
+	fmt.Printf("Termite URL: %s\n", *termiteURL)
+	fmt.Printf("Model:  %s\n", *model)
+	fmt.Printf("Labels: %s\n", strings.Join(labels, ", "))
+	if len(relationLabels) > 0 {
+		fmt.Printf("Relation labels: %s\n", strings.Join(relationLabels, ", "))
+	}
+	fmt.Println()
+
+	records, err := readJSONFile[map[string]map[string]any](*inputFile)
+	if err != nil {
+		return fmt.Errorf("failed to read input: %w", err)
+	}
+
+	candidates := entityCandidates(records, *reprocess)
+	fmt.Printf("Total records: %d\n", len(records))
+	fmt.Printf("Entity candidates: %d\n", len(candidates))
+	if *dryRun {
+		fmt.Printf("Dry run complete. Use without -dry-run to process.\n")
+		return nil
+	}
+	if len(candidates) == 0 {
+		return writeJSONSorted(outPath, records)
+	}
+
+	client, err := termiteclient.NewTermiteClient(*termiteURL, http.DefaultClient)
+	if err != nil {
+		return fmt.Errorf("create termite client: %w", err)
+	}
+
+	var processed, entityCount, relationCount int
+	for start := 0; start < len(candidates); start += *batchSize {
+		end := min(start+*batchSize, len(candidates))
+		batch := candidates[start:end]
+		ids := make([]string, len(batch))
+		texts := make([]string, len(batch))
+		for i, candidate := range batch {
+			ids[i] = candidate.id
+			texts[i] = candidate.content
+		}
+
+		var resp *termiteoapi.RecognizeResponse
+		if len(relationLabels) > 0 {
+			resp, err = client.ExtractRelations(context.Background(), *model, texts, labels, relationLabels)
+		} else {
+			resp, err = client.Recognize(context.Background(), *model, texts, labels)
+		}
+		if err != nil {
+			return fmt.Errorf("recognize batch %d-%d: %w", start+1, end, err)
+		}
+
+		usedModel := resp.Model
+		if usedModel == "" {
+			usedModel = *model
+		}
+
+		for i, id := range ids {
+			meta := ensureRecordMetadata(records[id])
+			entities := []termiteoapi.RecognizeEntity(nil)
+			if i < len(resp.Entities) {
+				entities = resp.Entities[i]
+			}
+			meta["entities"] = entities
+			meta["entity_model"] = usedModel
+			meta["entity_labels"] = labels
+			entityCount += len(entities)
+
+			if i < len(resp.Relations) {
+				relations := resp.Relations[i]
+				meta["relations"] = relations
+				meta["relation_labels"] = relationLabels
+				relationCount += len(relations)
+			}
+		}
+
+		processed += len(batch)
+		fmt.Printf("  Processed %d/%d records...\n", processed, len(candidates))
+	}
+
+	if err := writeJSONSorted(outPath, records); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+
+	fmt.Printf("\n=== Entities Summary ===\n")
+	fmt.Printf("  Records processed: %d\n", processed)
+	fmt.Printf("  Entities extracted: %d\n", entityCount)
+	fmt.Printf("  Relations extracted: %d\n", relationCount)
+	fmt.Printf("\nWrote %s\n", outPath)
+	return nil
+}
+
+func entityCandidates(records map[string]map[string]any, reprocess bool) []entityCandidate {
+	ids := make([]string, 0, len(records))
+	for id := range records {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	candidates := make([]entityCandidate, 0, len(records))
+	for _, id := range ids {
+		rec := records[id]
+		content, _ := rec["content"].(string)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		if !reprocess {
+			if meta, ok := rec["metadata"].(map[string]any); ok {
+				if _, ok := meta["entities"]; ok {
+					continue
+				}
+			}
+		}
+		candidates = append(candidates, entityCandidate{id: id, content: content})
+	}
+	return candidates
+}
+
+func ensureRecordMetadata(rec map[string]any) map[string]any {
+	meta, _ := rec["metadata"].(map[string]any)
+	if meta == nil {
+		meta = map[string]any{}
+		rec["metadata"] = meta
+	}
+	return meta
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "epstein - Epstein Documents Search Tool\n\n")
@@ -3001,10 +3242,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein sync [flags]      - Full pipeline (process + load)\n")
 		fmt.Fprintf(os.Stderr, "  epstein serve [flags]     - Start web search interface\n")
 		fmt.Fprintf(os.Stderr, "  epstein audit [flags]     - Audit parsed documents for errors\n")
-		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Florence 2\n")
+		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Termite readers\n")
+		fmt.Fprintf(os.Stderr, "  epstein entities [flags]  - Add Termite entity metadata to prepared JSON\n")
 		fmt.Fprintf(os.Stderr, "\nQuick Start:\n")
-		fmt.Fprintf(os.Stderr, "  # 1. Start Antfly\n")
-		fmt.Fprintf(os.Stderr, "  go run ./cmd/antfly swarm\n\n")
+		fmt.Fprintf(os.Stderr, "  # 1. Build and start Zig Antfly\n")
+		fmt.Fprintf(os.Stderr, "  cd zig && zig build install-antfly && ./zig-out/bin/antfly swarm\n\n")
 		fmt.Fprintf(os.Stderr, "  # 2. Download documents (choose dataset)\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset court-2024    # ~23MB, 943 pages\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset doj-complete  # ~4.8GB, 8 datasets (Dec 2025)\n")
@@ -3020,7 +3262,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein serve\n\n")
 		fmt.Fprintf(os.Stderr, "OCR Fallback:\n")
 		fmt.Fprintf(os.Stderr, "  The --enable-ocr flag enables automatic OCR when text extraction fails.\n")
-		fmt.Fprintf(os.Stderr, "  This requires Termite running with OCR models (trocr, florence-2).\n")
+		fmt.Fprintf(os.Stderr, "  This requires Termite running with OCR models such as %s.\n", DefaultOCRModel)
 		fmt.Fprintf(os.Stderr, "  Pages are rendered to images and sent to Termite for text recognition.\n")
 		fmt.Fprintf(os.Stderr, "  Useful for scanned documents or PDFs with garbled text extraction.\n\n")
 		fmt.Fprintf(os.Stderr, "Datasets:\n")
@@ -3048,9 +3290,11 @@ func main() {
 		err = auditCmd(os.Args[2:])
 	case "enrich":
 		err = enrichCmd(os.Args[2:])
+	case "entities":
+		err = entitiesCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		fmt.Fprintf(os.Stderr, "Valid commands: download, prepare, load, sync, serve, audit, enrich\n")
+		fmt.Fprintf(os.Stderr, "Valid commands: download, prepare, load, sync, serve, audit, enrich, entities\n")
 		os.Exit(1)
 	}
 

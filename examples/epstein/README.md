@@ -17,28 +17,41 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 ### Prerequisites
 
 - Go 1.21+
-- Running Antfly instance with Termite (for embeddings)
+- Zig 0.16.0+
+- Running Zig Antfly swarm with Termite models
 
-### 1. Start Antfly
+### 1. Build and Start Zig Antfly
 
 ```bash
 # From the antfly root directory
-go run ./cmd/antfly swarm
+cd zig
+zig build install-antfly
+./zig-out/bin/antfly swarm
 ```
 
-This starts a single-node Antfly cluster with:
-- Metadata server on port 8080
-- Store server on port 8081
-- Termite ML service on port 8082
+This starts a single-node Antfly cluster on `http://localhost:8080` with the
+Zig Termite routes mounted under the same public API.
 
-### 2. Build the Tool
+### 2. Pull Models
+
+The Zig model pull path treats HuggingFace as the default source, so `hf:` is
+omitted here.
+
+```bash
+cd zig
+./zig-out/bin/antfly termite pull antflydb/clipclap:gguf:Q4_K --tasks embedders
+./zig-out/bin/antfly termite pull Xenova/trocr-base-printed --tasks readers
+./zig-out/bin/antfly termite pull fastino/gliner2-base-v1:native --tasks recognizers
+```
+
+### 3. Build the Tool
 
 ```bash
 cd examples/epstein
 go build -o epstein .
 ```
 
-### 3. Download Documents
+### 4. Download or Point at Local Documents
 
 Choose a dataset based on your needs:
 
@@ -58,18 +71,38 @@ Choose a dataset based on your needs:
 ./epstein download --dataset all
 ```
 
-### 4. Index and Load
+If the files are already on an external disk, point the tool at them instead:
 
 ```bash
-# Process PDFs and load into Antfly
-./epstein sync --create-table
-
-# Or do it in steps:
-./epstein prepare                    # Extract text from PDFs
-./epstein load --create-table        # Load into Antfly
+export EPSTEIN_DOCS_DIR="/path/to/T9/epstein-files"
+export EPSTEIN_ZIP="/path/to/T9/DataSet_10.zip"
 ```
 
-### 5. Start Search Interface
+### 5. Prepare, Enrich, and Load
+
+```bash
+# Process PDFs into page records. --split-pages enables direct PDF viewing.
+./epstein prepare --dir "$EPSTEIN_DOCS_DIR" --split-pages
+
+# Optional: OCR low-quality pages through Zig Termite.
+./epstein enrich --input epstein-docs.json --dir "$EPSTEIN_DOCS_DIR"
+
+# Optional: add entity metadata to each page record.
+./epstein entities --input epstein-docs-enriched.json
+
+# Load into Antfly using ClipClap embeddings.
+./epstein load --input epstein-docs-enriched-entities.json --create-table
+```
+
+For ZIP sources that should not be extracted first:
+
+```bash
+./epstein prepare --zip "$EPSTEIN_ZIP" --split-pages
+./epstein entities --input epstein-docs.json
+./epstein load --input epstein-docs-entities.json --create-table
+```
+
+### 6. Start Search Interface
 
 ```bash
 ./epstein serve
@@ -102,6 +135,14 @@ Flags:
   --dir       Path to PDF directory (default: ./epstein-docs)
   --output    Output JSON file (default: epstein-docs.json)
   --base-url  Base URL for document links
+  --split-pages
+              Split PDFs into individual page PDFs for direct viewing
+  --zip       Path to ZIP archive containing PDFs (repeatable)
+  --enable-ocr
+              Enable OCR fallback through Termite readers
+  --ocr-url   Termite URL (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --ocr-models
+              OCR models to try (default: Xenova/trocr-base-printed)
 ```
 
 ### `load`
@@ -119,7 +160,8 @@ Flags:
   --dry-run         Preview changes without applying
   --num-shards      Number of shards (default: 1)
   --batch-size      Batch size for linear merge (default: 25)
-  --embedding-model Embedding model (default: embeddinggemma)
+  --termite-url     Termite URL for embeddings/chunking (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --embedding-model Embedding model (default: antflydb/clipclap)
   --chunker-model   Chunker model (default: fixed-bert-tokenizer)
   --target-tokens   Target tokens per chunk (default: 512)
   --overlap-tokens  Overlap between chunks (default: 50)
@@ -133,6 +175,41 @@ Full pipeline: process PDFs and load directly.
 ./epstein sync [flags]
 
 # Combines prepare + load flags
+```
+
+### `enrich`
+
+Runs a second OCR/vision pass over prepared JSON and writes a new JSON file.
+
+```bash
+./epstein enrich [flags]
+
+Flags:
+  --input       Input JSON file (default: epstein-docs.json)
+  --output      Output JSON file (default: {input-base}-enriched.json)
+  --termite-url Termite URL (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --model       Reader model (default: Xenova/trocr-base-printed)
+  --category    ocr, vision, quality, or all (default: ocr)
+  --dir         Base directory for resolving split page PDFs
+  --zip         Source ZIP archive for page lookup (repeatable)
+```
+
+### `entities`
+
+Adds Termite NER metadata to prepared or enriched JSON records.
+
+```bash
+./epstein entities [flags]
+
+Flags:
+  --input           Input JSON file (default: epstein-docs.json)
+  --output          Output JSON file (default: {input-base}-entities.json)
+  --termite-url     Termite URL (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --model           Recognizer model (default: fastino/gliner2-base-v1)
+  --labels          Entity labels to extract
+  --relation-labels Optional relation labels to extract
+  --batch-size      Texts per Termite recognize request (default: 16)
+  --reprocess       Re-process records that already have entities
 ```
 
 ### `serve`
@@ -169,8 +246,13 @@ Documents are indexed with:
 
 2. **Embedding Index** (aknn_v0)
    - Semantic similarity search
-   - Powered by Termite + embedding model
+   - Powered by Zig Termite + `antflydb/clipclap`
    - Chunked with configurable overlap
+
+3. **Entity Metadata** (optional)
+   - `epstein entities` stores recognized entities in `metadata.entities`
+   - Optional relations are stored in `metadata.relations`
+   - The search UI displays entity chips when present
 
 ### Search
 

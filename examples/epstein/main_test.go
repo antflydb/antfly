@@ -113,6 +113,70 @@ func createTestZip(t *testing.T, files map[string][]byte) string {
 	return path
 }
 
+func TestCreateEmbeddingIndexUsesTermiteClipClap(t *testing.T) {
+	idx, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultTermiteURL, DefaultChunkerModel, 512, 50)
+	if err != nil {
+		t.Fatalf("createEmbeddingIndex failed: %v", err)
+	}
+
+	cfg, err := idx.AsEmbeddingsIndexConfig()
+	if err != nil {
+		t.Fatalf("AsEmbeddingsIndexConfig failed: %v", err)
+	}
+
+	embedder, err := cfg.Embedder.AsTermiteEmbedderConfig()
+	if err != nil {
+		t.Fatalf("AsTermiteEmbedderConfig failed: %v", err)
+	}
+	if embedder.Model != DefaultEmbeddingModel {
+		t.Fatalf("embedder model = %q, want %q", embedder.Model, DefaultEmbeddingModel)
+	}
+	if embedder.ApiUrl != DefaultTermiteURL {
+		t.Fatalf("embedder api URL = %q, want %q", embedder.ApiUrl, DefaultTermiteURL)
+	}
+}
+
+func TestEntityCandidatesSkipExistingUnlessReprocess(t *testing.T) {
+	records := map[string]map[string]any{
+		"b": {"content": "Jane Doe wrote to Acme."},
+		"a": {
+			"content": "John Smith works at Google.",
+			"metadata": map[string]any{
+				"entities": []any{},
+			},
+		},
+		"c": {"content": "   "},
+	}
+
+	candidates := entityCandidates(records, false)
+	if len(candidates) != 1 || candidates[0].id != "b" {
+		t.Fatalf("candidates = %#v, want only b", candidates)
+	}
+
+	candidates = entityCandidates(records, true)
+	if len(candidates) != 2 || candidates[0].id != "a" || candidates[1].id != "b" {
+		t.Fatalf("reprocess candidates = %#v, want a then b", candidates)
+	}
+}
+
+func TestExtractEntityChipsDedupesAndLimits(t *testing.T) {
+	chips := extractEntityChips([]any{
+		map[string]any{"text": "Jane Doe", "label": "person"},
+		map[string]any{"text": "Jane Doe", "label": "person"},
+		map[string]any{"text": "Acme", "label": "organization"},
+	}, 2)
+
+	if len(chips) != 2 {
+		t.Fatalf("len(chips) = %d, want 2", len(chips))
+	}
+	if chips[0] != (EntityChip{Text: "Jane Doe", Label: "person"}) {
+		t.Fatalf("chips[0] = %#v", chips[0])
+	}
+	if chips[1] != (EntityChip{Text: "Acme", Label: "organization"}) {
+		t.Fatalf("chips[1] = %#v", chips[1])
+	}
+}
+
 func TestExtractOneZipPDF(t *testing.T) {
 	pdfData := createMinimalPDF()
 	zipPath := createTestZip(t, map[string][]byte{
@@ -196,10 +260,10 @@ func TestIterateZipPDFs(t *testing.T) {
 	jpgData := []byte("\xff\xd8\xff fake jpeg")
 
 	zipPath := createTestZip(t, map[string][]byte{
-		"docs/report.pdf":    pdfData,
-		"docs/summary.PDF":   pdfData, // uppercase extension
-		"docs/readme.txt":    txtData,
-		"images/photo.jpg":   jpgData,
+		"docs/report.pdf":     pdfData,
+		"docs/summary.PDF":    pdfData, // uppercase extension
+		"docs/readme.txt":     txtData,
+		"images/photo.jpg":    jpgData,
 		"nested/a/b/deep.pdf": pdfData,
 	})
 
@@ -248,8 +312,8 @@ func TestIterateZipPDFs(t *testing.T) {
 
 func TestIterateZipPDFs_Empty(t *testing.T) {
 	zipPath := createTestZip(t, map[string][]byte{
-		"readme.txt":  []byte("hello"),
-		"data.csv":    []byte("a,b,c"),
+		"readme.txt": []byte("hello"),
+		"data.csv":   []byte("a,b,c"),
 	})
 
 	called := false
@@ -319,8 +383,8 @@ func TestIdentifyEnrichCandidates(t *testing.T) {
 		minContent   int
 		reprocess    bool
 		wantIDs      []string            // expected candidate IDs (order-independent)
-		wantReason   map[string][]string  // id → expected reasons
-		wantCategory map[string]string    // id → expected category
+		wantReason   map[string][]string // id → expected reasons
+		wantCategory map[string]string   // id → expected category
 	}{
 		{
 			name: "short content triggers short_content with ocr category",
@@ -417,7 +481,7 @@ func TestIdentifyEnrichCandidates(t *testing.T) {
 			name: "no page source skipped",
 			records: map[string]map[string]any{
 				"page-1": {
-					"content": "short",
+					"content":  "short",
 					"metadata": map[string]any{},
 				},
 			},

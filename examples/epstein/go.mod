@@ -8,6 +8,7 @@ require (
 	github.com/antflydb/antfly/pkg/docsaf v0.0.0-20260207183149-045031239f8a
 	github.com/antflydb/antfly/pkg/generating v0.0.0
 	github.com/antflydb/antfly/pkg/libaf v0.0.1
+	github.com/antflydb/antfly/pkg/termite-client v0.0.0
 	github.com/pdfcpu/pdfcpu v0.11.1
 )
 
@@ -23,7 +24,6 @@ require (
 	github.com/antchfx/htmlquery v1.3.6 // indirect
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
-	github.com/antflydb/antfly/pkg/termite-client v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
