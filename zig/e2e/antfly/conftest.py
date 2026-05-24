@@ -1333,8 +1333,15 @@ def serverless_api(serverless_runtime):
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self._check(self.s.delete(f"{self.url}/tables/{table_name}/indexes/{index_name}", timeout=10))
 
-        def build_table(self, table_name: str) -> dict:
-            return self.post(antfly_internal_api_path(f"/tables/{table_name}/build"), {})
+        def build_table(self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1) -> dict:
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    return self.post(antfly_internal_api_path(f"/tables/{table_name}/build"), {})
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 409 or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(interval_s)
 
         def table_build_status(self, table_name: str) -> dict:
             return self.get(antfly_internal_api_path(f"/tables/{table_name}/build-status"))
