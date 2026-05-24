@@ -1633,7 +1633,7 @@ fn benchDbSearch(alloc: std.mem.Allocator, db: *db_mod.DB, query_bodies: []const
             defer result.deinit();
             stats.total_ns += elapsedSince(started);
             stats.queries += 1;
-            if (result.hits.len == 0) {
+            if (result.hits.len == 0 and !searchResultHasGraphPayload(result)) {
                 const db_stats = try db.stats(alloc);
                 defer db_mod.types.freeDBStats(alloc, db_stats);
                 std.debug.print("public-query guardrail empty db result idx={d} query={d}\n", .{
@@ -1649,6 +1649,13 @@ fn benchDbSearch(alloc: std.mem.Allocator, db: *db_mod.DB, query_bodies: []const
         }
     }
     return stats;
+}
+
+fn searchResultHasGraphPayload(result: db_mod.types.SearchResult) bool {
+    for (result.graph_results) |graph_result| {
+        if (graph_result.nodes.len > 0 or graph_result.paths.len > 0 or graph_result.matches.len > 0 or graph_result.hits.len > 0) return true;
+    }
+    return false;
 }
 
 fn benchDirectHandler(

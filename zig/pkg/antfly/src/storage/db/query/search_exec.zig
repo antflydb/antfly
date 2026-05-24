@@ -2186,26 +2186,56 @@ fn collectSearchQueryResolvedDocSetAlloc(
     text_entry: *index_manager_mod.IndexManager.TextIndex,
     search_query: search_mod.SearchQuery,
 ) !?doc_set.ResolvedDocSet {
+    const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+    const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    var snapshot_ns: u64 = 0;
+    var capability_ns: u64 = 0;
+    var filter_compile_ns: u64 = 0;
+    var execute_ns: u64 = 0;
+    var ordinal_ns: u64 = 0;
+    const snapshot_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const snapshot = text_entry.persistent.snapshot();
+    if (bench_profile) snapshot_ns = platform_time.monotonicNs() - snapshot_start_ns;
+    const capability_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     if (!(try searchQueryCanUseSnapshot(
         snapshot,
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
     ))) return null;
+    if (bench_profile) capability_ns = platform_time.monotonicNs() - capability_start_ns;
 
+    const filter_compile_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
+    if (bench_profile) filter_compile_ns = platform_time.monotonicNs() - filter_compile_start_ns;
+    const execute_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const doc_nums = try snapshot.executeFilter(alloc, filter);
+    if (bench_profile) execute_ns = platform_time.monotonicNs() - execute_start_ns;
     defer alloc.free(doc_nums);
     if (doc_nums.len == 0) {
         const empty: doc_set.ResolvedDocSet = .none;
+        if (bench_profile) {
+            std.log.info(
+                "antfly_bench_structured_filter total_us={d} snapshot_us={d} capability_us={d} filter_compile_us={d} execute_us={d} ordinal_us={d} doc_nums={d} result=none",
+                .{ nsToUs(platform_time.monotonicNs() - total_start_ns), nsToUs(snapshot_ns), nsToUs(capability_ns), nsToUs(filter_compile_ns), nsToUs(execute_ns), nsToUs(ordinal_ns), doc_nums.len },
+            );
+        }
         return empty;
     }
 
     if (snapshot.hasDocOrdinalCoverage()) {
+        const ordinal_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         if (try resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(alloc, snapshot, doc_nums, executor)) |resolved| {
+            if (bench_profile) {
+                ordinal_ns = platform_time.monotonicNs() - ordinal_start_ns;
+                std.log.info(
+                    "antfly_bench_structured_filter total_us={d} snapshot_us={d} capability_us={d} filter_compile_us={d} execute_us={d} ordinal_us={d} doc_nums={d} result=ordinals",
+                    .{ nsToUs(platform_time.monotonicNs() - total_start_ns), nsToUs(snapshot_ns), nsToUs(capability_ns), nsToUs(filter_compile_ns), nsToUs(execute_ns), nsToUs(ordinal_ns), doc_nums.len },
+                );
+            }
             return resolved;
         }
+        if (bench_profile) ordinal_ns = platform_time.monotonicNs() - ordinal_start_ns;
     }
 
     const resolve = executor.resolve_doc_ids_to_doc_set orelse return null;
@@ -2215,7 +2245,14 @@ fn collectSearchQueryResolvedDocSetAlloc(
         const stored = snapshot.storedDoc(doc_num) orelse continue;
         try doc_ids.append(alloc, try alloc.dupe(u8, stored.id));
     }
-    return try resolve(executor.ctx, alloc, doc_ids.items, executor.identity_read_generation);
+    const resolved = try resolve(executor.ctx, alloc, doc_ids.items, executor.identity_read_generation);
+    if (bench_profile) {
+        std.log.info(
+            "antfly_bench_structured_filter total_us={d} snapshot_us={d} capability_us={d} filter_compile_us={d} execute_us={d} ordinal_us={d} doc_nums={d} result=doc_ids",
+            .{ nsToUs(platform_time.monotonicNs() - total_start_ns), nsToUs(snapshot_ns), nsToUs(capability_ns), nsToUs(filter_compile_ns), nsToUs(execute_ns), nsToUs(ordinal_ns), doc_nums.len },
+        );
+    }
+    return resolved;
 }
 
 fn collectStructuredFilterTextDocNumsAlloc(
@@ -2268,15 +2305,11 @@ fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
     doc_nums: []const u32,
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocSet {
+    _ = executor;
     const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums)) orelse return null;
     defer alloc.free(ordinals);
     if (ordinals.len == 0) return null;
-    var resolved = try doc_set.fromOrdinalsAlloc(alloc, ordinals);
-    errdefer resolved.deinit(alloc);
-    const live_filter = executor.live_filter_doc_set orelse return resolved;
-    const live = try live_filter(executor.ctx, alloc, &resolved, executor.identity_read_generation);
-    resolved.deinit(alloc);
-    return live;
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
 }
 
 fn collectStructuredFilterResolvedDocSetCachedAlloc(

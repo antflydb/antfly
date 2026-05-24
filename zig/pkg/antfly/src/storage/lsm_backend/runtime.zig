@@ -2038,6 +2038,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
         stable_point_view: bool = false,
+        stable_point_view_loaded: bool = false,
         empty_state: State = .{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2054,34 +2055,18 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             errdefer backend.releaseReader();
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
-            var runs: []Run = &.{};
-            var l0_groups: []RunGroup = &.{};
-            var levels: []RunLevel = &.{};
-            errdefer {
-                deinitRunGroups(metadata_allocator, l0_groups);
-                metadata_allocator.free(levels);
-                freeRunSnapshotList(metadata_allocator, runs);
-            }
-            if (stable_point_view) {
-                runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
-                l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
-                levels = try buildLowerLevels(metadata_allocator, runs);
-            }
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
                 .backend = backend,
                 .namespace = namespace,
                 .stable_point_view = stable_point_view,
-                .runs = runs,
-                .l0_groups = l0_groups,
-                .levels = levels,
             };
         }
 
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
-            if (self.stable_point_view) {
+            if (self.stable_point_view_loaded) {
                 deinitRunGroups(self.metadata_allocator, self.l0_groups);
                 self.metadata_allocator.free(self.levels);
                 freeRunSnapshotList(self.metadata_allocator, self.runs);
@@ -2094,8 +2079,25 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
+        fn ensureStablePointViewLoaded(self: *@This()) !void {
+            if (!self.stable_point_view or self.stable_point_view_loaded) return;
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+            const runs = try borrowRunSnapshotList(self.metadata_allocator, self.backend.runs.items);
+            errdefer freeRunSnapshotList(self.metadata_allocator, runs);
+            const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
+            errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
+            const levels = try buildLowerLevels(self.metadata_allocator, runs);
+            errdefer self.metadata_allocator.free(levels);
+            self.runs = runs;
+            self.l0_groups = l0_groups;
+            self.levels = levels;
+            self.stable_point_view_loaded = true;
+        }
+
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             if (self.stable_point_view) {
+                try self.ensureStablePointViewLoaded();
                 self.backend.recordPointGet();
                 switch (try getFromStableCachedPointView(self.backend, self.metadata_allocator, self.runs, self.l0_groups, self.levels, &self.last_l0_group_index, self.namespace, key)) {
                     .hit => |value| return value,

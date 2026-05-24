@@ -8946,15 +8946,37 @@ pub const DB = struct {
     }
 
     fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
+        const bench_profile = platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var summary_ns: u64 = 0;
+        var stats_ns: u64 = 0;
+        const summary_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         if (try self.allDocsVisibleSummaryFastMaybe(generation)) |all_visible| {
+            if (bench_profile) summary_ns = platform_time.monotonicNs() - summary_start_ns;
+            if (bench_profile) {
+                std.log.info(
+                    "antfly_bench_visibility_gate total_us={d} summary_us={d} stats_us={d} result={}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, summary_ns / 1000, stats_ns / 1000, all_visible },
+                );
+            }
             if (all_visible) return true;
         }
+        if (bench_profile) summary_ns = platform_time.monotonicNs() - summary_start_ns;
+        const stats_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
+        if (bench_profile) stats_ns = platform_time.monotonicNs() - stats_start_ns;
         const generation_covers_all_creates = if (generation) |at|
             identity_stats.max_created_generation <= at
         else
             true;
-        return identity_stats.complete and identity_stats.tombstone_ordinals == 0 and generation_covers_all_creates;
+        const result = identity_stats.complete and identity_stats.tombstone_ordinals == 0 and generation_covers_all_creates;
+        if (bench_profile) {
+            std.log.info(
+                "antfly_bench_visibility_gate total_us={d} summary_us={d} stats_us={d} result={}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, summary_ns / 1000, stats_ns / 1000, result },
+            );
+        }
+        return result;
     }
 
     fn allDocsVisibleSummaryFast(self: *DB, generation: ?u64) !bool {

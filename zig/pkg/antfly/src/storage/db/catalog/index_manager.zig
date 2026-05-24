@@ -1668,7 +1668,7 @@ pub const IndexManager = struct {
 
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
-        var txn = try runtime_store.store.beginRead();
+        var txn = try runtime_store.store.beginProbe();
         defer txn.abort();
         const data = txn.get(index_catalog_key) catch |err| switch (err) {
             error.NotFound => {
@@ -4979,6 +4979,8 @@ pub const IndexManager = struct {
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
 
+                const forward_path = try std.fmt.allocPrint(self.alloc, "{s}/forward", .{path});
+                defer self.alloc.free(forward_path);
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
                 const reverse_store_missing = if (comptime builtin.os.tag == .freestanding) true else blk: {
@@ -4991,6 +4993,8 @@ pub const IndexManager = struct {
                     reverse_dir.close(io_impl.io());
                     break :blk false;
                 };
+                const zforward = try self.alloc.dupeZ(u8, forward_path);
+                defer self.alloc.free(zforward);
                 const zreverse = try self.alloc.dupeZ(u8, reverse_path);
                 defer self.alloc.free(zreverse);
 
@@ -4998,7 +5002,7 @@ pub const IndexManager = struct {
                 var cloned_cfg_moved = false;
                 errdefer if (!cloned_cfg_moved) cloned_cfg.deinit(self.alloc);
 
-                var index = try graph_mod.GraphIndex.open(self.alloc, store, zreverse, cloned_cfg.name, .{
+                var index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, cloned_cfg.name, .{
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .reverse_backend = self.graph_reverse_backend,
@@ -6762,31 +6766,58 @@ pub const IndexManager = struct {
     pub fn lookupSparseDocNumsForOrdinalsAlloc(
         self: *IndexManager,
         alloc: Allocator,
-        store: anytype,
+        store: *docstore_mod.DocStore,
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]const u32 {
+        const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var runtime_store_ns: u64 = 0;
+        var primary_txn_ns: u64 = 0;
+        var sparse_txn_ns: u64 = 0;
+        var doc_id_ns: u64 = 0;
+        var doc_num_ns: u64 = 0;
         const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
-        var runtime_store = try initRuntimeStore(self.alloc, store);
-        defer runtime_store.deinit();
 
-        var txn = try runtime_store.store.beginRead();
+        const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var txn = try store.beginProbeTxn();
         defer txn.abort();
+        if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
+        const sparse_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var sparse_txn = try entry.index.beginReadTxn();
         defer sparse_txn.abort();
+        if (bench_profile) sparse_txn_ns = platform_time.monotonicNs() - sparse_txn_start_ns;
 
         if (entry.chunk_name == null) {
-            var parent_doc_ids = std.ArrayListUnmanaged([]u8).empty;
-            defer {
-                for (parent_doc_ids.items) |parent_doc_id| self.alloc.free(parent_doc_id);
-                parent_doc_ids.deinit(self.alloc);
+            const doc_id_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, ordinals);
+            defer alloc.free(parent_doc_ids);
+            if (bench_profile) doc_id_ns = platform_time.monotonicNs() - doc_id_start_ns;
+            const doc_num_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const out = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
+            if (bench_profile) {
+                doc_num_ns = platform_time.monotonicNs() - doc_num_start_ns;
+                std.log.info(
+                    "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
+                    .{
+                        (platform_time.monotonicNs() - total_start_ns) / 1000,
+                        runtime_store_ns / 1000,
+                        primary_txn_ns / 1000,
+                        sparse_txn_ns / 1000,
+                        doc_id_ns / 1000,
+                        doc_num_ns / 1000,
+                        ordinals.len,
+                        out.len,
+                    },
+                );
             }
-            for (ordinals) |ordinal| {
-                const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
-                try parent_doc_ids.append(self.alloc, parent_doc_id);
-            }
-            return try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids.items);
+            return out;
         }
+
+        const runtime_store_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        if (bench_profile) runtime_store_ns = platform_time.monotonicNs() - runtime_store_start_ns;
 
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
@@ -6812,6 +6843,43 @@ pub const IndexManager = struct {
             }
         }
         return try out.toOwnedSlice(alloc);
+    }
+
+    fn lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_identity.DocOrdinal) ![]const []const u8 {
+        if (ordinals.len == 0) return try alloc.alloc([]const u8, 0);
+
+        const sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
+        defer alloc.free(sorted_ordinals);
+        std.mem.sort(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+
+        const IdentityOrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
+        var key_storage = try alloc.alloc(IdentityOrdinalKey, sorted_ordinals.len);
+        defer alloc.free(key_storage);
+        var keys = try alloc.alloc([]const u8, sorted_ordinals.len);
+        defer alloc.free(keys);
+        var values = try alloc.alloc(?[]const u8, sorted_ordinals.len);
+        defer alloc.free(values);
+
+        var key_count: usize = 0;
+        var previous: ?doc_identity.DocOrdinal = null;
+        for (sorted_ordinals) |ordinal| {
+            if (previous != null and previous.? == ordinal) continue;
+            key_storage[key_count] = internal_keys.identityOrdinalToDocKey(ordinal);
+            keys[key_count] = key_storage[key_count][0..];
+            values[key_count] = null;
+            key_count += 1;
+            previous = ordinal;
+        }
+
+        try txn.getManySorted(keys[0..key_count], values[0..key_count]);
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer doc_ids.deinit(alloc);
+        try doc_ids.ensureTotalCapacity(alloc, key_count);
+        for (values[0..key_count]) |maybe_raw| {
+            if (maybe_raw) |raw| doc_ids.appendAssumeCapacity(raw);
+        }
+        return try doc_ids.toOwnedSlice(alloc);
     }
 
     fn deleteGraphDocsEntry(self: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {

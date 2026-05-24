@@ -312,8 +312,8 @@ pub const ReverseBackend = enum {
 pub const GraphIndex = struct {
     alloc: Allocator,
     index_name: []const u8,
-    main_store: backend_erased.Store,
-    owns_main_store: bool,
+    outgoing_store: backend_erased.Store,
+    outgoing_owner: ReverseStoreOwner,
     reverse_store: backend_erased.Store,
     reverse_owner: ReverseStoreOwner,
     edge_type_configs: []const EdgeTypeConfig,
@@ -378,6 +378,10 @@ pub const GraphIndex = struct {
 
     pub fn reverseStore(self: *GraphIndex) *backend_erased.Store {
         return &self.reverse_store;
+    }
+
+    fn beginWriteOutgoingBatch(self: *GraphIndex) !backend_erased.Batch {
+        return try self.outgoing_store.beginBatch();
     }
 
     fn beginReadReverseTxn(self: *GraphIndex) !backend_erased.ReadTxn {
@@ -546,13 +550,13 @@ pub const GraphIndex = struct {
         try batch.commit();
     }
 
-    fn openReverseStore(alloc: Allocator, reverse_path: [*:0]const u8, opts: GraphIndexOptions) !OpenedReverseStore {
+    fn openEdgeStore(alloc: Allocator, path: [*:0]const u8, opts: GraphIndexOptions) !OpenedReverseStore {
         switch (opts.reverse_backend) {
             .lmdb => {
                 if (!supports_native_reverse_lmdb) return error.UnsupportedPlatform;
                 const backend = try alloc.create(lmdb_backend.Backend);
                 errdefer alloc.destroy(backend);
-                backend.* = try lmdb_backend.Backend.open(alloc, reverse_path, .{
+                backend.* = try lmdb_backend.Backend.open(alloc, path, .{
                     .backend = .{
                         .durability = if (opts.no_sync) .none else .full,
                     },
@@ -598,7 +602,7 @@ pub const GraphIndex = struct {
                 };
             },
             .lsm => {
-                var handle = try lsm_backend.BackendHandle.open(alloc, std.mem.span(reverse_path), resolvedReverseLsmOptions(opts, false));
+                var handle = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), resolvedReverseLsmOptions(opts, false));
                 errdefer handle.close();
 
                 var runtime = try handle.backend.runtimeStore(alloc, .{});
@@ -611,9 +615,32 @@ pub const GraphIndex = struct {
         }
     }
 
+    fn openReverseStore(alloc: Allocator, reverse_path: [*:0]const u8, opts: GraphIndexOptions) !OpenedReverseStore {
+        return try openEdgeStore(alloc, reverse_path, opts);
+    }
+
+    /// Test/backward-compatible opener. The supplied store is ignored: graph
+    /// edges live in private forward/reverse stores rooted under reverse_path.
     pub fn open(alloc: Allocator, main_store: anytype, reverse_path: [*:0]const u8, index_name: []const u8, opts: GraphIndexOptions) !GraphIndex {
-        var runtime_store = try initRuntimeStore(alloc, main_store);
-        errdefer if (runtime_store.owned) runtime_store.store.deinit();
+        _ = main_store;
+        const root = std.mem.span(reverse_path);
+        const outgoing_raw = try std.fmt.allocPrint(alloc, "{s}/forward", .{root});
+        defer alloc.free(outgoing_raw);
+        const outgoing_path = try alloc.dupeZ(u8, outgoing_raw);
+        defer alloc.free(outgoing_path);
+        const reverse_raw = try std.fmt.allocPrint(alloc, "{s}/reverse", .{root});
+        defer alloc.free(reverse_raw);
+        const private_reverse_path = try alloc.dupeZ(u8, reverse_raw);
+        defer alloc.free(private_reverse_path);
+        return try openWithPrivateStores(alloc, outgoing_path, private_reverse_path, index_name, opts);
+    }
+
+    pub fn openWithPrivateStores(alloc: Allocator, outgoing_path: [*:0]const u8, reverse_path: [*:0]const u8, index_name: []const u8, opts: GraphIndexOptions) !GraphIndex {
+        var outgoing_store = try openEdgeStore(alloc, outgoing_path, opts);
+        errdefer {
+            outgoing_store.store.deinit();
+            outgoing_store.owner.close(alloc);
+        }
         var reverse_store = try openReverseStore(alloc, reverse_path, opts);
         errdefer {
             reverse_store.store.deinit();
@@ -624,8 +651,8 @@ pub const GraphIndex = struct {
         return .{
             .alloc = alloc,
             .index_name = index_name,
-            .main_store = runtime_store.store,
-            .owns_main_store = runtime_store.owned,
+            .outgoing_store = outgoing_store.store,
+            .outgoing_owner = outgoing_store.owner,
             .reverse_store = reverse_store.store,
             .reverse_owner = reverse_store.owner,
             .edge_type_configs = opts.edge_type_configs,
@@ -642,7 +669,8 @@ pub const GraphIndex = struct {
     }
 
     pub fn close(self: *GraphIndex) void {
-        if (self.owns_main_store) self.main_store.deinit();
+        self.outgoing_store.deinit();
+        self.outgoing_owner.close(self.alloc);
         self.reverse_store.deinit();
         self.reverse_owner.close(self.alloc);
         if (self.rebuild_root_path) |path| self.alloc.free(path);
@@ -650,10 +678,12 @@ pub const GraphIndex = struct {
     }
 
     pub fn sync(self: *GraphIndex, force: bool) !void {
+        try self.outgoing_owner.sync(force);
         try self.reverse_owner.sync(force);
     }
 
     pub fn syncReplayState(self: *GraphIndex) !void {
+        try self.outgoing_owner.sync(false);
         try self.reverse_owner.sync(false);
     }
 
@@ -779,7 +809,7 @@ pub const GraphIndex = struct {
         return .graph;
     }
 
-    /// Add an edge (writes outgoing to main store + reverse to reverse env).
+    /// Add an edge (writes outgoing and reverse edge rows to private graph stores).
     /// Returns TreeTopologyViolation if the edge type has tree topology and
     /// the source already has an outgoing edge of that type to a different target.
     pub fn addEdge(
@@ -819,7 +849,7 @@ pub const GraphIndex = struct {
 
         try self.validateTreeBatchWrites(writes, deletes);
 
-        var main_batch = try self.main_store.beginBatch();
+        var main_batch = try self.beginWriteOutgoingBatch();
         errdefer main_batch.abort();
 
         var reverse_batch = try self.beginWriteReverseBatch();
@@ -867,7 +897,7 @@ pub const GraphIndex = struct {
         try reverse_batch.commit();
     }
 
-    /// Delete an edge (removes from both main store and reverse env).
+    /// Delete an edge (removes from both private graph stores).
     pub fn deleteEdge(self: *GraphIndex, source: []const u8, target: []const u8, edge_type: []const u8) !void {
         return try self.batchApply(&.{}, &.{.{
             .source = source,
@@ -1152,11 +1182,11 @@ pub const GraphIndex = struct {
     }
 
     fn mainStoreScanPrefix(self: *GraphIndex, alloc: Allocator, prefix: []const u8) ![]backend_scan.OwnedKVPair {
-        return try backend_scan.scanPrefix(alloc, &self.main_store, prefix);
+        return try backend_scan.scanPrefix(alloc, &self.outgoing_store, prefix);
     }
 
     fn mainStoreScanRange(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) ![]backend_scan.OwnedKVPair {
-        return try backend_scan.scanRange(alloc, &self.main_store, lower, upper);
+        return try backend_scan.scanRange(alloc, &self.outgoing_store, lower, upper);
     }
 
     fn containsBatchDelete(
@@ -1495,7 +1525,12 @@ test "graph rebuildReverseFromOwnedOutgoingEdges reconstructs incoming index" {
     const edge_val = encodeEdgeValue(&val_buf, 1.0, 10, 11, "");
     const edge_key = try edgeKeyAlloc(alloc, "doc:m", "g", "ref", "doc:z");
     defer alloc.free(edge_key);
-    try store.put(edge_key, edge_val);
+    {
+        var batch = try graph.outgoing_store.beginBatch();
+        errdefer batch.abort();
+        try batch.put(edge_key, edge_val);
+        try batch.commit();
+    }
 
     try std.testing.expectEqual(@as(usize, 1), try graph.rebuildReverseFromOwnedOutgoingEdges(alloc, "doc:m", ""));
 
@@ -1528,9 +1563,14 @@ test "graph rebuildReverseFromOwnedOutgoingEdges respects split ownership bounds
     defer alloc.free(edge_m);
     const edge_t = try edgeKeyAlloc(alloc, "doc:t", "g", "ref", "doc:y");
     defer alloc.free(edge_t);
-    try store.put(edge_a, edge_val);
-    try store.put(edge_m, edge_val);
-    try store.put(edge_t, edge_val);
+    {
+        var batch = try graph.outgoing_store.beginBatch();
+        errdefer batch.abort();
+        try batch.put(edge_a, edge_val);
+        try batch.put(edge_m, edge_val);
+        try batch.put(edge_t, edge_val);
+        try batch.commit();
+    }
 
     try std.testing.expectEqual(@as(usize, 1), try graph.rebuildReverseFromOwnedOutgoingEdges(alloc, "doc:m", "doc:t"));
 
