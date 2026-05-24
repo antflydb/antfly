@@ -986,18 +986,19 @@ func (r *Reconciler) executeMergeRollback(
 	if err != nil {
 		return err
 	}
+	var cleanupErrs []error
 	if receiverStatus.MergeState != nil {
 		rollbackState := proto.Clone(receiverStatus.MergeState).(*db.MergeState)
 		rollbackState.SetPhase(db.MergeState_PHASE_ROLLING_BACK)
 		if err := r.shardOps.SetMergeState(ctx, receiverShardID, rollbackState); err != nil {
-			return fmt.Errorf("setting receiver rollback state: %w", err)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("setting receiver rollback state: %w", err))
 		}
 	}
 	if err := r.shardOps.SetMergeState(ctx, donorShardID, nil); err != nil {
-		return fmt.Errorf("clearing donor merge state: %w", err)
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("clearing donor merge state: %w", err))
 	}
 	if err := r.shardOps.SetMergeState(ctx, receiverShardID, nil); err != nil {
-		return fmt.Errorf("clearing receiver merge state: %w", err)
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("clearing receiver merge state: %w", err))
 	}
 	if _, err := r.tableOps.RollbackShardsForMerge(tablemgr.MergeTransition{
 		ShardID:      receiverShardID,
@@ -1011,7 +1012,7 @@ func (r *Reconciler) executeMergeRollback(
 	r.SetShardCooldown(receiverShardID, r.getCooldownDuration())
 	r.SetShardCooldown(donorShardID, r.getCooldownDuration())
 	_ = donorStatus
-	return nil
+	return errors.Join(cleanupErrs...)
 }
 
 // executeSplitAndMergeTransitions executes split and merge transitions

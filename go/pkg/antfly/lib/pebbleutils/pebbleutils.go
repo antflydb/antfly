@@ -84,6 +84,13 @@ func IsPebbleEmpty(db *pebble.DB, skipPrefix []byte) (bool, error) {
 // DefaultCacheSizeMB is the default shared block cache size in megabytes.
 const DefaultCacheSizeMB int64 = 256
 
+func cacheSizeBytesOrDefault(sizeBytes int64) int64 {
+	if sizeBytes > 0 {
+		return sizeBytes
+	}
+	return DefaultCacheSizeMB << 20
+}
+
 // Cache wraps a shared pebble.Cache that can be used across multiple pebble.DB instances.
 // A shared cache lets Pebble's LRU globally evict cold blocks from idle DBs in favor of
 // hot blocks from active ones, reducing total memory usage.
@@ -93,7 +100,7 @@ type Cache struct {
 
 // NewCache creates a new shared Pebble block cache with the given size in bytes.
 func NewCache(sizeBytes int64) *Cache {
-	return &Cache{cache: pebble.NewCache(sizeBytes)}
+	return &Cache{cache: pebble.NewCache(cacheSizeBytesOrDefault(sizeBytes))}
 }
 
 // Get returns the underlying pebble.Cache. It is nil-safe: if c is nil, returns nil.
@@ -118,7 +125,7 @@ func (c *Cache) Apply(opts *pebble.Options, fallbackBytes int64) {
 	if c != nil && c.cache != nil {
 		opts.Cache = c.cache
 	} else {
-		opts.Cache = pebble.NewCache(fallbackBytes)
+		opts.Cache = pebble.NewCache(cacheSizeBytesOrDefault(fallbackBytes))
 	}
 }
 

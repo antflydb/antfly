@@ -86,7 +86,7 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 	t.Log("full_text_index_v0 build complete")
 
 	// Update schema via oapi client (AntflyClient doesn't wrap UpdateSchema).
-	apiURL := swarm.MetadataAPIURL + "/api/v1"
+	apiURL := antfly.NormalizeBaseURL(swarm.MetadataAPIURL)
 	oapiClient, err := oapi.NewClient(apiURL, oapi.WithHTTPClient(&http.Client{Timeout: 30 * time.Second}))
 	require.NoError(t, err, "Failed to create oapi client")
 

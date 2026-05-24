@@ -19,8 +19,29 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNewCacheDefaultsNonPositiveSize(t *testing.T) {
+	cache := NewCache(0)
+	defer cache.Close()
+
+	require.NotNil(t, cache.Get())
+}
+
+func TestCacheApplyDefaultsNonPositiveFallback(t *testing.T) {
+	opts := &pebble.Options{FS: vfs.NewMem()}
+	var cache *Cache
+
+	cache.Apply(opts, 0)
+	require.NotNil(t, opts.Cache)
+
+	db, err := pebble.Open("", opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Set([]byte("k"), []byte("v"), pebble.NoSync))
+	require.NoError(t, db.Close())
+}
 
 func TestRecoverPebbleClosed_RecognizesRawPebbleClosedError(t *testing.T) {
 	var err error
