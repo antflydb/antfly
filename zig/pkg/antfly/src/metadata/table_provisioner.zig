@@ -772,7 +772,14 @@ test "table provisioner restores local shard data from metadata restore intent" 
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), source_db_path) catch {};
 
-    var source_db = try db_mod.DB.open(std.testing.allocator, source_db_path, .{});
+    const restore_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 2001,
+        .range_id = 2001,
+    };
+    var source_db = try db_mod.DB.open(std.testing.allocator, source_db_path, .{
+        .identity_namespace = restore_namespace,
+    });
     defer {
         source_db.close();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), source_db_path) catch {};

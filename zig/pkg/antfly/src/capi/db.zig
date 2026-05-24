@@ -5681,6 +5681,7 @@ test "capi execute graph queries honors identity read generation" {
             .{ .key = "n:a", .value = "{\"title\":\"A\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"}]}}}" },
             .{ .key = "n:b", .value = "{\"title\":\"B\"}" },
         },
+        .sync_level = .full_index,
     });
 
     const missing_generation_request =

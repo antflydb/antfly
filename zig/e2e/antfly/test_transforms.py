@@ -25,6 +25,11 @@ from helpers import wait_until
 from helpers import json_doc, upsert
 
 
+def _raise_thread_errors(errors: list[Exception]) -> None:
+    if errors:
+        raise AssertionError("\n\n".join(str(err) for err in errors))
+
+
 def _transform(key: str, *operations: dict[str, object], upsert: bool = False) -> dict[str, object]:
     payload: dict[str, object] = {
         "key": key,
@@ -178,7 +183,7 @@ def test_transform_concurrent_max_updates(stateful_api):
     for thread in threads:
         thread.join()
 
-    assert not errors
+    _raise_thread_errors(errors)
     doc = wait_until(
         lambda: _lookup_doc(stateful_api, table_name, "concurrent-item"),
         timeout_s=10.0,
@@ -222,7 +227,7 @@ def test_transform_inc_atomic_counter(stateful_api):
     for thread in threads:
         thread.join()
 
-    assert not errors
+    _raise_thread_errors(errors)
     doc = wait_until(
         lambda: _lookup_doc(stateful_api, table_name, "counter-item"),
         timeout_s=10.0,
