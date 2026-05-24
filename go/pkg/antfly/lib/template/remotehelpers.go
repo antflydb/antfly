@@ -50,10 +50,10 @@ func resolveCredentials(rawURL, credentials string) (*scraping.S3Credentials, *s
 	if err != nil {
 		log.Printf("S3 credential resolution failed for %s: %v", rawURL, err)
 		s3Creds = scraping.GetDefaultS3Credentials()
-		securityConfig = scraping.GetDefaultSecurityConfig()
+		securityConfig = scraping.GetEffectiveSecurity()
 	}
 	if securityConfig == nil {
-		securityConfig = scraping.GetDefaultSecurityConfig()
+		securityConfig = scraping.GetEffectiveSecurity()
 	}
 	return s3Creds, securityConfig
 }

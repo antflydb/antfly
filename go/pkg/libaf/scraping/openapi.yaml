@@ -101,7 +101,7 @@ components:
       properties:
         security:
           $ref: '#/components/schemas/ContentSecurityConfig'
-          description: Global security defaults for remote content operations. Overrides top-level content_security when set.
+          description: Global security defaults for remote content operations.
         default_s3:
           type: string
           description: Default S3 credential name when no bucket pattern matches.

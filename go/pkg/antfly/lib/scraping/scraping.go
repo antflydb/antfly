@@ -60,31 +60,19 @@ func IsSecurityConfigEmpty(cfg ContentSecurityConfig) bool {
 		cfg.MaxImageDimension == 0
 }
 
-// Package-level defaults for security config and S3 credentials.
-// These can be set at startup by the application (e.g., from antfly/termite config).
+// Package-level defaults for S3 credentials.
 var (
-	defaultSecurityConfig *ContentSecurityConfig
-	defaultS3Credentials  *S3Credentials
+	defaultS3Credentials *S3Credentials
 )
 
 // GetDefaultSecurityConfig returns the default security configuration for content downloads.
-// If no custom config has been set, returns safe defaults.
 func GetDefaultSecurityConfig() *ContentSecurityConfig {
-	if defaultSecurityConfig != nil {
-		return defaultSecurityConfig
-	}
 	return &ContentSecurityConfig{
 		BlockPrivateIps:        true,
 		MaxDownloadSizeBytes:   100 * 1024 * 1024, // 100MB
 		DownloadTimeoutSeconds: 30,
 		MaxImageDimension:      2048,
 	}
-}
-
-// SetDefaultSecurityConfig sets the package-level default security configuration.
-// This affects all content downloads unless overridden.
-func SetDefaultSecurityConfig(config *ContentSecurityConfig) {
-	defaultSecurityConfig = config
 }
 
 // GetDefaultS3Credentials returns the default S3 credentials for content downloads.
