@@ -23,6 +23,12 @@ const resource_manager_mod = antfly.resource_manager;
 
 const full_text_index_name = "ft_docid";
 const sparse_index_name = "sp_docid";
+const dense_index_name = "dn_docid";
+const graph_index_name = "gr_docid";
+const algebraic_index_name = "alg_docid";
+const algebraic_config_json =
+    \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"},{"name":"status","path":"status","type":"string"},{"name":"tenant","path":"tenant","type":"string"}],"measure_fields":[{"name":"score","path":"score","type":"number"}],"adaptive":{"observe":true,"lazy_materialization":true,"min_observations":2,"max_backfill_rows_per_tick":100000,"min_estimated_scan_rows_saved":1},"materializations":[]}
+;
 
 const Config = struct {
     docs: usize = 4096,
@@ -31,6 +37,7 @@ const Config = struct {
     filter_size: usize = 256,
     batch_size: usize = 256,
     sparse_dims: usize = 64,
+    dense_dims: usize = 4,
     limit: u32 = 32,
     body_repeat: usize = 1,
     require_correctness: bool = true,
@@ -39,6 +46,10 @@ const Config = struct {
     progress_every: usize = 0,
     defer_full_index_load: bool = false,
     bulk_load: bool = false,
+    with_sparse: bool = false,
+    with_dense: bool = false,
+    with_graph: bool = false,
+    with_algebraic: bool = false,
 };
 
 const QueryShape = enum {
@@ -100,7 +111,7 @@ const BenchResult = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const alloc = std.heap.page_allocator;
+    const alloc = std.heap.smp_allocator;
     const cfg = try parseArgs(init.minimal.args);
 
     var stdout_buffer: [4096]u8 = undefined;
@@ -131,11 +142,40 @@ pub fn main(init: std.process.Init) !void {
         .kind = .full_text,
         .config_json = "{\"field\":\"title\"}",
     });
-    try db.addIndex(.{
-        .name = sparse_index_name,
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    if (cfg.with_sparse) {
+        try db.addIndex(.{
+            .name = sparse_index_name,
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse\",\"external\":true}",
+        });
+    }
+    if (cfg.with_dense) {
+        const dense_config = try std.fmt.allocPrint(
+            alloc,
+            "{{\"field\":\"embedding\",\"dims\":{d},\"metric\":\"l2_squared\",\"external\":true}}",
+            .{cfg.dense_dims},
+        );
+        defer alloc.free(dense_config);
+        try db.addIndex(.{
+            .name = dense_index_name,
+            .kind = .dense_vector,
+            .config_json = dense_config,
+        });
+    }
+    if (cfg.with_graph) {
+        try db.addIndex(.{
+            .name = graph_index_name,
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+    if (cfg.with_algebraic) {
+        try db.addIndex(.{
+            .name = algebraic_index_name,
+            .kind = .algebraic,
+            .config_json = algebraic_config_json,
+        });
+    }
 
     const doc_ids = try loadDocs(alloc, &db, cfg);
     defer freeDocIds(alloc, doc_ids);
@@ -164,6 +204,7 @@ pub fn main(init: std.process.Init) !void {
 
     const shapes = [_]QueryShape{ .match_all_filter, .full_text_filter, .sparse_filter };
     for (shapes) |shape| {
+        if (shape == .sparse_filter and !cfg.with_sparse) continue;
         const public_result = try runBench(alloc, &db, cfg, filters, shape, .public_ids, generation, null);
         try printResult(out, cfg, public_result);
 
@@ -173,7 +214,9 @@ pub fn main(init: std.process.Init) !void {
         try stdout_writer.flush();
         try validateSummary(cfg, public_result, ordinal_result);
     }
-    try printSparseProjectionResult(out, cfg, try runSparseIdProjectionBench(alloc, &db, doc_ids, cfg, generation, filters));
+    if (cfg.with_sparse) {
+        try printSparseProjectionResult(out, cfg, try runSparseIdProjectionBench(alloc, &db, doc_ids, cfg, generation, filters));
+    }
     try stdout_writer.flush();
 }
 
@@ -189,6 +232,8 @@ fn loadDocs(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) ![][]u8 {
 
     var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
     defer writes.deinit(alloc);
+    var graph_writes = std.ArrayListUnmanaged(db_mod.types.GraphEdgeWrite).empty;
+    defer graph_writes.deinit(alloc);
     var values = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (values.items) |value| alloc.free(value);
@@ -209,18 +254,29 @@ fn loadDocs(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) ![][]u8 {
         const value = try makeDocValue(alloc, i, cfg);
         try values.append(alloc, value);
         try writes.append(alloc, .{ .key = doc_id, .value = value });
+        if (cfg.with_graph) {
+            const target_idx = if (i == 0) i else i - 1;
+            try graph_writes.append(alloc, .{
+                .index_name = graph_index_name,
+                .source = doc_id,
+                .target = doc_ids[target_idx],
+                .edge_type = "prev",
+                .weight = 1.0,
+            });
+        }
         if (writes.items.len >= cfg.batch_size) {
             var profile = db_mod.BatchProfile{};
-            try db.batchProfiled(.{ .writes = writes.items, .sync_level = loadSyncLevel(cfg) }, &profile);
+            try db.batchProfiled(.{ .writes = writes.items, .graph_writes = graph_writes.items, .sync_level = loadSyncLevel(cfg) }, &profile);
             addBatchProfile(&total_profile, profile);
             batches += 1;
             writes.clearRetainingCapacity();
+            graph_writes.clearRetainingCapacity();
             printLoadProgress(cfg, i + 1, load_start);
         }
     }
     if (writes.items.len > 0) {
         var profile = db_mod.BatchProfile{};
-        try db.batchProfiled(.{ .writes = writes.items, .sync_level = loadSyncLevel(cfg) }, &profile);
+        try db.batchProfiled(.{ .writes = writes.items, .graph_writes = graph_writes.items, .sync_level = loadSyncLevel(cfg) }, &profile);
         addBatchProfile(&total_profile, profile);
         batches += 1;
         printLoadProgress(cfg, cfg.docs, load_start);
@@ -278,6 +334,31 @@ fn printLoadSummary(cfg: Config, batches: usize, elapsed_ns: u64, profile: db_mo
             profile.index_sync_ns,
         },
     );
+    std.debug.print(
+        "{{\"event\":\"docid_query_bench_load_extract_summary\",\"docs\":{d},\"batches\":{d},\"extract_vector_field_names_ns\":{d},\"extract_mapper_ns\":{d},\"extract_graph_fields_ns\":{d},\"extract_index_field_embeddings_ns\":{d},\"extract_embedding_artifacts_ns\":{d},\"extract_graph_artifacts_ns\":{d},\"extract_strip_store_value_ns\":{d},\"extract_timestamp_ns\":{d},\"overwrite_probe_ns\":{d},\"identity_upsert_keys\":{d},\"identity_delete_keys\":{d},\"store_write_count\":{d},\"store_delete_count\":{d},\"dense_apply_ns\":{d},\"dense_delete_ns\":{d},\"dense_doc_index_ns\":{d},\"dense_embedding_apply_ns\":{d},\"graph_apply_ns\":{d}}}\n",
+        .{
+            cfg.docs,
+            batches,
+            profile.extract_vector_field_names_ns,
+            profile.extract_mapper_ns,
+            profile.extract_graph_fields_ns,
+            profile.extract_index_field_embeddings_ns,
+            profile.extract_embedding_artifacts_ns,
+            profile.extract_graph_artifacts_ns,
+            profile.extract_strip_store_value_ns,
+            profile.extract_timestamp_ns,
+            profile.overwrite_probe_ns,
+            profile.identity_upsert_keys,
+            profile.identity_delete_keys,
+            profile.store_write_count,
+            profile.store_delete_count,
+            profile.dense_apply_ns,
+            profile.dense_delete_ns,
+            profile.dense_doc_index_ns,
+            profile.dense_embedding_apply_ns,
+            profile.graph_apply_ns,
+        },
+    );
 }
 
 fn addBatchProfile(total: *db_mod.BatchProfile, item: db_mod.BatchProfile) void {
@@ -287,12 +368,25 @@ fn addBatchProfile(total: *db_mod.BatchProfile, item: db_mod.BatchProfile) void 
     total.predicates_ns += item.predicates_ns;
     total.validate_range_ns += item.validate_range_ns;
     total.extract_writes_ns += item.extract_writes_ns;
+    total.extract_vector_field_names_ns += item.extract_vector_field_names_ns;
+    total.extract_mapper_ns += item.extract_mapper_ns;
+    total.extract_graph_fields_ns += item.extract_graph_fields_ns;
+    total.extract_index_field_embeddings_ns += item.extract_index_field_embeddings_ns;
+    total.extract_embedding_artifacts_ns += item.extract_embedding_artifacts_ns;
+    total.extract_graph_artifacts_ns += item.extract_graph_artifacts_ns;
+    total.extract_strip_store_value_ns += item.extract_strip_store_value_ns;
+    total.extract_timestamp_ns += item.extract_timestamp_ns;
+    total.overwrite_probe_ns += item.overwrite_probe_ns;
     total.delete_artifacts_ns += item.delete_artifacts_ns;
     total.precompute_generated_ns += item.precompute_generated_ns;
     total.identity_capacity_check_ns += item.identity_capacity_check_ns;
     total.identity_metadata_ns += item.identity_metadata_ns;
     total.identity_metadata_writes += item.identity_metadata_writes;
+    total.identity_upsert_keys += item.identity_upsert_keys;
+    total.identity_delete_keys += item.identity_delete_keys;
     total.store_write_ns += item.store_write_ns;
+    total.store_write_count += item.store_write_count;
+    total.store_delete_count += item.store_delete_count;
     total.split_delta_ns += item.split_delta_ns;
     total.build_derived_ns += item.build_derived_ns;
     total.apply_shadow_ns += item.apply_shadow_ns;
@@ -390,11 +484,38 @@ fn makeDocValue(alloc: std.mem.Allocator, i: usize, cfg: Config) ![]u8 {
     const sparse_dim = i % cfg.sparse_dims;
     const prefix = try std.fmt.allocPrint(
         alloc,
-        "{{\"title\":\"{s} title {d}\",\"tenant\":\"tenant{d}\",\"score\":{d},\"sparse\":{{\"indices\":[{d}],\"values\":[1.0]}}",
-        .{ token_text, i, i % 16, i, sparse_dim },
+        "{{\"title\":\"{s} title {d}\",\"tenant\":\"tenant{d}\",\"category\":\"cat{d}\",\"status\":\"status{d}\",\"score\":{d}",
+        .{ token_text, i, i % 16, i % 32, i % 4, i },
     );
     defer alloc.free(prefix);
     try body.appendSlice(alloc, prefix);
+    if (cfg.with_sparse or cfg.with_dense) {
+        try body.appendSlice(alloc, ",\"_embeddings\":{\"");
+        if (cfg.with_sparse) {
+            try body.appendSlice(alloc, sparse_index_name);
+            try body.appendSlice(alloc, "\":{\"packed_indices\":\"");
+            const indices = [_]u32{@intCast(sparse_dim)};
+            try appendPackedU32Base64(&body, alloc, indices[0..]);
+            try body.appendSlice(alloc, "\",\"packed_values\":\"");
+            const values = [_]f32{1.0};
+            try appendPackedF32Base64(&body, alloc, values[0..]);
+            try body.appendSlice(alloc, "\"}");
+        }
+        if (cfg.with_sparse and cfg.with_dense) try body.appendSlice(alloc, ",\"");
+        if (cfg.with_dense) {
+            const vector = try alloc.alloc(f32, cfg.dense_dims);
+            defer alloc.free(vector);
+            for (vector, 0..) |*value, dim| {
+                value.* = @as(f32, @floatFromInt((i + dim * 17) % 1000)) / 1000.0;
+            }
+            if (!cfg.with_sparse) try body.append(alloc, '"');
+            try body.appendSlice(alloc, dense_index_name);
+            try body.appendSlice(alloc, "\":\"");
+            try appendPackedF32Base64(&body, alloc, vector);
+            try body.append(alloc, '"');
+        }
+        try body.append(alloc, '}');
+    }
     if (cfg.body_repeat > 0) {
         try body.appendSlice(alloc, ",\"body\":\"");
         for (0..cfg.body_repeat) |_| {
@@ -405,6 +526,34 @@ fn makeDocValue(alloc: std.mem.Allocator, i: usize, cfg: Config) ![]u8 {
     }
     try body.append(alloc, '}');
     return try body.toOwnedSlice(alloc);
+}
+
+fn appendPackedF32Base64(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, vector: []const f32) !void {
+    const raw_len = vector.len * @sizeOf(f32);
+    const raw = try alloc.alloc(u8, raw_len);
+    defer alloc.free(raw);
+    for (vector, 0..) |value, i| {
+        const offset = i * @sizeOf(f32);
+        std.mem.writeInt(u32, raw[offset..][0..4], @bitCast(value), .little);
+    }
+    const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+    const start = out.items.len;
+    try out.resize(alloc, start + encoded_len);
+    _ = std.base64.standard.Encoder.encode(out.items[start..][0..encoded_len], raw);
+}
+
+fn appendPackedU32Base64(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, values: []const u32) !void {
+    const raw_len = values.len * @sizeOf(u32);
+    const raw = try alloc.alloc(u8, raw_len);
+    defer alloc.free(raw);
+    for (values, 0..) |value, i| {
+        const offset = i * @sizeOf(u32);
+        std.mem.writeInt(u32, raw[offset..][0..4], value, .little);
+    }
+    const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+    const start = out.items.len;
+    try out.resize(alloc, start + encoded_len);
+    _ = std.base64.standard.Encoder.encode(out.items[start..][0..encoded_len], raw);
 }
 
 fn buildFilterPlans(
@@ -433,8 +582,11 @@ fn buildFilterPlans(
         defer txn.abort();
         var include = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(alloc, &txn, selected, generation);
         errdefer include.deinit(alloc);
-        const native_ids = try sparseNativeIdsForResolvedSetAlloc(alloc, db, &include);
-        errdefer alloc.free(native_ids);
+        const native_ids = if (cfg.with_sparse)
+            try sparseNativeIdsForResolvedSetAlloc(alloc, db, &include)
+        else
+            try alloc.alloc(u64, 0);
+        errdefer if (native_ids.len > 0) alloc.free(native_ids);
         filter.* = .{
             .doc_ids = selected,
             .native_ids = native_ids,
@@ -837,6 +989,8 @@ fn parseArgs(args_in: std.process.Args) !Config {
             cfg.batch_size = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--sparse-dims")) {
             cfg.sparse_dims = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--dense-dims")) {
+            cfg.dense_dims = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             cfg.limit = @intCast(try parseNextUsize(&args, arg));
         } else if (std.mem.eql(u8, arg, "--body-repeat")) {
@@ -853,12 +1007,20 @@ fn parseArgs(args_in: std.process.Args) !Config {
             cfg.defer_full_index_load = true;
         } else if (std.mem.eql(u8, arg, "--bulk-load")) {
             cfg.bulk_load = true;
+        } else if (std.mem.eql(u8, arg, "--with-sparse")) {
+            cfg.with_sparse = true;
+        } else if (std.mem.eql(u8, arg, "--with-dense")) {
+            cfg.with_dense = true;
+        } else if (std.mem.eql(u8, arg, "--with-graph")) {
+            cfg.with_graph = true;
+        } else if (std.mem.eql(u8, arg, "--with-algebraic")) {
+            cfg.with_algebraic = true;
         } else {
             std.debug.print("invalid argument: {s}\n", .{arg});
             return error.InvalidArgument;
         }
     }
-    if (cfg.docs == 0 or cfg.queries == 0 or cfg.repeats == 0 or cfg.filter_size == 0 or cfg.sparse_dims == 0) return error.InvalidArgument;
+    if (cfg.docs == 0 or cfg.queries == 0 or cfg.repeats == 0 or cfg.filter_size == 0 or cfg.sparse_dims == 0 or cfg.dense_dims == 0) return error.InvalidArgument;
     return cfg;
 }
 

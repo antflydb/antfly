@@ -172,6 +172,7 @@ run_bench_case() {
     --filter-size "$filter_size"
     --batch-size "$BATCH_SIZE"
     --sparse-dims "$sparse_dims"
+    --with-sparse
     --limit "$limit"
     --body-repeat "$BODY_REPEAT"
     --max-ordinal-ratio "$MAX_ORDINAL_RATIO"

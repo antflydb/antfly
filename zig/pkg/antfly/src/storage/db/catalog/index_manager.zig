@@ -106,6 +106,8 @@ pub const IndexBatchOptions = struct {
     defer_text_compaction: bool = false,
 };
 
+const max_text_projection_docs_per_segment_build: usize = 32 * 1024;
+
 const TextBatchMutationStats = struct {
     indexed_any: bool = false,
     deleted_any: bool = false,
@@ -6134,7 +6136,7 @@ pub const IndexManager = struct {
                 .doc_ordinal = ordinals[i],
             };
         }
-        return try self.indexTextProjectionDocs(store, entry, docs);
+        return try self.indexTextProjectionDocsMaybeChunked(store, entry, docs);
     }
 
     fn indexTextProjectionDocs(
@@ -6152,6 +6154,28 @@ pub const IndexManager = struct {
             try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null),
         );
         return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_batch.docs);
+    }
+
+    fn indexTextProjectionDocsMaybeChunked(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *TextIndex,
+        docs: []const mapper.MapperDoc,
+    ) !TextBatchMutationStats {
+        if (docs.len <= max_text_projection_docs_per_segment_build) {
+            return try self.indexTextProjectionDocs(store, entry, docs);
+        }
+
+        var stats = TextBatchMutationStats{};
+        var start: usize = 0;
+        while (start < docs.len) {
+            const end = @min(start + max_text_projection_docs_per_segment_build, docs.len);
+            const chunk_stats = try self.indexTextProjectionDocs(store, entry, docs[start..end]);
+            stats.noteIndex(chunk_stats.indexed_any);
+            stats.noteDelete(chunk_stats.deleted_any);
+            start = end;
+        }
+        return stats;
     }
 
     fn indexTextProjectionSourceDocs(
@@ -6189,7 +6213,37 @@ pub const IndexManager = struct {
         }
         if (filtered.items.len == 0) return .{};
 
-        return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, filtered.items);
+        return try self.indexPreparedTextProjectionSourceDocsMaybeChunked(arena, store, entry, filtered.items);
+    }
+
+    fn indexPreparedTextProjectionSourceDocsMaybeChunked(
+        self: *IndexManager,
+        arena: std.mem.Allocator,
+        store: *docstore_mod.DocStore,
+        entry: *TextIndex,
+        source_docs: []const mapper.TextProjectionSourceDoc,
+    ) !TextBatchMutationStats {
+        if (source_docs.len <= max_text_projection_docs_per_segment_build) {
+            return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_docs);
+        }
+
+        var stats = TextBatchMutationStats{};
+        var start: usize = 0;
+        while (start < source_docs.len) {
+            const end = @min(start + max_text_projection_docs_per_segment_build, source_docs.len);
+            var chunk_arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer chunk_arena_state.deinit();
+            const chunk_stats = try self.indexPreparedTextProjectionSourceDocsWithArena(
+                chunk_arena_state.allocator(),
+                store,
+                entry,
+                source_docs[start..end],
+            );
+            stats.noteIndex(chunk_stats.indexed_any);
+            stats.noteDelete(chunk_stats.deleted_any);
+            start = end;
+        }
+        return stats;
     }
 
     fn indexPreparedTextProjectionSourceDocsWithArena(
@@ -6224,17 +6278,26 @@ pub const IndexManager = struct {
         }
 
         const segment_build_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        const segments = try mapper.buildTextSegmentsFromProjectionBatch(arena, projection_batch, entry.text_analysis, .{
+        const segments = try mapper.buildTextSegmentsFromProjectionBatch(self.alloc, projection_batch, entry.text_analysis, .{
             .target_segment_bytes = @intCast(default_merge_policy.max_segment_size),
         });
+        var segments_owned = true;
+        defer self.alloc.free(segments);
+        errdefer if (segments_owned) {
+            for (segments) |segment| {
+                if (segment.len > 0) self.alloc.free(segment);
+            }
+        };
         if (profile_enabled) segment_build_ns = platform_time.monotonicNs() - segment_build_start_ns;
 
         var indexed_any = false;
         var segment_bytes: usize = 0;
         const index_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        for (segments) |seg| {
-            segment_bytes += seg.len;
-            entry.persistent.indexSegment(seg) catch |err| {
+        for (segments) |*seg| {
+            const owned_segment = seg.*;
+            segment_bytes += owned_segment.len;
+            seg.* = &.{};
+            entry.persistent.indexSegmentOwned(owned_segment) catch |err| {
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("index text batch indexSegment failed: {s}", .{@errorName(err)});
                 }
@@ -6242,6 +6305,7 @@ pub const IndexManager = struct {
             };
             indexed_any = true;
         }
+        segments_owned = false;
         if (profile_enabled) {
             index_segment_ns = platform_time.monotonicNs() - index_segment_start_ns;
             std.log.info(
@@ -6644,20 +6708,29 @@ pub const IndexManager = struct {
 
         var txn = try runtime_store.store.beginRead();
         defer txn.abort();
+        var sparse_txn = try entry.index.beginReadTxn();
+        defer sparse_txn.abort();
+
+        if (entry.chunk_name == null) {
+            var parent_doc_ids = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (parent_doc_ids.items) |parent_doc_id| self.alloc.free(parent_doc_id);
+                parent_doc_ids.deinit(self.alloc);
+            }
+            for (ordinals) |ordinal| {
+                const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
+                try parent_doc_ids.append(self.alloc, parent_doc_id);
+            }
+            return try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids.items);
+        }
 
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
+        var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(alloc);
         for (ordinals) |ordinal| {
             const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
             defer self.alloc.free(parent_doc_id);
-            if (entry.chunk_name == null) {
-                const doc_num = (entry.index.debugDocNumForDocId(parent_doc_id) catch |err| switch (err) {
-                    error.DocNumOverflow => continue,
-                    else => return err,
-                }) orelse continue;
-                if (!containsU32(out.items, doc_num)) try out.append(alloc, doc_num);
-                continue;
-            }
             const prefix = try internal_keys.artifactNamedPrefixAlloc(self.alloc, parent_doc_id, "chunk", entry.chunk_name.?);
             defer self.alloc.free(prefix);
             const upper = try internal_keys.nextPrefixAlloc(self.alloc, prefix);
@@ -6670,7 +6743,8 @@ pub const IndexManager = struct {
                     error.DocNumOverflow => continue,
                     else => return err,
                 }) orelse continue;
-                if (!containsU32(out.items, doc_num)) try out.append(alloc, doc_num);
+                const gop = try seen.getOrPut(alloc, doc_num);
+                if (!gop.found_existing) try out.append(alloc, doc_num);
             }
         }
         return try out.toOwnedSlice(alloc);

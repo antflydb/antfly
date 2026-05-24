@@ -79,12 +79,18 @@ pub const Stats = struct {
     complete: bool = false,
 };
 
-const VisibilitySummary = struct {
+pub const VisibilitySummary = struct {
     live_ordinals: u64 = 0,
     tombstone_ordinals: u64 = 0,
     max_created_generation: u64 = 0,
     min_deleted_generation: u64 = 0,
     max_deleted_generation: u64 = 0,
+};
+
+pub const AllNewTrustedState = struct {
+    next_ordinal: DocOrdinal = 1,
+    visibility_summary: VisibilitySummary = .{},
+    namespace_written: bool = false,
 };
 
 pub fn canonicalDocId(table_id: u64, shard_id: u64, doc_id: []const u8) u64 {
@@ -1028,6 +1034,132 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
     if (visibility_summary_dirty) {
         try appendVisibilitySummaryWrite(alloc, out, visibility_summary.?);
     }
+}
+
+pub fn loadAllNewTrustedStateForNamespace(store: *docstore_mod.DocStore, namespace: Namespace) !?AllNewTrustedState {
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+
+    const namespace_written = if (try loadNamespaceTxn(&txn)) |stored_namespace| blk: {
+        if (!stored_namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+        break :blk true;
+    } else false;
+
+    const next_ordinal = try readNextOrdinalTxn(&txn);
+    if (next_ordinal != 1) return null;
+    const summary = (try readVisibilitySummaryTxn(&txn)) orelse VisibilitySummary{};
+    if (summary.live_ordinals != 0 or summary.tombstone_ordinals != 0) return null;
+    return .{
+        .next_ordinal = next_ordinal,
+        .visibility_summary = summary,
+        .namespace_written = namespace_written,
+    };
+}
+
+pub fn appendBatchIdentityMetadataAllNewTrustedForNamespaceAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    namespace: Namespace,
+    generation: u64,
+    out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    doc_upserts: []const []const u8,
+) !bool {
+    if (doc_upserts.len == 0) return true;
+
+    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 4), 2);
+    try out.ensureUnusedCapacity(alloc, identity_write_capacity);
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+
+    const missing_namespace = if (try loadNamespaceTxn(&txn)) |stored_namespace| blk: {
+        if (!stored_namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+        break :blk false;
+    } else true;
+
+    var seen_doc_ids = std.StringHashMapUnmanaged(void).empty;
+    defer seen_doc_ids.deinit(alloc);
+    var seen_canonical_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen_canonical_ids.deinit(alloc);
+    for (doc_upserts) |doc_id| {
+        if (seen_doc_ids.contains(doc_id)) return false;
+        try seen_doc_ids.put(alloc, doc_id, {});
+
+        const canonical_doc_id = canonicalDocIdForNamespace(namespace, doc_id);
+        if (seen_canonical_ids.contains(canonical_doc_id)) return false;
+        try seen_canonical_ids.put(alloc, canonical_doc_id, {});
+    }
+
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
+
+    var next_ordinal = try readNextOrdinalTxn(&txn);
+    const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
+    if (doc_upserts.len > available_ordinals) return error.DocOrdinalExhausted;
+
+    for (doc_upserts) |doc_id| {
+        const ordinal = try reserveOrdinalLocal(&next_ordinal);
+        const state = OrdinalState{
+            .canonical_doc_id = canonicalDocIdForNamespace(namespace, doc_id),
+            .created_generation = generation,
+        };
+        if (visibility_summary) |*summary| noteSummaryLiveCreate(summary, generation);
+        try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+    }
+    try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    if (visibility_summary) |summary| try appendVisibilitySummaryWrite(alloc, out, summary);
+    return true;
+}
+
+pub fn appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
+    alloc: Allocator,
+    namespace: Namespace,
+    generation: u64,
+    out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    doc_upserts: []const []const u8,
+    state: *AllNewTrustedState,
+) !bool {
+    if (doc_upserts.len == 0) return true;
+
+    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 4), 2);
+    try out.ensureUnusedCapacity(alloc, identity_write_capacity);
+
+    var seen_doc_ids = std.StringHashMapUnmanaged(void).empty;
+    defer seen_doc_ids.deinit(alloc);
+    var seen_canonical_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen_canonical_ids.deinit(alloc);
+    for (doc_upserts) |doc_id| {
+        if (seen_doc_ids.contains(doc_id)) return false;
+        try seen_doc_ids.put(alloc, doc_id, {});
+
+        const canonical_doc_id = canonicalDocIdForNamespace(namespace, doc_id);
+        if (seen_canonical_ids.contains(canonical_doc_id)) return false;
+        try seen_canonical_ids.put(alloc, canonical_doc_id, {});
+    }
+
+    var next_ordinal = state.next_ordinal;
+    const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
+    if (doc_upserts.len > available_ordinals) return error.DocOrdinalExhausted;
+
+    var visibility_summary = state.visibility_summary;
+    if (!state.namespace_written) try appendNamespaceWrite(alloc, out, namespace);
+
+    for (doc_upserts) |doc_id| {
+        const ordinal = try reserveOrdinalLocal(&next_ordinal);
+        const doc_state = OrdinalState{
+            .canonical_doc_id = canonicalDocIdForNamespace(namespace, doc_id),
+            .created_generation = generation,
+        };
+        noteSummaryLiveCreate(&visibility_summary, generation);
+        try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, doc_state);
+    }
+    try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    try appendVisibilitySummaryWrite(alloc, out, visibility_summary);
+
+    state.next_ordinal = next_ordinal;
+    state.visibility_summary = visibility_summary;
+    state.namespace_written = true;
+    return true;
 }
 
 const IdentityLookup = struct {

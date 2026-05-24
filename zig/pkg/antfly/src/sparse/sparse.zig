@@ -1204,7 +1204,7 @@ pub const SparseIndex = struct {
         }
     }
 
-    fn beginReadTxn(self: *SparseIndex) !backend_erased.ReadTxn {
+    pub fn beginReadTxn(self: *SparseIndex) !backend_erased.ReadTxn {
         return try self.store.beginRead();
     }
 
@@ -2812,12 +2812,80 @@ pub const SparseIndex = struct {
     pub fn debugDocNumForDocId(self: *SparseIndex, doc_id: []const u8) !?u32 {
         var txn = try self.beginReadTxn();
         defer txn.abort();
-        const doc_num = self.lookupDocNumByDocId(&txn, doc_id) catch |err| switch (err) {
+        return try self.docNumForDocIdTxn(&txn, doc_id);
+    }
+
+    pub fn docNumForDocIdTxn(self: *SparseIndex, txn: anytype, doc_id: []const u8) !?u32 {
+        const doc_num = self.lookupDocNumByDocId(txn, doc_id) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
         if (doc_num > std.math.maxInt(u32)) return error.DocNumOverflow;
         return @intCast(doc_num);
+    }
+
+    pub fn docNumsForDocIdsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_ids: []const []const u8) ![]const u32 {
+        var wanted = std.StringHashMapUnmanaged(void).empty;
+        defer wanted.deinit(alloc);
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+        var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(alloc);
+
+        for (doc_ids) |doc_id| {
+            const gop = try wanted.getOrPut(alloc, doc_id);
+            if (gop.found_existing) continue;
+            var key_buf: [256]u8 = undefined;
+            if (txnGet(txn, self.dbi, fwdKey(&key_buf, doc_id))) |fwd_data| {
+                const doc_num_u64 = try decodeFwdDocNum(fwd_data);
+                if (doc_num_u64 <= std.math.maxInt(u32) and !self.docNumDeleted(txn, doc_num_u64)) {
+                    const doc_num: u32 = @intCast(doc_num_u64);
+                    const seen_gop = try seen.getOrPut(alloc, doc_num);
+                    if (!seen_gop.found_existing) try out.append(alloc, doc_num);
+                }
+                _ = wanted.remove(doc_id);
+            } else |_| {}
+        }
+        if (wanted.count() == 0) return try out.toOwnedSlice(alloc);
+
+        const LookupContext = struct {
+            alloc: Allocator,
+            index: *SparseIndex,
+            txn: @TypeOf(txn),
+            wanted: *std.StringHashMapUnmanaged(void),
+            seen: *std.AutoHashMapUnmanaged(u32, void),
+            out: *std.ArrayListUnmanaged(u32),
+
+            fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                if (!ctx.wanted.contains(entry.doc_id)) return false;
+                if (entry.doc_num <= std.math.maxInt(u32) and !ctx.index.docNumDeleted(ctx.txn, entry.doc_num)) {
+                    const doc_num: u32 = @intCast(entry.doc_num);
+                    const seen_gop = try ctx.seen.getOrPut(ctx.alloc, doc_num);
+                    if (!seen_gop.found_existing) try ctx.out.append(ctx.alloc, doc_num);
+                }
+                _ = ctx.wanted.remove(entry.doc_id);
+                return ctx.wanted.count() == 0;
+            }
+        };
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
+        while (maybe_entry) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
+            var ctx = LookupContext{
+                .alloc = alloc,
+                .index = self,
+                .txn = txn,
+                .wanted = &wanted,
+                .seen = &seen,
+                .out = &out,
+            };
+            if (try forEachDocMapEntry(entry.value, &ctx, LookupContext.visit)) break;
+            maybe_entry = try cur.next();
+        }
+
+        return try out.toOwnedSlice(alloc);
     }
 
     /// Free search results.

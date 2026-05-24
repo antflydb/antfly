@@ -715,12 +715,25 @@ pub const BatchProfile = struct {
     predicates_ns: u64 = 0,
     validate_range_ns: u64 = 0,
     extract_writes_ns: u64 = 0,
+    extract_vector_field_names_ns: u64 = 0,
+    extract_mapper_ns: u64 = 0,
+    extract_graph_fields_ns: u64 = 0,
+    extract_index_field_embeddings_ns: u64 = 0,
+    extract_embedding_artifacts_ns: u64 = 0,
+    extract_graph_artifacts_ns: u64 = 0,
+    extract_strip_store_value_ns: u64 = 0,
+    extract_timestamp_ns: u64 = 0,
+    overwrite_probe_ns: u64 = 0,
     delete_artifacts_ns: u64 = 0,
     precompute_generated_ns: u64 = 0,
     identity_capacity_check_ns: u64 = 0,
     identity_metadata_ns: u64 = 0,
     identity_metadata_writes: u64 = 0,
+    identity_upsert_keys: u64 = 0,
+    identity_delete_keys: u64 = 0,
     store_write_ns: u64 = 0,
+    store_write_count: u64 = 0,
+    store_delete_count: u64 = 0,
     split_delta_ns: u64 = 0,
     build_derived_ns: u64 = 0,
     apply_shadow_ns: u64 = 0,
@@ -847,12 +860,25 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.predicates_ns += delta.predicates_ns;
     total.validate_range_ns += delta.validate_range_ns;
     total.extract_writes_ns += delta.extract_writes_ns;
+    total.extract_vector_field_names_ns += delta.extract_vector_field_names_ns;
+    total.extract_mapper_ns += delta.extract_mapper_ns;
+    total.extract_graph_fields_ns += delta.extract_graph_fields_ns;
+    total.extract_index_field_embeddings_ns += delta.extract_index_field_embeddings_ns;
+    total.extract_embedding_artifacts_ns += delta.extract_embedding_artifacts_ns;
+    total.extract_graph_artifacts_ns += delta.extract_graph_artifacts_ns;
+    total.extract_strip_store_value_ns += delta.extract_strip_store_value_ns;
+    total.extract_timestamp_ns += delta.extract_timestamp_ns;
+    total.overwrite_probe_ns += delta.overwrite_probe_ns;
     total.delete_artifacts_ns += delta.delete_artifacts_ns;
     total.precompute_generated_ns += delta.precompute_generated_ns;
     total.identity_capacity_check_ns += delta.identity_capacity_check_ns;
     total.identity_metadata_ns += delta.identity_metadata_ns;
     total.identity_metadata_writes += delta.identity_metadata_writes;
+    total.identity_upsert_keys += delta.identity_upsert_keys;
+    total.identity_delete_keys += delta.identity_delete_keys;
     total.store_write_ns += delta.store_write_ns;
+    total.store_write_count += delta.store_write_count;
+    total.store_delete_count += delta.store_delete_count;
     total.split_delta_ns += delta.split_delta_ns;
     total.build_derived_ns += delta.build_derived_ns;
     total.apply_shadow_ns += delta.apply_shadow_ns;
@@ -1202,6 +1228,26 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             nsToMs(profile.index_sync_ns),
             nsToMs(profile.applied_sequence_save_ns),
             nsToMs(profile.replay_journal_truncate_ns),
+        },
+    );
+    std.log.info(
+        "antfly_bench_batch_extract writes={d} total_extract_ms={d} vector_field_names_ms={d} mapper_ms={d} graph_fields_ms={d} index_field_embeddings_ms={d} embedding_artifacts_ms={d} graph_artifacts_ms={d} strip_store_value_ms={d} timestamp_ms={d} overwrite_probe_ms={d} identity_upserts={d} identity_deletes={d} store_writes={d} store_deletes={d}",
+        .{
+            req.writes.len,
+            nsToMs(profile.extract_writes_ns),
+            nsToMs(profile.extract_vector_field_names_ns),
+            nsToMs(profile.extract_mapper_ns),
+            nsToMs(profile.extract_graph_fields_ns),
+            nsToMs(profile.extract_index_field_embeddings_ns),
+            nsToMs(profile.extract_embedding_artifacts_ns),
+            nsToMs(profile.extract_graph_artifacts_ns),
+            nsToMs(profile.extract_strip_store_value_ns),
+            nsToMs(profile.extract_timestamp_ns),
+            nsToMs(profile.overwrite_probe_ns),
+            profile.identity_upsert_keys,
+            profile.identity_delete_keys,
+            profile.store_write_count,
+            profile.store_delete_count,
         },
     );
     std.log.info(
@@ -2187,6 +2233,9 @@ pub const DB = struct {
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
+    bulk_ingest_identity_all_new: bool = false,
+    bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
+    bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
 
     const engine_vtable = db_core.Engine.VTable{
@@ -2657,6 +2706,8 @@ pub const DB = struct {
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
         self.bulk_ingest_coalescer.deinit(self.alloc);
+        self.clearBulkIngestSeenDocKeysLocked();
+        self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
         self.closeShadowIndexManager() catch {};
         if (self.transaction_runtime) |runtime| {
             runtime.deinit();
@@ -2706,6 +2757,11 @@ pub const DB = struct {
         try resources.index_manager.beginSparseBulkIngestSessions();
         errdefer resources.index_manager.abortSparseBulkIngestSessions();
         try resources.index_manager.beginAlgebraicBulkIngestSessions();
+        self.configureBulkIngestIdentityAllNewLocked() catch |err| {
+            resources.index_manager.abortAlgebraicBulkIngestSessions();
+            return err;
+        };
+        errdefer self.clearBulkIngestIdentityAllNewLocked();
         self.bulk_ingest_coalescer.begin();
     }
 
@@ -2735,6 +2791,7 @@ pub const DB = struct {
                 if (first_err == null) first_err = err;
             };
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
             if (first_err) |err| return err;
         }
         finishExternalDenseBulkSessionTracked(self.async_context);
@@ -2771,6 +2828,8 @@ pub const DB = struct {
         try resources.store.beginBulkIngestSession();
         errdefer resources.store.abortBulkIngestSession();
         try resources.index_manager.beginDenseBulkIngestSessions();
+        try self.configureBulkIngestIdentityAllNewLocked();
+        errdefer self.clearBulkIngestIdentityAllNewLocked();
         self.bulk_ingest_coalescer.begin();
     }
 
@@ -2790,6 +2849,7 @@ pub const DB = struct {
                 if (first_err == null) first_err = err;
             };
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
             if (first_err) |err| return err;
         }
         finishExternalDenseBulkSessionTracked(self.async_context);
@@ -2825,9 +2885,11 @@ pub const DB = struct {
             };
             resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
                 self.bulk_ingest_coalescer.clear(self.alloc);
+                self.clearBulkIngestIdentityAllNewLocked();
                 return err;
             };
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
         }
         finishExternalDenseBulkSessionTracked(self.async_context);
         external_session_tracked = false;
@@ -2859,6 +2921,7 @@ pub const DB = struct {
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
             resources.index_manager.abortDenseBulkIngestSessions();
             resources.store.abortBulkIngestSession();
         }
@@ -2872,6 +2935,7 @@ pub const DB = struct {
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
             resources.index_manager.abortAlgebraicBulkIngestSessions();
             resources.index_manager.abortDenseBulkIngestSessions();
             resources.store.abortBulkIngestSession();
@@ -3130,7 +3194,9 @@ pub const DB = struct {
             for (owned_store_values.items) |value| self.alloc.free(value);
             owned_store_values.deinit(self.alloc);
         }
+        const vector_field_names_start_ns = monotonicTimeNs();
         const vector_store_field_names = try self.core.index_manager.vectorStoreFieldNamesAlloc(self.alloc);
+        if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_vector_field_names_ns, vector_field_names_start_ns);
         defer {
             for (vector_store_field_names) |field| self.alloc.free(field);
             if (vector_store_field_names.len > 0) self.alloc.free(vector_store_field_names);
@@ -3183,6 +3249,8 @@ pub const DB = struct {
         defer overwrite_probe_entries.deinit(self.alloc);
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
+        var identity_upsert_write_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer identity_upsert_write_indexes.deinit(self.alloc);
         var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer {
             for (identity_writes.items) |item| {
@@ -3211,10 +3279,17 @@ pub const DB = struct {
                 });
                 continue;
             }
+            const mapper_extract_start_ns = monotonicTimeNs();
             extracted[i] = try mapper.extractWrite(self.alloc, write.key, write.value);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
+            const graph_field_extract_start_ns = monotonicTimeNs();
             try augmentExtractedWriteWithGraphFieldEdges(self, self.alloc, write.key, write.value, &extracted[i]);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_fields_ns, graph_field_extract_start_ns);
+            const index_field_embeddings_start_ns = monotonicTimeNs();
             try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(self.alloc, write.key, write.value, &extracted[i]);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_index_field_embeddings_ns, index_field_embeddings_start_ns);
             extracted_initialized += 1;
+            const embedding_artifacts_start_ns = monotonicTimeNs();
             for (extracted[i].dense_embeddings) |*embedding| {
                 if (embedding.artifact_key != null) continue;
                 embedding.artifact_key = try appendEmbeddingArtifactWrite(
@@ -3241,6 +3316,8 @@ pub const DB = struct {
                     embedding.values,
                 );
             }
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_embedding_artifacts_ns, embedding_artifacts_start_ns);
+            const graph_artifacts_start_ns = monotonicTimeNs();
             for (extracted[i].graph_writes) |graph_write| {
                 try appendGraphEdgeArtifactWrite(self.alloc, &explicit_graph_artifact_writes, graph_write);
             }
@@ -3250,13 +3327,16 @@ pub const DB = struct {
                     .index_name = try self.alloc.dupe(u8, index_name),
                 });
             }
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
             if (extracted[i].cleaned_value) |cleaned| {
+                const strip_store_value_start_ns = monotonicTimeNs();
                 const store_value = try strippedStoredDocumentValueAlloc(
                     self.alloc,
                     cleaned,
                     vector_store_field_names,
                     &owned_store_values,
                 );
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                 const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
                 try owned_store_keys.append(self.alloc, store_key);
                 try overwrite_probe_entries.append(self.alloc, .{
@@ -3268,7 +3348,9 @@ pub const DB = struct {
                     .value = store_value,
                 });
                 try identity_upsert_keys.append(self.alloc, write.key);
+                try identity_upsert_write_indexes.append(self.alloc, i);
                 if (shouldWriteTimestamp(write.key)) {
+                    const timestamp_start_ns = monotonicTimeNs();
                     const write_timestamp_ns = try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value);
                     const timestamp_key = try makeTimestampKey(self.alloc, write.key);
                     const timestamp_value = try encodeTimestampValue(self.alloc, write_timestamp_ns);
@@ -3276,14 +3358,28 @@ pub const DB = struct {
                         .key = timestamp_key,
                         .value = timestamp_value,
                     });
+                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_timestamp_ns, timestamp_start_ns);
                 }
             }
         }
+        if (profile) |active_profile| {
+            active_profile.identity_upsert_keys += @intCast(identity_upsert_keys.items.len);
+            active_profile.identity_delete_keys += @intCast(effective_req.deletes.len);
+        }
         const identity_capacity_start_ns = monotonicTimeNs();
-        try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        if (!self.bulk_ingest_identity_all_new or effective_req.deletes.len != 0) {
+            try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
-        if (overwrite_probe_entries.items.len > 0) {
+        var assume_all_new_identity_upserts = false;
+        if (self.bulk_ingest_identity_all_new and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
+            assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(identity_upsert_keys.items);
+            if (!assume_all_new_identity_upserts) self.clearBulkIngestIdentityAllNewLocked();
+        }
+
+        if (!assume_all_new_identity_upserts and overwrite_probe_entries.items.len > 0) {
+            const overwrite_probe_start_ns = monotonicTimeNs();
             std.sort.pdq(OverwriteProbeEntry, overwrite_probe_entries.items, {}, overwriteProbeLessThan);
             const probe_keys = try self.alloc.alloc([]const u8, overwrite_probe_entries.items.len);
             defer self.alloc.free(probe_keys);
@@ -3298,6 +3394,7 @@ pub const DB = struct {
             for (overwrite_probe_entries.items, 0..) |entry, i| {
                 overwritten_flags[entry.write_index] = probe_values[i] != null;
             }
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.overwrite_probe_ns, overwrite_probe_start_ns);
         }
 
         for (effective_req.graph_writes) |graph_write| {
@@ -3404,15 +3501,36 @@ pub const DB = struct {
         defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
         const sequence = self.core.reserveDerivedAppendSequence();
         const identity_metadata_start_ns = monotonicTimeNs();
-        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
-            self.alloc,
-            self.core.store,
-            self.core.identity_namespace,
-            sequence,
-            &identity_writes,
-            identity_upsert_keys.items,
-            effective_req.deletes,
-        );
+        var used_trusted_identity_path = false;
+        if (effective_req.deletes.len != 0) {
+            self.clearBulkIngestIdentityAllNewLocked();
+        }
+        if (self.bulk_ingest_identity_all_new and
+            effective_req.deletes.len == 0 and
+            identity_upsert_keys.items.len > 0 and
+            (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
+        {
+            used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
+                self.alloc,
+                self.core.identity_namespace,
+                sequence,
+                &identity_writes,
+                identity_upsert_keys.items,
+                &self.bulk_ingest_identity_state,
+            );
+            if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
+        }
+        if (!used_trusted_identity_path) {
+            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+                self.alloc,
+                self.core.store,
+                self.core.identity_namespace,
+                sequence,
+                &identity_writes,
+                identity_upsert_keys.items,
+                effective_req.deletes,
+            );
+        }
         if (profile) |active_profile| {
             recordProfileNs(profile, &active_profile.identity_metadata_ns, identity_metadata_start_ns);
             active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
@@ -3473,7 +3591,11 @@ pub const DB = struct {
             },
             store_batch_options,
         );
-        if (profile) |active_profile| recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
+        if (profile) |active_profile| {
+            recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
+            active_profile.store_write_count += @intCast(store_writes.items.len);
+            active_profile.store_delete_count += @intCast(delete_keys.items.len);
+        }
         if (shouldAppendSplitDelta(self)) {
             const split_delta_start_ns = monotonicTimeNs();
             try self.core.appendSplitDelta(batch_timestamp_ns, store_writes.items, delete_keys.items);
@@ -3544,6 +3666,63 @@ pub const DB = struct {
             if (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, doc_id) != null) continue;
             return error.DocOrdinalExhausted;
         }
+    }
+
+    fn configureBulkIngestIdentityAllNewLocked(self: *DB) !void {
+        self.clearBulkIngestIdentityAllNewLocked();
+        if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
+        if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
+            self.bulk_ingest_identity_state = state;
+            self.bulk_ingest_identity_all_new = true;
+        }
+    }
+
+    fn clearBulkIngestIdentityAllNewLocked(self: *DB) void {
+        self.bulk_ingest_identity_all_new = false;
+        self.bulk_ingest_identity_state = .{};
+        self.clearBulkIngestSeenDocKeysLocked();
+    }
+
+    fn clearBulkIngestSeenDocKeysLocked(self: *DB) void {
+        var it = self.bulk_ingest_seen_doc_keys.keyIterator();
+        while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
+        self.bulk_ingest_seen_doc_keys.clearRetainingCapacity();
+    }
+
+    fn primaryUserNamespaceIsEmptyLocked(self: *DB) !bool {
+        var txn = try self.core.store.beginCurrentScanTxn();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        const lower = [_]u8{internal_keys.user_namespace};
+        const first = (try cur.seekAtOrAfter(lower[0..])) orelse return true;
+        return first.key.len == 0 or first.key[0] != internal_keys.user_namespace;
+    }
+
+    fn rememberBulkIngestAllNewIdentityUpserts(self: *DB, doc_ids: []const []const u8) !bool {
+        var batch_seen = std.StringHashMapUnmanaged(void).empty;
+        defer batch_seen.deinit(self.alloc);
+        for (doc_ids) |doc_id| {
+            if (self.bulk_ingest_seen_doc_keys.contains(doc_id)) return false;
+            if (batch_seen.contains(doc_id)) return false;
+            try batch_seen.put(self.alloc, doc_id, {});
+        }
+
+        for (doc_ids) |doc_id| {
+            const owned = try self.alloc.dupe(u8, doc_id);
+            errdefer self.alloc.free(owned);
+            try self.bulk_ingest_seen_doc_keys.put(self.alloc, owned, {});
+        }
+        return true;
+    }
+
+    fn identityUpsertStoreWritesAreNew(write_indexes: []const usize, overwritten_flags: []const bool) bool {
+        for (write_indexes) |write_index| {
+            if (write_index >= overwritten_flags.len) return false;
+            if (overwritten_flags[write_index]) return false;
+        }
+        return true;
     }
 
     fn CoalescedKeyValueRequest(comptime T: type) type {
@@ -10292,16 +10471,19 @@ fn buildOverwrittenDocKeys(
     return try keys.toOwnedSlice(alloc);
 }
 
-fn appendUniqueReplayRecordKey(
+fn appendUniqueReplayRecordKeyWithSet(
     alloc: Allocator,
     list: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
     key: []const u8,
 ) !void {
     if (key.len == 0) return;
-    for (list.items) |existing| {
-        if (std.mem.eql(u8, existing, key)) return;
-    }
-    try list.append(alloc, try alloc.dupe(u8, key));
+    if (seen.contains(key)) return;
+    const owned = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned);
+    try seen.put(alloc, owned, {});
+    errdefer _ = seen.remove(owned);
+    try list.append(alloc, owned);
 }
 
 fn appendUniqueReplayRecordHint(
@@ -10326,34 +10508,44 @@ fn encodeThinReplayRecordPayload(
     include_generated_enrichment_hint: bool,
 ) ![]u8 {
     var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var changed_doc_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (changed_doc_keys.items) |key| alloc.free(@constCast(key));
         changed_doc_keys.deinit(alloc);
     }
     var deleted_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var deleted_doc_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (deleted_doc_keys.items) |key| alloc.free(@constCast(key));
         deleted_doc_keys.deinit(alloc);
     }
     var overwritten_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var overwritten_doc_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (overwritten_doc_keys.items) |key| alloc.free(@constCast(key));
         overwritten_doc_keys.deinit(alloc);
     }
     var thin_changed_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var thin_changed_artifact_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (thin_changed_artifact_keys.items) |key| alloc.free(@constCast(key));
         thin_changed_artifact_keys.deinit(alloc);
     }
     var target_hints = std.ArrayListUnmanaged(change_journal_mod.TargetHint).empty;
     errdefer target_hints.deinit(alloc);
+    defer {
+        changed_doc_key_set.deinit(alloc);
+        deleted_doc_key_set.deinit(alloc);
+        overwritten_doc_key_set.deinit(alloc);
+        thin_changed_artifact_key_set.deinit(alloc);
+    }
 
     var saw_overwritten = false;
 
     for (req.writes, 0..) |write, i| {
         const extracted_write = extracted[i];
         if (extracted_write.cleaned_value != null or include_generated_enrichment_hint) {
-            try appendUniqueReplayRecordKey(alloc, &changed_doc_keys, write.key);
+            try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
             if (extracted_write.cleaned_value != null) {
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
@@ -10364,19 +10556,19 @@ fn encodeThinReplayRecordPayload(
         }
 
         for (extracted_write.dense_embeddings) |embedding| {
-            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
         }
         for (extracted_write.sparse_embeddings) |embedding| {
-            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
         }
         if (extracted_write.mentioned_graph_indexes.len > 0 or extracted_write.graph_writes.len > 0) {
-            try appendUniqueReplayRecordKey(alloc, &changed_doc_keys, write.key);
+            try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         }
         if (overwritten_flags[i] and extracted_write.cleaned_value != null) {
-            try appendUniqueReplayRecordKey(alloc, &overwritten_doc_keys, write.key);
+            try appendUniqueReplayRecordKeyWithSet(alloc, &overwritten_doc_keys, &overwritten_doc_key_set, write.key);
             saw_overwritten = true;
         }
     }
@@ -10389,31 +10581,31 @@ fn encodeThinReplayRecordPayload(
     }
 
     for (changed_artifact_keys) |key| {
-        try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
         if (internal_keys.isGraphEdgeArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
     }
 
     for (req.graph_writes) |write| {
-        try appendUniqueReplayRecordKey(alloc, &changed_doc_keys, write.source);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.source);
         const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
         defer alloc.free(artifact_key);
-        try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
     }
     for (req.graph_deletes) |delete| {
-        try appendUniqueReplayRecordKey(alloc, &deleted_doc_keys, delete.source);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, delete.source);
         const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
         defer alloc.free(artifact_key);
-        try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
     }
 
     for (req.deletes) |key| {
-        try appendUniqueReplayRecordKey(alloc, &deleted_doc_keys, key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
     }
     for (deleted_artifact_keys) |key| {
-        try appendUniqueReplayRecordKey(alloc, &deleted_doc_keys, key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
     }
 
     var record: change_journal_mod.Record = .{
