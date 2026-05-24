@@ -1376,7 +1376,19 @@ fn resolveTermiteBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Co
         "http://localhost:8082",
     );
     defer alloc.free(raw);
-    return try appendPathIfMissing(alloc, raw, "/api");
+    return try normalizeTermiteMlBaseUrl(alloc, raw);
+}
+
+fn normalizeTermiteMlBaseUrl(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.endsWith(u8, trimmed, "/ml/v1")) return try alloc.dupe(u8, trimmed);
+
+    const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
+    const host_start = if (scheme_pos) |pos| pos + 3 else 0;
+    const path_pos = std.mem.indexOfPos(u8, trimmed, host_start, "/");
+    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ml/v1", .{trimmed});
+
+    return error.InvalidTermiteBaseUrl;
 }
 
 fn resolveBedrockRegion(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
@@ -1754,7 +1766,13 @@ test "managed embedder parses openai and termite entries from indexes metadata" 
     try std.testing.expectEqual(ProviderKind.openai, managed.entries[0].provider);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", managed.entries[0].base_url);
     try std.testing.expectEqual(ProviderKind.termite, managed.entries[1].provider);
-    try std.testing.expectEqualStrings("http://localhost:8082/api", managed.entries[1].base_url);
+    try std.testing.expectEqualStrings("http://localhost:8082/ml/v1", managed.entries[1].base_url);
+}
+
+test "managed embedder rejects legacy termite api path" {
+    try std.testing.expectError(error.InvalidTermiteBaseUrl, ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":768,"embedder":{"provider":"termite","model":"bge-base-en-v1.5","api_url":"http://localhost:8082/api"}}}
+    ));
 }
 
 test "managed embedder interface deinit uses owner allocator" {

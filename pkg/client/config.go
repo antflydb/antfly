@@ -49,6 +49,11 @@ func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
 		if err := modelConfig.FromVertexEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from vertex embedder config: %w", err)
 		}
+	case AntflyEmbedderConfig:
+		provider = EmbedderProviderAntfly
+		if err := modelConfig.FromAntflyEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from antfly embedder config: %w", err)
+		}
 	case TermiteEmbedderConfig:
 		provider = EmbedderProviderTermite
 		if err := modelConfig.FromTermiteEmbedderConfig(v); err != nil {

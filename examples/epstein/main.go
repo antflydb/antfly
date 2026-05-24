@@ -1366,7 +1366,7 @@ func prepareCmd(args []string) error {
 func loadCmd(args []string) error {
 	fs := flag.NewFlagSet("load", flag.ExitOnError)
 	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
-	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed embeddings and chunking")
+	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name to merge into")
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file path")
 	dryRun := fs.Bool("dry-run", false, "Preview changes without applying them")
@@ -1454,7 +1454,7 @@ func loadCmd(args []string) error {
 func syncCmd(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
-	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed embeddings and chunking")
+	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name")
 	dirPath := fs.String("dir", "./epstein-docs", "Path to PDF directory")
 	baseURL := fs.String("base-url", "", "Base URL for document links")
@@ -1871,9 +1871,8 @@ func createEmbeddingIndex(embeddingModel, termiteURL, chunkerModel string, targe
 		Type: antfly.IndexTypeEmbeddings,
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.TermiteEmbedderConfig{
-		ApiUrl: termiteURL,
-		Model:  embeddingModel,
+	embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+		"model": embeddingModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure embedder: %w", err)

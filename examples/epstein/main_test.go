@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	antfly "github.com/antflydb/antfly/pkg/client"
 	termiteoapi "github.com/antflydb/antfly/pkg/termite-client/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
@@ -114,7 +115,7 @@ func createTestZip(t *testing.T, files map[string][]byte) string {
 	return path
 }
 
-func TestCreateEmbeddingIndexUsesTermiteClipClap(t *testing.T) {
+func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 	idx, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultTermiteURL, DefaultChunkerModel, 512, 50)
 	if err != nil {
 		t.Fatalf("createEmbeddingIndex failed: %v", err)
@@ -125,15 +126,15 @@ func TestCreateEmbeddingIndexUsesTermiteClipClap(t *testing.T) {
 		t.Fatalf("AsEmbeddingsIndexConfig failed: %v", err)
 	}
 
-	embedder, err := cfg.Embedder.AsTermiteEmbedderConfig()
+	embedder, err := cfg.Embedder.AsAntflyEmbedderConfig()
 	if err != nil {
-		t.Fatalf("AsTermiteEmbedderConfig failed: %v", err)
+		t.Fatalf("AsAntflyEmbedderConfig failed: %v", err)
 	}
-	if embedder.Model != DefaultEmbeddingModel {
-		t.Fatalf("embedder model = %q, want %q", embedder.Model, DefaultEmbeddingModel)
+	if cfg.Embedder.Provider != antfly.EmbedderProviderAntfly {
+		t.Fatalf("embedder provider = %q, want %q", cfg.Embedder.Provider, antfly.EmbedderProviderAntfly)
 	}
-	if embedder.ApiUrl != DefaultTermiteURL {
-		t.Fatalf("embedder api URL = %q, want %q", embedder.ApiUrl, DefaultTermiteURL)
+	if embedder["model"] != DefaultEmbeddingModel {
+		t.Fatalf("embedder model = %q, want %q", embedder["model"], DefaultEmbeddingModel)
 	}
 
 	chunker, err := cfg.Chunker.AsTermiteChunkerConfig()

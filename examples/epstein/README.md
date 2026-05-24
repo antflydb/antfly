@@ -160,7 +160,7 @@ Flags:
   --dry-run         Preview changes without applying
   --num-shards      Number of shards (default: 1)
   --batch-size      Batch size for linear merge (default: 25)
-  --termite-url     Termite URL for embeddings/chunking (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --termite-url     Termite URL for chunking (default: ANTFLY_TERMITE_URL or http://localhost:8080)
   --embedding-model Embedding model (default: antflydb/clipclap)
   --chunker-model   Chunker model (default: fixed-bert-tokenizer)
   --target-tokens   Target tokens per chunk (default: 512)
@@ -248,7 +248,7 @@ Documents are indexed with:
 
 2. **Embedding Index** (aknn_v0)
    - Semantic similarity search
-   - Powered by Zig Termite + `antflydb/clipclap`
+   - Powered by the native Zig Antfly embedder + `antflydb/clipclap`
    - Chunked with configurable overlap
 
 3. **Entity Metadata** (optional)
