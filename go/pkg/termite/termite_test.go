@@ -270,14 +270,25 @@ func TestTermiteNode_HandleApiRerank_Success(t *testing.T) {
 
 	// Decode response
 	var resp struct {
-		Model  string    `json:"model"`
+		Object string `json:"object"`
+		Model  string `json:"model"`
+		Data   []struct {
+			Object string  `json:"object"`
+			Index  int     `json:"index"`
+			Score  float32 `json:"score"`
+		} `json:"data"`
 		Scores []float32 `json:"scores"`
 	}
 	err = json.NewDecoder(w.Body).Decode(&resp)
 	require.NoError(t, err)
 
 	// Verify response
+	assert.Equal(t, "list", resp.Object)
 	assert.Equal(t, "test_model", resp.Model)
+	assert.Len(t, resp.Data, 3)
+	assert.Equal(t, "rerank.score", resp.Data[0].Object)
+	assert.Equal(t, 0, resp.Data[0].Index)
+	assert.Equal(t, float32(0.0), resp.Data[0].Score)
 	assert.Len(t, resp.Scores, 3)
 	assert.Equal(t, float32(0.0), resp.Scores[0])
 	assert.Equal(t, float32(0.5), resp.Scores[1])

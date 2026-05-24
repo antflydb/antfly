@@ -9,7 +9,7 @@ import {
   Label,
   Switch,
 } from "@antfly/design-system";
-import type { query_components, components } from "@antfly/sdk";
+import type { components, query_components } from "@antfly/sdk";
 import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import AggregationBuilder, { type AggregationConfig } from "@/components/AggregationBuilder";

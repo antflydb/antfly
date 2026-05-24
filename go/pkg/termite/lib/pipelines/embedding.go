@@ -605,7 +605,7 @@ func (p *EmbeddingPipeline) EmbedOne(ctx context.Context, text string) ([]float3
 	return result[0], nil
 }
 
-// EmbedImages generates embeddings for a batch of images.
+// EmbedImages generates embeddings for images.
 // Use this for vision encoders like CLIP's visual encoder.
 // The pipeline must have an ImageProcessor configured (use NewImageEmbeddingPipeline
 // or NewMultimodalEmbeddingPipeline).
@@ -618,9 +618,10 @@ func (p *EmbeddingPipeline) EmbedImages(ctx context.Context, images []image.Imag
 		return nil, fmt.Errorf("EmbedImages requires an ImageProcessor; use NewImageEmbeddingPipeline or NewMultimodalEmbeddingPipeline")
 	}
 
-	// Check if the model supports dynamic batching by inspecting input shapes.
-	// If the batch dimension (first axis) is fixed, process images one at a time.
-	if !modelSupportsBatching(p.Model) && len(images) > 1 {
+	// Some vision ONNX exports expose a dynamic image input while retaining
+	// fixed batch-size reshapes internally. Run image embeddings one at a time
+	// unless a backend advertises proven image batching support.
+	if !modelSupportsImageBatching(p.Model) && len(images) > 1 {
 		allEmbeddings := make([][]float32, len(images))
 		for i, img := range images {
 			emb, err := p.EmbedImages(ctx, []image.Image{img})
@@ -785,6 +786,11 @@ func modelSupportsBatching(model backends.Model) bool {
 		}
 	}
 	return true
+}
+
+func modelSupportsImageBatching(model backends.Model) bool {
+	provider, ok := model.(interface{ SupportsImageBatching() bool })
+	return ok && provider.SupportsImageBatching()
 }
 
 // ============================================================================

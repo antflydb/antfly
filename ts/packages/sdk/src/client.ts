@@ -42,7 +42,11 @@ type UserOperations = {
   updatePassword: (userName: string, newPassword: string) => Promise<SuccessMessage | undefined>;
   getPermissions: (userName: string) => Promise<Permission[] | undefined>;
   addPermission: (userName: string, permission: Permission) => Promise<SuccessMessage | undefined>;
-  removePermission: (userName: string, resource: string, resourceType: ResourceType) => Promise<boolean>;
+  removePermission: (
+    userName: string,
+    resource: string,
+    resourceType: ResourceType
+  ) => Promise<boolean>;
 };
 
 type CurrentUser = {
@@ -239,12 +243,15 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
-    const response = await fetch(`${normalizeBaseUrl(this.config.baseUrl)}/api/v1/agents/retrieval`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(request),
-      signal: abortController.signal,
-    });
+    const response = await fetch(
+      `${normalizeBaseUrl(this.config.baseUrl)}/api/v1/agents/retrieval`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: abortController.signal,
+      }
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -672,11 +679,14 @@ export class AntflyClient {
         // Merge with any additional headers
         Object.assign(headers, config.headers);
 
-        const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/api/v1/tables/${tableName}/lookup`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(request || {}),
-        });
+        const response = await fetch(
+          `${normalizeBaseUrl(config.baseUrl)}/api/v1/tables/${tableName}/lookup`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify(request || {}),
+          }
+        );
 
         if (!response.ok) {
           const errorText = await response.text();
@@ -753,9 +763,12 @@ export class AntflyClient {
      * Get index details
      */
     get: async (tableName: string, indexName: string) => {
-      const { data, error } = await this.client.GET("/api/v1/tables/{tableName}/indexes/{indexName}", {
-        params: { path: { tableName, indexName } },
-      });
+      const { data, error } = await this.client.GET(
+        "/api/v1/tables/{tableName}/indexes/{indexName}",
+        {
+          params: { path: { tableName, indexName } },
+        }
+      );
       if (error) throw new Error(`Failed to get index: ${error.error}`);
       return data;
     },
@@ -915,5 +928,8 @@ export class AntflyClient {
 }
 
 export function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.trim().replace(/\/$/, "").replace(/\/api\/v1$/, "");
+  return baseUrl
+    .trim()
+    .replace(/\/$/, "")
+    .replace(/\/api\/v1$/, "");
 }

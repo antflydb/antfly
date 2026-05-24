@@ -61,6 +61,13 @@ type onnxBackend struct {
 	sharedAllocator bool
 }
 
+func onnxNumThreads(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	return max(1, min(runtime.NumCPU(), 4))
+}
+
 func (b *onnxBackend) Type() BackendType {
 	return BackendONNX
 }
@@ -329,11 +336,17 @@ func (l *ortModelLoader) Load(path string, opts ...LoadOption) (Model, error) {
 		return nil, fmt.Errorf("enabling shared allocator: %w", err)
 	}
 
-	// Configure number of threads
-	if config.NumThreads > 0 {
-		if err := sessionOpts.SetIntraOpNumThreads(config.NumThreads); err != nil {
+	// Configure thread counts explicitly. Leaving ONNX Runtime in auto mode can
+	// emit pthread affinity warnings on constrained Linux runners.
+	numThreads := onnxNumThreads(config.NumThreads)
+	if numThreads > 0 {
+		if err := sessionOpts.SetIntraOpNumThreads(numThreads); err != nil {
 			sessionOpts.Destroy()
-			return nil, fmt.Errorf("setting thread count: %w", err)
+			return nil, fmt.Errorf("setting intra-op thread count: %w", err)
+		}
+		if err := sessionOpts.SetInterOpNumThreads(1); err != nil {
+			sessionOpts.Destroy()
+			return nil, fmt.Errorf("setting inter-op thread count: %w", err)
 		}
 	}
 
@@ -1047,11 +1060,17 @@ func (f *onnxSessionFactory) CreateSession(modelPath string, opts ...SessionOpti
 		return nil, fmt.Errorf("enabling shared allocator: %w", err)
 	}
 
-	// Configure number of threads
-	if cfg.NumThreads > 0 {
-		if err := sessionOpts.SetIntraOpNumThreads(cfg.NumThreads); err != nil {
+	// Configure thread counts explicitly. Leaving ONNX Runtime in auto mode can
+	// emit pthread affinity warnings on constrained Linux runners.
+	numThreads := onnxNumThreads(cfg.NumThreads)
+	if numThreads > 0 {
+		if err := sessionOpts.SetIntraOpNumThreads(numThreads); err != nil {
 			sessionOpts.Destroy()
-			return nil, fmt.Errorf("setting thread count: %w", err)
+			return nil, fmt.Errorf("setting intra-op thread count: %w", err)
+		}
+		if err := sessionOpts.SetInterOpNumThreads(1); err != nil {
+			sessionOpts.Destroy()
+			return nil, fmt.Errorf("setting inter-op thread count: %w", err)
 		}
 	}
 
