@@ -135,6 +135,14 @@ func TestCreateEmbeddingIndexUsesTermiteClipClap(t *testing.T) {
 	if embedder.ApiUrl != DefaultTermiteURL {
 		t.Fatalf("embedder api URL = %q, want %q", embedder.ApiUrl, DefaultTermiteURL)
 	}
+
+	chunker, err := cfg.Chunker.AsTermiteChunkerConfig()
+	if err != nil {
+		t.Fatalf("AsTermiteChunkerConfig failed: %v", err)
+	}
+	if chunker.ApiUrl != DefaultTermiteURL {
+		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, DefaultTermiteURL)
+	}
 }
 
 func TestEntityCandidatesSkipExistingUnlessReprocess(t *testing.T) {
@@ -149,14 +157,49 @@ func TestEntityCandidatesSkipExistingUnlessReprocess(t *testing.T) {
 		"c": {"content": "   "},
 	}
 
-	candidates := entityCandidates(records, false)
+	candidates := entityCandidates(records, false, DefaultRecognizerModel, splitCSV(DefaultEntityLabels), splitCSV(DefaultRelationLabels), DefaultEntityMaxChars, DefaultEntityOverlap)
 	if len(candidates) != 1 || candidates[0].id != "b" {
 		t.Fatalf("candidates = %#v, want only b", candidates)
 	}
 
-	candidates = entityCandidates(records, true)
+	candidates = entityCandidates(records, true, DefaultRecognizerModel, splitCSV(DefaultEntityLabels), splitCSV(DefaultRelationLabels), DefaultEntityMaxChars, DefaultEntityOverlap)
 	if len(candidates) != 2 || candidates[0].id != "a" || candidates[1].id != "b" {
 		t.Fatalf("reprocess candidates = %#v, want a then b", candidates)
+	}
+}
+
+func TestEntityCandidatesRetryIncompleteMatchingWindows(t *testing.T) {
+	records := map[string]map[string]any{
+		"a": {
+			"content": "John Smith works at Google.",
+			"metadata": map[string]any{
+				"entities":              []any{},
+				"entity_model":          DefaultRecognizerModel,
+				"entity_labels":         []any{"person", "organization"},
+				"entity_window_chars":   float64(20),
+				"entity_overlap_chars":  float64(5),
+				"relations":             []any{},
+				"relation_labels":       []any{"worked for"},
+				"entity_error_windows":  float64(1),
+				"entity_failed_windows": []any{map[string]any{"start": float64(0), "end": float64(20)}},
+			},
+		},
+	}
+
+	candidates := entityCandidates(records, false, DefaultRecognizerModel, []string{"person", "organization"}, []string{"worked for"}, 20, 5)
+	if len(candidates) != 1 {
+		t.Fatalf("len(candidates) = %d, want 1", len(candidates))
+	}
+	if len(candidates[0].retryWindows) != 1 || candidates[0].retryWindows[0] != (entityWindowSpan{Start: 0, End: 20}) {
+		t.Fatalf("retry windows = %#v, want failed span", candidates[0].retryWindows)
+	}
+
+	windows, retryOnly := entityWindows(candidates, 20, 5)
+	if !retryOnly["a"] {
+		t.Fatalf("retryOnly[a] = false, want true")
+	}
+	if len(windows) != 1 || windows[0].start != 0 || windows[0].end != 20 {
+		t.Fatalf("windows = %#v, want only failed window", windows)
 	}
 }
 
@@ -243,6 +286,7 @@ func TestClearEntityMetadataRemovesPriorRunFields(t *testing.T) {
 		"relations":             []any{"stale"},
 		"relation_labels":       []string{"worked for"},
 		"entity_error_windows":  2,
+		"entity_failed_windows": []entityWindowSpan{{Start: 0, End: 10}},
 		"unrelated_page_source": "kept",
 	}
 
@@ -257,6 +301,7 @@ func TestClearEntityMetadataRemovesPriorRunFields(t *testing.T) {
 		"relations",
 		"relation_labels",
 		"entity_error_windows",
+		"entity_failed_windows",
 	} {
 		if _, ok := meta[key]; ok {
 			t.Fatalf("metadata key %q was not cleared", key)

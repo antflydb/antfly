@@ -255,6 +255,7 @@ Documents are indexed with:
    - `epstein entities` stores recognized entities in `metadata.entities`
    - Optional relations are stored in `metadata.relations`
    - Long pages are processed as overlapping windows and offsets are rebased to the page
+   - Failed entity windows are tracked and retried on the next run
    - The search UI displays entity chips when present
 
 ### Search

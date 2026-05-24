@@ -1881,7 +1881,8 @@ func createEmbeddingIndex(embeddingModel, termiteURL, chunkerModel string, targe
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
-		Model: chunkerModel,
+		ApiUrl: termiteURL,
+		Model:  chunkerModel,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  targetTokens,
 			OverlapTokens: overlapTokens,
@@ -3072,21 +3073,30 @@ func enrichCmd(args []string) error {
 }
 
 type entityCandidate struct {
-	id      string
-	content string
+	id           string
+	content      string
+	retryWindows []entityWindowSpan
 }
 
 type entityWindow struct {
 	id      string
 	content string
 	start   int
+	end     int
+}
+
+type entityWindowSpan struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
 }
 
 type entityAccum struct {
-	entities  []termiteoapi.RecognizeEntity
-	relations []termiteoapi.Relation
-	windows   int
-	errors    int
+	entities         []termiteoapi.RecognizeEntity
+	relations        []termiteoapi.Relation
+	failed           []entityWindowSpan
+	windows          int
+	errors           int
+	preserveExisting bool
 }
 
 // entitiesCmd enriches prepared page records with NER metadata from Termite.
@@ -3146,8 +3156,8 @@ func entitiesCmd(args []string) error {
 		return fmt.Errorf("failed to read input: %w", err)
 	}
 
-	candidates := entityCandidates(records, *reprocess)
-	windows := entityWindows(candidates, *maxChars, *overlapChars)
+	candidates := entityCandidates(records, *reprocess, *model, labels, relationLabels, *maxChars, *overlapChars)
+	windows, retryOnly := entityWindows(candidates, *maxChars, *overlapChars)
 	fmt.Printf("Total records: %d\n", len(records))
 	fmt.Printf("Entity candidates: %d\n", len(candidates))
 	fmt.Printf("Entity windows: %d\n", len(windows))
@@ -3166,7 +3176,15 @@ func entitiesCmd(args []string) error {
 
 	accum := make(map[string]*entityAccum, len(candidates))
 	for _, candidate := range candidates {
-		accum[candidate.id] = &entityAccum{}
+		a := &entityAccum{}
+		if retryOnly[candidate.id] {
+			if meta, ok := records[candidate.id]["metadata"].(map[string]any); ok {
+				a.entities = metadataEntities(meta["entities"])
+				a.relations = metadataRelations(meta["relations"])
+				a.preserveExisting = true
+			}
+		}
+		accum[candidate.id] = a
 	}
 
 	usedModel, processedWindows, failedWindows := recognizeEntityWindows(
@@ -3195,7 +3213,7 @@ func entitiesCmd(args []string) error {
 
 		meta := ensureRecordMetadata(records[candidate.id])
 		clearEntityMetadata(meta)
-		if a.windows > 0 {
+		if a.windows > 0 || a.preserveExisting {
 			entities := dedupeEntities(a.entities)
 			relations := dedupeRelations(a.relations)
 
@@ -3215,6 +3233,7 @@ func entitiesCmd(args []string) error {
 		}
 		if a.errors > 0 {
 			meta["entity_error_windows"] = a.errors
+			meta["entity_failed_windows"] = a.failed
 			recordsWithErrors++
 		}
 	}
@@ -3234,7 +3253,15 @@ func entitiesCmd(args []string) error {
 	return nil
 }
 
-func entityCandidates(records map[string]map[string]any, reprocess bool) []entityCandidate {
+func entityCandidates(
+	records map[string]map[string]any,
+	reprocess bool,
+	model string,
+	labels []string,
+	relationLabels []string,
+	maxChars int,
+	overlapChars int,
+) []entityCandidate {
 	ids := make([]string, 0, len(records))
 	for id := range records {
 		ids = append(ids, id)
@@ -3251,6 +3278,14 @@ func entityCandidates(records map[string]map[string]any, reprocess bool) []entit
 		if !reprocess {
 			if meta, ok := rec["metadata"].(map[string]any); ok {
 				if _, ok := meta["entities"]; ok {
+					if entityMetadataIncomplete(meta) {
+						candidate := entityCandidate{id: id, content: content}
+						if entityMetadataConfigMatches(meta, model, labels, relationLabels, maxChars, overlapChars) {
+							candidate.retryWindows = metadataFailedWindows(meta)
+						}
+						candidates = append(candidates, candidate)
+						continue
+					}
 					continue
 				}
 			}
@@ -3258,6 +3293,46 @@ func entityCandidates(records map[string]map[string]any, reprocess bool) []entit
 		candidates = append(candidates, entityCandidate{id: id, content: content})
 	}
 	return candidates
+}
+
+func entityMetadataIncomplete(meta map[string]any) bool {
+	return metadataInt(meta["entity_error_windows"]) > 0 || len(metadataFailedWindows(meta)) > 0
+}
+
+func entityMetadataConfigMatches(meta map[string]any, model string, labels []string, relationLabels []string, maxChars, overlapChars int) bool {
+	return metadataString(meta["entity_model"]) == model &&
+		stringSlicesEqual(metadataStringSlice(meta["entity_labels"]), labels) &&
+		stringSlicesEqual(metadataStringSlice(meta["relation_labels"]), relationLabels) &&
+		metadataInt(meta["entity_window_chars"]) == maxChars &&
+		metadataInt(meta["entity_overlap_chars"]) == overlapChars
+}
+
+func metadataFailedWindows(meta map[string]any) []entityWindowSpan {
+	switch value := meta["entity_failed_windows"].(type) {
+	case []entityWindowSpan:
+		return append([]entityWindowSpan(nil), value...)
+	case []any:
+		spans := make([]entityWindowSpan, 0, len(value))
+		for _, item := range value {
+			switch v := item.(type) {
+			case entityWindowSpan:
+				if v.End > v.Start {
+					spans = append(spans, v)
+				}
+			case map[string]any:
+				span := entityWindowSpan{
+					Start: metadataInt(v["start"]),
+					End:   metadataInt(v["end"]),
+				}
+				if span.End > span.Start {
+					spans = append(spans, span)
+				}
+			}
+		}
+		return spans
+	default:
+		return nil
+	}
 }
 
 func clearEntityMetadata(meta map[string]any) {
@@ -3269,14 +3344,25 @@ func clearEntityMetadata(meta map[string]any) {
 	delete(meta, "relations")
 	delete(meta, "relation_labels")
 	delete(meta, "entity_error_windows")
+	delete(meta, "entity_failed_windows")
 }
 
-func entityWindows(candidates []entityCandidate, maxChars, overlapChars int) []entityWindow {
+func entityWindows(candidates []entityCandidate, maxChars, overlapChars int) ([]entityWindow, map[string]bool) {
 	var windows []entityWindow
+	retryOnly := map[string]bool{}
 	for _, candidate := range candidates {
-		windows = append(windows, splitEntityWindows(candidate, maxChars, overlapChars)...)
+		all := splitEntityWindows(candidate, maxChars, overlapChars)
+		if len(candidate.retryWindows) > 0 {
+			selected := filterEntityWindows(all, candidate.retryWindows)
+			if len(selected) > 0 {
+				windows = append(windows, selected...)
+				retryOnly[candidate.id] = true
+				continue
+			}
+		}
+		windows = append(windows, all...)
 	}
-	return windows
+	return windows, retryOnly
 }
 
 func splitEntityWindows(candidate entityCandidate, maxChars, overlapChars int) []entityWindow {
@@ -3285,7 +3371,7 @@ func splitEntityWindows(candidate entityCandidate, maxChars, overlapChars int) [
 		return nil
 	}
 	if maxChars <= 0 || len(runes) <= maxChars {
-		return []entityWindow{{id: candidate.id, content: candidate.content, start: 0}}
+		return []entityWindow{{id: candidate.id, content: candidate.content, start: 0, end: len(runes)}}
 	}
 	if overlapChars < 0 {
 		overlapChars = 0
@@ -3307,6 +3393,7 @@ func splitEntityWindows(candidate entityCandidate, maxChars, overlapChars int) [
 				id:      candidate.id,
 				content: content,
 				start:   start,
+				end:     end,
 			})
 		}
 		if end >= len(runes) {
@@ -3320,6 +3407,23 @@ func splitEntityWindows(candidate entityCandidate, maxChars, overlapChars int) [
 		start = next
 	}
 	return windows
+}
+
+func filterEntityWindows(windows []entityWindow, spans []entityWindowSpan) []entityWindow {
+	if len(spans) == 0 {
+		return windows
+	}
+	wanted := make(map[entityWindowSpan]struct{}, len(spans))
+	for _, span := range spans {
+		wanted[span] = struct{}{}
+	}
+	out := make([]entityWindow, 0, len(spans))
+	for _, window := range windows {
+		if _, ok := wanted[entityWindowSpan{Start: window.start, End: window.end}]; ok {
+			out = append(out, window)
+		}
+	}
+	return out
 }
 
 func chooseEntityWindowEnd(runes []rune, start, hardEnd int) int {
@@ -3398,6 +3502,7 @@ func recognizeEntityWindowBatch(
 		window := windows[0]
 		if a := accum[window.id]; a != nil {
 			a.errors++
+			a.failed = append(a.failed, entityWindowSpan{Start: window.start, End: window.end})
 		}
 		log.Printf("Warning: entity recognition failed for %s at char %d: %v", window.id, window.start, err)
 		return "", 0, 1
@@ -3448,6 +3553,144 @@ func offsetRelations(relations []termiteoapi.Relation, base int) []termiteoapi.R
 		out[i] = relation
 	}
 	return out
+}
+
+func metadataEntities(value any) []termiteoapi.RecognizeEntity {
+	items, ok := value.([]any)
+	if !ok {
+		if entities, ok := value.([]termiteoapi.RecognizeEntity); ok {
+			return append([]termiteoapi.RecognizeEntity(nil), entities...)
+		}
+		return nil
+	}
+	entities := make([]termiteoapi.RecognizeEntity, 0, len(items))
+	for _, item := range items {
+		entity, ok := metadataEntity(item)
+		if ok {
+			entities = append(entities, entity)
+		}
+	}
+	return entities
+}
+
+func metadataRelations(value any) []termiteoapi.Relation {
+	items, ok := value.([]any)
+	if !ok {
+		if relations, ok := value.([]termiteoapi.Relation); ok {
+			return append([]termiteoapi.Relation(nil), relations...)
+		}
+		return nil
+	}
+	relations := make([]termiteoapi.Relation, 0, len(items))
+	for _, item := range items {
+		relation, ok := metadataRelation(item)
+		if ok {
+			relations = append(relations, relation)
+		}
+	}
+	return relations
+}
+
+func metadataEntity(value any) (termiteoapi.RecognizeEntity, bool) {
+	if entity, ok := value.(termiteoapi.RecognizeEntity); ok {
+		return entity, true
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return termiteoapi.RecognizeEntity{}, false
+	}
+	return termiteoapi.RecognizeEntity{
+		Text:  metadataString(m["text"]),
+		Label: metadataString(m["label"]),
+		Start: metadataInt(m["start"]),
+		End:   metadataInt(m["end"]),
+		Score: metadataFloat32(m["score"]),
+	}, true
+}
+
+func metadataRelation(value any) (termiteoapi.Relation, bool) {
+	if relation, ok := value.(termiteoapi.Relation); ok {
+		return relation, true
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return termiteoapi.Relation{}, false
+	}
+	head, headOK := metadataEntity(m["head"])
+	tail, tailOK := metadataEntity(m["tail"])
+	if !headOK || !tailOK {
+		return termiteoapi.Relation{}, false
+	}
+	return termiteoapi.Relation{
+		Head:  head,
+		Label: metadataString(m["label"]),
+		Score: metadataFloat32(m["score"]),
+		Tail:  tail,
+	}, true
+}
+
+func metadataString(value any) string {
+	s, _ := value.(string)
+	return s
+}
+
+func metadataInt(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func metadataFloat32(value any) float32 {
+	switch v := value.(type) {
+	case float32:
+		return v
+	case float64:
+		return float32(v)
+	case json.Number:
+		n, _ := v.Float64()
+		return float32(n)
+	default:
+		return 0
+	}
+}
+
+func metadataStringSlice(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func dedupeEntities(entities []termiteoapi.RecognizeEntity) []termiteoapi.RecognizeEntity {
