@@ -4269,6 +4269,11 @@ pub const HttpHandler = struct {
         if (status.full_text_index_actions.len > 0) {
             for (status.full_text_index_actions) |entry| {
                 if (entry.action == .rebuild) return false;
+                if (entry.chunked_source_count > 0 and
+                    (status.pending_materialization_families.chunk_preview or !status.chunk_preview_complete))
+                {
+                    return false;
+                }
             }
             return true;
         }
