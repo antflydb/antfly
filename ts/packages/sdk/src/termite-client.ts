@@ -4,8 +4,8 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
-import { deserializeEmbeddings } from "./termite-codec.js";
 import type { paths } from "./public-api.js";
+import { deserializeEmbeddings } from "./termite-codec.js";
 import type {
   ChunkConfig,
   ChunkResponse,

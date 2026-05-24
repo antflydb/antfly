@@ -517,6 +517,7 @@ func (tm *TableManager) needsUpdates(
 			// through the parent's final fence.
 			log.Printf("SPLIT_STATE: Shard %s transitioning SplitOffPreSnap -> Default (cutoverReady=true)", oldShardStatus.ID)
 			newShardStatus.State = store.ShardState_Default
+			needsPersist = true
 		}
 	case store.ShardState_Default:
 	default:

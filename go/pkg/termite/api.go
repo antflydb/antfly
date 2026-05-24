@@ -851,12 +851,38 @@ func (ln *TermiteNode) handleApiRerank(w http.ResponseWriter, r *http.Request) {
 		zap.Int("num_prompts", len(req.Prompts)),
 		zap.Int("num_scores", len(scores)))
 
-	// Send response
+	data := make([]struct {
+		Object string  `json:"object"`
+		Index  int     `json:"index"`
+		Score  float32 `json:"score"`
+	}, len(scores))
+	for i, score := range scores {
+		data[i] = struct {
+			Object string  `json:"object"`
+			Index  int     `json:"index"`
+			Score  float32 `json:"score"`
+		}{
+			Object: "rerank.score",
+			Index:  i,
+			Score:  score,
+		}
+	}
+
+	// Send both response shapes while generated clients converge on the
+	// OpenAI-compatible data[] contract.
 	resp := struct {
-		Model  string    `json:"model"`
+		Object string `json:"object"`
+		Model  string `json:"model"`
+		Data   []struct {
+			Object string  `json:"object"`
+			Index  int     `json:"index"`
+			Score  float32 `json:"score"`
+		} `json:"data"`
 		Scores []float32 `json:"scores"`
 	}{
+		Object: "list",
 		Model:  req.Model,
+		Data:   data,
 		Scores: scores,
 	}
 

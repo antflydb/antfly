@@ -296,12 +296,14 @@ const RerankingPlaygroundPage: React.FC = () => {
     if (!result?.data) return [];
 
     const nonEmptyDocs = documents.filter((d) => d.trim());
-    const ranked = [...result.data].sort((a, b) => a.index - b.index).map((item) => ({
-      index: item.index,
-      text: nonEmptyDocs[item.index] || "",
-      score: item.score,
-      rank: 0,
-    }));
+    const ranked = [...result.data]
+      .sort((a, b) => a.index - b.index)
+      .map((item) => ({
+        index: item.index,
+        text: nonEmptyDocs[item.index] || "",
+        score: item.score,
+        rank: 0,
+      }));
 
     // Sort by score descending
     ranked.sort((a, b) => b.score - a.score);
