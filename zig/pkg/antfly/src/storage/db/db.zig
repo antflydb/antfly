@@ -27128,6 +27128,11 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
         .kind = .sparse_vector,
         .config_json = "{\"field\":\"sparse\"}",
     });
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"body\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"semantic_idx\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    });
 
     try db.batch(.{
         .writes = &.{
@@ -27147,6 +27152,18 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
     const vector_only_stored = (try db.get(alloc, "doc:c")).?;
     defer alloc.free(vector_only_stored);
     try std.testing.expectEqualStrings("{}", vector_only_stored);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:managed", .value = "{\"body\":\"managed embedding source text\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[13],\"values\":[1.0]}}" },
+        },
+        .sync_level = .write,
+    });
+    const managed_stored = (try db.get(alloc, "doc:managed")).?;
+    defer alloc.free(managed_stored);
+    try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"body\":\"managed embedding source text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"embedding\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"sparse\"") == null);
 
     const dense_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(dense_artifact_key);

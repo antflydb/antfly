@@ -2517,10 +2517,15 @@ pub const IndexManager = struct {
         }
 
         for (self.dense_indexes.items) |entry| {
+            if (entry.external or entry.chunk_name != null or entry.embedding_name != null) continue;
             if (containsOwnedString(fields.items, entry.field_name)) continue;
             try fields.append(alloc, try alloc.dupe(u8, entry.field_name));
         }
         for (self.sparse_indexes.items) |entry| {
+            if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
+                generator.deinit(alloc);
+                continue;
+            }
             if (containsOwnedString(fields.items, entry.field_name)) continue;
             try fields.append(alloc, try alloc.dupe(u8, entry.field_name));
         }
