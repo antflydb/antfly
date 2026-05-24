@@ -109,7 +109,9 @@ jobs:
           (cd go/pkg/sdk && GOWORK=off go generate ./...)
           status="$(git status --porcelain -- \
             openapi.yaml \
-            go/pkg/sdk/oapi/client.gen.go)"
+            go/pkg/sdk/oapi/client.gen.go \
+            go/pkg/sdk/oapi/validate.go \
+            go/pkg/sdk/query/query.gen.go)"
           if [ -n "$status" ]; then
             echo "$status"
             exit 1

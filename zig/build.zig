@@ -750,13 +750,13 @@ fn addPublicOpenApiModule(
         "antfly_public_openapi",
         "types,extractors",
         &.{
-            .{ "../go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "../go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
+            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
+            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
+            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
+            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         },
     );
 }
@@ -778,13 +778,13 @@ fn addPublicClientOpenApiModule(
         "antfly_client_openapi",
         "types,client",
         &.{
-            .{ "../go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "../go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
+            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
+            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
+            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
+            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         },
         httpx_mod,
     );
@@ -918,50 +918,50 @@ fn addOpenApiRegenStep(
     const termite_generated_root = "pkg/termite/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
-            .{ "../go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "../go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
+            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
+            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
+            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
+            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
-            .{ "../go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "../go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
+            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
+            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
+            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
+            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/schema/openapi.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/src/store/db/indexes/openapi.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
-            .{ "../go/pkg/antfly/lib/embeddings/openapi.yaml", "antfly_embeddings_openapi" },
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../go/pkg/antfly/lib/chunking/openapi.yaml", "antfly_chunking_openapi" },
+            .{ "../../../../lib/embeddings/openapi.yaml", "antfly_embeddings_openapi" },
+            .{ "../../../../../generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "../../../../lib/chunking/openapi.yaml", "antfly_chunking_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/websearch/openapi.yaml"), "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi", "types", &.{
-            .{ "../go/pkg/libaf/s3/openapi.yaml", "antfly_s3_openapi" },
+            .{ "../../../libaf/s3/openapi.yaml", "antfly_s3_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/ai/eval/openapi.yaml"), "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi", "types", &.{
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "../../../../generating/openapi.yaml", "antfly_generating_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/usermgr.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
             .{ "usermgr.yaml", "antfly_usermgr_openapi" },
-            .{ "../go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "../go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "../../../src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "../../../lib/schema/openapi.yaml", "antfly_schema_openapi" },
+            .{ "../../../lib/ai/openapi.yaml", "antfly_ai_openapi" },
+            .{ "../../../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
+            .{ "../../../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "../../../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
             .{ "query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/libaf/logging/openapi.yaml"), "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/audio/openapi.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
-            .{ "../go/pkg/libaf/s3/openapi.yaml", "antfly_s3_openapi" },
+            .{ "../../../libaf/s3/openapi.yaml", "antfly_s3_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/middleware/openapi.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/libaf/scraping/openapi.yaml"), "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi", "types", &.{}),
@@ -974,25 +974,25 @@ fn addOpenApiRegenStep(
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/libaf/chunking/openapi.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/chunking/openapi.yaml"), "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi", "types", &.{
-            .{ "../go/pkg/libaf/chunking/openapi.yaml", "antfly_chunking_api_openapi" },
+            .{ "../../../libaf/chunking/openapi.yaml", "antfly_chunking_api_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/embeddings/openapi.yaml"), "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/src/common/openapi.yaml"), "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi", "types", &.{
-            .{ "../go/pkg/libaf/logging/openapi.yaml", "antfly_logging_openapi" },
-            .{ "../go/pkg/antfly/lib/audio/openapi.yaml", "antfly_audio_openapi" },
-            .{ "../go/pkg/antfly/lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
-            .{ "../go/pkg/antfly/lib/embeddings/openapi.yaml", "antfly_embeddings_openapi" },
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../go/pkg/antfly/lib/chunking/openapi.yaml", "antfly_chunking_openapi" },
-            .{ "../go/pkg/libaf/scraping/openapi.yaml", "antfly_scraping_openapi" },
-            .{ "../go/pkg/libaf/s3/openapi.yaml", "antfly_s3_openapi" },
-            .{ "../go/pkg/termite/openapi.yaml", "antfly_termite_config_openapi" },
+            .{ "../../../libaf/logging/openapi.yaml", "antfly_logging_openapi" },
+            .{ "../../lib/audio/openapi.yaml", "antfly_audio_openapi" },
+            .{ "../../lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
+            .{ "../../lib/embeddings/openapi.yaml", "antfly_embeddings_openapi" },
+            .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "../../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "../../lib/chunking/openapi.yaml", "antfly_chunking_openapi" },
+            .{ "../../../libaf/scraping/openapi.yaml", "antfly_scraping_openapi" },
+            .{ "../../../libaf/s3/openapi.yaml", "antfly_s3_openapi" },
+            .{ "../../../termite/openapi.yaml", "antfly_termite_config_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/generating/openapi.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/reranking/openapi.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/ai/openapi.yaml"), "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi", "types", &.{
-            .{ "../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
+            .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../websearch/openapi.yaml", "antfly_websearch_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{}),
@@ -1658,14 +1658,14 @@ pub fn build(b: *std.Build) void {
     embedded_mod.addImport("embedded_api_surface", embedded_api_mod);
 
     const antfly_embedded_pkg_mod = b.addModule("antfly-embedded", .{
-        .root_source_file = b.path("pkg/antfly-embedded/go/pkg/antfly/src/root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     antfly_embedded_pkg_mod.addImport("embedded_surface", embedded_mod);
 
     const antfly_client_pkg_mod = b.addModule("antfly-client", .{
-        .root_source_file = b.path("pkg/antfly-client/go/pkg/antfly/src/root.zig"),
+        .root_source_file = b.path("pkg/antfly-client/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1727,21 +1727,21 @@ pub fn build(b: *std.Build) void {
     embedded_wasm_mod.addImport("embedded_api_surface", embedded_api_wasm_mod);
 
     const antfly_embedded_db_pkg_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/go/pkg/antfly/src/db.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/db.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     antfly_embedded_db_pkg_wasm_mod.addImport("embedded_db_surface", embedded_db_wasm_mod);
 
     const antfly_embedded_api_pkg_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/go/pkg/antfly/src/api.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/api.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     antfly_embedded_api_pkg_wasm_mod.addImport("embedded_api_surface", embedded_api_wasm_mod);
 
     const antfly_embedded_pkg_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/go/pkg/antfly/src/root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });

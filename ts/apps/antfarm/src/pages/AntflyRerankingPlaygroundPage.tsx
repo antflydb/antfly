@@ -245,8 +245,9 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
     try {
       const prompts = searchResults.map((r) => r.text);
       const response = await termiteClient.rerank(selectedModel, query, prompts);
+      const scores = [...response.data].sort((a, b) => a.index - b.index).map((item) => item.score);
 
-      if (!response.scores || response.scores.length !== searchResults.length) {
+      if (scores.length !== searchResults.length) {
         throw new Error("Reranker returned unexpected number of scores");
       }
 
@@ -254,7 +255,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
       const withScores: RankedHit[] = searchResults.map((hit, i) => ({
         ...hit,
         originalRank: i + 1,
-        rerankScore: response.scores[i],
+        rerankScore: scores[i],
         newRank: 0,
         rankChange: 0,
       }));

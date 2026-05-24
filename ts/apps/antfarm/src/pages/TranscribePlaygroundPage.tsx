@@ -372,7 +372,7 @@ const TranscribePlaygroundPage: React.FC = () => {
       const result = await termiteClient.transcribe(audioBase64, langOpts);
       if (signal.aborted) return;
 
-      const rawText = (result.text || "").trim();
+      const rawText = (result.data[0]?.text || "").trim();
 
       if (generatorModel && rawText) {
         updateSegment(index, { rawText, status: "cleaning" });

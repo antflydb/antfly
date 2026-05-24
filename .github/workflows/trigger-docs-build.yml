@@ -9,7 +9,6 @@ on:
       - 'CHANGELOG.md'
       - 'examples/**'
       - 'docs/**'
-      - 'go/pkg/antfly/src/common/openapi.yaml'
       - 'go/pkg/operator/docs/**'
       - 'go/pkg/termite/registry/index.json'
 

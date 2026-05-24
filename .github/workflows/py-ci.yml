@@ -40,7 +40,7 @@ jobs:
         working-directory: py/packages/sdk
         run: |
           make generate
-          status="$(git status --porcelain -- go/pkg/antfly/src/antfly/client_generated)"
+          status="$(git status --porcelain -- src/antfly/client_generated)"
           if [ -n "$status" ]; then
             echo "$status"
             exit 1

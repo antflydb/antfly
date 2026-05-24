@@ -23,7 +23,7 @@ import {
   Skeleton,
   Textarea,
 } from "@antfly/design-system";
-import { type Chunk, type ChunkResponse, TermiteClient } from "@antfly/sdk";
+import { type ChunkResponse, TermiteClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Database, Hash, RotateCcw, Scissors, Zap } from "lucide-react";
 import type React from "react";
@@ -46,9 +46,10 @@ interface ChunkConfig {
   threshold: number;
 }
 
-function isTextChunk(
-  chunk: Chunk
-): chunk is Chunk & { text: string; start_char: number; end_char: number } {
+type ChunkResult = ChunkResponse["data"][number];
+type TextChunkResult = ChunkResult & { text: string; start_char: number; end_char: number };
+
+function isTextChunk(chunk: ChunkResult): chunk is TextChunkResult {
   return "text" in chunk;
 }
 
@@ -285,7 +286,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
 
   // Render text with chunk boundaries highlighted
   const renderHighlightedText = () => {
-    if (!result || result.chunks.length === 0) {
+    if (!result || result.data.length === 0) {
       return (
         <pre className="whitespace-pre-wrap text-sm text-muted-foreground font-mono">
           {inputText || "Enter text and click 'Chunk' to see results"}
@@ -296,7 +297,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     const elements: React.ReactNode[] = [];
     let lastEnd = 0;
 
-    result.chunks.forEach((chunk, index) => {
+    result.data.forEach((chunk, index) => {
       if (!isTextChunk(chunk)) return;
 
       // Add any text before this chunk (gaps)
@@ -542,7 +543,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
-            {result.chunks.length} chunks
+            {result.data.length} chunks
           </Badge>
           <Badge variant="secondary" className="gap-1.5">
             <Zap className="h-3 w-3" />
@@ -610,7 +611,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
 
                 {/* Chunk list */}
                 <div className="space-y-3">
-                  {result.chunks.filter(isTextChunk).map((chunk, index) => {
+                  {result.data.filter(isTextChunk).map((chunk, index) => {
                     const colorIndex = index % CHUNK_COLORS.length;
                     return (
                       <div
