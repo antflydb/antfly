@@ -2875,6 +2875,20 @@ pub const ApiHttpServer = struct {
                     return try textResponse(self.alloc, 400, "invalid create table request");
                 };
                 defer create_req.deinit(self.alloc);
+                const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+                    self.alloc,
+                    create_req.indexes_json orelse tables_api.default_indexes_json,
+                    .{
+                        .local_termite_provider = self.local_termite_provider,
+                        .secret_store = self.cfg.secret_store,
+                        .remote_content = self.cfg.remote_content,
+                    },
+                ) catch |err| switch (err) {
+                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+                    else => return err,
+                };
+                if (create_req.indexes_json) |old_indexes_json| self.alloc.free(old_indexes_json);
+                create_req.indexes_json = normalized_indexes_json;
                 tables_api.validatePublicAlgebraicIndexesJson(self.alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
                     return try textResponse(self.alloc, 400, "unsupported table index configuration");
                 };
@@ -4840,13 +4854,31 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
+        const normalized_index_json = table_writes.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+            alloc,
+            index_name,
+            expanded_index_json,
+            .{
+                .local_termite_provider = self.local_termite_provider,
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+            },
+        ) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            else => return error.InternalFailure,
+        };
+        defer alloc.free(normalized_index_json);
 
-        table_writes.validateIndexConfig(alloc, index_name, expanded_index_json) catch |err| switch (err) {
+        table_writes.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
+            .local_termite_provider = self.local_termite_provider,
+            .secret_store = self.cfg.secret_store,
+            .remote_content = self.cfg.remote_content,
+        }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
 
-        self.source.createIndex(alloc, table_name, index_name, expanded_index_json) catch |err| switch (err) {
+        self.source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -4855,7 +4887,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, expanded_index_json) catch |err| switch (err) {
+        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, normalized_index_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -4865,7 +4897,7 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
-            _ = table_writes_source.createIndex(alloc, table_name, index_name, expanded_index_json) catch |err| switch (err) {
+            _ = table_writes_source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
                 else => {
                     std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
