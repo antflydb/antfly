@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	termiteoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -111,6 +113,254 @@ func createTestZip(t *testing.T, files map[string][]byte) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
+	idx, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultTermiteURL, DefaultChunkerModel, 512, 50)
+	if err != nil {
+		t.Fatalf("createEmbeddingIndex failed: %v", err)
+	}
+
+	cfg, err := idx.AsEmbeddingsIndexConfig()
+	if err != nil {
+		t.Fatalf("AsEmbeddingsIndexConfig failed: %v", err)
+	}
+
+	embedder, err := cfg.Embedder.AsAntflyEmbedderConfig()
+	if err != nil {
+		t.Fatalf("AsAntflyEmbedderConfig failed: %v", err)
+	}
+	if cfg.Embedder.Provider != antfly.EmbedderProviderAntfly {
+		t.Fatalf("embedder provider = %q, want %q", cfg.Embedder.Provider, antfly.EmbedderProviderAntfly)
+	}
+	if embedder["model"] != DefaultEmbeddingModel {
+		t.Fatalf("embedder model = %q, want %q", embedder["model"], DefaultEmbeddingModel)
+	}
+
+	chunker, err := cfg.Chunker.AsTermiteChunkerConfig()
+	if err != nil {
+		t.Fatalf("AsTermiteChunkerConfig failed: %v", err)
+	}
+	wantChunkerURL := DefaultTermiteURL + "/ml/v1"
+	if chunker.ApiUrl != wantChunkerURL {
+		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, wantChunkerURL)
+	}
+}
+
+func TestTermiteMLBaseURLNormalizesRoots(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "root", in: "http://localhost:8080", want: "http://localhost:8080/ml/v1"},
+		{name: "api root", in: "http://localhost:8080/api/v1", want: "http://localhost:8080/ml/v1"},
+		{name: "already ml", in: "http://localhost:8080/ml/v1/", want: "http://localhost:8080/ml/v1"},
+		{name: "cloud root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance/ml/v1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := termiteMLBaseURL(tt.in)
+			if err != nil {
+				t.Fatalf("termiteMLBaseURL failed: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("termiteMLBaseURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTermiteMLBaseURLRejectsLegacyAPI(t *testing.T) {
+	if _, err := termiteMLBaseURL("http://localhost:8082/api"); err == nil {
+		t.Fatalf("termiteMLBaseURL accepted legacy /api URL")
+	}
+}
+
+func TestCreateSearchTableIndexesIncludesQueriedIndexes(t *testing.T) {
+	embeddingIndex, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultTermiteURL, DefaultChunkerModel, 512, 50)
+	if err != nil {
+		t.Fatalf("createEmbeddingIndex failed: %v", err)
+	}
+	indexes, err := createSearchTableIndexes(*embeddingIndex)
+	if err != nil {
+		t.Fatalf("createSearchTableIndexes failed: %v", err)
+	}
+	for _, name := range searchIndexNames() {
+		if _, ok := indexes[name]; !ok {
+			t.Fatalf("search index %q missing from created table indexes: %#v", name, indexes)
+		}
+	}
+	if indexes[DefaultFullTextIndex].Type != antfly.IndexTypeFullText {
+		t.Fatalf("full-text index type = %q, want %q", indexes[DefaultFullTextIndex].Type, antfly.IndexTypeFullText)
+	}
+}
+
+func TestEntityCandidatesSkipExistingUnlessReprocess(t *testing.T) {
+	records := map[string]map[string]any{
+		"b": {"content": "Jane Doe wrote to Acme."},
+		"a": {
+			"content": "John Smith works at Google.",
+			"metadata": map[string]any{
+				"entities": []any{},
+			},
+		},
+		"c": {"content": "   "},
+	}
+
+	candidates := entityCandidates(records, false, DefaultRecognizerModel, splitCSV(DefaultEntityLabels), splitCSV(DefaultRelationLabels), DefaultEntityMaxChars, DefaultEntityOverlap)
+	if len(candidates) != 1 || candidates[0].id != "b" {
+		t.Fatalf("candidates = %#v, want only b", candidates)
+	}
+
+	candidates = entityCandidates(records, true, DefaultRecognizerModel, splitCSV(DefaultEntityLabels), splitCSV(DefaultRelationLabels), DefaultEntityMaxChars, DefaultEntityOverlap)
+	if len(candidates) != 2 || candidates[0].id != "a" || candidates[1].id != "b" {
+		t.Fatalf("reprocess candidates = %#v, want a then b", candidates)
+	}
+}
+
+func TestEntityCandidatesRetryIncompleteMatchingWindows(t *testing.T) {
+	records := map[string]map[string]any{
+		"a": {
+			"content": "John Smith works at Google.",
+			"metadata": map[string]any{
+				"entities":              []any{},
+				"entity_model":          DefaultRecognizerModel,
+				"entity_labels":         []any{"person", "organization"},
+				"entity_window_chars":   float64(20),
+				"entity_overlap_chars":  float64(5),
+				"relations":             []any{},
+				"relation_labels":       []any{"worked for"},
+				"entity_error_windows":  float64(1),
+				"entity_failed_windows": []any{map[string]any{"start": float64(0), "end": float64(20)}},
+			},
+		},
+	}
+
+	candidates := entityCandidates(records, false, DefaultRecognizerModel, []string{"person", "organization"}, []string{"worked for"}, 20, 5)
+	if len(candidates) != 1 {
+		t.Fatalf("len(candidates) = %d, want 1", len(candidates))
+	}
+	if len(candidates[0].retryWindows) != 1 || candidates[0].retryWindows[0] != (entityWindowSpan{Start: 0, End: 20}) {
+		t.Fatalf("retry windows = %#v, want failed span", candidates[0].retryWindows)
+	}
+
+	windows, retryOnly := entityWindows(candidates, 20, 5)
+	if !retryOnly["a"] {
+		t.Fatalf("retryOnly[a] = false, want true")
+	}
+	if len(windows) != 1 || windows[0].start != 0 || windows[0].end != 20 {
+		t.Fatalf("windows = %#v, want only failed window", windows)
+	}
+}
+
+func TestExtractEntityChipsDedupesAndLimits(t *testing.T) {
+	chips := extractEntityChips([]any{
+		map[string]any{"text": "Jane Doe", "label": "person"},
+		map[string]any{"text": "Jane Doe", "label": "person"},
+		map[string]any{"text": "Acme", "label": "organization"},
+	}, 2)
+
+	if len(chips) != 2 {
+		t.Fatalf("len(chips) = %d, want 2", len(chips))
+	}
+	if chips[0] != (EntityChip{Text: "Jane Doe", Label: "person"}) {
+		t.Fatalf("chips[0] = %#v", chips[0])
+	}
+	if chips[1] != (EntityChip{Text: "Acme", Label: "organization"}) {
+		t.Fatalf("chips[1] = %#v", chips[1])
+	}
+}
+
+func TestSplitEntityWindowsRebasesAndOverlaps(t *testing.T) {
+	candidate := entityCandidate{
+		id:      "page-1",
+		content: "Alpha Beta Gamma Delta Epsilon Zeta Eta Theta",
+	}
+	windows := splitEntityWindows(candidate, 20, 5)
+	if len(windows) < 2 {
+		t.Fatalf("len(windows) = %d, want at least 2", len(windows))
+	}
+	if windows[0].id != "page-1" || windows[0].start != 0 {
+		t.Fatalf("first window = %#v", windows[0])
+	}
+	if windows[1].start <= windows[0].start {
+		t.Fatalf("second window start = %d, want > %d", windows[1].start, windows[0].start)
+	}
+	if !strings.Contains(windows[1].content, "Delta") {
+		t.Fatalf("second window content = %q, want overlap around Delta", windows[1].content)
+	}
+}
+
+func TestOffsetAndDedupeEntities(t *testing.T) {
+	entities := []termiteoapi.TermiteRecognizeEntity{
+		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.2},
+		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.9},
+	}
+
+	rebased := offsetEntities(entities, 10)
+	deduped := dedupeEntities(rebased)
+	if len(deduped) != 1 {
+		t.Fatalf("len(deduped) = %d, want 1", len(deduped))
+	}
+	if deduped[0].Start != 12 || deduped[0].End != 16 {
+		t.Fatalf("deduped offsets = %d-%d, want 12-16", deduped[0].Start, deduped[0].End)
+	}
+	if deduped[0].Score != 0.9 {
+		t.Fatalf("deduped score = %v, want highest score", deduped[0].Score)
+	}
+}
+
+func TestDedupeRelationsKeepsHighestScore(t *testing.T) {
+	head := termiteoapi.TermiteRecognizeEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
+	tail := termiteoapi.TermiteRecognizeEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
+	relations := dedupeRelations([]termiteoapi.TermiteRelation{
+		{Head: head, Tail: tail, Label: "worked for", Score: 0.4},
+		{Head: head, Tail: tail, Label: "worked for", Score: 0.8},
+	})
+
+	if len(relations) != 1 {
+		t.Fatalf("len(relations) = %d, want 1", len(relations))
+	}
+	if relations[0].Score != 0.8 {
+		t.Fatalf("deduped relation score = %v, want highest score", relations[0].Score)
+	}
+}
+
+func TestClearEntityMetadataRemovesPriorRunFields(t *testing.T) {
+	meta := map[string]any{
+		"entities":              []any{"stale"},
+		"entity_model":          "old",
+		"entity_labels":         []string{"person"},
+		"entity_window_chars":   500,
+		"entity_overlap_chars":  50,
+		"relations":             []any{"stale"},
+		"relation_labels":       []string{"worked for"},
+		"entity_error_windows":  2,
+		"entity_failed_windows": []entityWindowSpan{{Start: 0, End: 10}},
+		"unrelated_page_source": "kept",
+	}
+
+	clearEntityMetadata(meta)
+
+	for _, key := range []string{
+		"entities",
+		"entity_model",
+		"entity_labels",
+		"entity_window_chars",
+		"entity_overlap_chars",
+		"relations",
+		"relation_labels",
+		"entity_error_windows",
+		"entity_failed_windows",
+	} {
+		if _, ok := meta[key]; ok {
+			t.Fatalf("metadata key %q was not cleared", key)
+		}
+	}
+	if meta["unrelated_page_source"] != "kept" {
+		t.Fatalf("unrelated metadata was changed: %#v", meta)
+	}
 }
 
 func TestExtractOneZipPDF(t *testing.T) {

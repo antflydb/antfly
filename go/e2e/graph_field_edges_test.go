@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/base64"
 	"testing"
 	"time"
@@ -78,47 +79,66 @@ func setupFieldEdgeSwarm(t *testing.T) *SwarmInstance {
 	return swarm
 }
 
-// waitForFieldEdges polls until field-based edges are created by the enricher.
-func waitForFieldEdges(t *testing.T, client *antfly.AntflyClient, startKey string, edgeType string, timeout time.Duration) {
+// waitForFieldEdge polls until a field-based edge is queryable in both
+// directions. Field-edge enrichment is asynchronous, and multi-hop pattern
+// queries rely on the reverse lookup becoming visible, not just the forward
+// edge from the child.
+func waitForFieldEdge(t *testing.T, client *antfly.AntflyClient, childKey string, parentKey string, edgeType string, timeout time.Duration) {
 	t.Helper()
 
 	ctx := testContext(t, timeout)
 	deadline := time.Now().Add(timeout)
-	b64Key := base64.StdEncoding.EncodeToString([]byte(startKey))
 
 	for time.Now().Before(deadline) {
-		result, err := client.Query(ctx, antfly.QueryRequest{
-			Table: fieldEdgeTestTable,
-			GraphSearches: map[string]oapi.GraphQuery{
-				"probe": {
-					Type:      oapi.GraphQueryTypePattern,
-					IndexName: "hierarchy",
-					StartNodes: oapi.GraphNodeSelector{
-						Keys: []string{b64Key},
-					},
-					Pattern: []oapi.PatternStep{
-						{Alias: "a"},
-						{
-							Alias: "b",
-							Edge: oapi.PatternEdgeStep{
-								Types:     []string{edgeType},
-								Direction: oapi.EdgeDirectionOut,
-								MinHops:   1,
-								MaxHops:   1,
-							},
+		outReady := graphPatternHasEdge(ctx, client, childKey, parentKey, edgeType, oapi.EdgeDirectionOut)
+		inReady := graphPatternHasEdge(ctx, client, parentKey, childKey, edgeType, oapi.EdgeDirectionIn)
+		if outReady && inReady {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("Timed out waiting for enricher to create %s edge %s -> %s", edgeType, childKey, parentKey)
+}
+
+func graphPatternHasEdge(ctx context.Context, client *antfly.AntflyClient, startKey string, expectedKey string, edgeType string, direction oapi.EdgeDirection) bool {
+	result, err := client.Query(ctx, antfly.QueryRequest{
+		Table: fieldEdgeTestTable,
+		GraphSearches: map[string]oapi.GraphQuery{
+			"probe": {
+				Type:      oapi.GraphQueryTypePattern,
+				IndexName: "hierarchy",
+				StartNodes: oapi.GraphNodeSelector{
+					Keys: []string{base64.StdEncoding.EncodeToString([]byte(startKey))},
+				},
+				Pattern: []oapi.PatternStep{
+					{Alias: "start"},
+					{
+						Alias: "next",
+						Edge: oapi.PatternEdgeStep{
+							Types:     []string{edgeType},
+							Direction: direction,
+							MinHops:   1,
+							MaxHops:   1,
 						},
 					},
 				},
 			},
-		})
-		if err == nil && len(result.Responses) > 0 {
-			if gr, ok := result.Responses[0].GraphResults["probe"]; ok && len(gr.Matches) > 0 {
-				return // edges exist
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
+		},
+	})
+	if err != nil || len(result.Responses) == 0 {
+		return false
 	}
-	t.Fatalf("Timed out waiting for enricher to create %s edges from %s", edgeType, startKey)
+	gr, ok := result.Responses[0].GraphResults["probe"]
+	if !ok {
+		return false
+	}
+	expectedB64 := base64.StdEncoding.EncodeToString([]byte(expectedKey))
+	for _, match := range gr.Matches {
+		if node, ok := match.Bindings["next"]; ok && node.Key == expectedB64 {
+			return true
+		}
+	}
+	return false
 }
 
 // TestE2E_GraphFieldEdges_BasicFieldExtraction tests that field-based edges
@@ -170,9 +190,9 @@ func TestE2E_GraphFieldEdges_BasicFieldExtraction(t *testing.T) {
 	// Wait for enricher to create field-based edges for ALL documents.
 	// The enricher processes documents sequentially, so we must wait for each.
 	t.Log("Waiting for enricher to create child_of edges...")
-	waitForFieldEdges(t, swarm.Client, "4_child1", "child_of", 60*time.Second)
-	waitForFieldEdges(t, swarm.Client, "8_child2", "child_of", 60*time.Second)
-	waitForFieldEdges(t, swarm.Client, "c_grandchild1", "child_of", 60*time.Second)
+	waitForFieldEdge(t, swarm.Client, "4_child1", "0_root", "child_of", 60*time.Second)
+	waitForFieldEdge(t, swarm.Client, "8_child2", "0_root", "child_of", 60*time.Second)
+	waitForFieldEdge(t, swarm.Client, "c_grandchild1", "4_child1", "child_of", 60*time.Second)
 
 	// Query: find all direct children of root using reverse edge traversal
 	t.Log("Querying for children of root...")
@@ -394,7 +414,7 @@ func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
 
 	// Wait for enricher to create initial edge
 	t.Log("Waiting for initial child_of edge...")
-	waitForFieldEdges(t, swarm.Client, "8_child", "child_of", 60*time.Second)
+	waitForFieldEdge(t, swarm.Client, "8_child", "0_parent1", "child_of", 60*time.Second)
 
 	// Verify: child -> parent1
 	result, err := swarm.Client.Query(ctx, antfly.QueryRequest{
@@ -527,7 +547,7 @@ func TestE2E_GraphFieldEdges_MixedExplicitAndFieldEdges(t *testing.T) {
 
 	// Wait for enricher to create child_of edge
 	t.Log("Waiting for enricher to create child_of edge...")
-	waitForFieldEdges(t, swarm.Client, "4_page", "child_of", 60*time.Second)
+	waitForFieldEdge(t, swarm.Client, "4_page", "0_root", "child_of", 60*time.Second)
 
 	// Verify both edge types
 	result, err := swarm.Client.Query(ctx, antfly.QueryRequest{

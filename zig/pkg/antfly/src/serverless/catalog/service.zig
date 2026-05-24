@@ -4559,7 +4559,7 @@ test "catalog service reports chunk-augmented full text status without chunk pre
         .{},
         "{\"version\":0}",
         "",
-        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4}}}}",
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     var status = try catalog.tableBuildStatus("docs");
@@ -4619,7 +4619,7 @@ test "catalog service marks chunk-backed full text as waiting on chunk preview m
         },
         "{\"version\":0}",
         "",
-        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4}}}}",
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
@@ -4690,7 +4690,7 @@ test "catalog service auto-enables chunk embeddings for chunked embedding indexe
         .{},
         "{\"version\":0}",
         "",
-        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"text\":{\"target_tokens\":4}}}}",
+        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     var status = try catalog.tableBuildStatus("docs");

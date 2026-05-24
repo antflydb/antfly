@@ -87,7 +87,7 @@ fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteI
     if (cfg.max_chunks > 0) fixed_cfg.max_chunks = @intCast(cfg.max_chunks);
     fixed_cfg.threshold = cfg.threshold;
     if (cfg.text.target_tokens > 0) fixed_cfg.text.target_tokens = @intCast(cfg.text.target_tokens);
-    if (cfg.text.overlap_tokens > 0) fixed_cfg.text.overlap_tokens = @intCast(cfg.text.overlap_tokens);
+    if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) fixed_cfg.text.overlap_tokens = @intCast(cfg.text.overlap_tokens);
     if (cfg.text.separator.len > 0) fixed_cfg.text.separator = cfg.text.separator;
     if (cfg.audio.window_duration_ms > 0) fixed_cfg.audio.window_duration_ms = @intCast(cfg.audio.window_duration_ms);
     if (cfg.audio.overlap_duration_ms > 0) fixed_cfg.audio.overlap_duration_ms = @intCast(cfg.audio.overlap_duration_ms);
@@ -143,7 +143,7 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
         .threshold = cfg.threshold,
         .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
-            .overlap_tokens = if (cfg.text.overlap_tokens > 0) cfg.text.overlap_tokens else null,
+            .overlap_tokens = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) cfg.text.overlap_tokens else null,
             .separator = if (cfg.text.separator.len > 0) cfg.text.separator else null,
         } else null,
         .audio = if (cfg.audio.window_duration_ms > 0 or cfg.audio.overlap_duration_ms > 0) .{
@@ -380,5 +380,23 @@ test "termite chunker with empty api_url runs locally" {
 
     try std.testing.expect(chunks.len > 0);
     try std.testing.expect(chunks.len <= 2);
+    try std.testing.expect(chunks[0].text != null);
+}
+
+test "termite chunker local path preserves explicit zero overlap when target is set" {
+    const alloc = std.testing.allocator;
+    const cfg = chunking_types.Config{
+        .provider = .termite,
+        .model = "fixed-bert-tokenizer",
+        .text = .{ .target_tokens = 4, .overlap_tokens = 0, .separator = " " },
+    };
+
+    const chunks = try chunkText(alloc, cfg, "alpha beta gamma delta epsilon");
+    defer {
+        for (chunks) |*chunk| chunk.deinit(alloc);
+        alloc.free(chunks);
+    }
+
+    try std.testing.expect(chunks.len > 0);
     try std.testing.expect(chunks[0].text != null);
 }

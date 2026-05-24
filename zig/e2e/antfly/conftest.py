@@ -191,6 +191,8 @@ def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if not isinstance(status, dict):
         return None
+    if status.get("materialization_blocked", False):
+        return None
     if status.get("rebuilding", status.get("backfill_active", False)):
         return None
     if status.get("dense_publish_pending", False):
@@ -199,6 +201,32 @@ def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if status.get("catch_up_active", False):
         return None
+    return status
+
+
+def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | None:
+    if status.get("head_version", 0) < 1 or status.get("published_wal_end_lsn", 0) < 1:
+        return None
+    pending_families = status.get("pending_materialization_families")
+    full_text_pending = isinstance(pending_families, dict) and pending_families.get("full_text", False)
+    chunk_preview_pending = isinstance(pending_families, dict) and pending_families.get("chunk_preview", False)
+    if full_text_pending:
+        return None
+    if status.get("next_publish_reason") is not None:
+        return None
+    for field in (
+        "full_text_index_actions",
+    ):
+        actions = status.get(field)
+        if not isinstance(actions, list):
+            continue
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if action.get("action") == "rebuild":
+                return None
+            if action.get("chunked_source_count", 0) > 0 and chunk_preview_pending:
+                return None
     return status
 
 
@@ -1333,8 +1361,15 @@ def serverless_api(serverless_runtime):
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self._check(self.s.delete(f"{self.url}/tables/{table_name}/indexes/{index_name}", timeout=10))
 
-        def build_table(self, table_name: str) -> dict:
-            return self.post(antfly_internal_api_path(f"/tables/{table_name}/build"), {})
+        def build_table(self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1) -> dict:
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    return self.post(antfly_internal_api_path(f"/tables/{table_name}/build"), {})
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 409 or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(interval_s)
 
         def table_build_status(self, table_name: str) -> dict:
             return self.get(antfly_internal_api_path(f"/tables/{table_name}/build-status"))
@@ -2307,17 +2342,18 @@ def table_api(request):
         def publish_table(self, table_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict | None:
             if self.backend == "stateful":
                 return None
-            try:
-                self.raw.build_table(table_name)
-            except requests.HTTPError as exc:
-                assert exc.response is not None
-                if exc.response.status_code != 409:
-                    raise
             deadline = time.monotonic() + timeout_s
             while True:
+                try:
+                    self.raw.build_table(table_name)
+                except requests.HTTPError as exc:
+                    assert exc.response is not None
+                    if exc.response.status_code != 409:
+                        raise
                 status = self.raw.table_build_status(table_name)
-                if status.get("head_version", 0) >= 1 and status.get("published_wal_end_lsn", 0) >= 1:
-                    return status
+                ready = ready_serverless_build_status(status)
+                if ready is not None:
+                    return ready
                 if time.monotonic() >= deadline:
                     return None
                 time.sleep(interval_s)
