@@ -33,14 +33,11 @@
  * ```
  */
 
+// Main client export
+export { AntflyClient } from "./client.js";
 // Re-export the generated types for advanced users
 export type { components, operations, paths } from "./public-api.js";
 export type { components as query_components } from "./query.js";
-// Main client export
-export { AntflyClient } from "./client.js";
-export { Client, type SDKConfig } from "./sdk.js";
-export { TermiteClient } from "./termite-client.js";
-export { deserializeEmbeddings, serializeEmbeddings } from "./termite-codec.js";
 // Query helper functions
 export {
   boolean,
@@ -60,6 +57,45 @@ export {
   queryString,
   term,
 } from "./query-helpers.js";
+export { Client, type SDKConfig } from "./sdk.js";
+export { TermiteClient } from "./termite-client.js";
+export { deserializeEmbeddings, serializeEmbeddings } from "./termite-codec.js";
+export type {
+  Chunk,
+  ChunkConfig,
+  ChunkRequest,
+  ChunkResponse,
+  Config as TermiteRuntimeConfig,
+  ContentPart,
+  ContentSecurityConfig,
+  Credentials,
+  EmbedInput,
+  EmbedRequest,
+  EmbedResponse,
+  ExtractFieldValue,
+  ExtractRequest,
+  ExtractResponse,
+  ImageURL,
+  ImageURLContentPart,
+  Level,
+  ModelsResponse,
+  RecognizeEntity,
+  RecognizeRequest,
+  RecognizeResponse,
+  RequestOptions,
+  RerankRequest,
+  RerankResponse,
+  RewriteRequest,
+  RewriteResponse,
+  Style,
+  TermiteConfig,
+  TermiteError,
+  TextContentPart,
+  TranscribeRequest,
+  TranscribeResponse,
+  VersionResponse,
+} from "./termite-types.js";
+export { logLevels, logStyles } from "./termite-types.js";
 // Type exports
 export type {
   // Chat Agent types
@@ -195,42 +231,6 @@ export type {
   WebSearchResultItem,
 } from "./types.js";
 export { embedderProviders, generatorProviders } from "./types.js";
-export type {
-  Chunk,
-  ChunkConfig,
-  ChunkRequest,
-  ChunkResponse,
-  Config as TermiteRuntimeConfig,
-  ContentPart,
-  ContentSecurityConfig,
-  Credentials,
-  EmbedInput,
-  EmbedRequest,
-  EmbedResponse,
-  ExtractFieldValue,
-  ExtractRequest,
-  ExtractResponse,
-  ImageURL,
-  ImageURLContentPart,
-  Level,
-  ModelsResponse,
-  RecognizeEntity,
-  RecognizeRequest,
-  RecognizeResponse,
-  RequestOptions,
-  RerankRequest,
-  RerankResponse,
-  RewriteRequest,
-  RewriteResponse,
-  Style,
-  TermiteConfig,
-  TermiteError,
-  TextContentPart,
-  TranscribeRequest,
-  TranscribeResponse,
-  VersionResponse,
-} from "./termite-types.js";
-export { logLevels, logStyles } from "./termite-types.js";
 
 // Default export for convenience
 import { Client } from "./sdk.js";
