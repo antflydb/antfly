@@ -455,8 +455,13 @@ func (tm *TableManager) needsUpdates(
 			needsPersist = true
 		}
 	case store.ShardState_PreMerge:
-		// Online merge keeps metadata unchanged until finalize, so stay in PreMerge
-		// until table metadata is explicitly updated by the merge finalizer.
+		// Online merge keeps metadata unchanged until finalize. If both metadata
+		// and the live shard have no active merge state, a rollback/final cleanup
+		// won the merge state race and this shard must not remain stuck PreMerge.
+		if newShardStatus.MergeState == nil && newShardInfo.MergeState == nil {
+			newShardStatus.State = store.ShardState_Default
+			needsPersist = true
+		}
 	case store.ShardState_PreSplit:
 		if newShardInfo.ByteRange.Equal(oldShardStatus.ByteRange) {
 			splitStateActive := newShardInfo.SplitState != nil &&
@@ -845,6 +850,9 @@ func (tm *TableManager) UpdateShardMergeState(ctx context.Context, shardID types
 	}
 
 	status.MergeState = mergeState
+	if mergeState == nil && status.State == store.ShardState_PreMerge {
+		status.State = store.ShardState_Default
+	}
 	data, err := json.Marshal(status)
 	if err != nil {
 		return fmt.Errorf("marshalling shard status for %s: %w", shardID, err)

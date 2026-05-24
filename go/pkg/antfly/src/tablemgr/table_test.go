@@ -1108,6 +1108,46 @@ func TestNeedsUpdates_PreMergeRetainsMergeStateWhenLeaderHeartbeatOmitsIt(t *tes
 	assert.Equal(t, store.ShardState_PreMerge, newStatus.State)
 }
 
+func TestNeedsUpdates_PreMergeWithoutMergeStateReturnsDefault(t *testing.T) {
+	db := setupTestDB(t)
+
+	tm, err := NewTableManager(db, nil, 0)
+	require.NoError(t, err)
+
+	oldStatus := &store.ShardStatus{
+		ID:    types.ID(400),
+		Table: "docs",
+		State: store.ShardState_PreMerge,
+		ShardInfo: store.ShardInfo{
+			ShardConfig: store.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, {0x80}},
+			},
+			Peers:      common.NewPeerSet(42),
+			ReportedBy: common.NewPeerSet(42),
+			RaftStatus: &common.RaftStatus{
+				Lead:   42,
+				Voters: common.NewPeerSet(42),
+			},
+		},
+	}
+
+	newInfo := &store.ShardInfo{
+		ShardConfig: oldStatus.ShardConfig,
+		Peers:       common.NewPeerSet(42),
+		ReportedBy:  common.NewPeerSet(42),
+		RaftStatus: &common.RaftStatus{
+			Lead:   42,
+			Voters: common.NewPeerSet(42),
+		},
+	}
+
+	newStatus, needsUpdate := tm.needsUpdates(oldStatus, newInfo)
+	require.NotNil(t, newStatus)
+	assert.True(t, needsUpdate)
+	assert.Nil(t, newStatus.MergeState)
+	assert.Equal(t, store.ShardState_Default, newStatus.State)
+}
+
 func TestTableManager_ReassignShardsForMerge(t *testing.T) {
 	db := setupTestDB(t)
 
@@ -1369,6 +1409,40 @@ func TestTableManager_FinalizeAndRollbackShardsForMerge(t *testing.T) {
 		donorStatus, err := tm.GetShardStatus(donorID)
 		require.NoError(t, err)
 		assert.Nil(t, donorStatus.MergeState)
+	})
+
+	t.Run("clearing merge state restores stale premerge receiver", func(t *testing.T) {
+		db := setupTestDB(t)
+
+		tm, err := NewTableManager(db, nil, 0)
+		require.NoError(t, err)
+
+		tableName := "clearMergeStateTable"
+		_, err = tm.CreateTable(tableName, TableConfig{
+			NumShards: 2,
+			StartID:   600,
+			Schema:    &schema.TableSchema{},
+		})
+		require.NoError(t, err)
+
+		receiverID := types.ID(600)
+		donorID := types.ID(601)
+		transition := MergeTransition{
+			ShardID:      receiverID,
+			MergeShardID: donorID,
+			TableName:    tableName,
+		}
+
+		_, err = tm.PrepareShardsForMerge(transition)
+		require.NoError(t, err)
+
+		err = tm.UpdateShardMergeState(context.Background(), receiverID, nil)
+		require.NoError(t, err)
+
+		receiverStatus, err := tm.GetShardStatus(receiverID)
+		require.NoError(t, err)
+		assert.Equal(t, store.ShardState_Default, receiverStatus.State)
+		assert.Nil(t, receiverStatus.MergeState)
 	})
 }
 
