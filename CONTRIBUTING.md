@@ -46,7 +46,6 @@ docs/                Hand-written documentation (synced to docs site at build ti
 
 - **Go 1.26+** — the Makefile sets `GOEXPERIMENT=simd` automatically
 - **Node.js 18+** and **pnpm** — for TypeScript SDK, React components, and Antfarm dashboard
-- **[goreman](https://github.com/mattn/goreman)** — optional, for running a distributed cluster locally
 
 ## Makefile Targets
 
@@ -97,20 +96,6 @@ go run ./cmd/antfly swarm
 ```
 
 Dashboard at `http://localhost:8080`. Termite auto-discovers models from `~/.termite/models/`.
-
-### Distributed Mode (Multi-Process)
-
-Starts 5 storage nodes, 3 metadata nodes, Termite, and a load balancer:
-
-```bash
-make build && goreman -f Procfile start
-```
-
-Clean up after:
-
-```bash
-make cleanup-goreman
-```
 
 ### Docker
 

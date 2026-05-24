@@ -46,7 +46,6 @@ help:
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
-	@echo "  cleanup-goreman    Clean up goreman logs and data"
 	@echo "  sim-validate       Run simulator-focused validation"
 	@echo "  sim-validate-repo  Run broader repo validation including go test ./..."
 	@echo "  sim-soak           Run simulator soak scenarios"
@@ -516,13 +515,3 @@ termite-client-test: ## Run termite-client tests
 
 termite-client-lint: ## Run linter on termite-client
 	(cd ./go/pkg/sdk && $(GO) vet ./...)
-
-
-# ====================================================================================
-# Cleanup Commands
-# ====================================================================================
-
-.PHONY: cleanup-goreman
-
-cleanup-goreman:
-	rm -rf goreman.log antflydb/metadata antflydb/store qlogdir; lsof -i udp:9021 -i udp:9022 -i udp:9023 -i udp:9024 -i udp:9025 -i udp:9026 -i udp:52380 -i udp:42380 -i udp:22380 -i udp:42380 -i udp:12380 -i udp:32380 -i udp:12277 -i udp:9018 -i udp:9019 -i tcp:8080 -i udp:9017 -i udp:4211 -i tcp:8080 -i tcp:9021 -i tcp:4201 -i tcp:4202 -i tcp:4203 -i tcp:4211 -i tcp:4212 -i tcp:4213 -i tcp:4201 -i tcp:9022 -i tcp:9025 -i tcp:9023 -i tcp:9024 -i tcp:11433 -i udp:11433 | awk '{print $2 }' | sed '1d' | xargs kill -9
