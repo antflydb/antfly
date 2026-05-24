@@ -6,42 +6,22 @@ name: Go
 on:
   push:
     branches: ["main"]
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - "go/Dockerfile*"
-      - "zig/**"
-      - "ts/**"
-      - "py/**"
-      - "go/pkg/proxy/antfly/**"
-      - "go/pkg/operator/**"
-      - "go/pkg/proxy/termite/**"
-      - ".github/workflows/zig-*.yml"
-      - ".github/workflows/ts-*.yml"
-      - ".github/workflows/py-*.yml"
-      - ".github/workflows/antfly-operator-*.yml"
-      - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/antfly-container.yml"
-      - ".github/workflows/trigger-docs-build.yml"
+    paths:
+      - "go/**"
+      - "Makefile"
+      - ".github/workflows/antfly-go.yml"
+      - "!go/Dockerfile*"
+      - "!go/pkg/operator/**"
+      - "!go/pkg/proxy/**"
   pull_request:
     branches: ["main"]
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - "go/Dockerfile*"
-      - "zig/**"
-      - "ts/**"
-      - "py/**"
-      - "go/pkg/proxy/antfly/**"
-      - "go/pkg/operator/**"
-      - "go/pkg/proxy/termite/**"
-      - ".github/workflows/zig-*.yml"
-      - ".github/workflows/ts-*.yml"
-      - ".github/workflows/py-*.yml"
-      - ".github/workflows/antfly-operator-*.yml"
-      - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/antfly-container.yml"
-      - ".github/workflows/trigger-docs-build.yml"
+    paths:
+      - "go/**"
+      - "Makefile"
+      - ".github/workflows/antfly-go.yml"
+      - "!go/Dockerfile*"
+      - "!go/pkg/operator/**"
+      - "!go/pkg/proxy/**"
   workflow_dispatch:
 
 concurrency:

@@ -4,16 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "specs/openapi/**"
       - "ts/**"
-      - "ts/pnpm-workspace.yaml"
       - ".github/workflows/ts-ci.yml"
   pull_request:
     branches: [main]
     paths:
-      - "specs/openapi/**"
       - "ts/**"
-      - "ts/pnpm-workspace.yaml"
       - ".github/workflows/ts-ci.yml"
 
 concurrency:

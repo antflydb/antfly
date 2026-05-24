@@ -83,16 +83,10 @@ jobs:
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
-            ':(glob)zig/**/*.zig' \
-            zig/build.zig \
-            zig/build.zig.zon \
-            zig/deps/snowball \
-            ':(glob)specs/openapi/**' \
+            ':(glob)zig/**' \
             Makefile \
-            zig/Makefile \
             .github/workflows/zig-tests.yml \
-            .github/workflows/zig-container.yml \
-            zig/Dockerfile
+            .github/workflows/zig-container.yml
           then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
@@ -100,13 +94,8 @@ jobs:
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
-            ':(glob)zig/**/*.zig' \
-            ':(glob)zig/e2e/**' \
-            ':(glob)specs/openapi/**' \
+            ':(glob)zig/**' \
             Makefile \
-            zig/build.zig \
-            zig/build.zig.zon \
-            zig/Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/zig-container.yml
           then
@@ -120,7 +109,6 @@ jobs:
             ':(glob)scripts/tla-*.sh' \
             ':(glob)scripts/tla-*.py' \
             Makefile \
-            zig/Makefile \
             .github/workflows/zig-tests.yml
           then
             echo "model_check=false" >> "$GITHUB_OUTPUT"
@@ -137,7 +125,6 @@ jobs:
             ':(glob)zig/pkg/antfly/src/storage/db/**' \
             ':(glob)zig/lib/raft/**' \
             Makefile \
-            zig/Makefile \
             zig/build.zig \
             .github/workflows/zig-tests.yml
           then

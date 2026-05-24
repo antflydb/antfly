@@ -4,13 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - "specs/openapi/**"
       - "py/**"
       - ".github/workflows/py-ci.yml"
   pull_request:
     branches: [main]
     paths:
-      - "specs/openapi/**"
       - "py/**"
       - ".github/workflows/py-ci.yml"
 
