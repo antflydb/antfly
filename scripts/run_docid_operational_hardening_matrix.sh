@@ -79,23 +79,35 @@ run_case() {
   fi
 }
 
-zig_build() {
-  zig build \
+if [[ "$RUN_FULL_TARGET" == "1" ]]; then
+  run_case docid-operational-hardening-test zig build \
     --build-file "$ZIG_BUILD_FILE" \
     --cache-dir "$ZIG_CACHE_DIR" \
     --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
-    "$@"
-}
-
-if [[ "$RUN_FULL_TARGET" == "1" ]]; then
-  run_case docid-operational-hardening-test zig_build docid-operational-hardening-test
+    docid-operational-hardening-test
 else
-  run_case docid-lifecycle-test zig_build docid-lifecycle-test
+  run_case docid-lifecycle-test zig build \
+    --build-file "$ZIG_BUILD_FILE" \
+    --cache-dir "$ZIG_CACHE_DIR" \
+    --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+    docid-lifecycle-test
 
   if [[ "$RUN_CHAOS" == "1" ]]; then
-    run_case lib-metadata-transition-chaos-test zig_build lib-metadata-transition-chaos-test
-    run_case lib-metadata-public-chaos-test zig_build lib-metadata-public-chaos-test
-    run_case lib-lsm-backend-chaos-test zig_build lib-lsm-backend-chaos-test
+    run_case lib-metadata-transition-chaos-test zig build \
+      --build-file "$ZIG_BUILD_FILE" \
+      --cache-dir "$ZIG_CACHE_DIR" \
+      --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+      lib-metadata-transition-chaos-test
+    run_case lib-metadata-public-chaos-test zig build \
+      --build-file "$ZIG_BUILD_FILE" \
+      --cache-dir "$ZIG_CACHE_DIR" \
+      --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+      lib-metadata-public-chaos-test
+    run_case lib-lsm-backend-chaos-test zig build \
+      --build-file "$ZIG_BUILD_FILE" \
+      --cache-dir "$ZIG_CACHE_DIR" \
+      --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+      lib-lsm-backend-chaos-test
   fi
 fi
 
