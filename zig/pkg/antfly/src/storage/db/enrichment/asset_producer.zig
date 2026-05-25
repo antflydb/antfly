@@ -78,10 +78,15 @@ pub const Producer = struct {
 
     pub const VTable = struct {
         produce: *const fn (ptr: *anyopaque, alloc: Allocator, request: Request) anyerror![]u8,
+        deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
     };
 
     pub fn produce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
         return try self.vtable.produce(self.ptr, alloc, request);
+    }
+
+    pub fn deinit(self: Producer, alloc: Allocator) void {
+        if (self.vtable.deinit) |deinit_fn| deinit_fn(self.ptr, alloc);
     }
 };
 

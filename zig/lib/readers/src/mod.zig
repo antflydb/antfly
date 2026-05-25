@@ -442,7 +442,10 @@ fn CloudReaderState(comptime provider: Provider) type {
 
         fn readOpenAi(self: *Self, alloc: Allocator, req: Request) ![]Result {
             var content = std.json.Array.init(alloc);
-            defer content.deinit();
+            defer {
+                for (content.items) |*item| deinitJsonValue(alloc, item);
+                content.deinit();
+            }
             try appendTextPart(alloc, &content, req.prompt orelse self.prompt orelse "Read the image and return the text.");
             for (req.images) |image| try appendImageUrlPart(alloc, &content, image);
             const messages = [_]struct { role: []const u8, content: std.json.Value }{
@@ -478,7 +481,10 @@ fn CloudReaderState(comptime provider: Provider) type {
 
         fn readVertex(self: *Self, alloc: Allocator, req: Request) ![]Result {
             var parts = std.json.Array.init(alloc);
-            defer parts.deinit();
+            defer {
+                for (parts.items) |*item| deinitJsonValue(alloc, item);
+                parts.deinit();
+            }
             try appendVertexTextPart(alloc, &parts, req.prompt orelse self.prompt orelse "Read the image and return the text.");
             for (req.images) |image| try appendVertexImagePart(alloc, &parts, image);
             const contents = [_]struct { role: []const u8, parts: std.json.Value }{
@@ -518,6 +524,22 @@ fn appendTextPart(alloc: Allocator, parts: *std.json.Array, text: []const u8) !v
     try obj.put(alloc, "type", .{ .string = "text" });
     try obj.put(alloc, "text", .{ .string = text });
     try parts.append(.{ .object = obj });
+}
+
+fn deinitJsonValue(alloc: Allocator, value: *std.json.Value) void {
+    switch (value.*) {
+        .array => |*array| {
+            for (array.items) |*item| deinitJsonValue(alloc, item);
+            array.deinit();
+        },
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| deinitJsonValue(alloc, entry.value_ptr);
+            obj.deinit(alloc);
+        },
+        else => {},
+    }
+    value.* = undefined;
 }
 
 fn appendImageUrlPart(alloc: Allocator, parts: *std.json.Array, url: []const u8) !void {
@@ -601,4 +623,108 @@ test "reader registry preserves named providers" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("ocr", parsed.defaultProviderName().?);
     try std.testing.expectEqual(Provider.antfly, (try parsed.getConfig(null)).provider);
+}
+
+test "vertex reader exchanges service account credentials and sends bearer auth" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/token", .respond = .{
+            .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
+        } },
+        .{ .method = .POST, .path = "/models/gemini-test:generateContent", .assert_request = expectVertexBearer, .respond = .{
+            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]}}]}",
+        } },
+    });
+    defer server.deinit();
+
+    const token_uri = try std.fmt.allocPrint(alloc, "{s}/token", .{server.baseUrl()});
+    defer alloc.free(token_uri);
+    const credentials_json = try fakeVertexCredentialsJsonAlloc(alloc, token_uri);
+    defer alloc.free(credentials_json);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
+    const credentials_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "credentials.json" });
+    defer alloc.free(credentials_path);
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const reader = try initReader(alloc, &client, .{
+        .provider = .vertex,
+        .base_url = server.baseUrl(),
+        .model = "gemini-test",
+        .credentials_path = credentials_path,
+    });
+    defer reader.deinit();
+
+    var results: ?[]Result = null;
+    defer if (results) |items| {
+        for (items) |*item| deinitResult(alloc, item);
+        alloc.free(items);
+    };
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(a: Allocator, r: Reader, out: *?[]Result, err_out: *?anyerror) std.Io.Cancelable!void {
+            const images = [_][]const u8{"data:image/png;base64,ZmFrZQ=="};
+            out.* = r.read(a, .{ .images = &images }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, reader, &results, &run_err }) catch return;
+    try server.handleOne();
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqual(@as(usize, 1), results.?.len);
+    try std.testing.expectEqualStrings("read from vertex", results.?[0].text);
+}
+
+const fake_vertex_private_key_json =
+    "-----BEGIN PRIVATE KEY-----\\n" ++
+    "MIICeAIBADANBgkqhkiG9w0BAQEFAASCAmIwggJeAgEAAoGBAOXaLd9jk03zcJ95\\n" ++
+    "CfwKjyqHiZAaf0KC4rwRWd+TSvrqdiZUHneOXchF4FtwAJ6m+qi5KsTyazOWv4S0\\n" ++
+    "FRLd49XFNv8op9e8x+gnItgt4QoQ2UT+QU7qG+wyavU25+m61G2CFB8+I9wXzH3x\\n" ++
+    "HMfUuOWgqfy+szxUFNRf3sEfGW8DAgMBAAECgYEAmR1LG5mQggfeCU2vGgfKsRES\\n" ++
+    "0Tzlc2APPCruzKGo/Bb917CHjyr2TDhIKYEl2InxRj37QLEgOoB8WiFAPI41e2mZ\\n" ++
+    "r/sshHAB74N7OOCG6G4Jin1qsnQKgSwloBctDxtvUydD1ApmjfKQB1vENL6h4jKU\\n" ++
+    "VMBm/65DU/4iWJkWgBECQQD4oRPl63IemtUsRTnz+j8tEC5MsH7CNvwNj5os2ptm\\n" ++
+    "X3/rAge3BKYMWlN237K6yapZMHfiLj3K3fv8Kkbn7VwpAkEA7KqY97XZaLr4sI3a\\n" ++
+    "9EHgbB2GjzJAsnzXSfn7OXLuc812rDpK/+6mcXFSbe1OmQTbzPIOJIARcIz3fqXI\\n" ++
+    "uAHXSwJAOlA1RYjKVElGVELMS9/Wr3ALG+uNX2ncBiY3J+wB5Knja7AnNRK/C0io\\n" ++
+    "KMpgthSUgqSuiXsE/S7BaixUQxNVuQJBAJC8hHB5tkxmjFDtcEqRPz7fj7tjcE24\\n" ++
+    "K7ICP7ISp+IKddk+jT+YJBKcy1yPFNJgNkxQfHW2HPRIQdQib26ZMaECQQCcW21U\\n" ++
+    "jsnUTXZp0WrOnzoqkJtQmmey1Bb9ZxBym/IoaQdDefgbdlyeFQTz2tWKDwqAlEsl\\n" ++
+    "8peeQ6Fmi8Vuw9qK\\n" ++
+    "-----END PRIVATE KEY-----\\n";
+
+fn fakeVertexCredentialsJsonAlloc(alloc: Allocator, token_uri: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        \\{{
+        \\  "project_id": "proj-from-json",
+        \\  "private_key_id": "kid-1",
+        \\  "private_key": "{s}",
+        \\  "client_email": "svc@example.iam.gserviceaccount.com",
+        \\  "token_uri": "{s}"
+        \\}}
+    ,
+        .{ fake_vertex_private_key_json, token_uri },
+    );
+}
+
+fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+    try std.testing.expectEqualStrings("Bearer vertex-token", req.header("Authorization") orelse return error.MissingHeader);
 }

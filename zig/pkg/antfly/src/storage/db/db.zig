@@ -2560,7 +2560,7 @@ pub const DB = struct {
     }
 
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null) return;
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null) return;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -11553,7 +11553,12 @@ fn extractAssetSourceValue(
 }
 
 fn assetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
-    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "_asset_state", artifact_name);
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
 }
 
 fn assetStateValueAlloc(
@@ -22118,6 +22123,117 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     try std.testing.expect(journalRecordHasHint(journal_record.record, .sparse_vector));
     try std.testing.expect(!journalRecordHasHint(journal_record.record, .enrichment));
     try std.testing.expect(journal_record.record.changed_artifact_keys.len > 0);
+}
+
+const TestAssetProducer = struct {
+    calls: usize = 0,
+    generator_calls: usize = 0,
+    reader_calls: usize = 0,
+    transcriber_calls: usize = 0,
+
+    fn producer(self: *@This()) asset_producer_mod.Producer {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .produce = produce },
+        };
+    }
+
+    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        switch (request.producer_type) {
+            .copy => {},
+            .generator => self.generator_calls += 1,
+            .reader => self.reader_calls += 1,
+            .transcriber => self.transcriber_calls += 1,
+        }
+        return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
+    }
+};
+
+test "db asset producer enrichments execute fake providers and skip unchanged state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "generated_title_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addEnrichment(.{
+        .name = "image_text_v1",
+        .kind = .asset,
+        .field = "image",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"reader\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addEnrichment(.{
+        .name = "audio_text_v1",
+        .kind = .asset,
+        .field = "audio",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"transcriber\",\"config\":{\"provider\":\"mock\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"hello\",\"image\":\"data:image/png;base64,aaa\",\"audio\":\"https://example.test/a.wav\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    var first = (try db.lookup(alloc, "doc:a", .{
+        .fields = &.{"_artifacts"},
+        .include_all_fields = false,
+    })).?;
+    defer first.deinit(alloc);
+    var parsed_first = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
+    defer parsed_first.deinit();
+    const first_artifacts = parsed_first.value.object.get("_artifacts").?.object;
+    try std.testing.expectEqualStrings("generator:hello", first_artifacts.get("generated_title_v1").?.object.get("value").?.string);
+    try std.testing.expectEqualStrings("reader:data:image/png;base64,aaa", first_artifacts.get("image_text_v1").?.object.get("value").?.string);
+    try std.testing.expectEqualStrings("transcriber:https://example.test/a.wav", first_artifacts.get("audio_text_v1").?.object.get("value").?.string);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"hello\",\"image\":\"data:image/png;base64,aaa\",\"audio\":\"https://example.test/a.wav\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"goodbye\",\"image\":\"data:image/png;base64,aaa\",\"audio\":\"https://example.test/a.wav\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.generator_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
 }
 
 test "db extractEnrichments exposes cleaned writes and special fields" {

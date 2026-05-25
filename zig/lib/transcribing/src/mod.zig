@@ -487,7 +487,7 @@ const VertexTranscriberState = struct {
             .alloc = alloc,
             .http = http,
             .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://speech.googleapis.com/v2"),
-            .project_id = try alloc.dupe(u8, cfg.project_id orelse (try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path) orelse return error.InvalidTranscribingConfig)),
+            .project_id = if (cfg.project_id) |value| try alloc.dupe(u8, value) else (try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path) orelse return error.InvalidTranscribingConfig),
             .location = try alloc.dupe(u8, cfg.location orelse "global"),
             .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),
             .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
@@ -955,4 +955,106 @@ test "transcribing runtime loads openai provider and transcribes data uri input"
 
     try std.testing.expectEqualStrings("hello from openai", response.?.text.?);
     try std.testing.expectEqualStrings("en", response.?.language.?);
+}
+
+test "vertex transcriber exchanges service account credentials and sends bearer auth" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/token", .respond = .{
+            .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
+        } },
+        .{ .method = .POST, .path = "/projects/proj-from-json/locations/global/recognizers/_:recognize", .assert_request = expectVertexBearer, .respond = .{
+            .body = "{\"results\":[{\"alternatives\":[{\"transcript\":\"transcribed by vertex\"}],\"languageCode\":\"en-US\"}]}",
+        } },
+    });
+    defer server.deinit();
+
+    const token_uri = try std.fmt.allocPrint(alloc, "{s}/token", .{server.baseUrl()});
+    defer alloc.free(token_uri);
+    const credentials_json = try fakeVertexCredentialsJsonAlloc(alloc, token_uri);
+    defer alloc.free(credentials_json);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
+    const credentials_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "credentials.json" });
+    defer alloc.free(credentials_path);
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const transcriber = try initTranscriber(alloc, &client, .{
+        .provider = .vertex,
+        .base_url = server.baseUrl(),
+        .credentials_path = credentials_path,
+        .model = "latest_long",
+    });
+    defer transcriber.deinit();
+
+    var response: ?Response = null;
+    defer if (response) |*value| deinitResponse(alloc, value);
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(a: Allocator, t: Transcriber, out: *?Response, err_out: *?anyerror) std.Io.Cancelable!void {
+            out.* = t.transcribe(a, .{
+                .url = "data:audio/wav;base64,ZmFrZQ==",
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, transcriber, &response, &run_err }) catch return;
+    try server.handleOne();
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqualStrings("transcribed by vertex", response.?.text.?);
+    try std.testing.expectEqualStrings("en-US", response.?.language.?);
+}
+
+const fake_vertex_private_key_json =
+    "-----BEGIN PRIVATE KEY-----\\n" ++
+    "MIICeAIBADANBgkqhkiG9w0BAQEFAASCAmIwggJeAgEAAoGBAOXaLd9jk03zcJ95\\n" ++
+    "CfwKjyqHiZAaf0KC4rwRWd+TSvrqdiZUHneOXchF4FtwAJ6m+qi5KsTyazOWv4S0\\n" ++
+    "FRLd49XFNv8op9e8x+gnItgt4QoQ2UT+QU7qG+wyavU25+m61G2CFB8+I9wXzH3x\\n" ++
+    "HMfUuOWgqfy+szxUFNRf3sEfGW8DAgMBAAECgYEAmR1LG5mQggfeCU2vGgfKsRES\\n" ++
+    "0Tzlc2APPCruzKGo/Bb917CHjyr2TDhIKYEl2InxRj37QLEgOoB8WiFAPI41e2mZ\\n" ++
+    "r/sshHAB74N7OOCG6G4Jin1qsnQKgSwloBctDxtvUydD1ApmjfKQB1vENL6h4jKU\\n" ++
+    "VMBm/65DU/4iWJkWgBECQQD4oRPl63IemtUsRTnz+j8tEC5MsH7CNvwNj5os2ptm\\n" ++
+    "X3/rAge3BKYMWlN237K6yapZMHfiLj3K3fv8Kkbn7VwpAkEA7KqY97XZaLr4sI3a\\n" ++
+    "9EHgbB2GjzJAsnzXSfn7OXLuc812rDpK/+6mcXFSbe1OmQTbzPIOJIARcIz3fqXI\\n" ++
+    "uAHXSwJAOlA1RYjKVElGVELMS9/Wr3ALG+uNX2ncBiY3J+wB5Knja7AnNRK/C0io\\n" ++
+    "KMpgthSUgqSuiXsE/S7BaixUQxNVuQJBAJC8hHB5tkxmjFDtcEqRPz7fj7tjcE24\\n" ++
+    "K7ICP7ISp+IKddk+jT+YJBKcy1yPFNJgNkxQfHW2HPRIQdQib26ZMaECQQCcW21U\\n" ++
+    "jsnUTXZp0WrOnzoqkJtQmmey1Bb9ZxBym/IoaQdDefgbdlyeFQTz2tWKDwqAlEsl\\n" ++
+    "8peeQ6Fmi8Vuw9qK\\n" ++
+    "-----END PRIVATE KEY-----\\n";
+
+fn fakeVertexCredentialsJsonAlloc(alloc: Allocator, token_uri: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        \\{{
+        \\  "project_id": "proj-from-json",
+        \\  "private_key_id": "kid-1",
+        \\  "private_key": "{s}",
+        \\  "client_email": "svc@example.iam.gserviceaccount.com",
+        \\  "token_uri": "{s}"
+        \\}}
+    ,
+        .{ fake_vertex_private_key_json, token_uri },
+    );
+}
+
+fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+    try std.testing.expectEqualStrings("Bearer vertex-token", req.header("Authorization") orelse return error.MissingHeader);
 }

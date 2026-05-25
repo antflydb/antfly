@@ -776,6 +776,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
+                .asset_producer = config.asset_producer,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .clock = config.clock,
@@ -791,6 +792,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
+        if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -818,7 +820,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn waitForApplied(self: *@This(), sequence: u64) !void {
-        if (self.config.dense_embedder == null and self.config.sparse_embedder == null) return;
+        if (self.config.dense_embedder == null and self.config.sparse_embedder == null and self.config.asset_producer == null) return;
 
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
@@ -872,7 +874,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null,
+            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null,
             .lease_owned = true,
             .has_lease = true,
             .acquisition_count = 0,
@@ -970,7 +972,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         config: Config,
     ) !EnrichmentRuntime {
         const io_impl = backend_runtime.io_impl;
-        if ((config.dense_embedder != null or config.sparse_embedder != null) and io_impl == null) return error.MissingBackendRuntimeIo;
+        if ((config.dense_embedder != null or config.sparse_embedder != null or config.asset_producer != null) and io_impl == null) return error.MissingBackendRuntimeIo;
         var runtime_store = try initRuntimeStore(alloc, store);
         errdefer runtime_store.deinit();
         var runtime = EnrichmentRuntime{
@@ -989,6 +991,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
+                .asset_producer = config.asset_producer,
+                .secret_store = config.secret_store,
+                .remote_content = config.remote_content,
                 .clock = config.clock,
             },
             .ownership = try ownership_mod.State.init(alloc, store, enrichment_lease.default_lease_key, .{
@@ -1018,6 +1023,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
+        if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1133,7 +1139,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
         const ownership_stats = self.ownership.stats();
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null,
+            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null,
             .lease_owned = ownership_stats.lease_owned,
             .has_lease = ownership_stats.has_lease,
             .acquisition_count = ownership_stats.acquisition_count,
@@ -2598,7 +2604,12 @@ fn shouldSkipAssetProducer(runtime: *EnrichmentRuntime, state_key: []const u8, e
 }
 
 fn assetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
-    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "_asset_state", artifact_name);
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
 }
 
 fn assetStateValueAlloc(

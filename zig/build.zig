@@ -2402,7 +2402,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"generating backend factory executes fallback chain across providers"},
+        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
     });
     const run_lib_generating_runtime_tests = b.addRunArtifact(lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
@@ -3597,8 +3597,13 @@ pub fn build(b: *std.Build) void {
         .root_module = audio_test_mod,
     });
     const run_lib_audio_tests = b.addRunArtifact(lib_audio_tests);
+    const lib_transcribing_tests = b.addTest(.{
+        .root_module = transcribing_mod,
+    });
+    const run_lib_transcribing_tests = b.addRunArtifact(lib_transcribing_tests);
     const lib_audio_test_step = b.step("lib-audio-test", "Run audio transcribing and synthesizing runtime tests");
     lib_audio_test_step.dependOn(&run_lib_audio_tests.step);
+    lib_audio_test_step.dependOn(&run_lib_transcribing_tests.step);
 
     const lib_audio_xiph_conformance = b.addExecutable(.{
         .name = "lib-audio-xiph-conformance",

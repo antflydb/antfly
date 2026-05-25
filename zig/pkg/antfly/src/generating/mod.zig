@@ -33,6 +33,7 @@ pub const RetryConfig = lib.RetryConfig;
 pub const ChainCondition = lib.ChainCondition;
 pub const ChainLink = lib.ChainLink;
 pub const GeneratorFactory = lib.GeneratorFactory;
+pub const parseConfigFromSlice = lib.parseConfigFromSlice;
 
 pub const BackendFactory = struct {
     alloc: std.mem.Allocator,

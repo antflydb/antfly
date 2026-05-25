@@ -2149,6 +2149,12 @@ pub const IndexManager = struct {
                 return true;
             }
         }
+        for (self.enrichments.items) |entry| {
+            if (excluded_enrichment) |skip| {
+                if (entry.kind == skip.kind and std.mem.eql(u8, entry.name, skip.name)) continue;
+            }
+            if (entry.kind == .asset) return true;
+        }
         return false;
     }
 

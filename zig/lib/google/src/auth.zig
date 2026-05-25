@@ -306,7 +306,7 @@ pub fn configFromEnvAlloc(alloc: Allocator, scope: []const u8) !Config {
 }
 
 pub fn serviceAccountEnvProjectIdAlloc(alloc: Allocator) !?[]u8 {
-    const service_account = configFromEnvAlloc(alloc, default_scope) catch return null;
+    var service_account = configFromEnvAlloc(alloc, default_scope) catch return null;
     defer service_account.deinit(alloc);
     return if (service_account.service_account.project_id) |value| try alloc.dupe(u8, value) else null;
 }
