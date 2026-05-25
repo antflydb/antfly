@@ -1799,6 +1799,14 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
+    const wasm_termite_onnx_graph_mod = b.createModule(.{
+        .root_source_file = b.path("lib/onnx/src/root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+        .single_threaded = true,
+    });
+    wasm_termite_onnx_graph_mod.addImport("protobuf", protobuf_mod);
+    wasm_termite_onnx_graph_mod.addImport("ml", wasm_termite_ml_mod);
     const wasm_termite_audio_mod = b.createModule(.{
         .root_source_file = b.path("lib/audio/src/mod.zig"),
         .target = wasm_target,
@@ -1815,8 +1823,10 @@ pub fn build(b: *std.Build) void {
     termite_wasm_inference_mod.addImport("termite_tokenizer", wasm_termite_tokenizer_mod);
     termite_wasm_inference_mod.addImport("termite_hf_tokenizer", wasm_termite_hf_tokenizer_mod);
     termite_wasm_inference_mod.addImport("antfly_image", wasm_image_mod);
+    termite_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
     termite_wasm_inference_mod.addImport("jinja", wasm_termite_jinja_mod);
     termite_wasm_inference_mod.addImport("ml", wasm_termite_ml_mod);
+    termite_wasm_inference_mod.addImport("onnx_graph", wasm_termite_onnx_graph_mod);
 
     const antfly_wasm_mod = b.createModule(.{
         .root_source_file = b.path("examples/antfly_wasm.zig"),
