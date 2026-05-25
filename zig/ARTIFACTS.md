@@ -165,11 +165,16 @@ Example:
     "artifact_name": "page_ocr_v1",
     "content_type": "text/plain"
   },
-  "provider": {
-    "role": "reader",
-    "type": "antfly",
-    "url": "http://127.0.0.1:8080",
-    "model": "ocr/default"
+  "producer": {
+    "type": "reader",
+    "config": {
+      "provider": "vertex",
+      "model": "gemini-2.5-flash",
+      "project_id": "my-project",
+      "location": "us-central1",
+      "credentials_path": "/path/to/service-account.json",
+      "prompt": "Read the document text."
+    }
   },
   "trigger": {
     "on_write": true,
@@ -183,7 +188,34 @@ Example:
 }
 ```
 
-The model-facing provider roles are separate from artifact kinds:
+Asset producers have two independent axes:
+
+- `producer.type` describes the operation that produces the asset: `copy`,
+  `generator`, `reader`, or `transcriber`.
+- `producer.config.provider` describes the implementation provider for that
+  operation, following the existing typed config convention used by embedders,
+  generators, rerankers, chunkers, readers, and transcribers.
+
+Canonical producer shape:
+
+```json
+{
+  "type": "reader",
+  "config": {
+    "provider": "vertex",
+    "model": "gemini-2.5-flash"
+  }
+}
+```
+
+Provider-specific fields belong inside `producer.config` and are only valid
+when that provider config supports them. For example, `credentials_path`,
+`project_id`, and `location` are Vertex/Google fields, not universal asset
+enrichment fields. If `producer` is omitted, the enrichment defaults to `copy`
+behavior: the source field or rendered source template value is stored directly
+as the asset value.
+
+The model-facing producer types are separate from artifact kinds:
 
 - **generators** call LLM-style generation endpoints, including tool-calling
   models and prompt-driven extraction.
