@@ -15,6 +15,7 @@
 const std = @import("std");
 const metadata_api = @import("../metadata/api.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const scraping = @import("antfly_scraping");
 const db_mod = @import("../storage/db/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const distributed_graph = @import("distributed_graph.zig");
@@ -85,6 +86,7 @@ pub const QueryPlanningContext = struct {
     admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
     free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);
@@ -108,7 +110,10 @@ pub fn planSemanticQuery(
     defer planning.freeAdminSnapshot(&snapshot);
 
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithLocalTermite(alloc, table.indexes_json, planning.local_termite_provider);
+    var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, table.indexes_json, .{
+        .local_termite_provider = planning.local_termite_provider,
+        .remote_content = planning.remote_content,
+    });
     defer runtime.deinit();
 
     return .{

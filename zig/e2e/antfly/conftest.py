@@ -262,6 +262,15 @@ def _read_log_tail(path: Path, *, limit: int = 20000) -> str:
     return data[-limit:]
 
 
+def _write_remote_content_e2e_config(root: Path) -> Path:
+    config_path = root / "antfly-e2e.json"
+    config_path.write_text(
+        json.dumps({"remote_content": {"security": {"block_private_ips": False}}}),
+        encoding="utf-8",
+    )
+    return config_path
+
+
 class AntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.url = f"http://{host}:{port}"
@@ -365,6 +374,8 @@ def _serverless_swarm_command(binary: str, *, host: str, port: int, root: Path) 
             str(port),
             "--tick-ms",
             "5",
+            "--remote-content-block-private-ips",
+            "false",
         ]
     return [
         binary,
@@ -405,6 +416,8 @@ def _swarm_stateful_command(binary: str, *, host: str, port: int, root: Path) ->
     return [
         binary,
         "swarm",
+        "--config",
+        str(_write_remote_content_e2e_config(root)),
         "--host",
         host,
         "--port",

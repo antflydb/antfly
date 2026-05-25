@@ -33,6 +33,7 @@ const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
+const scraping = @import("antfly_scraping");
 
 pub const BootstrapConfig = struct {
     artifacts_uri: []const u8,
@@ -55,6 +56,7 @@ pub const BootstrapConfig = struct {
     prune_enabled: bool = true,
     enrichment_enabled: bool = true,
     foreign_registry: ?*const foreign_mod.Registry = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
 };
 
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
@@ -142,7 +144,8 @@ pub const OwnedStack = struct {
         self.runtime.setCompactor(build_mod.Compactor.init(alloc, &self.artifacts, &self.manifests, &self.progress));
         var enricher = enrichment_mod.SparseEnricher.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         if (cfg.embedding_indexes_json) |indexes_json| {
-            var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJson(alloc, indexes_json);
+            const embedder_options = managed_embedder.InitOptions{ .remote_content = cfg.remote_content };
+            var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, embedder_options);
             errdefer query_embedder.deinit();
             if (query_embedder.hasDenseEntries()) {
                 self.managed_query_embedder = query_embedder;
@@ -152,10 +155,10 @@ pub const OwnedStack = struct {
                 self.managed_query_embedder = null;
                 self.dense_query_index_name = null;
             }
-            if (try managed_embedder.ManagedEmbedder.createSparseEmbedder(alloc, indexes_json)) |sparse_embedder| {
+            if (try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |sparse_embedder| {
                 try enricher.setSparseEmbedder(sparse_embedder, cfg.sparse_embedding_index_name);
             }
-            if (try managed_embedder.ManagedEmbedder.createDenseEmbedder(alloc, indexes_json)) |dense_embedder| {
+            if (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |dense_embedder| {
                 try enricher.setChunkEmbedder(dense_embedder, cfg.chunk_embedding_index_name, cfg.chunk_embedding_dimensions);
             }
         } else {
@@ -165,6 +168,7 @@ pub const OwnedStack = struct {
         self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
         self.runtime.setEnricher(enricher);
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(
             self.dense_query_index_name,

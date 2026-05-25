@@ -399,7 +399,7 @@ pub const ManagedEmbedder = struct {
         });
     }
 
-    fn initFromIndexesJsonWithOptions(alloc: std.mem.Allocator, indexes_json: []const u8, options: InitOptions) !ManagedEmbedder {
+    pub fn initFromIndexesJsonWithOptions(alloc: std.mem.Allocator, indexes_json: []const u8, options: InitOptions) !ManagedEmbedder {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
         defer parsed.deinit();
         return try initFromIndexValueObjectWithOptions(alloc, parsed.value, options);
