@@ -17,12 +17,12 @@ const build_options = @import("build_options");
 const ml = @import("ml");
 const onnx_graph = @import("onnx_graph");
 const c_file = @import("../util/c_file.zig");
-const native_mod = @import("../ops/native_compute.zig");
+const native_mod = if (build_options.enable_native) @import("../ops/native_compute.zig") else struct {};
+const wasm_compute_mod = if (build_options.enable_wasm) @import("../ops/wasm_compute.zig") else struct {};
 const gpu_store_mod = if (build_options.enable_mlx or build_options.enable_metal) @import("../ops/gpu_hosted_store.zig") else struct {};
 const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 const metal_compute_mod = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {};
 const graph_interpreter = @import("../graph/interpreter.zig");
-const graph_runtime_mod = @import("../graph/runtime.zig");
 const graph_partition = @import("../graph/partition.zig");
 const metal_capabilities = @import("../graph/metal_capabilities.zig");
 const graph_contracts = @import("../graph/backend_contracts.zig");
@@ -36,9 +36,10 @@ const TensorInfo = @import("tensor.zig").TensorInfo;
 const DType = @import("tensor.zig").DType;
 const BackendType = @import("backends.zig").BackendType;
 const ops_mod = @import("../ops/ops.zig");
+const graph_runtime_mod = if (build_options.enable_wasm) WasmGraphRuntime else @import("../graph/runtime.zig");
 
-const NativeCompute = native_mod.NativeCompute;
-const WeightStore = native_mod.WeightStore;
+const NativeCompute = if (build_options.enable_native) native_mod.NativeCompute else opaque {};
+const WeightStore = if (build_options.enable_native) native_mod.WeightStore else opaque {};
 const RuntimeInput = graph_interpreter.RuntimeInput;
 const CachedAnalysis = graph_interpreter.CachedAnalysis;
 const Graph = ml.graph.Graph;
@@ -51,7 +52,74 @@ const max_onnx_model_bytes = 2 * 1024 * 1024 * 1024;
 const GpuWeightStore = if (build_options.enable_mlx or build_options.enable_metal) gpu_store_mod.WeightStore else opaque {};
 const MlxCompute = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else opaque {};
 const MetalCompute = if (build_options.enable_metal) metal_compute_mod.MetalCompute else opaque {};
+const WasmCompute = if (build_options.enable_wasm) wasm_compute_mod.WasmCompute else opaque {};
 const clipclap_audio_input_frames: i64 = 1001;
+
+const WasmGraphRuntime = struct {
+    pub const Strategy = enum {
+        interpreter,
+        partitioned,
+        compiled_preferred,
+        compiled_required,
+    };
+
+    pub fn strategyFromEnv() Strategy {
+        return .interpreter;
+    }
+
+    pub const Runtime = struct {
+        default_backend: *const ops_mod.ComputeBackend,
+
+        pub fn init(
+            _: std.mem.Allocator,
+            _: *const Graph,
+            compute_backend: *const ops_mod.ComputeBackend,
+            requested_strategy: Strategy,
+        ) !Runtime {
+            if (requested_strategy != .interpreter) return error.UnsupportedCompiledGraphRuntime;
+            return .{ .default_backend = compute_backend };
+        }
+
+        pub fn deinit(_: *Runtime) void {}
+
+        pub fn execute(
+            self: *Runtime,
+            allocator: std.mem.Allocator,
+            graph: *const Graph,
+            options: graph_interpreter.ExecuteOptions,
+        ) !Result {
+            var result = try graph_interpreter.execute(allocator, graph, self.default_backend, options);
+            errdefer result.deinit(self.default_backend);
+            const outputs = result.outputs;
+            result.outputs = &.{};
+            return .{
+                .outputs = outputs,
+                .allocator = result.allocator,
+            };
+        }
+    };
+
+    pub const Result = struct {
+        outputs: []ops_mod.CT,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *Result, runtime: *const Runtime) void {
+            for (self.outputs, 0..) |ct, idx| {
+                if (containsCt(self.outputs[0..idx], ct)) continue;
+                runtime.default_backend.free(ct);
+            }
+            self.allocator.free(self.outputs);
+            self.outputs = &.{};
+        }
+    };
+
+    fn containsCt(values: []const ops_mod.CT, value: ops_mod.CT) bool {
+        for (values) |candidate| {
+            if (candidate == value) return true;
+        }
+        return false;
+    }
+};
 
 fn shouldSpecializeClipclapAudioInputTime(path: []const u8) bool {
     const base = std.fs.path.basename(path);
@@ -72,10 +140,14 @@ const BackendContext = union(enum) {
         compute: *MetalCompute,
         weight_store: *GpuWeightStore,
     },
+    wasm: struct {
+        compute: *WasmCompute,
+    },
 
     fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !BackendContext {
         return switch (requested) {
             .native, .onnx => blk: {
+                if (comptime !build_options.enable_native) return error.NativeNotEnabled;
                 const compute = try allocator.create(NativeCompute);
                 errdefer allocator.destroy(compute);
                 const weight_store = try allocator.create(WeightStore);
@@ -95,6 +167,13 @@ const BackendContext = union(enum) {
                         .weight_store = weight_store,
                     },
                 };
+            },
+            .wasm => blk: {
+                if (comptime !build_options.enable_wasm) return error.WasmNotEnabled;
+                const compute = try allocator.create(WasmCompute);
+                errdefer allocator.destroy(compute);
+                compute.* = wasm_compute_mod.WasmCompute.init(allocator);
+                break :blk .{ .wasm = .{ .compute = compute } };
             },
             .mlx => blk: {
                 if (comptime !build_options.enable_mlx) return error.MlxNotEnabled;
@@ -143,11 +222,15 @@ const BackendContext = union(enum) {
     fn deinit(self: *BackendContext, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .native => |*ctx| {
-                ctx.compute.computeBackend().deinit();
-                ctx.weight_store.resident_weights.deinit(allocator);
-                ctx.weight_store.lazy_weights.deinit(allocator);
-                native_mod.deinitPrefetchQueue(ctx.weight_store);
-                allocator.destroy(ctx.weight_store);
+                if (comptime build_options.enable_native) {
+                    ctx.compute.computeBackend().deinit();
+                    ctx.weight_store.resident_weights.deinit(allocator);
+                    ctx.weight_store.lazy_weights.deinit(allocator);
+                    native_mod.deinitPrefetchQueue(ctx.weight_store);
+                    allocator.destroy(ctx.weight_store);
+                } else {
+                    unreachable;
+                }
             },
             .mlx_hosted => |*ctx| {
                 if (comptime build_options.enable_mlx) {
@@ -169,17 +252,33 @@ const BackendContext = union(enum) {
                 deinitGpuHostedWeightStore(allocator, ctx.weight_store, .metal);
                 allocator.destroy(ctx.weight_store);
             },
+            .wasm => |*ctx| {
+                if (comptime build_options.enable_wasm) {
+                    var cb = ctx.compute.computeBackend();
+                    cb.deinit();
+                    allocator.destroy(ctx.compute);
+                } else {
+                    unreachable;
+                }
+            },
         }
     }
 
     fn computeBackend(self: *BackendContext) ops_mod.ComputeBackend {
         return switch (self.*) {
-            .native => |*ctx| ctx.compute.computeBackend(),
+            .native => |*ctx| if (comptime build_options.enable_native)
+                ctx.compute.computeBackend()
+            else
+                unreachable,
             .mlx_hosted => |*ctx| if (comptime build_options.enable_mlx)
                 (@as(*mlx_compute_mod.MlxCompute, @ptrCast(@alignCast(ctx.compute)))).computeBackend()
             else
                 unreachable,
             .metal_hosted => |*ctx| if (comptime build_options.enable_metal)
+                ctx.compute.computeBackend()
+            else
+                unreachable,
+            .wasm => |*ctx| if (comptime build_options.enable_wasm)
                 ctx.compute.computeBackend()
             else
                 unreachable,
@@ -191,12 +290,16 @@ const BackendContext = union(enum) {
             .native => .native,
             .mlx_hosted => |ctx| ctx.reported_backend,
             .metal_hosted => .metal,
+            .wasm => .wasm,
         };
     }
 
     fn importHostTensor(self: *BackendContext, allocator: std.mem.Allocator, tensor: *const Tensor) !ops_mod.CT {
         return switch (self.*) {
-            .native => |*ctx| ctx.compute.importHostTensor(tensor),
+            .native => |*ctx| if (comptime build_options.enable_native)
+                ctx.compute.importHostTensor(tensor)
+            else
+                unreachable,
             .mlx_hosted => |*ctx| {
                 const cb = if (comptime build_options.enable_mlx)
                     (@as(*mlx_compute_mod.MlxCompute, @ptrCast(@alignCast(ctx.compute)))).computeBackend()
@@ -211,12 +314,22 @@ const BackendContext = union(enum) {
                     unreachable;
                 return importTensorToBackend(allocator, &cb, tensor);
             },
+            .wasm => |*ctx| {
+                const cb = if (comptime build_options.enable_wasm)
+                    ctx.compute.computeBackend()
+                else
+                    unreachable;
+                return importTensorToBackend(allocator, &cb, tensor);
+            },
         };
     }
 
     fn importStaticTensor(self: *BackendContext, allocator: std.mem.Allocator, tensor: Tensor) !ops_mod.CT {
         return switch (self.*) {
-            .native => |*ctx| ctx.compute.importOwnedStaticTensor(tensor),
+            .native => |*ctx| if (comptime build_options.enable_native)
+                ctx.compute.importOwnedStaticTensor(tensor)
+            else
+                unreachable,
             .mlx_hosted => |*ctx| {
                 var owned_tensor = tensor;
                 defer owned_tensor.deinit();
@@ -230,6 +343,15 @@ const BackendContext = union(enum) {
                 var owned_tensor = tensor;
                 defer owned_tensor.deinit();
                 const cb = if (comptime build_options.enable_metal)
+                    ctx.compute.computeBackend()
+                else
+                    unreachable;
+                return importTensorToBackend(allocator, &cb, &owned_tensor);
+            },
+            .wasm => |*ctx| {
+                var owned_tensor = tensor;
+                defer owned_tensor.deinit();
+                const cb = if (comptime build_options.enable_wasm)
                     ctx.compute.computeBackend()
                 else
                     unreachable;
@@ -246,7 +368,10 @@ const BackendContext = union(enum) {
         values: []f32,
     ) !ops_mod.CT {
         return switch (self.*) {
-            .native => |*ctx| ctx.compute.importDenseTensor("", dtype, shape, values),
+            .native => |*ctx| if (comptime build_options.enable_native)
+                ctx.compute.importDenseTensor("", dtype, shape, values)
+            else
+                unreachable,
             .mlx_hosted => |*ctx| {
                 defer allocator.free(values);
                 const shape_i32 = try tensorShapeI32(allocator, shape);
@@ -262,6 +387,16 @@ const BackendContext = union(enum) {
                 const shape_i32 = try tensorShapeI32(allocator, shape);
                 defer allocator.free(shape_i32);
                 const cb = if (comptime build_options.enable_metal)
+                    ctx.compute.computeBackend()
+                else
+                    unreachable;
+                return cb.fromFloat32Shape(values, shape_i32);
+            },
+            .wasm => |*ctx| {
+                defer allocator.free(values);
+                const shape_i32 = try tensorShapeI32(allocator, shape);
+                defer allocator.free(shape_i32);
+                const cb = if (comptime build_options.enable_wasm)
                     ctx.compute.computeBackend()
                 else
                     unreachable;
@@ -484,6 +619,60 @@ test "tensorShapeI32 rejects oversized dimensions" {
     try std.testing.expectError(error.UnsupportedShape, tensorShapeI32(allocator, &.{ 1, std.math.maxInt(i64) }));
 }
 
+fn tensorToOwnedI32(allocator: std.mem.Allocator, tensor: *const Tensor) ![]i32 {
+    const count = tensor.elementCount();
+    const out = try allocator.alloc(i32, count);
+    errdefer allocator.free(out);
+    switch (tensor.dtype) {
+        .i8 => {
+            const src = tensor.asInt8();
+            for (src, 0..) |value, i| out[i] = value;
+        },
+        .i16 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const offset = i * 2;
+                out[i] = std.mem.readInt(i16, src_bytes[offset..][0..2], .little);
+            }
+        },
+        .i32 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const offset = i * 4;
+                out[i] = std.mem.readInt(i32, src_bytes[offset..][0..4], .little);
+            }
+        },
+        .i64 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const offset = i * 8;
+                const value = std.mem.readInt(i64, src_bytes[offset..][0..8], .little);
+                out[i] = std.math.cast(i32, value) orelse return error.UnsupportedTensorDType;
+            }
+        },
+        .u8 => {
+            const src = std.mem.bytesAsSlice(u8, tensor.data);
+            for (src, 0..) |value, i| out[i] = value;
+        },
+        .bool_ => {
+            const src = std.mem.bytesAsSlice(u8, tensor.data);
+            if (src.len == count) {
+                for (src, 0..) |value, i| out[i] = if (value == 0) 0 else 1;
+            } else if (src.len * 8 >= count) {
+                for (0..count) |i| {
+                    const byte = src[i / 8];
+                    const bit = (byte >> @intCast(i % 8)) & 1;
+                    out[i] = if (bit == 0) 0 else 1;
+                }
+            } else {
+                return error.InvalidTensorData;
+            }
+        },
+        else => return error.UnsupportedTensorDType,
+    }
+    return out;
+}
+
 fn tensorToOwnedF32(allocator: std.mem.Allocator, tensor: *const Tensor) ![]f32 {
     const count = tensor.elementCount();
     const out = try allocator.alloc(f32, count);
@@ -590,6 +779,13 @@ fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
 }
 
 fn importTensorToBackend(allocator: std.mem.Allocator, cb: *const ops_mod.ComputeBackend, tensor: *const Tensor) !ops_mod.CT {
+    if (tensorToOwnedI32(allocator, tensor)) |values| {
+        defer allocator.free(values);
+        const shape = try tensorShapeI32(allocator, tensor.shape);
+        defer allocator.free(shape);
+        if (try cb.fromInt32Shape(values, shape)) |ct| return ct;
+    } else |_| {}
+
     const values = try tensorToOwnedF32(allocator, tensor);
     defer allocator.free(values);
     const shape = try tensorShapeI32(allocator, tensor.shape);
@@ -854,6 +1050,7 @@ pub fn sharedBackendContext(session: Session) ?*SharedBackendContext {
 }
 
 fn importedOnnxTraceEnabled() bool {
+    if (comptime build_options.enable_wasm or !build_options.link_libc) return false;
     const value = std.c.getenv("TERMITE_ONNX_GRAPH_TRACE") orelse return false;
     return value[0] != 0 and value[0] != '0';
 }

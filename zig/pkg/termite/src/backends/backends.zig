@@ -30,22 +30,11 @@ pub const SessionPool = session_pool.SessionPool;
 
 pub const onnx = if (build_options.enable_onnx) @import("onnx.zig") else struct {};
 pub const ortgenai = if (build_options.enable_onnx) @import("ortgenai.zig") else struct {};
-pub const imported_onnx_session = if (supports_onnx_models) @import("imported_onnx_session.zig") else struct {
-    pub const SharedBackendContext = opaque {};
-
-    pub fn sharedBackendContext(_: anytype) ?*SharedBackendContext {
-        return null;
-    }
-
-    pub fn createSessionWithOptions(_: std.mem.Allocator, _: []const u8, _: anytype, _: anytype) !Session {
-        return error.OnnxDisabled;
-    }
-};
+pub const imported_onnx_session = @import("imported_onnx_session.zig");
 pub const mlx = if (build_options.enable_mlx) @import("mlx.zig") else struct {};
 pub const metal_kv_storage = if (build_options.enable_metal) @import("metal_kv_storage.zig") else struct {};
 
 const session_factory = @import("../architectures/session_factory.zig");
-const supports_onnx_models = build_options.enable_onnx and !build_options.enable_wasm;
 
 pub const BackendType = enum {
     native,
@@ -59,7 +48,7 @@ pub const BackendType = enum {
     pub fn available(self: BackendType) bool {
         return switch (self) {
             .native => build_options.enable_native,
-            .onnx => supports_onnx_models,
+            .onnx => true,
             .metal => build_options.enable_metal,
             .mlx => build_options.enable_mlx,
             .cuda => build_options.enable_cuda,
@@ -90,8 +79,8 @@ pub const BackendType = enum {
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
-            .native, .onnx, .metal, .mlx, .cuda => true,
-            .pjrt, .wasm => false,
+            .native, .onnx, .metal, .mlx, .cuda, .wasm => true,
+            .pjrt => false,
         };
     }
 };
@@ -146,35 +135,32 @@ pub const SessionManager = struct {
             }
             std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
             const effective_model_path = switch (backend) {
-                .onnx => if (manifest) |m| m.onnx_path orelse model_path else model_path,
+                .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
                 else => model_path,
             };
 
             const session = switch (backend) {
-                .onnx => if ((shared_backend_ctx != null and supports_onnx_models and isOnnxFilePath(effective_model_path)) or self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
+                .onnx => if ((shared_backend_ctx != null and isOnnxFilePath(effective_model_path)) or self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                    self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx graph-runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
                     }
                 else if (build_options.enable_onnx and isOnnxFilePath(effective_model_path))
                     onnx.createSession(self.allocator, effective_model_path) catch |err| {
                         std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        if (supports_onnx_models) {
-                            return self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |graph_err| {
-                                std.log.err("imported onnx session create failed for {s}: {s}", .{ effective_model_path, @errorName(graph_err) });
-                                return graph_err;
-                            };
-                        }
-                        continue;
+                        return self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |graph_err| {
+                            std.log.err("imported onnx session create failed for {s}: {s}", .{ effective_model_path, @errorName(graph_err) });
+                            return graph_err;
+                        };
                     }
-                else if (supports_onnx_models and isOnnxFilePath(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
+                else if (isOnnxFilePath(effective_model_path))
+                    self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
                     }
                 else
                     continue,
-                .metal => if (supports_onnx_models and isOnnxFilePath(effective_model_path))
+                .metal => if (isOnnxFilePath(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
@@ -186,7 +172,7 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .mlx => if (supports_onnx_models and isOnnxFilePath(effective_model_path))
+                .mlx => if (isOnnxFilePath(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .mlx, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx MLX session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
@@ -198,7 +184,7 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .cuda => if (supports_onnx_models and isOnnxFilePath(effective_model_path))
+                .cuda => if (isOnnxFilePath(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
@@ -210,7 +196,7 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .native => if (supports_onnx_models and isOnnxFilePath(effective_model_path))
+                .native => if (isOnnxFilePath(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
@@ -220,7 +206,14 @@ pub const SessionManager = struct {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         continue;
                     },
-                .pjrt, .wasm => continue,
+                .wasm => if (isOnnxFilePath(effective_model_path))
+                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx) catch |err| {
+                        std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        continue;
+                    }
+                else
+                    continue,
+                .pjrt => continue,
             };
             // For sessions produced by session_factory (native/Metal/MLX
             // direct loads -- not the imported_onnx path which already
@@ -255,7 +248,7 @@ pub const SessionManager = struct {
     }
 
     fn shouldUseImportedOnnxGraphRuntime(self: *const SessionManager, model_path: []const u8) bool {
-        return self.graph_runtime_strategy != null and supports_onnx_models and isOnnxFilePath(model_path);
+        return self.graph_runtime_strategy != null and isOnnxFilePath(model_path);
     }
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
@@ -270,7 +263,7 @@ fn configuredPreferredBackends() []const BackendType {
     if (build_options.enable_wasm) return &.{.wasm};
     if (preferredBackendOverride()) |backend| {
         return switch (backend) {
-            .onnx => if (supports_onnx_models) &.{.onnx} else &.{ .metal, .mlx, .native },
+            .onnx => &.{.onnx},
             .metal => if (build_options.enable_metal) &.{.metal} else &.{.native},
             .mlx => if (build_options.enable_mlx) &.{.mlx} else &.{.native},
             .cuda => if (build_options.enable_cuda) &.{.cuda} else &.{.native},
@@ -282,6 +275,10 @@ fn configuredPreferredBackends() []const BackendType {
     return &.{ .onnx, .metal, .mlx, .native };
 }
 
+fn defaultImportedOnnxBackend() BackendType {
+    return if (build_options.enable_wasm) .wasm else .native;
+}
+
 fn isOnnxFilePath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".onnx");
 }
@@ -291,11 +288,23 @@ test "onnx artifact routes graph execution for direct compute backends" {
     try std.testing.expect(!isOnnxFilePath("model.gguf"));
 }
 
+test "onnx graph import is available without onnx runtime and in wasm" {
+    try std.testing.expect(BackendType.onnx.available());
+    try std.testing.expect(BackendType.onnx.supportsDirectSessionLoad());
+    if (build_options.enable_wasm) {
+        try std.testing.expectEqual(BackendType.wasm, configuredPreferredBackends()[0]);
+        try std.testing.expectEqual(BackendType.wasm, defaultImportedOnnxBackend());
+        try std.testing.expect(BackendType.wasm.supportsDirectSessionLoad());
+    } else {
+        try std.testing.expectEqual(BackendType.native, defaultImportedOnnxBackend());
+    }
+}
+
 test "explicit graph runtime uses imported onnx path before external runtime" {
     var manager = SessionManager.init(std.testing.allocator);
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
     manager.graph_runtime_strategy = .partitioned;
-    try std.testing.expect(manager.shouldUseImportedOnnxGraphRuntime("model.onnx") == supports_onnx_models);
+    try std.testing.expect(manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.gguf"));
 }
 
@@ -438,9 +447,7 @@ test {
     if (build_options.enable_mlx) {
         _ = mlx;
     }
-    if (supports_onnx_models) {
-        _ = imported_onnx_session;
-    }
+    _ = imported_onnx_session;
 }
 
 test "shouldPreferBlasBeforeMlxForBytes prefers native only above eager dense threshold" {
