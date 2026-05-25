@@ -15708,6 +15708,13 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
             split_handoffs.sparse,
         );
     }
+    try applySplitGraphArtifactsInRange(
+        self.alloc,
+        byte_range.start,
+        byte_range.end,
+        dest_store,
+        &dest_indexes,
+    );
 
     try dest_indexes.syncAll(true);
     try dest_store.sync(true);
@@ -15923,6 +15930,35 @@ fn collectEmbeddingArtifactKeysInRangeAlloc(
     return try keys.toOwnedSlice(alloc);
 }
 
+fn collectGraphArtifactKeysInRangeAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    lower: []const u8,
+    upper: []const u8,
+) ![][]const u8 {
+    const store_lower = try documentRangeLowerAlloc(alloc, lower);
+    defer alloc.free(store_lower);
+    const store_upper = if (upper.len > 0) try documentRangeUpperAlloc(alloc, upper) else null;
+    defer if (store_upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, store_lower, if (store_upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        if (!internal_keys.isGraphEdgeArtifactKey(entry.key)) continue;
+        const owned = try alloc.dupe(u8, entry.key);
+        try keys.append(alloc, owned);
+    }
+
+    return try keys.toOwnedSlice(alloc);
+}
+
 fn freeOwnedConstStringSlice(alloc: Allocator, keys: []const []const u8) void {
     for (keys) |key| alloc.free(@constCast(key));
     if (keys.len > 0) alloc.free(keys);
@@ -16044,6 +16080,37 @@ fn applySplitEmbeddingArtifactsInRange(
     const artifact_keys = try collectEmbeddingArtifactKeysInRangeAlloc(alloc, dest_store, lower, upper);
     defer freeOwnedConstStringSlice(alloc, artifact_keys);
     try applySplitEmbeddingArtifacts(dest_store, dest_indexes, artifact_keys, dense_handoffs, sparse_handoffs);
+}
+
+fn applySplitGraphArtifacts(
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    artifact_keys: []const []const u8,
+) !void {
+    if (artifact_keys.len == 0) return;
+
+    for (dest_indexes.graph_indexes.items) |entry| {
+        var graph_mutations = try collectGraphMutationsForArtifacts(
+            dest_indexes.alloc,
+            dest_store,
+            artifact_keys,
+            entry.config.name,
+        );
+        defer graph_mutations.deinit();
+        try dest_indexes.applyGraphMutationsByName(entry.config.name, graph_mutations.writes, graph_mutations.deletes);
+    }
+}
+
+fn applySplitGraphArtifactsInRange(
+    alloc: Allocator,
+    lower: []const u8,
+    upper: []const u8,
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+) !void {
+    const artifact_keys = try collectGraphArtifactKeysInRangeAlloc(alloc, dest_store, lower, upper);
+    defer freeOwnedConstStringSlice(alloc, artifact_keys);
+    try applySplitGraphArtifacts(dest_store, dest_indexes, artifact_keys);
 }
 
 fn indexExistingSplitDestinationDirect(
