@@ -9,9 +9,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/antflydb/antfly/pkg/docsaf"
-	docsafentity "github.com/antflydb/antfly/pkg/docsaf/entity"
-	termiteclient "github.com/antflydb/antfly/pkg/termite-client"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	docsafentity "github.com/antflydb/antfly/go/pkg/docsaf/entity"
+	termiteclient "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 const defaultTermiteURL = "http://localhost:8088"

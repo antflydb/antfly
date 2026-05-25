@@ -9,13 +9,12 @@ published packages ship through this repo's CI and tag-triggered npm releases.
 ## Layout
 
 ```
-packages/sdk/            → @antfly/sdk (TS client for the Antfly API)
+packages/sdk/           → @antfly/sdk (TS client for the joined public API)
 packages/components/     → @antfly/components (unstyled search primitives:
                            Autosuggest, AnswerBar, SearchBar)
 packages/design-system/  → @antfly/design-system (shadcn/ui-based shared
                            component library: primitives, compound patterns,
                            brand/marketing blocks, OKLCH tokens, Aeonik)
-packages/termite-sdk/    → SDK for the Termite ML service
 apps/antfarm/            → dashboard (consumes sdk + components)
 apps/playground/         → design-system gallery (unpublished; used by
                            library authors to dogfood new primitives)

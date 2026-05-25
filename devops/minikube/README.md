@@ -98,5 +98,5 @@ If the Docker image isn't being found, ensure you're building with Minikube's Do
 
 ```bash
 eval $(minikube docker-env)
-docker build -t antfly:latest .
+docker build -f go/Dockerfile -t antfly:latest .
 ```

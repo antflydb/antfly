@@ -7353,7 +7353,8 @@ test "data runtime resolves metadata api urls from common config" {
     orchestration_urls[1] = .{ .node_id = 2, .url = try alloc.dupe(u8, "http://127.0.0.1:7102") };
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .metadata = .{
             .orchestration_urls = orchestration_urls,
@@ -7372,7 +7373,8 @@ test "data runtime resolves paths from common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .storage = .{ .local_base_dir = try alloc.dupe(u8, "/tmp/antflydb") },
     };

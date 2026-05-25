@@ -176,14 +176,14 @@ pub const EmbedderConfig = struct {
     dimensions: ?i64 = null,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
     /// Whether to strip new lines from the input text before embedding.
     strip_new_lines: ?bool = null,
     /// The batch size for embedding requests to optimize throughput.
     batch_size: ?i64 = null,
-    /// Specifies the type of input for optimized embeddings.
-    input_type: ?[]const u8 = null,
-    /// How to handle inputs longer than the max token length.
-    truncate: ?[]const u8 = null,
     /// The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
     api_url: ?[]const u8 = null,
     provider: EmbedderProvider,

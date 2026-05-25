@@ -1744,7 +1744,8 @@ test "termite config uses cli override before common config" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .termite = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:9000"),
@@ -1792,7 +1793,8 @@ test "termite config falls back to common config" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .termite = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
@@ -1808,7 +1810,8 @@ test "swarm runtime resolves paths from common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .metadata = .{},
         .storage = .{
@@ -1850,7 +1853,8 @@ test "swarm runtime data dir overrides common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .metadata = .{},
         .storage = .{

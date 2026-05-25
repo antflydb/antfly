@@ -123,6 +123,7 @@ pub const generating_runtime = @import("generating/mod.zig");
 pub const reranking = @import("antfly_reranking");
 pub const reranking_runtime = @import("reranking/mod.zig");
 pub const transcribing = @import("antfly_transcribing");
+pub const readers = @import("antfly_readers");
 pub const synthesizing = @import("antfly_synthesizing");
 
 // Storage backends
@@ -274,6 +275,7 @@ test {
     _ = reranking;
     _ = reranking_runtime;
     _ = transcribing;
+    _ = readers;
     _ = synthesizing;
 
     // Storage

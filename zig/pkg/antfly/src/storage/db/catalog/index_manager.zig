@@ -2506,6 +2506,19 @@ pub const IndexManager = struct {
             }
         }
 
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            try requests.append(alloc, .{
+                .kind = .asset,
+                .index_name = try alloc.dupe(u8, entry.name),
+                .artifact_name = try alloc.dupe(u8, entry.name),
+                .doc_key = try alloc.dupe(u8, doc_key),
+                .source_field = try alloc.dupe(u8, entry.source_field),
+                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+            });
+        }
+
         return try requests.toOwnedSlice(alloc);
     }
 
@@ -9723,6 +9736,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
     };
 }
 
@@ -9745,6 +9759,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
     };
 }
 

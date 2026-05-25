@@ -10401,7 +10401,7 @@ fn loadArtifactFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?st
         var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
         defer artifact_ref.deinit(alloc);
 
-        var artifact_value = try artifactProjectionValue(alloc, artifact_ref, entry.value);
+        var artifact_value = try artifactProjectionValue(self, alloc, artifact_ref, entry.value);
         errdefer freeJsonValue(alloc, &artifact_value);
 
         try appendArtifactProjectionValue(alloc, &artifacts_obj, artifact_ref.name, artifact_ref.kind, artifact_value);
@@ -10416,7 +10416,7 @@ fn loadArtifactFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?st
     return .{ .object = artifacts_obj };
 }
 
-fn artifactProjectionValue(alloc: Allocator, artifact_ref: types.ArtifactRef, raw: []const u8) !std.json.Value {
+fn artifactProjectionValue(self: *DB, alloc: Allocator, artifact_ref: types.ArtifactRef, raw: []const u8) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
     errdefer {
         var value = std.json.Value{ .object = obj };
@@ -10436,7 +10436,8 @@ fn artifactProjectionValue(alloc: Allocator, artifact_ref: types.ArtifactRef, ra
     }
 
     try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
-    try putOwnedValue(alloc, &obj, "content_type", .{ .string = try alloc.dupe(u8, artifactContentType(artifact_ref.kind)) });
+    const content_type = try artifactContentTypeAlloc(self, alloc, artifact_ref.kind, artifact_ref.name);
+    try putOwnedValue(alloc, &obj, "content_type", .{ .string = content_type });
     try putOwnedValue(alloc, &obj, "status", .{ .string = try alloc.dupe(u8, "ready") });
 
     if (enrichment_artifact_codec.sourceHash(raw) catch null) |source_hash| {
@@ -10457,7 +10458,7 @@ fn artifactProjectionValue(alloc: Allocator, artifact_ref: types.ArtifactRef, ra
             }
         },
         .asset => {
-            try putOwnedValue(alloc, &obj, "value", .{ .string = try artifactTextPayloadAlloc(alloc, raw) });
+            try putOwnedValue(alloc, &obj, "value", try assetPayloadJsonValue(alloc, content_type, raw));
         },
         .embedding => {
             if (enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch null) |dims| {
@@ -10568,10 +10569,23 @@ fn artifactContentType(kind: types.ArtifactKind) []const u8 {
     };
 }
 
-fn artifactTextPayloadAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
-    const header = enrichment_artifact_codec.decodeHeader(raw) catch return try alloc.dupe(u8, raw);
-    if (header.kind != .asset) return try alloc.dupe(u8, raw);
-    return try alloc.dupe(u8, raw[enrichment_artifact_codec.header_len..][0..header.payload_len]);
+fn artifactContentTypeAlloc(self: *DB, alloc: Allocator, kind: types.ArtifactKind, artifact_name: []const u8) ![]u8 {
+    if (kind == .asset) {
+        if (self.core.index_manager.getEnrichment(.asset, artifact_name)) |cfg| {
+            if (cfg.content_type.len > 0) return try alloc.dupe(u8, cfg.content_type);
+            return try alloc.dupe(u8, "text/plain");
+        }
+    }
+    return try alloc.dupe(u8, artifactContentType(kind));
+}
+
+fn assetPayloadJsonValue(alloc: Allocator, content_type: []const u8, raw: []const u8) !std.json.Value {
+    if (std.mem.eql(u8, content_type, "application/json")) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return try cloneJsonValue(alloc, parsed.value);
+    }
+    return .{ .string = try alloc.dupe(u8, raw) };
 }
 
 fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
@@ -11447,6 +11461,31 @@ fn computeChunkRequestDerived(
     }
 }
 
+fn computeAssetRequestDerived(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+) !void {
+    const source_text = if (request.source_template.len > 0)
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+    else
+        try extractStringField(alloc, doc_value, request.source_field);
+    if (source_text == null or source_text.?.len == 0) {
+        if (source_text) |s| alloc.free(s);
+        return;
+    }
+    defer alloc.free(source_text.?);
+
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
+    defer alloc.free(key);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .value = try alloc.dupe(u8, source_text.?),
+    });
+}
+
 fn computeChunkRequest(
     alloc: Allocator,
     db: *DB,
@@ -11944,6 +11983,7 @@ fn prepareGeneratedEnrichments(
             }
 
             switch (request.kind) {
+                .asset => try computeAssetRequestDerived(self.alloc, self, cleaned, request, &artifact_writes),
                 .chunk_text => try computeChunkRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
                 .dense_embedding => computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
                     error.MissingDenseEmbedder => try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request)),
@@ -32548,6 +32588,18 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello world\"}" }},
     });
+    try db.addEnrichment(.{
+        .name = "page_ocr_v1",
+        .kind = .asset,
+        .source_field = "body",
+        .content_type = "text/plain",
+    });
+    try db.addEnrichment(.{
+        .name = "entities_v1",
+        .kind = .asset,
+        .source_field = "body",
+        .content_type = "application/json",
+    });
 
     const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
@@ -32569,6 +32621,16 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     const ocr_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ocr_ref);
     defer alloc.free(ocr_key);
     try db.core.store.put(ocr_key, "Revenue increased");
+
+    var entities_ref = types.ArtifactRef{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "entities_v1"),
+        .kind = .asset,
+    };
+    defer entities_ref.deinit(alloc);
+    const entities_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, entities_ref);
+    defer alloc.free(entities_key);
+    try db.core.store.put(entities_key, "{\"entities\":[{\"text\":\"Antfly\"}],\"relations\":[]}");
 
     var result = (try db.lookup(alloc, "doc:a", .{
         .fields = &.{ "title", "_artifacts" },
@@ -32602,8 +32664,12 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     try std.testing.expect(std.mem.startsWith(u8, ocr.get("artifact_id").?.string, "af1:asset:"));
     try std.testing.expectEqualStrings("asset", ocr.get("artifact_ref").?.object.get("kind").?.string);
     try std.testing.expectEqualStrings("asset", ocr.get("kind").?.string);
-    try std.testing.expectEqualStrings("application/octet-stream", ocr.get("content_type").?.string);
+    try std.testing.expectEqualStrings("text/plain", ocr.get("content_type").?.string);
     try std.testing.expectEqualStrings("Revenue increased", ocr.get("value").?.string);
+
+    const entities = artifacts.get("entities_v1").?.object;
+    try std.testing.expectEqualStrings("application/json", entities.get("content_type").?.string);
+    try std.testing.expectEqualStrings("Antfly", entities.get("value").?.object.get("entities").?.array.items[0].object.get("text").?.string);
 }
 
 test "db search includes chunk artifacts on hydrated hits when _chunks is requested" {

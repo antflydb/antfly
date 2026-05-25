@@ -20,13 +20,59 @@ const scraping = @import("antfly_scraping");
 
 const Allocator = std.mem.Allocator;
 
-pub const Provider = audio.STTProvider;
-pub const Config = audio.STTConfig;
 pub const Request = audio.STTRequest;
 pub const Response = audio.STTResponse;
 pub const Segment = audio.TranscriptSegment;
 pub const WordTimestamp = audio.WordTimestamp;
 pub const Speaker = audio.Speaker;
+
+pub const Provider = enum {
+    antfly,
+    termite,
+    openai,
+    vertex,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.write(switch (self) {
+            .antfly => "antfly",
+            .termite => "termite",
+            .openai => "openai",
+            .vertex => "vertex",
+        });
+    }
+
+    pub fn jsonParse(_: Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const raw = switch (try source.next()) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, raw, "antfly")) return .antfly;
+        if (std.mem.eql(u8, raw, "termite")) return .termite;
+        if (std.mem.eql(u8, raw, "openai")) return .openai;
+        if (std.mem.eql(u8, raw, "vertex")) return .vertex;
+        return error.UnexpectedToken;
+    }
+};
+
+pub const Config = struct {
+    provider: Provider,
+    model: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    bearer_token: ?[]const u8 = null,
+    base_url: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    api_url: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+    credentials_path: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    enable_automatic_punctuation: ?bool = null,
+    use_enhanced: ?bool = null,
+
+    pub fn resolvedUrl(self: Config) ?[]const u8 {
+        return self.url orelse self.api_url;
+    }
+};
 
 const remote_fetch_security = scraping.ContentSecurityConfig{
     .max_download_size_bytes = 32 << 20,
@@ -180,14 +226,16 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     return .{
         .model = try dupOpt(alloc, cfg.model),
         .api_key = try dupOpt(alloc, cfg.api_key),
+        .bearer_token = try dupOpt(alloc, cfg.bearer_token),
         .base_url = try dupOpt(alloc, cfg.base_url),
+        .url = try dupOpt(alloc, cfg.url),
+        .api_url = try dupOpt(alloc, cfg.api_url),
         .project_id = try dupOpt(alloc, cfg.project_id),
         .location = try dupOpt(alloc, cfg.location),
         .credentials_path = try dupOpt(alloc, cfg.credentials_path),
         .language_code = try dupOpt(alloc, cfg.language_code),
         .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
         .use_enhanced = cfg.use_enhanced,
-        .api_url = try dupOpt(alloc, cfg.api_url),
         .provider = cfg.provider,
     };
 }
@@ -195,12 +243,14 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     freeOpt(alloc, cfg.model);
     freeOpt(alloc, cfg.api_key);
+    freeOpt(alloc, cfg.bearer_token);
     freeOpt(alloc, cfg.base_url);
+    freeOpt(alloc, cfg.url);
+    freeOpt(alloc, cfg.api_url);
     freeOpt(alloc, cfg.project_id);
     freeOpt(alloc, cfg.location);
     freeOpt(alloc, cfg.credentials_path);
     freeOpt(alloc, cfg.language_code);
-    freeOpt(alloc, cfg.api_url);
     cfg.* = undefined;
 }
 
@@ -255,13 +305,13 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
 
 fn initTranscriber(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
     return switch (cfg.provider) {
-        .termite => try TermiteTranscriberState.init(alloc, http, cfg),
+        .antfly, .termite => try AntflyTranscriberState.init(alloc, http, cfg),
         .openai => try OpenAiTranscriberState.init(alloc, http, cfg),
-        else => error.UnsupportedTranscribingProvider,
+        .vertex => try VertexTranscriberState.init(alloc, http, cfg),
     };
 }
 
-const TermiteTranscriberState = struct {
+const AntflyTranscriberState = struct {
     alloc: Allocator,
     http: *httpx.Client,
     api_url: []const u8,
@@ -269,13 +319,13 @@ const TermiteTranscriberState = struct {
     language_code: ?[]const u8 = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
-        const state = try alloc.create(TermiteTranscriberState);
+        const state = try alloc.create(AntflyTranscriberState);
         errdefer alloc.destroy(state);
 
         state.* = .{
             .alloc = alloc,
             .http = http,
-            .api_url = try alloc.dupe(u8, cfg.api_url orelse "http://127.0.0.1:8080"),
+            .api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080"),
             .model = try dupOpt(alloc, cfg.model),
             .language_code = try dupOpt(alloc, cfg.language_code),
         };
@@ -290,7 +340,7 @@ const TermiteTranscriberState = struct {
     }
 
     fn deinit(ptr: *anyopaque) void {
-        const self: *TermiteTranscriberState = @ptrCast(@alignCast(ptr));
+        const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.api_url);
         freeOpt(self.alloc, self.model);
         freeOpt(self.alloc, self.language_code);
@@ -298,7 +348,7 @@ const TermiteTranscriberState = struct {
     }
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
-        const self: *TermiteTranscriberState = @ptrCast(@alignCast(ptr));
+        const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
         const audio_bytes = try resolveAudioInputAlloc(alloc, req.url);
         defer alloc.free(audio_bytes);
 
@@ -413,6 +463,139 @@ const OpenAiTranscriberState = struct {
         });
         defer parsed.deinit();
         return try cloneResponse(alloc, parsed.value);
+    }
+};
+
+const VertexTranscriberState = struct {
+    alloc: Allocator,
+    http: *httpx.Client,
+    base_url: []const u8,
+    auth_header: ?[2][]const u8 = null,
+    project_id: []const u8,
+    location: []const u8,
+    model: []const u8,
+    language_code: []const u8,
+
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
+        const state = try alloc.create(VertexTranscriberState);
+        errdefer alloc.destroy(state);
+
+        state.* = .{
+            .alloc = alloc,
+            .http = http,
+            .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://speech.googleapis.com/v2"),
+            .project_id = try alloc.dupe(u8, cfg.project_id orelse return error.InvalidTranscribingConfig),
+            .location = try alloc.dupe(u8, cfg.location orelse "global"),
+            .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),
+            .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
+        };
+        errdefer state.deinitState();
+
+        if (cfg.bearer_token orelse cfg.api_key) |token| {
+            try state.setBearer(token);
+        } else if (cfg.credentials_path != null) {
+            return error.UnsupportedVertexServiceAccountCredentials;
+        } else {
+            return error.MissingVertexCredentials;
+        }
+
+        return .{
+            .ptr = state,
+            .vtable = &.{
+                .transcribe = transcribe,
+                .deinit = deinit,
+            },
+        };
+    }
+
+    fn deinitState(self: *VertexTranscriberState) void {
+        self.alloc.free(self.base_url);
+        self.alloc.free(self.project_id);
+        self.alloc.free(self.location);
+        self.alloc.free(self.model);
+        self.alloc.free(self.language_code);
+        if (self.auth_header) |header| self.alloc.free(header[1]);
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
+        self.deinitState();
+        self.alloc.destroy(self);
+    }
+
+    fn setBearer(self: *VertexTranscriberState, token: []const u8) !void {
+        if (self.auth_header) |header| self.alloc.free(header[1]);
+        self.auth_header = .{
+            "Authorization",
+            try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}),
+        };
+    }
+
+    fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
+        const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
+        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url);
+        defer alloc.free(audio_bytes);
+
+        const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
+        const encoded = try alloc.alloc(u8, encoded_len);
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, audio_bytes);
+
+        const language = req.language orelse self.language_code;
+        const RecognitionConfig = struct {
+            explicitDecodingConfig: struct {} = .{},
+            model: []const u8,
+            languageCodes: []const []const u8,
+        };
+        const RequestBody = struct {
+            config: RecognitionConfig,
+            content: []const u8,
+        };
+        const languages = [_][]const u8{language};
+        const body = try httpx.json.Json.stringify(alloc, RequestBody{
+            .config = .{
+                .model = self.model,
+                .languageCodes = &languages,
+            },
+            .content = encoded,
+        });
+        defer alloc.free(body);
+
+        const url = try std.fmt.allocPrint(
+            alloc,
+            "{s}/projects/{s}/locations/{s}/recognizers/_:recognize",
+            .{ self.base_url, self.project_id, self.location },
+        );
+        defer alloc.free(url);
+
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        if (self.auth_header) |header| try headers.append(alloc, header);
+
+        var resp = try self.http.post(url, .{
+            .json = body,
+            .headers = headers.items,
+        });
+        defer resp.deinit();
+        if (!resp.ok()) return error.TranscribeRequestFailed;
+
+        const ResponseBody = struct {
+            results: []const struct {
+                alternatives: []const struct {
+                    transcript: ?[]const u8 = null,
+                } = &.{},
+                languageCode: ?[]const u8 = null,
+            } = &.{},
+        };
+        const payload = resp.body orelse return error.EmptyResponse;
+        var parsed = try std.json.parseFromSlice(ResponseBody, alloc, payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.results.len == 0 or parsed.value.results[0].alternatives.len == 0) return error.EmptyResponse;
+
+        return .{
+            .text = try dupOpt(alloc, parsed.value.results[0].alternatives[0].transcript),
+            .language = try dupOpt(alloc, parsed.value.results[0].languageCode),
+        };
     }
 };
 

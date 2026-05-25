@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	docsafentity "github.com/antflydb/antfly/pkg/docsaf/entity"
-	termiteclient "github.com/antflydb/antfly/pkg/termite-client"
-	"github.com/antflydb/antfly/pkg/termite-client/oapi"
+	docsafentity "github.com/antflydb/antfly/go/pkg/docsaf/entity"
+	termiteclient "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/mbleigh/raymond"
 )
 

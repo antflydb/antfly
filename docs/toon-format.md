@@ -144,8 +144,8 @@ To use the previous key-value format, specify it explicitly:
 
 ## Implementation Details
 
-- **Default template**: Changed in `lib/ai/genkit.go:320`
-- **Helper function**: Implemented in `lib/template/template.go:103-136`
+- **Default template**: Changed in `go/pkg/antfly/lib/ai/genkit.go:320`
+- **Helper function**: Implemented in `go/pkg/antfly/lib/template/template.go:103-136`
 - **Powered by**: [github.com/alpkeskin/gotoon](https://github.com/alpkeskin/gotoon)
 
 ## See Also

@@ -1368,11 +1368,35 @@ fn processPendingDocumentGroup(
             continue;
         }
         switch (request.kind) {
+            .asset => try processAsset(runtime, request),
             .chunk_text => try processChunkText(runtime, request, chunk_cache, window),
             .dense_embedding => try processDenseEmbedding(runtime, request, chunk_cache, window),
             .sparse_embedding => try processSparseEmbedding(runtime, request, chunk_cache, window),
         }
     }
+}
+
+fn processAsset(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !void {
+    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    defer runtime.alloc.free(doc_store_key);
+    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return,
+    };
+    defer runtime.alloc.free(raw);
+
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
+    defer runtime.alloc.free(@constCast(source_text));
+    const artifact_name = requestArtifactName(request);
+    const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
+    defer runtime.alloc.free(key);
+    if (try shouldSkipAssetArtifact(runtime, key, source_text)) return;
+
+    try storePutWithRetry(runtime, key, source_text);
+    recordArtifactBytes(runtime, .asset, source_text.len);
 }
 
 fn sameChunkedDenseBatchKey(
@@ -2503,6 +2527,19 @@ fn shouldSkipEmbeddingArtifact(runtime: *EnrichmentRuntime, artifact_key: []cons
         return false;
     };
     if (existing_hash != null and existing_hash.? == source_hash) {
+        runtime.skip_by_hash_count += 1;
+        return true;
+    }
+    return false;
+}
+
+fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8, value: []const u8) !bool {
+    const raw = storeGetAlloc(runtime, artifact_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer runtime.alloc.free(raw);
+    if (std.mem.eql(u8, raw, value)) {
         runtime.skip_by_hash_count += 1;
         return true;
     }

@@ -116,7 +116,10 @@ const BackendState = struct {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
                 break :blk .{ .openai = provider };
             },
-            .antfly => .{ .local_termite = local_termite_provider orelse return error.UnsupportedGeneratorProvider },
+            .antfly => if (cfg.url.len == 0)
+                .{ .local_termite = local_termite_provider orelse return error.UnsupportedGeneratorProvider }
+            else
+                .{ .termite = termite_provider.Provider.init(alloc, http, cfg.url) },
             .termite => if (cfg.url.len == 0 and local_termite_provider != null)
                 .{ .local_termite = local_termite_provider.? }
             else

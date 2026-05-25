@@ -2,7 +2,7 @@
 
 ## Current State
 
-This repo now has reusable protocol cores under `lib/mcp` and `lib/a2a`, plus Antfly-specific HTTP adapters in
+This repo now has reusable protocol cores under `go/pkg/antfly/lib/mcp` and `go/pkg/antfly/lib/a2a`, plus Antfly-specific HTTP adapters in
 `pkg/antfly/src/api/protocol_adapters.zig`.
 
 The implementation intentionally keeps the protocol libraries independent of Antfly OpenAPI/generated types. Antfly
@@ -14,21 +14,21 @@ centralized.
 
 The Go implementation uses mature protocol SDKs:
 
-- MCP is mounted with `github.com/modelcontextprotocol/go-sdk/mcp.NewStreamableHTTPHandler` in `src/mcp/mcp.go`. That
+- MCP is mounted with `github.com/modelcontextprotocol/go-sdk/mcp.NewStreamableHTTPHandler` in `go/pkg/antfly/src/mcp/mcp.go`. That
   SDK provides streamable HTTP sessions, `Mcp-Session-Id`, DELETE close, SSE reconnect behavior, and `Last-Event-ID`
   resumability. The Antfly Go product code exposes streamable HTTP; the SDK also supports stdio, but there is no
   Antfly-specific stdio server command wired in the Go tree.
-- A2A is mounted with `github.com/a2aproject/a2a-go/a2asrv.NewJSONRPCHandler` in `src/metadata/a2a_adapters.go`.
+- A2A is mounted with `github.com/a2aproject/a2a-go/a2asrv.NewJSONRPCHandler` in `go/pkg/antfly/src/metadata/a2a_adapters.go`.
   `message/stream` is a real SSE stream backed by the SDK event queue, and retrieval writes callback events into that
   queue as work progresses.
 - A2A `tasks/get` and `tasks/cancel` are provided by the SDK's default in-memory task store. Antfly Go does not appear
   to configure a durable task store for this surface.
 - MCP tool schemas in Go are derived by the MCP SDK from typed argument structs and `json`/`mcp` tags in
-  `src/mcp/mcp.go`, not handwritten JSON strings.
+  `go/pkg/antfly/src/mcp/mcp.go`, not handwritten JSON strings.
 
 ## Implemented
 
-- `lib/mcp`
+- `go/pkg/antfly/lib/mcp`
   - JSON-RPC 2.0 request/response handling.
   - MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`.
   - Tool registry API with `Server`, `Tool`, `ToolHandler`, and `CallToolResult`.
@@ -38,7 +38,7 @@ The Go implementation uses mature protocol SDKs:
   - Session-scoped SSE event IDs and `Last-Event-ID` cursor handling for streamable HTTP GET.
   - Line-oriented stdio dispatch helper for newline-framed JSON-RPC messages.
   - Standalone tests via `zig build lib-mcp-test`.
-- `lib/a2a`
+- `go/pkg/antfly/lib/a2a`
   - Agent skill registration and metadata skill routing.
   - Agent card production.
   - JSON-RPC methods for `agent/getAuthenticatedExtendedCard`, `message/send`, `message/stream`, `tasks/get`, and
@@ -96,7 +96,7 @@ missing A2A tasks.
   initialize responses, validates inbound `Mcp-Session-Id` headers for streamable HTTP requests, and closes sessions
   via `DELETE /mcp/v1`. GET streams emit event IDs and honor `Last-Event-ID`, but historical event replay is not
   implemented yet.
-- MCP has a line-oriented stdio JSON-RPC dispatcher in `lib/mcp`; the product CLI does not yet expose a long-running
+- MCP has a line-oriented stdio JSON-RPC dispatcher in `go/pkg/antfly/lib/mcp`; the product CLI does not yet expose a long-running
   stdio server mode. This is also not exposed by Antfly's Go product code, even though the Go SDK supports it.
 - A2A task storage is in-memory only. That matches the current Antfly Go mount; durable storage is still out of scope
   until product requirements demand it.
@@ -115,7 +115,7 @@ registered outside the libraries.
 The next durability improvements should be:
 
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
-2. Expose the `lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
+2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
 3. Add durable task store plumbing if A2A task state needs to survive process restart.
 4. Broaden adapter failure mapping and tool schema stability tests.
 5. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to

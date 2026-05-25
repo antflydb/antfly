@@ -224,9 +224,8 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .provider = providerToOpenApi(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
-            .openai, .ollama, .mock => if (cfg.url.len > 0) cfg.url else null,
+            .openai, .ollama, .antfly, .mock => if (cfg.url.len > 0) cfg.url else null,
             .termite => null,
-            .antfly => null,
         },
         .api_url = switch (cfg.provider) {
             .termite => if (cfg.url.len > 0) cfg.url else null,

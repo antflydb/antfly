@@ -19,8 +19,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
-    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "build": "tsup",
+    "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
@@ -28,10 +28,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check . --write --unsafe",
 
-    "generate": "openapi-typescript ../../../openapi.yaml -o ./src/antfly-api.d.ts --default-non-nullable=false && openapi-typescript ../../../bleve-query-openapi.yaml --client fetch -o ./src/bleve-query.d.ts --default-non-nullable=false",
+    "generate": "openapi-typescript ../../../openapi.yaml -o ./src/public-api.d.ts --default-non-nullable=false && openapi-typescript ../../../specs/openapi/antfly/query.yaml --client fetch -o ./src/query.d.ts --default-non-nullable=false",
     "clean": "rm -rf dist",
     "prepare": "pnpm run build",
-    "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run build && pnpm run test",
     "example:node": "tsx examples/node-example.ts"
   },
   "keywords": [

@@ -20,7 +20,15 @@ There is no public artifact kind for one model task. LLM outputs, OCR text,
 transcripts, classifications, entity extraction, captions, audio/image
 derivatives, and similar model-produced payloads are `asset` artifacts with
 explicit `content_type` and optional schema metadata. The artifact name and
-enrichment kind describe the producer; `kind` describes the storage shape.
+enrichment producer describe what made the value; `kind` describes the Antfly
+artifact family.
+
+`content_type` is not a replacement for `kind`. `kind` is the storage and
+indexing family (`asset`, `chunk`, `embedding`, graph edge families, and later
+other first-class artifact families). `content_type` describes how to decode or
+project an artifact value (`text/plain`, `application/json`,
+`application/vnd.antfly.embedding+binary`, etc.). This is why chunks and
+embeddings stay artifact families even though they also have content types.
 
 The rule is:
 
@@ -99,6 +107,16 @@ Example response:
 }
 ```
 
+Asset rows store only the artifact value bytes. They do not embed
+`content_type`, producer configuration, schema names, or source metadata in the
+row payload. That metadata belongs to the enrichment/catalog configuration and
+is joined in when `_artifacts` is projected. For lookup projection:
+
+- `text/plain` assets are returned as JSON strings.
+- `application/json` assets are parsed and returned as JSON values.
+- other asset content types can be returned as strings, opaque bytes, or direct
+  artifact references depending on the API surface and field projection.
+
 ## Artifact Identity
 
 `ArtifactRef` remains the structured identity. `artifact_id` remains the opaque,
@@ -138,18 +156,19 @@ Example:
 ```json
 {
   "name": "page_ocr_v1",
-  "kind": "ocr_text",
+  "kind": "asset",
   "input": {
     "source": "document_field",
     "field": "image"
   },
   "output": {
     "artifact_name": "page_ocr_v1",
-    "artifact_kind": "asset",
     "content_type": "text/plain"
   },
   "provider": {
-    "type": "termite",
+    "role": "reader",
+    "type": "antfly",
+    "url": "http://127.0.0.1:8080",
     "model": "ocr/default"
   },
   "trigger": {
@@ -163,6 +182,21 @@ Example:
   }
 }
 ```
+
+The model-facing provider roles are separate from artifact kinds:
+
+- **generators** call LLM-style generation endpoints, including tool-calling
+  models and prompt-driven extraction.
+- **transcribers** produce text or structured transcript values from audio.
+- **readers** produce text or structured values from images/documents, including
+  OCR providers and multimodal LLMs.
+- **chunkers**, **embedders**, and **rerankers** keep their current index-facing
+  roles.
+
+For Zig providers, `antfly` is the canonical local/remote provider name. A
+provider config with `provider: "antfly"` and no `url` uses the local Termite
+runtime when available. Supplying `url` routes to an Antfly/Termite-compatible
+HTTP service. `termite` remains an alias while older configs migrate.
 
 ## Distributed System Boundary
 
@@ -194,8 +228,7 @@ Example:
   "name": "relations_graph",
   "kind": "graph",
   "source": {
-    "artifact_name": "relations_v1",
-    "artifact_kind": "graph_edges"
+    "artifact_name": "relations_v1"
   }
 }
 ```
@@ -210,7 +243,6 @@ relations, when the producer naturally emits them together:
 ```json
 {
   "artifact_name": "entity_graph_v1",
-  "artifact_kind": "asset",
   "content_type": "application/json",
   "schema": "antfly.extraction.v1",
   "value": {

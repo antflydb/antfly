@@ -22,7 +22,7 @@ The approach uses the existing bleve filter query JSON DSL (already used for `fi
 |------|--------|
 | `src/metadata/foreign/filter.go` | Add `FilterToLiteralSQL` — translates bleve JSON filter to SQL with inlined literal values (for `CREATE PUBLICATION WHERE`) |
 | `src/store/table.go` | Add `ReplicationRouteConfig` struct, add `Routes` + `PublicationFilter` (now `json.RawMessage`) to `ReplicationSourceConfig` |
-| `src/metadata/api.yaml` | Add `ReplicationRoute` schema, add `routes` + `publication_filter` (bleve query JSON) to `ReplicationSource` |
+| `src/metadata/api.yaml` | Add `ReplicationRoute` schema, add `routes` + `publication_filter` (Antfly query JSON) to `ReplicationSource` |
 | `src/metadata/foreign/replication.go` | Add `ReplicationRouteConfig` to `ReplicationConfig`, add `processDataChangeRouted`/`processDeleteRouted`, modify `ensurePublication` to use `FilterToLiteralSQL` |
 | `src/metadata/foreign/replication_manager.go` | Pass routes + publication_filter through to `ReplicationConfig` |
 | `src/metadata/api.go` | Map routes + publication_filter in `CreateTable` handler and `replicationSourcesToAPI` |
@@ -110,13 +110,13 @@ Note: `json.RawMessage` works because `store` already imports `json "github.com/
 
 Add `ReplicationRoute` schema (after `ReplicationTransformOp`, ~line 4149):
 - `target_table`: required string
-- `where`: bleve query ref (`$ref: "../../bleve-query-openapi.yaml#/components/schemas/Query"` with `x-go-type: json.RawMessage`)
+- `where`: Antfly query ref (`$ref: "../../specs/openapi/antfly/query.yaml#/components/schemas/Query"` with `x-go-type: json.RawMessage`)
 - `key_template`: optional string (override source-level)
 - `on_update`: optional array of `ReplicationTransformOp`
 - `on_delete`: optional array of `ReplicationTransformOp`
 
 Add to `ReplicationSource` properties:
-- `publication_filter`: bleve query JSON (same `$ref` + `x-go-type: json.RawMessage` pattern as `filter_query`). Translated to SQL via `FilterToLiteralSQL` for the PG publication WHERE clause.
+- `publication_filter`: Antfly query JSON (same `$ref` + `x-go-type: json.RawMessage` pattern as `filter_query`). Translated to SQL via `FilterToLiteralSQL` for the PG publication WHERE clause.
 - `routes`: array of `ReplicationRoute`
 
 ### Step 6: Regenerate

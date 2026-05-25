@@ -2350,7 +2350,97 @@ The original implementation shape below has been replaced by the implemented
 above. The remaining value in this section is the adversarial coverage checklist
 for structured internal keys and public document-ID boundaries.
 
-Minimum coverage should include:
+- `go/pkg/antfly/src/storage/key_codec.zig`
+
+Suggested responsibilities:
+
+- encode a single component
+- decode a single component
+- build primary document keys
+- build TTL keys
+- build summary, embedding, chunk, artifact, and edge keys
+- parse internal keys back into structured parts where needed
+- compute prefix scan bounds for document-ID prefixes
+
+The important rule is that key construction and parsing should be centralized.
+Call sites should not manually append delimiters or inspect textual suffixes.
+
+## Migration Plan
+
+### Option A: Flag Day
+
+Introduce the new codec and require fresh databases.
+
+Pros:
+
+- simplest implementation
+- avoids dual-format parsing
+- easiest to reason about
+
+Cons:
+
+- old on-disk data must be rebuilt or migrated offline
+
+### Option B: Dual Read, New Write
+
+Teach the storage layer to read both old and new key formats but only write the
+new one.
+
+Pros:
+
+- softer migration
+
+Cons:
+
+- more code complexity
+- scan logic gets harder because both formats must be considered
+- deletes and artifact cleanup become easier to get wrong
+
+### Option C: Offline Rewrite Tool
+
+Add a one-shot migration utility that reads an old DB and writes a new DB using
+the new codec.
+
+Pros:
+
+- keeps runtime code clean
+- explicit operational boundary
+
+Cons:
+
+- requires migration tooling and validation
+
+### Recommended Path
+
+For `antfly-zig`, prefer:
+
+1. implement the new codec
+2. switch runtime storage to the new format
+3. use fresh databases for development and testing first
+4. add an offline rewrite tool later if old data needs to be preserved
+
+This is materially safer than carrying both formats in the main code path.
+
+## Code Areas Affected
+
+The change is broader than `DocStore` alone.
+
+Primary places that must move off delimiter semantics:
+
+- `go/pkg/antfly/src/storage/docstore.zig`
+- `go/pkg/antfly/src/storage/db/db.zig`
+- `go/pkg/antfly/src/storage/ttl.zig`
+- `go/pkg/antfly/src/storage/db/catalog/index_manager.zig`
+- any enrichment or artifact scan code that currently prefixes on raw `doc_key`
+- any graph-key parser that currently searches for `:i:`, `:out:`, or `:in:`
+
+The dense-vector metadata mapping should also stop embedding raw `doc_key`
+inside metadata strings and instead use the same encoded component scheme under
+its metadata namespace.
+
+## Testing Requirements
+
+Minimum test coverage should include:
 
 - ordering of encoded document IDs matches ordering of raw document IDs
 - round-trip encode/decode for arbitrary bytes, including `0x00` and `0xff`

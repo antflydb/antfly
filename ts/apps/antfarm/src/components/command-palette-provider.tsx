@@ -9,7 +9,7 @@ import {
   CommandList,
   CommandSeparator,
 } from "@antfly/design-system";
-import { TermiteClient } from "@antfly/termite-sdk";
+import { TermiteClient } from "@antfly/sdk";
 import {
   ArrowUpDown,
   ClipboardCheck,

@@ -36,7 +36,7 @@ import { fetchWithRetry } from "@/lib/utils";
 
 interface RerankResponse {
   model: string;
-  scores: number[];
+  data: { index: number; score: number }[];
 }
 
 interface ModelInfo {
@@ -293,15 +293,17 @@ const RerankingPlaygroundPage: React.FC = () => {
 
   // Get ranked documents sorted by score
   const getRankedDocuments = (): RankedDocument[] => {
-    if (!result?.scores) return [];
+    if (!result?.data) return [];
 
     const nonEmptyDocs = documents.filter((d) => d.trim());
-    const ranked = result.scores.map((score, index) => ({
-      index,
-      text: nonEmptyDocs[index] || "",
-      score,
-      rank: 0,
-    }));
+    const ranked = [...result.data]
+      .sort((a, b) => a.index - b.index)
+      .map((item) => ({
+        index: item.index,
+        text: nonEmptyDocs[item.index] || "",
+        score: item.score,
+        rank: 0,
+      }));
 
     // Sort by score descending
     ranked.sort((a, b) => b.score - a.score);
@@ -316,8 +318,8 @@ const RerankingPlaygroundPage: React.FC = () => {
 
   // Get the max score for normalization
   const getMaxScore = (): number => {
-    if (!result?.scores || result.scores.length === 0) return 1;
-    return Math.max(...result.scores);
+    if (!result?.data || result.data.length === 0) return 1;
+    return Math.max(...result.data.map((item) => item.score));
   };
 
   const getScoreColor = (score: number, maxScore: number) => {
@@ -446,7 +448,7 @@ const RerankingPlaygroundPage: React.FC = () => {
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
-            {result.scores.length} documents
+            {result.data.length} documents
           </Badge>
           <Badge variant="secondary" className="gap-1.5">
             <Zap className="h-3 w-3" />

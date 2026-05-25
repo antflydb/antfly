@@ -94,8 +94,10 @@ pub const Config = struct {
     termite: ?antfly_termite_config_openapi.Config = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
-    /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```yaml speech_to_text: whisper-local: provider: termite api_url: "http://localhost:8080" model: openai/whisper-base openai-whisper: provider: openai model: whisper-1 ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
-    speech_to_text: ?std.json.ArrayHashMap(antfly_audio_openapi.STTConfig) = null,
+    /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```yaml transcribers: whisper-local: provider: termite api_url: "http://localhost:8080" model: openai/whisper-base openai-whisper: provider: openai model: whisper-1 ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
+    transcribers: ?std.json.Value = null,
+    /// Named reader/OCR/VLM provider configurations. Parsed by the Zig readers registry.
+    readers: ?std.json.Value = null,
     cors: ?antfly_middleware_openapi.CORSConfig = null,
     /// How many replicas of each shard should be maintained.
     replication_factor: ?i64 = null,
