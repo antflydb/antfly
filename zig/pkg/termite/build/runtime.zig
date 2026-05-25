@@ -478,6 +478,7 @@ fn addTermiteApiModule(
             .optimize = optimize,
         });
         mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_ai_messages_openapi", addAiMessagesOpenApiModule(b, target, optimize, paths));
         return mod;
     }
 
@@ -499,6 +500,8 @@ fn addTermiteApiModule(
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", "termite_api" });
     codegen.addArgs(&.{ "--generate", "types,server,client" });
+    codegen.addArgs(&.{"--import-mapping"});
+    codegen.addArg(b.fmt("{s}={s}", .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" }));
     codegen.addArg("--output");
     const gen_dir = codegen.addOutputDirectoryArg("termite_api");
     const mod = addOrCreateModule(b, register_public_modules, "termite_api", .{
@@ -507,7 +510,21 @@ fn addTermiteApiModule(
         .optimize = optimize,
     });
     mod.addImport("httpx", httpx_mod);
+    mod.addImport("antfly_ai_messages_openapi", addAiMessagesOpenApiModule(b, target, optimize, paths));
     return mod;
+}
+
+fn addAiMessagesOpenApiModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    paths: Paths,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_ai_messages_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
 }
 
 fn addTokenizerDataModule(b: *std.Build, paths: Paths, register_public_modules: bool) *std.Build.Module {

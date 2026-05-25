@@ -14049,6 +14049,141 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
     try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.indexes[0].doc_count);
 }
 
+test "provisioned query db installs asset producer from indexes_json and replays assets" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-asset-enrichment";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(group_path);
+    {
+        var db = try db_mod.DB.open(alloc, group_path, .{});
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"body\":\"hello\"}",
+            }},
+            .sync_level = .write,
+        });
+    }
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+
+    const FakeLocal = struct {
+        calls: usize = 0,
+
+        fn embedDenseTexts(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            texts: []const []const u8,
+        ) anyerror![][]f32 {
+            _ = ptr;
+            _ = a;
+            _ = model;
+            _ = texts;
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparseTexts(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            texts: []const []const u8,
+        ) anyerror![]db_embedder.SparseEmbedding {
+            _ = ptr;
+            _ = a;
+            _ = model;
+            _ = texts;
+            return error.TestUnexpectedResult;
+        }
+
+        fn generateText(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            roles: []const []const u8,
+            contents: []const []const u8,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("local-model", model);
+            try std.testing.expectEqual(@as(usize, 1), roles.len);
+            try std.testing.expectEqualStrings("user", roles[0]);
+            try std.testing.expectEqualStrings("hello", contents[0]);
+            return try a.dupe(u8, "generator:hello");
+        }
+    };
+
+    var fake = FakeLocal{};
+    const local_provider = managed_embedder.LocalTermiteProvider{
+        .ptr = &fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_text = FakeLocal.generateText,
+    };
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json =
+                    \\{"search_idx":{"type":"full_text","field":"body","enrichments":[{"name":"generated_title_v1","kind":"asset","field":"body","content_type":"text/plain","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}"}]}}
+                    ,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+    cache.backend_runtime = &backend_runtime;
+    cache.local_termite_provider = local_provider;
+
+    var db_lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 0, "docs");
+    defer db_lease.release();
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    var lookup = (try db_lease.db.lookup(alloc, "doc:a", .{
+        .fields = &.{"_artifacts"},
+        .include_all_fields = false,
+    })).?;
+    defer lookup.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{});
+    defer parsed.deinit();
+    const artifacts = parsed.value.object.get("_artifacts").?.object;
+    try std.testing.expectEqualStrings("generator:hello", artifacts.get("generated_title_v1").?.object.get("value").?.string);
+}
+
 test "provisioned table read source runtime status stays cache-only without shared snapshot" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-read-runtime-cache";

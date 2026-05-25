@@ -2305,8 +2305,8 @@ fn buildGenerationMessages(
         );
 
     const messages = try alloc.alloc(generating.ChatMessage, 2);
-    messages[0] = .{ .role = .system, .content = system_prompt };
-    messages[1] = .{ .role = .user, .content = user_prompt };
+    messages[0] = .{ .role = .system, .content = .{ .text = system_prompt } };
+    messages[1] = .{ .role = .user, .content = .{ .text = user_prompt } };
     return messages;
 }
 

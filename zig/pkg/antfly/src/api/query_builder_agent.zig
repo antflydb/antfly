@@ -2471,7 +2471,7 @@ fn buildGraphQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2539,8 +2539,8 @@ fn buildSemanticQueryBuilderMessages(
         .{ intent, if (hybrid_mode) "hybrid" else "semantic", if (hybrid_mode) "{ ... native Bleve query ... }" else "null" },
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 
@@ -2575,7 +2575,7 @@ fn buildSemanticQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2709,8 +2709,8 @@ fn buildBleveQueryBuilderMessages(
         .{intent},
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 
@@ -2743,7 +2743,7 @@ fn buildBleveQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2847,8 +2847,8 @@ fn buildGraphQueryBuilderMessages(
         .{intent},
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 

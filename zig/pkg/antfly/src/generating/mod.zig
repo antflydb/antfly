@@ -22,6 +22,8 @@ const termite_provider = @import("../inference/termite.zig");
 const common_secrets = @import("../common/secrets.zig");
 
 pub const Role = lib.Role;
+pub const ContentPart = lib.ContentPart;
+pub const ChatMessageContent = lib.ChatMessageContent;
 pub const ChatMessage = lib.ChatMessage;
 pub const GenerateResult = lib.GenerateResult;
 pub const Provider = lib.Provider;
@@ -151,20 +153,6 @@ const BackendState = struct {
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
-        const inference_messages = try alloc.alloc(inference.ChatMessage, messages.len);
-        defer alloc.free(inference_messages);
-
-        for (messages, 0..) |message, i| {
-            inference_messages[i] = .{
-                .role = switch (message.role) {
-                    .system => .system,
-                    .user => .user,
-                    .assistant => .assistant,
-                },
-                .content = message.content,
-            };
-        }
-
         var result = switch (self.provider) {
             .openai => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
@@ -172,9 +160,9 @@ const BackendState = struct {
                     defer alloc.free(auth_header);
                     try provider.setAuthorizationHeader(auth_header);
                 }
-                break :blk try provider.generator().generate(alloc, model, inference_messages);
+                break :blk try provider.generator().generate(alloc, model, messages);
             },
-            .termite => |*provider| try provider.generator().generate(alloc, model, inference_messages),
+            .termite => |*provider| try provider.generator().generate(alloc, model, messages),
             .local_termite => |local| blk: {
                 const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
@@ -182,12 +170,8 @@ const BackendState = struct {
                 const contents = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(contents);
                 for (messages, 0..) |message, i| {
-                    roles[i] = switch (message.role) {
-                        .system => "system",
-                        .user => "user",
-                        .assistant => "assistant",
-                    };
-                    contents[i] = message.content;
+                    roles[i] = message.role.toSlice();
+                    contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
                 const content = try generate_text(local.ptr, alloc, model, roles, contents);
                 break :blk inference.GenerateResult{
@@ -204,6 +188,14 @@ const BackendState = struct {
         };
     }
 };
+
+fn textContent(message: ChatMessage) ?[]const u8 {
+    const content = message.content orelse return "";
+    return switch (content) {
+        .text => |text| text,
+        .parts => null,
+    };
+}
 
 pub fn executeChain(
     alloc: std.mem.Allocator,
@@ -287,7 +279,7 @@ test "generating backend factory executes fallback chain across providers" {
             err_out: *?anyerror,
         ) std.Io.Cancelable!void {
             _ = test_io;
-            var result = executeChain(a, test_client, links, &.{.{ .role = .user, .content = "hello" }}) catch |err| {
+            var result = executeChain(a, test_client, links, &.{.{ .role = .user, .content = .{ .text = "hello" } }}) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -371,7 +363,7 @@ test "generating backend routes antfly and url-less termite to local provider" {
         .generate_text = FakeLocal.generateText,
     };
 
-    const messages = [_]ChatMessage{.{ .role = .user, .content = "hello" }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
     const antfly_chain = [_]ChainLink{.{
         .generator = .{
             .provider = .antfly,

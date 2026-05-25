@@ -1023,67 +1023,15 @@ components:
           type: string
           description: Error message
     TextContentPart:
-      type: object
-      description: Text content for embedding
-      required:
-        - type
-        - text
-      properties:
-        type:
-          type: string
-          enum:
-            - text
-        text:
-          type: string
-          description: Text content to embed
+      $ref: '../ai/messages.yaml#/components/schemas/TextContentPart'
     ImageURL:
-      type: object
-      description: Image URL or data URI
-      required:
-        - url
-      properties:
-        url:
-          type: string
-          description: URL or data URI (data:image/png;base64,...)
-          example: data:image/png;base64,iVBORw0KGgo...
+      $ref: '../ai/messages.yaml#/components/schemas/ImageURL'
     ImageURLContentPart:
-      type: object
-      description: Image content for embedding (OpenAI-compatible format)
-      required:
-        - type
-        - image_url
-      properties:
-        type:
-          type: string
-          enum:
-            - image_url
-        image_url:
-          $ref: '#/components/schemas/ImageURL'
+      $ref: '../ai/messages.yaml#/components/schemas/ImageURLContentPart'
     MediaContentPart:
-      type: object
-      description: Inline binary media content (audio, image, etc.)
-      required:
-        - type
-        - data
-        - mime_type
-      properties:
-        type:
-          type: string
-          enum:
-            - media
-        data:
-          type: string
-          format: byte
-          description: Base64-encoded binary data
-        mime_type:
-          type: string
-          description: MIME type (audio/wav, image/gif, image/png, etc.)
+      $ref: '../ai/messages.yaml#/components/schemas/MediaContentPart'
     ContentPart:
-      description: A content part for multimodal input (text, image URL, or inline media)
-      oneOf:
-        - $ref: '#/components/schemas/TextContentPart'
-        - $ref: '#/components/schemas/ImageURLContentPart'
-        - $ref: '#/components/schemas/MediaContentPart'
+      $ref: '../ai/messages.yaml#/components/schemas/ContentPart'
     EmbedRequest:
       type: object
       description: OpenAI-compatible embedding request with Termite multimodal content-part extension
@@ -2552,39 +2500,9 @@ components:
           description: Whether to enforce strict parameter validation
           default: false
     ToolCall:
-      type: object
-      description: A tool call made by the model
-      required:
-        - id
-        - type
-        - function
-      properties:
-        id:
-          type: string
-          description: Unique identifier for this tool call
-          example: call_abc123
-        type:
-          type: string
-          enum:
-            - function
-          description: The type of tool call (currently only "function")
-        function:
-          $ref: '#/components/schemas/ToolCallFunction'
+      $ref: '../ai/messages.yaml#/components/schemas/ToolCall'
     ToolCallFunction:
-      type: object
-      description: The function called by the model
-      required:
-        - name
-        - arguments
-      properties:
-        name:
-          type: string
-          description: The name of the function called
-          example: get_weather
-        arguments:
-          type: string
-          description: JSON string of the arguments to the function
-          example: '{"location": "San Francisco, CA"}'
+      $ref: '../ai/messages.yaml#/components/schemas/ToolCallFunction'
     ToolChoice:
       description: |
         Controls how the model uses tools. Options:
@@ -2617,13 +2535,7 @@ components:
                   type: string
                   description: The name of the function to call
     Role:
-      type: string
-      enum:
-        - system
-        - user
-        - assistant
-        - tool
-      description: The role of a message sender in a conversation
+      $ref: '../ai/messages.yaml#/components/schemas/ChatMessageRole'
     FinishReason:
       type: string
       enum:
@@ -2634,34 +2546,9 @@ components:
         - function_call
       description: Reason why generation stopped
     ChatMessageContent:
-      description: |
-        Message content. Supports two formats:
-        - Simple string: "Hello, how are you?"
-        - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-      oneOf:
-        - type: string
-          description: Simple text content
-        - type: array
-          description: Array of content parts (OpenAI multimodal format)
-          items:
-            $ref: '#/components/schemas/ContentPart'
+      $ref: '../ai/messages.yaml#/components/schemas/ChatMessageContent'
     ChatMessage:
-      type: object
-      required:
-        - role
-      properties:
-        role:
-          $ref: '#/components/schemas/Role'
-        content:
-          $ref: '#/components/schemas/ChatMessageContent'
-        tool_calls:
-          type: array
-          items:
-            $ref: '#/components/schemas/ToolCall'
-          description: Tool calls made by the assistant (only for role=assistant)
-        tool_call_id:
-          type: string
-          description: ID of the tool call this message is responding to (only for role=tool)
+      $ref: '../ai/messages.yaml#/components/schemas/ChatMessage'
     GenerateRequest:
       type: object
       required:

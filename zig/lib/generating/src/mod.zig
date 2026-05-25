@@ -20,11 +20,49 @@ pub const Role = enum {
     system,
     user,
     assistant,
+    tool,
+
+    pub fn toSlice(self: Role) []const u8 {
+        return switch (self) {
+            .system => "system",
+            .user => "user",
+            .assistant => "assistant",
+            .tool => "tool",
+        };
+    }
+};
+
+pub const ImageURL = struct {
+    url: []const u8,
+};
+
+pub const MediaContent = struct {
+    data: []const u8,
+    mime_type: []const u8,
+};
+
+pub const ContentPart = union(enum) {
+    text: []const u8,
+    image_url: ImageURL,
+    media: MediaContent,
+};
+
+pub const ChatMessageContent = union(enum) {
+    text: []const u8,
+    parts: []const ContentPart,
+};
+
+pub const ToolCall = struct {
+    id: []const u8,
+    name: []const u8,
+    arguments: []const u8,
 };
 
 pub const ChatMessage = struct {
     role: Role,
-    content: []const u8,
+    content: ?ChatMessageContent = null,
+    tool_calls: ?[]const ToolCall = null,
+    tool_call_id: ?[]const u8 = null,
 };
 
 pub const GenerateResult = struct {
@@ -622,7 +660,7 @@ test "executeChain falls back on timeout and retries within a link" {
         },
     };
 
-    var retried = try executeChain(alloc, &retry_chain, factory, &.{.{ .role = .user, .content = "hello" }});
+    var retried = try executeChain(alloc, &retry_chain, factory, &.{.{ .role = .user, .content = .{ .text = "hello" } }});
     defer retried.deinit();
     try std.testing.expectEqualStrings("retry-success", retried.content);
 
@@ -638,7 +676,7 @@ test "executeChain falls back on timeout and retries within a link" {
         },
     };
 
-    var fallback = try executeChain(alloc, &fallback_chain, factory, &.{.{ .role = .user, .content = "hello" }});
+    var fallback = try executeChain(alloc, &fallback_chain, factory, &.{.{ .role = .user, .content = .{ .text = "hello" } }});
     defer fallback.deinit();
     try std.testing.expectEqualStrings("fallback-success", fallback.content);
 }
@@ -696,7 +734,7 @@ test "executeChain falls back on rate limit" {
         },
     };
 
-    var result = try executeChain(alloc, &chain, factory, &.{.{ .role = .user, .content = "hello" }});
+    var result = try executeChain(alloc, &chain, factory, &.{.{ .role = .user, .content = .{ .text = "hello" } }});
     defer result.deinit();
     try std.testing.expectEqualStrings("rate-limit-fallback", result.content);
 }

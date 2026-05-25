@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_ai_messages_openapi = @import("antfly_ai_messages_openapi");
 const antfly_websearch_openapi = @import("antfly_websearch_openapi");
 
 pub const GeneratorProvider = antfly_generating_openapi.GeneratorProvider;
@@ -125,57 +126,13 @@ pub const ChainCondition = antfly_generating_openapi.ChainCondition;
 
 pub const ChainLink = antfly_generating_openapi.ChainLink;
 
-/// Role of the message sender in the conversation
-pub const ChatMessageRole = enum {
-    user,
-    assistant,
-    system,
-    tool,
+pub const ChatMessageRole = antfly_ai_messages_openapi.ChatMessageRole;
 
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .user => "user",
-            .assistant => "assistant",
-            .system => "system",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
+pub const ChatToolCall = antfly_ai_messages_openapi.ToolCall;
 
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "system", .system },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
+pub const ChatMessageContent = antfly_ai_messages_openapi.ChatMessageContent;
 
-/// A tool call made by the assistant
-pub const ChatToolCall = struct {
-    /// Unique identifier for this tool call
-    id: []const u8,
-    /// Name of the tool being called
-    name: []const u8,
-    /// Arguments passed to the tool as key-value pairs
-    arguments: std.json.Value,
-};
-
-/// Result from executing a tool call
-pub const ChatToolResult = struct {
-    /// ID of the tool call this result corresponds to
-    tool_call_id: []const u8,
-    /// Result data from the tool execution
-    result: std.json.Value,
-    /// Error message if tool execution failed
-    @"error": ?[]const u8 = null,
-};
+pub const ChatMessage = antfly_ai_messages_openapi.ChatMessage;
 
 /// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
 pub const ChatToolName = enum {
@@ -321,17 +278,6 @@ pub const ConfidenceStepConfig = struct {
     chain: ?[]const ChainLink = null,
     /// Custom guidance for confidence assessment approach
     context: ?[]const u8 = null,
-};
-
-/// A message in the conversation history
-pub const ChatMessage = struct {
-    role: ChatMessageRole,
-    /// Text content of the message
-    content: []const u8,
-    /// Tool calls made by the assistant (only for assistant role)
-    tool_calls: ?[]const ChatToolCall = null,
-    /// Results from tool executions (only for tool role)
-    tool_results: ?[]const ChatToolResult = null,
 };
 
 /// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.

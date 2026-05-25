@@ -995,11 +995,15 @@ fn addOpenApiRegenStep(
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/generating/openapi.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/reranking/openapi.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/ai/messages.yaml"), "antfly_ai_messages_openapi", antfly_generated_root ++ "/antfly_ai_messages_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/ai/openapi.yaml"), "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi", "types", &.{
             .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../websearch/openapi.yaml", "antfly_websearch_openapi" },
+            .{ "../../../../../specs/openapi/ai/messages.yaml", "antfly_ai_messages_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{
+            .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" },
+        }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
     };
 
@@ -1146,6 +1150,7 @@ pub fn build(b: *std.Build) void {
     const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
+    const ai_messages_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_ai_messages_openapi", antfly_generated_root ++ "/antfly_ai_messages_openapi");
     const ai_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi");
     indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1154,6 +1159,7 @@ pub fn build(b: *std.Build) void {
     eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     ai_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     ai_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
+    ai_openapi_mod.addImport("antfly_ai_messages_openapi", ai_messages_openapi_mod);
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     public_openapi_mod.addImport("antfly_ai_openapi", ai_openapi_mod);
@@ -1503,6 +1509,7 @@ pub fn build(b: *std.Build) void {
     });
     const termite_build_options_mod = termite_graph.build_options_mod;
     const termite_api_mod = termite_graph.termite_api_mod;
+    termite_api_mod.addImport("antfly_ai_messages_openapi", ai_messages_openapi_mod);
     const termite_hf_tokenizer_mod = termite_graph.termite_hf_tokenizer_mod;
     const termite_fixed_tokenizer_data_mod = termite_graph.termite_fixed_tokenizer_data_mod;
     const termite_chunker_mod = termite_graph.termite_chunker_mod;

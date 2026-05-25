@@ -104,67 +104,22 @@ pub const Runtime = struct {
     fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         var cfg = try generating_runtime.parseConfigFromSlice(alloc, request.config_json);
         defer cfg.deinit(alloc);
-        if (request.source_parts_json) |raw_parts| {
-            if (raw_parts.len > 0) return try self.generateMultimodal(alloc, cfg, request.source_text, raw_parts);
-        }
+        var parts: ?[]generating_runtime.ContentPart = null;
+        defer if (parts) |items| freeGeneratorContentParts(alloc, items);
+        const content: generating_runtime.ChatMessageContent = if (request.source_parts_json) |raw_parts| blk: {
+            if (raw_parts.len == 0) break :blk .{ .text = request.source_text };
+            parts = try parseGeneratorContentParts(alloc, request.source_text, raw_parts);
+            break :blk .{ .parts = parts.? };
+        } else .{ .text = request.source_text };
         const link = generating_runtime.ChainLink{ .generator = cfg };
         var result = try generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
             .local_termite_provider = self.local_termite_provider,
             .secret_store = self.secret_store,
         }, &.{
-            .{ .role = .user, .content = request.source_text },
+            .{ .role = .user, .content = content },
         });
         defer result.deinit();
         return try alloc.dupe(u8, result.content);
-    }
-
-    fn generateMultimodal(
-        self: *Runtime,
-        alloc: Allocator,
-        cfg: generating_runtime.GeneratorConfig,
-        source_text: []const u8,
-        source_parts_json: []const u8,
-    ) ![]u8 {
-        const endpoint = try generatorEndpointUrlAlloc(alloc, cfg);
-        defer alloc.free(endpoint);
-
-        const content_json = switch (cfg.provider) {
-            .openai, .ollama => try openAiContentJsonAlloc(alloc, source_text, source_parts_json),
-            .termite, .antfly => try alloc.dupe(u8, source_parts_json),
-            else => return error.UnsupportedGeneratorProvider,
-        };
-        defer alloc.free(content_json);
-
-        const body = try generatorRequestJsonAlloc(alloc, cfg.model, content_json);
-        defer alloc.free(body);
-
-        var auth_header_storage: ?[]u8 = null;
-        defer if (auth_header_storage) |value| alloc.free(value);
-        const headers: ?[]const [2][]const u8 = if (cfg.api_key) |api_key| blk: {
-            auth_header_storage = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
-            break :blk &[_][2][]const u8{.{ "Authorization", auth_header_storage.? }};
-        } else null;
-
-        var resp = try self.http.post(endpoint, .{
-            .json = body,
-            .headers = headers,
-            .timeout_ms = 300_000,
-        });
-        defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
-        const resp_body = resp.body orelse return error.EmptyResponse;
-
-        const Response = struct {
-            choices: []const struct {
-                message: struct {
-                    content: ?[]const u8 = null,
-                },
-            },
-        };
-        var parsed = try std.json.parseFromSlice(Response, alloc, resp_body, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        if (parsed.value.choices.len == 0) return error.EmptyResponse;
-        return try alloc.dupe(u8, parsed.value.choices[0].message.content orelse return error.EmptyResponse);
     }
 
     fn read(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -306,42 +261,17 @@ fn isJsonContentType(content_type: []const u8) bool {
         std.mem.endsWith(u8, content_type, "+json");
 }
 
-fn generatorEndpointUrlAlloc(alloc: Allocator, cfg: generating_runtime.GeneratorConfig) ![]u8 {
-    const base = switch (cfg.provider) {
-        .termite => if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082",
-        .antfly => if (cfg.url.len > 0) cfg.url else return error.UnsupportedGeneratorProvider,
-        .openai, .ollama => cfg.url,
-        else => return error.UnsupportedGeneratorProvider,
-    };
-    const path = switch (cfg.provider) {
-        .termite, .antfly => "/generate",
-        .openai, .ollama => "/chat/completions",
-        else => unreachable,
-    };
-    if (base.len == 0) return error.UnsupportedGeneratorProvider;
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, path });
-}
-
-fn generatorRequestJsonAlloc(alloc: Allocator, model: []const u8, content_json: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"model\":");
-    try appendJsonString(alloc, &out, model);
-    try out.appendSlice(alloc, ",\"messages\":[{\"role\":\"user\",\"content\":");
-    try out.appendSlice(alloc, content_json);
-    try out.appendSlice(alloc, "}]}");
-    return try out.toOwnedSlice(alloc);
-}
-
-fn openAiContentJsonAlloc(alloc: Allocator, source_text: []const u8, raw_parts: []const u8) ![]u8 {
+fn parseGeneratorContentParts(alloc: Allocator, source_text: []const u8, raw_parts: []const u8) ![]generating_runtime.ContentPart {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
     defer parsed.deinit();
-    if (parsed.value != .array) return try jsonStringAlloc(alloc, source_text);
+    if (parsed.value != .array) {
+        const items = try alloc.alloc(generating_runtime.ContentPart, 1);
+        items[0] = .{ .text = try alloc.dupe(u8, source_text) };
+        return items;
+    }
 
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.append(alloc, '[');
-    var first = true;
+    var parts = std.ArrayListUnmanaged(generating_runtime.ContentPart).empty;
+    errdefer freeGeneratorContentParts(alloc, parts.items);
     for (parsed.value.array.items) |part| {
         if (part != .object) continue;
         const type_value = part.object.get("type") orelse continue;
@@ -349,48 +279,46 @@ fn openAiContentJsonAlloc(alloc: Allocator, source_text: []const u8, raw_parts: 
         if (std.mem.eql(u8, type_value.string, "text")) {
             const text = part.object.get("text") orelse continue;
             if (text != .string) continue;
-            if (!first) try out.append(alloc, ',');
-            first = false;
-            try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
-            try appendJsonString(alloc, &out, text.string);
-            try out.append(alloc, '}');
+            try parts.append(alloc, .{ .text = try alloc.dupe(u8, text.string) });
+        } else if (std.mem.eql(u8, type_value.string, "image_url")) {
+            const image_url = part.object.get("image_url") orelse continue;
+            if (image_url != .object) continue;
+            const url = image_url.object.get("url") orelse continue;
+            if (url != .string) continue;
+            try parts.append(alloc, .{ .image_url = .{ .url = try alloc.dupe(u8, url.string) } });
         } else if (std.mem.eql(u8, type_value.string, "media")) {
-            const url = if (part.object.get("url")) |url_value| blk: {
-                if (url_value != .string) continue;
-                break :blk url_value.string;
-            } else if (part.object.get("mime_type")) |mime| blk: {
+            if (part.object.get("url")) |url| {
+                if (url == .string) try parts.append(alloc, .{ .image_url = .{ .url = try alloc.dupe(u8, url.string) } });
+            } else if (part.object.get("mime_type")) |mime| {
                 const data = part.object.get("data") orelse continue;
-                if (mime != .string or data != .string) continue;
-                break :blk try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime.string, data.string });
-            } else continue;
-            const owned_url = part.object.get("url") == null;
-            defer if (owned_url) alloc.free(@constCast(url));
-            if (!first) try out.append(alloc, ',');
-            first = false;
-            try out.appendSlice(alloc, "{\"type\":\"image_url\",\"image_url\":{\"url\":");
-            try appendJsonString(alloc, &out, url);
-            try out.appendSlice(alloc, "}}");
+                if (mime == .string and data == .string) {
+                    try parts.append(alloc, .{ .media = .{
+                        .data = try alloc.dupe(u8, data.string),
+                        .mime_type = try alloc.dupe(u8, mime.string),
+                    } });
+                }
+            }
         }
     }
-    try out.append(alloc, ']');
-    if (first) {
-        out.deinit(alloc);
-        return try jsonStringAlloc(alloc, source_text);
+
+    if (parts.items.len == 0) {
+        try parts.append(alloc, .{ .text = try alloc.dupe(u8, source_text) });
     }
-    return try out.toOwnedSlice(alloc);
+    return try parts.toOwnedSlice(alloc);
 }
 
-fn jsonStringAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try appendJsonString(alloc, &out, value);
-    return try out.toOwnedSlice(alloc);
-}
-
-fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
+fn freeGeneratorContentParts(alloc: Allocator, parts: []generating_runtime.ContentPart) void {
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| alloc.free(@constCast(text)),
+            .image_url => |image_url| alloc.free(@constCast(image_url.url)),
+            .media => |media| {
+                alloc.free(@constCast(media.data));
+                alloc.free(@constCast(media.mime_type));
+            },
+        }
+    }
+    alloc.free(parts);
 }
 
 test "asset producer runtime parses reader multimodal parts" {
