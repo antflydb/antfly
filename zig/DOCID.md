@@ -1237,7 +1237,9 @@ Status as of 2026-05-19:
   round-trip/merge regression, and forced full-text compaction has DB-level
   coverage that a merged segment keeps the ordinal sidecar in live-document
   order: a resolved ordinal filter continues to match the same document after
-  compaction and after reopening the database.
+  compaction and after reopening the database. Primary LSM compaction now has
+  matching DB-level coverage: document identity forward/reverse mappings remain
+  stable across flush/compaction, update/delete churn, and reopen.
 - Public query JSON now accepts a top-level `with` object for named document
   filters and treats `{ "ref": "name" }` as a structured filter clause. The
   query parser normalizes each public binding once into
@@ -1405,11 +1407,12 @@ Status as of 2026-05-19:
   intent writes use the same guard under the DB apply lock before storing
   pending intents, so exhausted shards do not accept new-document transaction
   writes that would later be unable to allocate identity rows at commit.
-  Metadata merge planning and public merge-intent validation now also treat
-  exhausted ordinal capacity as a DOCID readiness failure, including explicit
-  merge-reassignment opt-ins. Split remains the preferred operational response
-  for large ranges approaching the `u32` boundary; merge is blocked because it
-  would combine exhausted or near-exhausted identity domains.
+  Metadata split/merge planning and public split/merge validation now also
+  treat exhausted ordinal capacity as a DOCID readiness failure, including
+  explicit merge-reassignment opt-ins. Split remains the preferred operational
+  response for large ranges approaching the `u32` boundary, but once a range has
+  reached the exhausted sentinel, lifecycle planning fails closed until repair,
+  reassignment, or rebuild establishes a safe identity boundary.
   Focused coverage exercises that
   fail-closed behavior for `propose`, `write`, `full_text`, `enrichments`,
   `aknn`, and `full_index` sync levels plus direct and request-shaped
@@ -1491,6 +1494,26 @@ Status as of 2026-05-19:
   fast local matrix; the default non-smoke matrix is a bounded developer
   evidence run, and larger release-scale runs should override the
   `DOCID_QUERY_MATRIX_*` case sizes and `DOCID_QUERY_MATRIX_MAX_ORDINAL_RATIO`.
+  `zig build docid-lifecycle-test` is now the durable focused hardening target
+  for lifecycle cutover, mixed-version, distributed snapshot, cache, compaction,
+  and near-capacity boundary coverage. `scripts/run_docid_lifecycle_matrix.sh`
+  wraps that target, focused DB/storage checks, and the DOCID query matrix into
+  timestamped evidence under `bench/results/docid-lifecycle-matrix/`; it
+  defaults to smoke-sized query evidence and can be expanded with
+  `DOCID_LIFECYCLE_MATRIX_SMOKE=0`.
+  `zig build docid-operational-hardening-test` is the broader operational
+  evidence target: it chains the focused lifecycle gate with metadata
+  split/merge restart/partition chaos, public split/merge traffic chaos, and
+  LSM backend compaction chaos. `scripts/run_docid_operational_hardening_matrix.sh`
+  wraps the same work into timestamped logs under
+  `bench/results/docid-operational-hardening/`; set
+  `DOCID_OPERATIONAL_MATRIX_RUN_SCALE=1` to add the large public-query
+  performance matrix, and set `DOCID_OPERATIONAL_MATRIX_RUN_FULL_TARGET=1` when
+  a single build-step invocation is preferred over per-bucket logs. A local
+  operational pass at
+  `bench/results/docid-operational-hardening/20260525T173023Z/` completed all
+  four buckets: focused DOCID lifecycle, metadata split/merge transition chaos,
+  public split/merge traffic chaos, and LSM backend compaction chaos.
   The scripted cases cover the existing medium baseline, a selective
   small-filter shape, and a broad large-filter shape so future evidence is not
   limited to one favorable filter size. A local smoke matrix passed all three
@@ -2065,6 +2088,33 @@ Status as of 2026-05-19:
   --query-shape hybrid-filter-exclude-project` profile, these changes moved the
   handler path from roughly 570ms before this pass to roughly 55ms while
   preserving the filled `k=20` correctness guardrail.
+  `scripts/run_docid_perf_matrix.sh` now captures a broader 100k public-query
+  evidence pass across full-text, dense-filter, sparse-filter, graph expansion,
+  algebraic-filter, and hybrid-composed shapes. The default wrapper no longer
+  requires symbolic dense profile rows because handler/local guardrail runs do
+  not currently expose dense/HBC profile counters for dense-filter or
+  hybrid-composed requests; set
+  `DOCID_PERF_MATRIX_REQUIRE_SYMBOLIC_PROFILE=1` only when using a route that is
+  expected to emit those profiles. A 100k handler-mode pass on this branch
+  showed query-side full-text is no longer the visible query bottleneck
+  (`~15.6ms` DB, `~16.3ms` handler), dense-filter is fast through the public
+  handler (`~22ms`, with direct DB-search still varying between `~43-107ms`),
+  sparse-filter is about `~126-128ms`, algebraic-filter is still expensive
+  (`~469ms` DB, `~196ms` handler), and hybrid-composed remains dominated by the
+  composed/algebraic path (`~423ms` DB, `~149ms` handler). The same run exposed
+  two harness gaps that need separate evidence before calling them product
+  regressions: graph-expand direct DB-search measured `~592ms` while the handler
+  path measured `~0.4ms`, and dense/HBC profile counters remained zero even
+  when profile responses were requested. Follow-up dense/HBC work should use a
+  dedicated dense-stack or HBC read benchmark until public-query guardrail
+  profile extraction is fixed for those shapes. A dedicated 100k
+  `dense-stack-bench` run with `dims=64`, `k=20`, `queries=2`, and
+  `sync_level=full_index` measured pure dense DB search at `~9.9ms`,
+  concurrent dense DB search at `~5.5ms`, packed C API at `~15.0ms`, and dense
+  search/HBC cache resource-manager peaks of only about `0.65MiB` and
+  `1.68MiB`. That points the remaining dense-filter direct-DB outlier at the
+  public-query guardrail's composed filter/DB benchmark path, not at HBC vector
+  cache warming as the dominant dense-search cost.
   Graph
   `result_ref` projection from complete resolved document sets now carries the
   same stamped generation when translating ordinals back to graph document keys,
@@ -2317,27 +2367,37 @@ Status as of 2026-05-19:
   searchable through the receiver namespace after opt-in; strict namespace
   reopen fails before reassignment repair and succeeds after repair; generation
   projection hides future ordinal allocations and tombstones deleted ordinals;
-  and DB-level capacity tests cover the final allocatable `u32` ordinal before
-  rejecting new documents at exhaustion. The remaining DOCID work is broader
-  operational scale and upgrade validation rather than a known internal
-  public-document-ID exchange path.
+  primary and full-text compaction preserve ordinal mappings and filters across
+  reopen;
+  DB-level capacity tests cover the final allocatable `u32` ordinal with dense,
+  sparse, full-text, graph, and algebraic indexes present before rejecting new
+  documents at exhaustion; and the focused DOCID gate names mixed-version
+  lifecycle classification plus stale-namespace range validation. The extended
+  operational hardening gate now makes restart/partition chaos and compaction
+  chaos part of the explicit DOCID evidence path. The remaining DOCID work is
+  broader production-scale and real rolling-upgrade validation rather than a
+  known internal public-document-ID exchange path.
 
 ## Open Problems
 
 The hard parts are operational rather than syntactic:
 
-- ordinal stability across compaction
-- broader split/merge/reassignment chaos coverage under multi-node restarts
+- production-scale ordinal stability coverage across async/background
+  compaction beyond the explicit LSM/full-text chaos gates
+- production multi-node split/merge/reassignment chaos with concurrent
+  query/write pressure beyond the deterministic metadata restart/partition
+  simulations
 - broader snapshot visibility and MVCC integration across public distributed
   query paths
 - rebuild validation beyond strict namespace repair/reopen checks
 - production shared/global bitmap cache invalidation beyond the structured
   filter cache's namespace-and-generation key primitive
-- very large shards that approach `u32` ordinal limits under realistic indexes
-- mixed-version indexes during rolling upgrades beyond doc-identity lifecycle
-  fail-closed coverage
-- whether public query errors should fail closed or fall back when ordinal
-  coverage is missing
+- very large shards that approach `u32` ordinal limits under production-scale
+  data volumes
+- real old/new binary mixed-version rolling upgrades beyond doc-identity
+  lifecycle fail-closed fixtures
+- continued audit that public query errors fail closed or use exact doc-key
+  fallback when ordinal coverage is missing
 
 The design should prefer correctness first: missing ordinal coverage should use
 the doc-key fallback or fail closed according to the caller's policy. It should

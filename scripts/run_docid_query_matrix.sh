@@ -17,6 +17,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+ZIG_BUILD_FILE="$ROOT/zig/build.zig"
+ZIG_CACHE_DIR="$ROOT/zig/.zig-cache"
+ZIG_GLOBAL_CACHE_DIR="${DOCID_QUERY_MATRIX_ZIG_GLOBAL_CACHE_DIR:-$ROOT/zig/.zig-global-cache}"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${DOCID_QUERY_MATRIX_OUT:-bench/results/docid-query-matrix/$STAMP}"
@@ -139,7 +142,7 @@ run_case() {
   local name="$1"
   shift
   local args=("$@")
-  local cmd=(zig build docid-query-bench -- "${args[@]}")
+  local cmd=(zig build --build-file "$ZIG_BUILD_FILE" --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" docid-query-bench -- "${args[@]}")
   echo "running $name"
   record_command "$name" "${cmd[@]}"
   local started ended rc
@@ -185,7 +188,7 @@ run_bench_case() {
 
 if [[ "$WARM_BUILD" == "1" ]]; then
   echo "warming docid-query-bench"
-  zig build docid-query-bench-build
+  zig build --build-file "$ZIG_BUILD_FILE" --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" docid-query-bench-build
 fi
 
 run_bench_case tiny_baseline "$TINY_DOCS" "$TINY_QUERIES" "$TINY_REPEATS" "$TINY_FILTER_SIZE" "$TINY_SPARSE_DIMS" "$TINY_LIMIT"

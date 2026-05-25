@@ -124,10 +124,17 @@ pub const StdHttpListener = struct {
             .reuse_address = self.cfg.reuse_address,
         }) catch |err| blk: {
             if (err == error.Unexpected and self.cfg.reuse_address) {
-                std.log.err(
-                    "std http listener bind retrying without reuse_address host={s} port={d}",
-                    .{ self.cfg.bind_host, self.cfg.bind_port },
-                );
+                if (builtin.is_test) {
+                    std.debug.print(
+                        "std http listener bind retrying without reuse_address host={s} port={d}\n",
+                        .{ self.cfg.bind_host, self.cfg.bind_port },
+                    );
+                } else {
+                    std.log.err(
+                        "std http listener bind retrying without reuse_address host={s} port={d}",
+                        .{ self.cfg.bind_host, self.cfg.bind_port },
+                    );
+                }
                 break :blk listen_addr.listen(self.io_impl.io(), .{
                     .kernel_backlog = self.cfg.kernel_backlog,
                     .reuse_address = false,

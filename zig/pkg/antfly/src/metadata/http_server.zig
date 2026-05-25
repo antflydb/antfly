@@ -2084,6 +2084,7 @@ fn validateSplitDocIdentityCompatibility(
     if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
 }
 
 fn validateSplitRequestDocIdentity(source: AdminSource, table_name: []const u8, req: SplitRequest) !void {
@@ -3573,6 +3574,12 @@ test "metadata split request validation rejects stale doc identity namespace" {
     );
     statuses[0].doc_identity_namespace_conflict = false;
     statuses[0].doc_identity_reassignment_active = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateSplitDocIdentityCompatibility(&snapshot, 91),
+    );
+    statuses[0].doc_identity_reassignment_active = false;
+    statuses[0].doc_identity.ordinal_capacity_exhausted = true;
     try std.testing.expectError(
         error.DocIdentityNamespaceMismatch,
         validateSplitDocIdentityCompatibility(&snapshot, 91),

@@ -3156,6 +3156,9 @@ pub fn build(b: *std.Build) void {
             "catalog resolved filter validation accepts preserved split identity domains",
             "metadata merge request validation rejects incompatible doc identity namespaces",
             "metadata split request validation rejects stale doc identity namespace",
+            "metadata reconciler does not automatically split ordinal exhausted doc identity",
+            "metadata state classifies mixed-version doc identity lifecycle reports",
+            "metadata state marks doc identity rebuild required on range namespace mismatch",
             "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
             "metadata http server serves status and filtered admin routes",
             "metadata http server maps source split merge doc identity conflicts",
@@ -3218,6 +3221,8 @@ pub fn build(b: *std.Build) void {
             "batch identity metadata fails closed at ordinal capacity",
             "db stats flag document identity ordinal capacity exhaustion",
             "db stats expose document identity coverage and tombstones",
+            "db allocates final document ordinal with all index families present",
+            "db lsm primary compaction preserves doc identity ordinals",
             "db rejects new document writes at ordinal exhaustion for every sync level",
             "db transaction intent writes reject new documents at ordinal exhaustion",
             "db restore snapshot rejects invalid doc identity metadata",
@@ -3360,6 +3365,61 @@ pub fn build(b: *std.Build) void {
     const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const lib_docid_lifecycle_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "metadata reconciler does not automatically split ordinal exhausted doc identity",
+            "metadata state classifies mixed-version doc identity lifecycle reports",
+            "metadata state marks doc identity rebuild required on range namespace mismatch",
+            "metadata split request validation rejects stale doc identity namespace",
+            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
+            "table workflow doc identity guards reject active transition intents",
+            "metadata reconciler doc identity guards block new planning during active reassignment",
+            "metadata reconciler does not upsert desired split with stale doc identity namespace",
+            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
+            "distributed join follow-up pagination requires stamped identity request",
+            "distributed join group-local hit pagination reuses structured search generation",
+            "distributed join rejects doc identity rebuild before right-table fanout",
+            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
+            "distributed graph rejects doc identity rebuild before cross-range fanout",
+            "distributed graph rejects unstamped result refs before cross-range fanout",
+            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
+            "internal worker doc identity exchange audit covers every boundary",
+            "aggregation context rejects non-current identity generation",
+            "aggregation full-result rerun can reuse snapped result identity generation",
+            "explicit text stats requests preserve identity generation",
+            "explicit text stats requests reject stale identity generation",
+            "structured filter doc set cache separates shared namespace generation keys",
+            "db text compaction preserves ordinal filters across reopen",
+            "db lsm primary compaction preserves doc identity ordinals",
+            "db allocates final document ordinal with all index families present",
+            "db stats flag document identity ordinal capacity exhaustion",
+            "db rejects new document writes at ordinal exhaustion for every sync level",
+            "db transaction intent writes reject new documents at ordinal exhaustion",
+            "db search requests default to current identity generation snapshot",
+            "db validates internal resolved doc filter wire namespace and generation",
+            "db resolved doc-set projection honors identity read generation",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_docid_lifecycle_tests = b.addRunArtifact(lib_docid_lifecycle_tests);
+    const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
+    docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+
+    const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
+    docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_metadata_transition_chaos_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
+
     const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
     lib_api_docid_test_step.dependOn(&run_lib_api_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_serverless_docid_tests.step);

@@ -6964,6 +6964,16 @@ test "structured filter doc set cache separates shared namespace generation keys
     const cached = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 7) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cached.containsOrdinal(9));
     try std.testing.expect(cached.containsOrdinal(10));
+
+    var next_generation_source = try doc_set.fromOrdinalsAlloc(alloc, &.{11});
+    defer next_generation_source.deinit(alloc);
+    try cache.putSharedCloneAlloc(alloc, "{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 8, &next_generation_source);
+    const cached_generation_7 = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cached_generation_7.containsOrdinal(9));
+    try std.testing.expect(!cached_generation_7.containsOrdinal(11));
+    const cached_generation_8 = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cached_generation_8.containsOrdinal(11));
+    try std.testing.expect(!cached_generation_8.containsOrdinal(9));
 }
 
 test "composed search carries resolved doc sets for graph attachment" {
