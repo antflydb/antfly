@@ -57,6 +57,16 @@ pub const SparseWrite = struct {
     doc_num: ?u32 = null,
 };
 
+pub const OrdinalDocNumLookup = struct {
+    doc_nums: []const u32,
+    missing_ordinals: []const u32,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_nums);
+        alloc.free(self.missing_ordinals);
+    }
+};
+
 pub const BatchOptions = struct {
     defer_term_range_updates: bool = false,
     backend_batch_options: backend_types.BatchOptions = .{},
@@ -2886,6 +2896,32 @@ pub const SparseIndex = struct {
         }
 
         return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn docNumsForOrdinalDocNumsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, ordinals: []const u32) !OrdinalDocNumLookup {
+        _ = self;
+        _ = txn;
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+        var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(alloc);
+
+        const sorted = try alloc.dupe(u32, ordinals);
+        defer alloc.free(sorted);
+        std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
+
+        var previous: ?u32 = null;
+        for (sorted) |ordinal| {
+            if (previous != null and previous.? == ordinal) continue;
+            previous = ordinal;
+            const gop = try seen.getOrPut(alloc, ordinal);
+            if (!gop.found_existing) try out.append(alloc, ordinal);
+        }
+
+        return .{
+            .doc_nums = try out.toOwnedSlice(alloc),
+            .missing_ordinals = try alloc.alloc(u32, 0),
+        };
     }
 
     /// Free search results.

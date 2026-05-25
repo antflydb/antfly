@@ -5704,6 +5704,7 @@ pub const IndexManager = struct {
         const flush_batch = struct {
             fn run(
                 manager: *IndexManager,
+                doc_store: *docstore_mod.DocStore,
                 sparse_entry: *SparseIndex,
                 rebuild: backfill_state_mod.RebuildState,
                 writes_buf: *std.ArrayListUnmanaged(sparse_mod.SparseWrite),
@@ -5712,6 +5713,7 @@ pub const IndexManager = struct {
                 doc_count: *u64,
             ) !void {
                 if (writes_buf.items.len == 0) return;
+                try manager.assignSparseWriteDocNumsFromIdentity(doc_store, sparse_entry, writes_buf.items);
                 try sparse_entry.index.batchWithOptions(writes_buf.items, &.{}, .{
                     .defer_term_range_updates = true,
                 });
@@ -5758,12 +5760,12 @@ pub const IndexManager = struct {
             });
             sparse_vec_owned = false;
             if (writes.items.len >= backfill_batch_size) {
-                try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+                try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
             }
         }
 
         if (writes.items.len > 0) {
-            try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+            try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -6614,7 +6616,6 @@ pub const IndexManager = struct {
         skip: ?*const SparseSplitHandoff,
         batch_options: StoreBatchOptions,
     ) !void {
-        _ = store;
         const ReplayProfile = struct {
             scan_ns: u64 = 0,
             extract_ns: u64 = 0,
@@ -6677,6 +6678,9 @@ pub const IndexManager = struct {
             .prefer_bulk_build = batch_options.mode == .bulk_ingest,
             .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
         };
+        if (store) |doc_store| {
+            try self.assignSparseWriteDocNumsFromIdentity(doc_store, entry, sparse_writes.items);
+        }
         const max_sparse_writes_per_txn: usize = if (batch_options.mode == .bulk_ingest) 16 * 1024 else 256;
         var start: usize = 0;
         while (start < sparse_writes.items.len) {
@@ -6705,6 +6709,29 @@ pub const IndexManager = struct {
                     nsToMs(profile.batch_ns),
                 },
             );
+        }
+    }
+
+    fn assignSparseWriteDocNumsFromIdentity(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *SparseIndex,
+        writes: []sparse_mod.SparseWrite,
+    ) !void {
+        if (entry.chunk_name != null or writes.len == 0) return;
+
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+
+        const doc_ids = try self.alloc.alloc([]const u8, writes.len);
+        defer self.alloc.free(doc_ids);
+        for (writes, 0..) |write, i| doc_ids[i] = write.doc_id;
+
+        const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(self.alloc, &txn, doc_ids);
+        defer self.alloc.free(ordinals);
+        for (ordinals, 0..) |maybe_ordinal, i| {
+            const ordinal = maybe_ordinal orelse continue;
+            writes[i].doc_num = ordinal;
         }
     }
 
@@ -6779,22 +6806,50 @@ pub const IndexManager = struct {
         var doc_num_ns: u64 = 0;
         const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
 
-        const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var txn = try store.beginProbeTxn();
-        defer txn.abort();
-        if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
         const sparse_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var sparse_txn = try entry.index.beginReadTxn();
         defer sparse_txn.abort();
         if (bench_profile) sparse_txn_ns = platform_time.monotonicNs() - sparse_txn_start_ns;
 
         if (entry.chunk_name == null) {
+            var fast_lookup = try entry.index.docNumsForOrdinalDocNumsAlloc(alloc, &sparse_txn, ordinals);
+            defer fast_lookup.deinit(alloc);
+            if (fast_lookup.missing_ordinals.len == 0) {
+                const out = try alloc.dupe(u32, fast_lookup.doc_nums);
+                if (bench_profile) {
+                    std.log.info(
+                        "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
+                        .{
+                            (platform_time.monotonicNs() - total_start_ns) / 1000,
+                            runtime_store_ns / 1000,
+                            primary_txn_ns / 1000,
+                            sparse_txn_ns / 1000,
+                            doc_id_ns / 1000,
+                            doc_num_ns / 1000,
+                            ordinals.len,
+                            out.len,
+                        },
+                    );
+                }
+                return out;
+            }
+
+            const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var txn = try store.beginProbeTxn();
+            defer txn.abort();
+            if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
             const doc_id_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, ordinals);
+            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, fast_lookup.missing_ordinals);
             defer alloc.free(parent_doc_ids);
             if (bench_profile) doc_id_ns = platform_time.monotonicNs() - doc_id_start_ns;
             const doc_num_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const out = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
+            const fallback_doc_nums = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
+            defer alloc.free(fallback_doc_nums);
+            var out = std.ArrayListUnmanaged(u32).empty;
+            errdefer out.deinit(alloc);
+            try out.appendSlice(alloc, fast_lookup.doc_nums);
+            try out.appendSlice(alloc, fallback_doc_nums);
+            const out_slice = try out.toOwnedSlice(alloc);
             if (bench_profile) {
                 doc_num_ns = platform_time.monotonicNs() - doc_num_start_ns;
                 std.log.info(
@@ -6807,12 +6862,17 @@ pub const IndexManager = struct {
                         doc_id_ns / 1000,
                         doc_num_ns / 1000,
                         ordinals.len,
-                        out.len,
+                        out_slice.len,
                     },
                 );
             }
-            return out;
+            return out_slice;
         }
+
+        const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
 
         const runtime_store_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -8825,6 +8885,7 @@ pub const IndexManager = struct {
             }
             if (sparse_writes.items.len > 0) {
                 const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+                try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
                 try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
                     .defer_term_range_updates = true,
                     .backend_batch_options = batch_options,
@@ -8845,6 +8906,7 @@ pub const IndexManager = struct {
         }
         if (pending_artifact_loads.items.len == 0 and sparse_writes.items.len > 0) {
             const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
             try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
                 .defer_term_range_updates = true,
                 .backend_batch_options = batch_options,

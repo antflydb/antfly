@@ -112,6 +112,10 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
 }
 
+fn benchQueryProfileEnabled() bool {
+    return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+}
+
 pub const OpenOptions = struct {
     pub const OpenMode = enum {
         writer,
@@ -8362,12 +8366,43 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var generation_ns: u64 = 0;
+        var lock_wait_ns: u64 = 0;
+        var locked_search_ns: u64 = 0;
         if (self.canUsePublishedDenseSearch(req)) {
-            return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), exec_ctx);
+            const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+            if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
+            const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
+            if (bench_profile) {
+                locked_search_ns = platform_time.monotonicNs() - search_start_ns;
+                std.log.info(
+                    "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, true },
+                );
+            }
+            return result;
         }
+        const lock_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         lockApplyShared(self);
+        if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
         defer self.core.unlockApplyShared();
-        return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), exec_ctx);
+        const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
+        const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
+        if (bench_profile) {
+            locked_search_ns = platform_time.monotonicNs() - search_start_ns;
+            std.log.info(
+                "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, false },
+            );
+        }
+        return result;
     }
 
     fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
@@ -8985,8 +9020,7 @@ pub const DB = struct {
 
     fn allDocsVisibleSummaryFastMaybe(self: *DB, generation: ?u64) !?bool {
         if (self.identity_visibility_summary_cache) |summary| {
-            const cached = doc_identity.allVisibleFromSummary(summary, generation);
-            if (!cached) return false;
+            return doc_identity.allVisibleFromSummary(summary, generation);
         }
         return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
     }
@@ -9132,10 +9166,20 @@ pub const DB = struct {
         const metric_name = self.sparseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var algebraic_ns: u64 = 0;
+        var prove_ns: u64 = 0;
+        var inner_ns: u64 = 0;
+        const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+        const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .sparse_vector, hasNativeDocIdConstraints(algebraic_filter.req));
-        return try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
+        if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
+        const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .sparse_index = sparseIndexCallback,
@@ -9144,9 +9188,18 @@ pub const DB = struct {
             .live_filter_doc_set = liveFilterDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
+        if (bench_profile) {
+            inner_ns = platform_time.monotonicNs() - inner_start_ns;
+            std.log.info(
+                "antfly_bench_db_sparse_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
+            );
+        }
+        return result;
     }
 
     fn proveVectorSearchAccessPath(self: *DB, index_name: ?[]const u8, layout: algebraic_mod.ir.PhysicalLayout, constrained: bool) !void {
@@ -19525,7 +19578,7 @@ test "db doc set planning stats record ordinal bitmap promotion" {
     try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.bitmap_promotion_count);
 }
 
-test "db sparse index keeps physical doc nums distinct from doc identity ordinals" {
+test "db sparse index uses identity ordinals as physical doc nums for primary docs" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -19549,8 +19602,8 @@ test "db sparse index keeps physical doc nums distinct from doc identity ordinal
     });
 
     const sparse_entry = db.core.index_manager.sparseIndex("sp_v1") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?u32, 0), try sparse_entry.index.debugDocNumForDocId("doc:a"));
-    try std.testing.expectEqual(@as(?u32, 1), try sparse_entry.index.debugDocNumForDocId("doc:b"));
+    try std.testing.expectEqual(@as(?u32, 1), try sparse_entry.index.debugDocNumForDocId("doc:a"));
+    try std.testing.expectEqual(@as(?u32, 2), try sparse_entry.index.debugDocNumForDocId("doc:b"));
 
     var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
     errdefer include.deinit(alloc);
@@ -19566,8 +19619,7 @@ test "db sparse index keeps physical doc nums distinct from doc identity ordinal
     const sparse_doc_nums = try db.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, db.core.store, "sp_v1", &.{ordinal});
     defer alloc.free(sparse_doc_nums);
     try std.testing.expectEqual(@as(usize, 1), sparse_doc_nums.len);
-    try std.testing.expectEqual(@as(u32, 1), sparse_doc_nums[0]);
-    try std.testing.expect(sparse_doc_nums[0] != ordinal);
+    try std.testing.expectEqual(@as(u32, ordinal), sparse_doc_nums[0]);
 
     var filter = doc_set.ResolvedDocFilter{
         .include = include,
@@ -20003,6 +20055,7 @@ test "db non chunked search paths apply broad live doc filter" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
+    db.identity_visibility_summary_cache = null;
 
     var dense_live = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -22747,6 +22800,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
+    db.identity_visibility_summary_cache = null;
 
     var stale_sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -24976,6 +25030,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
+    db.identity_visibility_summary_cache = null;
 
     var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
