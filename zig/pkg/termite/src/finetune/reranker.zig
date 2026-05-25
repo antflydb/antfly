@@ -33,7 +33,7 @@ pub const EvalSummary = struct {
 pub const BackendChoice = enum {
     auto,
     native,
-    mlx,
+    metal,
 };
 
 pub const RuntimeEvalResult = struct {
@@ -281,9 +281,9 @@ fn computeOneGroupedRankingMetrics(
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => &.{ backends.BackendType.mlx, backends.BackendType.native },
+        .auto => &.{ backends.BackendType.metal, backends.BackendType.native },
         .native => &.{backends.BackendType.native},
-        .mlx => &.{backends.BackendType.mlx},
+        .metal => &.{backends.BackendType.metal},
     };
 }
 

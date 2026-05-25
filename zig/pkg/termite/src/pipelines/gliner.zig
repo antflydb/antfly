@@ -1228,7 +1228,7 @@ test "gliner distributed mlx helpers mirror pipeline/session state" {
         }
 
         fn backend(_: *anyopaque) backends.BackendType {
-            return .mlx;
+            return .metal;
         }
 
         fn close(_: *anyopaque) void {}

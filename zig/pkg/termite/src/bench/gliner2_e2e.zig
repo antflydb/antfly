@@ -32,7 +32,6 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
-    mlx,
 };
 
 const OutputFormat = enum {
@@ -334,7 +333,6 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
         .auto => &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .metal => &.{backends.BackendType.metal},
-        .mlx => &.{backends.BackendType.mlx},
     };
 }
 
@@ -386,7 +384,6 @@ fn parseBackend(value: []const u8) ?BackendChoice {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     return null;
 }
 
@@ -466,7 +463,7 @@ fn printCsv(opts: Options, result: Result) void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|mlx] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv]
         \\
     , .{});
 }

@@ -55,8 +55,6 @@ pub const Context = struct {
     termite_linalg_mod: *std.Build.Module,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
     enable_metal: bool,
 
     pub fn moduleFor(ctx: Context, import: Import) *std.Build.Module {
@@ -167,17 +165,16 @@ fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import) 
 fn configureNative(ctx: Context, artifact: *std.Build.Step.Compile, native_link: NativeLink) void {
     switch (native_link) {
         .none => {},
-        .default => configureNativeTool(ctx, artifact, ctx.enable_mlx, ctx.enable_metal),
-        .no_accel => configureNativeTool(ctx, artifact, false, false),
+        .default => configureNativeTool(ctx, artifact, ctx.enable_metal),
+        .no_accel => configureNativeTool(ctx, artifact, false),
     }
 }
 
-fn configureNativeTool(ctx: Context, artifact: *std.Build.Step.Compile, enable_mlx: bool, enable_metal: bool) void {
+fn configureNativeTool(ctx: Context, artifact: *std.Build.Step.Compile, enable_metal: bool) void {
     if (ctx.enable_system_blas) {
         configureSystemBlas(ctx, artifact.root_module);
     }
     configureMetal(ctx, artifact.root_module, enable_metal);
-    configureMlx(ctx, artifact.root_module, enable_mlx);
     artifact.root_module.link_libc = true;
 }
 
@@ -199,13 +196,4 @@ fn configureMetal(ctx: Context, module: *std.Build.Module, enable_metal: bool) v
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
     module.addCSourceFile(.{ .file = ctx.b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
-}
-
-fn configureMlx(ctx: Context, module: *std.Build.Module, enable_mlx: bool) void {
-    if (!enable_mlx or ctx.target.result.os.tag != .macos) return;
-    if (ctx.mlx_root) |root| {
-        module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = ctx.b.fmt("{s}/lib", .{root}) });
-    }
-    module.linkSystemLibrary("mlxc", .{});
 }

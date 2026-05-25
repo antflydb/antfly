@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
 fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 

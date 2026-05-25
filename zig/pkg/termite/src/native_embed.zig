@@ -15,7 +15,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const backends = @import("backends/backends.zig");
-const mlx_backend = if (build_options.enable_mlx) @import("backends/mlx.zig") else struct {};
 const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
     fn metalDeviceAvailable() bool {
         return false;
@@ -35,7 +34,6 @@ const BackendChoice = enum {
     onnx,
     native,
     metal,
-    mlx,
     cuda,
 };
 
@@ -422,31 +420,25 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
-        else if (build_options.enable_metal)
+        .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.mlx, backends.BackendType.native }
         else
             &.{ backends.BackendType.onnx, backends.BackendType.native },
         .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .mlx => if (build_options.enable_mlx) &.{backends.BackendType.mlx} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
     };
 }
 
 fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
-    if (choice != .metal and choice != .mlx and choice != .cuda) return;
+    if (choice != .metal and choice != .cuda) return;
     if (choice == .cuda) {
         if (!build_options.enable_cuda) return error.CudaNotEnabled;
         return;
@@ -458,16 +450,11 @@ fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
         }
         return;
     }
-    const mlx_metal_available = if (build_options.enable_mlx) mlx_backend.metalDeviceAvailable() else false;
-    if (native_backend_guard.checkMlx(build_options.enable_mlx, mlx_metal_available)) |failure| {
-        native_backend_guard.printFailure(failure);
-        return native_backend_guard.raise(failure);
-    }
 }
 
 fn printUsage() void {
     print(
-        \\usage: termite embed <model-dir> [--backend auto|onnx|native|metal|mlx|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--print-timing] [--text <text>]... [--image <path>]... [--audio <path>]...
+        \\usage: termite embed <model-dir> [--backend auto|onnx|native|metal|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--print-timing] [--text <text>]... [--image <path>]... [--audio <path>]...
         \\  Runs local embedding and prints a JSON response to stdout.
         \\  Input order is preserved across repeated --text/--image/--audio flags.
         \\  graph-runtime controls imported static graph execution; default is environment fallback, then interpreter.
@@ -489,7 +476,7 @@ test "parseArgs preserves multimodal input order" {
         "--text",
         "world",
         "--backend",
-        "mlx",
+        "metal",
         "--graph-runtime",
         "partitioned",
         "--print-timing",
@@ -497,7 +484,7 @@ test "parseArgs preserves multimodal input order" {
     defer opts.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("/tmp/model", opts.model_dir);
-    try std.testing.expectEqual(BackendChoice.mlx, opts.backend);
+    try std.testing.expectEqual(BackendChoice.metal, opts.backend);
     try std.testing.expectEqual(graph_runtime.Strategy.partitioned, opts.graph_runtime_strategy.?);
     try std.testing.expect(opts.print_timing);
     try std.testing.expectEqual(@as(usize, 2), opts.texts.items.len);

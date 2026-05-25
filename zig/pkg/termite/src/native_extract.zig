@@ -25,7 +25,6 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
-    mlx,
 };
 
 const Options = struct {
@@ -256,29 +255,23 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
-        else if (build_options.enable_metal)
+        .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_mlx)
-            &.{ backends.BackendType.mlx, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .mlx => if (build_options.enable_mlx) &.{backends.BackendType.mlx} else &.{backends.BackendType.native},
     };
 }
 
 fn printUsage() void {
     print(
-        \\usage: termite extract <model-dir> <text> <schema-json> [--backend auto|native|metal|mlx] [--relation-label LABEL]...
+        \\usage: termite extract <model-dir> <text> <schema-json> [--backend auto|native|metal] [--relation-label LABEL]...
         \\  Runs native local extraction and prints a JSON response to stdout.
         \\
     , .{});

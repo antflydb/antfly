@@ -361,8 +361,6 @@ pub const BackendCapabilities = struct {
     native: ?bool = null,
     /// Whether the ONNX Runtime backend is built into this runtime
     onnx: ?bool = null,
-    /// Whether the MLX backend is built into this runtime
-    mlx: ?bool = null,
     /// Whether the WASM backend is built into this runtime
     wasm: ?bool = null,
 };
@@ -1150,7 +1148,7 @@ pub const GenerateRequest = struct {
     cache_dtype: ?[]const u8 = null,
     /// Termite-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
     cache_compaction_ratio: ?f32 = null,
-    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native`, `metal`, and `mlx` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
+    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native` and `metal` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
     backend: ?[]const u8 = null,
     /// Termite-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs Termite graph planning, partitioning, and backend executor attachment.
     mode: ?[]const u8 = null,

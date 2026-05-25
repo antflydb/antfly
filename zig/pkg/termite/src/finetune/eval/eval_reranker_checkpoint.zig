@@ -95,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
             .backend_selected = switch (opts.backend) {
                 .auto => .native,
                 .native => .native,
-                .mlx => .mlx,
+                .metal => .metal,
             },
             .distributed = .{},
             .uses_distributed_mlx = false,
@@ -135,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
 fn parseBackendChoice(value: []const u8) ?reranker.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "blas") or std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 

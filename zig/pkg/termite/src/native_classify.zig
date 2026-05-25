@@ -193,7 +193,7 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 
 fn printUsage() void {
     print(
-        \\usage: termite classify <model-dir> [<text>] [--text <text>]... --label <label>... [--backend auto|onnx|native|metal|mlx|xla] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--multi-label] [--hypothesis-template <template>] [--entailment-index <n>]
+        \\usage: termite classify <model-dir> [<text>] [--text <text>]... --label <label>... [--backend auto|onnx|native|metal|xla] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--multi-label] [--hypothesis-template <template>] [--entailment-index <n>]
         \\  Runs native local classification and prints a JSON response to stdout.
         \\  graph-runtime controls imported static graph execution; default is environment fallback, then interpreter.
         \\

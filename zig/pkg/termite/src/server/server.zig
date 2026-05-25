@@ -586,7 +586,6 @@ pub const Node = struct {
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
             .metal => .metal,
-            .mlx => .mlx,
             .cuda => .cuda,
             .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
         };
@@ -1975,7 +1974,7 @@ pub const Node = struct {
             }
         }
 
-        // Fall back to native generation (native/MLX with GPT arch forward pass)
+        // Fall back to native generation (native/Metal with GPT arch forward pass)
         const model = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
@@ -2007,7 +2006,6 @@ pub const Node = struct {
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
             .metal => .metal,
-            .mlx => .mlx,
             .cuda => .cuda,
             .pjrt => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected PJRT backend in native generation path" }),
             .onnx => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected ONNX backend in native generation path" }),
@@ -4082,7 +4080,6 @@ pub const Node = struct {
                 .native = build_options.enable_native,
                 .onnx = !build_options.enable_wasm,
                 .onnx_runtime = build_options.enable_onnx,
-                .mlx = build_options.enable_mlx,
                 .wasm = build_options.enable_wasm,
             },
         });
@@ -4109,7 +4106,7 @@ pub const Node = struct {
             .host = host,
             .port = port,
             // Generation can legitimately take longer than the generic 30s HTTP
-            // default during cold model startup or first-token MLX execution.
+            // default during cold model startup or first-token GPU execution.
             .request_timeout_ms = 300_000,
             .keep_alive_timeout_ms = 300_000,
         });

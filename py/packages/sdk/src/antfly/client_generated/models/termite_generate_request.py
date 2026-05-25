@@ -63,7 +63,7 @@ class TermiteGenerateRequest:
         backend (TermiteGenerateRequestBackend | Unset): Optional backend override for this request.
             `auto` keeps the node default behavior.
             `onnx` forces ONNX generation when the model/package supports it.
-            `native`, `metal`, and `mlx` force the native host backend choice.
+            `native` and `metal` force the native host backend choice.
             `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
             requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`,
             `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.

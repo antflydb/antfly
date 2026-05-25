@@ -27,7 +27,6 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
-    mlx,
     cuda,
 };
 
@@ -238,31 +237,25 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
-        else if (build_options.enable_metal)
+        .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_mlx)
-            &.{ backends.BackendType.mlx, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .mlx => if (build_options.enable_mlx) &.{backends.BackendType.mlx} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
     };
 }
 
 fn printUsage() void {
     print(
-        \\usage: termite recognize <model-dir> <text> [--label NAME]... [--backend auto|native|metal|mlx|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required]
+        \\usage: termite recognize <model-dir> <text> [--label NAME]... [--backend auto|native|metal|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required]
         \\  Runs native local recognition and prints a JSON response to stdout.
         \\  --graph-runtime selects how the GLiNER head executes:
         \\    interpreter (default) -- eager forward via gliner_head.forwardCt

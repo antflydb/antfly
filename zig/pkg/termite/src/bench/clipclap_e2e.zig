@@ -31,7 +31,6 @@ const model_manager_mod = termite.server.model_manager;
 const embedding_mod = termite.pipelines.embedding;
 const native_backend_guard = termite.native_backend_guard;
 const metal_runtime = termite.metal_runtime;
-const mlx_backend = termite.mlx_backend;
 
 const max_file_bytes = 512 * 1024 * 1024;
 
@@ -40,7 +39,6 @@ const BackendChoice = enum {
     onnx,
     native,
     metal,
-    mlx,
     cuda,
 };
 
@@ -762,34 +760,21 @@ fn parseOutputFormat(value: []const u8) ?OutputFormat {
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
-        else if (build_options.enable_metal)
+        .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.mlx, backends.BackendType.native }
         else
             &.{ backends.BackendType.onnx, backends.BackendType.native },
         .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .mlx => if (build_options.enable_mlx) &.{backends.BackendType.mlx} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
     };
 }
 
 fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
     if (choice == .cuda and !build_options.enable_cuda) return error.CudaNotEnabled;
-    if (choice != .metal and choice != .mlx) return;
-    if (choice == .metal) {
-        if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
-            native_backend_guard.printFailure(failure);
-            return native_backend_guard.raise(failure);
-        }
-        return;
-    }
-    const mlx_metal_available = if (build_options.enable_mlx) mlx_backend.metalDeviceAvailable() else false;
-    if (native_backend_guard.checkMlx(build_options.enable_mlx, mlx_metal_available)) |failure| {
+    if (choice != .metal) return;
+    if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
         native_backend_guard.printFailure(failure);
         return native_backend_guard.raise(failure);
     }
@@ -828,7 +813,7 @@ fn nsToSeconds(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-clipclap-e2e -- --model-dir <dir> [--backend auto|onnx|native|metal|mlx|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--text <text>]... [--image <path>]... [--audio <path>]...
+        \\usage: zig build bench-clipclap-e2e -- --model-dir <dir> [--backend auto|onnx|native|metal|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--text <text>]... [--image <path>]... [--audio <path>]...
         \\  Options:
         \\    --warmup-iters N                 Warm request iterations before measurement (default 1)
         \\    --measure-iters N                Measurement iterations (default 5)

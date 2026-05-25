@@ -24,7 +24,6 @@ pub const Choice = enum {
     onnx,
     native,
     metal,
-    mlx,
     cuda,
     xla,
     webgpu,
@@ -35,7 +34,6 @@ pub fn parse(value: []const u8) ?Choice {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
     if (std.mem.eql(u8, value, "xla")) return .xla;
     if (std.mem.eql(u8, value, "webgpu")) return .webgpu;
@@ -48,41 +46,28 @@ pub fn validate(choice: Choice) !void {
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
         .xla => if (!build_options.enable_pjrt) return error.BackendUnavailable,
         .webgpu => if (!(build_options.enable_wasm and build_options.enable_webgpu)) return error.BackendUnavailable,
-        .auto, .native, .metal, .mlx => {},
+        .auto, .native, .metal => {},
     }
 }
 
 pub fn configureSessionPreference(session_manager: *backends.SessionManager, choice: Choice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
-        else if (build_options.enable_metal)
+        .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_mlx)
-            &.{ backends.BackendType.mlx, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
         .onnx => if (supports_onnx_models and build_options.enable_native)
             &.{ backends.BackendType.onnx, backends.BackendType.native }
-        else if (supports_onnx_models and build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.mlx }
         else if (supports_onnx_models and build_options.enable_metal)
             &.{ backends.BackendType.onnx, backends.BackendType.metal }
-        else if (supports_onnx_models and build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.mlx }
         else if (supports_onnx_models)
             &.{backends.BackendType.onnx}
-        else if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.metal, backends.BackendType.mlx }
         else if (build_options.enable_metal)
             &.{backends.BackendType.metal}
-        else if (build_options.enable_mlx)
-            &.{backends.BackendType.mlx}
         else
             &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .mlx => if (build_options.enable_mlx) &.{backends.BackendType.mlx} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
         .webgpu => if (build_options.enable_wasm and build_options.enable_webgpu)
             &.{backends.BackendType.wasm}
@@ -90,12 +75,8 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
             &.{},
         .xla => if (build_options.enable_native)
             &.{backends.BackendType.native}
-        else if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.metal, backends.BackendType.mlx }
         else if (build_options.enable_metal)
             &.{backends.BackendType.metal}
-        else if (build_options.enable_mlx)
-            &.{backends.BackendType.mlx}
         else
             &.{},
     };
@@ -105,7 +86,7 @@ pub fn compiledPartitionBackend(choice: Choice) ?ops.BackendKind {
     return switch (choice) {
         .onnx => .onnx,
         .xla => .pjrt,
-        .auto, .native, .metal, .mlx, .cuda, .webgpu => null,
+        .auto, .native, .metal, .cuda, .webgpu => null,
     };
 }
 
@@ -138,7 +119,6 @@ test "parse accepts explicit compiled backends" {
 test "compiledPartitionBackend maps explicit compiled backends" {
     try std.testing.expectEqual(@as(?ops.BackendKind, .onnx), compiledPartitionBackend(.onnx));
     try std.testing.expectEqual(@as(?ops.BackendKind, .pjrt), compiledPartitionBackend(.xla));
-    try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.mlx));
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.metal));
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.webgpu));
     if (build_options.enable_metal) {

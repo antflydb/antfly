@@ -16682,7 +16682,6 @@ components:
             - onnx
             - native
             - metal
-            - mlx
             - xla
             - webgpu
           description: >
@@ -16692,7 +16691,7 @@ components:
 
             `onnx` forces ONNX generation when the model/package supports it.
 
-            `native`, `metal`, and `mlx` force the native host backend choice.
+            `native` and `metal` force the native host backend choice.
 
             `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
 
@@ -17187,10 +17186,6 @@ components:
           type: boolean
           description: Whether the ONNX Runtime backend is built into this runtime
           example: false
-        mlx:
-          type: boolean
-          description: Whether the MLX backend is built into this runtime
-          example: true
         wasm:
           type: boolean
           description: Whether the WASM backend is built into this runtime

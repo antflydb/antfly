@@ -126,8 +126,8 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 
 ## Current Status
 
-- `--backend metal` builds without MLX when configured with `-Dmetal=true
-  -Dmlx=false`.
+- `--backend metal` builds without an external Apple tensor-runtime dependency
+  when configured with `-Dmetal=true`.
 - The Gemma4 4-token anchor is correct on the current safe path:
   `Hi! How can`, token ids `10979 236888 2088 740`.
 - `gelu_new` now lowers as a backend activation kind instead of decomposing
@@ -409,11 +409,9 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   path without adding a format-specific public API. The public runtime wrapper
   also retains the RMS-add params buffer when encoding into an active frame, so
   row-batched frame users do not rely on Objective-C autorelease lifetime.
-- In builds that include both MLX and native Metal, the `.metal` backend now
-  uses the native Metal session/provider path instead of opening an MLX stream
-  and constructing an MLX-backed Metal provider. This keeps GGUF Metal runtime
-  availability tied to Termite's native `MTLDevice` probe and prevents native
-  Metal sessions from failing with `MlxMetalUnavailable` before model load.
+- The `.metal` backend uses the native Metal session/provider path. GGUF Metal
+  runtime availability is tied to Termite's native `MTLDevice` probe before
+  model load.
 - Active decode now passes per-layer output scale into the direct
   f32-KV/Q8_0 gated block. That removes the separate post-block scale multiply
   from the active layer loop and drops the latest single-token frame from
@@ -526,8 +524,8 @@ These are local directional anchors, not absolute device claims.
   failed during session creation with `MetalDeviceUnavailable`, before kernel
   execution, and produced no diagnostic reports
   (`metal-command-20260507-221033`).
-- The native-provider-with-MLX boundary fix rebuilt successfully through the
-  Metal wrapper (`metal-command-20260507-222912`) and `zig build test-bin`
+- The native-provider boundary fix rebuilt successfully through the Metal
+  wrapper (`metal-command-20260507-222912`) and `zig build test-bin`
   passed (`metal-command-20260507-223021`). The 4-token Gemma4 compiled
   whole-model smoke now passes API validation (`metal-command-20260507-222950`)
   with token IDs `10979 236888 2088 740`, `prefill=157ms`, `decode=149ms`,
@@ -1602,7 +1600,7 @@ Termite commands or long-running Metal executions.
 
 ## Rejected Directions
 
-- Do not bring MLX back into the pure Metal backend.
+- Do not bring another Apple tensor runtime back into the pure Metal backend.
 - Do not use environment variables as the primary backend selection surface.
 - Do not dequantize whole dense weights in the Metal hot path.
 - Do not add model-named public runtime APIs when a structural graph/layer

@@ -2784,7 +2784,7 @@ fn runDirectMaterializeGliner2Lora(allocator: std.mem.Allocator, io: std.Io, arg
 
 fn parseGlinerBackend(value: []const u8) !reranker.BackendChoice {
     if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     return error.InvalidBackend;
 }
@@ -3178,7 +3178,7 @@ fn runDirectMaterializeRerankerHead(allocator: std.mem.Allocator, io: std.Io, ar
 fn parseRerankerBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 
