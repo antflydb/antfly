@@ -59,6 +59,7 @@ pub const SharedModules = struct {
     platform: ?*std.Build.Module = null,
     vellum: ?*std.Build.Module = null,
     scraping: ?*std.Build.Module = null,
+    google: ?*std.Build.Module = null,
     objectstore: ?*std.Build.Module = null,
     regex: ?*std.Build.Module = null,
     jsonschema: ?*std.Build.Module = null,
@@ -138,10 +139,17 @@ pub fn create(config: Config) Graph {
     };
     const platform_mod = shared.platform orelse createSharedModule(config, "lib/platform/src/root.zig");
     const vellum_mod = shared.vellum orelse createSharedModule(config, "lib/vellum/src/mod.zig");
+    const google_mod = shared.google orelse blk: {
+        const mod = createSharedModule(config, "lib/google/src/root.zig");
+        mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        break :blk mod;
+    };
     const objectstore_mod = shared.objectstore orelse blk: {
         const mod = createSharedModule(config, "lib/objectstore/src/root.zig");
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("antfly_google", google_mod);
         break :blk mod;
     };
     const scraping_mod = shared.scraping orelse blk: {

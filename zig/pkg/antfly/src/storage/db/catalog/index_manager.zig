@@ -2516,6 +2516,7 @@ pub const IndexManager = struct {
                 .source_field = try alloc.dupe(u8, entry.source_field),
                 .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
                 .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
             });
         }
 
@@ -5224,7 +5225,7 @@ pub const IndexManager = struct {
     }
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
-        if (cfg.name.len == 0 or cfg.source_field.len == 0) return error.InvalidEnrichmentConfig;
+        if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;
@@ -9729,14 +9730,15 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
     return .{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
-        .source_field = try alloc.dupe(u8, cfg.source_field),
-        .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
+        .source_field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
+        .source_template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+        .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
 }
 
@@ -9749,18 +9751,20 @@ fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types
 }
 
 fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig) !types.EnrichmentConfig {
-    return .{
+    const out = types.EnrichmentConfig{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = internalEnrichmentKindToPublic(cfg.kind),
-        .source_field = try alloc.dupe(u8, cfg.source_field),
-        .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
+        .field = if (cfg.source_field.len > 0) try alloc.dupe(u8, cfg.source_field) else "",
+        .template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+        .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
+    return out;
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {

@@ -31,6 +31,7 @@ const enrichment_worker = @import("enrichment_worker.zig");
 const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
+const asset_producer_mod = @import("asset_producer.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
@@ -65,6 +66,7 @@ pub const Config = struct {
     lease_ttl_ms: u64 = 30_000,
     dense_embedder: ?embedder_mod.DenseEmbedder = null,
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
+    asset_producer: ?asset_producer_mod.Producer = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
@@ -1388,15 +1390,51 @@ fn processAsset(
     };
     defer runtime.alloc.free(raw);
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
+    var producer_cfg = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
+    defer producer_cfg.deinit(runtime.alloc);
+
+    const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse return;
     defer runtime.alloc.free(@constCast(source_text));
+
+    const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
+        try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
+    else
+        null;
+    defer if (source_parts_json) |value| runtime.alloc.free(value);
+
     const artifact_name = requestArtifactName(request);
     const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
     defer runtime.alloc.free(key);
-    if (try shouldSkipAssetArtifact(runtime, key, source_text)) return;
 
-    try storePutWithRetry(runtime, key, source_text);
-    recordArtifactBytes(runtime, .asset, source_text.len);
+    if (producer_cfg.type == .copy) {
+        if (try shouldSkipAssetArtifact(runtime, key, source_text)) return;
+        try storePutWithRetry(runtime, key, source_text);
+        recordArtifactBytes(runtime, .asset, source_text.len);
+        return;
+    }
+
+    const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+    defer runtime.alloc.free(state_key);
+    const state_value = try assetStateValueAlloc(runtime.alloc, source_text, source_parts_json, request.producer_json);
+    defer runtime.alloc.free(state_value);
+    if (try shouldSkipAssetProducer(runtime, state_key, state_value)) return;
+
+    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const produced = try producer.produce(runtime.alloc, .{
+        .producer_type = producer_cfg.type,
+        .config_json = producer_cfg.config_json,
+        .source_text = source_text,
+        .source_parts_json = source_parts_json,
+        .content_type = request.content_type,
+    });
+    defer runtime.alloc.free(produced);
+
+    const writes = [_]KVPair{
+        .{ .key = key, .value = produced },
+        .{ .key = state_key, .value = state_value },
+    };
+    try storePutBatch(runtime, &writes, &.{});
+    recordArtifactBytes(runtime, .asset, produced.len);
 }
 
 fn sameChunkedDenseBatchKey(
@@ -2546,6 +2584,38 @@ fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8
     return false;
 }
 
+fn shouldSkipAssetProducer(runtime: *EnrichmentRuntime, state_key: []const u8, expected_state: []const u8) !bool {
+    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer runtime.alloc.free(raw);
+    if (std.mem.eql(u8, raw, expected_state)) {
+        runtime.skip_by_hash_count += 1;
+        return true;
+    }
+    return false;
+}
+
+fn assetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "_asset_state", artifact_name);
+}
+
+fn assetStateValueAlloc(
+    alloc: Allocator,
+    source_text: []const u8,
+    source_parts_json: ?[]const u8,
+    producer_json: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_text);
+    if (source_parts_json) |parts| hasher.update(parts);
+    hasher.update(producer_json);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try alloc.dupe(u8, &digest);
+}
+
 fn recordArtifactBytes(runtime: *EnrichmentRuntime, kind: enrichment_artifact_codec.Kind, byte_count: usize) void {
     const bytes: u64 = @intCast(byte_count);
     switch (kind) {
@@ -2923,6 +2993,37 @@ fn extractSourceText(
     return try alloc.dupe(u8, source.string);
 }
 
+fn extractAssetSourceValue(
+    alloc: Allocator,
+    config: Config,
+    raw_doc: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]const u8 {
+    if (request.source_template.len > 0) {
+        const rendered = template_remote.renderJsonToTextWithConfig(
+            alloc,
+            request.source_template,
+            raw_doc,
+            remoteRenderConfig(config.secret_store, config.remote_content),
+        ) catch return null;
+        if (rendered.len == 0) {
+            alloc.free(rendered);
+            return null;
+        }
+        return rendered;
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(request.source_field) orelse return null;
+    return switch (source) {
+        .null => null,
+        .string => |value| try alloc.dupe(u8, value),
+        else => try std.json.Stringify.valueAlloc(alloc, source, .{}),
+    };
+}
+
 fn renderSourceParts(
     alloc: Allocator,
     config: Config,
@@ -2939,6 +3040,57 @@ fn renderSourceParts(
         return null;
     }
     return parts;
+}
+
+fn renderSourcePartsJson(
+    alloc: Allocator,
+    config: Config,
+    raw_doc: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]u8 {
+    const parts = try renderSourceParts(alloc, config, raw_doc, request) orelse return null;
+    defer template.freeContentParts(alloc, parts);
+    return try contentPartsJsonAlloc(alloc, parts);
+}
+
+fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template.ContentPart) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (parts, 0..) |part, i| {
+        if (i > 0) try out.append(alloc, ',');
+        switch (part) {
+            .text => |text| {
+                try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
+                try appendJsonString(alloc, &out, text);
+                try out.append(alloc, '}');
+            },
+            .media_url => |url| {
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"url\":");
+                try appendJsonString(alloc, &out, url);
+                try out.append(alloc, '}');
+            },
+            .binary => |binary| {
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
+                const encoded = try alloc.alloc(u8, encoded_len);
+                defer alloc.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, binary.data);
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
+                try appendJsonString(alloc, &out, binary.mime_type);
+                try out.appendSlice(alloc, ",\"data\":");
+                try appendJsonString(alloc, &out, encoded);
+                try out.append(alloc, '}');
+            },
+        }
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
 }
 
 fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {

@@ -125,6 +125,7 @@ pub const reranking_runtime = @import("reranking/mod.zig");
 pub const transcribing = @import("antfly_transcribing");
 pub const readers = @import("antfly_readers");
 pub const synthesizing = @import("antfly_synthesizing");
+pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
 pub const platform_clock = @import("platform/clock.zig");
@@ -277,6 +278,7 @@ test {
     _ = transcribing;
     _ = readers;
     _ = synthesizing;
+    _ = asset_producer_runtime;
 
     // Storage
     _ = lmdb;

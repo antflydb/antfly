@@ -38,6 +38,7 @@ pub const GeneratedEnrichmentRequest = struct {
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
     content_type: []const u8 = "",
+    producer_json: []const u8 = "",
 };
 
 pub const GeneratedEnrichmentRef = struct {
@@ -64,6 +65,7 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.source_template.len > 0) alloc.free(request.source_template);
     if (request.chunker_json.len > 0) alloc.free(request.chunker_json);
     if (request.content_type.len > 0) alloc.free(request.content_type);
+    if (request.producer_json.len > 0) alloc.free(request.producer_json);
 }
 
 pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentRequest) !GeneratedEnrichmentRequest {
@@ -80,6 +82,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .chunk_overlap = request.chunk_overlap,
         .chunker_json = if (request.chunker_json.len > 0) try alloc.dupe(u8, request.chunker_json) else "",
         .content_type = if (request.content_type.len > 0) try alloc.dupe(u8, request.content_type) else "",
+        .producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "",
     };
 }
 

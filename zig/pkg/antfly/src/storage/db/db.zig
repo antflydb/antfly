@@ -53,6 +53,7 @@ else
     @import("../../sparse/sparse.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
+const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
@@ -11468,22 +11469,106 @@ fn computeAssetRequestDerived(
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
 ) !void {
-    const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
-    else
-        try extractStringField(alloc, doc_value, request.source_field);
+    var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
+    defer producer_cfg.deinit(alloc);
+
+    const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
     if (source_text == null or source_text.?.len == 0) {
         if (source_text) |s| alloc.free(s);
         return;
     }
     defer alloc.free(source_text.?);
 
+    const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
+        try renderSourcePartsJson(alloc, db, doc_value, request)
+    else
+        null;
+    defer if (source_parts_json) |value| alloc.free(value);
+
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
     defer alloc.free(key);
+
+    const state_key = if (producer_cfg.type != .copy)
+        try assetStateKeyAlloc(alloc, request.doc_key, requestArtifactName(request))
+    else
+        null;
+    defer if (state_key) |value| alloc.free(value);
+    const state_value = if (producer_cfg.type != .copy)
+        try assetStateValueAlloc(alloc, source_text.?, source_parts_json, request.producer_json)
+    else
+        null;
+    defer if (state_value) |value| alloc.free(value);
+    if (state_key != null and state_value != null) {
+        const existing_state = try db.core.getStoreValue(alloc, state_key.?);
+        defer if (existing_state) |value| alloc.free(value);
+        if (existing_state != null and std.mem.eql(u8, existing_state.?, state_value.?)) return;
+    }
+
+    const value = if (producer_cfg.type == .copy) source_text.? else blk: {
+        const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
+        const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+        break :blk try producer.produce(alloc, .{
+            .producer_type = producer_cfg.type,
+            .config_json = producer_cfg.config_json,
+            .source_text = source_text.?,
+            .source_parts_json = source_parts_json,
+            .content_type = request.content_type,
+        });
+    };
+    defer if (producer_cfg.type != .copy) alloc.free(value);
+
     try artifact_writes.append(alloc, .{
         .key = try alloc.dupe(u8, key),
-        .value = try alloc.dupe(u8, source_text.?),
+        .value = try alloc.dupe(u8, value),
     });
+
+    if (producer_cfg.type != .copy) {
+        try artifact_writes.append(alloc, .{
+            .key = try alloc.dupe(u8, state_key.?),
+            .value = try alloc.dupe(u8, state_value.?),
+        });
+    }
+}
+
+fn extractAssetSourceValue(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]u8 {
+    if (request.source_template.len > 0) {
+        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+        return @constCast(rendered);
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(request.source_field) orelse return null;
+    return switch (source) {
+        .null => null,
+        .string => |value| try alloc.dupe(u8, value),
+        else => try std.json.Stringify.valueAlloc(alloc, source, .{}),
+    };
+}
+
+fn assetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "_asset_state", artifact_name);
+}
+
+fn assetStateValueAlloc(
+    alloc: Allocator,
+    source_text: []const u8,
+    source_parts_json: ?[]const u8,
+    producer_json: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_text);
+    if (source_parts_json) |parts| hasher.update(parts);
+    hasher.update(producer_json);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try alloc.dupe(u8, &digest);
 }
 
 fn computeChunkRequest(
@@ -12019,6 +12104,57 @@ fn renderSourceParts(
         return null;
     }
     return parts;
+}
+
+fn renderSourcePartsJson(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]u8 {
+    const parts = try renderSourceParts(alloc, db, doc_value, request) orelse return null;
+    defer template_mod.freeContentParts(alloc, parts);
+    return try contentPartsJsonAlloc(alloc, parts);
+}
+
+fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template_mod.ContentPart) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (parts, 0..) |part, i| {
+        if (i > 0) try out.append(alloc, ',');
+        switch (part) {
+            .text => |text| {
+                try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
+                try appendJsonString(alloc, &out, text);
+                try out.append(alloc, '}');
+            },
+            .media_url => |url| {
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"url\":");
+                try appendJsonString(alloc, &out, url);
+                try out.append(alloc, '}');
+            },
+            .binary => |binary| {
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
+                const encoded = try alloc.alloc(u8, encoded_len);
+                defer alloc.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, binary.data);
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
+                try appendJsonString(alloc, &out, binary.mime_type);
+                try out.appendSlice(alloc, ",\"data\":");
+                try appendJsonString(alloc, &out, encoded);
+                try out.append(alloc, '}');
+            },
+        }
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
 }
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
@@ -23799,14 +23935,14 @@ test "db addEnrichment supports explicit shared definitions" {
     try db.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
-        .source_field = "body",
+        .field = "body",
         .chunk_size = 8,
         .chunk_overlap = 2,
     });
     try db.addEnrichment(.{
         .name = "chunk_dense_v1",
         .kind = .embedding,
-        .source_field = "body",
+        .field = "body",
         .source_artifact_name = "body_chunks_v1",
         .expected_dims = 3,
     });
@@ -23849,7 +23985,7 @@ test "db addEnrichment supports explicit shared definitions" {
         var tmp = chunk;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", chunk.source_field);
+    try std.testing.expectEqualStrings("body", chunk.field);
 
     const embedding = (try db.getEnrichment(alloc, .embedding, "chunk_dense_v1")) orelse return error.TestUnexpectedResult;
     defer {
@@ -24407,7 +24543,7 @@ test "db deleteEnrichment rejects referenced definitions" {
     try db.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
-        .source_field = "body",
+        .field = "body",
         .chunk_size = 8,
         .chunk_overlap = 2,
     });
@@ -24549,7 +24685,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
             var tmp = enrichment;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", enrichment.source_field);
+        try std.testing.expectEqualStrings("body", enrichment.field);
         try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
         try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -24558,7 +24694,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
             var tmp = embedding;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", embedding.source_field);
+        try std.testing.expectEqualStrings("body", embedding.field);
         try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
         try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
     }
@@ -24571,7 +24707,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
         var tmp = enrichment;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", enrichment.source_field);
+    try std.testing.expectEqualStrings("body", enrichment.field);
     try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
     try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -24580,7 +24716,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
         var tmp = embedding;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", embedding.source_field);
+    try std.testing.expectEqualStrings("body", embedding.field);
     try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
     try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
 }
@@ -24611,7 +24747,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
             var tmp = enrichment;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", enrichment.source_field);
+        try std.testing.expectEqualStrings("body", enrichment.field);
         try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
         try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -24620,7 +24756,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
             var tmp = embedding;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", embedding.source_field);
+        try std.testing.expectEqualStrings("body", embedding.field);
         try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
         try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
     }
@@ -24635,7 +24771,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
         var tmp = enrichment;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", enrichment.source_field);
+    try std.testing.expectEqualStrings("body", enrichment.field);
     try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
     try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -24644,7 +24780,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
         var tmp = embedding;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", embedding.source_field);
+    try std.testing.expectEqualStrings("body", embedding.field);
     try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
     try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
 }
@@ -24663,14 +24799,14 @@ test "db listEnrichments returns explicit definitions across reopen" {
         try db.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
-            .source_field = "body",
+            .field = "body",
             .chunk_size = 8,
             .chunk_overlap = 2,
         });
         try db.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
-            .source_field = "body",
+            .field = "body",
             .source_artifact_name = "body_chunks_v1",
             .expected_dims = 3,
         });
@@ -24706,14 +24842,14 @@ test "db listEnrichments returns explicit definitions across reopen with durable
         try db.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
-            .source_field = "body",
+            .field = "body",
             .chunk_size = 8,
             .chunk_overlap = 2,
         });
         try db.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
-            .source_field = "body",
+            .field = "body",
             .source_artifact_name = "body_chunks_v1",
             .expected_dims = 3,
         });
@@ -32591,13 +32727,13 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     try db.addEnrichment(.{
         .name = "page_ocr_v1",
         .kind = .asset,
-        .source_field = "body",
+        .field = "body",
         .content_type = "text/plain",
     });
     try db.addEnrichment(.{
         .name = "entities_v1",
         .kind = .asset,
-        .source_field = "body",
+        .field = "body",
         .content_type = "application/json",
     });
 

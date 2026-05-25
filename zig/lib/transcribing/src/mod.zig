@@ -15,10 +15,12 @@
 const std = @import("std");
 const audio = @import("antfly_audio_openapi");
 const httpx = @import("httpx");
+const google_auth = @import("antfly_google").auth;
 const termite_api = @import("termite_api");
 const scraping = @import("antfly_scraping");
 
 const Allocator = std.mem.Allocator;
+const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
 pub const Request = audio.STTRequest;
 pub const Response = audio.STTResponse;
@@ -471,6 +473,7 @@ const VertexTranscriberState = struct {
     http: *httpx.Client,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    token_source: ?*google_auth.CachedTokenSource = null,
     project_id: []const u8,
     location: []const u8,
     model: []const u8,
@@ -484,7 +487,7 @@ const VertexTranscriberState = struct {
             .alloc = alloc,
             .http = http,
             .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://speech.googleapis.com/v2"),
-            .project_id = try alloc.dupe(u8, cfg.project_id orelse return error.InvalidTranscribingConfig),
+            .project_id = try alloc.dupe(u8, cfg.project_id orelse (try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path) orelse return error.InvalidTranscribingConfig)),
             .location = try alloc.dupe(u8, cfg.location orelse "global"),
             .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),
             .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
@@ -493,10 +496,8 @@ const VertexTranscriberState = struct {
 
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
-        } else if (cfg.credentials_path != null) {
-            return error.UnsupportedVertexServiceAccountCredentials;
         } else {
-            return error.MissingVertexCredentials;
+            state.token_source = try initVertexTokenSource(alloc, cfg.credentials_path);
         }
 
         return .{
@@ -515,6 +516,10 @@ const VertexTranscriberState = struct {
         self.alloc.free(self.model);
         self.alloc.free(self.language_code);
         if (self.auth_header) |header| self.alloc.free(header[1]);
+        if (self.token_source) |source| {
+            source.deinit();
+            self.alloc.destroy(source);
+        }
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -529,6 +534,22 @@ const VertexTranscriberState = struct {
             "Authorization",
             try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}),
         };
+    }
+
+    fn appendAuthHeaders(
+        self: *VertexTranscriberState,
+        alloc: Allocator,
+        headers: *std.ArrayList([2][]const u8),
+        minted_auth: *?[]u8,
+    ) !void {
+        if (self.auth_header) |header| {
+            try headers.append(alloc, header);
+            return;
+        }
+        if (self.token_source) |source| {
+            minted_auth.* = try source.authorizationValueAlloc(alloc);
+            try headers.append(alloc, .{ "Authorization", minted_auth.*.? });
+        }
     }
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
@@ -570,7 +591,9 @@ const VertexTranscriberState = struct {
 
         var headers = std.ArrayList([2][]const u8).empty;
         defer headers.deinit(alloc);
-        if (self.auth_header) |header| try headers.append(alloc, header);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
 
         var resp = try self.http.post(url, .{
             .json = body,
@@ -598,6 +621,28 @@ const VertexTranscriberState = struct {
         };
     }
 };
+
+fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
+    var cfg = if (credentials_path) |path| blk: {
+        const service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return error.MissingVertexCredentials;
+        break :blk google_auth.configFromServiceAccountAlloc(alloc, service_account, vertex_auth_scope) catch return error.MissingVertexCredentials;
+    } else google_auth.configFromEnvAlloc(alloc, vertex_auth_scope) catch return error.MissingVertexCredentials;
+    errdefer cfg.deinit(alloc);
+
+    const source = try alloc.create(google_auth.CachedTokenSource);
+    errdefer alloc.destroy(source);
+    source.* = try google_auth.CachedTokenSource.init(alloc, cfg);
+    return source;
+}
+
+fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
+    if (credentials_path) |path| {
+        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
+        defer service_account.deinit(alloc);
+        return if (service_account.project_id) |value| try alloc.dupe(u8, value) else null;
+    }
+    return try google_auth.serviceAccountEnvProjectIdAlloc(alloc);
+}
 
 const MultipartBody = struct {
     content_type: []u8,

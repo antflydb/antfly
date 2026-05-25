@@ -157,15 +157,10 @@ Example:
 {
   "name": "page_ocr_v1",
   "kind": "asset",
-  "input": {
-    "source": "document_field",
-    "field": "image"
-  },
-  "output": {
-    "artifact_name": "page_ocr_v1",
-    "content_type": "text/plain"
-  },
-  "producer": {
+  "field": "image",
+  "template": "{{remoteMedia url=image_url}}",
+  "content_type": "text/plain",
+  "producer_json": {
     "type": "reader",
     "config": {
       "provider": "vertex",
@@ -175,15 +170,6 @@ Example:
       "credentials_path": "/path/to/service-account.json",
       "prompt": "Read the document text."
     }
-  },
-  "trigger": {
-    "on_write": true,
-    "on_backfill": true
-  },
-  "policy": {
-    "dedupe_by_source_hash": true,
-    "model": "prefer_model",
-    "failure": "skip_document"
   }
 }
 ```
@@ -215,6 +201,23 @@ enrichment fields. If `producer` is omitted, the enrichment defaults to `copy`
 behavior: the source field or rendered source template value is stored directly
 as the asset value.
 
+The public asset enrichment shape uses `field` and `template`. The older
+`source_field`/`source_template` names are internal catalog/replay names and are
+not part of the public enrichment config. `template` follows the existing
+Handlebars/template remote behavior used by embedders, including data-URI and
+remote-media rendering for multimodal producers.
+
+Model-backed assets run in both paths:
+
+- synchronous `.enrichments` write precompute calls the configured producer and
+  includes the artifact write in the document commit;
+- asynchronous enrichment workers call the same producer from replay and retry
+  on transient failures.
+
+For model-backed assets, Antfly stores a separate internal skip-state row keyed
+by the source value, rendered multimodal parts, and `producer_json`. Asset rows
+remain value-only.
+
 The model-facing producer types are separate from artifact kinds:
 
 - **generators** call LLM-style generation endpoints, including tool-calling
@@ -229,6 +232,13 @@ For Zig providers, `antfly` is the canonical local/remote provider name. A
 provider config with `provider: "antfly"` and no `url` uses the local Termite
 runtime when available. Supplying `url` routes to an Antfly/Termite-compatible
 HTTP service. `termite` remains an alias while older configs migrate.
+
+Vertex/Google auth uses provider-specific config. Explicit `bearer_token` or
+provider API key config wins. Otherwise Vertex providers resolve service-account
+credentials from `credentials_path`, then the existing Google environment
+variables, mint a `https://www.googleapis.com/auth/cloud-platform` token, and
+cache it through `lib/google`. `project_id` may be omitted when it is present in
+the service-account JSON.
 
 ## Distributed System Boundary
 

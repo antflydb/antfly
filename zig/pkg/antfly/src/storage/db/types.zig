@@ -233,37 +233,40 @@ pub const ArtifactRef = struct {
 pub const EnrichmentConfig = struct {
     name: []const u8,
     kind: EnrichmentKind,
-    source_field: []const u8,
-    source_template: []const u8 = "",
+    field: []const u8 = "",
+    template: []const u8 = "",
     source_artifact_name: []const u8 = "",
     expected_dims: u32 = 0,
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
     content_type: []const u8 = "",
+    producer_json: []const u8 = "",
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         return .{
             .name = try alloc.dupe(u8, cfg.name),
             .kind = cfg.kind,
-            .source_field = try alloc.dupe(u8, cfg.source_field),
-            .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
+            .field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
+            .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
             .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
             .expected_dims = cfg.expected_dims,
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+            .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         };
     }
 
     pub fn deinit(self: *EnrichmentConfig, alloc: Allocator) void {
         alloc.free(self.name);
-        alloc.free(self.source_field);
-        if (self.source_template.len > 0) alloc.free(self.source_template);
+        if (self.field.len > 0) alloc.free(self.field);
+        if (self.template.len > 0) alloc.free(self.template);
         if (self.source_artifact_name.len > 0) alloc.free(self.source_artifact_name);
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
+        if (self.producer_json.len > 0) alloc.free(self.producer_json);
         self.* = undefined;
     }
 };

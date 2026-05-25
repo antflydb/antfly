@@ -35,6 +35,7 @@ pub const EnrichmentConfig = struct {
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
     content_type: []const u8 = "",
+    producer_json: []const u8 = "",
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         return .{
@@ -48,6 +49,7 @@ pub const EnrichmentConfig = struct {
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+            .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         };
     }
 
@@ -58,6 +60,7 @@ pub const EnrichmentConfig = struct {
         if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
         if (self.chunker_json.len > 0) alloc.free(@constCast(self.chunker_json));
         if (self.content_type.len > 0) alloc.free(@constCast(self.content_type));
+        if (self.producer_json.len > 0) alloc.free(@constCast(self.producer_json));
         self.* = undefined;
     }
 };

@@ -18,7 +18,7 @@ pub const filesystem = @import("filesystem.zig");
 pub const memory = @import("memory.zig");
 pub const s3 = @import("s3.zig");
 pub const gcs = @import("gcs.zig");
-pub const google_auth = @import("google_auth.zig");
+pub const google_auth = @import("antfly_google").auth;
 pub const s3_compat = @import("s3_compat.zig");
 
 pub const ObjectMetadata = types.ObjectMetadata;

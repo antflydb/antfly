@@ -428,6 +428,7 @@ const AntflyRootImports = struct {
     readers: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
+    google: *std.Build.Module,
     objectstore: *std.Build.Module,
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
@@ -486,6 +487,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_readers", .field = "readers" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
+        .{ .name = "antfly_google", .field = "google" },
         .{ .name = "objectstore", .field = "objectstore" },
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
@@ -1213,15 +1215,31 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const google_mod = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
+    objectstore_mod.addImport("antfly_google", google_mod);
     const wasm_objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_google_mod = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("httpx", httpx_mod);
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_objectstore_mod.addImport("antfly_google", wasm_google_mod);
     const bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = target,
@@ -1468,6 +1486,7 @@ pub fn build(b: *std.Build) void {
             .platform = platform_mod,
             .vellum = vellum_mod,
             .scraping = scraping_mod,
+            .google = google_mod,
             .objectstore = objectstore_mod,
             .regex = regex_mod,
             .jsonschema = jsonschema_mod,
@@ -1498,6 +1517,7 @@ pub fn build(b: *std.Build) void {
     transcribing_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("termite_api", termite_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
+    transcribing_mod.addImport("antfly_google", google_mod);
     const readers_mod = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/mod.zig"),
         .target = target,
@@ -1505,6 +1525,7 @@ pub fn build(b: *std.Build) void {
     });
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("termite_api", termite_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),
         .target = target,
@@ -1545,6 +1566,7 @@ pub fn build(b: *std.Build) void {
         .readers = readers_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
+        .google = google_mod,
         .objectstore = objectstore_mod,
         .bloom = bloom_mod,
         .vector = vector_mod,

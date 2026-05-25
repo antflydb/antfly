@@ -14,9 +14,11 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
+const google_auth = @import("antfly_google").auth;
 const termite_api = @import("termite_api");
 
 const Allocator = std.mem.Allocator;
+const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
 pub const Provider = enum {
     antfly,
@@ -347,6 +349,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         http: *httpx.Client,
         base_url: []const u8,
         auth_header: ?[2][]const u8 = null,
+        token_source: ?*google_auth.CachedTokenSource = null,
         model: []const u8,
         prompt: ?[]const u8 = null,
         max_tokens: ?i64 = null,
@@ -377,7 +380,14 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .location = try dupOpt(alloc, cfg.location),
             };
             errdefer state.deinitState();
-            if (cfg.bearer_token orelse cfg.api_key) |token| try state.setBearer(token) else if (cfg.credentials_path != null) return error.UnsupportedVertexServiceAccountCredentials;
+            if (cfg.bearer_token orelse cfg.api_key) |token| {
+                try state.setBearer(token);
+            } else if (provider == .vertex) {
+                state.token_source = try initVertexTokenSource(alloc, cfg.credentials_path);
+                if (state.project_id == null) {
+                    state.project_id = try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path);
+                }
+            }
             return .{ .ptr = state, .vtable = &.{ .read = read, .deinit = deinit } };
         }
 
@@ -388,6 +398,10 @@ fn CloudReaderState(comptime provider: Provider) type {
             freeOpt(self.alloc, self.project_id);
             freeOpt(self.alloc, self.location);
             if (self.auth_header) |header| self.alloc.free(header[1]);
+            if (self.token_source) |source| {
+                source.deinit();
+                self.alloc.destroy(source);
+            }
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -399,6 +413,22 @@ fn CloudReaderState(comptime provider: Provider) type {
         fn setBearer(self: *Self, token: []const u8) !void {
             if (self.auth_header) |header| self.alloc.free(header[1]);
             self.auth_header = .{ "Authorization", try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}) };
+        }
+
+        fn appendAuthHeaders(
+            self: *Self,
+            alloc: Allocator,
+            headers: *std.ArrayList([2][]const u8),
+            minted_auth: *?[]u8,
+        ) !void {
+            if (self.auth_header) |header| {
+                try headers.append(alloc, header);
+                return;
+            }
+            if (self.token_source) |source| {
+                minted_auth.* = try source.authorizationValueAlloc(alloc);
+                try headers.append(alloc, .{ "Authorization", minted_auth.*.? });
+            }
         }
 
         fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
@@ -433,7 +463,9 @@ fn CloudReaderState(comptime provider: Provider) type {
             defer alloc.free(url);
             var headers = std.ArrayList([2][]const u8).empty;
             defer headers.deinit(alloc);
-            if (self.auth_header) |header| try headers.append(alloc, header);
+            var minted_auth: ?[]u8 = null;
+            defer if (minted_auth) |value| alloc.free(value);
+            try self.appendAuthHeaders(alloc, &headers, &minted_auth);
             var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
             defer resp.deinit();
             if (!resp.ok()) return error.ReadRequestFailed;
@@ -459,7 +491,9 @@ fn CloudReaderState(comptime provider: Provider) type {
             defer alloc.free(url);
             var headers = std.ArrayList([2][]const u8).empty;
             defer headers.deinit(alloc);
-            if (self.auth_header) |header| try headers.append(alloc, header);
+            var minted_auth: ?[]u8 = null;
+            defer if (minted_auth) |value| alloc.free(value);
+            try self.appendAuthHeaders(alloc, &headers, &minted_auth);
             var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
             defer resp.deinit();
             if (!resp.ok()) return error.ReadRequestFailed;
@@ -520,6 +554,28 @@ fn singleTextResult(alloc: Allocator, text: []const u8) ![]Result {
     errdefer alloc.free(out);
     out[0] = .{ .text = try alloc.dupe(u8, text) };
     return out;
+}
+
+fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
+    var cfg = if (credentials_path) |path| blk: {
+        const service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return error.MissingVertexCredentials;
+        break :blk google_auth.configFromServiceAccountAlloc(alloc, service_account, vertex_auth_scope) catch return error.MissingVertexCredentials;
+    } else google_auth.configFromEnvAlloc(alloc, vertex_auth_scope) catch return error.MissingVertexCredentials;
+    errdefer cfg.deinit(alloc);
+
+    const source = try alloc.create(google_auth.CachedTokenSource);
+    errdefer alloc.destroy(source);
+    source.* = try google_auth.CachedTokenSource.init(alloc, cfg);
+    return source;
+}
+
+fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
+    if (credentials_path) |path| {
+        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
+        defer service_account.deinit(alloc);
+        return if (service_account.project_id) |value| try alloc.dupe(u8, value) else null;
+    }
+    return try google_auth.serviceAccountEnvProjectIdAlloc(alloc);
 }
 
 fn dupOpt(alloc: Allocator, value: ?[]const u8) !?[]const u8 {
