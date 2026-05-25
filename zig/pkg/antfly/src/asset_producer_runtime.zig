@@ -129,6 +129,24 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
 
+        var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
+        defer source.deinit(alloc);
+
+        if (cfg_parsed.value.provider == .antfly and cfg_parsed.value.resolvedUrl() == null) {
+            const local = self.local_termite_provider orelse return error.UnsupportedReaderProvider;
+            const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
+            const results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+                .images = source.images,
+                .prompt = source.prompt,
+                .max_tokens = cfg_parsed.value.max_tokens,
+            });
+            defer {
+                for (results) |*result| readers.deinitResult(alloc, result);
+                alloc.free(results);
+            }
+            return try encodeReaderResults(alloc, request.content_type, results);
+        }
+
         var registry = readers.Registry.init(alloc);
         defer registry.deinit();
         try registry.registerConfig("asset", cfg_parsed.value);
@@ -136,9 +154,6 @@ pub const Runtime = struct {
         var runtime = readers.Runtime.init(alloc);
         defer runtime.deinit();
         try runtime.loadFromRegistry(self.http, &registry);
-
-        var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
-        defer source.deinit(alloc);
 
         const provider = try runtime.get("asset");
         const results = try provider.read(alloc, .{
@@ -159,6 +174,21 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
+
+        if (cfg_parsed.value.provider == .antfly and cfg_parsed.value.resolvedUrl() == null) {
+            const local = self.local_termite_provider orelse return error.UnsupportedTranscriberProvider;
+            const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
+            var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+                .url = request.source_text,
+                .language = cfg_parsed.value.language_code,
+            });
+            defer transcribing.deinitResponse(alloc, &result);
+
+            if (isJsonContentType(request.content_type)) {
+                return try std.json.Stringify.valueAlloc(alloc, result, .{});
+            }
+            return try alloc.dupe(u8, result.text orelse "");
+        }
 
         var registry = transcribing.Registry.init(alloc);
         defer registry.deinit();
@@ -390,4 +420,120 @@ test "asset producer runtime passes rendered media parts to generators" {
     if (run_err) |err| return err;
     defer alloc.free(result.?);
     try std.testing.expectEqualStrings("vision result", result.?);
+}
+
+test "asset producer runtime routes antfly reader without url to local provider" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        read_calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.LocalTermiteProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .read_images = readImages,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.read_calls += 1;
+            try std.testing.expectEqualStrings("local-reader", model);
+            try std.testing.expectEqual(@as(usize, 1), request.images.len);
+            try std.testing.expectEqualStrings("data:image/png;base64,aaa", request.images[0]);
+            try std.testing.expectEqualStrings("extract", request.prompt.?);
+
+            const out = try a.alloc(readers.Result, 1);
+            out[0] = .{ .text = try a.dupe(u8, "local read text") };
+            return out;
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .local_termite_provider = local.provider() });
+    const producer = runtime.producer();
+
+    const result = try producer.produce(alloc, .{
+        .producer_type = .reader,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+        .source_text = "",
+        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,aaa\"}]",
+        .content_type = "text/plain",
+    });
+    defer alloc.free(result);
+
+    try std.testing.expectEqualStrings("local read text", result);
+    try std.testing.expectEqual(@as(usize, 1), local.read_calls);
+}
+
+test "asset producer runtime routes antfly transcriber without url to local provider" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        transcribe_calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.LocalTermiteProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .transcribe_audio = transcribeAudio,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn transcribeAudio(ptr: *anyopaque, a: Allocator, model: []const u8, request: transcribing.Request) !transcribing.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.transcribe_calls += 1;
+            try std.testing.expectEqualStrings("local-transcriber", model);
+            try std.testing.expectEqualStrings("file:///tmp/audio.wav", request.url);
+            try std.testing.expectEqualStrings("en-US", request.language.?);
+            return .{
+                .text = try a.dupe(u8, "local transcript"),
+                .language = try a.dupe(u8, "en-US"),
+            };
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .local_termite_provider = local.provider() });
+    const producer = runtime.producer();
+
+    const result = try producer.produce(alloc, .{
+        .producer_type = .transcriber,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\",\"language_code\":\"en-US\"}",
+        .source_text = "file:///tmp/audio.wav",
+        .content_type = "text/plain",
+    });
+    defer alloc.free(result);
+
+    try std.testing.expectEqualStrings("local transcript", result);
+    try std.testing.expectEqual(@as(usize, 1), local.transcribe_calls);
 }
